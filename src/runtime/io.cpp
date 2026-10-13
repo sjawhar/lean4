@@ -256,8 +256,11 @@ static int lean_crt_to_uv_err(int err) {
 static obj_res decode_uv_error_impl(int errnum, int posix_errnum, b_lean_obj_arg fname) {
     object * details = mk_string(uv_strerror(errnum));
     switch (errnum) {
+    /* `interrupted` and `noFileOrDirectory` require a file name; callers without one get "". */
     case UV_EINTR:
-        lean_assert(fname != nullptr);
+        if (fname == nullptr) {
+            return lean_mk_io_error_interrupted(mk_string(""), posix_errnum, details);
+        }
         inc_ref(fname);
         return lean_mk_io_error_interrupted(fname, posix_errnum, details);
     /* LibUV does not map EDOM and ENOSTR as of version 1.52.1 */
@@ -274,7 +277,9 @@ static obj_res decode_uv_error_impl(int errnum, int posix_errnum, b_lean_obj_arg
             return lean_mk_io_error_invalid_argument_file(fname, posix_errnum, details);
         }
     case UV_ENOENT:
-        lean_assert(fname != nullptr);
+        if (fname == nullptr) {
+            return lean_mk_io_error_no_file_or_directory(mk_string(""), posix_errnum, details);
+        }
         inc_ref(fname);
         return lean_mk_io_error_no_file_or_directory(fname, posix_errnum, details);
     case UV_EACCES: case UV_EROFS: case UV_ECONNABORTED: case UV_EFBIG:
