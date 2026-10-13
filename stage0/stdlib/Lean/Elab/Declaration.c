@@ -18081,7 +18081,7 @@ _start:
 lean_object* v___x_6031_; lean_object* v___x_6032_; lean_object* v___x_6033_; lean_object* v___x_6034_; lean_object* v___x_6035_; lean_object* v___x_6036_; 
 v___x_6031_ = ((lean_object*)(l___private_Init_Data_Array_Basic_0__Array_mapMUnsafe_map___at___00Lean_Elab_Command_expandMutualNamespace_spec__2___closed__1));
 v___x_6032_ = lean_unsigned_to_nat(11u);
-v___x_6033_ = lean_unsigned_to_nat(429u);
+v___x_6033_ = lean_unsigned_to_nat(469u);
 v___x_6034_ = ((lean_object*)(l_Lean_ensureNonAmbiguous___at___00Lean_Elab_Command_elabAttr_spec__1___closed__1));
 v___x_6035_ = ((lean_object*)(l_Lean_ensureNonAmbiguous___at___00Lean_Elab_Command_elabAttr_spec__1___closed__0));
 v___x_6036_ = l_mkPanicMessageWithDecl(v___x_6035_, v___x_6034_, v___x_6033_, v___x_6032_, v___x_6031_);

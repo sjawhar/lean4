@@ -3918,7 +3918,7 @@ _start:
 lean_object* v___x_1203_; lean_object* v___x_1204_; lean_object* v___x_1205_; lean_object* v___x_1206_; lean_object* v___x_1207_; lean_object* v___x_1208_; 
 v___x_1203_ = ((lean_object*)(l_Lean_ensureNonAmbiguous___at___00Lean_resolveGlobalConstNoOverload___at___00__private_Lean_Meta_Tactic_Grind_PropagatorAttr_0__Lean_Meta_Grind_addBuiltin_spec__0_spec__1___closed__2));
 v___x_1204_ = lean_unsigned_to_nat(11u);
-v___x_1205_ = lean_unsigned_to_nat(429u);
+v___x_1205_ = lean_unsigned_to_nat(469u);
 v___x_1206_ = ((lean_object*)(l_Lean_ensureNonAmbiguous___at___00Lean_resolveGlobalConstNoOverload___at___00__private_Lean_Meta_Tactic_Grind_PropagatorAttr_0__Lean_Meta_Grind_addBuiltin_spec__0_spec__1___closed__1));
 v___x_1207_ = ((lean_object*)(l_Lean_ensureNonAmbiguous___at___00Lean_resolveGlobalConstNoOverload___at___00__private_Lean_Meta_Tactic_Grind_PropagatorAttr_0__Lean_Meta_Grind_addBuiltin_spec__0_spec__1___closed__0));
 v___x_1208_ = l_mkPanicMessageWithDecl(v___x_1207_, v___x_1206_, v___x_1205_, v___x_1204_, v___x_1203_);
