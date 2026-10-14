@@ -15,6 +15,7 @@ import Lean.Compiler.InitAttr  -- for `runInitAttrsForModules` on snapshot load
 import Lean.Linter.PersistentLintLog
 import Lean.Util.ProfilerServer
 import Lean.Util.ModuleUsage
+import Lean.Util.UsedByChecks
 
 public section
 
@@ -384,6 +385,13 @@ def runFrontend
       let commandLints := collectCommandLints snaps none #[]
       let env ← Linter.recordLints inputCtx.fileMap env commandLints
       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
+    let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
+    let used := trees.foldl (init := ← usedByChecksRef.get) fun s t =>
+      t.foldInfo (init := s) fun ctx i s => match i with
+        | .ofTermInfo ti => (instantiateMVarsCore ctx.mctx ti.expr).1.foldConsts s fun c s => s.insert c
+        | .ofFieldInfo fi => s.insert fi.projName
+        | _ => s
+    ModuleUsage.writeUsage env used (oleanFileName.withExtension "usage")
 
   if let some ileanFileName := ileanFileName? then
     let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])

@@ -5,6 +5,7 @@ public import Lean.Util.FoldConsts
 public import Lean.Util.PtrSet
 public import Lean.Compiler.ImplementedByAttr
 public import Lean.Compiler.ExternAttr
+import Lean.ExtraModUses
 public section
 namespace Lean.ModuleUsage
 
@@ -145,5 +146,25 @@ def moduleUsed (env : Environment) (extra : NameSet) : Array (Name × Array (Nam
     | _, _ => m
   byMod.toArray.map (fun (k, v) => (k, v.qsort fun a b => Name.quickLt a.1 b.1))
     |>.qsort fun a b => Name.quickLt a.1 b.1
+
+def hex16 (v : UInt64) : String :=
+  let s := String.ofList (Nat.toDigits 16 v.toNat); "".pushn '0' (16 - s.length) ++ s
+
+def writeUsage (env : Environment) (extra : NameSet) (path : System.FilePath) : IO Unit := do
+  let own := localDigests env
+  let privEnv := env.setExporting false
+  let noskip := own.any fun (n, _) => ((privEnv.find? n).map (refs env) |>.getD #[]).any
+    (· matches ``Lean.reduceBool | ``Lean.reduceNat)
+  let s := state env
+  let extraMods := (getLocalExtraModUses env).filter fun u =>
+    (env.getModuleIdx? u.module).any s.hasEntries
+  let pair (n : Name) (d : UInt64) := Json.arr #[toJson n, hex16 d]
+  let j := Json.mkObj [("version", 1), ("noskip", noskip),
+    ("moduleDigest", hex16 (own.foldl (fun h (_, d) => mixHash h d) 7)),
+    ("own", Json.arr (own.map fun (n, d) => pair n d)),
+    ("used", Json.arr ((moduleUsed env extra).map fun (m, cs) =>
+      Json.arr #[toJson m, Json.arr (cs.map fun (n, d) => pair n d)])),
+    ("extra", Json.arr (extraMods.map fun u => Json.arr #[toJson u.module, u.isMeta]))]
+  IO.FS.writeFile path j.compress
 
 end Lean.ModuleUsage
