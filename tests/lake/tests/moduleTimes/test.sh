@@ -2,11 +2,26 @@
 source ../common.sh
 ./clean.sh
 
+# has_row NAME [MS]: the record has a row of its own for NAME (with compile time MS, if given).
+# A name can also appear in the names table only as another row's import, so a plain grep for it
+# does not show that the module has an entry.
+has_row() {
+  echo "? row for $*"
+  python3 -c '
+import json, sys
+r = json.load(open(".lake/module-times.json"))
+rows = {r["names"][m[0]]: m for m in r["modules"]}
+row = rows.get(sys.argv[1])
+print(row)
+sys.exit(0 if row and (len(sys.argv) < 3 or row[1] == int(sys.argv[2])) else 1)
+' "$@"
+}
+
 # No record: stock order, the first import starts first. The build writes a record.
 LEAN_NUM_THREADS=1 test_run build
 test_cmd_eq "Test.Quick1" head -n1 order.txt
 test_cmd test -f .lake/module-times.json
-match_text '"Test.Slow"' .lake/module-times.json
+has_row Test.Slow
 
 # The record survives a removed build directory, and the longest remaining path starts first.
 rm -rf .lake/build order.txt
@@ -15,7 +30,7 @@ test_cmd_eq "Test.Slow" head -n1 order.txt
 
 # An executable's root module gets an entry too.
 test_run build main
-match_text '"Main"' .lake/module-times.json
+has_row Main
 
 # A module whose source is gone leaves the record at the next build that compiles something.
 # Entries of modules this build did not compile stay, the executable's root among them.
@@ -23,8 +38,8 @@ cp Test.lean Test.lean.bak; mv Test/Quick3.lean Test/Quick3.lean.bak
 printf 'import Test.Quick1\nimport Test.Quick2\nimport Test.SlowTop\n' > Test.lean
 test_run build
 no_match_text '"Test.Quick3"' .lake/module-times.json
-match_text '"Test.Slow"' .lake/module-times.json
-match_text '"Main"' .lake/module-times.json
+has_row Test.Slow
+has_row Main
 mv Test.lean.bak Test.lean; mv Test/Quick3.lean.bak Test/Quick3.lean
 
 # The save merges over the record as it is on disk at the end of the build, so an entry another
@@ -33,7 +48,7 @@ printf '{"version":2,"names":["Test.Quick1"],"modules":[[0,777777,[]]]}' > injec
 cp Test.lean Test.lean.bak
 printf 'import Test.Quick1\nimport Test.Quick2\nimport Test.Quick3\nimport Test.SlowTop\n#eval do IO.FS.writeFile ".lake/module-times.json" (← IO.FS.readFile "inject.json")\n' > Test.lean
 test_run build
-match_text ',777777,' .lake/module-times.json
+has_row Test.Quick1 777777
 mv Test.lean.bak Test.lean; rm inject.json
 
 # A save that fails warns, naming the file, and the build still succeeds. Here `Test`'s compile
