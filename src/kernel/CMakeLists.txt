@@ -17,4 +17,5 @@ add_library(
   quot.cpp
   inductive.cpp
   trace.cpp
+  census.cpp
 )

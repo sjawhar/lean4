@@ -14,6 +14,7 @@ import Lean.Compiler.Options
 import Lean.Compiler.InitAttr  -- for `runInitAttrsForModules` on snapshot load
 import Lean.Linter.PersistentLintLog
 import Lean.Util.ProfilerServer
+import Lean.Util.Census
 
 public section
 
@@ -407,6 +408,9 @@ def runFrontend
     let traceStates := snaps.getAll.map (·.traces)
     let profile ← Firefox.Profile.export mainModuleName.toString startTime traceStates opts
     Firefox.Profile.serve <| Json.compress <| toJson profile
+
+  -- lean-build-perf#15: writes nothing unless `LEAN_CENSUS_DIR` is set.
+  Census.flush mainModuleName
 
   -- no point in freeing the snapshot graph and all referenced data this close to process exit
   Runtime.forget snaps

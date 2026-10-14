@@ -119,6 +119,7 @@ private:
     template<typename F> optional<expr> reduce_bin_nat_pred(F const & f, expr const & e);
     optional<expr> reduce_pow(expr const & e);
     optional<expr> reduce_shiftLeft(expr const & e);
+    optional<expr> reduce_nat_impl(expr const & e);
     optional<expr> reduce_nat(expr const & e);
 public:
     // The following two constructor are used only by the old compiler and should be deleted with it

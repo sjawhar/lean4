@@ -22,6 +22,7 @@ Author: Leonardo de Moura
 #include "kernel/for_each_fn.h"
 #include "kernel/quot.h"
 #include "kernel/inductive.h"
+#include "kernel/census.h"
 
 namespace lean {
 static name * g_kernel_fresh = nullptr;
@@ -330,8 +331,11 @@ expr type_checker::infer_type_core(expr const & e, bool infer_only) {
     check_system("type checker", /* do_check_interrupted */ true);
 
     auto it = m_st->m_infer_type[infer_only].find(e);
-    if (it != m_st->m_infer_type[infer_only].end())
+    if (it != m_st->m_infer_type[infer_only].end()) {
+        census_infer_call(/* cache_hit */ true);
         return it->second;
+    }
+    census_infer_call(/* cache_hit */ false);
 
     expr r;
     switch (e.kind()) {
@@ -353,6 +357,7 @@ expr type_checker::infer_type_core(expr const & e, bool infer_only) {
     case expr_kind::Let:      r = infer_let(e, infer_only);            break;
     }
 
+    if (!has_fvar(e)) census_record_closed_term(/* infer */ 0, hash(e));
     m_st->m_infer_type[infer_only].insert(mk_pair(e, r));
     return r;
 }
@@ -570,15 +575,21 @@ optional<expr> type_checker::unfold_definition_core(expr const & e) {
             if (m_diag) {
                 m_diag->record_unfold(d->get_name());
             }
+            bool do_time = census_enabled();
             if (len > 0) {
                 auto it = m_st->m_unfold.find(e);
                 if (it != m_st->m_unfold.end())
                     return some_expr(it->second);
+                double t0 = do_time ? census_now_ns() : 0;
                 expr result = instantiate_value_lparams(*d, us);
+                if (do_time) census_record_unfold(d->get_name(), census_now_ns() - t0);
                 m_st->m_unfold.insert(mk_pair(e, result));
                 return some_expr(result);
             } else {
-                return some_expr(instantiate_value_lparams(*d, us));
+                double t0 = do_time ? census_now_ns() : 0;
+                expr result = instantiate_value_lparams(*d, us);
+                if (do_time) census_record_unfold(d->get_name(), census_now_ns() - t0);
+                return some_expr(result);
             }
         }
     }
@@ -699,7 +710,7 @@ template<typename F> optional<expr> type_checker::reduce_bin_nat_pred(F const & 
     return f(v1.raw(), v2.raw()) ? some_expr(mk_bool_true()) : some_expr(mk_bool_false());
 }
 
-optional<expr> type_checker::reduce_nat(expr const & e) {
+optional<expr> type_checker::reduce_nat_impl(expr const & e) {
     unsigned nargs = get_app_num_args(e);
     if (nargs == 1) {
         expr const & f = app_fn(e);
@@ -732,6 +743,14 @@ optional<expr> type_checker::reduce_nat(expr const & e) {
     return none_expr();
 }
 
+optional<expr> type_checker::reduce_nat(expr const & e) {
+    if (!census_enabled()) return reduce_nat_impl(e);
+    double t0 = census_now_ns();
+    optional<expr> r = reduce_nat_impl(e);
+    if (r) census_record_lit_reduce(census_now_ns() - t0);
+    return r;
+}
+
 /** \brief Put expression \c t in weak head normal form */
 expr type_checker::whnf(expr const & e) {
     // Do not cache easy cases
@@ -753,22 +772,28 @@ expr type_checker::whnf(expr const & e) {
 
     // check cache
     auto it = m_st->m_whnf.find(e);
-    if (it != m_st->m_whnf.end())
+    if (it != m_st->m_whnf.end()) {
+        census_whnf_call(/* cache_hit */ true);
         return it->second;
+    }
+    census_whnf_call(/* cache_hit */ false);
 
     expr t = e;
     while (true) {
         expr t1 = whnf_core(t);
         if (auto v = reduce_native(env(), t1)) {
+            if (!has_fvar(e)) census_record_closed_term(/* whnf */ 1, hash(e));
             m_st->m_whnf.insert(mk_pair(e, *v));
             return *v;
         } else if (auto v = reduce_nat(t1)) {
+            if (!has_fvar(e)) census_record_closed_term(/* whnf */ 1, hash(e));
             m_st->m_whnf.insert(mk_pair(e, *v));
             return *v;
         } else if (auto next_t = unfold_definition(t1)) {
             t = *next_t;
         } else {
             auto r = t1;
+            if (!has_fvar(e)) census_record_closed_term(/* whnf */ 1, hash(e));
             m_st->m_whnf.insert(mk_pair(e, r));
             return r;
         }
@@ -939,15 +964,18 @@ lbool type_checker::is_def_eq_proof_irrel(expr const & t, expr const & s) {
 }
 
 bool type_checker::failed_before(expr const & t, expr const & s) const {
+    bool r;
     if (hash(t) < hash(s)) {
-        return m_st->m_failure.find(mk_pair(t, s)) != m_st->m_failure.end();
+        r = m_st->m_failure.find(mk_pair(t, s)) != m_st->m_failure.end();
     } else if (hash(t) > hash(s)) {
-        return m_st->m_failure.find(mk_pair(s, t)) != m_st->m_failure.end();
+        r = m_st->m_failure.find(mk_pair(s, t)) != m_st->m_failure.end();
     } else {
-        return
+        r =
             m_st->m_failure.find(mk_pair(t, s)) != m_st->m_failure.end() ||
             m_st->m_failure.find(mk_pair(s, t)) != m_st->m_failure.end();
     }
+    if (r) census_defeq_cache_hit(/* success */ false);
+    return r;
 }
 
 void type_checker::cache_failure(expr const & t, expr const & s) {
@@ -958,15 +986,18 @@ void type_checker::cache_failure(expr const & t, expr const & s) {
 }
 
 bool type_checker::succeeded_before(expr const & t, expr const & s) const {
+    bool r;
     if (hash(t) < hash(s)) {
-        return m_st->m_success.find(mk_pair(t, s)) != m_st->m_success.end();
+        r = m_st->m_success.find(mk_pair(t, s)) != m_st->m_success.end();
     } else if (hash(t) > hash(s)) {
-        return m_st->m_success.find(mk_pair(s, t)) != m_st->m_success.end();
+        r = m_st->m_success.find(mk_pair(s, t)) != m_st->m_success.end();
     } else {
-        return
+        r =
             m_st->m_success.find(mk_pair(t, s)) != m_st->m_success.end() ||
             m_st->m_success.find(mk_pair(s, t)) != m_st->m_success.end();
     }
+    if (r) census_defeq_cache_hit(/* success */ true);
+    return r;
 }
 
 void type_checker::cache_success(expr const & t, expr const & s) {
@@ -1169,6 +1200,7 @@ bool type_checker::is_def_eq_unit_like(expr const & t, expr const & s) {
 }
 
 bool type_checker::is_def_eq_core(expr const & t, expr const & s) {
+    census_defeq_call();
     scope_rec_depth guard;
     check_system("is_definitionally_equal", /* do_check_interrupted */ true);
     lbool r = quick_is_def_eq(t, s);
