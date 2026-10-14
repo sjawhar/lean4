@@ -1087,6 +1087,16 @@ def modsysHash (importArts : NameMap ImportArtifacts) : JobM Hash := do
   return h
 
 /--
+The `.olean` of importee `m` in `importArts` and its `.usage`, or `none` if either is missing or
+the `.usage` is invalid.
+-/
+def importUsage? (importArts : NameMap ImportArtifacts) (m : Name) :
+    JobM (Option (FilePath × UsageSidecar)) := do
+  let some olean := (importArts.find? m).bind (·.olean?) | return none
+  let some usage ← readUsageSidecar (olean.withExtension "usage") UsageSidecar.parse | return none
+  return some (olean, usage)
+
+/--
 Writes the module's `.usekey` from the `.usage` Lean just wrote: the module's local trace hash, the
 hash of its `.olean` (`oleanHash`), the `modsysHash` of its closure and, for each `extra` module,
 the hash of its `.olean` and its current `moduleDigest`. Writes nothing if the `.usage` or an
@@ -1097,8 +1107,7 @@ def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
   let some usage ← readUsageSidecar mod.usageFile UsageSidecar.parse | return
   let mut extra := #[]
   for m in usage.extra do
-    let some olean := (importArts.find? m).bind (·.olean?) | return
-    let some imp ← readUsageSidecar (olean.withExtension "usage") UsageSidecar.parse | return
+    let some (olean, imp) ← importUsage? importArts m | return
     extra := extra.push <|
       Json.arr #[toJson m, toJson (← fetchFileHash olean).hex, toJson imp.moduleDigest.hex]
   let key := Json.mkObj [
@@ -1110,12 +1119,16 @@ def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
   ]
   IO.FS.writeFile mod.usekeyFile key.compress
 
+/--
+Compiles the module. `setup?` is its `ModuleSetup` if the caller already computed it
+(`Module.skipOrBuild`); otherwise it is computed here.
+-/
 def Module.buildLean
-  (mod : Module) (presetup : ModulePreSetup)
+  (mod : Module) (presetup : ModulePreSetup) (setup? : Option ModuleSetup := none)
 : JobM ModuleOutputArtifacts := do buildAction (← getTrace) mod.traceFile do
   let args := mod.weakLeanArgs ++ mod.leanArgs
   let relSrcFile := relPathFrom mod.pkg.dir presetup.srcFile
-  let setup ← mkModuleSetup mod presetup
+  let setup ← setup?.getDM (mkModuleSetup mod presetup)
   let arts := mod.mkArtifacts presetup.srcFile presetup.isModule
   mod.clearOutputArtifacts
   compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile arts args
@@ -1131,52 +1144,52 @@ def usageCutoffEnabled : BaseIO Bool :=
 
 /--
 Whether nothing the module used changed meaning since Lean wrote its `.usage`: its `.olean` and
-local inputs are unchanged, no module-system module in its closure changed (`modsysHash`), every
-imported constant it used has the same digest in its module's current `.usage`, and every `extra`
-module has the same `.olean` hash and `moduleDigest`.
+local inputs are unchanged, no module-system module in its closure (`importArts`) changed
+(`modsysHash`), every imported constant it used has the same digest in its module's current
+`.usage`, and every `extra` module has the same `.olean` hash and `moduleDigest`.
 -/
-def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup) : JobM Bool := do
+def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
+    (importArts : NameMap ImportArtifacts) : JobM Bool := do
   let some usage ← readUsageSidecar mod.usageFile UsageSidecar.parse | return false
   let some key ← readUsageSidecar mod.usekeyFile UsekeySidecar.parse | return false
   if usage.noskip || key.localHash != presetup.localTrace.hash then
     return false
   unless (← fetchFileHash mod.oleanFile) == key.olean do return false
-  let importArts := (← mkModuleSetup mod presetup).importArts
   unless (← modsysHash importArts) == key.modsys do return false
   for (m, consts) in usage.used do
-    let some olean := (importArts.find? m).bind (·.olean?) | return false
-    let some imp ← readUsageSidecar (olean.withExtension "usage") UsageSidecar.parse | return false
+    let some (_, imp) ← importUsage? importArts m | return false
     for (c, d) in consts do
       unless imp.own.find? c == some d do return false
   for m in usage.extra do
     let some (oleanHash, digest) := key.extra.find? m | return false
-    let some olean := (importArts.find? m).bind (·.olean?) | return false
+    let some (olean, imp) ← importUsage? importArts m | return false
     unless (← fetchFileHash olean) == oleanHash do return false
-    let some imp ← readUsageSidecar (olean.withExtension "usage") UsageSidecar.parse | return false
     unless imp.moduleDigest == digest do return false
   return true
 
 /--
-Whether the module's compile may be skipped: cutoff is enabled, the module is neither a
-module-system file nor part of a `precompileModules` library, its artifacts exist, and
-`Module.usageUpToDate` holds. Checks are short-circuited in that order.
+Whether usage cutoff applies to the module: cutoff is enabled, the module is neither a
+module-system file nor part of a `precompileModules` library, and its artifacts exist.
 -/
-def Module.canSkipCompile (mod : Module) (presetup : ModulePreSetup) : JobM Bool := do
+def Module.usageCutoffApplies (mod : Module) (presetup : ModulePreSetup) : JobM Bool := do
   if presetup.isModule || mod.shouldPrecompile then return false
   unless (← usageCutoffEnabled) do return false
-  unless (← mod.checkArtifactsExist presetup.isModule) do return false
-  mod.usageUpToDate presetup
+  mod.checkArtifactsExist presetup.isModule
 
 /--
-Skips compiling a module whose trace is stale if nothing it used changed meaning
-(`Module.canSkipCompile`): replays its saved log and rewrites its trace with `depTrace`.
-Otherwise, builds it.
+Skips compiling a module whose trace is stale if usage cutoff applies to it
+(`Module.usageCutoffApplies`) and nothing it used changed meaning (`Module.usageUpToDate`):
+replays its saved log and rewrites its trace with `depTrace`. Otherwise, builds it, reusing the
+module setup the check computed.
 -/
 def Module.skipOrBuild (mod : Module) (presetup : ModulePreSetup) (savedTrace : SavedTrace)
     (depTrace : BuildTrace) : JobM ModuleOutputArtifacts := do
   let .ok data := savedTrace | mod.buildLean presetup
-  unless (← mod.canSkipCompile presetup) do
+  unless (← mod.usageCutoffApplies presetup) do
     return ← mod.buildLean presetup
+  let setup ← mkModuleSetup mod presetup
+  unless (← mod.usageUpToDate presetup setup.importArts) do
+    return ← mod.buildLean presetup setup
   updateAction .replay
   data.log.replay
   unless (← getNoBuild) do
