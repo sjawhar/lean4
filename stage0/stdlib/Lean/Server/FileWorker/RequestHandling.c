@@ -6681,9 +6681,9 @@ return v___x_1649_;
 LEAN_EXPORT lean_object* l_List_mapM_loop___at___00Lean_Server_FileWorker_getInteractiveGoals_spec__1___redArg___lam__1___boxed(lean_object* v_useAfter_1663_, lean_object* v_tacticInfo_1664_, lean_object* v_a_1665_, lean_object* v___y_1666_, lean_object* v___y_1667_, lean_object* v___y_1668_, lean_object* v___y_1669_, lean_object* v___y_1670_){
 _start:
 {
-uint8_t v_useAfter_3724__boxed_1671_; lean_object* v_res_1672_; 
-v_useAfter_3724__boxed_1671_ = lean_unbox(v_useAfter_1663_);
-v_res_1672_ = l_List_mapM_loop___at___00Lean_Server_FileWorker_getInteractiveGoals_spec__1___redArg___lam__1(v_useAfter_3724__boxed_1671_, v_tacticInfo_1664_, v_a_1665_, v___y_1666_, v___y_1667_, v___y_1668_, v___y_1669_);
+uint8_t v_useAfter_3733__boxed_1671_; lean_object* v_res_1672_; 
+v_useAfter_3733__boxed_1671_ = lean_unbox(v_useAfter_1663_);
+v_res_1672_ = l_List_mapM_loop___at___00Lean_Server_FileWorker_getInteractiveGoals_spec__1___redArg___lam__1(v_useAfter_3733__boxed_1671_, v_tacticInfo_1664_, v_a_1665_, v___y_1666_, v___y_1667_, v___y_1668_, v___y_1669_);
 lean_dec(v___y_1669_);
 lean_dec_ref(v___y_1668_);
 lean_dec(v___y_1667_);
@@ -9565,7 +9565,7 @@ return v___x_2632_;
 LEAN_EXPORT lean_object* l_Lean_Server_FileWorker_NamespaceEntry_finish(lean_object* v_text_2637_, lean_object* v_syms_2638_, lean_object* v_endStx_2639_, lean_object* v_x_2640_){
 _start:
 {
-lean_object* v_name_2641_; lean_object* v_stx_2642_; lean_object* v_selection_2643_; lean_object* v_prevSiblings_2644_; lean_object* v___y_2646_; lean_object* v___y_2647_; lean_object* v___y_2648_; uint8_t v___y_2649_; lean_object* v___y_2650_; lean_object* v___y_2657_; lean_object* v___y_2658_; lean_object* v___y_2666_; lean_object* v___y_2675_; 
+lean_object* v_name_2641_; lean_object* v_stx_2642_; lean_object* v_selection_2643_; lean_object* v_prevSiblings_2644_; uint8_t v___y_2646_; lean_object* v___y_2647_; lean_object* v___y_2648_; lean_object* v___y_2649_; lean_object* v___y_2650_; lean_object* v___y_2657_; lean_object* v___y_2658_; lean_object* v___y_2666_; lean_object* v___y_2675_; 
 v_name_2641_ = lean_ctor_get(v_x_2640_, 0);
 lean_inc(v_name_2641_);
 v_stx_2642_ = lean_ctor_get(v_x_2640_, 1);
@@ -9642,14 +9642,14 @@ lean_object* v___x_2651_; lean_object* v___x_2652_; lean_object* v___x_2653_; le
 v___x_2651_ = l_Lean_Syntax_Range_toLspRange(v_text_2637_, v___y_2650_);
 v___x_2652_ = lean_alloc_ctor(1, 1, 0);
 lean_ctor_set(v___x_2652_, 0, v_syms_2638_);
-lean_inc(v___y_2646_);
+lean_inc(v___y_2649_);
 v___x_2653_ = lean_alloc_ctor(0, 5, 1);
-lean_ctor_set(v___x_2653_, 0, v___y_2647_);
-lean_ctor_set(v___x_2653_, 1, v___y_2646_);
-lean_ctor_set(v___x_2653_, 2, v___y_2648_);
+lean_ctor_set(v___x_2653_, 0, v___y_2648_);
+lean_ctor_set(v___x_2653_, 1, v___y_2649_);
+lean_ctor_set(v___x_2653_, 2, v___y_2647_);
 lean_ctor_set(v___x_2653_, 3, v___x_2651_);
 lean_ctor_set(v___x_2653_, 4, v___x_2652_);
-lean_ctor_set_uint8(v___x_2653_, sizeof(void*)*5, v___y_2649_);
+lean_ctor_set_uint8(v___x_2653_, sizeof(void*)*5, v___y_2646_);
 v___x_2654_ = lean_alloc_ctor(0, 1, 0);
 lean_ctor_set(v___x_2654_, 0, v___x_2653_);
 v___x_2655_ = lean_array_push(v_prevSiblings_2644_, v___x_2654_);
@@ -9668,10 +9668,10 @@ v___x_2663_ = l_Lean_Syntax_getRange_x3f(v_selection_2643_, v___x_2662_);
 lean_dec(v_selection_2643_);
 if (lean_obj_tag(v___x_2663_) == 0)
 {
-v___y_2646_ = v___x_2659_;
-v___y_2647_ = v___y_2658_;
-v___y_2648_ = v___x_2661_;
-v___y_2649_ = v___x_2660_;
+v___y_2646_ = v___x_2660_;
+v___y_2647_ = v___x_2661_;
+v___y_2648_ = v___y_2658_;
+v___y_2649_ = v___x_2659_;
 v___y_2650_ = v___y_2657_;
 goto v___jp_2645_;
 }
@@ -9682,10 +9682,10 @@ lean_dec_ref(v___y_2657_);
 v_val_2664_ = lean_ctor_get(v___x_2663_, 0);
 lean_inc(v_val_2664_);
 lean_dec_ref_known(v___x_2663_, 1);
-v___y_2646_ = v___x_2659_;
-v___y_2647_ = v___y_2658_;
-v___y_2648_ = v___x_2661_;
-v___y_2649_ = v___x_2660_;
+v___y_2646_ = v___x_2660_;
+v___y_2647_ = v___x_2661_;
+v___y_2648_ = v___y_2658_;
+v___y_2649_ = v___x_2659_;
 v___y_2650_ = v_val_2664_;
 goto v___jp_2645_;
 }

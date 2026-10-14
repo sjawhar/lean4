@@ -338,7 +338,7 @@ static inline void dec(lean_object * o, lean_object* & todo) {
         lean_internal_sub_rc(o, 1);
     } else if (lean_internal_get_rc(o) == 1) {
         push_back(todo, o);
-    } else if (lean_internal_get_rc(o) == 0) {
+    } else if (lean_is_never_freed(o)) {
         return;
     } else if (std::atomic_fetch_add_explicit(lean_get_rc_mt_addr(o), 1, std::memory_order_acq_rel) == -1) {
         push_back(todo, o);
@@ -441,20 +441,49 @@ static object * lean_del_core(object * o, object * todo) {
     }
 }
 
-extern "C" LEAN_EXPORT void lean_dec_ref_cold(lean_object * o) {
-    if (lean_internal_get_rc(o) == 1 || std::atomic_fetch_add_explicit(lean_get_rc_mt_addr(o), 1, std::memory_order_acq_rel) == -1) {
-#ifdef LEAN_LAZY_RC
-        push_back(g_to_free, o);
-#else
-        object * todo = nullptr;
-        while (true) {
-            todo = lean_del_core(o, todo);
-            if (todo == nullptr)
-                return;
-            o = pop_back(todo);
+// sync with tests/elab/rc_model.lean (`incRefHugeN`)
+extern "C" LEAN_EXPORT void lean_inc_ref_huge_n(lean_object * o, size_t n) {
+    // `n` is above what `lean_inc_ref_n` adjusts by inline. Only `lean_mk_array` gets here.
+    if (lean_is_st(o)) {
+        int rc = lean_internal_get_rc(o);
+        if (n > (size_t)(INT_MAX - rc))
+            lean_internal_set_rc(o, LEAN_RC_STUCK_ST);
+        else
+            lean_internal_set_rc(o, rc + (int)n);
+    } else {
+        // The loop condition is the sticky test `lean_inc_ref_n` makes before its own
+        // `fetch_sub`, so each iteration is one ordinary increment of at most `LEAN_RC_INC_MAX`,
+        // and re-reading the count stops the loop once the count freezes.
+        while (n > 0 && lean_is_unstuck_mt(o)) {
+            size_t chunk = std::min(n, LEAN_RC_INC_MAX);
+            std::atomic_fetch_sub_explicit(lean_get_rc_mt_addr(o), (int)chunk,
+                                           std::memory_order_relaxed);
+            n -= chunk;
         }
-#endif
     }
+}
+
+// sync with tests/elab/rc_model.lean (`decRefCold`)
+extern "C" LEAN_EXPORT void lean_dec_ref_cold(lean_object * o) {
+    // `rc == 1` is the hot single-threaded free path and can never be sticky, so the sticky check
+    // is kept out of it.
+    if (lean_internal_get_rc(o) != 1) {
+        if (LEAN_UNLIKELY(lean_is_never_freed(o)))
+            return;
+        if (std::atomic_fetch_add_explicit(lean_get_rc_mt_addr(o), 1, std::memory_order_acq_rel) != -1)
+            return;
+    }
+#ifdef LEAN_LAZY_RC
+    push_back(g_to_free, o);
+#else
+    object * todo = nullptr;
+    while (true) {
+        todo = lean_del_core(o, todo);
+        if (todo == nullptr)
+            return;
+        o = pop_back(todo);
+    }
+#endif
 }
 
 
@@ -551,6 +580,91 @@ static obj_res mark_persistent_fn(obj_arg o) {
 #endif
 #endif
 
+extern "C" void lean_mark_persistent_unshared(object * o);
+static inline bool is_unshared(object * o);
+
+static obj_res mark_persistent_unshared_fn(obj_arg o) {
+    lean_mark_persistent_unshared(o);
+    return lean_box(0);
+}
+
+/*
+Like `lean_mark_persistent`, but skips thread-shared objects and their subgraphs, which contain
+no unshared objects by the `lean_mark_mt` closure invariant. Safe on graphs whose unshared part
+is owned by the calling thread even while the thread-shared fringe is concurrently accessed,
+since only thread-owned reference counts are written; the skipped fringe stays alive below
+persistent parents because `dec` never traverses persistent objects. Unlike
+`lean_mark_persistent`, already-shared parts keep their atomic reference counting.
+*/
+extern "C" LEAN_EXPORT void lean_mark_persistent_unshared(object * o) {
+    buffer<object*> todo;
+    todo.push_back(o);
+    while (!todo.empty()) {
+        object * o = todo.back();
+        todo.pop_back();
+        if (!lean_is_scalar(o) && is_unshared(o)) {
+            lean_internal_set_rc(o, 0);
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+            // do not report as leak
+            // NOTE: Most persistent objects are actually reachable from global
+            // variables up to the end of the process. However, this is *not*
+            // true for closures inside of persistent thunks, which are
+            // "orphaned" after being evaluated.
+            __lsan_ignore_object(o);
+#endif
+#endif
+            uint8_t tag = lean_ptr_tag(o);
+            if (tag <= LeanMaxCtorTag) {
+                object ** it  = lean_ctor_obj_cptr(o);
+                object ** end = it + lean_ctor_num_objs(o);
+                for (; it != end; ++it) todo.push_back(*it);
+            } else {
+                switch (tag) {
+                case LeanScalarArray:
+                case LeanString:
+                case LeanMPZ:
+                    break;
+                case LeanExternal: {
+                    object * fn = lean_alloc_closure((void*)mark_persistent_unshared_fn, 1, 0);
+                    lean_to_external(o)->m_class->m_foreach(lean_to_external(o)->m_data, fn);
+                    lean_dec(fn);
+                    break;
+                }
+                case LeanTask:
+                    todo.push_back(lean_task_get(o));
+                    break;
+                case LeanPromise:
+                    todo.push_back((lean_object *)lean_to_promise(o)->m_result);
+                    break;
+                case LeanClosure: {
+                    object ** it  = lean_closure_arg_cptr(o);
+                    object ** end = it + lean_closure_num_fixed(o);
+                    for (; it != end; ++it) todo.push_back(*it);
+                    break;
+                }
+                case LeanArray: {
+                    object ** it  = lean_array_cptr(o);
+                    object ** end = it + lean_array_size(o);
+                    for (; it != end; ++it) todo.push_back(*it);
+                    break;
+                }
+                case LeanThunk:
+                    if (object * c = lean_to_thunk(o)->m_closure) todo.push_back(c);
+                    if (object * v = lean_to_thunk(o)->m_value) todo.push_back(v);
+                    break;
+                case LeanRef:
+                    if (object * v = lean_to_ref(o)->m_value) todo.push_back(v);
+                    break;
+                default:
+                    lean_unreachable();
+                    break;
+                }
+            }
+        }
+    }
+}
+
 extern "C" LEAN_EXPORT void lean_mark_persistent(object * o) {
     buffer<object*> todo;
     todo.push_back(o);
@@ -631,19 +745,30 @@ static obj_res mark_mt_fn(obj_arg o) {
     return lean_box(0);
 }
 
+// Whether `o` is owned by one thread: its count is single-threaded or overflowed from one.
+// sync with tests/elab/rc_model.lean (`isUnshared`)
+static inline bool is_unshared(object * o) {
+    int rc = lean_internal_get_rc(o);
+    return rc > 0 || rc <= LEAN_RC_STUCK_ST;
+}
+
 extern "C" LEAN_EXPORT void lean_mark_mt(object * o) {
 #ifndef LEAN_MULTI_THREAD
     return;
 #endif
-    if (lean_is_scalar(o) || !lean_is_st(o)) return;
+    if (lean_is_scalar(o) || !is_unshared(o)) return;
 
     buffer<object*> todo;
     todo.push_back(o);
     while (!todo.empty()) {
         object * o = todo.back();
         todo.pop_back();
-        if (!lean_is_scalar(o) && lean_is_st(o)) {
-            lean_internal_set_rc(o, -lean_internal_get_rc(o));
+        if (!lean_is_scalar(o) && is_unshared(o)) {
+            // A count that overflowed, or is too large for the live thread-shared range, freezes at
+            // `LEAN_RC_STICKY`, where no later `lean_mark_mt` takes it for an unshared one.
+            // sync with tests/elab/rc_model.lean (`markMtRc`)
+            int rc = lean_internal_get_rc(o);
+            lean_internal_set_rc(o, rc < 0 || -rc <= LEAN_RC_STICKY_DROP ? LEAN_RC_STICKY : -rc);
             uint8_t tag = lean_ptr_tag(o);
             if (tag <= LeanMaxCtorTag) {
                 object ** it  = lean_ctor_obj_cptr(o);
@@ -1620,6 +1745,12 @@ extern "C" LEAN_EXPORT lean_obj_res lean_nat_log2(b_lean_obj_arg a) {
     } else {
       return lean_box(mpz_value(a).log2());
     }
+}
+
+extern "C" LEAN_EXPORT size_t lean_nat_size_in_bytes(b_lean_obj_arg a) {
+    if (lean_is_scalar(a))
+        return sizeof(size_t); // a scalar occupies one machine word
+    return mpz_value(a).size_in_bytes();
 }
 
 // =======================================

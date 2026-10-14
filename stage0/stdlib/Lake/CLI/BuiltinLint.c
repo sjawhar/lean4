@@ -1558,7 +1558,7 @@ LEAN_EXPORT uint8_t l___private_Lake_CLI_BuiltinLint_0__Lake_BuiltinLint_getIsMo
 _start:
 {
 uint8_t v_isModule_339_; 
-v_isModule_339_ = lean_ctor_get_uint8(v_modData_337_, sizeof(void*)*5);
+v_isModule_339_ = lean_ctor_get_uint8(v_modData_337_, sizeof(void*)*7);
 return v_isModule_339_;
 }
 }
