@@ -22,8 +22,8 @@ The file is a header line `lake-module-times 3`, then one line per module, sorte
 `<ms>\t<rem>\t<name>\t<import> <import> ...`, where `ms` is the module's last compile time,
 `rem` its remaining path when the file was written, and each import is the index (from 0) of the
 imported module's line among the module lines. A module with no compile time of its own has `ms`
-0, no imports, and a line only while some line imports it, so that the edge survives until the
-module is compiled and timed.
+0, no imports, and a line only while some line imports it and its source exists, so that the edge
+survives until the module is compiled and timed.
 
 A name is written as its components joined by `.`. In a component, the characters `%`, `.`,
 space, tab, CR and LF are written `%XX` (two uppercase hex digits); an empty component is `%-`, a
@@ -460,8 +460,8 @@ public def ModuleTimes.markSeen (self : ModuleTimes) (mod : Name) : BaseIO Unit 
   self.seen.modify (mod :: ·)
 
 /--
-For each row, whether to keep it: not if this build compiled the module again (`fresh`); yes if
-its compile job ran (`seen`); otherwise only if `sourceOf` resolves it to a source file that
+For each row, whether its module may keep a line: not if this build compiled it again (`fresh`);
+yes if its compile job ran (`seen`); otherwise only if `sourceOf` resolves it to a source file that
 exists. The names are resolved serially and the files checked in parallel chunks: resolving
 touches the shared workspace, whose reference counts parallel tasks would contend on, while a
 chunk of paths is the task's own.
@@ -473,7 +473,7 @@ private def keepRows (rows : Array ModuleTimeRow) (fresh seen : Name → Bool)
   let mut paths : Array FilePath := #[]
   for h : i in [0:rows.size] do
     let name := rows[i].name
-    if fresh name || rows[i].ms == 0 then
+    if fresh name then
       flags := flags.push 0
     else if seen name then
       flags := flags.push 1
@@ -523,10 +523,11 @@ path. If the file's size or modification time changed since `load` (another Lake
 during this build), the file is read again, so that process's entries survive; otherwise the
 record read by `load` is reused.
 
-A row with a compile time is kept if its module was not compiled again and either its compile job
-ran in this build or `sourceOf` resolves it to a source file that exists. A module with no time of
-its own (`ms` 0) has a line while some line imports it, so the edge outlives the build that saw it:
-when the module is compiled later, its new line takes the importer's path into its remaining path.
+A row of the file is kept if its module was not compiled again and either its compile job ran in
+this build or `sourceOf` resolves it to a source file that exists. A row with a compile time keeps
+its line then. A module with no time of its own (`ms` 0) keeps a line only while, in addition, some
+line imports it, so the edge outlives the build that saw it: when the module is compiled later, its
+new line takes the importer's path into its remaining path.
 
 Writes nothing and returns 0 when this build compiled nothing; otherwise returns how many entries
 this build recorded.
@@ -561,7 +562,7 @@ public def ModuleTimes.save (self : ModuleTimes) (sourceOf : Name → Option Fil
     if k < fresh.size && order == .eq then
       status := status.set! i 2
       replacedBy := replacedBy.set! i k
-    else if kept.get! i != 0 then
+    else if kept.get! i != 0 && row.ms > 0 then
       status := status.set! i 1
   let findFresh (key : String) : Option Nat :=
     bsearch fresh.size fun j => let f := fresh[j]!.1; compareRange f 0 f.utf8ByteSize key
@@ -571,14 +572,14 @@ public def ModuleTimes.save (self : ModuleTimes) (sourceOf : Name → Option Fil
   for h : i in [0:rows.size] do
     if status.get! i != 1 then continue
     for r in importIndices s rows[i].impStart rows[i].impStop do
-      if status.get! r == 0 && rows[r]!.ms == 0 then status := status.set! r 3
+      if status.get! r == 0 && kept.get! r != 0 then status := status.set! r 3
   let mut extraSet : Std.HashSet String := {}
   for (_, e) in fresh do
     for imp in e.imports do
       let key := encodeModuleName imp
       if (findFresh key).isSome then continue
       match findRow key with
-      | some r => if status.get! r == 0 then status := status.set! r 3
+      | some r => if status.get! r == 0 && kept.get! r != 0 then status := status.set! r 3
       | none => extraSet := extraSet.insert key
   let extras := extraSet.toArray.qsort (· < ·)
   -- The lines, merging the three sorted, disjoint streams: kept and hollow rows, this build's
