@@ -28,7 +28,7 @@ test_not_out "warning" build -v Test.HU
 match_text "Replayed Test.HU" produced.out
 # a name component that is neither a string nor a number is corrupt input: warned, then built
 printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 1\n' > Test/H.lean
-printf '{"version":1,"noskip":false,"moduleDigest":"0000000000000000","own":[],"used":[[[true],[]]],"extra":[]}' > .lake/build/lib/lean/Test/HU.usage
+printf '{"version":2,"noskip":false,"moduleDigest":"0000000000000000","closure":"0000000000000000","own":[],"used":[[[true],[]]],"extra":[]}' > .lake/build/lib/lean/Test/HU.usage
 test_out "expected a name component" build Test.HU
 match_text "Built Test.HU" produced.out
 # unrelated addition: A recompiles, nothing below it does
@@ -86,6 +86,46 @@ printf 'import Test.K\ntheorem t : c = 1 := rfl\n' > Test/N.lean
 test_run build Test.N
 printf 'module\npublic def d : Nat := 2\n' > Test/U.lean
 test_err "Building Test.N" build -v Test.N
+# toolchain modules in the closure: KS drops `import Std.Data.HashMap`, which MS reaches only through KS.
+# MS must rebuild and fail as it does from scratch, not replay and leave the error to a new importer PS.
+printf 'import Std.Data.HashMap\ndef k := 1\n' > Test/KS.lean
+printf 'import Test.KS\ndef m : Std.HashMap Nat Nat := {}\n' > Test/MS.lean
+printf 'import Test.MS\ndef n := m\n' > Test/NS.lean
+test_run build Test.NS
+printf 'def k := 2\n' > Test/KS.lean
+test_err "error: Test/MS.lean" build -v Test.NS
+printf 'import Test.MS\ntheorem t : m.size = 0 := rfl\n' > Test/PS.lean
+test_err "error: Test/MS.lean" build Test.PS
+# two levels: KK -> J -> MM, MM uses Std.HashMap, which only KK imports
+printf 'import Std.Data.HashMap\ndef kk := 1\n' > Test/KK.lean
+printf 'import Test.KK\ndef j := 1\n' > Test/J.lean
+printf 'import Test.J\ndef mm : Std.HashMap Nat Nat := {}\n' > Test/MM.lean
+test_run build Test.MM
+# an edit that keeps KK's imports: KK rebuilds, J and MM replay, the latter reading J's recorded closure
+printf 'import Std.Data.HashMap\ndef kk := 1\ndef kk2 := 2\n' > Test/KK.lean
+lake_out build -v Test.MM
+match_text "Built Test.KK" produced.out
+match_text "Replayed Test.J" produced.out
+match_text "Replayed Test.MM" produced.out
+# J also imports the HashMap directly: KK drops it, J's closure does not change, and MM replays correctly
+printf 'import Test.KK\nimport Std.Data.HashMap\ndef j := 1\n' > Test/J.lean
+test_run build Test.MM
+printf 'def kk := 1\n' > Test/KK.lean
+lake_out build -v Test.MM
+match_text "Built Test.KK" produced.out
+match_text "Replayed Test.MM" produced.out
+# J drops it too: MM must rebuild and fail as from scratch
+printf 'import Test.KK\ndef j := 2\n' > Test/J.lean
+test_err "error: Test/MM.lean" build -v Test.MM
+# J's source unchanged and KK drops the import: J's closure changed, so J rebuilds in the same run, and MM,
+# checked after J, reads J's new closure and rebuilds
+printf 'import Std.Data.HashMap\ndef kk := 1\n' > Test/KK.lean
+printf 'import Test.KK\ndef j := 1\n' > Test/J.lean
+test_run build Test.MM
+printf 'def kk := 1\n' > Test/KK.lean
+test_err "error: Test/MM.lean" build -v Test.MM
+match_text "Built Test.J" produced.out
+no_match_text "Replayed Test.MM" produced.out
 # `lake unpack` of an archive that ships no sidecars (e.g. built by another toolchain) drops the
 # old ones, without following a symlink out of the build directory
 test_exp -f .lake/build/lib/lean/Test/A.usage
