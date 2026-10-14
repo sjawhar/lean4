@@ -52,12 +52,16 @@ public def readModuleTimes (path : FilePath) : IO ModuleTimeMap := do
       {ModuleTimesFile.currentVersion}; delete it to start a new record"
   return file.modules.foldl (init := {}) fun m e => m.insert e.name e
 
-/-- Writes the record through a temporary file, so a reader sees the old file or the new one. -/
+/--
+Writes the record through a temporary file, so a reader sees the old file or the new one. The
+temporary file is per process: concurrent writers (e.g. `lake setup-file` runs) each rename a
+whole file, and the last one wins.
+-/
 public def writeModuleTimes (path : FilePath) (entries : ModuleTimeMap) : IO Unit := do
   let modules := entries.fold (init := #[]) (fun a _ e => a.push e)
     |>.qsort (fun a b => a.name.cmp b.name == .lt)
   let file : ModuleTimesFile := {version := ModuleTimesFile.currentVersion, modules}
-  let tmp := path.addExtension "tmp"
+  let tmp := path.addExtension s!"{← IO.Process.getPID}.tmp"
   createParentDirs path
   IO.FS.writeFile tmp (toJson file).compress
   IO.FS.rename tmp path
