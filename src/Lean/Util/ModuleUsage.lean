@@ -5,11 +5,12 @@ public import Lean.Util.FoldConsts
 public import Lean.Util.PtrSet
 public import Lean.Compiler.ImplementedByAttr
 public import Lean.Compiler.ExternAttr
+public import Lean.Compiler.NoncomputableAttr
 import Lean.ExtraModUses
 public section
 namespace Lean.ModuleUsage
 
-partial def levelHash : Level → UInt64
+def levelHash : Level → UInt64
   | .zero => 3
   | .succ l => mixHash 5 (levelHash l)
   | .max a b => mixHash 7 (mixHash (levelHash a) (levelHash b))
@@ -54,7 +55,8 @@ def safetyHash : DefinitionSafety → UInt64
 /-- Everything of `c` except the meaning of the constants it refers to. -/
 def localHash (env : Environment) (c : ConstantInfo) : UInt64 :=
   let base := mixHash (hash c.levelParams) (exprHash true c.type)
-  let base := mixHash base (mixHash (hash (Compiler.getImplementedBy? env c.name)) (hash (isExtern env c.name)))
+  let base := mixHash base (mixHash (hash (Compiler.getImplementedBy? env c.name))
+    (mixHash (hash (isExtern env c.name)) (hash (isNoncomputable env c.name))))
   let v := exprHash false
   mixHash base <| match c with
   | .defnInfo d => mixHash (v d.value) (mixHash (hintsHash d.hints) (safetyHash d.safety))
@@ -85,34 +87,39 @@ structure State where
   importedModuleEntries : Array (Array (Name × UInt64)) := #[]
 instance : Inhabited State := ⟨{}⟩
 
-def State.find? (s : State) (env : Environment) (c : Name) : Option UInt64 := do
-  let i ← env.getModuleIdxFor? c
+/-- The digest of `c` if module `i` (the module defining `c`) wrote one. -/
+def State.findAt? (s : State) (i : ModuleIdx) (c : Name) : Option UInt64 := do
   let es ← s.importedModuleEntries[i.toNat]?
   (·.2) <$> es.binSearch (c, 0) (fun a b => Name.quickLt a.1 b.1)
+
+def State.find? (s : State) (env : Environment) (c : Name) : Option UInt64 := do
+  s.findAt? (← env.getModuleIdxFor? c) c
 
 def State.hasEntries (s : State) (i : ModuleIdx) : Bool :=
   !(s.importedModuleEntries[i.toNat]?.getD #[]).isEmpty
 
+/-- The current module's own constants, from the kernel environment, each with its `refs`. -/
+def ownConsts (env : Environment) : Array (Name × ConstantInfo × Array Name) :=
+  env.checked.get.constants.foldStage2 (fun cs n ci => cs.push (n, ci, refs env ci)) #[]
+
 /-- Digests of the current module's constants: SCCs in dependency order; each SCC mixes its members' names and
 local hashes with the name and digest of every constant outside it that they refer to. -/
-def compute (env : Environment) (s : State) : Array (Name × UInt64) := Id.run do
-  let privEnv := env.setExporting false
-  let names := env.checked.get.constants.foldStage2 (fun ns n _ => ns.push n) #[]
-  let info n := privEnv.find? n
-  let isLocal n := (env.getModuleIdxFor? n).isNone && (info n).isSome
-  let sccs := SCC.scc names.toList fun n => ((info n).map (refs env) |>.getD #[]).toList.filter isLocal
+def compute (env : Environment) (s : State) (consts := ownConsts env) : Array (Name × UInt64) := Id.run do
+  let byName : Std.HashMap Name (ConstantInfo × Array Name) :=
+    consts.foldl (fun m (n, ci, rs) => m.insert n (ci, rs)) {}
+  let sccs := SCC.scc (consts.map (·.1)).toList fun n => byName[n]!.2.toList.filter byName.contains
   let mut out : Std.HashMap Name UInt64 := {}
   for scc in sccs do
-    let members := scc.toArray.qsort Name.quickLt
+    let members := NameSet.ofList scc
     let mut h : UInt64 := 83
-    for m in members do
-      let some ci := info m | continue
+    for m in scc.toArray.qsort Name.quickLt do
+      let (ci, rs) := byName[m]!
       h := mixHash h (mixHash (hash m) (localHash env ci))
-      for r in refs env ci do
+      for r in rs do
         unless members.contains r do
           h := mixHash h (mixHash (hash r) ((out[r]? <|> s.find? env r).getD (mixHash 97 (hash r))))
-    for m in members do out := out.insert m h
-  return (names.map fun n => (n, out[n]?.getD 89)).qsort fun a b => Name.quickLt a.1 b.1
+    for m in scc do out := out.insert m h
+  return (consts.map fun (n, _) => (n, out[n]!)).qsort fun a b => Name.quickLt a.1 b.1
 
 builtin_initialize ext : PersistentEnvExtension (Name × UInt64) (Name × UInt64) State ←
   registerPersistentEnvExtension {
@@ -131,33 +138,32 @@ def state (env : Environment) : State := ext.getState (asyncMode := .mainOnly) e
 
 def importedDigest? (env : Environment) (c : Name) : Option UInt64 := (state env).find? env c
 
-def localDigests (env : Environment) : Array (Name × UInt64) := compute env (state env)
+def localDigests (env : Environment) (consts := ownConsts env) : Array (Name × UInt64) :=
+  compute env (state env) consts
 
 /-- Per defining module, sorted: every imported constant that the current module's own constants refer to or
 that is in `extra`, with its digest. Constants without a digest (from a module built without this extension) are
 left out. -/
-def moduleUsed (env : Environment) (extra : NameSet) : Array (Name × Array (Name × UInt64)) :=
-  let privEnv := env.setExporting false
-  let own := env.checked.get.constants.foldStage2 (fun ns n _ => ns.push n) #[]
-  let used := own.foldl (init := extra) fun s n =>
-    ((privEnv.find? n).map (refs env) |>.getD #[]).foldl (·.insert ·) s
-  let byMod := used.foldl (init := (∅ : Std.HashMap Name (Array (Name × UInt64)))) fun m c =>
-    match env.getModuleIdxFor? c, importedDigest? env c with
-    | some i, some d => match env.header.modules[i.toNat]? with
-      | some mi => m.alter mi.module fun o => some ((o.getD #[]).push (c, d))
-      | none => m
-    | _, _ => m
+def moduleUsed (env : Environment) (extra : NameSet) (consts := ownConsts env) :
+    Array (Name × Array (Name × UInt64)) :=
+  let s := state env
+  let used := consts.foldl (init := extra) fun u (_, _, rs) => rs.foldl (·.insert ·) u
+  let byMod := used.foldl (init := (∅ : Std.HashMap Name (Array (Name × UInt64)))) fun m c => Id.run do
+    let some i := env.getModuleIdxFor? c | return m
+    let some d := s.findAt? i c | return m
+    m.alter env.header.modules[i.toNat]!.module fun o => some ((o.getD #[]).push (c, d))
   byMod.toArray.map (fun (k, v) => (k, v.qsort fun a b => Name.quickLt a.1 b.1))
     |>.qsort fun a b => Name.quickLt a.1 b.1
 
 def hex16 (v : UInt64) : String :=
   let s := String.ofList (Nat.toDigits 16 v.toNat); "".pushn '0' (16 - s.length) ++ s
 
-def writeUsage (env : Environment) (extra : NameSet) (path : System.FilePath) : IO Unit := do
-  let own := localDigests env
-  let privEnv := env.setExporting false
-  let noskip := own.any fun (n, _) => ((privEnv.find? n).map (refs env) |>.getD #[]).any
-    (· matches ``Lean.reduceBool | ``Lean.reduceNat)
+/-- With `incrLoaded` (the run reused commands from an `--incr-load` snapshot), `noskip` is set: reused commands
+never call `addDecl` in this process, so `extra` may miss constants they used. -/
+def writeUsage (env : Environment) (extra : NameSet) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
+  let consts := ownConsts env
+  let own := localDigests env consts
+  let noskip := incrLoaded || consts.any fun (_, _, rs) => rs.any (· matches ``Lean.reduceBool | ``Lean.reduceNat)
   let s := state env
   let extraMods := (getLocalExtraModUses env).filter fun u =>
     (env.getModuleIdx? u.module).any s.hasEntries
@@ -165,7 +171,7 @@ def writeUsage (env : Environment) (extra : NameSet) (path : System.FilePath) : 
   let j := Json.mkObj [("version", 1), ("noskip", noskip),
     ("moduleDigest", hex16 (own.foldl (fun h (_, d) => mixHash h d) 7)),
     ("own", Json.arr (own.map fun (n, d) => pair n d)),
-    ("used", Json.arr ((moduleUsed env extra).map fun (m, cs) =>
+    ("used", Json.arr ((moduleUsed env extra consts).map fun (m, cs) =>
       Json.arr #[toJson m, Json.arr (cs.map fun (n, d) => pair n d)])),
     ("extra", Json.arr (extraMods.map fun u => Json.arr #[toJson u.module, u.isMeta]))]
   IO.FS.writeFile path j.compress
