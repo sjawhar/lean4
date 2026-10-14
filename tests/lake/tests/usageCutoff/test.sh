@@ -126,6 +126,22 @@ printf 'def kk := 1\n' > Test/KK.lean
 test_err "error: Test/MM.lean" build -v Test.MM
 match_text "Built Test.J" produced.out
 no_match_text "Replayed Test.MM" produced.out
+# `used` and `extra` modules outside the workspace are toolchain modules, pinned by the Lean githash in the
+# local trace: the check does not look them up (a stage1-built stdlib has no entries, so they are added here)
+printf 'def ta1 := 1\n' > Test/TA.lean
+printf 'import Test.TA\ndef tb := ta1\n' > Test/TB.lean
+test_run build Test.TB
+test_cmd_out '"extra":[]' cat .lake/build/lib/lean/Test/TB.usage
+sed -e 's/"used":\[/"used":[[["Init","Prelude"],[[["Nat","add"],"0000000000000000"]]],/' \
+  -e 's/"extra":\[\]/"extra":[[["Init","Prelude"],false]]/' \
+  .lake/build/lib/lean/Test/TB.usage > TB.usage.tmp
+mv -f TB.usage.tmp .lake/build/lib/lean/Test/TB.usage
+test_cmd_out '"used":[[["Init","Prelude"],' cat .lake/build/lib/lean/Test/TB.usage
+test_cmd_out '"extra":[[["Init","Prelude"],false]' cat .lake/build/lib/lean/Test/TB.usage
+printf 'def ta1 := 1\ndef ta2 := 2\n' > Test/TA.lean
+lake_out build -v Test.TB
+match_text "Built Test.TA" produced.out
+match_text "Replayed Test.TB" produced.out
 # `lake unpack` of an archive that ships no sidecars (e.g. built by another toolchain) drops the
 # old ones, without following a symlink out of the build directory
 test_exp -f .lake/build/lib/lean/Test/A.usage
