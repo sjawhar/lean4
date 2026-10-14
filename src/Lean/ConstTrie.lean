@@ -50,17 +50,27 @@ to be equal.
 
 /-!
 A trie node's `childIndex` field has the layout
-`[k : 1 byte][2^k + 1 offsets : u16 LE each][one fingerprint byte per child, in child order]`.
-The children are sorted by key hash; offset `s` is the first child index whose key hash's top `k`
-bits are at least `s`, so the query hash's top `k` bits select a window of on average at most one
-child (`2^k ≥ #children`). Window candidates are filtered by a fingerprint byte (a further hash
-byte) and confirmed by comparing the final name component, which is sound on its own: siblings
-always differ in their final component. A lookup thus costs O(1) contiguous byte reads per level,
-works inside memory-mapped compacted regions, and adds no per-entry heap objects.
+`[hdr : 1 byte][2^k + 1 offsets, u16 or u32 LE each][one fingerprint byte per child, in child order]`.
+The low five bits of `hdr` are `k` (at most 16); its top bit is set iff the offsets are u32, which
+nodes with more than 65,535 children need. The children are sorted by key hash; offset `s` is the
+first child index whose key hash's top `k` bits are at least `s`, so the query hash's top `k` bits
+select a window of on average at most one child (`2^k ≥ #children`) for nodes of up to 2^16
+children, and of `#children / 2^16` children beyond that. Window candidates are filtered by a
+fingerprint byte (a further hash byte) and confirmed by comparing the final name component, which
+is sound on its own: siblings always differ in their final component. A lookup thus costs O(1)
+contiguous byte reads per level, works inside memory-mapped compacted regions, and adds no
+per-entry heap objects.
 -/
+
+/-- Set in the child index header byte iff the offsets are u32. -/
+private def wideOffsetsFlag : UInt8 := 0x80
 
 @[inline] private def getU16 (bs : ByteArray) (o : Nat) : Nat :=
   ((bs.get! o).toUInt32 ||| ((bs.get! (o + 1)).toUInt32 <<< 8)).toNat
+
+@[inline] private def getU32 (bs : ByteArray) (o : Nat) : Nat :=
+  ((bs.get! o).toUInt32 ||| ((bs.get! (o + 1)).toUInt32 <<< 8) |||
+    ((bs.get! (o + 2)).toUInt32 <<< 16) ||| ((bs.get! (o + 3)).toUInt32 <<< 24)).toNat
 
 @[inline] private def topBits (h : UInt64) (bits : UInt64) : Nat :=
   ((h >>> 48) >>> (16 - bits)).toNat
@@ -73,25 +83,29 @@ private def pushU16 (bs : ByteArray) (v : Nat) : ByteArray :=
   let v := v.toUInt32
   (bs.push v.toUInt8).push (v >>> 8).toUInt8
 
+private def pushU32 (bs : ByteArray) (v : Nat) : ByteArray :=
+  let v := v.toUInt32
+  (((bs.push v.toUInt8).push (v >>> 8).toUInt8).push (v >>> 16).toUInt8).push (v >>> 24).toUInt8
+
 /-- Builds the child index for `cs` (sorted by key hash); see the layout note above. -/
 @[specialize] private def buildChildIndex [Inhabited β] (cs : Array β) (keyOf : β → Name) : ByteArray := Id.run do
   let n := cs.size
   if n == 0 then
     return .empty
-  -- `u16` offsets bound the node width; trie nodes are nowhere near this wide
-  assert! n < 0xFFFF
+  -- offsets range over `0..n`
+  let wide := n > 0xFFFF
   let mut bits : UInt64 := 1
   while ((1 : UInt64) <<< bits).toNat < n && bits < 16 do
     bits := bits + 1
   let slots := ((1 : UInt64) <<< bits).toNat + 1
-  let mut bs := ByteArray.emptyWithCapacity (1 + 2 * slots + n)
-  bs := bs.push bits.toUInt8
+  let mut bs := ByteArray.emptyWithCapacity (1 + (if wide then 4 else 2) * slots + n)
+  bs := bs.push (if wide then bits.toUInt8 ||| wideOffsetsFlag else bits.toUInt8)
   let mut j := 0
   let mut s := 0
   while s < slots do
     while j < n && topBits (keyOf cs[j]!).hash bits < s do
       j := j + 1
-    bs := pushU16 bs j
+    bs := if wide then pushU32 bs j else pushU16 bs j
     s := s + 1
   for c in cs do
     bs := bs.push (fingerprint (keyOf c).hash)
@@ -108,12 +122,16 @@ dereferenced to confirm the final component.
     none
   else
     let h := k.hash
-    let bits := (index.get! 0).toUInt64
+    let hdr := index.get! 0
+    let bits := (hdr &&& 0x1F).toUInt64
     let slot := topBits h bits
-    let lo := getU16 index (1 + 2 * slot)
-    let hi := getU16 index (3 + 2 * slot)
-    let fpOff := (3 + 2 * ((1 : UInt64) <<< bits)).toNat
-    scanWindow (fingerprint h) fpOff lo hi
+    let slots := ((1 : UInt64) <<< bits).toNat + 1
+    if hdr < wideOffsetsFlag then
+      scanWindow (fingerprint h) (1 + 2 * slots) (getU16 index (1 + 2 * slot))
+        (getU16 index (3 + 2 * slot))
+    else
+      scanWindow (fingerprint h) (1 + 4 * slots) (getU32 index (1 + 4 * slot))
+        (getU32 index (5 + 4 * slot))
 where
   @[specialize] scanWindow (fp : UInt8) (fpOff j hi : Nat) : Option Nat :=
     if j < hi then
