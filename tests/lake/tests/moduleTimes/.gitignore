@@ -1,3 +1,7 @@
 /.lake
 /order.txt
 /produced.out
+/inject.json
+/writeFails
+/Test.lean.bak
+/Test/Quick3.lean.bak

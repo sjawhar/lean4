@@ -1,4 +1,4 @@
-rm -rf .lake lake-manifest.json produced.out order.txt inject.json
+rm -rf .lake lake-manifest.json produced.out order.txt inject.json writeFails
 # A run that failed mid-way leaves the edited sources moved aside; put them back.
 if [ -f Test.lean.bak ]; then mv Test.lean.bak Test.lean; fi
 if [ -f Test/Quick3.lean.bak ]; then mv Test/Quick3.lean.bak Test/Quick3.lean; fi

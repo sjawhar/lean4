@@ -29,15 +29,27 @@ mv Test.lean.bak Test.lean; mv Test/Quick3.lean.bak Test/Quick3.lean
 
 # The save merges over the record as it is on disk at the end of the build, so an entry another
 # Lake process wrote during the build survives. Here `Test`'s own compile plays that process.
-printf '{"version":1,"modules":[{"name":"Test.Quick1","ms":777777,"imports":[]}]}' > inject.json
+printf '{"version":2,"names":["Test.Quick1"],"modules":[[0,777777,[]]]}' > inject.json
 cp Test.lean Test.lean.bak
 printf 'import Test.Quick1\nimport Test.Quick2\nimport Test.Quick3\nimport Test.SlowTop\n#eval do IO.FS.writeFile ".lake/module-times.json" (← IO.FS.readFile "inject.json")\n' > Test.lean
 test_run build
-match_text '"ms":777777' .lake/module-times.json
+match_text ',777777,' .lake/module-times.json
 mv Test.lean.bak Test.lean; rm inject.json
 
+# A save that fails warns, naming the file, and the build still succeeds. Here `Test`'s compile
+# leaves a record that does not parse, so the save's re-read of the changed file fails.
+cp Test.lean Test.lean.bak
+printf 'import Test.Quick1\nimport Test.Quick2\nimport Test.Quick3\nimport Test.SlowTop\n#eval IO.FS.writeFile ".lake/module-times.json" "{"\n' > Test.lean
+test_out "module-times.json: failed to save module compile times" build
+mv Test.lean.bak Test.lean
+
+# A write that fails (here the rename, onto a directory) leaves no temporary file behind.
+test_cmd_out "write failed" "$LAKE" env lean --run WriteFails.lean
+match_text "left: module-times.json" produced.out
+no_match_pat "^left: .*\.tmp$" produced.out
+
 # A stale import cycle in the record does not hang or fail the build.
-printf '{"version":1,"modules":[{"name":"Test.Quick1","ms":5000,"imports":["Test.Quick2"]},{"name":"Test.Quick2","ms":5000,"imports":["Test.Quick1"]}]}' \
+printf '{"version":2,"names":["Test.Quick1","Test.Quick2"],"modules":[[0,5000,[1]],[1,5000,[0]]]}' \
   > .lake/module-times.json
 rm -rf .lake/build
 test_run build
@@ -46,8 +58,11 @@ test_run build
 echo '{' > .lake/module-times.json
 test_err "module-times.json" build
 
-# A record with another version fails loudly, naming the file.
-echo '{"version":2,"modules":[]}' > .lake/module-times.json
-test_err "module-times.json" build
+# The editor's `lake setup-file` names the file too.
+test_err "module-times.json" setup-file Test/SlowTop.lean
+
+# A record with another version (here the first format) fails loudly, naming the file.
+echo '{"version":1,"modules":[]}' > .lake/module-times.json
+test_err "module-times.json: version 1, expected 2" build
 
 ./clean.sh

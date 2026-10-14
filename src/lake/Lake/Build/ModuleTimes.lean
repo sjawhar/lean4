@@ -16,6 +16,12 @@ import Init.Data.Array.QSort
 The workspace's record of each module's last compile time and direct local imports
 (`.lake/module-times.json`). A build reads it to start the compiles with the longest remaining
 path first, and writes back the modules it compiled.
+
+The file is a name table plus one `[name, ms, imports]` row per module, where `name` and the
+`imports` are indices into the table:
+`{"version": 2, "names": ["A.B", "A.C"], "modules": [[0, 1234, [1]]]}`. Both are sorted by name.
+Each name is parsed once and shared by every row that mentions it, which keeps reading the
+record and looking modules up in it cheap.
 -/
 
 open Lean System
@@ -27,44 +33,88 @@ public structure ModuleTimeEntry where
   name : Name
   ms : Nat
   imports : Array Name
-  deriving ToJson, FromJson, Inhabited
+  deriving Inhabited
 
-public structure ModuleTimesFile where
-  version : Nat
-  modules : Array ModuleTimeEntry
-  deriving ToJson, FromJson
-
-public def ModuleTimesFile.currentVersion : Nat := 1
+public def moduleTimesVersion : Nat := 2
 
 /-- The record's file name inside the workspace's Lake directory. -/
 public def moduleTimesFileName : FilePath := "module-times.json"
 
 public abbrev ModuleTimeMap := Std.HashMap Name ModuleTimeEntry
 
-/-- Reads the record. A missing file is an empty record; a file that does not parse is an error. -/
+private def parseModuleTimes (contents : String) : Except String ModuleTimeMap := do
+  let json ← Json.parse contents
+  let version ← json.getObjValAs? Nat "version"
+  unless version == moduleTimesVersion do
+    throw s!"version {version}, expected {moduleTimesVersion}"
+  let names ← json.getObjValAs? (Array Name) "names"
+  let rows ← json.getObjValAs? (Array Json) "modules"
+  let name (j : Json) : Except String Name := do
+    let i ← j.getNat?
+    match names[i]? with
+    | some n => pure n
+    | none => throw s!"name index {i} out of range"
+  rows.foldlM (init := {}) fun m row => do
+    let cols ← row.getArr?
+    let (some n, some ms, some imports) := (cols[0]?, cols[1]?, cols[2]?)
+      | throw s!"expected a [name, ms, imports] row, got {row.compress}"
+    let n ← name n
+    let imports ← (← imports.getArr?).mapM name
+    return m.insert n {name := n, ms := ← ms.getNat?, imports}
+
+/--
+Reads the record. A missing file is an empty record; a file that does not parse, or has another
+version, is an error naming the file.
+-/
 public def readModuleTimes (path : FilePath) : IO ModuleTimeMap := do
   unless (← path.pathExists) do return {}
-  let contents ← IO.FS.readFile path
-  let file ← IO.ofExcept <| (Json.parse contents >>= fromJson? (α := ModuleTimesFile)).mapError
-    fun e => s!"{path}: {e}; delete it to start a new record"
-  unless file.version == ModuleTimesFile.currentVersion do
-    throw <| IO.userError s!"{path}: version {file.version}, expected \
-      {ModuleTimesFile.currentVersion}; delete it to start a new record"
-  return file.modules.foldl (init := {}) fun m e => m.insert e.name e
+  match parseModuleTimes (← IO.FS.readFile path) with
+  | .ok m => return m
+  | .error e => throw <| IO.userError s!"{path}: {e}; delete it to start a new record"
+
+private def renderModuleTimes (entries : ModuleTimeMap) : String := Id.run do
+  let mut seen : Std.HashSet Name := {}
+  for (n, e) in entries do
+    seen := e.imports.foldl (·.insert ·) (seen.insert n)
+  let names := seen.toArray.qsort (fun a b => a.cmp b == .lt)
+  let mut index : Std.HashMap Name Nat := Std.HashMap.emptyWithCapacity names.size
+  for h : i in [0:names.size] do
+    index := index.insert names[i] i
+  let idx (n : Name) : Json := index.getD n 0
+  let mut rows := Array.mkEmpty entries.size
+  for n in names do
+    if let some e := entries.get? n then
+      rows := rows.push <| Json.arr #[idx n, e.ms, Json.arr (e.imports.map idx)]
+  let json := Json.mkObj [
+    ("version", moduleTimesVersion),
+    ("names", Json.arr (names.map (Json.str ·.toString))),
+    ("modules", Json.arr rows)]
+  return json.compress
 
 /--
 Writes the record through a temporary file, so a reader sees the old file or the new one. The
 temporary file is per process: concurrent writers (e.g. `lake setup-file` runs) each rename a
-whole file, and the last one wins.
+whole file, and the last one wins. A failed write removes its temporary file.
 -/
 public def writeModuleTimes (path : FilePath) (entries : ModuleTimeMap) : IO Unit := do
-  let modules := entries.fold (init := #[]) (fun a _ e => a.push e)
-    |>.qsort (fun a b => a.name.cmp b.name == .lt)
-  let file : ModuleTimesFile := {version := ModuleTimesFile.currentVersion, modules}
+  let contents := renderModuleTimes entries
   let tmp := path.addExtension s!"{← IO.Process.getPID}.tmp"
   createParentDirs path
-  IO.FS.writeFile tmp (toJson file).compress
-  IO.FS.rename tmp path
+  try
+    IO.FS.writeFile tmp contents
+    IO.FS.rename tmp path
+  catch e =>
+    discard <| (IO.FS.removeFile tmp).toBaseIO
+    throw e
+
+/-- The record file's size and modification time, or `none` if it does not exist. -/
+public def moduleTimesStamp? (path : FilePath) : IO (Option (UInt64 × IO.FS.SystemTime)) := do
+  try
+    let m ← path.metadata
+    return some (m.byteSize, m.modified)
+  catch
+    | .noFileOrDirectory .. => return none
+    | e => throw e
 
 private partial def visitRemaining (entries : ModuleTimeMap) (importers : Std.HashMap Name (Array Name))
     (n : Name) : StateM (Std.HashMap Name Nat × Std.HashSet Name) Nat := do
@@ -98,35 +148,48 @@ The priority of a module's compile job: `⌊log₂⌋` of its remaining path in 
 public def compilePrio (remainingMs : Nat) : Task.Priority :=
   min 7 (Nat.log2 (remainingMs / 1000))
 
-/-- One build's view of the record: priorities from the file as read, entries this build compiled. -/
+/--
+One build's view of the record: the entries and priorities as read at the start of the build (with
+the file's size and modification time then), and the entries this build compiled.
+-/
 public structure ModuleTimes where
   path : FilePath
+  stamp? : Option (UInt64 × IO.FS.SystemTime)
+  entries : ModuleTimeMap
   prios : Std.HashMap Name Task.Priority
-  new : IO.Ref ModuleTimeMap
+  /-- Entries this build recorded, newest first. A list, so that recording one is O(1). -/
+  new : IO.Ref (List ModuleTimeEntry)
 
 public def ModuleTimes.load (path : FilePath) : IO ModuleTimes := do
+  -- Stamp before reading: a write that lands in between makes the stamp stale, never the entries.
+  let stamp? ← moduleTimesStamp? path
   let entries ← readModuleTimes path
   let prios := (remainingPaths entries).fold (init := {}) fun m n t => m.insert n (compilePrio t)
-  return {path, prios, new := ← IO.mkRef {}}
+  return {path, stamp?, entries, prios, new := ← IO.mkRef []}
 
 public def ModuleTimes.prio (self : ModuleTimes) (mod : Name) : Task.Priority :=
   self.prios.getD mod Task.Priority.default
 
 public def ModuleTimes.record (self : ModuleTimes) (e : ModuleTimeEntry) : BaseIO Unit :=
-  self.new.modify (·.insert e.name e)
+  self.new.modify (e :: ·)
 
 /--
-Writes this build's entries over the record as it is on disk now (re-read, so entries another
-Lake process saved during this build survive), keeping an entry from the file only if `keep`
-accepts its module. Writes nothing and returns 0 when this build compiled nothing; otherwise
-returns how many entries this build recorded.
+Writes this build's entries over the record as it is on disk now, keeping an entry from the file
+only if `keep` accepts its module. If the file's size or modification time changed since `load`
+(another Lake process saved it during this build), the file is read again, so that process's
+entries survive; otherwise the entries read by `load` are reused. Writes nothing and returns 0 when
+this build compiled nothing; otherwise returns how many entries this build recorded.
 -/
 public def ModuleTimes.save (self : ModuleTimes) (keep : Name → BaseIO Bool) : IO Nat := do
   let new ← self.new.get
   if new.isEmpty then return 0
-  let mut merged := new
-  for (n, e) in ← readModuleTimes self.path do
+  let onDisk ←
+    if (← moduleTimesStamp? self.path) == self.stamp? then pure self.entries
+    else readModuleTimes self.path
+  -- `new` is newest first, so `insertIfNew` keeps a module's latest compile.
+  let mut merged : ModuleTimeMap := new.foldl (init := {}) fun m e => m.insertIfNew e.name e
+  for (n, e) in onDisk do
     if !merged.contains n && (← keep n) then
       merged := merged.insert n e
   writeModuleTimes self.path merged
-  return new.size
+  return new.length

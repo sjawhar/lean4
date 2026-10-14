@@ -398,11 +398,16 @@ def finalizeBuild
 : IO α := do
   reportResult cfg mctx.out result
   if let some mt := bctx.moduleTimes? then
-    let n ← mt.save fun name => do
+    -- The record only orders compiles, so failing to save it warns instead of failing the build.
+    let saved ← mt.save (fun name => do
       let some mod := bctx.workspace.findTargetModule? name | return false
-      mod.leanFile.pathExists
-    if n > 0 && cfg.verbosity matches .verbose then
-      print! mctx.out s!"Recorded compile times of {n} modules in {mt.path}\n"
+      mod.leanFile.pathExists) |>.toBaseIO
+    match saved with
+    | .ok n =>
+      if n > 0 && cfg.verbosity matches .verbose then
+        print! mctx.out s!"Recorded compile times of {n} modules in {mt.path}\n"
+    | .error e =>
+      mctx.logger.logEntry (.warning s!"{mt.path}: failed to save module compile times: {e}")
   if let some outputsFile := cfg.outputsFile? then
     bctx.saveOutputs (logger := mctx.logger) mctx.out outputsFile
   match result.out with
