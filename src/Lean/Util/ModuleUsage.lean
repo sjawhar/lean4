@@ -9,7 +9,7 @@ import Lean.ExtraModUses
 public section
 namespace Lean.ModuleUsage
 
-partial def levelHash : Level → UInt64
+def levelHash : Level → UInt64
   | .zero => 3
   | .succ l => mixHash 5 (levelHash l)
   | .max a b => mixHash 7 (mixHash (levelHash a) (levelHash b))
@@ -96,23 +96,22 @@ def State.hasEntries (s : State) (i : ModuleIdx) : Bool :=
 /-- Digests of the current module's constants: SCCs in dependency order; each SCC mixes its members' names and
 local hashes with the name and digest of every constant outside it that they refer to. -/
 def compute (env : Environment) (s : State) : Array (Name × UInt64) := Id.run do
-  let privEnv := env.setExporting false
-  let names := env.checked.get.constants.foldStage2 (fun ns n _ => ns.push n) #[]
-  let info n := privEnv.find? n
-  let isLocal n := (env.getModuleIdxFor? n).isNone && (info n).isSome
-  let sccs := SCC.scc names.toList fun n => ((info n).map (refs env) |>.getD #[]).toList.filter isLocal
+  let consts := env.checked.get.constants.foldStage2 (fun cs n ci => cs.push (n, ci, refs env ci)) #[]
+  let byName : Std.HashMap Name (ConstantInfo × Array Name) :=
+    consts.foldl (fun m (n, ci, rs) => m.insert n (ci, rs)) {}
+  let sccs := SCC.scc (consts.map (·.1)).toList fun n => byName[n]!.2.toList.filter byName.contains
   let mut out : Std.HashMap Name UInt64 := {}
   for scc in sccs do
-    let members := scc.toArray.qsort Name.quickLt
+    let members := NameSet.ofList scc
     let mut h : UInt64 := 83
-    for m in members do
-      let some ci := info m | continue
+    for m in scc.toArray.qsort Name.quickLt do
+      let (ci, rs) := byName[m]!
       h := mixHash h (mixHash (hash m) (localHash env ci))
-      for r in refs env ci do
+      for r in rs do
         unless members.contains r do
           h := mixHash h (mixHash (hash r) ((out[r]? <|> s.find? env r).getD (mixHash 97 (hash r))))
-    for m in members do out := out.insert m h
-  return (names.map fun n => (n, out[n]?.getD 89)).qsort fun a b => Name.quickLt a.1 b.1
+    for m in scc do out := out.insert m h
+  return (consts.map fun (n, _) => (n, out[n]!)).qsort fun a b => Name.quickLt a.1 b.1
 
 builtin_initialize ext : PersistentEnvExtension (Name × UInt64) (Name × UInt64) State ←
   registerPersistentEnvExtension {
