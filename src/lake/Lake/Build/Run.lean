@@ -370,7 +370,7 @@ def finalizeBuild
   reportResult cfg mctx.out result
   if let some mt := bctx.moduleTimes? then
     let n ← mt.save fun name => do
-      let some mod := bctx.workspace.findModule? name | return false
+      let some mod := bctx.workspace.findTargetModule? name | return false
       mod.leanFile.pathExists
     if n > 0 && cfg.verbosity matches .verbose then
       print! mctx.out s!"Recorded compile times of {n} modules in {mt.path}\n"
