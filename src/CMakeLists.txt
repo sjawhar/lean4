@@ -1083,6 +1083,8 @@ install(
   PATTERN "*.trace" EXCLUDE
   PATTERN "*.rsp" EXCLUDE
   PATTERN "*.filelist" EXCLUDE
+  PATTERN "*.usage" EXCLUDE
+  PATTERN "*.usekey" EXCLUDE
 )
 
 # symlink source into expected installation location for go-to-definition, if file system allows it

@@ -9,6 +9,7 @@ prelude
 public import Lean.CoreM
 public import Lean.Compiler.MetaAttr  -- TODO: public because of specializations
 import Init.Data.Range.Polymorphic.Stream
+public import Lean.Util.UsedByChecks  -- public: `recordExtraModUse*` are specialized at their callers
 
 /-!
 Infrastructure for recording extra import dependencies not implied by the environment constants for
@@ -99,7 +100,8 @@ def recordExtraModUseCore [MonadLiftT IO m] (mod : Name) (isMeta : Bool) (hint :
     trace[extraModUses] "recording {if entry.isExported then "public" else "private"} \
       {if isMeta then "meta" else "regular"} extra mod use {mod}\
       {if hint.isAnonymous then m!"" else m!" of {hint}"}"
-    (extraModUsesByChecksRef.modify (·.insert entry) : IO Unit)
+    if (← (usageRecordingRef.get : IO Bool)) then
+      (extraModUsesByChecksRef.modify (·.insert entry) : IO Unit)
     modifyEnv (extraModUses.addEntry · entry)
 
 /--
