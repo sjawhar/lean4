@@ -5,6 +5,7 @@ public import Lean.Util.FoldConsts
 public import Lean.Util.PtrSet
 public import Lean.Compiler.ImplementedByAttr
 public import Lean.Compiler.ExternAttr
+public import Lean.Compiler.ExportAttr
 public import Lean.Compiler.NoncomputableAttr
 public import Lean.Elab.InfoTree.Types
 import Lean.ExtraModUses
@@ -54,11 +55,13 @@ def hintsHash : ReducibilityHints → UInt64
 def safetyHash : DefinitionSafety → UInt64
   | .safe => 19 | .unsafe => 23 | .partial => 29
 
-/-- Everything of `c` except the meaning of the constants it refers to. -/
+/-- Everything of `c` except the meaning of the constants it refers to, including what its importers' compiled
+code links against: the `@[extern]` entries and the `@[export]` name. -/
 def localHash (env : Environment) (c : ConstantInfo) : UInt64 :=
   let base := mixHash (hash c.levelParams) (exprHash true c.type)
   let base := mixHash base (mixHash (hash (Compiler.getImplementedBy? env c.name))
-    (mixHash (hash (isExtern env c.name)) (hash (isNoncomputable env c.name))))
+    (mixHash (hash (getExternAttrData? env c.name)) (hash (isNoncomputable env c.name))))
+  let base := mixHash base (hash (getExportNameFor? env c.name))
   let v := exprHash false
   mixHash base <| match c with
   | .defnInfo d => mixHash (v d.value) (mixHash (hintsHash d.hints) (safetyHash d.safety))
