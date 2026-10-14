@@ -604,6 +604,14 @@ def Module.recFetchPreSetup (mod : Module) : FetchM (Job ModulePreSetup) := ensu
     let {dynlibs, plugins} ← computeModuleDeps impLibs externLibs dynlibs plugins
     let extra := (← getLeanOptOverrides).find? mod.pkg.baseName |>.getD {}
     let leanOptions := mod.leanOptions ++ extra
+    let libPart := match mod.platformIndependent with
+      | none => libTrace
+      | some false => libTrace.mix platformTrace
+      | some true => nilLibTrace
+    let localTrace := (BuildTrace.nil "local").mix extraDepJob.getTrace |>.mix libPart
+      |>.mix (← getLeanTrace) |>.mix input.trace |>.mix (traceOptions leanOptions "options")
+      |>.mix (.ofHash (pureHash input.header.isModule)) |>.mix (.ofHash (pureHash mod.name))
+      |>.mix (.ofHash (pureHash mod.pkg.id?)) |>.mix (.ofHash (pureHash mod.leanArgs))
     addLeanTrace
     addTrace input.trace
     addTrace <| traceOptions leanOptions "options"
@@ -613,6 +621,7 @@ def Module.recFetchPreSetup (mod : Module) : FetchM (Job ModulePreSetup) := ensu
     addPureTrace mod.leanArgs "Module.leanArgs"
     return {
       trace := ← getTrace
+      localTrace
       srcFile := input.path
       srcMTime := input.trace.mtime
       isModule := input.header.isModule
@@ -680,6 +689,8 @@ public def Module.clearOutputArtifacts (mod : Module) : IO PUnit := do
     removeFileIfExists mod.irFile
     removeFileIfExists mod.cFile
     removeFileIfExists mod.bcFile
+    removeFileIfExists mod.usageFile
+    removeFileIfExists mod.usekeyFile
   catch e =>
     error s!"failed to remove output artifacts: {e}"
 
