@@ -121,6 +121,10 @@ private:
     optional<expr> reduce_pow(expr const & e);
     optional<expr> reduce_shiftLeft(expr const & e);
     optional<expr> reduce_nat(expr const & e);
+    optional<expr> reduce_nat_add_offset(expr const & e);
+    optional<expr> to_nat_offset(expr e, nat & k);
+    optional<expr> reduce_nat_offset_pred(expr const & e, bool is_ble);
+    optional<expr> reduce_nat_offset_app(expr const & e);
 public:
     // The following two constructor are used only by the old compiler and should be deleted with it
     type_checker(state & st, local_ctx const & lctx, definition_safety ds = definition_safety::safe);

@@ -699,6 +699,86 @@ template<typename F> optional<expr> type_checker::reduce_bin_nat_pred(F const & 
     return f(v1.raw(), v2.raw()) ? some_expr(mk_bool_true()) : some_expr(mk_bool_false());
 }
 
+/* `a + k`, as `a` when `k = 0`. */
+static expr mk_nat_add_lit(expr const & a, nat const & k) {
+    if (k.is_zero()) return a;
+    return mk_app(*g_nat_add, a, mk_lit(literal(k)));
+}
+
+/* `Nat.add a k` with `k` reducing to a literal `> 0` (and `a` not reducing to one): `Nat.succ (a + (k - 1))`, one step
+   of `Nat.add`'s recursion on its second argument, kept in `Nat.add` form. Unfolding `Nat.add` instead leaves its
+   compiled recursor, which every further step reduces again. */
+optional<expr> type_checker::reduce_nat_add_offset(expr const & e) {
+    expr b = whnf(app_arg(e));
+    if (!is_nat_lit(b) || lit_value(b).get_nat().is_zero())
+        return none_expr();
+    return some_expr(mk_app(*g_nat_succ, mk_nat_add_lit(app_arg(app_fn(e)), lit_value(b).get_nat() - nat(1u))));
+}
+
+/* View `e` as `a + k` with `k` a literal `> 0`: `Nat.succ^i (Nat.add a j)` with `j` reducing to a literal, or
+   `Nat.succ^i a` with `i > 0`, looking through `whnf_core` and abbreviation-hinted heads (`HAdd.hAdd`, `Add.add`).
+   Returns `a` and sets `k`. */
+optional<expr> type_checker::to_nat_offset(expr e, nat & k) {
+    nat i;
+    while (true) {
+        e = whnf_core(e);
+        if (is_nat_lit_ext(e))
+            return none_expr();
+        if (is_app(e) && app_fn(e) == *g_nat_succ) {
+            i = i + nat(1u);
+            e = app_arg(e);
+            continue;
+        }
+        nat j;
+        if (optional<expr> a = is_nat_add_lit(e, j)) {
+            k = i + j;
+            return a;
+        }
+        optional<constant_info> d = is_delta(e);
+        if (!d || !d->get_hints().is_abbrev())
+            break;
+        e = *unfold_definition(e);
+    }
+    if (i.is_zero())
+        return none_expr();
+    k = i;
+    return some_expr(e);
+}
+
+/* `Nat.ble`/`Nat.beq` with one argument a literal `n` and the other `a + k` (`to_nat_offset`): both recurse by
+   stripping a `Nat.succ` from each argument, so strip `min(n, k)` at once:
+   `n ≤ a + k` is `true` if `n ≤ k`, else `Nat.ble (n - k) a`; `a + k ≤ n` is `false` if `n < k`, else
+   `Nat.ble a (n - k)`; `n = a + k` is `false` if `n < k`, else `Nat.beq (n - k) a` (and symmetrically). */
+optional<expr> type_checker::reduce_nat_offset_pred(expr const & e, bool is_ble) {
+    expr const & f = app_fn(app_fn(e));
+    /* Both arguments in whnf (cached; `reduce_bin_nat_pred` has just computed at least the first): exactly one must
+       be a literal. */
+    expr lhs = whnf(app_arg(app_fn(e)));
+    expr rhs = whnf(app_arg(e));
+    bool off_right = is_nat_lit_ext(lhs);
+    if (off_right == is_nat_lit_ext(rhs))
+        return none_expr();
+    nat k;
+    optional<expr> a = to_nat_offset(off_right ? rhs : lhs, k);
+    if (!a) return none_expr();
+    nat n = get_nat_val(off_right ? lhs : rhs);
+    if (is_ble && off_right && n <= k)
+        return some_expr(mk_bool_true());
+    if (n < k)
+        return some_expr(mk_bool_false());
+    expr r = mk_lit(literal(n - k));
+    return some_expr(whnf(off_right ? mk_app(f, r, *a) : mk_app(f, *a, r)));
+}
+
+/* `reduce_nat_offset_pred` on a `Nat.ble`/`Nat.beq` application. */
+optional<expr> type_checker::reduce_nat_offset_app(expr const & e) {
+    if (get_app_num_args(e) != 2) return none_expr();
+    expr const & f = app_fn(app_fn(e));
+    if (f == *g_nat_ble) return reduce_nat_offset_pred(e, /* is_ble */ true);
+    if (f == *g_nat_beq) return reduce_nat_offset_pred(e, /* is_ble */ false);
+    return none_expr();
+}
+
 optional<expr> type_checker::reduce_nat(expr const & e) {
     unsigned nargs = get_app_num_args(e);
     if (nargs == 1) {
@@ -714,15 +794,24 @@ optional<expr> type_checker::reduce_nat(expr const & e) {
     } else if (nargs == 2) {
         expr const & f = app_fn(app_fn(e));
         if (!is_constant(f)) return none_expr();
-        if (f == *g_nat_add) return reduce_bin_nat_op(nat_add, e, /* check_size */ true);
+        if (f == *g_nat_add) {
+            if (auto r = reduce_bin_nat_op(nat_add, e, /* check_size */ true)) return r;
+            return reduce_nat_add_offset(e);
+        }
         if (f == *g_nat_sub) return reduce_bin_nat_op(nat_sub, e, /* check_size */ true);
         if (f == *g_nat_mul) return reduce_bin_nat_op(nat_mul, e, /* check_size */ true);
         if (f == *g_nat_pow) return reduce_pow(e);
         if (f == *g_nat_gcd) return reduce_bin_nat_op(nat_gcd, e);
         if (f == *g_nat_mod) return reduce_bin_nat_op(nat_mod, e);
         if (f == *g_nat_div) return reduce_bin_nat_op(nat_div, e);
-        if (f == *g_nat_beq) return reduce_bin_nat_pred(nat_eq, e);
-        if (f == *g_nat_ble) return reduce_bin_nat_pred(nat_le, e);
+        if (f == *g_nat_beq) {
+            if (auto r = reduce_bin_nat_pred(nat_eq, e)) return r;
+            return reduce_nat_offset_pred(e, /* is_ble */ false);
+        }
+        if (f == *g_nat_ble) {
+            if (auto r = reduce_bin_nat_pred(nat_le, e)) return r;
+            return reduce_nat_offset_pred(e, /* is_ble */ true);
+        }
         if (f == *g_nat_land) return reduce_bin_nat_op(nat_land, e);
         if (f == *g_nat_lor)  return reduce_bin_nat_op(nat_lor, e);
         if (f == *g_nat_xor)  return reduce_bin_nat_op(nat_lxor, e);
@@ -1085,12 +1174,6 @@ optional<expr> type_checker::is_nat_add_lit(expr const & e, nat & k) {
     return some_expr(app_arg(app_fn(e)));
 }
 
-/* `a + k`, as `a` when `k = 0`. */
-static expr mk_nat_add_lit(expr const & a, nat const & k) {
-    if (k.is_zero()) return a;
-    return mk_app(*g_nat_add, a, mk_lit(literal(k)));
-}
-
 lbool type_checker::is_def_eq_offset(expr const & t, expr const & s) {
     if (is_nat_zero(t) && is_nat_zero(s))
         return l_true;
@@ -1132,6 +1215,14 @@ lbool type_checker::lazy_delta_reduction(expr & t_n, expr & s_n) {
             if (auto t_v = reduce_nat(t_n)) {
                 return to_lbool(is_def_eq_core(*t_v, s_n));
             } else if (auto s_v = reduce_nat(s_n)) {
+                return to_lbool(is_def_eq_core(t_n, *s_v));
+            }
+        } else {
+            /* With free variables only the offset rule of `Nat.ble`/`Nat.beq` (`reduce_nat_offset_pred`), which
+               needs one literal argument and one `a + k`, instead of unfolding the recursion `k` times. */
+            if (auto t_v = reduce_nat_offset_app(t_n)) {
+                return to_lbool(is_def_eq_core(*t_v, s_n));
+            } else if (auto s_v = reduce_nat_offset_app(s_n)) {
                 return to_lbool(is_def_eq_core(t_n, *s_v));
             }
         }
