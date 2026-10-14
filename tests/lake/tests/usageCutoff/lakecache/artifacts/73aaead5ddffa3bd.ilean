@@ -1,0 +1,1 @@
+{"decls":{"d":[1,0,1,23,1,11,1,12]},"directImports":[],"module":"Test.U","references":{"{\"c\":{\"m\":\"Init.Prelude\",\"n\":\"Nat\"}}":{"definition":null,"usages":[[1,15,1,18,"d"]]},"{\"c\":{\"m\":\"Test.U\",\"n\":\"d\"}}":{"definition":[1,11,1,12],"usages":[]}},"version":5}

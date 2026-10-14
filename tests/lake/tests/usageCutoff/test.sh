@@ -27,7 +27,9 @@ printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH 
 test_not_out "warning" build -v Test.HU
 match_text "Replayed Test.HU" produced.out
 # a name component that is neither a string nor a number is corrupt input: warned, then built
+# (sidecars are removed before being rewritten: under an artifact cache they are read-only links)
 printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 1\n' > Test/H.lean
+rm -f .lake/build/lib/lean/Test/HU.usage
 printf '{"version":1,"noskip":false,"moduleDigest":"0000000000000000","own":[],"used":[[[true],[]]],"extra":[]}' > .lake/build/lib/lean/Test/HU.usage
 test_out "expected a name component" build Test.HU
 match_text "Built Test.HU" produced.out
@@ -65,12 +67,14 @@ printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 4\n' > Test/A.le
 LAKE_USAGE_CUTOFF=0 test_out "Built Test.B" build Test.B
 # a corrupt key is reported and the module builds normally
 printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 5\n' > Test/A.lean
+rm -f .lake/build/lib/lean/Test/B.usekey
 printf '{' > .lake/build/lib/lean/Test/B.usekey
 test_out "Test/B.usekey" build Test.B
 # a key is bound to its module's .olean: an .olean rewritten behind Lake's back (e.g. by another
 # toolchain, which keeps the old sidecars) makes the module build normally
 printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 6\n' > Test/A.lean
-printf 'x' >> .lake/build/lib/lean/Test/B.olean
+{ cat .lake/build/lib/lean/Test/B.olean; printf 'x'; } > B.tmp
+mv -f B.tmp .lake/build/lib/lean/Test/B.olean
 rm .lake/build/lib/lean/Test/B.olean.hash
 test_out "Built Test.B" build Test.B
 # a failed rebuild leaves no sidecars behind
@@ -97,4 +101,53 @@ test_run unpack stock.tgz
 test_exp ! -f .lake/build/lib/lean/Test/A.usage
 test_exp ! -f .lake/build/lib/lean/Test/A.usekey
 test_exp -f outside/keep.usage
+# Under a writable artifact cache with restored artifacts (machcsl's `tools/lakecache.sh`), in fresh
+# package dirs sharing a cache of their own. Restored and cached outputs are read-only hard links
+# into the cache, so a test edits one by replacing it, never by writing through it.
+export LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true LAKE_CACHE_DIR="$PWD/lakecache"
+mkdir -p cache1/Test cache2/Test
+cp lakefile.toml cache1/
+cp lakefile.toml cache2/
+cd cache1
+printf 'def a := 1\ntheorem ta : a = 1 := sorry\n' > Test/A.lean
+printf 'import Test.A\ndef b := a + 1\n' > Test/B.lean
+printf 'import Test.A\nexample : a = 1 := rfl\n' > Test/C.lean
+printf 'import Test.A\n#print axioms ta\n' > Test/D.lean
+test_run build Test.B Test.C Test.D
+# unrelated addition: A recompiles, nothing below it does
+printf 'def a := 1\ntheorem ta : a = 1 := sorry\ndef unrelated := 2\n' > Test/A.lean
+lake_out build -v Test.B Test.C Test.D
+match_text "Built Test.A" produced.out
+match_text "Replayed Test.B" produced.out
+match_text "Replayed Test.C" produced.out
+match_text "Replayed Test.D" produced.out
+# a second tree with the same sources restores every module, sidecars included, from the cache
+# (B's entry exists only because the skip above stored it)
+cd ../cache2
+cp ../cache1/Test/*.lean Test/
+test_not_out "Built" build -v Test.B Test.C Test.D
+test_exp -f .lake/build/lib/lean/Test/B.usage
+test_exp -f .lake/build/lib/lean/Test/B.usekey
+# an unrelated edit no tree has seen: B misses the cache by input hash and is skipped
+printf 'def a := 1\ntheorem ta : a = 1 := sorry\ndef unrelated := 3\n' > Test/A.lean
+lake_out build -v Test.B Test.C Test.D
+match_text "Built Test.A" produced.out
+match_text "Replayed Test.B" produced.out
+match_text "Replayed Test.C" produced.out
+match_text "Replayed Test.D" produced.out
+# a restored key is bound to its module's .olean: B.olean replaced behind Lake's back builds B
+printf 'def a := 1\ntheorem ta : a = 1 := sorry\ndef unrelated := 4\n' > Test/A.lean
+{ cat .lake/build/lib/lean/Test/B.olean; printf 'x'; } > B.tmp
+mv -f B.tmp .lake/build/lib/lean/Test/B.olean
+rm .lake/build/lib/lean/Test/B.olean.hash
+test_out "Built Test.B" build Test.B
+# a module-system file in the closure still forces the rebuild (N's proof becomes false)
+printf 'module\npublic def d : Nat := 1\n' > Test/U.lean
+printf 'module\npublic import Test.U\npublic def c : Nat := d\n' > Test/K.lean
+printf 'import Test.K\ntheorem t : c = 1 := rfl\n' > Test/N.lean
+test_run build Test.N
+printf 'module\npublic def d : Nat := 2\n' > Test/U.lean
+test_err "Building Test.N" build -v Test.N
+cd ..
+
 rm -f produced.out

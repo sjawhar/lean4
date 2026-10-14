@@ -699,6 +699,8 @@ public def Module.clearOutputHashes (mod : Module) : IO PUnit := do
     clearFileHash mod.irFile
     clearFileHash mod.cFile
     clearFileHash mod.bcFile
+    clearFileHash mod.usageFile
+    clearFileHash mod.usekeyFile
   catch e =>
     error s!"failed to remove output hashes: {e}"
 
@@ -733,6 +735,8 @@ def ModuleOutputDescrs.resolve
     ilean := ← resolve descrs.ilean
     c := ← resolve descrs.c
     ltar? := ← descrs.ltar?.mapM resolve
+    usage? := ← descrs.usage?.mapM resolve
+    usekey? := ← descrs.usekey?.mapM resolve
   }
   if Lean.Internal.hasLLVMBackend () then
     let some descr := descrs.bc?
@@ -792,6 +796,8 @@ def Module.cacheOutputArtifacts
     c := ← cache mod.cFile "c"
     bc? := ← cacheIf? (Lean.Internal.hasLLVMBackend ()) mod.bcFile "bc"
     ltar? := ← cacheIf? (← mod.ltarFile.pathExists) mod.ltarFile "ltar"
+    usage? := ← cacheIf? (← mod.usageFile.pathExists) mod.usageFile "usage"
+    usekey? := ← cacheIf? (← mod.usekeyFile.pathExists) mod.usekeyFile "usekey"
   }
 where
   @[inline] cache file ext := do
@@ -821,6 +827,8 @@ def Module.restoreAllArtifacts (mod : Module) (cached : ModuleOutputArtifacts) :
     c := ← restoreArtifact mod.cFile cached.c
     bc? := ← restoreSome mod.bcFile cached.bc?
     ltar? := ← restoreSome mod.ltarFile cached.ltar?
+    usage? := ← restoreSome mod.usageFile cached.usage?
+    usekey? := ← restoreSome mod.usekeyFile cached.usekey?
   }
 where
   @[inline] restoreSome file art? := art?.mapM (restoreArtifact file ·)
@@ -1282,7 +1290,7 @@ where
             else
               discard <| mod.buildLean presetup
         else
-          discard <| mod.buildLean presetup
+          discard <| mod.skipOrBuild presetup savedTrace depTrace
         if status.isCacheable then
           let arts ← mod.cacheOutputArtifacts presetup.isModule restore
           (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs
