@@ -89,6 +89,7 @@ private:
     bool is_def_eq(levels const & ls1, levels const & ls2);
     lbool quick_is_def_eq(expr const & t, expr const & s);
     lbool is_def_eq_offset(expr const & t, expr const & s);
+    optional<expr> is_nat_add_lit(expr const & e, nat & k);
     bool is_def_eq_args(expr t, expr s);
     bool try_eta_expansion_core(expr const & t, expr const & s);
     bool try_eta_expansion(expr const & t, expr const & s) {
