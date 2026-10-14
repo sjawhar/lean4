@@ -14,6 +14,7 @@ import Lean.Compiler.Options
 import Lean.Compiler.InitAttr  -- for `runInitAttrsForModules` on snapshot load
 import Lean.Linter.PersistentLintLog
 import Lean.Util.ProfilerServer
+import Lean.Util.ModuleUsage
 
 public section
 
