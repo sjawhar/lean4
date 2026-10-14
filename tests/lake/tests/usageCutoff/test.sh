@@ -9,4 +9,40 @@ printf 'import Test.A\n#print axioms ta\n' > Test/D.lean
 test_run build Test.B Test.C Test.D
 test_exp -f .lake/build/lib/lean/Test/B.usage
 test_cmd_out '"Test.A"' cat .lake/build/lib/lean/Test/B.usage
+# unrelated addition: A recompiles, nothing below it does
+printf 'def a := 1\ntheorem ta : a = 1 := sorry\ndef unrelated := 2\n' > Test/A.lean
+lake_out build -v Test.B Test.C Test.D
+match_text "Built Test.A" produced.out
+match_text "Replayed Test.B" produced.out
+match_text "Replayed Test.C" produced.out
+match_text "Replayed Test.D" produced.out
+# ta's proof changes: D's #print axioms output changes; B and C do not use ta
+printf 'def a := 1\ntheorem ta : a = 1 := rfl\ndef unrelated := 2\n' > Test/A.lean
+lake_out build -v Test.B Test.C Test.D
+match_text "Built Test.D" produced.out
+match_text "Replayed Test.B" produced.out
+match_text "Replayed Test.C" produced.out
+# a's value changes: B recompiles; C's example recompiles and now fails
+printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 2\n' > Test/A.lean
+test_out "Built Test.B" build Test.B
+test_err "Test.C" build Test.C
+printf 'import Test.A\nexample : a = 2 := rfl\n' > Test/C.lean
+test_run build Test.C
+# an option change: local trace differs
+cp lakefile.toml lakefile.toml.bak
+printf '[leanOptions]\nmaxRecDepth = 1000\n' >> lakefile.toml
+test_out "Built Test.B" build Test.B
+cp lakefile.toml.bak lakefile.toml
+test_run build Test.B
+# missing key: stock path
+rm .lake/build/lib/lean/Test/B.usekey
+printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 3\n' > Test/A.lean
+test_out "Built Test.B" build Test.B
+# disabled
+printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 4\n' > Test/A.lean
+LAKE_USAGE_CUTOFF=0 test_out "Built Test.B" build Test.B
+# a corrupt key is reported and the module builds normally
+printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 5\n' > Test/A.lean
+printf '{' > .lake/build/lib/lean/Test/B.usekey
+test_out "Test/B.usekey" build Test.B
 rm -f produced.out

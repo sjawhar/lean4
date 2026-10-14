@@ -989,6 +989,110 @@ def Module.recBuildLtar (self : Module) : FetchM (Job FilePath) := do
 public def Module.ltarFacetConfig : ModuleFacetConfig ltarFacet :=
   mkFacetJobConfig recBuildLtar
 
+/-- The parts of a module's `.usage` sidecar (written by Lean next to its `.olean`) that Lake checks. -/
+structure UsageSidecar where
+  noskip : Bool
+  moduleDigest : Hash
+  own : NameMap Hash
+  used : Array (Name × Array (Name × Hash))
+  extra : Array Name
+
+/-- A module's `.usekey` sidecar: what Lake saw of the module's build when Lean wrote its `.usage`. -/
+structure UsekeySidecar where
+  localHash : Hash
+  /-- For each `extra` module of the `.usage`: the hash of its `.olean` and its `moduleDigest`. -/
+  extra : NameMap (Hash × Hash)
+
+namespace UsageSidecar
+
+def checkVersion (j : Json) : Except String Unit := do
+  let v ← j.getObjValAs? Nat "version"
+  unless v == 1 do throw s!"unsupported version {v}"
+
+def parseHash (j : Json) : Except String Hash := do
+  let s ← j.getStr?
+  let some h := Hash.ofHex? s | throw s!"invalid digest: {s}"
+  return h
+
+def parseName (j : Json) : Except String Name :=
+  fromJson? j
+
+def parsePair (j : Json) : Except String (Json × Json) := do
+  let #[a, b] ← j.getArr? | throw s!"expected a pair, got {j.compress}"
+  return (a, b)
+
+def parseNamed (j : Json) : Except String (Name × Hash) := do
+  let (n, d) ← parsePair j
+  return (← parseName n, ← parseHash d)
+
+def parse (j : Json) : Except String UsageSidecar := do
+  checkVersion j
+  let noskip ← j.getObjValAs? Bool "noskip"
+  let moduleDigest ← parseHash (← j.getObjVal? "moduleDigest")
+  let own ← (← (← j.getObjVal? "own").getArr?).foldlM (init := ({} : NameMap Hash)) fun m e => do
+    let (n, d) ← parseNamed e
+    return m.insert n d
+  let used ← (← (← j.getObjVal? "used").getArr?).mapM fun e => do
+    let (m, cs) ← parsePair e
+    return (← parseName m, ← (← cs.getArr?).mapM parseNamed)
+  let extra ← (← (← j.getObjVal? "extra").getArr?).mapM fun e => do
+    let (m, isMeta) ← parsePair e
+    discard <| isMeta.getBool?
+    parseName m
+  return {noskip, moduleDigest, own, used, extra}
+
+end UsageSidecar
+
+def UsekeySidecar.parse (j : Json) : Except String UsekeySidecar := do
+  UsageSidecar.checkVersion j
+  let localHash ← UsageSidecar.parseHash (← j.getObjVal? "local")
+  let extra ← (← (← j.getObjVal? "extra").getArr?).foldlM (init := ({} : NameMap (Hash × Hash)))
+    fun m e => do
+      let #[n, o, d] ← e.getArr? | throw s!"expected a triple, got {e.compress}"
+      return m.insert (← UsageSidecar.parseName n)
+        (← UsageSidecar.parseHash o, ← UsageSidecar.parseHash d)
+  return {localHash, extra}
+
+/--
+Reads a usage-cutoff sidecar. Returns `none` if it does not exist. If it exists but is not valid,
+logs a warning and returns `none`, so the module builds normally.
+-/
+def readUsageSidecar {α : Type} (path : FilePath) (parse : Json → Except String α) :
+    JobM (Option α) := do
+  match (← IO.FS.readFile path |>.toBaseIO) with
+  | .ok contents =>
+    match Json.parse contents >>= parse with
+    | .ok a =>
+      return some a
+    | .error e =>
+      logWarning s!"{path}: {e}"
+      return none
+  | .error (.noFileOrDirectory ..) =>
+    return none
+  | .error e =>
+    error s!"{path}: read failed: {e}"
+
+/--
+Writes the module's `.usekey` from the `.usage` Lean just wrote: the module's local trace hash and,
+for each `extra` module, the hash of its `.olean` and its current `moduleDigest`. Writes nothing
+if the `.usage` or an `extra` module's `.usage` is missing, so the module is never skipped.
+-/
+def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
+    (importArts : NameMap ImportArtifacts) : JobM Unit := do
+  let some usage ← readUsageSidecar mod.usageFile UsageSidecar.parse | return
+  let mut extra := #[]
+  for m in usage.extra do
+    let some olean := (importArts.find? m).bind (·.olean?) | return
+    let some imp ← readUsageSidecar (olean.withExtension "usage") UsageSidecar.parse | return
+    extra := extra.push <|
+      Json.arr #[toJson m, toJson (← fetchFileHash olean).hex, toJson imp.moduleDigest.hex]
+  let key := Json.mkObj [
+    ("version", 1),
+    ("local", toJson presetup.localTrace.hash.hex),
+    ("extra", Json.arr extra)
+  ]
+  IO.FS.writeFile mod.usekeyFile key.compress
+
 def Module.buildLean
   (mod : Module) (presetup : ModulePreSetup)
 : JobM ModuleOutputArtifacts := do buildAction (← getTrace) mod.traceFile do
@@ -1000,7 +1104,65 @@ def Module.buildLean
   compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile arts args
     (← getLeanPath) (← getLean) (← getLeanir)
   mod.clearOutputHashes
-  mod.computeArtifacts setup.isModule
+  let arts ← mod.computeArtifacts setup.isModule
+  mod.writeUsekey presetup setup.importArts
+  return arts
+
+/-- Usage cutoff is on unless `LAKE_USAGE_CUTOFF=0`. -/
+def usageCutoffEnabled : BaseIO Bool :=
+  return (← IO.getEnv "LAKE_USAGE_CUTOFF") != some "0"
+
+/--
+Whether nothing the module used changed meaning since Lean wrote its `.usage`: its local inputs
+are unchanged, every imported constant it used has the same digest in its module's current
+`.usage`, and every `extra` module has the same `.olean` hash and `moduleDigest`.
+-/
+def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup) : JobM Bool := do
+  let some usage ← readUsageSidecar mod.usageFile UsageSidecar.parse | return false
+  let some key ← readUsageSidecar mod.usekeyFile UsekeySidecar.parse | return false
+  if usage.noskip || key.localHash != presetup.localTrace.hash then
+    return false
+  let importArts := (← mkModuleSetup mod presetup).importArts
+  for (m, consts) in usage.used do
+    let some olean := (importArts.find? m).bind (·.olean?) | return false
+    let some imp ← readUsageSidecar (olean.withExtension "usage") UsageSidecar.parse | return false
+    for (c, d) in consts do
+      unless imp.own.find? c == some d do return false
+  for m in usage.extra do
+    let some (oleanHash, digest) := key.extra.find? m | return false
+    let some olean := (importArts.find? m).bind (·.olean?) | return false
+    unless (← fetchFileHash olean) == oleanHash do return false
+    let some imp ← readUsageSidecar (olean.withExtension "usage") UsageSidecar.parse | return false
+    unless imp.moduleDigest == digest do return false
+  return true
+
+/--
+Whether the module's compile may be skipped: cutoff is enabled, the module is neither a
+module-system file nor part of a `precompileModules` library, its artifacts exist, and
+`Module.usageUpToDate` holds. Checks are short-circuited in that order.
+-/
+def Module.canSkipCompile (mod : Module) (presetup : ModulePreSetup) : JobM Bool := do
+  if presetup.isModule || mod.shouldPrecompile then return false
+  unless (← usageCutoffEnabled) do return false
+  unless (← mod.checkArtifactsExist presetup.isModule) do return false
+  mod.usageUpToDate presetup
+
+/--
+Skips compiling a module whose trace is stale if nothing it used changed meaning
+(`Module.canSkipCompile`): replays its saved log and rewrites its trace with `depTrace`.
+Otherwise, builds it.
+-/
+def Module.skipOrBuild (mod : Module) (presetup : ModulePreSetup) (savedTrace : SavedTrace)
+    (depTrace : BuildTrace) : JobM ModuleOutputArtifacts := do
+  let .ok data := savedTrace | mod.buildLean presetup
+  unless (← mod.canSkipCompile presetup) do
+    return ← mod.buildLean presetup
+  updateAction .replay
+  data.log.replay
+  unless (← getNoBuild) do
+    writeBuildTrace mod.traceFile depTrace (data.outputs?.getD .null) data.log
+    removeFileIfExists (mod.traceFile.addExtension "nobuild")
+  mod.computeArtifacts presetup.isModule
 
 /--
 Recursively build a Lean module.
@@ -1108,9 +1270,9 @@ where
             if (← savedTrace.replayIfUpToDate (oldTrace := presetup.srcMTime) mod depTrace) then
               mod.computeArtifacts presetup.isModule
             else
-              mod.buildLean presetup
+              mod.skipOrBuild presetup savedTrace depTrace
         else
-          mod.buildLean presetup
+          mod.skipOrBuild presetup savedTrace depTrace
   trackOutputsIfEnabled arts : JobM ModuleOutputArtifacts := do
     if mod.pkg.isRoot then
       if let some ref := (← getBuildContext).outputsRef? then
