@@ -45,4 +45,9 @@ LAKE_USAGE_CUTOFF=0 test_out "Built Test.B" build Test.B
 printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 5\n' > Test/A.lean
 printf '{' > .lake/build/lib/lean/Test/B.usekey
 test_out "Test/B.usekey" build Test.B
+# a failed rebuild leaves no sidecars behind
+printf 'import Test.A\ndef b : Bool := a\n' > Test/B.lean
+test_err "Test.B" build Test.B
+test_exp ! -f .lake/build/lib/lean/Test/B.usekey
+test_exp ! -f .lake/build/lib/lean/Test/B.usage
 rm -f produced.out
