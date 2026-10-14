@@ -4,9 +4,9 @@ import Lake.Build.ModuleTimes
 
 def main : IO Unit := do
   let dir : System.FilePath := "writeFails"
-  IO.FS.createDirAll (dir / "module-times.json" / "sub")
+  IO.FS.createDirAll (dir / "module-times.tsv" / "sub")
   try
-    Lake.writeModuleTimes (dir / "module-times.json") {}
+    Lake.writeModuleTimesFile (dir / "module-times.tsv") "lake-module-times 3\n"
     IO.println "unexpected success"
   catch e =>
     IO.println s!"write failed: {e}"
