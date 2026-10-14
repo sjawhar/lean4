@@ -1127,9 +1127,9 @@ def closureHash (presetup : ModulePreSetup) (importArts : NameMap ImportArtifact
 /--
 Writes the module's `.usekey` from the `.usage` Lean just wrote: the module's local trace hash, the
 hash of its `.olean` (`oleanHash`), the `modsysHash` of its closure, the `closureHash` of its
-direct imports and, for each `extra` module, the hash of its `.olean` and its current
-`moduleDigest`. Writes nothing if the `.usage`, a direct import's `.usage` or an `extra` module's
-`.usage` is missing, so the module is never skipped.
+direct imports and, for each workspace `extra` module, the hash of its `.olean` and its current
+`moduleDigest`. Writes nothing if the `.usage`, a direct import's `.usage` or a workspace `extra`
+module's `.usage` is missing, so the module is never skipped.
 -/
 def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     (importArts : NameMap ImportArtifacts) (oleanHash : Hash) : JobM Unit := do
@@ -1137,6 +1137,7 @@ def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
   let some closure ← closureHash presetup importArts | return
   let mut extra := #[]
   for m in usage.extra do
+    if (← findModule? m).isNone then continue
     let some (olean, imp) ← importUsage? importArts m | return
     extra := extra.push <|
       Json.arr #[toJson (SidecarName.mk m), toJson (← fetchFileHash olean).hex,
@@ -1177,9 +1178,9 @@ def usageCutoffEnabled : BaseIO Bool :=
 /--
 Whether nothing the module used changed meaning since Lean wrote its `.usage`: its `.olean` and
 local inputs are unchanged, no module-system module in its closure (`importArts`) changed
-(`modsysHash`), its closure is unchanged (`closureHash`), every imported constant it used has the
-same digest in its module's current `.usage`, and every `extra` module has the same `.olean` hash
-and `moduleDigest`.
+(`modsysHash`), its closure is unchanged (`closureHash`), every constant it used from a workspace
+module has the same digest in that module's current `.usage`, and every workspace `extra` module
+has the same `.olean` hash and `moduleDigest`.
 -/
 def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
     (importArts : NameMap ImportArtifacts) : JobM Bool := do
@@ -1190,11 +1191,14 @@ def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
   unless (← fetchFileHash mod.oleanFile) == key.olean do return false
   unless (← modsysHash importArts) == key.modsys do return false
   unless (← closureHash presetup importArts) == some key.closure do return false
+  -- A module outside the workspace is a toolchain module, pinned by the Lean githash in `localTrace`.
   for (m, consts) in usage.used do
+    if (← findModule? m).isNone then continue
     let some (_, imp) ← importUsage? importArts m | return false
     for (c, d) in consts do
       unless imp.own.find? c == some d do return false
   for m in usage.extra do
+    if (← findModule? m).isNone then continue
     let some (oleanHash, digest) := key.extra.find? m | return false
     let some (olean, imp) ← importUsage? importArts m | return false
     unless (← fetchFileHash olean) == oleanHash do return false
