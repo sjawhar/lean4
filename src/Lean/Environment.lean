@@ -27,6 +27,7 @@ import Init.Data.Slice
 import Init.Data.String.TakeDrop
 import Init.Data.Range.Polymorphic.Iterators
 import Init.While
+import Lean.Util.Census
 
 public section
 
@@ -2107,7 +2108,10 @@ where
       let s := extDescr.toEnvExtension.getState (asyncMode := .sync) env
       let prevSize := (← persistentEnvExtensionsRef.get).size
       let prevAttrSize ← getNumBuiltinAttributes
+      let importT0 ← IO.monoNanosNow
       let newState ← extDescr.addImportedFn s.importedEntries { env := env, opts := opts }
+      let importT1 ← IO.monoNanosNow
+      Census.recordImportExt extDescr.name (importT1 - importT0)
       let mut env := extDescr.toEnvExtension.setState (asyncMode := .sync) env { s with state := newState }
       if extDescr.name == `Lean.regularInitAttr then
         -- Run `[init]` attributes now. We do this after `setState` so `runInitAttrs` can access
@@ -2624,14 +2628,18 @@ def importModules (imports : Array Import) (opts : Options) (trustLevel : UInt32
     (plugins : Array Plugin := #[]) (leakEnv := false) (loadExts := false)
     (level := OLeanLevel.private) (arts : NameMap ImportArtifacts := {})
     : IO Environment := profileitIO "import" opts do
+  let importTotalT0 ← IO.monoNanosNow
   for imp in imports do
     if imp.module matches .anonymous then
       throw <| IO.userError "import failed, trying to import module with anonymous name"
-  withImporting do
+  let env ← withImporting do
     plugins.forM fun {path, initFn?} => Lean.loadPlugin path initFn?
     let (_, s) ← importModulesCore (globalLevel := level) imports arts |>.run
     finalizeImport (leakEnv := leakEnv) (loadExts := loadExts) (level := level)
       s imports opts trustLevel
+  let importTotalT1 ← IO.monoNanosNow
+  Census.recordImportTotal (importTotalT1 - importTotalT0)
+  return env
 
 /--
 Creates environment object from imports and frees compacted regions after calling `act`. No live

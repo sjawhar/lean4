@@ -12,6 +12,7 @@ import Std.Data.HashMap.Basic
 import Std.Data.HashSet.Basic
 import Init.Data.Array.QSort
 import Init.While
+import Lean.Util.Census
 
 namespace Lean
 
@@ -493,6 +494,23 @@ public def collectDuplicates (trees : Array (Nat × ConstTrie α))
   if trees.size < 2 then #[]
   else collectDupsAux covered .anonymous trees #[]
 
+/-- Times forcing one of `mergeLazy`'s thunks (lean-build-perf#7's lazy constant-trie merge) into
+    `Census.addConstMapForceNs`'s process-wide running total. `Thunk.get` memoizes, so only the
+    first force of a given node actually runs `f` and gets timed; later `get`s are free. No-op
+    overhead beyond the `isEnabled` check when census collection is off. -/
+@[noinline] private unsafe def timeThunkUnsafe (f : Unit → α) : α := unsafeBaseIO do
+  if (← Census.isEnabled) then
+    let t0 ← IO.monoNanosNow
+    let r := f ()
+    let t1 ← IO.monoNanosNow
+    Census.addConstMapForceNs (t1 - t0)
+    return r
+  else
+    return f ()
+
+@[inherit_doc timeThunkUnsafe, implemented_by timeThunkUnsafe] private def timeThunk (f : Unit → α) : α :=
+  f ()
+
 /--
 `mergeCands` without duplicate reporting, producing lazily expanded nodes. `resolve` picks the
 entry stored for a prefix from the candidate entries, given in module order; conflicts must have
@@ -505,8 +523,9 @@ private partial def mergeLazy (resolve : Array (α × Nat) → Option (α × Nat
     .mod i t
   else
     .lazy key
-      (Thunk.mk fun _ => resolve <| cands.filterMap fun (i, t) => t.val?.map ((·, i)))
-      (Thunk.mk fun _ => expandLazy cands)
+      (Thunk.mk fun _ => timeThunk fun _ =>
+        resolve <| cands.filterMap fun (i, t) => t.val?.map ((·, i)))
+      (Thunk.mk fun _ => timeThunk fun _ => expandLazy cands)
 where
   expandLazy (cands : Array (Nat × ConstTrie α)) :
       Array (ImportedConsts α) × ByteArray := Id.run do
