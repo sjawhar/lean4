@@ -1004,9 +1004,18 @@ def Module.recBuildLean (mod : Module) : FetchM (Job ModuleOutputArtifacts) := d
   -/
   withRegisterJob mod.name.toString do
   let presetupJob ← mod.presetup.fetch
-  presetupJob.mapM fun presetup => do
+  let moduleTimes? ← getModuleTimes?
+  let prio := moduleTimes?.map (·.prio mod.name) |>.getD Task.Priority.default
+  presetupJob.mapM (prio := prio) fun presetup => do
     setTrace presetup.trace
+    let before := (← getThe JobState).buildTime
     let arts ← fetchCore presetup
+    if let some mt := moduleTimes? then
+      -- `buildTime` grows only inside `buildAction`, so a skip or a cache restore records nothing.
+      let ms := (← getThe JobState).buildTime - before
+      if ms > 0 then
+        let imports := presetup.directImports.filterMap (·.module?.map (·.name))
+        mt.record {name := mod.name, ms, imports}
     let arts ← trackOutputsIfEnabled arts
     let arts ← adjustMTime arts
     return arts
