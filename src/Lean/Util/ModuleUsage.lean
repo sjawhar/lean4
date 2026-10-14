@@ -119,8 +119,11 @@ builtin_initialize ext : PersistentEnvExtension (Name × UInt64) (Name × UInt64
     mkInitial := pure {}
     addImportedFn := fun es => pure { importedModuleEntries := es }
     addEntryFn := fun s _ => s
+    -- Private level only: digests cover private constants and unexposed bodies, which must not change the
+    -- exported `.olean` of a `module` file. Non-module files are written and read at the private level.
     exportEntriesFnEx := fun env s =>
-      .uniform ((compute env s).push (markerName, 1) |>.qsort fun a b => Name.quickLt a.1 b.1)
+      let es := (compute env s).push (markerName, 1) |>.qsort fun a b => Name.quickLt a.1 b.1
+      { exported := #[], server := #[], «private» := es }
     asyncMode := .mainOnly
   }
 
