@@ -35,15 +35,15 @@ where
       | .mvar m => pure (mixHash 29 (hash m.name))
       | .sort l => pure (mixHash 31 (levelHash l))
       | .const n ls => pure (ls.foldl (fun h l => mixHash h (levelHash l)) (mixHash 37 (hash n)))
-      | .app f a => return mixHash 41 (mixHash (← go f) (← go a))
-      | .lam n t b bi => return mixHash (binderHash 43 n bi) (mixHash (← go t) (← go b))
-      | .forallE n t b bi => return mixHash (binderHash 47 n bi) (mixHash (← go t) (← go b))
+      | .app f a => pure (mixHash 41 (mixHash (← go f) (← go a)))
+      | .lam n t b bi => pure (mixHash (binderHash 43 n bi) (mixHash (← go t) (← go b)))
+      | .forallE n t b bi => pure (mixHash (binderHash 47 n bi) (mixHash (← go t) (← go b)))
       | .letE n t v b nd =>
-        return mixHash (binderHash 53 n .default) (mixHash (hash nd) (mixHash (← go t) (mixHash (← go v) (← go b))))
+        pure (mixHash (binderHash 53 n .default) (mixHash (hash nd) (mixHash (← go t) (mixHash (← go v) (← go b)))))
       | .lit (.natVal n) => pure (mixHash 59 (hash (toString n)))
       | .lit (.strVal s) => pure (mixHash 61 (hash s))
       | .mdata _ b => go b
-      | .proj s i b => return mixHash 67 (mixHash (hash s) (mixHash (hash i) (← go b)))
+      | .proj s i b => pure (mixHash 67 (mixHash (hash s) (mixHash (hash i) (← go b))))
     modify (·.insert e h)
     return h
 
