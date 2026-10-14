@@ -1,0 +1,1 @@
+{"decls":{"b":[1,0,1,14,1,4,1,5]},"directImports":[["Test.A",false,false,false]],"module":"Test.B","references":{"{\"c\":{\"m\":\"Test.A\",\"n\":\"a\"}}":{"definition":null,"usages":[[1,9,1,10,"b"]]},"{\"c\":{\"m\":\"Test.B\",\"n\":\"b\"}}":{"definition":[1,4,1,5],"usages":[]}},"version":5}
