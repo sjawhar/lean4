@@ -147,12 +147,7 @@ def Package.fetchBuildArchive
     download url archiveFile headers
   unless upToDate && (← self.buildDir.pathExists) do
     updateAction .unpack
-    -- The archive may replace `.olean`s without shipping their `.usage`/`.usekey`. Usage cutoff
-    -- would then compare against digests of the replaced builds, so drop every old sidecar first.
-    if (← self.buildDir.pathExists) then
-      for p in (← self.buildDir.walkDir) do
-        if p.extension == some "usage" || p.extension == some "usekey" then
-          IO.FS.removeFile p
+    removeUsageSidecars self.buildDir
     untar archiveFile self.buildDir
 
 @[inline]

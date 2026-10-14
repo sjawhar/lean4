@@ -64,4 +64,15 @@ printf 'import Test.K\ntheorem t : c = 1 := rfl\n' > Test/N.lean
 test_run build Test.N
 printf 'module\npublic def d : Nat := 2\n' > Test/U.lean
 test_err "Building Test.N" build -v Test.N
+# `lake unpack` of an archive that ships no sidecars (e.g. built by another toolchain) drops the
+# old ones, without following a symlink out of the build directory
+test_exp -f .lake/build/lib/lean/Test/A.usage
+mkdir -p outside stock
+printf '{' > outside/keep.usage
+ln -s "$PWD/outside" .lake/build/link
+tar -czf stock.tgz -C stock .
+test_run unpack stock.tgz
+test_exp ! -f .lake/build/lib/lean/Test/A.usage
+test_exp ! -f .lake/build/lib/lean/Test/A.usekey
+test_exp -f outside/keep.usage
 rm -f produced.out
