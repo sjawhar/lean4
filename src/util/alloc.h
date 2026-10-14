@@ -9,6 +9,7 @@ Authors: Sebastian Ullrich
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <optional>
 #include "util/unordered_dense.h"
 
 #ifdef LEAN_MIMALLOC
@@ -61,4 +62,20 @@ template<
     class Hash = ankerl::unordered_dense::hash<Key>,
     class KeyEqual = std::equal_to<Key>
 > using dense_set = ankerl::unordered_dense::set<Key, Hash, KeyEqual, lean::allocator<Key>>;
+
+// A `dense_map`/`dense_set` that allocates nothing until its first insert, for caches constructed
+// per call (one per `instantiate`, say) that most calls never fill: a default-constructed dense
+// table allocates its initial buckets, unlike `unordered_map/set`. Supports `find`/`end`/`insert`.
+template<class Table>
+class lazy_table {
+    std::optional<Table> m_table;
+public:
+    using iterator = typename Table::iterator;
+    iterator find(typename Table::key_type const & k) { return m_table ? m_table->find(k) : iterator(); }
+    iterator end() { return m_table ? m_table->end() : iterator(); }
+    template<class V> std::pair<iterator, bool> insert(V && v) {
+        if (!m_table) m_table.emplace();
+        return m_table->insert(std::forward<V>(v));
+    }
+};
 };
