@@ -21,8 +21,9 @@ path first, and writes back the modules it compiled.
 The file is a header line `lake-module-times 3`, then one line per module, sorted by encoded name:
 `<ms>\t<rem>\t<name>\t<import> <import> ...`, where `ms` is the module's last compile time,
 `rem` its remaining path when the file was written, and each import is the index (from 0) of the
-imported module's line among the module lines. Imports of modules with no line of their own are
-not kept: they would add nothing to a remaining path.
+imported module's line among the module lines. A module with no compile time of its own has `ms`
+0, no imports, and a line only while some line imports it, so that the edge survives until the
+module is compiled and timed.
 
 A name is written as its components joined by `.`. In a component, the characters `%`, `.`,
 space, tab, CR and LF are written `%XX` (two uppercase hex digits); an empty component is `%-`, a
@@ -47,6 +48,9 @@ public structure ModuleTimeEntry where
 
 /-- The record's file name inside the workspace's Lake directory. -/
 public def moduleTimesFileName : FilePath := "module-times.tsv"
+
+/-- The file name of the records of older Lakes (formats 1 and 2), which this one does not read. -/
+public def legacyModuleTimesFileName : String := "module-times.json"
 
 /-- The record's first line. -/
 public def moduleTimesHeader : String := "lake-module-times 3"
@@ -323,9 +327,18 @@ private def parseModuleTimes (s : String) : Except String ModuleTimeRecord := do
     throw s!"line {topLine}: import index {top}, but there are {rows.size} lines"
   return {contents := s, rows}
 
-/-- Reads the record. A missing file is an empty record; a file that does not parse is an error naming the file. -/
+/--
+Reads the record. A missing file is an empty record, unless an older Lake's record
+(`legacyModuleTimesFileName`) is beside it; that, and a file that does not parse, is an error naming
+the file.
+-/
 public def readModuleTimes (path : FilePath) : IO ModuleTimeRecord := do
-  unless (← path.pathExists) do return {}
+  unless (← path.pathExists) do
+    let legacy := path.withFileName legacyModuleTimesFileName
+    if ← legacy.pathExists then
+      throw <| IO.userError s!"{legacy}: a module-times record from an older Lake; \
+        delete it to start a new record"
+    return {}
   match parseModuleTimes (← IO.FS.readFile path) with
   | .ok r => return r
   | .error e => throw <| IO.userError s!"{path}: {e}; delete it to start a new record"
@@ -460,7 +473,7 @@ private def keepRows (rows : Array ModuleTimeRow) (fresh seen : Name → Bool)
   let mut paths : Array FilePath := #[]
   for h : i in [0:rows.size] do
     let name := rows[i].name
-    if fresh name then
+    if fresh name || rows[i].ms == 0 then
       flags := flags.push 0
     else if seen name then
       flags := flags.push 1
@@ -480,18 +493,41 @@ private def keepRows (rows : Array ModuleTimeRow) (fresh seen : Name → Bool)
       if found[j] then flags := flags.set! ask[start + j]! 1
   return flags
 
-/-- A line of the record being written: a row kept from the file, or an entry from this build. -/
+/--
+A line of the record being written: a row of the file kept as it is, a row of the file kept only
+as an import (`hollow`: no time, no imports), an entry from this build, or a module that is only
+imported by one (`extra`: no time, no imports).
+-/
 private inductive OutLine
   | kept (row : Nat)
+  | hollow (row : Nat)
   | fresh (entry : Nat)
+  | extra (name : Nat)
   deriving Inhabited
+
+/-- The index `i < n` where `cmp i` is `.eq`, if any, for `cmp` increasing in `i`. -/
+private def bsearch (n : Nat) (cmp : Nat → Ordering) : Option Nat := Id.run do
+  let mut lo := 0
+  let mut hi := n
+  while lo < hi do
+    let mid := (lo + hi) / 2
+    match cmp mid with
+    | .lt => lo := mid + 1
+    | .gt => hi := mid
+    | .eq => return some mid
+  return none
 
 /--
 Writes this build's entries over the record as it is on disk now, and recomputes every remaining
-path. A row from the file is kept if its module was not compiled again and either its compile job
-ran in this build or `sourceOf` resolves it to a source file that exists. If the file's size or
-modification time changed since `load` (another Lake process saved it during this build), the file
-is read again, so that process's entries survive; otherwise the record read by `load` is reused.
+path. If the file's size or modification time changed since `load` (another Lake process saved it
+during this build), the file is read again, so that process's entries survive; otherwise the
+record read by `load` is reused.
+
+A row with a compile time is kept if its module was not compiled again and either its compile job
+ran in this build or `sourceOf` resolves it to a source file that exists. A module with no time of
+its own (`ms` 0) has a line while some line imports it, so the edge outlives the build that saw it:
+when the module is compiled later, its new line takes the importer's path into its remaining path.
+
 Writes nothing and returns 0 when this build compiled nothing; otherwise returns how many entries
 this build recorded.
 -/
@@ -510,12 +546,10 @@ public def ModuleTimes.save (self : ModuleTimes) (sourceOf : Name → Option Fil
     newMap.fold (init := #[]) (fun a _ e => a.push (encodeModuleName e.name, e))
       |>.qsort (·.1 < ·.1)
   let seen : Std.HashSet Name := (← self.seen.get).foldl (·.insert ·) {}
-  let kept ← keepRows rows newMap.contains seen.contains sourceOf
-  -- The lines to write, in name order, and the line each row of the file maps to: its own line if
-  -- kept, this build's entry for the module if it was compiled again, or none.
-  let noLine := rows.size + fresh.size
-  let mut lines : Array OutLine := Array.mkEmpty (rows.size + fresh.size)
-  let mut lineOf : Array Nat := Array.replicate rows.size noLine
+  let kept ← keepRows rows (fun n => newMap.contains n) seen.contains sourceOf
+  -- What becomes of each row: 0 dropped, 1 kept, 2 replaced by this build's entry, 3 hollow.
+  let mut status := ByteArray.mk (Array.replicate rows.size 0)
+  let mut replacedBy : Array Nat := Array.replicate rows.size 0
   let mut k := 0
   for h : i in [0:rows.size] do
     let row := rows[i]
@@ -523,33 +557,82 @@ public def ModuleTimes.save (self : ModuleTimes) (sourceOf : Name → Option Fil
     while h : k < fresh.size do
       order := compareRange s row.keyStart row.keyStop fresh[k].1
       unless order == .gt do break
-      lines := lines.push (.fresh k)
       k := k + 1
     if k < fresh.size && order == .eq then
-      lineOf := lineOf.set! i lines.size
-      lines := lines.push (.fresh k)
-      k := k + 1
+      status := status.set! i 2
+      replacedBy := replacedBy.set! i k
     else if kept.get! i != 0 then
-      lineOf := lineOf.set! i lines.size
-      lines := lines.push (.kept i)
-  for j in [k:fresh.size] do
-    lines := lines.push (.fresh j)
-  -- The line of a module, by its encoded name (binary search).
-  let keyCmp (l : Nat) (key : String) : Ordering :=
-    match lines[l]! with
-    | .kept i => compareRange s rows[i]!.keyStart rows[i]!.keyStop key
-    | .fresh j => let k := fresh[j]!.1; compareRange k 0 k.utf8ByteSize key
-  let findLine (key : String) : Option Nat := Id.run do
-    let mut lo := 0
-    let mut hi := lines.size
-    while lo < hi do
-      let mid := (lo + hi) / 2
-      match keyCmp mid key with
-      | .lt => lo := mid + 1
-      | .gt => hi := mid
-      | .eq => return some mid
-    return none
-  -- Each line's imports, as line indices; imports of modules with no line are dropped.
+      status := status.set! i 1
+  let findFresh (key : String) : Option Nat :=
+    bsearch fresh.size fun j => let f := fresh[j]!.1; compareRange f 0 f.utf8ByteSize key
+  let findRow (key : String) : Option Nat :=
+    bsearch rows.size fun i => compareRange s rows[i]!.keyStart rows[i]!.keyStop key
+  -- Modules imported by a kept row or by this build's entries keep a line, hollow if need be.
+  for h : i in [0:rows.size] do
+    if status.get! i != 1 then continue
+    for r in importIndices s rows[i].impStart rows[i].impStop do
+      if status.get! r == 0 && rows[r]!.ms == 0 then status := status.set! r 3
+  let mut extraSet : Std.HashSet String := {}
+  for (_, e) in fresh do
+    for imp in e.imports do
+      let key := encodeModuleName imp
+      if (findFresh key).isSome then continue
+      match findRow key with
+      | some r => if status.get! r == 0 then status := status.set! r 3
+      | none => extraSet := extraSet.insert key
+  let extras := extraSet.toArray.qsort (· < ·)
+  -- The lines, merging the three sorted, disjoint streams: kept and hollow rows, this build's
+  -- entries, and the extra imported modules.
+  let noLine := rows.size + fresh.size + extras.size
+  let mut lines : Array OutLine := Array.mkEmpty noLine
+  let mut lineOf : Array Nat := Array.replicate rows.size noLine
+  let mut freshLine : Array Nat := Array.replicate fresh.size noLine
+  let mut extraLine : Array Nat := Array.replicate extras.size noLine
+  let mut ri := 0
+  let mut fj := 0
+  let mut ex := 0
+  while true do
+    while ri < rows.size do
+      let st := status.get! ri
+      if st == 1 || st == 3 then break
+      ri := ri + 1
+    -- The smallest head: 0 a row, 1 an entry, 2 an extra, 3 none left.
+    let mut pick := 3
+    if ri < rows.size then pick := 0
+    if h : fj < fresh.size then
+      if pick == 3 || compareRange s rows[ri]!.keyStart rows[ri]!.keyStop fresh[fj].1 == .gt then
+        pick := 1
+    if h : ex < extras.size then
+      let e := extras[ex]
+      let below : Bool := match pick with
+        | 0 => compareRange s rows[ri]!.keyStart rows[ri]!.keyStop e == .gt
+        | 1 => let f := fresh[fj]!.1; compareRange f 0 f.utf8ByteSize e == .gt
+        | _ => true
+      if below then pick := 2
+    match pick with
+    | 0 =>
+      lineOf := lineOf.set! ri lines.size
+      lines := lines.push (if status.get! ri == 1 then .kept ri else .hollow ri)
+      ri := ri + 1
+    | 1 =>
+      freshLine := freshLine.set! fj lines.size
+      lines := lines.push (.fresh fj)
+      fj := fj + 1
+    | 2 =>
+      extraLine := extraLine.set! ex lines.size
+      lines := lines.push (.extra ex)
+      ex := ex + 1
+    | _ => break
+  for h : r in [0:rows.size] do
+    if status.get! r == 2 then lineOf := lineOf.set! r freshLine[replacedBy[r]!]!
+  let lineOfKey (key : String) : Option Nat :=
+    match findFresh key with
+    | some j => some freshLine[j]!
+    | none => match findRow key with
+      | some r => let l := lineOf[r]!; if l == noLine then none else some l
+      | none => (bsearch extras.size fun x => let e := extras[x]!; compareRange e 0 e.utf8ByteSize key).map
+          (extraLine[·]!)
+  -- Each line's time and imports, as line indices.
   let mut ms : Array Nat := Array.mkEmpty lines.size
   let mut imports : Array (Array Nat) := Array.mkEmpty lines.size
   for l in lines do
@@ -563,7 +646,10 @@ public def ModuleTimes.save (self : ModuleTimes) (sourceOf : Name → Option Fil
     | .fresh j =>
       let e := fresh[j]!.2
       ms := ms.push e.ms
-      imports := imports.push <| e.imports.filterMap (findLine <| encodeModuleName ·)
+      imports := imports.push <| e.imports.filterMap (lineOfKey <| encodeModuleName ·)
+    | .hollow _ | .extra _ =>
+      ms := ms.push 0
+      imports := imports.push #[]
   let mut importers : Array (Array Nat) := Array.replicate lines.size #[]
   for h : l in [0:imports.size] do
     for i in imports[l] do
@@ -574,8 +660,9 @@ public def ModuleTimes.save (self : ModuleTimes) (sourceOf : Name → Option Fil
     out := pushNat out ms[l]! |>.push '\t'
     out := pushNat out rem[l]! |>.push '\t'
     out := match lines[l] with
-      | .kept i => out ++ slice s rows[i]!.keyStart rows[i]!.keyStop
+      | .kept i | .hollow i => out ++ slice s rows[i]!.keyStart rows[i]!.keyStop
       | .fresh j => out ++ fresh[j]!.1
+      | .extra x => out ++ extras[x]!
     out := out.push '\t'
     let imps := imports[l]!
     for h : m in [0:imps.size] do

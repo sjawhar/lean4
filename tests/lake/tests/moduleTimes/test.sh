@@ -37,6 +37,23 @@ sys.exit(0 if sys.argv[2] in imports.get(sys.argv[1], []) else 1)
 ' "$@"
 }
 
+# rec_check EXPR: the Python expression EXPR holds over the record, where `ms(NAME)` and `rem(NAME)`
+# read NAME's line.
+rec_check() {
+  echo "? $1"
+  python3 -c '
+import sys
+with open(".lake/module-times.tsv") as f:
+    assert next(f) == "lake-module-times 3\n"
+    rows = {r[2]: r for r in (line.rstrip("\n").split("\t") for line in f)}
+ms = lambda n: int(rows[n][0])
+rem = lambda n: int(rows[n][1])
+names = [n for n in rows if n in sys.argv[1]]
+print({n: (ms(n), rem(n)) for n in names})
+sys.exit(0 if eval(sys.argv[1]) else 1)
+' "$1"
+}
+
 # No record: stock order, the first import starts first. The build writes a record.
 LEAN_NUM_THREADS=1 test_run build
 test_cmd_eq "Test.Quick1" head -n1 order.txt
@@ -54,13 +71,34 @@ test_cmd_eq "Test.Slow" head -n1 order.txt
 test_run build main
 has_row Main
 
-# A module compiled again whose importer is not: the importer's kept line still imports it.
+# A module compiled again whose importer is not: the importer's kept line still imports it, and the
+# module's remaining path includes the importer's.
 cp Test/Quick1.lean Test/Quick1.lean.bak
 printf -- '-- touched\n' >> Test/Quick1.lean
 test_run build Test.Quick1
 has_import Test Test.Quick1
 has_import Test Test.SlowTop
+rec_check 'rem("Test.Quick1") == ms("Test.Quick1") + rem("Test")'
 mv Test/Quick1.lean.bak Test/Quick1.lean
+
+# An import with no line of its own (here: the record is gone, and only `Test` recompiles) gets a
+# line with no time, so the edge survives until the import is compiled, by a build that does not
+# recompile its importer.
+test_run build
+cp $REC .lake/module-times.tsv.saved
+rm $REC
+cp Test.lean Test.lean.bak
+printf -- '-- touched\n' >> Test.lean
+test_run build
+has_row Test.Quick1 0
+has_import Test Test.Quick1
+cp Test/Quick1.lean Test/Quick1.lean.bak
+printf -- '-- touched again\n' >> Test/Quick1.lean
+test_run build Test.Quick1
+has_import Test Test.Quick1
+rec_check 'ms("Test.Quick1") > 0 and rem("Test.Quick1") == ms("Test.Quick1") + rem("Test")'
+mv Test.lean.bak Test.lean; mv Test/Quick1.lean.bak Test/Quick1.lean
+mv .lake/module-times.tsv.saved $REC
 
 # A module whose source is gone leaves the record at the next build that compiles something.
 # Entries of modules this build did not compile stay: the executable's root, and the escaped name,
@@ -103,6 +141,9 @@ printf -- '-- touched\n' >> Test.lean
 test_run build
 has_row Test.Quick1 5000
 has_row Test.Quick2 5000
+# Each remaining path takes in `Test` (which imports both), and the edge that closes the cycle
+# counts 0, so exactly one of the two takes in the other.
+rec_check 'rem("Test.Quick1") >= 5000 + ms("Test") and rem("Test.Quick2") >= 5000 + ms("Test") and (rem("Test.Quick1") == 5000 + rem("Test.Quick2")) != (rem("Test.Quick2") == 5000 + rem("Test.Quick1"))'
 mv Test.lean.bak Test.lean
 
 # A record that does not parse fails loudly, naming the file.
@@ -121,5 +162,11 @@ printf 'lake-module-times 3\n1\t1\tTest.Quick1\t5\n' > $REC
 test_err "module-times.tsv: line 2: import index 5, but there are 1 lines" build
 printf 'lake-module-times 3\n1\t1\tTest.Quick2\t\n1\t1\tTest.Quick1\t\n' > $REC
 test_err "line 3: 'Test.Quick1' is not after 'Test.Quick2'" build
+
+# An older Lake's record, with no record of this format beside it, fails loudly, naming the file.
+rm $REC
+echo '{"version":2,"names":[],"modules":[]}' > .lake/module-times.json
+test_err "module-times.json: a module-times record from an older Lake; delete it to start a new record" build
+rm .lake/module-times.json
 
 ./clean.sh
