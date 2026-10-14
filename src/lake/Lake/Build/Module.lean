@@ -1177,6 +1177,8 @@ def Module.recBuildElabArts (mod : Module) : FetchM (Job ModuleOutputArtifacts) 
   let prio := moduleTimes?.map (·.prio mod.name) |>.getD Task.Priority.default
   presetupJob.mapM (prio := prio) fun presetup => do
     setTrace presetup.trace
+    -- Its presetup read the source, so the record keeps this module's line without checking it.
+    if let some mt := moduleTimes? then mt.markSeen mod.name
     let before := (← getThe JobState).buildTime
     let arts ← fetchCore presetup
     if let some mt := moduleTimes? then
