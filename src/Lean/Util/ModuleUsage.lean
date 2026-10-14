@@ -90,6 +90,8 @@ def markerName : Name := `_moduleUsage
 
 structure State where
   importedModuleEntries : Array (Array (Name × UInt64)) := #[]
+  /-- The current module's digests, if `setLocalDigests` stored them for the `.olean` write. -/
+  localDigests? : Option (Array (Name × UInt64)) := none
 instance : Inhabited State := ⟨{}⟩
 
 /-- The digest of `c` if module `i` (the module defining `c`) wrote one. -/
@@ -134,17 +136,21 @@ builtin_initialize ext : PersistentEnvExtension (Name × UInt64) (Name × UInt64
     -- Private level only: digests cover private constants and unexposed bodies, which must not change the
     -- exported `.olean` of a `module` file. Non-module files are written and read at the private level.
     exportEntriesFnEx := fun env s =>
-      let es := (compute env s).push (markerName, 1) |>.qsort fun a b => Name.quickLt a.1 b.1
+      let es := (s.localDigests?.getD (compute env s)).push (markerName, 1)
+        |>.qsort fun a b => Name.quickLt a.1 b.1
       { exported := #[], server := #[], «private» := es }
     asyncMode := .mainOnly
   }
 
 def state (env : Environment) : State := ext.getState (asyncMode := .mainOnly) env
 
-def importedDigest? (env : Environment) (c : Name) : Option UInt64 := (state env).find? env c
-
 def localDigests (env : Environment) (consts := ownConsts env) : Array (Name × UInt64) :=
   compute env (state env) consts
+
+/-- Stores `own` (`localDigests env`) for the extension to export, so writing the `.olean` does not compute
+them again. -/
+def setLocalDigests (env : Environment) (own : Array (Name × UInt64)) : Environment :=
+  ext.modifyState (asyncMode := .mainOnly) env ({ · with localDigests? := some own })
 
 /-- Per defining module, sorted: every imported constant that the current module's own constants refer to or
 that is in `extra`, with its digest. Constants without a digest (from a module built without this extension) are
@@ -231,12 +237,12 @@ where
     | .str p s, h => mixHash (go p h) (mixHash 107 (hash s))
     | .num p k, h => mixHash (go p h) (mixHash 109 (hash k))
 
-/-- `extra` lists the extra module uses of the environment and of `extraModUsesByChecksRef` (those of commands
-whose environment was discarded). With `incrLoaded` (the run reused commands from an `--incr-load` snapshot),
-`noskip` is set: reused commands never call `addDecl` in this process, so `extra` may miss constants they used. -/
-def writeUsage (env : Environment) (extra : NameSet) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
-  let consts := ownConsts env
-  let own := localDigests env consts
+/-- `own` is `localDigests env consts`. `extra` lists the extra module uses of the environment and of
+`extraModUsesByChecksRef` (those of commands whose environment was discarded). With `incrLoaded` (the run reused
+commands from an `--incr-load` snapshot), `noskip` is set: reused commands never call `addDecl` in this process,
+so `extra` may miss constants they used. -/
+def writeUsage (env : Environment) (consts : Array (Name × ConstantInfo × Array Name))
+    (own : Array (Name × UInt64)) (extra : NameSet) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
   let noskip := incrLoaded || consts.any fun (_, _, rs) => rs.any (· matches ``Lean.reduceBool | ``Lean.reduceNat)
   let s := state env
   let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecksRef.get)
