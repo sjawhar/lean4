@@ -152,10 +152,12 @@ def moduleUsed (env : Environment) (extra : NameSet) : Array (Name × Array (Nam
 def hex16 (v : UInt64) : String :=
   let s := String.ofList (Nat.toDigits 16 v.toNat); "".pushn '0' (16 - s.length) ++ s
 
-def writeUsage (env : Environment) (extra : NameSet) (path : System.FilePath) : IO Unit := do
+/-- With `incrLoaded` (the run reused commands from an `--incr-load` snapshot), `noskip` is set: reused commands
+never call `addDecl` in this process, so `extra` may miss constants they used. -/
+def writeUsage (env : Environment) (extra : NameSet) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
   let own := localDigests env
   let privEnv := env.setExporting false
-  let noskip := own.any fun (n, _) => ((privEnv.find? n).map (refs env) |>.getD #[]).any
+  let noskip := incrLoaded || own.any fun (n, _) => ((privEnv.find? n).map (refs env) |>.getD #[]).any
     (· matches ``Lean.reduceBool | ``Lean.reduceNat)
   let s := state env
   let extraMods := (getLocalExtraModUses env).filter fun u =>

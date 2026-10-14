@@ -391,7 +391,7 @@ def runFrontend
         | .ofTermInfo ti => (instantiateMVarsCore ctx.mctx ti.expr).1.foldConsts s fun c s => s.insert c
         | .ofFieldInfo fi => s.insert fi.projName
         | _ => s
-    ModuleUsage.writeUsage env used (oleanFileName.withExtension "usage")
+    ModuleUsage.writeUsage env used (incrLoaded := incrLoadFileName?.isSome) (oleanFileName.withExtension "usage")
 
   if let some ileanFileName := ileanFileName? then
     let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
