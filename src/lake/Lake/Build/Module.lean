@@ -993,6 +993,8 @@ structure UsageSidecar where
 /-- A module's `.usekey` sidecar: what Lake saw of the module's build when Lean wrote its `.usage`. -/
 structure UsekeySidecar where
   localHash : Hash
+  /-- The hash of the module's own `.olean` when the key was written. -/
+  olean : Hash
   /-- `modsysHash` of the module's import closure. -/
   modsys : Hash
   /-- For each `extra` module of the `.usage`: the hash of its `.olean` and its `moduleDigest`. -/
@@ -1041,13 +1043,14 @@ end UsageSidecar
 def UsekeySidecar.parse (j : Json) : Except String UsekeySidecar := do
   UsageSidecar.checkVersion j
   let localHash ← UsageSidecar.parseHash (← j.getObjVal? "local")
+  let olean ← UsageSidecar.parseHash (← j.getObjVal? "olean")
   let modsys ← UsageSidecar.parseHash (← j.getObjVal? "modsys")
   let extra ← (← (← j.getObjVal? "extra").getArr?).foldlM (init := ({} : NameMap (Hash × Hash)))
     fun m e => do
       let #[n, o, d] ← e.getArr? | throw s!"expected a triple, got {e.compress}"
       return m.insert (← UsageSidecar.parseName n)
         (← UsageSidecar.parseHash o, ← UsageSidecar.parseHash d)
-  return {localHash, modsys, extra}
+  return {localHash, olean, modsys, extra}
 
 /--
 Reads a usage-cutoff sidecar. Returns `none` if it does not exist. If it exists but is not valid,
@@ -1085,12 +1088,12 @@ def modsysHash (importArts : NameMap ImportArtifacts) : JobM Hash := do
 
 /--
 Writes the module's `.usekey` from the `.usage` Lean just wrote: the module's local trace hash, the
-`modsysHash` of its closure and, for each `extra` module, the hash of its `.olean` and its current
-`moduleDigest`. Writes nothing if the `.usage` or an `extra` module's `.usage` is missing, so the
-module is never skipped.
+hash of its `.olean` (`oleanHash`), the `modsysHash` of its closure and, for each `extra` module,
+the hash of its `.olean` and its current `moduleDigest`. Writes nothing if the `.usage` or an
+`extra` module's `.usage` is missing, so the module is never skipped.
 -/
 def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
-    (importArts : NameMap ImportArtifacts) : JobM Unit := do
+    (importArts : NameMap ImportArtifacts) (oleanHash : Hash) : JobM Unit := do
   let some usage ← readUsageSidecar mod.usageFile UsageSidecar.parse | return
   let mut extra := #[]
   for m in usage.extra do
@@ -1101,6 +1104,7 @@ def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
   let key := Json.mkObj [
     ("version", 1),
     ("local", toJson presetup.localTrace.hash.hex),
+    ("olean", toJson oleanHash.hex),
     ("modsys", toJson (← modsysHash importArts).hex),
     ("extra", Json.arr extra)
   ]
@@ -1118,7 +1122,7 @@ def Module.buildLean
     (← getLeanPath) (← getLean) (← getLeanir)
   mod.clearOutputHashes
   let arts ← mod.computeArtifacts setup.isModule
-  mod.writeUsekey presetup setup.importArts
+  mod.writeUsekey presetup setup.importArts arts.olean.hash
   return arts
 
 /-- Usage cutoff is on unless `LAKE_USAGE_CUTOFF=0`. -/
@@ -1126,16 +1130,17 @@ def usageCutoffEnabled : BaseIO Bool :=
   return (← IO.getEnv "LAKE_USAGE_CUTOFF") != some "0"
 
 /--
-Whether nothing the module used changed meaning since Lean wrote its `.usage`: its local inputs
-are unchanged, no module-system module in its closure changed (`modsysHash`), every imported
-constant it used has the same digest in its module's current `.usage`, and every `extra` module
-has the same `.olean` hash and `moduleDigest`.
+Whether nothing the module used changed meaning since Lean wrote its `.usage`: its `.olean` and
+local inputs are unchanged, no module-system module in its closure changed (`modsysHash`), every
+imported constant it used has the same digest in its module's current `.usage`, and every `extra`
+module has the same `.olean` hash and `moduleDigest`.
 -/
 def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup) : JobM Bool := do
   let some usage ← readUsageSidecar mod.usageFile UsageSidecar.parse | return false
   let some key ← readUsageSidecar mod.usekeyFile UsekeySidecar.parse | return false
   if usage.noskip || key.localHash != presetup.localTrace.hash then
     return false
+  unless (← fetchFileHash mod.oleanFile) == key.olean do return false
   let importArts := (← mkModuleSetup mod presetup).importArts
   unless (← modsysHash importArts) == key.modsys do return false
   for (m, consts) in usage.used do
