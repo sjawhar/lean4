@@ -5,6 +5,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 Author: Leonardo de Moura
 */
 #include "kernel/init_module.h"
+#include "kernel/kernel_cache.h"
 #include "kernel/environment.h"
 #include "kernel/type_checker.h"
 #include "kernel/expr.h"
@@ -21,6 +22,7 @@ void initialize_kernel_module() {
     initialize_expr();
     initialize_declaration();
     initialize_type_checker();
+    initialize_kernel_cache();
     initialize_environment();
     initialize_local_ctx();
     initialize_inductive();
@@ -34,6 +36,7 @@ void finalize_kernel_module() {
     finalize_inductive();
     finalize_local_ctx();
     finalize_environment();
+    finalize_kernel_cache();
     finalize_type_checker();
     finalize_declaration();
     finalize_expr();

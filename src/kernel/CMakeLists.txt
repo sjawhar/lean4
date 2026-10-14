@@ -12,6 +12,7 @@ add_library(
   declaration.cpp
   environment.cpp
   type_checker.cpp
+  kernel_cache.cpp
   init_module.cpp
   expr_cache.cpp
   quot.cpp

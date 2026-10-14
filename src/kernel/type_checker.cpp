@@ -22,6 +22,7 @@ Author: Leonardo de Moura
 #include "kernel/for_each_fn.h"
 #include "kernel/quot.h"
 #include "kernel/inductive.h"
+#include "kernel/kernel_cache.h"
 
 namespace lean {
 static name * g_kernel_fresh = nullptr;
@@ -329,9 +330,20 @@ expr type_checker::infer_type_core(expr const & e, bool infer_only) {
     scope_rec_depth guard;
     check_system("type checker", /* do_check_interrupted */ true);
 
-    auto it = m_st->m_infer_type[infer_only].find(e);
-    if (it != m_st->m_infer_type[infer_only].end())
-        return it->second;
+    /* `infer_only = true` results for a closed `e` (no free variables, no metavariables) are
+       pure in the environment, and so are shared across every declaration this process checks
+       (lean-build-perf#16). `infer_only = false` ("check") results are not shared even for a
+       closed `e`: `check_level` (below) and the unsafe/partial validation in `infer_constant`
+       depend on `m_lparams` and `m_definition_safety`, which vary per declaration. */
+    bool shared = infer_only && kc_is_closed(e);
+    if (shared) {
+        if (auto cached = get_kc_cache().find_infer(e))
+            return *cached;
+    } else {
+        auto it = m_st->m_infer_type[infer_only].find(e);
+        if (it != m_st->m_infer_type[infer_only].end())
+            return it->second;
+    }
 
     expr r;
     switch (e.kind()) {
@@ -353,7 +365,10 @@ expr type_checker::infer_type_core(expr const & e, bool infer_only) {
     case expr_kind::Let:      r = infer_let(e, infer_only);            break;
     }
 
-    m_st->m_infer_type[infer_only].insert(mk_pair(e, r));
+    if (shared)
+        get_kc_cache().insert_infer(e, r);
+    else
+        m_st->m_infer_type[infer_only].insert(mk_pair(e, r));
     return r;
 }
 
@@ -487,10 +502,18 @@ expr type_checker::whnf_core(expr const & e, bool cheap_rec, bool cheap_proj) {
         break;
     }
 
-    // check cache
-    auto it = m_st->m_whnf_core.find(e);
-    if (it != m_st->m_whnf_core.end())
-        return it->second;
+    // check cache: closed `e` (no free variables, no metavariables) is pure in the
+    // environment and shared across declarations (lean-build-perf#16); anything else stays in
+    // the per-declaration cache, exactly as before.
+    bool shared = kc_is_closed(e);
+    if (shared) {
+        if (auto cached = get_kc_cache().find_whnf_core(e))
+            return *cached;
+    } else {
+        auto it = m_st->m_whnf_core.find(e);
+        if (it != m_st->m_whnf_core.end())
+            return it->second;
+    }
 
     // do the actual work
     expr r;
@@ -545,7 +568,10 @@ expr type_checker::whnf_core(expr const & e, bool cheap_rec, bool cheap_proj) {
     }
 
     if (!cheap_rec && !cheap_proj) {
-        m_st->m_whnf_core.insert(mk_pair(e, r));
+        if (shared)
+            get_kc_cache().insert_whnf_core(e, r);
+        else
+            m_st->m_whnf_core.insert(mk_pair(e, r));
     }
     return r;
 }
@@ -571,6 +597,14 @@ optional<expr> type_checker::unfold_definition_core(expr const & e) {
                 m_diag->record_unfold(d->get_name());
             }
             if (len > 0) {
+                bool shared = kc_is_closed(e);
+                if (shared) {
+                    if (auto cached = get_kc_cache().find_unfold(e))
+                        return cached;
+                    expr result = instantiate_value_lparams(*d, us);
+                    get_kc_cache().insert_unfold(e, result);
+                    return some_expr(result);
+                }
                 auto it = m_st->m_unfold.find(e);
                 if (it != m_st->m_unfold.end())
                     return some_expr(it->second);
@@ -751,25 +785,32 @@ expr type_checker::whnf(expr const & e) {
         break;
     }
 
-    // check cache
-    auto it = m_st->m_whnf.find(e);
-    if (it != m_st->m_whnf.end())
-        return it->second;
+    // check cache: closed `e` is pure in the environment and shared across declarations
+    // (lean-build-perf#16); anything else stays in the per-declaration cache, as before.
+    bool shared = kc_is_closed(e);
+    if (shared) {
+        if (auto cached = get_kc_cache().find_whnf(e))
+            return *cached;
+    } else {
+        auto it = m_st->m_whnf.find(e);
+        if (it != m_st->m_whnf.end())
+            return it->second;
+    }
 
     expr t = e;
     while (true) {
         expr t1 = whnf_core(t);
         if (auto v = reduce_native(env(), t1)) {
-            m_st->m_whnf.insert(mk_pair(e, *v));
+            if (shared) get_kc_cache().insert_whnf(e, *v); else m_st->m_whnf.insert(mk_pair(e, *v));
             return *v;
         } else if (auto v = reduce_nat(t1)) {
-            m_st->m_whnf.insert(mk_pair(e, *v));
+            if (shared) get_kc_cache().insert_whnf(e, *v); else m_st->m_whnf.insert(mk_pair(e, *v));
             return *v;
         } else if (auto next_t = unfold_definition(t1)) {
             t = *next_t;
         } else {
             auto r = t1;
-            m_st->m_whnf.insert(mk_pair(e, r));
+            if (shared) get_kc_cache().insert_whnf(e, r); else m_st->m_whnf.insert(mk_pair(e, r));
             return r;
         }
     }
@@ -939,41 +980,50 @@ lbool type_checker::is_def_eq_proof_irrel(expr const & t, expr const & s) {
 }
 
 bool type_checker::failed_before(expr const & t, expr const & s) const {
+    // Closed `t`/`s` (no free variables, no metavariables) make `is_def_eq`'s cached outcome
+    // pure in the environment, shared across declarations (lean-build-perf#16); anything else
+    // stays in the per-declaration cache, as before.
+    bool shared = kc_is_closed(t, s);
+    auto contains = [&](expr const & a, expr const & b) {
+        return shared ? get_kc_cache().failed_before(a, b)
+                      : m_st->m_failure.find(mk_pair(a, b)) != m_st->m_failure.end();
+    };
     if (hash(t) < hash(s)) {
-        return m_st->m_failure.find(mk_pair(t, s)) != m_st->m_failure.end();
+        return contains(t, s);
     } else if (hash(t) > hash(s)) {
-        return m_st->m_failure.find(mk_pair(s, t)) != m_st->m_failure.end();
+        return contains(s, t);
     } else {
-        return
-            m_st->m_failure.find(mk_pair(t, s)) != m_st->m_failure.end() ||
-            m_st->m_failure.find(mk_pair(s, t)) != m_st->m_failure.end();
+        return contains(t, s) || contains(s, t);
     }
 }
 
 void type_checker::cache_failure(expr const & t, expr const & s) {
-    if (hash(t) <= hash(s))
-        m_st->m_failure.insert(mk_pair(t, s));
-    else
-        m_st->m_failure.insert(mk_pair(s, t));
+    bool shared = kc_is_closed(t, s);
+    expr const & a = hash(t) <= hash(s) ? t : s;
+    expr const & b = hash(t) <= hash(s) ? s : t;
+    if (shared) get_kc_cache().cache_failure(a, b); else m_st->m_failure.insert(mk_pair(a, b));
 }
 
 bool type_checker::succeeded_before(expr const & t, expr const & s) const {
+    bool shared = kc_is_closed(t, s);
+    auto contains = [&](expr const & a, expr const & b) {
+        return shared ? get_kc_cache().succeeded_before(a, b)
+                      : m_st->m_success.find(mk_pair(a, b)) != m_st->m_success.end();
+    };
     if (hash(t) < hash(s)) {
-        return m_st->m_success.find(mk_pair(t, s)) != m_st->m_success.end();
+        return contains(t, s);
     } else if (hash(t) > hash(s)) {
-        return m_st->m_success.find(mk_pair(s, t)) != m_st->m_success.end();
+        return contains(s, t);
     } else {
-        return
-            m_st->m_success.find(mk_pair(t, s)) != m_st->m_success.end() ||
-            m_st->m_success.find(mk_pair(s, t)) != m_st->m_success.end();
+        return contains(t, s) || contains(s, t);
     }
 }
 
 void type_checker::cache_success(expr const & t, expr const & s) {
-    if (hash(t) <= hash(s))
-        m_st->m_success.insert(mk_pair(t, s));
-    else
-        m_st->m_success.insert(mk_pair(s, t));
+    bool shared = kc_is_closed(t, s);
+    expr const & a = hash(t) <= hash(s) ? t : s;
+    expr const & b = hash(t) <= hash(s) ? s : t;
+    if (shared) get_kc_cache().cache_success(a, b); else m_st->m_success.insert(mk_pair(a, b));
 }
 
 /**
