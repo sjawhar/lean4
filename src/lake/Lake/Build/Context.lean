@@ -9,6 +9,7 @@ prelude
 public import Lake.Config.Cache
 public import Lake.Config.Context
 public import Lake.Build.Job.Basic
+public import Lake.Build.ModuleTimes
 
 open System
 namespace Lake
@@ -99,6 +100,11 @@ public structure BuildContext extends BuildConfig, Context where
    Only the build monitor should set this token: reporting assumes that a counted failure exists when the token is set.
   -/
   cancelTk? : Option IO.CancelToken := none
+  /--
+  The workspace's module-times record: compile priorities read at the start of the build, and the
+  compile times recorded during it. `none` when the build does not compile (`checkNoBuild`).
+  -/
+  moduleTimes? : Option ModuleTimes := none
 
 /-- A transformer to equip a monad with a `BuildContext`. -/
 public abbrev BuildT := ReaderT BuildContext
@@ -118,6 +124,9 @@ public instance [Pure m] : MonadLift LakeM (BuildT m) where
 
 @[inline] public def getBuildConfig [Functor m] [MonadBuild m] : m BuildConfig :=
   (·.toBuildConfig) <$> getBuildContext
+
+@[inline] public def getModuleTimes? [Functor m] [MonadBuild m] : m (Option ModuleTimes) :=
+  (·.moduleTimes?) <$> getBuildContext
 
 @[inline, inherit_doc BuildConfig.oldMode]
 public def getIsOldMode [Functor m] [MonadBuild m] : m Bool :=

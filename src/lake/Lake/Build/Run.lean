@@ -343,7 +343,7 @@ def monitorJob (ctx : MonitorContext) (job : Job α) : BaseIO (BuildResult α) :
 
 def mkBuildContext
   (ws : Workspace) (cfg : BuildConfig) (jobs : JobQueue)
-  (cancelTk? : Option IO.CancelToken := none)
+  (cancelTk? : Option IO.CancelToken := none) (moduleTimes? : Option ModuleTimes := none)
 : BaseIO BuildContext := return {
   opaqueWs := ws
   toBuildConfig := {cfg with
@@ -363,6 +363,7 @@ def mkBuildContext
     else
       return none
   registeredJobs := jobs
+  moduleTimes?
   leanTrace := .ofHash (pureHash ws.lakeEnv.leanGithash)
     s!"Lean {Lean.versionStringCore}, commit {ws.lakeEnv.leanGithash}"
   cancelTk?
@@ -396,6 +397,12 @@ def finalizeBuild
   (cfg : BuildConfig) (bctx : BuildContext) (mctx : MonitorContext) (result : BuildResult α)
 : IO α := do
   reportResult cfg mctx.out result
+  if let some mt := bctx.moduleTimes? then
+    let n ← mt.save fun name => do
+      let some mod := bctx.workspace.findModule? name | return false
+      mod.leanFile.pathExists
+    if n > 0 && cfg.verbosity matches .verbose then
+      print! mctx.out s!"Recorded compile times of {n} modules in {mt.path}\n"
   if let some outputsFile := cfg.outputsFile? then
     bctx.saveOutputs (logger := mctx.logger) mctx.out outputsFile
   match result.out with
@@ -441,7 +448,8 @@ public def Workspace.runFetchM
   let jobs ← mkJobQueue
   let cancelTk? ← if cfg.failFast then some <$> IO.CancelToken.new else pure none
   let mctx ← mkMonitorContext cfg jobs cancelTk?
-  let bctx ← mkBuildContext ws cfg jobs cancelTk?
+  let moduleTimes ← ModuleTimes.load (ws.lakeDir / moduleTimesFileName)
+  let bctx ← mkBuildContext ws cfg jobs cancelTk? (moduleTimes? := some moduleTimes)
   let job ← startBuild bctx build caption
   let result ← monitorJob mctx job
   finalizeBuild cfg bctx mctx result
@@ -482,7 +490,8 @@ public def Workspace.runBuild
   let jobs ← mkJobQueue
   let cancelTk? ← if cfg.failFast then some <$> IO.CancelToken.new else pure none
   let mctx ← mkMonitorContext cfg jobs cancelTk?
-  let bctx ← mkBuildContext ws cfg jobs cancelTk?
+  let moduleTimes ← ModuleTimes.load (ws.lakeDir / moduleTimesFileName)
+  let bctx ← mkBuildContext ws cfg jobs cancelTk? (moduleTimes? := some moduleTimes)
   let job ← startBuild bctx build
   let result ← monitorBuild mctx job
   finalizeBuild cfg bctx mctx result
