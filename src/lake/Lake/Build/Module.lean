@@ -597,22 +597,24 @@ def Module.recFetchPreSetup (mod : Module) : FetchM (Job ModulePreSetup) := ensu
       |>.mix (.nil "package external libraries")
       |>.mix (.nil "module dynlibs")
       |>.mix (.nil "module plugins")
-    match mod.platformIndependent with
-    | none => addTrace depTrace; addTrace libTrace
-    | some false => addTrace depTrace; addTrace libTrace; addPlatformTrace
-    | some true => addTrace depTrace; addTrace nilLibTrace
+    let libTraces := match mod.platformIndependent with
+      | none => #[libTrace]
+      | some false => #[libTrace, platformTrace]
+      | some true => #[nilLibTrace]
     let {dynlibs, plugins} ← computeModuleDeps impLibs externLibs dynlibs plugins
     let extra := (← getLeanOptOverrides).find? mod.pkg.baseName |>.getD {}
     let leanOptions := mod.leanOptions ++ extra
-    addLeanTrace
-    addTrace input.trace
-    addTrace <| traceOptions leanOptions "options"
-    addPureTrace input.header.isModule "isModule"
-    addPureTrace mod.name "Module.name"
-    addPureTrace mod.pkg.id? "Package.id?"
-    addPureTrace mod.leanArgs "Module.leanArgs"
+    -- Every input of the module's trace except its imports (`info.trace`, mixed in via `depTrace`).
+    let localInputs := libTraces ++ #[
+      ← getLeanTrace, input.trace, traceOptions leanOptions "options",
+      pureTrace input.header.isModule "isModule", pureTrace mod.name "Module.name",
+      pureTrace mod.pkg.id? "Package.id?", pureTrace mod.leanArgs "Module.leanArgs"]
+    addTrace depTrace
+    localInputs.forM addTrace
+    let localTrace := localInputs.foldl (·.mix ·) ((BuildTrace.nil "local").mix extraDepJob.getTrace)
     return {
       trace := ← getTrace
+      localTrace
       srcFile := input.path
       srcMTime := input.trace.mtime
       isModule := input.header.isModule
@@ -680,6 +682,8 @@ public def Module.clearOutputArtifacts (mod : Module) : IO PUnit := do
     removeFileIfExists mod.irFile
     removeFileIfExists mod.cFile
     removeFileIfExists mod.bcFile
+    removeFileIfExists mod.usageFile
+    removeFileIfExists mod.usekeyFile
   catch e =>
     error s!"failed to remove output artifacts: {e}"
 
@@ -978,18 +982,226 @@ def Module.recBuildLtar (self : Module) : FetchM (Job FilePath) := do
 public def Module.ltarFacetConfig : ModuleFacetConfig ltarFacet :=
   mkFacetJobConfig recBuildLtar
 
+/-- The parts of a module's `.usage` sidecar (written by Lean next to its `.olean`) that Lake checks. -/
+structure UsageSidecar where
+  noskip : Bool
+  moduleDigest : Hash
+  own : NameMap Hash
+  used : Array (Name × Array (Name × Hash))
+  extra : Array Name
+
+/-- A module's `.usekey` sidecar: what Lake saw of the module's build when Lean wrote its `.usage`. -/
+structure UsekeySidecar where
+  localHash : Hash
+  /-- The hash of the module's own `.olean` when the key was written. -/
+  olean : Hash
+  /-- `modsysHash` of the module's import closure. -/
+  modsys : Hash
+  /-- For each `extra` module of the `.usage`: the hash of its `.olean` and its `moduleDigest`. -/
+  extra : NameMap (Hash × Hash)
+
+/--
+A name in a usage sidecar: the JSON array of its components, root first, each a string or a
+number (`Lean.ModuleUsage.nameToJson`). Unlike `toJson Name`, this round-trips macro-scoped names.
+-/
+structure SidecarName where
+  name : Name
+
+instance : FromJson SidecarName where
+  fromJson? j := do
+    let n ← (← j.getArr?).foldlM (init := Name.anonymous) fun p c => do
+      match c with
+      | .str s => return Name.mkStr p s
+      | .num _ => return Name.mkNum p (← fromJson? c)
+      | _ => throw s!"expected a name component, got {c.compress}"
+    return ⟨n⟩
+
+/-- Encodes a name as `Lean.ModuleUsage.nameToJson` does. -/
+def SidecarName.toJson (n : SidecarName) : Json :=
+  .arr (go n.name #[])
+where
+  go : Name → Array Json → Array Json
+    | .anonymous, acc => acc
+    | .str p s, acc => (go p acc).push (.str s)
+    | .num p k, acc => (go p acc).push (Lean.toJson k)
+
+instance : ToJson SidecarName := ⟨SidecarName.toJson⟩
+
+def checkUsageVersion (j : Json) : Except String Unit := do
+  let v ← j.getObjValAs? Nat "version"
+  unless v == 1 do throw s!"unsupported version {v}"
+
+instance : FromJson UsageSidecar where
+  fromJson? j := do
+    checkUsageVersion j
+    let own ← j.getObjValAs? (Array (SidecarName × Hash)) "own"
+    let used ← j.getObjValAs? (Array (SidecarName × Array (SidecarName × Hash))) "used"
+    let extra ← j.getObjValAs? (Array (SidecarName × Bool)) "extra"
+    return {
+      noskip := ← j.getObjValAs? Bool "noskip"
+      moduleDigest := ← j.getObjValAs? Hash "moduleDigest"
+      own := own.foldl (init := {}) fun m (n, d) => m.insert n.name d
+      used := used.map fun (m, cs) => (m.name, cs.map fun (c, d) => (c.name, d))
+      extra := extra.map (·.1.name)
+    }
+
+instance : FromJson UsekeySidecar where
+  fromJson? j := do
+    checkUsageVersion j
+    let extra ← (← j.getObjValAs? (Array Json) "extra").foldlM (init := {}) fun m e => do
+      let #[n, o, d] ← e.getArr? | throw s!"expected a triple, got {e.compress}"
+      return m.insert (← fromJson? (α := SidecarName) n).name (← fromJson? o, ← fromJson? d)
+    return {
+      localHash := ← j.getObjValAs? Hash "local"
+      olean := ← j.getObjValAs? Hash "olean"
+      modsys := ← j.getObjValAs? Hash "modsys"
+      extra
+    }
+
+/--
+Reads a usage-cutoff sidecar. Returns `none` if it does not exist. If it exists but is not valid,
+logs a warning and returns `none`, so the module builds normally.
+-/
+def readUsageSidecar (α : Type) [FromJson α] (path : FilePath) : JobM (Option α) := do
+  match (← IO.FS.readFile path |>.toBaseIO) with
+  | .ok contents =>
+    match Json.parse contents >>= fromJson? with
+    | .ok a =>
+      return some a
+    | .error e =>
+      logWarning s!"{path}: {e}"
+      return none
+  | .error (.noFileOrDirectory ..) =>
+    return none
+  | .error e =>
+    error s!"{path}: read failed: {e}"
+
+/--
+A hash of every artifact of every module-system module in an import closure, with its name.
+Module-system files carry no meaning digests (Lean writes them at the private level only), so a
+non-module importer's digest chain cannot see through one; its skip requires these bytes unchanged.
+-/
+def modsysHash (importArts : NameMap ImportArtifacts) : JobM Hash := do
+  let mut h := Hash.nil
+  for (m, arts) in importArts do
+    if arts.oleanServer?.isSome then
+      h := h.mix (Hash.ofHashable m)
+      for paths in arts.toArrays do
+        for path in paths do
+          h := h.mix (← fetchFileHash path)
+  return h
+
+/--
+The `.olean` of importee `m` in `importArts` and its `.usage`, or `none` if either is missing or
+the `.usage` is invalid.
+-/
+def importUsage? (importArts : NameMap ImportArtifacts) (m : Name) :
+    JobM (Option (FilePath × UsageSidecar)) := do
+  let some olean := (importArts.find? m).bind (·.olean?) | return none
+  let some usage ← readUsageSidecar UsageSidecar (olean.withExtension "usage") | return none
+  return some (olean, usage)
+
+/--
+Writes the module's `.usekey` from the `.usage` Lean just wrote: the module's local trace hash, the
+hash of its `.olean` (`oleanHash`), the `modsysHash` of its closure and, for each `extra` module,
+the hash of its `.olean` and its current `moduleDigest`. Writes nothing if the `.usage` or an
+`extra` module's `.usage` is missing, so the module is never skipped.
+-/
+def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
+    (importArts : NameMap ImportArtifacts) (oleanHash : Hash) : JobM Unit := do
+  let some usage ← readUsageSidecar UsageSidecar mod.usageFile | return
+  let mut extra := #[]
+  for m in usage.extra do
+    let some (olean, imp) ← importUsage? importArts m | return
+    extra := extra.push <|
+      Json.arr #[toJson (SidecarName.mk m), toJson (← fetchFileHash olean).hex,
+        toJson imp.moduleDigest.hex]
+  let key := Json.mkObj [
+    ("version", 1),
+    ("local", toJson presetup.localTrace.hash.hex),
+    ("olean", toJson oleanHash.hex),
+    ("modsys", toJson (← modsysHash importArts).hex),
+    ("extra", Json.arr extra)
+  ]
+  IO.FS.writeFile mod.usekeyFile key.compress
+
+/--
+Compiles the module. `setup?` is its `ModuleSetup` if the caller already computed it
+(`Module.skipOrBuild`); otherwise it is computed here.
+-/
 def Module.buildLean
-  (mod : Module) (presetup : ModulePreSetup)
+  (mod : Module) (presetup : ModulePreSetup) (setup? : Option ModuleSetup := none)
 : JobM ModuleOutputArtifacts := do buildAction (← getTrace) mod.traceFile do
   let args := mod.weakLeanArgs ++ mod.leanArgs
   let relSrcFile := relPathFrom mod.pkg.dir presetup.srcFile
-  let setup ← mkModuleSetup mod presetup
+  let setup ← setup?.getDM (mkModuleSetup mod presetup)
   let arts := mod.mkArtifacts presetup.srcFile presetup.isModule
   mod.clearOutputArtifacts
   compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile arts args
     (← getLeanPath) (← getLean) (← getLeanir)
   mod.clearOutputHashes
-  mod.computeArtifacts setup.isModule
+  let arts ← mod.computeArtifacts setup.isModule
+  mod.writeUsekey presetup setup.importArts arts.olean.hash
+  return arts
+
+/-- Usage cutoff is on unless `LAKE_USAGE_CUTOFF=0`. -/
+def usageCutoffEnabled : BaseIO Bool :=
+  return (← IO.getEnv "LAKE_USAGE_CUTOFF") != some "0"
+
+/--
+Whether nothing the module used changed meaning since Lean wrote its `.usage`: its `.olean` and
+local inputs are unchanged, no module-system module in its closure (`importArts`) changed
+(`modsysHash`), every imported constant it used has the same digest in its module's current
+`.usage`, and every `extra` module has the same `.olean` hash and `moduleDigest`.
+-/
+def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
+    (importArts : NameMap ImportArtifacts) : JobM Bool := do
+  let some usage ← readUsageSidecar UsageSidecar mod.usageFile | return false
+  let some key ← readUsageSidecar UsekeySidecar mod.usekeyFile | return false
+  if usage.noskip || key.localHash != presetup.localTrace.hash then
+    return false
+  unless (← fetchFileHash mod.oleanFile) == key.olean do return false
+  unless (← modsysHash importArts) == key.modsys do return false
+  for (m, consts) in usage.used do
+    let some (_, imp) ← importUsage? importArts m | return false
+    for (c, d) in consts do
+      unless imp.own.find? c == some d do return false
+  for m in usage.extra do
+    let some (oleanHash, digest) := key.extra.find? m | return false
+    let some (olean, imp) ← importUsage? importArts m | return false
+    unless (← fetchFileHash olean) == oleanHash do return false
+    unless imp.moduleDigest == digest do return false
+  return true
+
+/--
+Whether usage cutoff applies to the module: cutoff is enabled, the module is neither a
+module-system file nor part of a `precompileModules` library, and its artifacts exist.
+-/
+def Module.usageCutoffApplies (mod : Module) (presetup : ModulePreSetup) : JobM Bool := do
+  if presetup.isModule || mod.shouldPrecompile then return false
+  unless (← usageCutoffEnabled) do return false
+  mod.checkArtifactsExist presetup.isModule
+
+/--
+Skips compiling a module whose trace is stale if usage cutoff applies to it
+(`Module.usageCutoffApplies`) and nothing it used changed meaning (`Module.usageUpToDate`):
+replays its saved log and rewrites its trace with `depTrace`. Otherwise, builds it, reusing the
+module setup the check computed.
+-/
+def Module.skipOrBuild (mod : Module) (presetup : ModulePreSetup) (savedTrace : SavedTrace)
+    (depTrace : BuildTrace) : JobM ModuleOutputArtifacts := do
+  let .ok data := savedTrace | mod.buildLean presetup
+  unless (← mod.usageCutoffApplies presetup) do
+    return ← mod.buildLean presetup
+  let setup ← mkModuleSetup mod presetup
+  unless (← mod.usageUpToDate presetup setup.importArts) do
+    return ← mod.buildLean presetup setup
+  updateAction .replay
+  data.log.replay
+  unless (← getNoBuild) do
+    writeBuildTrace mod.traceFile depTrace (data.outputs?.getD .null) data.log
+    removeFileIfExists (mod.traceFile.addExtension "nobuild")
+  mod.computeArtifacts presetup.isModule
 
 /--
 Recursively build a Lean module.
@@ -1097,9 +1309,9 @@ where
             if (← savedTrace.replayIfUpToDate (oldTrace := presetup.srcMTime) mod depTrace) then
               mod.computeArtifacts presetup.isModule
             else
-              mod.buildLean presetup
+              mod.skipOrBuild presetup savedTrace depTrace
         else
-          mod.buildLean presetup
+          mod.skipOrBuild presetup savedTrace depTrace
   trackOutputsIfEnabled arts : JobM ModuleOutputArtifacts := do
     if mod.pkg.isRoot then
       if let some ref := (← getBuildContext).outputsRef? then
