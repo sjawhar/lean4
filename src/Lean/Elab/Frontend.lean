@@ -380,21 +380,16 @@ def runFrontend
   if hasErrors then
     return none
 
+  let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
   if let some oleanFileName := oleanFileName? then
     profileitIO ".olean serialization" finalOpts do
       let commandLints := collectCommandLints snaps none #[]
       let env ← Linter.recordLints inputCtx.fileMap env commandLints
       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
-    let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
-    let used := trees.foldl (init := ← usedByChecksRef.get) fun s t =>
-      t.foldInfo (init := s) fun ctx i s => match i with
-        | .ofTermInfo ti => (instantiateMVarsCore ctx.mctx ti.expr).1.foldConsts s fun c s => s.insert c
-        | .ofFieldInfo fi => s.insert fi.projName
-        | _ => s
+    let used := ModuleUsage.usedFromInfoTrees trees (← usedByChecksRef.get)
     ModuleUsage.writeUsage env used (incrLoaded := incrLoadFileName?.isSome) (oleanFileName.withExtension "usage")
 
   if let some ileanFileName := ileanFileName? then
-    let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
     let references := Lean.Server.findModuleRefs inputCtx.fileMap trees (localVars := false)
     let (moduleRefs, decls) ← references.toLspModuleRefs
     let ilean := {

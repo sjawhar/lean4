@@ -6,7 +6,9 @@ public import Lean.Util.PtrSet
 public import Lean.Compiler.ImplementedByAttr
 public import Lean.Compiler.ExternAttr
 public import Lean.Compiler.NoncomputableAttr
+public import Lean.Elab.InfoTree.Types
 import Lean.ExtraModUses
+import Lean.Server.InfoUtils
 public section
 namespace Lean.ModuleUsage
 
@@ -167,6 +169,54 @@ where
     | .anonymous, acc => acc
     | .str p s, acc => (go p acc).push (.str s)
     | .num p k, acc => (go p acc).push (.num k)
+
+unsafe structure WalkState where
+  /-- Visited metavariable-free subterms: their constants do not depend on any assignment. -/
+  closed : PtrSet Expr := mkPtrSet
+  /-- Visited subterms with metavariables, valid for `mctx` only. -/
+  opened : PtrSet Expr := mkPtrSet
+  mctx : MetavarContext := {}
+  used : NameSet
+
+/-- Adds the constants of `e` with its metavariables instantiated by `s.mctx`, following assignments in place
+of building the instantiated term. -/
+unsafe def walkExpr (e : Expr) : StateM WalkState Unit := do
+  let s ← get
+  if e.hasMVar then
+    if s.opened.contains e then return
+    set { s with opened := s.opened.insert e }
+  else
+    if s.closed.contains e then return
+    set { s with closed := s.closed.insert e }
+  match e with
+  | .forallE _ d b _ | .lam _ d b _ => walkExpr d; walkExpr b
+  | .letE _ t v b _ => walkExpr t; walkExpr v; walkExpr b
+  | .app f a => walkExpr f; walkExpr a
+  | .mdata _ b => walkExpr b
+  | .proj n _ b => modify (fun s => { s with used := s.used.insert n }); walkExpr b
+  | .const c _ => modify fun s => { s with used := s.used.insert c }
+  | .mvar m =>
+    let mctx := (← get).mctx
+    if let some v := mctx.getExprAssignmentCore? m then walkExpr v
+    else if let some d := mctx.getDelayedMVarAssignmentCore? m then walkExpr (.mvar d.mvarIdPending)
+  | _ => pure ()
+
+unsafe def usedFromInfoTreesImpl (trees : Array Elab.InfoTree) (init : NameSet) : NameSet :=
+  let walk : StateM WalkState Unit := trees.forM fun t => t.foldInfoM (init := ()) fun ctx i _ => match i with
+    | .ofTermInfo ti => do
+      unless ptrEq (← get).mctx ctx.mctx do
+        modify fun s => { s with mctx := ctx.mctx, opened := mkPtrSet }
+      walkExpr ti.expr
+    | .ofFieldInfo fi => modify fun s => { s with used := s.used.insert fi.projName }
+    | _ => pure ()
+  (walk.run { used := init }).2.used
+
+/-- `init` plus every constant in a `TermInfo.expr` of `trees`, metavariables instantiated with the node's
+`ContextInfo.mctx`, and every `FieldInfo.projName`. Visited subterms are shared by all nodes, so a subterm that
+many nested nodes carry is walked once. Assignments are followed rather than instantiated, so the result can
+keep a constant that instantiation's beta reduction would drop: a superset, never less. -/
+@[implemented_by usedFromInfoTreesImpl]
+opaque usedFromInfoTrees (trees : Array Elab.InfoTree) (init : NameSet) : NameSet
 
 /-- `extra` lists the extra module uses of the environment and of `extraModUsesByChecksRef` (those of commands
 whose environment was discarded). With `incrLoaded` (the run reused commands from an `--incr-load` snapshot),
