@@ -221,6 +221,16 @@ keep a constant that instantiation's beta reduction would drop: a superset, neve
 @[implemented_by usedFromInfoTreesImpl]
 opaque usedFromInfoTrees (trees : Array Elab.InfoTree) (init : NameSet) : NameSet
 
+/-- A digest of the module's import closure: its sorted module names, each mixed in component by component. -/
+def closureDigest (env : Environment) : UInt64 :=
+  let names := env.header.moduleNames.qsort Name.quickLt
+  names.foldl (init := 101) fun h n => mixHash h (go n 103)
+where
+  go : Name → UInt64 → UInt64
+    | .anonymous, h => h
+    | .str p s, h => mixHash (go p h) (mixHash 107 (hash s))
+    | .num p k, h => mixHash (go p h) (mixHash 109 (hash k))
+
 /-- `extra` lists the extra module uses of the environment and of `extraModUsesByChecksRef` (those of commands
 whose environment was discarded). With `incrLoaded` (the run reused commands from an `--incr-load` snapshot),
 `noskip` is set: reused commands never call `addDecl` in this process, so `extra` may miss constants they used. -/
@@ -234,8 +244,9 @@ def writeUsage (env : Environment) (extra : NameSet) (incrLoaded : Bool) (path :
     |>.qsort fun a b => let k (u : ExtraModUse) := 2 * u.isExported.toNat + u.isMeta.toNat
       Name.quickLt a.module b.module || (a.module == b.module && k a < k b)
   let pair (n : Name) (d : UInt64) := Json.arr #[nameToJson n, hex16 d]
-  let j := Json.mkObj [("version", 1), ("noskip", noskip),
+  let j := Json.mkObj [("version", 2), ("noskip", noskip),
     ("moduleDigest", hex16 (own.foldl (fun h (_, d) => mixHash h d) 7)),
+    ("closure", hex16 (closureDigest env)),
     ("own", Json.arr (own.map fun (n, d) => pair n d)),
     ("used", Json.arr ((moduleUsed env extra consts).map fun (m, cs) =>
       Json.arr #[nameToJson m, Json.arr (cs.map fun (n, d) => pair n d)])),
