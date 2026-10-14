@@ -1000,6 +1000,33 @@ structure UsekeySidecar where
   /-- For each `extra` module of the `.usage`: the hash of its `.olean` and its `moduleDigest`. -/
   extra : NameMap (Hash × Hash)
 
+/--
+A name in a usage sidecar: the JSON array of its components, root first, each a string or a
+number (`Lean.ModuleUsage.nameToJson`). Unlike `toJson Name`, this round-trips macro-scoped names.
+-/
+structure SidecarName where
+  name : Name
+
+instance : FromJson SidecarName where
+  fromJson? j := do
+    let n ← (← j.getArr?).foldlM (init := Name.anonymous) fun p c => do
+      match c with
+      | .str s => return Name.mkStr p s
+      | .num _ => return Name.mkNum p (← fromJson? c)
+      | _ => throw s!"expected a name component, got {c.compress}"
+    return ⟨n⟩
+
+/-- Encodes a name as `Lean.ModuleUsage.nameToJson` does. -/
+def SidecarName.toJson (n : SidecarName) : Json :=
+  .arr (go n.name #[])
+where
+  go : Name → Array Json → Array Json
+    | .anonymous, acc => acc
+    | .str p s, acc => (go p acc).push (.str s)
+    | .num p k, acc => (go p acc).push (Lean.toJson k)
+
+instance : ToJson SidecarName := ⟨SidecarName.toJson⟩
+
 def checkUsageVersion (j : Json) : Except String Unit := do
   let v ← j.getObjValAs? Nat "version"
   unless v == 1 do throw s!"unsupported version {v}"
@@ -1007,14 +1034,15 @@ def checkUsageVersion (j : Json) : Except String Unit := do
 instance : FromJson UsageSidecar where
   fromJson? j := do
     checkUsageVersion j
-    let own ← j.getObjValAs? (Array (Name × Hash)) "own"
-    let extra ← j.getObjValAs? (Array (Name × Bool)) "extra"
+    let own ← j.getObjValAs? (Array (SidecarName × Hash)) "own"
+    let used ← j.getObjValAs? (Array (SidecarName × Array (SidecarName × Hash))) "used"
+    let extra ← j.getObjValAs? (Array (SidecarName × Bool)) "extra"
     return {
       noskip := ← j.getObjValAs? Bool "noskip"
       moduleDigest := ← j.getObjValAs? Hash "moduleDigest"
-      own := own.foldl (init := {}) fun m (n, d) => m.insert n d
-      used := ← j.getObjValAs? (Array (Name × Array (Name × Hash))) "used"
-      extra := extra.map (·.1)
+      own := own.foldl (init := {}) fun m (n, d) => m.insert n.name d
+      used := used.map fun (m, cs) => (m.name, cs.map fun (c, d) => (c.name, d))
+      extra := extra.map (·.1.name)
     }
 
 instance : FromJson UsekeySidecar where
@@ -1022,7 +1050,7 @@ instance : FromJson UsekeySidecar where
     checkUsageVersion j
     let extra ← (← j.getObjValAs? (Array Json) "extra").foldlM (init := {}) fun m e => do
       let #[n, o, d] ← e.getArr? | throw s!"expected a triple, got {e.compress}"
-      return m.insert (← fromJson? n) (← fromJson? o, ← fromJson? d)
+      return m.insert (← fromJson? (α := SidecarName) n).name (← fromJson? o, ← fromJson? d)
     return {
       localHash := ← j.getObjValAs? Hash "local"
       olean := ← j.getObjValAs? Hash "olean"
@@ -1086,7 +1114,8 @@ def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
   for m in usage.extra do
     let some (olean, imp) ← importUsage? importArts m | return
     extra := extra.push <|
-      Json.arr #[toJson m, toJson (← fetchFileHash olean).hex, toJson imp.moduleDigest.hex]
+      Json.arr #[toJson (SidecarName.mk m), toJson (← fetchFileHash olean).hex,
+        toJson imp.moduleDigest.hex]
   let key := Json.mkObj [
     ("version", 1),
     ("local", toJson presetup.localTrace.hash.hex),
