@@ -5,6 +5,7 @@ public import Lean.Util.FoldConsts
 public import Lean.Util.PtrSet
 public import Lean.Compiler.ImplementedByAttr
 public import Lean.Compiler.ExternAttr
+public import Lean.Compiler.NoncomputableAttr
 import Lean.ExtraModUses
 public section
 namespace Lean.ModuleUsage
@@ -54,7 +55,8 @@ def safetyHash : DefinitionSafety → UInt64
 /-- Everything of `c` except the meaning of the constants it refers to. -/
 def localHash (env : Environment) (c : ConstantInfo) : UInt64 :=
   let base := mixHash (hash c.levelParams) (exprHash true c.type)
-  let base := mixHash base (mixHash (hash (Compiler.getImplementedBy? env c.name)) (hash (isExtern env c.name)))
+  let base := mixHash base (mixHash (hash (Compiler.getImplementedBy? env c.name))
+    (mixHash (hash (isExtern env c.name)) (hash (isNoncomputable env c.name))))
   let v := exprHash false
   mixHash base <| match c with
   | .defnInfo d => mixHash (v d.value) (mixHash (hintsHash d.hints) (safetyHash d.safety))
