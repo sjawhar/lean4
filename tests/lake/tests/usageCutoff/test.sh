@@ -45,6 +45,12 @@ LAKE_USAGE_CUTOFF=0 test_out "Built Test.B" build Test.B
 printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 5\n' > Test/A.lean
 printf '{' > .lake/build/lib/lean/Test/B.usekey
 test_out "Test/B.usekey" build Test.B
+# a key is bound to its module's .olean: an .olean rewritten behind Lake's back (e.g. by another
+# toolchain, which keeps the old sidecars) makes the module build normally
+printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 6\n' > Test/A.lean
+printf 'x' >> .lake/build/lib/lean/Test/B.olean
+rm .lake/build/lib/lean/Test/B.olean.hash
+test_out "Built Test.B" build Test.B
 # a failed rebuild leaves no sidecars behind
 printf 'import Test.A\ndef b : Bool := a\n' > Test/B.lean
 test_err "Test.B" build Test.B
