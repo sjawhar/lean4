@@ -4,4 +4,7 @@
 /Test/D.lean
 /Test/H.lean
 /Test/HU.lean
+/Test/Syn.lean
+/Test/Rules.lean
+/Test/Ex.lean
 /lakefile.toml.bak
