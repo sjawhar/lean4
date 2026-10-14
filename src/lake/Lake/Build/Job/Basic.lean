@@ -188,12 +188,12 @@ Useful if the job is already known to be completed.
 
 @[inline] public def mapResult
   [OptDataKind β] (f : JobResult α → JobResult β) (self : Job α)
-  (prio := Task.Priority.default) (sync := false)
+  (prio := Task.Priority.max) (sync := false)
 : Job β := {self with task := self.task.map f prio sync, kind := inferInstance}
 
 @[inline] public def mapOk
   [OptDataKind β] (f : α → JobState → JobResult β) (self : Job α)
-  (prio := Task.Priority.default) (sync := false)
+  (prio := Task.Priority.max) (sync := false)
 : Job β :=
   self.mapResult (prio := prio) (sync := sync) fun
     | .ok a s => f a s
@@ -201,7 +201,7 @@ Useful if the job is already known to be completed.
 
 @[inline] public protected def map
   [OptDataKind β] (f : α → β) (self : Job α)
-  (prio := Task.Priority.default) (sync := false)
+  (prio := Task.Priority.max) (sync := false)
 : Job β := self.mapResult (·.map f) prio sync
 
 public instance : Functor Job where map := Job.map
