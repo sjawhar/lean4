@@ -129,4 +129,21 @@ def importedDigest? (env : Environment) (c : Name) : Option UInt64 := (state env
 
 def localDigests (env : Environment) : Array (Name × UInt64) := compute env (state env)
 
+/-- Per defining module, sorted: every imported constant that the current module's own constants refer to or
+that is in `extra`, with its digest. Constants without a digest (from a module built without this extension) are
+left out. -/
+def moduleUsed (env : Environment) (extra : NameSet) : Array (Name × Array (Name × UInt64)) :=
+  let privEnv := env.setExporting false
+  let own := env.checked.get.constants.foldStage2 (fun ns n _ => ns.push n) #[]
+  let used := own.foldl (init := extra) fun s n =>
+    ((privEnv.find? n).map (refs env) |>.getD #[]).foldl (·.insert ·) s
+  let byMod := used.foldl (init := (∅ : Std.HashMap Name (Array (Name × UInt64)))) fun m c =>
+    match env.getModuleIdxFor? c, importedDigest? env c with
+    | some i, some d => match env.header.modules[i.toNat]? with
+      | some mi => m.alter mi.module fun o => some ((o.getD #[]).push (c, d))
+      | none => m
+    | _, _ => m
+  byMod.toArray.map (fun (k, v) => (k, v.qsort fun a b => Name.quickLt a.1 b.1))
+    |>.qsort fun a b => Name.quickLt a.1 b.1
+
 end Lean.ModuleUsage
