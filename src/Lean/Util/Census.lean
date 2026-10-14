@@ -6,6 +6,9 @@ module
 
 prelude
 public import Init.System.IO
+import Init.Data.ToString.Macro
+import Init.Data.ToString.Name
+import Init.Data.String.Legacy
 
 public section
 namespace Lean.Census
@@ -64,7 +67,12 @@ builtin_initialize recordsRef : IO.Ref (Array String) ← IO.mkRef #[]
     names) records embed; Lean identifiers never contain control characters, so this only guards
     against the rare backslash/quote (e.g. in a `«...»` escaped name piece). -/
 def jesc (s : String) : String :=
-  ((s.replace "\\" "\\\\").replace "\"" "\\\"").replace "\n" "\\n"
+  s.toList.foldl (fun acc c =>
+    match c with
+    | '\\' => acc ++ "\\\\"
+    | '"'  => acc ++ "\\\""
+    | '\n' => acc ++ "\\n"
+    | _    => acc.push c) ""
 
 /-- Append one pre-built compact-JSON line (no trailing newline, no leading/trailing whitespace).
     No-op, with no allocation beyond the `isEnabled` check, if census collection is off. -/
@@ -92,7 +100,7 @@ def recordSimpLookup (candidates : Nat) : BaseIO Unit :=
     `simp` tried to rewrite, so the report can find the same (lemma, subterm) rewrite repeated
     across `simp` calls, within or across modules. -/
 def recordSimpRewrite (lemma : Name) (exprHash : UInt64) (succeeded : Bool) : BaseIO Unit :=
-  record s!"\{\"k\":\"simp_rw\",\"lemma\":\"{jesc lemma.toString}\",\"eh\":{exprHash},\"ok\":{succeeded}}"
+  record s!"\{\"k\":\"simp_rw\",\"lemma\":\"{jesc (toString lemma)}\",\"eh\":{exprHash},\"ok\":{succeeded}}"
 
 /-- One whole `Simp.simp` call's wall time. Cache hits/misses (`Simp.State.cache`, the per-call
     `Result` memoization table `simpLoop` checks) are tallied process-wide, not per call -- see
@@ -114,7 +122,7 @@ def addSimpCacheMiss : BaseIO Unit := do
 
 /-- One environment extension's `addImportedFn` call, in `Environment.finalizePersistentExtensions`. -/
 def recordImportExt (extName : Name) (ns : Nat) : BaseIO Unit :=
-  record s!"\{\"k\":\"import_ext\",\"name\":\"{jesc extName.toString}\",\"ns\":{ns}}"
+  record s!"\{\"k\":\"import_ext\",\"name\":\"{jesc (toString extName)}\",\"ns\":{ns}}"
 
 /-- Running total of time spent forcing the lazily-merged imported-constant tries
     (`ImportedConsts.mergeModuleTreesLazy`'s results, lean-build-perf#7), accumulated over the
@@ -148,6 +156,6 @@ def flush (moduleName : Name) : IO Unit := do
     else #[s!"\{\"k\":\"simp_cache\",\"hits\":{simpHits},\"misses\":{simpMisses}}"]
   let kernelLines := (kernelText.splitOn "\n").filter (· ≠ "")
   let allLines := ownLines.toList ++ simpCacheLine.toList ++ kernelLines
-  IO.FS.writeFile (dir / s!"{jesc moduleName.toString}.jsonl") (String.intercalate "\n" allLines ++ "\n")
+  IO.FS.writeFile (dir / s!"{jesc (toString moduleName)}.jsonl") (String.intercalate "\n" allLines ++ "\n")
 
 end Lean.Census
