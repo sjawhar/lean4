@@ -100,6 +100,29 @@ rec_check 'ms("Test.Quick1") > 0 and rem("Test.Quick1") == ms("Test.Quick1") + r
 mv Test.lean.bak Test.lean; mv Test/Quick1.lean.bak Test/Quick1.lean
 mv .lake/module-times.tsv.saved $REC
 
+# A module with no time of its own whose source is gone loses its line, even while a kept line
+# still imports it. `Test.User` imports `Test.Gone`; with no record, a build that recompiles only
+# `User` gives `Gone` a line with no time. Then `Gone.lean` goes, and a build that compiles neither
+# keeps `User`'s line but not `Gone`'s.
+cp $REC .lake/module-times.tsv.saved
+printf -- '-- gone\n' > Test/Gone.lean
+printf 'import Test.Gone\n' > Test/User.lean
+test_run build Test.User
+rm $REC
+printf -- '-- touched\n' >> Test/User.lean
+test_run build Test.User
+has_row Test.Gone 0
+has_import Test.User Test.Gone
+rm Test/Gone.lean
+cp Test/Quick1.lean Test/Quick1.lean.bak
+printf -- '-- touched\n' >> Test/Quick1.lean
+test_run build Test.Quick1
+has_row Test.User
+no_match_text "Test.Gone" $REC
+mv Test/Quick1.lean.bak Test/Quick1.lean
+rm Test/User.lean
+mv .lake/module-times.tsv.saved $REC
+
 # A module whose source is gone leaves the record at the next build that compiles something.
 # Entries of modules this build did not compile stay: the executable's root, and the escaped name,
 # which must decode back to a module whose source exists.
