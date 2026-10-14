@@ -158,6 +158,16 @@ def moduleUsed (env : Environment) (extra : NameSet) (consts := ownConsts env) :
 def hex16 (v : UInt64) : String :=
   let s := String.ofList (Nat.toDigits 16 v.toNat); "".pushn '0' (16 - s.length) ++ s
 
+/-- A name as the JSON array of its components, root first: each a string or a number. Unlike `toJson Name`
+(`Name.toString`), this round-trips macro-scoped names and components containing `»`. -/
+def nameToJson (n : Name) : Json :=
+  .arr (go n #[])
+where
+  go : Name → Array Json → Array Json
+    | .anonymous, acc => acc
+    | .str p s, acc => (go p acc).push (.str s)
+    | .num p k, acc => (go p acc).push (.num k)
+
 /-- With `incrLoaded` (the run reused commands from an `--incr-load` snapshot), `noskip` is set: reused commands
 never call `addDecl` in this process, so `extra` may miss constants they used. -/
 def writeUsage (env : Environment) (extra : NameSet) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
@@ -167,13 +177,13 @@ def writeUsage (env : Environment) (extra : NameSet) (incrLoaded : Bool) (path :
   let s := state env
   let extraMods := (getLocalExtraModUses env).filter fun u =>
     (env.getModuleIdx? u.module).any s.hasEntries
-  let pair (n : Name) (d : UInt64) := Json.arr #[toJson n, hex16 d]
+  let pair (n : Name) (d : UInt64) := Json.arr #[nameToJson n, hex16 d]
   let j := Json.mkObj [("version", 1), ("noskip", noskip),
     ("moduleDigest", hex16 (own.foldl (fun h (_, d) => mixHash h d) 7)),
     ("own", Json.arr (own.map fun (n, d) => pair n d)),
     ("used", Json.arr ((moduleUsed env extra consts).map fun (m, cs) =>
-      Json.arr #[toJson m, Json.arr (cs.map fun (n, d) => pair n d)])),
-    ("extra", Json.arr (extraMods.map fun u => Json.arr #[toJson u.module, u.isMeta]))]
+      Json.arr #[nameToJson m, Json.arr (cs.map fun (n, d) => pair n d)])),
+    ("extra", Json.arr (extraMods.map fun u => Json.arr #[nameToJson u.module, u.isMeta]))]
   IO.FS.writeFile path j.compress
 
 end Lean.ModuleUsage
