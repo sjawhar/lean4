@@ -45,10 +45,15 @@ and will be rebuilt on different host platforms.
 @[inline] public def addLeanTrace : JobM PUnit := do
   addTrace (← getLeanTrace)
 
+/-- The trace of a pure value. -/
+@[inline] public def pureTrace
+  [ToString α] [ComputeHash α Id] (a : α) (caption := "pure")
+: BuildTrace := .ofHash (pureHash a) s!"{caption}: {toString a}"
+
 /-- Mixes the trace of a pure value into the current job's trace. -/
 @[inline] public def addPureTrace
   [ToString α] [ComputeHash α Id] (a : α) (caption := "pure")
-: JobM PUnit := addTrace <| .ofHash (pureHash a) s!"{caption}: {toString a}"
+: JobM PUnit := addTrace <| pureTrace a caption
 
 /--
 The build trace file format,
