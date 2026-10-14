@@ -13,6 +13,7 @@ public import Lean.Meta.Tactic.Simp.Attr
 public import Lean.Meta.BinderNameHint
 import Lean.Meta.WHNF
 public import Lean.Meta.HasAssignableMVar
+public import Lean.Util.Census
 public section
 namespace Lean.Meta.Simp
 /--
@@ -213,6 +214,7 @@ where
   /-- For `(← getConfig).index := true`, use discrimination tree structure when collecting `simp` theorem candidates. -/
   rewriteUsingIndex? : SimpM (Option Result) := do
     let candidates ← withSimpIndexConfig <| s.getMatchWithExtra e
+    Lean.Census.recordSimpLookup candidates.size
     if candidates.isEmpty then
       trace[Debug.Meta.Tactic.simp] "no theorems found for {tag}-rewriting {e}"
       return none
@@ -231,7 +233,9 @@ where
               if isRflOld then
                 logWarning m!"theorem {thm.proof} is no longer rfl"
             continue
-        if let some result ← tryTheoremWithExtraArgs? e thm numExtraArgs then
+        let result? ← tryTheoremWithExtraArgs? e thm numExtraArgs
+        Lean.Census.recordSimpRewrite thm.origin.key (Lean.Expr.hash e) result?.isSome
+        if let some result := result? then
           trace[Debug.Meta.Tactic.simp] "rewrite result {e} => {result.expr}"
           if rflOnly && !thm.rfl && thm.backwardRfl then
             trace[Meta.Tactic.simp.backwardDefEq]
@@ -245,6 +249,7 @@ where
   -/
   rewriteNoIndex? : SimpM (Option Result) := do
     let (candidates, numArgs) ← withSimpIndexConfig <| s.getMatchLiberal e
+    Lean.Census.recordSimpLookup candidates.size
     if candidates.isEmpty then
       trace[Debug.Meta.Tactic.simp] "no theorems found for {tag}-rewriting {e}"
       return none
@@ -262,6 +267,7 @@ where
             let lhs := type.appFn!.appArg!
             let lhsNumArgs := lhs.getAppNumArgs
             tryTheoremCore lhs xs bis val type e thm (numArgs - lhsNumArgs)
+          Lean.Census.recordSimpRewrite thm.origin.key (Lean.Expr.hash e) result?.isSome
           if let some result := result? then
             trace[Debug.Meta.Tactic.simp] "rewrite result {e} => {result.expr}"
             if rflOnly && !thm.rfl && thm.backwardRfl then

@@ -679,7 +679,10 @@ partial def simpLoop (e : Expr) : SimpM Result := withIncRecDepth do
   if cfg.memoize then
     let cache := (← get).cache
     if let some result := cache.find? e then
+      Lean.Census.addSimpCacheHit
       return result
+    else
+      Lean.Census.addSimpCacheMiss
   if (← get).numSteps > cfg.maxSteps then
     throwError "`simp` failed: maximum number of steps exceeded"
   else
@@ -770,7 +773,9 @@ def simpCore (e : Expr) (ctx : Simp.Context) (simprocs : SimprocsArray := #[]) (
 
 def simp (e : Expr) (ctx : Simp.Context) (simprocs : SimprocsArray := #[]) (discharge? : Option Simp.Discharge := none)
     (stats : Stats := {}) : MetaM (Simp.Result × Stats) := do profileitM Exception "simp" (← getOptions) do
+  let startNs ← IO.monoNanosNow
   let (r, s) ← simpCore e ctx simprocs discharge? { stats with }
+  Lean.Census.recordSimpCall ((← IO.monoNanosNow) - startNs)
   return (r, { s with })
 
 def dsimp (e : Expr) (ctx : Simp.Context) (simprocs : SimprocsArray := #[])
