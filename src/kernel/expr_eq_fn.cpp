@@ -27,7 +27,7 @@ class expr_eq_fn {
             return hash((size_t)p.first >> 3, (size_t)p.second >> 3);
         }
     };
-    typedef lean::unordered_set<std::pair<lean_object *, lean_object *>, key_hasher> cache;
+    typedef lean::dense_set<std::pair<lean_object *, lean_object *>, key_hasher> cache;
     cache * m_cache = nullptr;
     size_t m_counter = 0;
     bool check_cache(expr const & a, expr const & b) {
