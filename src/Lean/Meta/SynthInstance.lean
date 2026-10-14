@@ -13,6 +13,7 @@ public import Lean.Meta.AbstractMVars
 public import Lean.Meta.Check
 import Init.While
 import Lean.Util.CollectFVars
+import Lean.Util.Census
 
 public section
 namespace Lean.Meta
@@ -967,12 +968,13 @@ def synthInstanceCore? (type : Expr) (maxResultSize? : Option Nat := none) : Met
     let type ← instantiateMVars type
     let { type, cacheKeyType, kind } ← preprocess type
     let cacheKey := { localInsts, type := cacheKeyType, synthPendingDepth := (← read).synthPendingDepth }
-    match (← get).cache.synthInstance.find? cacheKey with
+    let censusStartNs ← IO.monoNanosNow
+    let (result?, cacheHit) ← match (← get).cache.synthInstance.find? cacheKey with
     | some abstResult? =>
       trace[Meta.synthInstance.cache] "cached: {type}"
       let result? ← applyCachedAbstractResult? type abstResult?
       trace[Meta.synthInstance] "result {result?} (cached)"
-      return result?
+      pure (result?, true)
     | none =>
       trace[Meta.synthInstance.cache] "new: {type}"
       let abstResult? ← withNewMCtxDepth (allowLevelAssignments := true) do
@@ -1003,7 +1005,10 @@ def synthInstanceCore? (type : Expr) (maxResultSize? : Option Nat := none) : Met
       let result? ← applyAbstractResult? type abstResult?
       trace[Meta.synthInstance] "result {result?}"
       cacheResult cacheKey kind abstResult? result?
-      return result?
+      pure (result?, false)
+    Lean.Census.recordSynth cacheKeyType.hash (hash cacheKey) ((← IO.monoNanosNow) - censusStartNs) cacheHit
+      (if result?.isSome then "ok" else "fail")
+    return result?
 
 def synthInstance? (type : Expr) (maxResultSize? : Option Nat := none) : MetaM (Option Expr) := do profileitM Exception "typeclass inference" (← getOptions) (decl := type.getAppFn.constName?.getD .anonymous) do
   synthInstanceCore? type maxResultSize?
