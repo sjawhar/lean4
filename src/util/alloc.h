@@ -6,6 +6,7 @@ Authors: Sebastian Ullrich
 */
 #pragma once
 #include <lean/config.h>
+#include <cstdlib>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -45,6 +46,23 @@ template<
     class Allocator = lean::allocator<Key>
 > using unordered_set = std::unordered_set<Key, Hash, KeyEqual, Allocator>;
 
+// Allocator of the dense tables: mimalloc, as `lean::allocator`, but stateless without a
+// user-declared copy constructor. `mi_stl_allocator` declares one, so the copy assignment the
+// tables' vectors use when they swap storage is the deprecated implicit one (-Wdeprecated-copy).
+#ifdef LEAN_MIMALLOC
+template<class T> struct dense_allocator {
+    using value_type = T;
+    dense_allocator() noexcept = default;
+    template<class U> dense_allocator(dense_allocator<U> const &) noexcept {}
+    T * allocate(std::size_t n) { return static_cast<T *>(mi_new_n(n, sizeof(T))); }
+    void deallocate(T * p, std::size_t) noexcept { mi_free(p); }
+};
+template<class T, class U>
+bool operator==(dense_allocator<T> const &, dense_allocator<U> const &) noexcept { return true; }
+#else
+template<class T> using dense_allocator = std::allocator<T>;
+#endif
+
 // Open-addressing (robin-hood) tables that store elements contiguously: no per-insert node
 // allocation. Elements move when the table grows, so a reference, pointer or iterator into one
 // must not be held across an insert. Iteration order differs from `unordered_map/set`.
@@ -55,20 +73,31 @@ template<
     class T,
     class Hash = ankerl::unordered_dense::hash<Key>,
     class KeyEqual = std::equal_to<Key>
-> using dense_map = ankerl::unordered_dense::map<Key, T, Hash, KeyEqual, lean::allocator<std::pair<Key, T>>>;
+> using dense_map = ankerl::unordered_dense::map<Key, T, Hash, KeyEqual, dense_allocator<std::pair<Key, T>>>;
 
 template<
     class Key,
     class Hash = ankerl::unordered_dense::hash<Key>,
     class KeyEqual = std::equal_to<Key>
-> using dense_set = ankerl::unordered_dense::set<Key, Hash, KeyEqual, lean::allocator<Key>>;
+> using dense_set = ankerl::unordered_dense::set<Key, Hash, KeyEqual, dense_allocator<Key>>;
+
+// SWEEP BUILD ONLY: initial sizes read from the environment, to pick each table's size.
+inline unsigned dense_knob(char const * name, unsigned dflt) {
+    char const * v = std::getenv(name);
+    return v ? static_cast<unsigned>(std::strtoul(v, nullptr, 10)) : dflt;
+}
+inline unsigned g_dense_rr = dense_knob("LEAN_DENSE_RR", 16);   // replace_rec_fn, replace_fn, instantiate_direct_fn
+inline unsigned g_dense_tc = dense_knob("LEAN_DENSE_TC", 16);   // type checker caches
+inline unsigned g_dense_sc = dense_knob("LEAN_DENSE_SC", 16);   // sharecommon_quick_fn
+inline unsigned g_dense_eq = dense_knob("LEAN_DENSE_EQ", 16);   // expr_eq_fn; 0 = node-based
+inline unsigned g_dense_cs = dense_knob("LEAN_DENSE_CS", 1024*1024); // compactor max-sharing reservation
 
 // A `dense_map`/`dense_set` that allocates nothing until its first insert, for caches constructed
 // per call (one per `instantiate`, say) that most calls never fill: a default-constructed dense
 // table allocates its initial buckets, unlike `unordered_map/set`. The first insert sizes the table
-// for 16 elements, so the many small caches skip the 4 -> 8 -> 16 regrowths (each a rehash of every
-// element and a move of the element vector). Supports `find`/`end`/`insert`.
-template<class Table>
+// for `InitialSize` elements, so small caches skip the regrowths from ankerl's 4 buckets (each a
+// rehash of every element and a move of the element vector). Supports `find`/`end`/`insert`.
+template<class Table, unsigned const & InitialSize>
 class lazy_table {
     std::optional<Table> m_table;
 public:
@@ -76,7 +105,7 @@ public:
     iterator find(typename Table::key_type const & k) { return m_table ? m_table->find(k) : iterator(); }
     iterator end() { return m_table ? m_table->end() : iterator(); }
     template<class V> std::pair<iterator, bool> insert(V && v) {
-        if (!m_table) m_table.emplace(16);
+        if (!m_table) m_table.emplace(InitialSize);
         return m_table->insert(std::forward<V>(v));
     }
 };

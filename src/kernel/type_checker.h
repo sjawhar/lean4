@@ -23,8 +23,8 @@ namespace lean {
 class type_checker {
 public:
     class state {
-        typedef lazy_table<expr_map<expr>> infer_cache;
-        typedef lazy_table<lean::dense_set<expr_pair, expr_pair_hash, expr_pair_eq>> expr_pair_set;
+        typedef lazy_table<expr_map<expr>, g_dense_tc> infer_cache;
+        typedef lazy_table<lean::dense_set<expr_pair, expr_pair_hash, expr_pair_eq>, g_dense_tc> expr_pair_set;
         environment               m_env;
         name_generator            m_ngen;
         infer_cache               m_infer_type[2];

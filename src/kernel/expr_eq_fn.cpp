@@ -27,15 +27,25 @@ class expr_eq_fn {
             return hash((size_t)p.first >> 3, (size_t)p.second >> 3);
         }
     };
-    lean::lazy_table<lean::dense_set<std::pair<lean_object *, lean_object *>, key_hasher>> m_cache;
+    typedef std::pair<lean_object *, lean_object *> key;
+    lean::lazy_table<lean::dense_set<key, key_hasher>, lean::g_dense_eq> m_cache;
+    // SWEEP BUILD ONLY: `LEAN_DENSE_EQ=0` selects the node-based set
+    std::optional<lean::unordered_set<key, key_hasher>> m_node_cache;
     size_t m_counter = 0;
     bool check_cache(expr const & a, expr const & b) {
         if (!is_shared(a) || !is_shared(b))
             return false;
-        std::pair<lean_object *, lean_object *> key(a.raw(), b.raw());
-        if (m_cache.find(key) != m_cache.end())
+        key k(a.raw(), b.raw());
+        if (lean::g_dense_eq == 0) {
+            if (!m_node_cache) m_node_cache.emplace();
+            if (m_node_cache->find(k) != m_node_cache->end())
+                return true;
+            m_node_cache->insert(k);
+            return false;
+        }
+        if (m_cache.find(k) != m_cache.end())
             return true;
-        m_cache.insert(key);
+        m_cache.insert(k);
         return false;
     }
     bool apply(expr const & a, expr const & b, bool root = false) {

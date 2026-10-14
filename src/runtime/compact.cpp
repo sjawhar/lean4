@@ -64,7 +64,7 @@ struct max_sharing_eq {
 struct object_compactor::max_sharing_table {
     lean::dense_set<max_sharing_key, max_sharing_hash, max_sharing_eq> m_table;
     max_sharing_table(object_compactor * manager):
-        m_table(LEAN_MAX_SHARING_TABLE_INITIAL_SIZE, max_sharing_hash(manager), max_sharing_eq(manager)) {
+        m_table(g_dense_cs, max_sharing_hash(manager), max_sharing_eq(manager)) {
     }
 };
 
