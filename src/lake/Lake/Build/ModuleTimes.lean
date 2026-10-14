@@ -101,14 +101,13 @@ public def compilePrio (remainingMs : Nat) : Task.Priority :=
 /-- One build's view of the record: priorities from the file as read, entries this build compiled. -/
 public structure ModuleTimes where
   path : FilePath
-  old : ModuleTimeMap
   prios : Std.HashMap Name Task.Priority
   new : IO.Ref ModuleTimeMap
 
 public def ModuleTimes.load (path : FilePath) : IO ModuleTimes := do
-  let old ← readModuleTimes path
-  let prios := (remainingPaths old).fold (init := {}) fun m n t => m.insert n (compilePrio t)
-  return {path, old, prios, new := ← IO.mkRef {}}
+  let entries ← readModuleTimes path
+  let prios := (remainingPaths entries).fold (init := {}) fun m n t => m.insert n (compilePrio t)
+  return {path, prios, new := ← IO.mkRef {}}
 
 public def ModuleTimes.prio (self : ModuleTimes) (mod : Name) : Task.Priority :=
   self.prios.getD mod Task.Priority.default
@@ -117,15 +116,16 @@ public def ModuleTimes.record (self : ModuleTimes) (e : ModuleTimeEntry) : BaseI
   self.new.modify (·.insert e.name e)
 
 /--
-Writes this build's entries over the old record, keeping an old entry only if `keep` accepts its
-module. Writes nothing and returns 0 when this build compiled nothing; otherwise returns how many
-entries this build recorded.
+Writes this build's entries over the record as it is on disk now (re-read, so entries another
+Lake process saved during this build survive), keeping an entry from the file only if `keep`
+accepts its module. Writes nothing and returns 0 when this build compiled nothing; otherwise
+returns how many entries this build recorded.
 -/
 public def ModuleTimes.save (self : ModuleTimes) (keep : Name → BaseIO Bool) : IO Nat := do
   let new ← self.new.get
   if new.isEmpty then return 0
   let mut merged := new
-  for (n, e) in self.old do
+  for (n, e) in ← readModuleTimes self.path do
     if !merged.contains n && (← keep n) then
       merged := merged.insert n e
   writeModuleTimes self.path merged
