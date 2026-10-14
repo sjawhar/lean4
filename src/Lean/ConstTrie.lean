@@ -498,7 +498,7 @@ public def collectDuplicates (trees : Array (Nat × ConstTrie α))
     `Census.addConstMapForceNs`'s process-wide running total. `Thunk.get` memoizes, so only the
     first force of a given node actually runs `f` and gets timed; later `get`s are free. No-op
     overhead beyond the `isEnabled` check when census collection is off. -/
-@[noinline] private unsafe def timeThunkUnsafe (f : Unit → α) : α := unsafeBaseIO do
+@[noinline] private unsafe def timeThunkUnsafe {α : Type} (f : Unit → α) : α := unsafeBaseIO do
   if (← Census.isEnabled) then
     let t0 ← IO.monoNanosNow
     let r := f ()
@@ -508,7 +508,7 @@ public def collectDuplicates (trees : Array (Nat × ConstTrie α))
   else
     return f ()
 
-@[inherit_doc timeThunkUnsafe, implemented_by timeThunkUnsafe] private def timeThunk (f : Unit → α) : α :=
+@[inherit_doc timeThunkUnsafe, implemented_by timeThunkUnsafe] private def timeThunk {α : Type} (f : Unit → α) : α :=
   f ()
 
 /--
