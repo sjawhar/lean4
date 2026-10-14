@@ -1000,67 +1000,44 @@ structure UsekeySidecar where
   /-- For each `extra` module of the `.usage`: the hash of its `.olean` and its `moduleDigest`. -/
   extra : NameMap (Hash × Hash)
 
-namespace UsageSidecar
-
-def checkVersion (j : Json) : Except String Unit := do
+def checkUsageVersion (j : Json) : Except String Unit := do
   let v ← j.getObjValAs? Nat "version"
   unless v == 1 do throw s!"unsupported version {v}"
 
-def parseHash (j : Json) : Except String Hash := do
-  let s ← j.getStr?
-  let some h := Hash.ofHex? s | throw s!"invalid digest: {s}"
-  return h
+instance : FromJson UsageSidecar where
+  fromJson? j := do
+    checkUsageVersion j
+    let own ← j.getObjValAs? (Array (Name × Hash)) "own"
+    let extra ← j.getObjValAs? (Array (Name × Bool)) "extra"
+    return {
+      noskip := ← j.getObjValAs? Bool "noskip"
+      moduleDigest := ← j.getObjValAs? Hash "moduleDigest"
+      own := own.foldl (init := {}) fun m (n, d) => m.insert n d
+      used := ← j.getObjValAs? (Array (Name × Array (Name × Hash))) "used"
+      extra := extra.map (·.1)
+    }
 
-def parseName (j : Json) : Except String Name :=
-  fromJson? j
-
-def parsePair (j : Json) : Except String (Json × Json) := do
-  let #[a, b] ← j.getArr? | throw s!"expected a pair, got {j.compress}"
-  return (a, b)
-
-def parseNamed (j : Json) : Except String (Name × Hash) := do
-  let (n, d) ← parsePair j
-  return (← parseName n, ← parseHash d)
-
-def parse (j : Json) : Except String UsageSidecar := do
-  checkVersion j
-  let noskip ← j.getObjValAs? Bool "noskip"
-  let moduleDigest ← parseHash (← j.getObjVal? "moduleDigest")
-  let own ← (← (← j.getObjVal? "own").getArr?).foldlM (init := ({} : NameMap Hash)) fun m e => do
-    let (n, d) ← parseNamed e
-    return m.insert n d
-  let used ← (← (← j.getObjVal? "used").getArr?).mapM fun e => do
-    let (m, cs) ← parsePair e
-    return (← parseName m, ← (← cs.getArr?).mapM parseNamed)
-  let extra ← (← (← j.getObjVal? "extra").getArr?).mapM fun e => do
-    let (m, isMeta) ← parsePair e
-    discard <| isMeta.getBool?
-    parseName m
-  return {noskip, moduleDigest, own, used, extra}
-
-end UsageSidecar
-
-def UsekeySidecar.parse (j : Json) : Except String UsekeySidecar := do
-  UsageSidecar.checkVersion j
-  let localHash ← UsageSidecar.parseHash (← j.getObjVal? "local")
-  let olean ← UsageSidecar.parseHash (← j.getObjVal? "olean")
-  let modsys ← UsageSidecar.parseHash (← j.getObjVal? "modsys")
-  let extra ← (← (← j.getObjVal? "extra").getArr?).foldlM (init := ({} : NameMap (Hash × Hash)))
-    fun m e => do
+instance : FromJson UsekeySidecar where
+  fromJson? j := do
+    checkUsageVersion j
+    let extra ← (← j.getObjValAs? (Array Json) "extra").foldlM (init := {}) fun m e => do
       let #[n, o, d] ← e.getArr? | throw s!"expected a triple, got {e.compress}"
-      return m.insert (← UsageSidecar.parseName n)
-        (← UsageSidecar.parseHash o, ← UsageSidecar.parseHash d)
-  return {localHash, olean, modsys, extra}
+      return m.insert (← fromJson? n) (← fromJson? o, ← fromJson? d)
+    return {
+      localHash := ← j.getObjValAs? Hash "local"
+      olean := ← j.getObjValAs? Hash "olean"
+      modsys := ← j.getObjValAs? Hash "modsys"
+      extra
+    }
 
 /--
 Reads a usage-cutoff sidecar. Returns `none` if it does not exist. If it exists but is not valid,
 logs a warning and returns `none`, so the module builds normally.
 -/
-def readUsageSidecar {α : Type} (path : FilePath) (parse : Json → Except String α) :
-    JobM (Option α) := do
+def readUsageSidecar (α : Type) [FromJson α] (path : FilePath) : JobM (Option α) := do
   match (← IO.FS.readFile path |>.toBaseIO) with
   | .ok contents =>
-    match Json.parse contents >>= parse with
+    match Json.parse contents >>= fromJson? with
     | .ok a =>
       return some a
     | .error e =>
@@ -1093,7 +1070,7 @@ the `.usage` is invalid.
 def importUsage? (importArts : NameMap ImportArtifacts) (m : Name) :
     JobM (Option (FilePath × UsageSidecar)) := do
   let some olean := (importArts.find? m).bind (·.olean?) | return none
-  let some usage ← readUsageSidecar (olean.withExtension "usage") UsageSidecar.parse | return none
+  let some usage ← readUsageSidecar UsageSidecar (olean.withExtension "usage") | return none
   return some (olean, usage)
 
 /--
@@ -1104,7 +1081,7 @@ the hash of its `.olean` and its current `moduleDigest`. Writes nothing if the `
 -/
 def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     (importArts : NameMap ImportArtifacts) (oleanHash : Hash) : JobM Unit := do
-  let some usage ← readUsageSidecar mod.usageFile UsageSidecar.parse | return
+  let some usage ← readUsageSidecar UsageSidecar mod.usageFile | return
   let mut extra := #[]
   for m in usage.extra do
     let some (olean, imp) ← importUsage? importArts m | return
@@ -1150,8 +1127,8 @@ local inputs are unchanged, no module-system module in its closure (`importArts`
 -/
 def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
     (importArts : NameMap ImportArtifacts) : JobM Bool := do
-  let some usage ← readUsageSidecar mod.usageFile UsageSidecar.parse | return false
-  let some key ← readUsageSidecar mod.usekeyFile UsekeySidecar.parse | return false
+  let some usage ← readUsageSidecar UsageSidecar mod.usageFile | return false
+  let some key ← readUsageSidecar UsekeySidecar mod.usekeyFile | return false
   if usage.noskip || key.localHash != presetup.localTrace.hash then
     return false
   unless (← fetchFileHash mod.oleanFile) == key.olean do return false
