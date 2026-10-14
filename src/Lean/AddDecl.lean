@@ -13,6 +13,7 @@ public import Lean.AutoDecl
 import Lean.Linter.Init
 import Lean.Compiler.MetaAttr
 import Lean.Util.RecDepth
+import Lean.Util.UsedByChecks
 import all Lean.OriginalConstKind  -- for accessing `privateConstKindsExt`
 
 public section
@@ -227,6 +228,8 @@ is true, exposes the declaration body, i.e. preserves the full representation in
 independently of `Environment.isExporting` and even for theorems.
 -/
 def addDecl (decl : Declaration) (forceExpose := false) : CoreM Unit := do
+  let used := decl.foldExprM (m := Id) (fun s e => e.foldConsts s fun c s => s.insert c) ({} : NameSet)
+  usedByChecksRef.modify fun acc => used.foldl (·.insert ·) acc
   addDeclCore decl forceExpose
   discard <| decl.getTopLevelNames.mapM snapshotEnvLinterOptions
 
