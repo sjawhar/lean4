@@ -101,6 +101,12 @@ public abbrev pkg (self : Module) : Package :=
 @[inline] public def oleanFile (self : Module) : FilePath :=
   self.leanLibPath "olean"
 
+@[inline] public def usageFile (self : Module) : FilePath :=
+  self.leanLibPath "usage"
+
+@[inline] public def usekeyFile (self : Module) : FilePath :=
+  self.leanLibPath "usekey"
+
 @[inline] public def oleanServerFile (self : Module) : FilePath :=
   self.leanLibPath "olean.server"
 

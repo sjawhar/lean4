@@ -1,10 +1,5 @@
-/Test/A.lean
-/Test/B.lean
-/Test/C.lean
-/Test/D.lean
-/Test/H.lean
-/Test/HU.lean
-/Test/Syn.lean
-/Test/Rules.lean
-/Test/Ex.lean
+/Test/
 /lakefile.toml.bak
+/outside/
+/stock/
+/stock.tgz
