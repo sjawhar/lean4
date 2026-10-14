@@ -14,6 +14,9 @@ printf 'import Test.Rules\nexample : (mk2 : Nat) = 2 := rfl\n' > Test/Ex.lean
 test_run build Test.B Test.C Test.D Test.HU Test.Ex
 test_exp -f .lake/build/lib/lean/Test/B.usage
 test_cmd_out '[["Test","A"],[[["a"],"' cat .lake/build/lib/lean/Test/B.usage
+# `example` (C) reaches `used` through `usedByChecksRef`, `#print axioms` (D) through its `TermInfo`.
+test_cmd_out '[["Test","A"],[[["a"],"' cat .lake/build/lib/lean/Test/C.usage
+test_cmd_out '[["Test","A"],[[["ta"],"' cat .lake/build/lib/lean/Test/D.usage
 # Names are component arrays: a macro-scoped name keeps its components instead of an unparsable string.
 test_cmd_out '["hyg","_@","Test","H",' cat .lake/build/lib/lean/Test/H.usage
 test_cmd_out '[["Test","H"],[[["h"],"' cat .lake/build/lib/lean/Test/HU.usage
