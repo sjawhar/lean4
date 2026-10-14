@@ -168,15 +168,18 @@ where
     | .str p s, acc => (go p acc).push (.str s)
     | .num p k, acc => (go p acc).push (.num k)
 
-/-- With `incrLoaded` (the run reused commands from an `--incr-load` snapshot), `noskip` is set: reused commands
-never call `addDecl` in this process, so `extra` may miss constants they used. -/
+/-- `extra` lists the extra module uses of the environment and of `extraModUsesByChecksRef` (those of commands
+whose environment was discarded). With `incrLoaded` (the run reused commands from an `--incr-load` snapshot),
+`noskip` is set: reused commands never call `addDecl` in this process, so `extra` may miss constants they used. -/
 def writeUsage (env : Environment) (extra : NameSet) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
   let consts := ownConsts env
   let own := localDigests env consts
   let noskip := incrLoaded || consts.any fun (_, _, rs) => rs.any (· matches ``Lean.reduceBool | ``Lean.reduceNat)
   let s := state env
-  let extraMods := (getLocalExtraModUses env).filter fun u =>
-    (env.getModuleIdx? u.module).any s.hasEntries
+  let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecksRef.get)
+  let extraMods := allExtra.toArray.filter (fun u => (env.getModuleIdx? u.module).any s.hasEntries)
+    |>.qsort fun a b => let k (u : ExtraModUse) := 2 * u.isExported.toNat + u.isMeta.toNat
+      Name.quickLt a.module b.module || (a.module == b.module && k a < k b)
   let pair (n : Name) (d : UInt64) := Json.arr #[nameToJson n, hex16 d]
   let j := Json.mkObj [("version", 1), ("noskip", noskip),
     ("moduleDigest", hex16 (own.foldl (fun h (_, d) => mixHash h d) 7)),
