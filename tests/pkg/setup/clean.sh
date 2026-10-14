@@ -1,1 +1,1 @@
-rm -f Dep.olean
+rm -f Dep.olean Dep.usage
