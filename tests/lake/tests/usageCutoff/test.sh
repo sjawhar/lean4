@@ -14,6 +14,15 @@ test_cmd_out '[["Test","A"],[[["a"],"' cat .lake/build/lib/lean/Test/B.usage
 # Names are component arrays: a macro-scoped name keeps its components instead of an unparsable string.
 test_cmd_out '["hyg","_@","Test","H",' cat .lake/build/lib/lean/Test/H.usage
 test_cmd_out '[["Test","H"],[[["h"],"' cat .lake/build/lib/lean/Test/HU.usage
+# the reader rebuilds component-array names: an unrelated edit to H replays HU with no warning
+printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 0\n' > Test/H.lean
+test_not_out "warning" build -v Test.HU
+match_text "Replayed Test.HU" produced.out
+# a name component that is neither a string nor a number is corrupt input: warned, then built
+printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 1\n' > Test/H.lean
+printf '{"version":1,"noskip":false,"moduleDigest":"0000000000000000","own":[],"used":[[[true],[]]],"extra":[]}' > .lake/build/lib/lean/Test/HU.usage
+test_out "expected a name component" build Test.HU
+match_text "Built Test.HU" produced.out
 # unrelated addition: A recompiles, nothing below it does
 printf 'def a := 1\ntheorem ta : a = 1 := sorry\ndef unrelated := 2\n' > Test/A.lean
 lake_out build -v Test.B Test.C Test.D
