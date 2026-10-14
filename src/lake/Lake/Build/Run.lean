@@ -333,7 +333,7 @@ def monitorJob (ctx : MonitorContext) (job : Job α) : BaseIO (BuildResult α) :
     return {toMonitorResult := result, out := .error "build failed"}
 
 def mkBuildContext'
-  (ws : Workspace) (cfg : BuildConfig) (jobs : JobQueue)
+  (ws : Workspace) (cfg : BuildConfig) (jobs : JobQueue) (moduleTimes? : Option ModuleTimes := none)
 : BaseIO BuildContext := return {
   opaqueWs := ws
   toBuildConfig := {cfg with
@@ -353,6 +353,7 @@ def mkBuildContext'
     else
       return none
   registeredJobs := jobs
+  moduleTimes?
   leanTrace := .ofHash (pureHash ws.lakeEnv.leanGithash)
     s!"Lean {Lean.versionStringCore}, commit {ws.lakeEnv.leanGithash}"
 }
@@ -367,6 +368,15 @@ def finalizeBuild
   (cfg : BuildConfig) (bctx : BuildContext ) (mctx : MonitorContext) (result : BuildResult α)
 : IO α := do
   reportResult cfg mctx.out result
+  if let some mt := bctx.moduleTimes? then
+    -- The record only orders compiles, so failing to save it warns instead of failing the build.
+    let saved ← (mt.save fun name => (·.leanFile) <$> bctx.workspace.findTargetModule? name).toBaseIO
+    match saved with
+    | .ok n =>
+      if n > 0 && cfg.verbosity matches .verbose then
+        print! mctx.out s!"Recorded compile times of {n} modules in {mt.path}\n"
+    | .error e =>
+      mctx.logger.logEntry (.warning s!"{mt.path}: failed to save module compile times: {e}")
   if let some outputsFile := cfg.outputsFile? then
     bctx.workspace.saveOutputs (logger := mctx.logger)
       bctx.outputsRef? mctx.out outputsFile (cfg.verbosity matches .verbose)
@@ -389,7 +399,8 @@ public def Workspace.runFetchM
 : IO α := do
   let jobs ← mkJobQueue
   let mctx ← mkMonitorContext cfg jobs
-  let bctx ← mkBuildContext' ws cfg jobs
+  let moduleTimes ← ModuleTimes.load (ws.lakeDir / moduleTimesFileName)
+  let bctx ← mkBuildContext' ws cfg jobs (moduleTimes? := some moduleTimes)
   let job ← startBuild bctx build caption
   let result ← monitorJob mctx job
   finalizeBuild cfg bctx mctx result
@@ -429,7 +440,8 @@ public def Workspace.runBuild
 : IO α := do
   let jobs ← mkJobQueue
   let mctx ← mkMonitorContext cfg jobs
-  let bctx ← mkBuildContext' ws cfg jobs
+  let moduleTimes ← ModuleTimes.load (ws.lakeDir / moduleTimesFileName)
+  let bctx ← mkBuildContext' ws cfg jobs (moduleTimes? := some moduleTimes)
   let job ← startBuild bctx build
   let result ← monitorBuild mctx job
   finalizeBuild cfg bctx mctx result
