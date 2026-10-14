@@ -50,4 +50,12 @@ printf 'import Test.A\ndef b : Bool := a\n' > Test/B.lean
 test_err "Test.B" build Test.B
 test_exp ! -f .lake/build/lib/lean/Test/B.usekey
 test_exp ! -f .lake/build/lib/lean/Test/B.usage
+# a module-system file in a non-module file's closure carries no digests: an edit to its
+# private body must still rebuild the non-module importer (here N's proof becomes false)
+printf 'module\npublic def d : Nat := 1\n' > Test/U.lean
+printf 'module\npublic import Test.U\npublic def c : Nat := d\n' > Test/K.lean
+printf 'import Test.K\ntheorem t : c = 1 := rfl\n' > Test/N.lean
+test_run build Test.N
+printf 'module\npublic def d : Nat := 2\n' > Test/U.lean
+test_err "Building Test.N" build -v Test.N
 rm -f produced.out

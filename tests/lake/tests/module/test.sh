@@ -1,14 +1,6 @@
 #!/usr/bin/env bash
 source ../common.sh
 
-# A non-module importer that uses nothing from the edited import is replayed by usage cutoff
-# instead of rebuilt; either way its trace must change, which shows Lake saw the edit.
-test_nonmodule_rebuilt() {
-  cp .lake/build/lib/lean/Test/NonModule/$1.trace produced.trace
-  test_out_pat "(Built|Replayed) Test.NonModule.$1" build Test.NonModule.$1 -v
-  test_cmd_fails cmp -s produced.trace .lake/build/lib/lean/Test/NonModule/$1.trace
-}
-
 ./clean.sh
 
 # ---
@@ -100,13 +92,13 @@ test_out "Built Test.Module.PublicImport" build Test.Module.PublicImport -v
 # should trigger a rebuild on a direct `import all`
 test_out "Built Test.Module.ImportAll" build Test.Module.ImportAll -v
 # should trigger a rebuild for a non-module direct import
-test_nonmodule_rebuilt Import
+test_out "Built Test.NonModule.Import" build Test.NonModule.Import -v
 # should not trigger a rebuild on a module transitive private `import`
 test_run build Test.Module.ImportImport --no-build
 # should trigger a rebuild on an `import all` of a transitive private `import`
 test_out "Built Test.Module.ImportAllImport" build Test.Module.ImportAllImport -v
 # should trigger a rebuild for a non-module transitive import
-test_nonmodule_rebuilt ImportModuleImport
+test_out "Built Test.NonModule.ImportModuleImport" build Test.NonModule.ImportModuleImport -v
 
 # Build all tests before making an edit
 test_run build
@@ -127,14 +119,14 @@ test_run build Test.Module.Import Test.Module.PublicImport --no-build
 test_out "Built Test.Module.ImportAll" build Test.Module.ImportAll -v
 test_out "Built Test.Module.PromoteImport" build Test.Module.PromoteImport -v
 # should trigger a rebuild for a non-module direct import
-test_nonmodule_rebuilt Import
+test_out "Built Test.NonModule.Import" build Test.NonModule.Import -v
 # should not trigger a rebuild on an `import all` of a transitive private `import`
 test_run build Test.Module.ImportAllImport --no-build
 # should trigger a rebuild on an `import all` of a transitive private `import all`
 test_out "Built Test.Module.ImportAllImportAll" build Test.Module.ImportAllImportAll -v
 test_out "Built Test.Module.PromoteTransImport" build Test.Module.PromoteTransImport -v
 # should trigger a rebuild for a non-module transitive import
-test_nonmodule_rebuilt ImportModuleImport
+test_out "Built Test.NonModule.ImportModuleImport" build Test.NonModule.ImportModuleImport -v
 
 # Build all tests before making an edit
 test_run build
@@ -151,9 +143,9 @@ test_run build Test.Module.Import Test.Module.PublicImport --no-build
 # should trigger a rebuild on a direct `import all`
 test_out "Built Test.Module.ImportAll" build Test.Module.ImportAll -v
 # should trigger a rebuild for a non-module direct import
-test_nonmodule_rebuilt Import
+test_out "Built Test.NonModule.Import" build Test.NonModule.Import -v
 # should trigger a rebuild for a non-module transitive import
-test_nonmodule_rebuilt ImportModuleImport
+test_out "Built Test.NonModule.ImportModuleImport" build Test.NonModule.ImportModuleImport -v
 
 # Build all tests before making an edit
 test_run build
@@ -188,9 +180,9 @@ test_run build Test.Module.ImportAllImport --no-build
 # should trigger a rebuild on a `import all` of a private `meta import`
 test_out "Built Test.Module.ImportAllMetaImport" build Test.Module.ImportAllMetaImport -v
 # should trigger a rebuild for a non-module direct import
-test_nonmodule_rebuilt Import
+test_out "Built Test.NonModule.Import" build Test.NonModule.Import -v
 # should trigger a rebuild for a non-module transitive import
-test_nonmodule_rebuilt ImportModuleImport
+test_out "Built Test.NonModule.ImportModuleImport" build Test.NonModule.ImportModuleImport -v
 
 # Cleanup
 rm -f produced*

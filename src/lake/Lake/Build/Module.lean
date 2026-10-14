@@ -993,6 +993,8 @@ structure UsageSidecar where
 /-- A module's `.usekey` sidecar: what Lake saw of the module's build when Lean wrote its `.usage`. -/
 structure UsekeySidecar where
   localHash : Hash
+  /-- `modsysHash` of the module's import closure. -/
+  modsys : Hash
   /-- For each `extra` module of the `.usage`: the hash of its `.olean` and its `moduleDigest`. -/
   extra : NameMap (Hash × Hash)
 
@@ -1039,12 +1041,13 @@ end UsageSidecar
 def UsekeySidecar.parse (j : Json) : Except String UsekeySidecar := do
   UsageSidecar.checkVersion j
   let localHash ← UsageSidecar.parseHash (← j.getObjVal? "local")
+  let modsys ← UsageSidecar.parseHash (← j.getObjVal? "modsys")
   let extra ← (← (← j.getObjVal? "extra").getArr?).foldlM (init := ({} : NameMap (Hash × Hash)))
     fun m e => do
       let #[n, o, d] ← e.getArr? | throw s!"expected a triple, got {e.compress}"
       return m.insert (← UsageSidecar.parseName n)
         (← UsageSidecar.parseHash o, ← UsageSidecar.parseHash d)
-  return {localHash, extra}
+  return {localHash, modsys, extra}
 
 /--
 Reads a usage-cutoff sidecar. Returns `none` if it does not exist. If it exists but is not valid,
@@ -1066,9 +1069,25 @@ def readUsageSidecar {α : Type} (path : FilePath) (parse : Json → Except Stri
     error s!"{path}: read failed: {e}"
 
 /--
-Writes the module's `.usekey` from the `.usage` Lean just wrote: the module's local trace hash and,
-for each `extra` module, the hash of its `.olean` and its current `moduleDigest`. Writes nothing
-if the `.usage` or an `extra` module's `.usage` is missing, so the module is never skipped.
+A hash of every artifact of every module-system module in an import closure, with its name.
+Module-system files carry no meaning digests (Lean writes them at the private level only), so a
+non-module importer's digest chain cannot see through one; its skip requires these bytes unchanged.
+-/
+def modsysHash (importArts : NameMap ImportArtifacts) : JobM Hash := do
+  let mut h := Hash.nil
+  for (m, arts) in importArts do
+    if arts.oleanServer?.isSome then
+      h := h.mix (Hash.ofHashable m)
+      for paths in arts.toArrays do
+        for path in paths do
+          h := h.mix (← fetchFileHash path)
+  return h
+
+/--
+Writes the module's `.usekey` from the `.usage` Lean just wrote: the module's local trace hash, the
+`modsysHash` of its closure and, for each `extra` module, the hash of its `.olean` and its current
+`moduleDigest`. Writes nothing if the `.usage` or an `extra` module's `.usage` is missing, so the
+module is never skipped.
 -/
 def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     (importArts : NameMap ImportArtifacts) : JobM Unit := do
@@ -1082,6 +1101,7 @@ def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
   let key := Json.mkObj [
     ("version", 1),
     ("local", toJson presetup.localTrace.hash.hex),
+    ("modsys", toJson (← modsysHash importArts).hex),
     ("extra", Json.arr extra)
   ]
   IO.FS.writeFile mod.usekeyFile key.compress
@@ -1107,8 +1127,9 @@ def usageCutoffEnabled : BaseIO Bool :=
 
 /--
 Whether nothing the module used changed meaning since Lean wrote its `.usage`: its local inputs
-are unchanged, every imported constant it used has the same digest in its module's current
-`.usage`, and every `extra` module has the same `.olean` hash and `moduleDigest`.
+are unchanged, no module-system module in its closure changed (`modsysHash`), every imported
+constant it used has the same digest in its module's current `.usage`, and every `extra` module
+has the same `.olean` hash and `moduleDigest`.
 -/
 def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup) : JobM Bool := do
   let some usage ← readUsageSidecar mod.usageFile UsageSidecar.parse | return false
@@ -1116,6 +1137,7 @@ def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup) : JobM Bool 
   if usage.noskip || key.localHash != presetup.localTrace.hash then
     return false
   let importArts := (← mkModuleSetup mod presetup).importArts
+  unless (← modsysHash importArts) == key.modsys do return false
   for (m, consts) in usage.used do
     let some olean := (importArts.find? m).bind (·.olean?) | return false
     let some imp ← readUsageSidecar (olean.withExtension "usage") UsageSidecar.parse | return false
