@@ -61,6 +61,31 @@ static void kc_claim_entry() {
     g_kc_total_entries.fetch_add(1, std::memory_order_relaxed);
 }
 
+// Any `expr` entering one of these process-wide tables is about to be read, inc_ref'd and
+// dec_ref'd from every `Elab.async` thread this process runs for the rest of its life, not just
+// the thread that computed it: `object_ref`'s copy constructor and destructor (`expr`'s base
+// class, `runtime/object_ref.h`) touch the object's raw `m_rc` field directly
+// (`lean_inc_ref`/`lean_dec_ref`), and those only become an atomic RMW once `lean_mark_mt` has
+// been called on the object -- otherwise they are a plain, non-atomic `m_rc +=/-= 1`. A
+// `std::shared_mutex` around a table's own `insert`/`find` only serializes this cache's own
+// bookkeeping; it does nothing for the *caller's* own, completely unguarded local-variable
+// refcounting once its local copy of the same key or value goes out of scope on another thread
+// (or once a different declaration's computation happens to share the same subterm object and
+// drops or copies it independently). Mark every key and value here, right before it is stored,
+// closing that race (lean-build-perf#16: this -- not a gap in `is_shareable`'s own
+// closed/imported predicate -- is what let a verified-closed, verified-imported key's own
+// computed value still turn up with a corrupted, already-recycled subterm). `lean_mark_mt`
+// recurses through the whole reachable graph and is a no-op on an already-shared node, so
+// re-marking a subterm two tables share costs nothing extra, exactly like `alloc_task` already
+// marks unconditionally whatever is handed to a `Task`.
+static std::atomic<uint64_t> g_kc_st_marked{0};
+static void kc_mark_shared(expr const & e) {
+    object * o = e.raw();
+    if (!is_scalar(o) && is_st_heap_obj(o))
+        g_kc_st_marked.fetch_add(1, std::memory_order_relaxed);
+    mark_mt(o);
+}
+
 namespace {
 struct kc_expr_shard {
     std::shared_mutex m_mutex;
@@ -100,6 +125,8 @@ public:
     }
     void insert(expr const & e, expr const & r) {
         if (!kc_has_room()) return;
+        kc_mark_shared(e);
+        kc_mark_shared(r);
         kc_expr_shard & shard = *m_shards[kc_shard_index(hash(e))];
         std::unique_lock<std::shared_mutex> lock(shard.m_mutex);
         if (shard.m_table.insert(mk_pair(e, r)).second) {
@@ -128,6 +155,8 @@ public:
     }
     void insert(expr const & t, expr const & s) {
         if (!kc_has_room()) return;
+        kc_mark_shared(t);
+        kc_mark_shared(s);
         expr_pair p(t, s);
         kc_pair_shard & shard = *m_shards[kc_shard_index(expr_pair_hash()(p))];
         std::unique_lock<std::shared_mutex> lock(shard.m_mutex);
@@ -157,6 +186,7 @@ public:
     }
     void insert(expr const & e, bool v) {
         if (!kc_has_room()) return;
+        kc_mark_shared(e);
         kc_bool_shard & shard = *m_shards[kc_shard_index(hash(e))];
         std::unique_lock<std::shared_mutex> lock(shard.m_mutex);
         if (shard.m_table.insert(mk_pair(e, v)).second)
@@ -284,9 +314,10 @@ void kc_cache::dump_stats() {
     kc_dump_one("whnf",      m_whnf_stats);
     kc_dump_one("unfold",    m_unfold_stats);
     kc_dump_one("defeq",     m_defeq_stats);
-    fprintf(stderr, "[kc] total entries=%llu cap=%llu%s enabled=%d\n",
+    fprintf(stderr, "[kc] total entries=%llu cap=%llu%s enabled=%d st_marked=%llu\n",
             (unsigned long long)g_kc_total_entries.load(), (unsigned long long)g_kc_max_entries,
-            g_kc_total_entries.load() >= g_kc_max_entries ? " (cap reached)" : "", (int)g_kc_enabled);
+            g_kc_total_entries.load() >= g_kc_max_entries ? " (cap reached)" : "", (int)g_kc_enabled,
+            (unsigned long long)g_kc_st_marked.load());
 }
 
 kc_cache & get_kc_cache() {
