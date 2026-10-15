@@ -1036,11 +1036,11 @@ public def Module.ltarFacetConfig : ModuleFacetConfig ltarFacet :=
 /-- The parts of a module's `.usage` sidecar (written by Lean next to its `.olean`) that Lake checks. -/
 structure UsageSidecar where
   noskip : Bool
-  moduleDigest : Hash
+  moduleDigest : ModuleUsage.Digest
   /-- A digest of the module's import closure (`Lean.ModuleUsage.closureDigest`). -/
-  closure : Hash
-  own : NameMap Hash
-  used : Array (Name × Array (Name × Hash))
+  closure : ModuleUsage.Digest
+  own : NameMap ModuleUsage.Digest
+  used : Array (Name × Array (Name × ModuleUsage.Digest))
   extra : Array Name
 
 /-- A module's `.usekey` sidecar: what Lake saw of the module's build when Lean wrote its `.usage`. -/
@@ -1051,9 +1051,9 @@ structure UsekeySidecar where
   /-- `modsysHash` of the module's import closure. -/
   modsys : Hash
   /-- `closureHash` of the module's direct imports. -/
-  closure : Hash
+  closure : ModuleUsage.Digest
   /-- For each workspace `extra` module of the `.usage`: the hash of its `.olean` and its `moduleDigest`. -/
-  extra : NameMap (Hash × Hash)
+  extra : NameMap (Hash × ModuleUsage.Digest)
 
 /--
 A name in a usage sidecar, as `Lean.ModuleUsage.nameToJson` writes it: the JSON array of its
@@ -1072,20 +1072,15 @@ instance : FromJson SidecarName where
       | _ => throw s!"expected a name component, got {c.compress}"
     return ⟨n⟩
 
-def checkUsageVersion (j : Json) : Except String Unit := do
-  let v ← j.getObjValAs? Nat "version"
-  unless v == 2 do throw s!"unsupported version {v}"
-
 instance : FromJson UsageSidecar where
   fromJson? j := do
-    checkUsageVersion j
-    let own ← j.getObjValAs? (Array (SidecarName × Hash)) "own"
-    let used ← j.getObjValAs? (Array (SidecarName × Array (SidecarName × Hash))) "used"
+    let own ← j.getObjValAs? (Array (SidecarName × ModuleUsage.Digest)) "own"
+    let used ← j.getObjValAs? (Array (SidecarName × Array (SidecarName × ModuleUsage.Digest))) "used"
     let extra ← j.getObjValAs? (Array (SidecarName × Bool)) "extra"
     return {
       noskip := ← j.getObjValAs? Bool "noskip"
-      moduleDigest := ← j.getObjValAs? Hash "moduleDigest"
-      closure := ← j.getObjValAs? Hash "closure"
+      moduleDigest := ← j.getObjValAs? ModuleUsage.Digest "moduleDigest"
+      closure := ← j.getObjValAs? ModuleUsage.Digest "closure"
       own := own.foldl (init := {}) fun m (n, d) => m.insert n.name d
       used := used.map fun (m, cs) => (m.name, cs.map fun (c, d) => (c.name, d))
       extra := extra.map (·.1.name)
@@ -1093,7 +1088,6 @@ instance : FromJson UsageSidecar where
 
 instance : FromJson UsekeySidecar where
   fromJson? j := do
-    checkUsageVersion j
     let extra ← (← j.getObjValAs? (Array Json) "extra").foldlM (init := {}) fun m e => do
       let #[n, o, d] ← e.getArr? | throw s!"expected a triple, got {e.compress}"
       return m.insert (← fromJson? (α := SidecarName) n).name (← fromJson? o, ← fromJson? d)
@@ -1101,20 +1095,26 @@ instance : FromJson UsekeySidecar where
       localHash := ← j.getObjValAs? Hash "local"
       olean := ← j.getObjValAs? Hash "olean"
       modsys := ← j.getObjValAs? Hash "modsys"
-      closure := ← j.getObjValAs? Hash "closure"
+      closure := ← j.getObjValAs? ModuleUsage.Digest "closure"
       extra
     }
 
 /--
-Reads a usage-cutoff sidecar. Returns `none` if it does not exist. If it exists but is not valid,
+Reads a usage-cutoff sidecar. Returns `none` if it does not exist or has another format version
+than `Lean.ModuleUsage.usageVersion` (an older toolchain wrote it). If it exists but is not valid,
 logs a warning and returns `none`, so the module builds normally.
 -/
 def readUsageSidecar (α : Type) [FromJson α] (path : FilePath) : JobM (Option α) := do
   match (← IO.FS.readFile path |>.toBaseIO) with
   | .ok contents =>
-    match Json.parse contents >>= fromJson? with
+    let parsed := do
+      let j ← Json.parse contents
+      let v ← j.getObjValAs? Nat "version"
+      if v != ModuleUsage.usageVersion then return none
+      some <$> fromJson? (α := α) j
+    match parsed with
     | .ok a =>
-      return some a
+      return a
     | .error e =>
       logWarning s!"{path}: {e}"
       return none
@@ -1149,21 +1149,21 @@ def importUsage? (importArts : NameMap ImportArtifacts) (m : Name) :
   return some (olean, usage)
 
 /--
-A hash of the recorded `closure` digest of each direct workspace import, with its name, or `none`
+A digest of the recorded `closure` digest of each direct workspace import, with its name, or `none`
 if one has no `.usage`. A module's closure is its direct imports plus their closures; a direct
 toolchain import is pinned by the source text and the Lean githash (local trace). A module is
-replayed only if this hash is unchanged, so every workspace module's recorded closure digest
-stays equal to its current closure, and this hash covers the importer's whole closure.
+replayed only if this digest is unchanged, so every workspace module's recorded closure digest
+stays equal to its current closure, and this digest covers the importer's whole closure.
 -/
 def closureHash (presetup : ModulePreSetup) (importArts : NameMap ImportArtifacts) :
-    JobM (Option Hash) := do
+    JobM (Option ModuleUsage.Digest) := do
   let mods := presetup.directImports.filterMap (·.module?) |>.map (·.name)
     |>.qsort Name.quickLt |>.toList.eraseDups
-  let mut h := Hash.nil
+  let mut e := ({} : ModuleUsage.Enc).nat mods.length
   for m in mods do
     let some (_, imp) ← importUsage? importArts m | return none
-    h := h.mix (Hash.ofHashable m) |>.mix imp.closure
-  return some h
+    e := e.name m |>.digest imp.closure
+  return some e.finish
 
 /--
 Writes the module's `.usekey` from the `.usage` Lean just wrote: the module's local trace hash, the
@@ -1181,14 +1181,13 @@ def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     if (← findModule? m).isNone then continue
     let some (olean, imp) ← importUsage? importArts m | return
     extra := extra.push <|
-      Json.arr #[ModuleUsage.nameToJson m, toJson (← fetchFileHash olean).hex,
-        toJson imp.moduleDigest.hex]
+      Json.arr #[ModuleUsage.nameToJson m, toJson (← fetchFileHash olean).hex, toJson imp.moduleDigest]
   let key := Json.mkObj [
-    ("version", 2),
+    ("version", ModuleUsage.usageVersion),
     ("local", toJson presetup.localTrace.hash.hex),
     ("olean", toJson oleanHash.hex),
     ("modsys", toJson (← modsysHash importArts).hex),
-    ("closure", toJson closure.hex),
+    ("closure", toJson closure),
     ("extra", Json.arr extra)
   ]
   IO.FS.writeFile mod.usekeyFile key.compress
