@@ -986,6 +986,8 @@ public def Module.ltarFacetConfig : ModuleFacetConfig ltarFacet :=
 structure UsageSidecar where
   noskip : Bool
   moduleDigest : Hash
+  /-- A digest of the module's import closure (`Lean.ModuleUsage.closureDigest`). -/
+  closure : Hash
   own : NameMap Hash
   used : Array (Name × Array (Name × Hash))
   extra : Array Name
@@ -997,7 +999,9 @@ structure UsekeySidecar where
   olean : Hash
   /-- `modsysHash` of the module's import closure. -/
   modsys : Hash
-  /-- For each `extra` module of the `.usage`: the hash of its `.olean` and its `moduleDigest`. -/
+  /-- `closureHash` of the module's direct imports. -/
+  closure : Hash
+  /-- For each workspace `extra` module of the `.usage`: the hash of its `.olean` and its `moduleDigest`. -/
   extra : NameMap (Hash × Hash)
 
 /--
@@ -1029,7 +1033,7 @@ instance : ToJson SidecarName := ⟨SidecarName.toJson⟩
 
 def checkUsageVersion (j : Json) : Except String Unit := do
   let v ← j.getObjValAs? Nat "version"
-  unless v == 1 do throw s!"unsupported version {v}"
+  unless v == 2 do throw s!"unsupported version {v}"
 
 instance : FromJson UsageSidecar where
   fromJson? j := do
@@ -1040,6 +1044,7 @@ instance : FromJson UsageSidecar where
     return {
       noskip := ← j.getObjValAs? Bool "noskip"
       moduleDigest := ← j.getObjValAs? Hash "moduleDigest"
+      closure := ← j.getObjValAs? Hash "closure"
       own := own.foldl (init := {}) fun m (n, d) => m.insert n.name d
       used := used.map fun (m, cs) => (m.name, cs.map fun (c, d) => (c.name, d))
       extra := extra.map (·.1.name)
@@ -1055,6 +1060,7 @@ instance : FromJson UsekeySidecar where
       localHash := ← j.getObjValAs? Hash "local"
       olean := ← j.getObjValAs? Hash "olean"
       modsys := ← j.getObjValAs? Hash "modsys"
+      closure := ← j.getObjValAs? Hash "closure"
       extra
     }
 
@@ -1102,25 +1108,46 @@ def importUsage? (importArts : NameMap ImportArtifacts) (m : Name) :
   return some (olean, usage)
 
 /--
+A hash of the recorded `closure` digest of each direct workspace import, with its name, or `none`
+if one has no `.usage`. A module's closure is its direct imports plus their closures; a direct
+toolchain import is pinned by the source text and the Lean githash (local trace). A module is
+replayed only if this hash is unchanged, so every workspace module's recorded closure digest
+stays equal to its current closure, and this hash covers the importer's whole closure.
+-/
+def closureHash (presetup : ModulePreSetup) (importArts : NameMap ImportArtifacts) :
+    JobM (Option Hash) := do
+  let mods := presetup.directImports.filterMap (·.module?) |>.map (·.name)
+    |>.qsort Name.quickLt |>.toList.eraseDups
+  let mut h := Hash.nil
+  for m in mods do
+    let some (_, imp) ← importUsage? importArts m | return none
+    h := h.mix (Hash.ofHashable m) |>.mix imp.closure
+  return some h
+
+/--
 Writes the module's `.usekey` from the `.usage` Lean just wrote: the module's local trace hash, the
-hash of its `.olean` (`oleanHash`), the `modsysHash` of its closure and, for each `extra` module,
-the hash of its `.olean` and its current `moduleDigest`. Writes nothing if the `.usage` or an
-`extra` module's `.usage` is missing, so the module is never skipped.
+hash of its `.olean` (`oleanHash`), the `modsysHash` of its closure, the `closureHash` of its
+direct imports and, for each workspace `extra` module, the hash of its `.olean` and its current
+`moduleDigest`. Writes nothing if the `.usage`, a direct import's `.usage` or a workspace `extra`
+module's `.usage` is missing, so the module is never skipped.
 -/
 def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     (importArts : NameMap ImportArtifacts) (oleanHash : Hash) : JobM Unit := do
   let some usage ← readUsageSidecar UsageSidecar mod.usageFile | return
+  let some closure ← closureHash presetup importArts | return
   let mut extra := #[]
   for m in usage.extra do
+    if (← findModule? m).isNone then continue
     let some (olean, imp) ← importUsage? importArts m | return
     extra := extra.push <|
       Json.arr #[toJson (SidecarName.mk m), toJson (← fetchFileHash olean).hex,
         toJson imp.moduleDigest.hex]
   let key := Json.mkObj [
-    ("version", 1),
+    ("version", 2),
     ("local", toJson presetup.localTrace.hash.hex),
     ("olean", toJson oleanHash.hex),
     ("modsys", toJson (← modsysHash importArts).hex),
+    ("closure", toJson closure.hex),
     ("extra", Json.arr extra)
   ]
   IO.FS.writeFile mod.usekeyFile key.compress
@@ -1151,8 +1178,9 @@ def usageCutoffEnabled : BaseIO Bool :=
 /--
 Whether nothing the module used changed meaning since Lean wrote its `.usage`: its `.olean` and
 local inputs are unchanged, no module-system module in its closure (`importArts`) changed
-(`modsysHash`), every imported constant it used has the same digest in its module's current
-`.usage`, and every `extra` module has the same `.olean` hash and `moduleDigest`.
+(`modsysHash`), its closure is unchanged (`closureHash`), every constant it used from a workspace
+module has the same digest in that module's current `.usage`, and every workspace `extra` module
+has the same `.olean` hash and `moduleDigest`.
 -/
 def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
     (importArts : NameMap ImportArtifacts) : JobM Bool := do
@@ -1162,11 +1190,15 @@ def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
     return false
   unless (← fetchFileHash mod.oleanFile) == key.olean do return false
   unless (← modsysHash importArts) == key.modsys do return false
+  unless (← closureHash presetup importArts) == some key.closure do return false
+  -- A module outside the workspace is a toolchain module, pinned by the Lean githash in `localTrace`.
   for (m, consts) in usage.used do
+    if (← findModule? m).isNone then continue
     let some (_, imp) ← importUsage? importArts m | return false
     for (c, d) in consts do
       unless imp.own.find? c == some d do return false
   for m in usage.extra do
+    if (← findModule? m).isNone then continue
     let some (oleanHash, digest) := key.extra.find? m | return false
     let some (olean, imp) ← importUsage? importArts m | return false
     unless (← fetchFileHash olean) == oleanHash do return false
