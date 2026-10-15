@@ -24,6 +24,8 @@ test_cmd_out '["hyg","_@","Test","H",' cat .lake/build/lib/lean/Test/H.usage
 test_cmd_out '[["Test","H"],[[["h"],"' cat .lake/build/lib/lean/Test/HU.usage
 # An `example`'s environment is discarded; the macro it expanded still reaches `extra`.
 test_cmd_out '[["Test","Rules"],' cat .lake/build/lib/lean/Test/Ex.usage
+# `.usekey` names its `extra` modules the same way
+test_cmd_out '"extra":[[["Test","Rules"],"' cat .lake/build/lib/lean/Test/Ex.usekey
 # the reader rebuilds component-array names: an unrelated edit to H replays HU with no warning
 printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 0\n' > Test/H.lean
 test_not_out "warning" build -v Test.HU
