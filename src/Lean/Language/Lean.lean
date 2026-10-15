@@ -13,6 +13,7 @@ module
 prelude
 public import Lean.Language.Util
 public import Lean.Language.Lean.Types
+public import Lean.Language.Lean.Reuse
 public import Lean.Elab.Import
 
 public section
@@ -421,7 +422,7 @@ where
                   let prom ← IO.Promise.new
                   let cancelTk ← IO.CancelToken.new
                   parseCmd oldCmd newParserState oldProcSuccess.cmdState prom (sync := true)
-                    cancelTk #[] ctx
+                    cancelTk #[] none ctx
                   return .finished none {
                     diagnostics := .empty
                     metaSnap := .finished newStx {
@@ -541,7 +542,7 @@ where
       }
       let prom ← IO.Promise.new
       let cancelTk ← IO.CancelToken.new
-      parseCmd none parserState cmdState prom (sync := true) cancelTk #[] ctx
+      parseCmd none parserState cmdState prom (sync := true) cancelTk #[] none ctx
       return {
         diagnostics := .empty
         metaSnap := .finished stx {
@@ -556,7 +557,8 @@ where
 
   parseCmd (old? : Option CommandParsedSnapshot) (parserState : Parser.ModuleParserState)
       (cmdState : Command.State) (prom : IO.Promise CommandParsedSnapshot) (sync : Bool)
-      (parseCancelTk : IO.CancelToken) (cmds : Array Syntax) : LeanProcessingM Unit := do
+      (parseCancelTk : IO.CancelToken) (cmds : Array Syntax)
+      (graft? : Option Reuse.GraftState := none) : LeanProcessingM Unit := do
     let ctx ← read
 
     let unchanged old newParserState : BaseIO Unit :=
@@ -573,7 +575,7 @@ where
           -- elaboration reuse
           BaseIO.chainTask (sync := true) oldNext.task fun oldNext => do
             parseCmd oldNext newParserState oldResult.cmdState newProm sync cancelTk
-              (cmds.push old.stx) ctx
+              (cmds.push old.stx) none ctx
         prom.resolve <| { old with nextCmdSnap? := some {
           stx? := none
           reportingRange := .some ⟨newParserState.pos, ctx.endPos⟩
@@ -582,12 +584,63 @@ where
         } }
       else prom.resolve old  -- terminal command, we're done!
 
+    -- lean-build-perf#20: `graft?` is set after a proof-only edit to an earlier theorem `D` (see
+    -- below). It walks the *old* chain exactly like `unchanged`, but for each old command decides,
+    -- via `Reuse.commandVerdict`, whether that command's result still holds against the new
+    -- environment (`D`'s new proof): if so its declarations are grafted onto the new environment via
+    -- `Environment.replayConsts` and its own diagnostics/info tree are kept as-is (only `cmdState.env`
+    -- is patched, so a request answered from this exact command's snapshot sees `D`'s new value);
+    -- if not, grafting is abandoned from here on and we fall back to full re-elaboration, exactly as
+    -- today's handling of a genuine syntax change.
+    let graftedContinue (g : Reuse.GraftState) (old : CommandParsedSnapshot) (newParserState) :
+        BaseIO Unit := do
+      let isDeclaration := old.stx.isOfKind ``Lean.Parser.Command.declaration
+      BaseIO.chainTask (sync := true) old.elabSnap.resultSnap.task fun oldResult => do
+        let cConsts := Reuse.newConstants g.oldBeforeEnv oldResult.cmdState.env
+        match Reuse.commandVerdict oldResult.cmdState.env g.unsafeNames g.unsafeNameStrs isDeclaration
+            old.stx cConsts with
+        | some extra => do
+          let patchedEnv ← Environment.replayConsts g.newEnvSoFar g.oldBeforeEnv oldResult.cmdState.env
+          let patchedCmdState := { oldResult.cmdState with env := patchedEnv }
+          let patchedResult := { oldResult with cmdState := patchedCmdState }
+          let unsafeNames := extra.foldl (·.insert ·) g.unsafeNames
+          let unsafeNameStrs := g.unsafeNameStrs ++ extra.map Reuse.lastStr
+          let g' := { g with
+            unsafeNames, unsafeNameStrs, newEnvSoFar := patchedEnv, oldBeforeEnv := oldResult.cmdState.env }
+          if let some oldNext := old.nextCmdSnap? then
+            let newProm ← IO.Promise.new
+            let cancelTk ← IO.CancelToken.new
+            BaseIO.chainTask (sync := true) oldNext.task fun oldNextSnap =>
+              parseCmd oldNextSnap newParserState patchedCmdState newProm sync cancelTk
+                (cmds.push old.stx) (some g') ctx
+            prom.resolve <| { old with
+              elabSnap := { old.elabSnap with
+                resultSnap := .finished old.elabSnap.resultSnap.stx? patchedResult }
+              nextCmdSnap? := some {
+                stx? := none
+                reportingRange := .some ⟨newParserState.pos, ctx.endPos⟩
+                task := newProm.result!
+                cancelTk? := cancelTk
+              } }
+          else
+            prom.resolve <| { old with
+              elabSnap := { old.elabSnap with
+                resultSnap := .finished old.elabSnap.resultSnap.stx? patchedResult } }
+        | none => do
+          -- unsafe: abandon grafting from here on, same as today's genuine-syntax-change handling.
+          old.nextCmdSnap?.forM (·.cancelRec)
+          let cancelTk ← IO.CancelToken.new
+          parseCmd none newParserState { oldResult.cmdState with env := g.newEnvSoFar } prom sync
+            cancelTk (cmds.push old.stx) none ctx
+
     -- fast path, do not even start new task for this snapshot (see [Incremental Parsing])
     if let some old := old? then
       if let some nextCom ← old.nextCmdSnap?.bindM (·.get?) then
         if let some nextNextCom ← nextCom.nextCmdSnap?.bindM (·.get?) then
           if (← isBeforeEditPos nextNextCom.parserState.pos) then
-            return (← unchanged old old.parserState)
+            return (← match graft? with
+              | none => unchanged old old.parserState
+              | some g => graftedContinue g old old.parserState)
 
     let beginPos := parserState.pos
     let scope := cmdState.scopes.head!
@@ -600,18 +653,26 @@ where
         Parser.parseCommand ctx.toInputContext pmctx parserState .empty
 
     -- semi-fast path
+    let mut proofOnlyEdit := false
     if let some old := old? then
       -- NOTE: as `parserState.pos` includes trailing whitespace, this forces reprocessing even if
       -- only that whitespace changes, which is wasteful but still necessary because it may
       -- influence the range of error messages such as from a trailing `exact`
       if stx.eqWithInfo old.stx then
         -- Here we must make sure to pass the *new* parser state; see NOTE in `unchanged`
-        return (← unchanged old parserState)
-      -- On first change, immediately cancel old invocation for all subsequent commands. This
-      -- includes setting the global parse cancellation token, which is stored in
-      -- `next?` below. Thus we can be sure that no further commands will start to elaborate in the
-      -- old invocation from this point on.
-      old.nextCmdSnap?.forM (·.cancelRec)
+        return (← match graft? with
+          | none => unchanged old parserState
+          | some g => graftedContinue g old parserState)
+      -- lean-build-perf#20: a proof-only edit to a `theorem` keeps `old`'s tail around (it is not
+      -- cancelled below) so that, once this command's new environment is known, we can try to graft
+      -- later commands onto it instead of re-elaborating them; see the end of this function.
+      proofOnlyEdit := Reuse.isProofOnlyEdit old.stx stx
+      unless proofOnlyEdit do
+        -- On first change, immediately cancel old invocation for all subsequent commands. This
+        -- includes setting the global parse cancellation token, which is stored in
+        -- `next?` below. Thus we can be sure that no further commands will start to elaborate in the
+        -- old invocation from this point on.
+        old.nextCmdSnap?.forM (·.cancelRec)
       -- For the current command, we depend on the elaborator to either reuse parts of `old` or
       -- cancel them as soon as reuse can be ruled out.
 
@@ -678,6 +739,7 @@ where
           reportSnap := { stx? := none, reportingRange := initRange?, task := reportPromise.result!, cancelTk? := none }
         }
       }
+      let envBeforeD := cmdState.env
       let cmdState ← doElab stx cmds cmdState beginPos
         { old? := old?.map fun old => ⟨old.stx, old.elabSnap.elabSnap⟩, new := elabPromise }
         elabCmdCancelTk ctx
@@ -747,8 +809,21 @@ where
             cancelTk? := none
           }
       if let some next := next? then
+        -- lean-build-perf#20: if this command was a proof-only edit of a theorem, try to start a
+        -- grafting pass for everything after it instead of unconditionally re-elaborating it; see
+        -- `graftedContinue` above and `Reuse.startGraft`.
+        let graft?' ← match old? with
+          | some old =>
+            if proofOnlyEdit then
+              let identStx := ((stx.getArg 1).getArg 1).getArg 0
+              let declName := scope.currNamespace ++ identStx.getId
+              let oldResult := old.elabSnap.resultSnap.task.get
+              Reuse.startGraft declName scope.opts envBeforeD oldResult.cmdState.env cmdState.env
+            else pure none
+          | none => pure none
         -- We're definitely off the fast-forwarding path now
-        parseCmd none parserState cmdState next (sync := false) elabCmdCancelTk (cmds.push stx) ctx
+        parseCmd none parserState cmdState next (sync := false) elabCmdCancelTk (cmds.push stx)
+          graft?' ctx
 
   doElab (stx : Syntax) (cmds : Array Syntax) (cmdState : Command.State) (beginPos : String.Pos.Raw)
       (snap : SnapshotBundle DynamicSnapshot) (cancelTk : IO.CancelToken) :
