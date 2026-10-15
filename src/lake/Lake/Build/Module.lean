@@ -1102,9 +1102,16 @@ where
       -- Note: This branch implies that only the ltar output is (validly) cached.
       -- Thus, we use only the new trace unpacked from the ltar to resolve further artifacts.
       let savedTrace ← readTraceFile mod.traceFile
+      -- Verify against the trace's own descriptors unconditionally: `getArtifactsUsingTrace?`
+      -- below only resolves (and thus only the old code only verified) when every artifact is
+      -- *also* already in the local cache under its own hash, which a fresh `.ltar`-only
+      -- restore never is.
+      let some descrs := savedTrace.moduleOutputDescrs?
+        | error s!"{mod.name}: cannot verify restored artifacts: \
+            {mod.traceFile} has no decodable output descriptors"
+      mod.verifyUnpackedArtifacts descrs ltar.path
       let arts? ← getArtifactsUsingTrace? inputHash savedTrace mod.pkg
       if let some (arts : ModuleOutputArtifacts) := arts? then
-        mod.verifyUnpackedArtifacts arts.descrs ltar.path
         -- on initial unpack from cache ensure all artifacts uniformly
         -- end up in the build directory and, if writable, the cache
         let arts ← mod.restoreAllArtifacts {arts with ltar? := some ltar}
