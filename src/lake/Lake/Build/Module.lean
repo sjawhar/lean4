@@ -240,17 +240,37 @@ structure TransImportEntry where
   /-- Whether this module has been transitively imported by a `meta import`. -/
   needsMeta : Bool
 
+/--
+One snapshot of the build store (a single `ST.Ref.get`). A lookup-only pass over many memoized facets reads the
+shared cell once this way: each `get` of a multi-threaded ref is two atomic exchanges on it.
+-/
+@[inline] def getBuildStoreSnapshot : FetchM BuildStore :=
+  .ofFn fun _ _ _ store _ log => return .ok (← store.get) log
+
+/-- The job memoized for `info` in the snapshot `s`, if any. -/
+@[inline] def BuildStore.getInfo?
+  (s : BuildStore) (info : BuildInfo) [t : FamilyOut BuildData info.key α]
+: Option (Job α) :=
+  cast (by rw [t.fam_eq]) (s.get? info.key)
+
+/-- `info.fetch`, from the snapshot `s` when the facet is memoized there. -/
+@[inline] def fetchFrom
+  (s : BuildStore) (info : BuildInfo) [FamilyOut BuildData info.key α]
+: FetchM (Job α) := do
+  if let some job := s.getInfo? info then return job else info.fetch
+
 partial def fetchTransImportArts
   (directImports : Array ModuleImport) (directArts : NameMap ImportArtifacts) (nonModule : Bool)
 : FetchM (NameMap ImportArtifacts) := do
+  let snap ← getBuildStoreSnapshot
   let q ← directImports.foldrM (init := #[]) fun imp q => do
     let some mod := imp.module? | return q
-    let input ← (← mod.input.fetch).await
+    let input ← (← fetchFrom snap mod.input).await
     let importAll := strictOr nonModule imp.importAll
     return enqueue importAll imp.isMeta input q
-  walk directArts {} q
+  walk snap directArts {} q
 where
-  walk s (metaVisited : NameSet) (q : Array TransImportEntry) := do
+  walk (snap : BuildStore) s (metaVisited : NameSet) (q : Array TransImportEntry) := do
     if h : 0 < q.size then
       let {mod, importAll, needsMeta} := q.back
       let q := q.pop
@@ -264,14 +284,14 @@ where
         -- `.private`) or a non-module (no `.server`) must not be re-inserted, as that would demote it.
         let needsMeta := needsMeta && !metaVisited.contains mod.name
         unless (importAll || needsMeta) && arts.oleanServer?.isSome && arts.oleanPrivate?.isNone do
-          return ← walk s metaVisited q
-      let info ← (← mod.exportInfo.fetch).await
+          return ← walk snap s metaVisited q
+      let info ← (← fetchFrom snap mod.exportInfo).await
       let arts := if importAll then info.allArts else info.arts
       let s := s.insert mod.name arts
       let metaVisited := if importAll || needsMeta then metaVisited.insert mod.name else metaVisited
-      let input ← (← mod.input.fetch).await
+      let input ← (← fetchFrom snap mod.input).await
       let q := enqueue importAll needsMeta input q
-      walk s metaVisited q
+      walk snap s metaVisited q
     else
       return s
   enqueue importAll needsMeta input q :=
