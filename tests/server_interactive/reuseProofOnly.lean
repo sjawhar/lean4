@@ -75,3 +75,83 @@ theorem reuseAuxRename_later : True := by
 -- expected output is itself the check that it was *not* forced to re-elaborate (an aux-set edit alone
 -- is not a soundness hazard unless something later names the added/dropped auxiliary declaration
 -- directly).
+
+-- RESET
+
+import Lean.Server.Test.Cancel
+open Lean.Server.Test.Cancel
+
+/-!
+A proof-only edit to a theorem whose *old* elaboration has not kernel-checked yet
+(e.g. it is still running a test-blocking tactic) must not deadlock. `startGraft` needs `old`'s
+kernel-checked environment (`Environment.checked`) to diff against; under `Elab.async`, a theorem's
+*signature* commits as soon as its own command's `resultSnap` resolves, while its proof body and
+kernel check keep running on a background task (see `AddDecl.lean`'s `BaseIO.mapTask checkAct
+env.checked`). Blocking on that task here is unsound: it can itself depend on a *later* command
+making progress (the one that calls `unblock` below), which cannot happen while grafting's own
+startup is blocked waiting for it. Grafting must decline and fall back to ordinary re-elaboration
+instead of hanging.
+-/
+
+theorem reuseProofOnlyBlockedOld : True := by
+  wait_for_unblock
+  skip
+    --^ waitFor: blocked
+    --^ insert: "; trivial\nexample : True := by unblock; trivial"
+    --^ collectDiagnostics
+    -- (should print "blocked!" exactly once and the edit must complete, not hang)
+
+-- RESET
+
+/-!
+A kept (grafted) command that registers into a *scoped* environment extension --
+here, `Meta.instanceExtension` via an `instance` command -- must not be silently invisible to a later
+command's elaboration. `Environment.replayConsts` only replays `asyncConstsMap` and the kernel
+extensions that register a `replay?`; `ScopedEnvExtension`s such as `Meta.instanceExtension`
+(`asyncMode := .mainOnly`, no `replay?`) are not replayed, so the grafted environment's `base` -- what
+elaboration actually queries for instance resolution -- never sees the kept `instance` command's
+registration.
+-/
+
+theorem reuseExtInstance_early : True := by
+  trivial
+--^ sync
+       --^ insert: "; skip"
+
+class reuseExtInstance_C (n : Nat) where
+
+instance reuseExtInstance_inst : reuseExtInstance_C 0 where
+
+macro "reuseExtInstance_tac" : tactic => `(tactic| exact inferInstance)
+
+example : reuseExtInstance_C 0 := by
+  sorry
+--^ sync
+--^ change: "sorry" "reuseExtInstance_tac"
+--^ collectDiagnostics
+
+-- RESET
+
+/-!
+Same gap, for `@[simp]`: a kept command's simp-set registration must still make a
+later `simp` call fire, not just leave the lemma's constant reachable by name.
+-/
+
+theorem reuseExtSimp_early : True := by
+  trivial
+--^ sync
+       --^ insert: "; skip"
+
+opaque reuseExtSimp_f (n : Nat) : Nat
+axiom reuseExtSimp_f_ax (n : Nat) : reuseExtSimp_f n = n + 1
+@[simp] theorem reuseExtSimp_f_eq (n : Nat) : reuseExtSimp_f n = n + 1 := reuseExtSimp_f_ax n
+
+example (n : Nat) : reuseExtSimp_f n = n + 1 := by
+  sorry
+--^ sync
+--^ change: "sorry" "simp"
+--^ collectDiagnostics
+-- If the kept `@[simp]` lemma's registration is invisible after grafting, `simp` fails to close this
+-- goal even though `reuseExtSimp_f_eq` itself still exists as a constant.
+
+
