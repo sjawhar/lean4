@@ -408,13 +408,36 @@ def finalizeBuild
       throw (IO.userError e)
 
 /--
+Runs `act` holding an exclusive `flock` on the workspace's `.lake/build.lock`, so that two Lake
+processes never build the same workspace at once (they would delete, rewrite, and cache each
+other's outputs mid-build). The OS releases the lock when the process exits.
+Setting `LAKE_NO_BUILD_LOCK=1` disables it.
+-/
+public def Workspace.withBuildLock (ws : Workspace) (act : IO α) : IO α := do
+  if (← IO.getEnv "LAKE_NO_BUILD_LOCK").bind envToBool? |>.getD false then
+    return ← act
+  let lockFile := ws.root.lakeDir / "build.lock"
+  let h? ← try
+    IO.FS.createDirAll ws.root.lakeDir
+    pure (some (← IO.FS.Handle.mk lockFile .append))
+  catch e =>
+    IO.eprintln s!"warning: could not open build lock '{lockFile}', building without it: {e}"
+    pure none
+  let some h := h? | act
+  unless (← h.tryLock) do
+    IO.eprintln s!"waiting for another Lake process building this workspace to finish \
+      (lock: {lockFile})"
+    h.lock
+  try act finally h.unlock
+
+/--
 Run a build function in the Workspace's context using the provided configuration.
 Reports incremental build progress and build logs. In quiet mode, only reports
 failing build jobs (e.g., when using `-q` or non-verbose `--no-build`).
 -/
 public def Workspace.runFetchM
   (ws : Workspace) (build : FetchM α) (cfg : BuildConfig := {}) (caption := "job computation")
-: IO α := do
+: IO α := ws.withBuildLock do
   let jobs ← mkJobQueue
   let cancelTk? ← if cfg.failFast then some <$> IO.CancelToken.new else pure none
   let mctx ← mkMonitorContext cfg jobs cancelTk?
@@ -455,7 +478,7 @@ public def Workspace.checkNoBuild
 /-- Run a build function in the Workspace's context and await the result. -/
 public def Workspace.runBuild
   (ws : Workspace) (build : FetchM (Job α)) (cfg : BuildConfig := {})
-: IO α := do
+: IO α := ws.withBuildLock do
   let jobs ← mkJobQueue
   let cancelTk? ← if cfg.failFast then some <$> IO.CancelToken.new else pure none
   let mctx ← mkMonitorContext cfg jobs cancelTk?
