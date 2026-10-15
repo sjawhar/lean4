@@ -174,6 +174,25 @@ printf 'import Test.RY\ntheorem t : rbc = true := rfl\n' > Test/RN.lean
 test_run build Test.RN
 printf 'partial def f (n : Nat) : Nat := if n = 0 then 3 else f (n - 1)\ndef c : Bool := f 1 == 2\n' > Test/RX.lean
 test_err "error: Test/RN.lean" build -v Test.RN
+# a user constant with the name the extension once used for its marker entry (adversarial case a09d) has its
+# own digest: a change to its value rebuilds a module that proved it through an intermediate `def`. The same
+# for a name declared by `addDecl` from `run_cmd`, which can declare any name (no compiled code, so the
+# intermediate is `noncomputable`)
+printf 'def _moduleUsage : Nat := 1\n' > Test/MX.lean
+printf 'import Test.MX\ndef md : Nat := _moduleUsage\n' > Test/MA.lean
+printf 'import Test.MA\ntheorem mb : md = 1 := rfl\n' > Test/MB.lean
+test_run build Test.MB
+printf 'def _moduleUsage : Nat := 2\n' > Test/MX.lean
+test_err "error: Test/MB.lean" build -v Test.MB
+mkDecl() {
+  printf 'import Lean\nopen Lean Elab Command in\nrun_cmd liftCoreM <| addDecl <| .defnDecl { name := `_moduleUsage, levelParams := [], type := mkConst ``Nat, value := mkNatLit %s, hints := .abbrev, safety := .safe }\n' "$1"
+}
+mkDecl 1 > Test/MY.lean
+printf 'import Test.MY\nnoncomputable def me : Nat := _moduleUsage\n' > Test/MC.lean
+printf 'import Test.MC\ntheorem mf : me = 1 := rfl\n' > Test/MD.lean
+test_run build Test.MD
+mkDecl 2 > Test/MY.lean
+test_err "error: Test/MD.lean" build -v Test.MD
 # `bv_decide` checks its certificate with compiled toolchain code only: its module stays skippable
 printf 'def y := 1\n' > Test/BY.lean
 printf 'import Test.BY\nimport Std.Tactic.BVDecide\ntheorem tb (x : BitVec 8) : x + 0#8 = x := by bv_decide\n' \
