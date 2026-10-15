@@ -391,7 +391,7 @@ def runFrontend
       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts)
         (ModuleUsage.setLocalDigests env own) oleanFileName
     let used := ModuleUsage.usedFromInfoTrees trees (← usedByChecksRef.get)
-    ModuleUsage.writeUsage env consts own used (incrLoaded := incrLoadFileName?.isSome)
+    ModuleUsage.writeUsage env inputCtx.fileMap consts own used (incrLoaded := incrLoadFileName?.isSome)
       (oleanFileName.withExtension "usage")
 
   if let some ileanFileName := ileanFileName? then

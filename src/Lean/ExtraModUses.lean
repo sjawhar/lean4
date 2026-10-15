@@ -93,14 +93,23 @@ public def copyExtraModUses (src dest : Environment) : Environment := Id.run do
 discarded (`example`, `#check`, `#eval`, `#synth`, `#reduce`), which `getLocalExtraModUses` loses. -/
 public builtin_initialize extraModUsesByChecksRef : IO.Ref (Std.HashSet ExtraModUse) ← IO.mkRef {}
 
+/-- Every extra module use recorded in this process with the start of the syntax being elaborated when it was
+recorded (`none` if that syntax has no position), whether or not the module already had it. The `.usage` writer
+attributes each to the top-level command containing the position. -/
+public builtin_initialize extraModUsesByPosRef : IO.Ref (Std.HashSet (Option Nat × ExtraModUse)) ← IO.mkRef {}
+
 def recordExtraModUseCore [MonadLiftT IO m] (mod : Name) (isMeta : Bool) (hint : Name := .anonymous) :
     m Unit := do
   let entry := { module := mod, isExported := (← getEnv).isExporting, isMeta }
+  let recording ← (usageRecordingRef.get : IO Bool)
+  if recording then
+    let pos := (← getRef).getPos?.map (·.byteIdx)
+    (extraModUsesByPosRef.modify (·.insert (pos, entry)) : IO Unit)
   if !(extraModUses.getState (asyncMode := .local) (← getEnv)).contains entry then
     trace[extraModUses] "recording {if entry.isExported then "public" else "private"} \
       {if isMeta then "meta" else "regular"} extra mod use {mod}\
       {if hint.isAnonymous then m!"" else m!" of {hint}"}"
-    if (← (usageRecordingRef.get : IO Bool)) then
+    if recording then
       (extraModUsesByChecksRef.modify (·.insert entry) : IO Unit)
     modifyEnv (extraModUses.addEntry · entry)
 

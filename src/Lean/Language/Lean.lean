@@ -14,6 +14,7 @@ prelude
 public import Lean.Language.Util
 public import Lean.Language.Lean.Types
 public import Lean.Elab.Import
+import Lean.Util.UsedByChecks
 
 public section
 
@@ -590,6 +591,8 @@ where
             return (← unchanged old old.parserState)
 
     let beginPos := parserState.pos
+    if (← usageRecordingRef.get) then
+      commandStartsRef.modify (·.push beginPos.byteIdx)
     let scope := cmdState.scopes.head!
     let pmctx := {
       env := cmdState.env, options := scope.opts, currNamespace := scope.currNamespace

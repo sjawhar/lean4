@@ -237,26 +237,61 @@ where
     | .str p s, h => mixHash (go p h) (mixHash 107 (hash s))
     | .num p k, h => mixHash (go p h) (mixHash 109 (hash k))
 
+/-- Per top-level command, sorted by position: its start line, the declarations whose range starts in it, and the
+extra module uses recorded while elaborating it (`extraModUsesByPosRef`), filtered and sorted like `extra`. A use
+recorded without a position goes to a line-0 entry. Commands with no extra module use are left out. -/
+private def commandUses (env : Environment) (fileMap : FileMap) (keep : ExtraModUse → Bool) : IO Json := do
+  let starts := (← commandStartsRef.get).qsort (· < ·)
+  -- 1 + the index of the last command starting at or before `p`; 0 before the first command
+  let owner (p : Nat) : Nat := Id.run do
+    let mut lo := 0
+    let mut hi := starts.size
+    while lo < hi do
+      let mid := (lo + hi) / 2
+      if starts[mid]! ≤ p then lo := mid + 1 else hi := mid
+    return lo
+  let mut uses : Std.HashMap Nat (Std.HashSet ExtraModUse) := {}
+  for (p?, u) in ← extraModUsesByPosRef.get do
+    if keep u then
+      let i := p?.map owner |>.getD 0
+      uses := uses.alter i fun s => some ((s.getD {}).insert u)
+  let mut decls : Std.HashMap Nat (Array Name) := {}
+  for (n, r) in declRangeExt.getState (asyncMode := .sync) env do
+    let i := owner (fileMap.ofPosition r.range.pos).byteIdx
+    if uses.contains i then
+      decls := decls.alter i fun a => some ((a.getD #[]).push n)
+  let sortUses (us : Array ExtraModUse) := us.qsort fun a b =>
+    let k (u : ExtraModUse) := 2 * u.isExported.toNat + u.isMeta.toNat
+    Name.quickLt a.module b.module || (a.module == b.module && k a < k b)
+  let line (i : Nat) := if i == 0 then 0 else (fileMap.toPosition ⟨starts[i - 1]!⟩).line
+  let entries := (uses.toArray.qsort (·.1 < ·.1)).map fun (i, us) => Json.mkObj [
+    ("line", line i),
+    ("decls", Json.arr (((decls.getD i #[]).qsort Name.quickLt).map nameToJson)),
+    ("extra", Json.arr ((sortUses us.toArray).map fun u => Json.arr #[nameToJson u.module, u.isMeta]))]
+  return Json.arr entries
+
 /-- `own` is `localDigests env consts`. `extra` lists the extra module uses of the environment and of
-`extraModUsesByChecksRef` (those of commands whose environment was discarded). With `incrLoaded` (the run reused
-commands from an `--incr-load` snapshot), `noskip` is set: reused commands never call `addDecl` in this process,
-so `extra` may miss constants they used. -/
-def writeUsage (env : Environment) (consts : Array (Name × ConstantInfo × Array Name))
+`extraModUsesByChecksRef` (those of commands whose environment was discarded); `commands` lists them per top-level
+command (`commandUses`). With `incrLoaded` (the run reused commands from an `--incr-load` snapshot), `noskip` is
+set: reused commands never call `addDecl` in this process, so `extra` may miss constants they used. -/
+def writeUsage (env : Environment) (fileMap : FileMap) (consts : Array (Name × ConstantInfo × Array Name))
     (own : Array (Name × UInt64)) (extra : NameSet) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
   let noskip := incrLoaded || consts.any fun (_, _, rs) => rs.any (· matches ``Lean.reduceBool | ``Lean.reduceNat)
   let s := state env
+  let keep (u : ExtraModUse) := (env.getModuleIdx? u.module).any s.hasEntries
   let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecksRef.get)
-  let extraMods := allExtra.toArray.filter (fun u => (env.getModuleIdx? u.module).any s.hasEntries)
+  let extraMods := allExtra.toArray.filter keep
     |>.qsort fun a b => let k (u : ExtraModUse) := 2 * u.isExported.toNat + u.isMeta.toNat
       Name.quickLt a.module b.module || (a.module == b.module && k a < k b)
   let pair (n : Name) (d : UInt64) := Json.arr #[nameToJson n, hex16 d]
-  let j := Json.mkObj [("version", 2), ("noskip", noskip),
+  let j := Json.mkObj [("version", 3), ("noskip", noskip),
     ("moduleDigest", hex16 (own.foldl (fun h (_, d) => mixHash h d) 7)),
     ("closure", hex16 (closureDigest env)),
     ("own", Json.arr (own.map fun (n, d) => pair n d)),
     ("used", Json.arr ((moduleUsed env extra consts).map fun (m, cs) =>
       Json.arr #[nameToJson m, Json.arr (cs.map fun (n, d) => pair n d)])),
-    ("extra", Json.arr (extraMods.map fun u => Json.arr #[nameToJson u.module, u.isMeta]))]
+    ("extra", Json.arr (extraMods.map fun u => Json.arr #[nameToJson u.module, u.isMeta])),
+    ("commands", ← commandUses env fileMap keep)]
   IO.FS.writeFile path j.compress
 
 end Lean.ModuleUsage

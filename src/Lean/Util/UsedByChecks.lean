@@ -10,4 +10,7 @@ builtin_initialize usageRecordingRef : IO.Ref Bool ← IO.mkRef false
 /-- Constants of every declaration given to `addDecl` in this process, including those elaborated in an
 environment that is then discarded (`example`, `#eval`, `#guard`). -/
 builtin_initialize usedByChecksRef : IO.Ref NameSet ← IO.mkRef {}
+/-- Start positions (byte offsets) of the top-level commands elaborated in this process, when
+`usageRecordingRef` is set. -/
+builtin_initialize commandStartsRef : IO.Ref (Array Nat) ← IO.mkRef #[]
 end Lean

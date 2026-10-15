@@ -1052,13 +1052,14 @@ where
 
 instance : ToJson SidecarName := ⟨SidecarName.toJson⟩
 
-def checkUsageVersion (j : Json) : Except String Unit := do
+/-- `.usage` version 3 adds per-command records (`commands`), which Lake does not read; `.usekey` stays at 2. -/
+def checkUsageVersion (j : Json) (versions : List Nat := [2]) : Except String Unit := do
   let v ← j.getObjValAs? Nat "version"
-  unless v == 2 do throw s!"unsupported version {v}"
+  unless versions.contains v do throw s!"unsupported version {v}"
 
 instance : FromJson UsageSidecar where
   fromJson? j := do
-    checkUsageVersion j
+    checkUsageVersion j [2, 3]
     let own ← j.getObjValAs? (Array (SidecarName × Hash)) "own"
     let used ← j.getObjValAs? (Array (SidecarName × Array (SidecarName × Hash))) "used"
     let extra ← j.getObjValAs? (Array (SidecarName × Bool)) "extra"
