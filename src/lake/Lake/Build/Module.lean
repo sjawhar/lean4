@@ -1261,7 +1261,9 @@ where
     | .arts arts =>
       unless (← savedTrace.replayCachedIfUpToDate inputHash) do
         mod.clearOutputArtifacts
-        writeFetchTrace mod.traceFile inputHash (toJson arts.descrs)
+        -- The sidecars stay out of the trace, which `.ltar` archives include: a `.usekey` records
+        -- an input hash, and an archive depends only on outputs.
+        writeFetchTrace mod.traceFile inputHash (toJson {arts.descrs with usage? := none, usekey? := none})
       let arts ←
         if restoreAll then
           mod.restoreAllArtifacts arts
