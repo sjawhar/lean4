@@ -463,3 +463,92 @@ test_cmd rm -rf .lake/build "$CACHE_DIR"
 test_out "for revision $OLD_REV" cache get --scope=staged --service=ok --rev="$OLD_REV"
 test_artifacts "$NUM_ARTS"
 test_run build Test --no-build
+
+echo "# INTEGRITY TESTS"
+
+# A `LEAN_SYSROOT` farm whose `leantar` wrapper can corrupt one byte of a named file
+# immediately after an unpack (`-x`), simulating a leantar round-trip bug (e.g. its
+# `ByteArray` element-size bug) deterministically, without depending on a real bug
+# being present in the toolchain's own `leantar`.
+FARM_DIR="$WORK_DIR/leantar-farm"
+mkdir -p "$FARM_DIR/bin"
+for entry in "$LEAN_SYSROOT"/*; do
+  name="$(basename "$entry")"
+  [ "$name" = bin ] || ln -s "$entry" "$FARM_DIR/$name"
+done
+for entry in "$LEAN_SYSROOT/bin"/*; do
+  name="$(basename "$entry")"
+  case "$name" in
+    leantar|leantar.exe) ;;
+    *) ln -s "$entry" "$FARM_DIR/bin/$name" ;;
+  esac
+done
+REAL_LEANTAR="$(norm_path "$LEAN_SYSROOT")/bin/leantar"
+if [ -f "$REAL_LEANTAR.exe" ]; then REAL_LEANTAR="$REAL_LEANTAR.exe"; fi
+cat > "$FARM_DIR/bin/leantar" << EOF
+#!/usr/bin/env bash
+set -euo pipefail
+"$REAL_LEANTAR" "\$@"
+if [ -n "\${CORRUPT_LEANTAR_FILE:-}" ]; then
+  marker="\$CORRUPT_LEANTAR_FILE.corrupted-once"
+  for arg; do
+    if [ "\$arg" = "-x" ] && [ -f "\$CORRUPT_LEANTAR_FILE" ] && [ ! -f "\$marker" ]; then
+      "$PYTHON" -c "
+path = '\$CORRUPT_LEANTAR_FILE'
+with open(path, 'r+b') as f:
+    b = f.read(1)
+    f.seek(0)
+    f.write(bytes([b[0] ^ 0xFF]))
+"
+      touch "\$marker"
+      break
+    fi
+  done
+fi
+EOF
+chmod +x "$FARM_DIR/bin/leantar"
+export LAKE_OVERRIDE_LEAN=true
+export LEAN_SYSROOT="$FARM_DIR"
+
+BASIC_OLEAN="$WORK_DIR/.lake/build/lib/lean/Test/Basic.olean"
+
+# Verify the farm itself changes nothing when corruption is not requested
+# (a negative control for the farm wrapper, separate from the fix under test below)
+test_cmd rm -rf .lake/build "$CACHE_DIR"
+test_run cache get --scope=test --service=ok
+test_run build Test --no-build
+
+# Verify a corrupted `.ltar` unpack (the cross-machine `cache get` round trip, e.g.
+# leantar's `ByteArray` element-size bug) is caught and fails loudly, rather than
+# Lake reporting "All targets up-to-date" over silently drifted bytes (lean-build-perf#7)
+test_cmd rm -rf .lake/build "$CACHE_DIR"
+test_run cache get --scope=test --service=ok
+CORRUPT_LEANTAR_FILE="$BASIC_OLEAN" \
+  test_err 'restored artifact does not match its recorded hash' build Test --no-build
+match_text 'module:.*Basic' produced.out
+match_text 'archive:' produced.out
+match_text 'expected:' produced.out
+match_text 'actual:' produced.out
+# The corrupted build-directory copy is removed, not silently kept or re-cached
+test_exp ! -e "$BASIC_OLEAN"
+# A clean retry (no corruption) then restores correctly
+test_run build Test --no-build
+
+# Verify the same for a local restore from an already-built `.ltar`
+# (`LAKE_RESTORE_ARTIFACTS=true`, as in machcsl's `tools/lakecache.sh`): delete only
+# the module's build outputs, keeping its local `.ltar` and trace, so Lake unpacks the
+# local archive instead of rebuilding or re-fetching
+test_cmd rm -rf .lake/build "$CACHE_DIR"
+test_run build Test -o outputs.jsonl
+test_exp -f .lake/build/lib/lean/Test/Basic.ltar
+test_cmd rm -f "$BASIC_OLEAN" .lake/build/lib/lean/Test/Basic.ilean .lake/build/ir/Test/Basic.c
+CORRUPT_LEANTAR_FILE="$BASIC_OLEAN" LAKE_RESTORE_ARTIFACTS=true \
+  test_err 'restored artifact does not match its recorded hash' build Test --no-build
+test_exp ! -e "$BASIC_OLEAN"
+# A clean retry (no corruption) restores correctly from the local archive
+test_cmd rm -f "$BASIC_OLEAN" .lake/build/lib/lean/Test/Basic.ilean .lake/build/ir/Test/Basic.c
+LAKE_RESTORE_ARTIFACTS=true test_run build Test --no-build
+test_exp -f "$BASIC_OLEAN"
+
+unset LAKE_OVERRIDE_LEAN
+unset LEAN_SYSROOT

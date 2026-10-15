@@ -927,6 +927,54 @@ where
 
 instance : ToOutputJson ModuleOutputArtifacts := ⟨(toJson ·.descrs)⟩
 
+/--
+Verifies that each of a module's build-directory artifacts matches the hash recorded in
+`descrs` (an archive's own output descriptors, read back from its trace). `saveArtifact` and
+`computeArtifact` already hash every artifact Lake restores or builds, so this comparison adds no
+extra I/O; it only adds the check that a restored file's bytes match the hash their trace claims
+for them, so Lake never serves or re-caches bytes that don't match their recorded hash.
+
+On a mismatch, deletes the corrupted build-directory copy (and its `.hash`) so a later fetch
+neither reuses the bad bytes nor re-caches them under a wrong hash. The cache entry named by the
+*expected* hash, if any, is left untouched: the mismatch is between it and this unpack, not
+within the cache entry itself (which is content-addressed and verified at write/download time).
+-/
+def Module.verifyUnpackedArtifacts
+  (mod : Module) (descrs : ModuleOutputDescrs) (archive : FilePath)
+: JobM Unit := do
+  verify mod.oleanFile descrs.olean "olean"
+  verifyIf descrs.oleanServer? mod.oleanServerFile "olean.server"
+  verifyIf descrs.oleanPrivate? mod.oleanPrivateFile "olean.private"
+  verify mod.ileanFile descrs.ilean "ilean"
+  verifyIf descrs.irSig? mod.irSigFile "ir.sig"
+  verifyIf descrs.ir? mod.irFile "ir"
+  verify mod.cFile descrs.c "c"
+  if Lean.Internal.hasLLVMBackend () then
+    verifyIf descrs.bc? mod.bcFile "bc"
+where
+  verify file (descr : ArtifactDescr) ext := do
+    let hash ← computeFileHash file (text := false)
+    unless hash == descr.hash do
+      clearFileHash file
+      removeFileIfExists file
+      error s!"\
+        restored artifact does not match its recorded hash (a leantar/archive round-trip bug?)\
+        \n  module:   {mod.name}\
+        \n  artifact: {file} (.{ext})\
+        \n  archive:  {archive}\
+        \n  expected: {descr.hash}\
+        \n  actual:   {hash}"
+  verifyIf descr? file ext := descr?.forM fun descr => verify file descr ext
+
+/--
+Decodes a module's output descriptors (as recorded by `buildAction`/`writeFetchTrace`, see
+`ToOutputJson ModuleOutputArtifacts`) from a saved trace, if present and well-formed.
+-/
+def SavedTrace.moduleOutputDescrs? (self : SavedTrace) : Option ModuleOutputDescrs := do
+  let .ok data := self | none
+  let some outputs := data.outputs? | none
+  (ModuleOutputDescrs.fromJson? outputs).toOption
+
 def Module.packLtar (self : Module) (arts : ModuleOutputArtifacts) : JobM Artifact := do
   let arts ← id do
     if (← self.checkArtifactsExist arts.isModule) then
@@ -1056,6 +1104,7 @@ where
       let savedTrace ← readTraceFile mod.traceFile
       let arts? ← getArtifactsUsingTrace? inputHash savedTrace mod.pkg
       if let some (arts : ModuleOutputArtifacts) := arts? then
+        mod.verifyUnpackedArtifacts arts.descrs ltar.path
         -- on initial unpack from cache ensure all artifacts uniformly
         -- end up in the build directory and, if writable, the cache
         let arts ← mod.restoreAllArtifacts {arts with ltar? := some ltar}
@@ -1098,6 +1147,10 @@ where
             -- leaves the hash unconfirmed, so rebuild instead.
             if status == .hashUpToDate then
               mod.unpackLtar mod.ltarFile depTrace.hash
+              let some descrs := savedTrace.moduleOutputDescrs?
+                | error s!"{mod.name}: cannot verify restored artifacts: \
+                    {mod.traceFile} has no decodable output descriptors"
+              mod.verifyUnpackedArtifacts descrs mod.ltarFile
             else
               discard <| mod.buildLean presetup
         else
@@ -1116,6 +1169,10 @@ where
           -- rebuilds instead.
           if status == .hashUpToDate then
             mod.unpackLtar mod.ltarFile depTrace.hash
+            let some descrs := savedTrace.moduleOutputDescrs?
+              | error s!"{mod.name}: cannot verify restored artifacts: \
+                  {mod.traceFile} has no decodable output descriptors"
+            mod.verifyUnpackedArtifacts descrs mod.ltarFile
           else
             discard <| mod.buildLean presetup
         mod.computeArtifacts presetup.isModule
