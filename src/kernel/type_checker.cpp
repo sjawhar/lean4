@@ -334,8 +334,11 @@ expr type_checker::infer_type_core(expr const & e, bool infer_only) {
        pure in the environment, and so are shared across every declaration this process checks
        (lean-build-perf#16). `infer_only = false` ("check") results are not shared even for a
        closed `e`: `check_level` (below) and the unsafe/partial validation in `infer_constant`
-       depend on `m_lparams` and `m_definition_safety`, which vary per declaration. */
-    bool shared = infer_only && kc_is_closed(e);
+       depend on `m_lparams` and `m_definition_safety`, which vary per declaration. Sharing is
+       also off whenever kernel diagnostics are being collected (`m_diag != nullptr`): a hit
+       skips the nested `record_unfold` calls a fresh computation would have made, which would
+       undercount `set_option diagnostics true`'s per-declaration unfold counters. */
+    bool shared = infer_only && m_diag == nullptr && kc_is_closed(e);
     if (shared) {
         if (auto cached = get_kc_cache().find_infer(e))
             return *cached;
@@ -505,7 +508,7 @@ expr type_checker::whnf_core(expr const & e, bool cheap_rec, bool cheap_proj) {
     // check cache: closed `e` (no free variables, no metavariables) is pure in the
     // environment and shared across declarations (lean-build-perf#16); anything else stays in
     // the per-declaration cache, exactly as before.
-    bool shared = kc_is_closed(e);
+    bool shared = m_diag == nullptr && kc_is_closed(e);
     if (shared) {
         if (auto cached = get_kc_cache().find_whnf_core(e))
             return *cached;
@@ -597,7 +600,7 @@ optional<expr> type_checker::unfold_definition_core(expr const & e) {
                 m_diag->record_unfold(d->get_name());
             }
             if (len > 0) {
-                bool shared = kc_is_closed(e);
+                bool shared = m_diag == nullptr && kc_is_closed(e);
                 if (shared) {
                     if (auto cached = get_kc_cache().find_unfold(e))
                         return cached;
@@ -787,7 +790,7 @@ expr type_checker::whnf(expr const & e) {
 
     // check cache: closed `e` is pure in the environment and shared across declarations
     // (lean-build-perf#16); anything else stays in the per-declaration cache, as before.
-    bool shared = kc_is_closed(e);
+    bool shared = m_diag == nullptr && kc_is_closed(e);
     if (shared) {
         if (auto cached = get_kc_cache().find_whnf(e))
             return *cached;
@@ -983,7 +986,7 @@ bool type_checker::failed_before(expr const & t, expr const & s) const {
     // Closed `t`/`s` (no free variables, no metavariables) make `is_def_eq`'s cached outcome
     // pure in the environment, shared across declarations (lean-build-perf#16); anything else
     // stays in the per-declaration cache, as before.
-    bool shared = kc_is_closed(t, s);
+    bool shared = m_diag == nullptr && kc_is_closed(t, s);
     auto contains = [&](expr const & a, expr const & b) {
         return shared ? get_kc_cache().failed_before(a, b)
                       : m_st->m_failure.find(mk_pair(a, b)) != m_st->m_failure.end();
@@ -998,14 +1001,14 @@ bool type_checker::failed_before(expr const & t, expr const & s) const {
 }
 
 void type_checker::cache_failure(expr const & t, expr const & s) {
-    bool shared = kc_is_closed(t, s);
+    bool shared = m_diag == nullptr && kc_is_closed(t, s);
     expr const & a = hash(t) <= hash(s) ? t : s;
     expr const & b = hash(t) <= hash(s) ? s : t;
     if (shared) get_kc_cache().cache_failure(a, b); else m_st->m_failure.insert(mk_pair(a, b));
 }
 
 bool type_checker::succeeded_before(expr const & t, expr const & s) const {
-    bool shared = kc_is_closed(t, s);
+    bool shared = m_diag == nullptr && kc_is_closed(t, s);
     auto contains = [&](expr const & a, expr const & b) {
         return shared ? get_kc_cache().succeeded_before(a, b)
                       : m_st->m_success.find(mk_pair(a, b)) != m_st->m_success.end();
@@ -1020,7 +1023,7 @@ bool type_checker::succeeded_before(expr const & t, expr const & s) const {
 }
 
 void type_checker::cache_success(expr const & t, expr const & s) {
-    bool shared = kc_is_closed(t, s);
+    bool shared = m_diag == nullptr && kc_is_closed(t, s);
     expr const & a = hash(t) <= hash(s) ? t : s;
     expr const & b = hash(t) <= hash(s) ? s : t;
     if (shared) get_kc_cache().cache_success(a, b); else m_st->m_success.insert(mk_pair(a, b));

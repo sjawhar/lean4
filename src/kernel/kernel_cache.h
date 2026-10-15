@@ -10,17 +10,22 @@ Released under Apache 2.0 license as described in the file LICENSE.
 #include "kernel/expr_maps.h"
 
 namespace lean {
-/** \brief True iff \c e can never depend on a local context or an assignment: no free
-    variables and no (expression or universe) metavariables. Every entry point of the kernel
-    type checker already rejects loose bound variables (`has_loose_bvars`), so this is the
-    complete "closed" test for any key the type checker ever looks up or caches: a closed key's
-    `infer`/`whnf`/`unfold`/`is_def_eq` result cannot depend on which declaration is being
-    checked, only on the (monotonically growing, never-mutated) environment. See the soundness
-    note on lean-build-perf#16 for the full argument, including the two exceptions (the
-    `check()`/`infer_only = false` path and universe-parameter scope checking) that must stay
-    out of this cache. */
+/** \brief True iff \c e can never depend on a local context, a binder scope, or an assignment:
+    no loose bound variables, no free variables, and no (expression or universe) metavariables.
+    `infer_type_core` rejects loose bound variables at its own entry point, but `whnf_core`,
+    `whnf`, `unfold_definition_core` and `is_def_eq` do not re-check that invariant themselves:
+    they rely on every caller already having instantiated bound variables away before reaching
+    them. A process-wide cache keyed on bare structural equality cannot rely on that per-call
+    discipline — two unrelated declarations' raw, not-yet-instantiated subterms can be
+    bit-for-bit identical as de Bruijn terms (e.g. both literally `#0 #1`) while denoting
+    completely different things relative to their own binder scope, so `has_loose_bvars` must be
+    checked explicitly here at every site, not assumed from context. (An earlier version of this
+    cache omitted this check and crashed/produced wrong answers under `ctest`; see the
+    lean-build-perf#16 writeup for how it was found.) See that issue for the full soundness
+    argument, including the two further exceptions (the `check()`/`infer_only = false` path and
+    universe-parameter scope checking) that must stay out of this cache. */
 inline bool kc_is_closed(expr const & e) {
-    return !has_fvar(e) && !has_mvar(e);
+    return !has_loose_bvars(e) && !has_fvar(e) && !has_mvar(e);
 }
 inline bool kc_is_closed(expr const & t, expr const & s) {
     return kc_is_closed(t) && kc_is_closed(s);
