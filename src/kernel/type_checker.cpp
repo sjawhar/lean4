@@ -777,10 +777,12 @@ optional<expr> type_checker::reduce_nat_offset_pred(expr const & e, bool is_ble)
     return some_expr(whnf(off_right ? mk_app(f, r, *a) : mk_app(f, *a, r)));
 }
 
-/* `reduce_nat_offset_pred` on a `Nat.ble`/`Nat.beq` application. */
+/* `reduce_nat_offset_pred` on a `Nat.ble`/`Nat.beq` application. `lazy_delta_reduction` calls this on every step with
+   free variables, so the head is checked in O(1) before anything else. */
 optional<expr> type_checker::reduce_nat_offset_app(expr const & e) {
-    if (get_app_num_args(e) != 2) return none_expr();
+    if (!is_app(e) || !is_app(app_fn(e))) return none_expr();
     expr const & f = app_fn(app_fn(e));
+    if (!is_constant(f)) return none_expr();
     if (f == *g_nat_ble) return reduce_nat_offset_pred(e, /* is_ble */ true);
     if (f == *g_nat_beq) return reduce_nat_offset_pred(e, /* is_ble */ false);
     return none_expr();
