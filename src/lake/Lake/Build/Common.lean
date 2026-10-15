@@ -505,6 +505,39 @@ public def cacheArtifact
   (file : FilePath) (ext := "art") (text exe useLocalFile := false)
 : m Artifact := do (← getLakeCache).saveArtifact file ext text exe useLocalFile
 
+/--
+Like `Cache.saveArtifact`, but uses `hash` instead of hashing `file`'s contents again.
+
+**For internal use only**, by code that has already independently computed `hash` from `file`'s
+current bytes and compared it to a known-good descriptor: saving under an unverified hash would
+let the cache serve bytes under a name that does not describe them.
+-/
+public def Cache.saveVerifiedArtifact
+  (cache : Cache) (file : FilePath) (hash : Hash) (ext := "art") (exe useLocalFile := false)
+: IO Artifact := do
+  try
+    let descr := artifactWithExt hash ext
+    let cacheFile := cache.artifactDir / descr.relPath
+    -- make the local file unwritable where possible to discourage users from
+    -- writing to such paths as this can corrupt the cache if the file is hard linked
+    let r := {read := true, write := false, execution := exe}
+    IO.setAccessRights file ⟨r, r, r⟩
+    unless (← cacheFile.pathExists) do
+      createParentDirs cacheFile
+      if let .error e ← (IO.FS.hardLink file cacheFile).toBaseIO then
+        -- other functions can race to create the file
+        unless e matches .alreadyExists .. do
+          -- use `writeBinFileIfNew` to prevent errors on races
+          let contents ← IO.FS.readBinFile file
+          writeBinFileIfNew cacheFile contents
+    IO.setAccessRights cacheFile ⟨r, r, r⟩
+    writeFileHash file hash
+    let mtime ← getMTime cacheFile
+    let path := if useLocalFile then file else cacheFile
+    return {descr, name := file.toString, path, mtime}
+  catch e =>
+    error s!"failed to cache artifact: {e}"
+
 /-- **For internal use only.** -/
 public class ResolveOutputs (α : Type) where
   /-- **For internal use only.** -/
