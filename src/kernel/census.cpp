@@ -168,7 +168,7 @@ extern "C" LEAN_EXPORT object * lean_census_kernel_dump() {
     }
     std::string out;
     for (auto const & l : lines) { out += l; out += "\n"; }
-    return io_result_mk_ok(mk_string(out));
+    return mk_string(out);
 }
 
 }
