@@ -5,6 +5,7 @@ public import Lean.Util.FoldConsts
 public import Lean.Util.PtrSet
 public import Lean.Compiler.ImplementedByAttr
 public import Lean.Compiler.ExternAttr
+public import Lean.Compiler.ExportAttr
 public import Lean.Compiler.NoncomputableAttr
 public import Lean.Elab.InfoTree.Types
 import Lean.ExtraModUses
@@ -54,11 +55,13 @@ def hintsHash : ReducibilityHints → UInt64
 def safetyHash : DefinitionSafety → UInt64
   | .safe => 19 | .unsafe => 23 | .partial => 29
 
-/-- Everything of `c` except the meaning of the constants it refers to. -/
+/-- Everything of `c` except the meaning of the constants it refers to, including what its importers' compiled
+code links against: the `@[extern]` entries and the `@[export]` name. -/
 def localHash (env : Environment) (c : ConstantInfo) : UInt64 :=
   let base := mixHash (hash c.levelParams) (exprHash true c.type)
   let base := mixHash base (mixHash (hash (Compiler.getImplementedBy? env c.name))
-    (mixHash (hash (isExtern env c.name)) (hash (isNoncomputable env c.name))))
+    (mixHash (hash (getExternAttrData? env c.name)) (hash (isNoncomputable env c.name))))
+  let base := mixHash base (hash (getExportNameFor? env c.name))
   let v := exprHash false
   mixHash base <| match c with
   | .defnInfo d => mixHash (v d.value) (mixHash (hintsHash d.hints) (safetyHash d.safety))
@@ -87,6 +90,8 @@ def markerName : Name := `_moduleUsage
 
 structure State where
   importedModuleEntries : Array (Array (Name × UInt64)) := #[]
+  /-- The current module's digests, if `setLocalDigests` stored them for the `.olean` write. -/
+  localDigests? : Option (Array (Name × UInt64)) := none
 instance : Inhabited State := ⟨{}⟩
 
 /-- The digest of `c` if module `i` (the module defining `c`) wrote one. -/
@@ -131,17 +136,21 @@ builtin_initialize ext : PersistentEnvExtension (Name × UInt64) (Name × UInt64
     -- Private level only: digests cover private constants and unexposed bodies, which must not change the
     -- exported `.olean` of a `module` file. Non-module files are written and read at the private level.
     exportEntriesFnEx := fun env s =>
-      let es := (compute env s).push (markerName, 1) |>.qsort fun a b => Name.quickLt a.1 b.1
+      let es := (s.localDigests?.getD (compute env s)).push (markerName, 1)
+        |>.qsort fun a b => Name.quickLt a.1 b.1
       { exported := #[], server := #[], «private» := es }
     asyncMode := .mainOnly
   }
 
 def state (env : Environment) : State := ext.getState (asyncMode := .mainOnly) env
 
-def importedDigest? (env : Environment) (c : Name) : Option UInt64 := (state env).find? env c
-
 def localDigests (env : Environment) (consts := ownConsts env) : Array (Name × UInt64) :=
   compute env (state env) consts
+
+/-- Stores `own` (`localDigests env`) for the extension to export, so writing the `.olean` does not compute
+them again. -/
+def setLocalDigests (env : Environment) (own : Array (Name × UInt64)) : Environment :=
+  ext.modifyState (asyncMode := .mainOnly) env ({ · with localDigests? := some own })
 
 /-- Per defining module, sorted: every imported constant that the current module's own constants refer to or
 that is in `extra`, with its digest. Constants without a digest (from a module built without this extension) are
@@ -218,12 +227,22 @@ keep a constant that instantiation's beta reduction would drop: a superset, neve
 @[implemented_by usedFromInfoTreesImpl]
 opaque usedFromInfoTrees (trees : Array Elab.InfoTree) (init : NameSet) : NameSet
 
-/-- `extra` lists the extra module uses of the environment and of `extraModUsesByChecksRef` (those of commands
-whose environment was discarded). With `incrLoaded` (the run reused commands from an `--incr-load` snapshot),
-`noskip` is set: reused commands never call `addDecl` in this process, so `extra` may miss constants they used. -/
-def writeUsage (env : Environment) (extra : NameSet) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
-  let consts := ownConsts env
-  let own := localDigests env consts
+/-- A digest of the module's import closure: its sorted module names, each mixed in component by component. -/
+def closureDigest (env : Environment) : UInt64 :=
+  let names := env.header.moduleNames.qsort Name.quickLt
+  names.foldl (init := 101) fun h n => mixHash h (go n 103)
+where
+  go : Name → UInt64 → UInt64
+    | .anonymous, h => h
+    | .str p s, h => mixHash (go p h) (mixHash 107 (hash s))
+    | .num p k, h => mixHash (go p h) (mixHash 109 (hash k))
+
+/-- `own` is `localDigests env consts`. `extra` lists the extra module uses of the environment and of
+`extraModUsesByChecksRef` (those of commands whose environment was discarded). With `incrLoaded` (the run reused
+commands from an `--incr-load` snapshot), `noskip` is set: reused commands never call `addDecl` in this process,
+so `extra` may miss constants they used. -/
+def writeUsage (env : Environment) (consts : Array (Name × ConstantInfo × Array Name))
+    (own : Array (Name × UInt64)) (extra : NameSet) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
   let noskip := incrLoaded || consts.any fun (_, _, rs) => rs.any (· matches ``Lean.reduceBool | ``Lean.reduceNat)
   let s := state env
   let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecksRef.get)
@@ -231,8 +250,9 @@ def writeUsage (env : Environment) (extra : NameSet) (incrLoaded : Bool) (path :
     |>.qsort fun a b => let k (u : ExtraModUse) := 2 * u.isExported.toNat + u.isMeta.toNat
       Name.quickLt a.module b.module || (a.module == b.module && k a < k b)
   let pair (n : Name) (d : UInt64) := Json.arr #[nameToJson n, hex16 d]
-  let j := Json.mkObj [("version", 1), ("noskip", noskip),
+  let j := Json.mkObj [("version", 2), ("noskip", noskip),
     ("moduleDigest", hex16 (own.foldl (fun h (_, d) => mixHash h d) 7)),
+    ("closure", hex16 (closureDigest env)),
     ("own", Json.arr (own.map fun (n, d) => pair n d)),
     ("used", Json.arr ((moduleUsed env extra consts).map fun (m, cs) =>
       Json.arr #[nameToJson m, Json.arr (cs.map fun (n, d) => pair n d)])),
