@@ -21,6 +21,7 @@ extern "C" object* lean_environment_add(object*, object*);
 extern "C" object* lean_environment_find(object*, object*);
 extern "C" object* lean_environment_mark_quot_init(object*);
 extern "C" uint8 lean_environment_quot_init(object*);
+extern "C" uint8 lean_kernel_env_const_is_imported(object*, object*);
 extern "C" object* lean_kernel_record_unfold (object*, object*);
 extern "C" object* lean_kernel_get_diag(object*);
 extern "C" object* lean_kernel_set_diag(object*, object*);
@@ -64,6 +65,10 @@ environment environment::set_diag(diagnostics const & diag) const {
 
 bool environment::is_quot_initialized() const {
     return lean_environment_quot_init(to_obj_arg()) != 0;
+}
+
+bool environment::is_imported(name const & n) const {
+    return lean_kernel_env_const_is_imported(to_obj_arg(), n.to_obj_arg()) != 0;
 }
 
 void environment::mark_quot_initialized() {

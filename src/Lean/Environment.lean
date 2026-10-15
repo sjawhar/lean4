@@ -321,6 +321,10 @@ def getModuleIdxFor? (env : Environment) (declName : Name) : Option ModuleIdx :=
     | some modIdx => some modIdx
     | none        => env.importedExtraConsts.findExtraModIdxCached? declName
 
+@[export lean_kernel_env_const_is_imported]
+def isImportedConst (env : Environment) (declName : Name) : Bool :=
+  env.getModuleIdxFor? declName |>.isSome
+
 @[export lean_environment_mark_quot_init]
 private def markQuotInit (env : Environment) : Environment :=
   { env with quotInit := true }
