@@ -596,9 +596,23 @@ where
         BaseIO Unit := do
       let isDeclaration := (Reuse.unwrapCommand old.stx).isOfKind ``Lean.Parser.Command.declaration
       BaseIO.chainTask (sync := true) old.elabSnap.resultSnap.task fun oldResult => do
-        let cConsts := Reuse.newConstants g.oldBeforeEnv oldResult.cmdState.env
-        match Reuse.commandVerdict oldResult.cmdState.env g.unsafeNames g.unsafeNameStrs isDeclaration
-            old.stx cConsts with
+        -- `old`'s kernel check (and hence the full set of constants it ends up
+        -- adding, which `newConstants`/`commandVerdict` read via `Environment.checked.get`) may not
+        -- have finished yet -- `resultSnap` finishing only commits the signature under `Elab.async`;
+        -- the proof body and kernel check run on a background task (see the comment where grafting
+        -- starts, in `parseCmd`). A single non-blocking check loses this race almost always even for an
+        -- ordinary instantly-checkable declaration, since this continuation runs essentially the moment
+        -- the check task is scheduled; `Reuse.waitFinished`'s short bounded poll (not an indefinite
+        -- block) fixes that while still declining -- exactly like an unsafe verdict -- for a tactic that
+        -- is genuinely blocked on a later command's progress, the hazard this guards against.
+        let verdict ←
+          if (← Reuse.waitFinished oldResult.cmdState.env.checked) then
+            let cConsts := Reuse.newConstants g.oldBeforeEnv oldResult.cmdState.env
+            pure <| Reuse.commandVerdict oldResult.cmdState.env g.unsafeNames g.unsafeNameStrs
+              isDeclaration old.stx cConsts
+          else
+            pure none
+        match verdict with
         | some extra => do
           let patchedEnv ← Environment.replayConsts g.newEnvSoFar g.oldBeforeEnv oldResult.cmdState.env
           let patchedCmdState := { oldResult.cmdState with env := patchedEnv }
@@ -851,13 +865,40 @@ where
         let graft?' ← match old? with
           | some old =>
             if proofOnlyEdit then
-              let thmStx := Reuse.unwrapCommand stx
-              let identStx := ((thmStx.getArg 1).getArg 1).getArg 0
-              let declName := scope.currNamespace ++ identStx.getId
-              let oldResult := old.elabSnap.resultSnap.task.get
-              Reuse.startGraft declName scope.opts envBeforeD oldResult.cmdState.env cmdState.env
+              -- only diff `old`/`new` once their *kernel-checked* environments
+              -- (`Environment.checked`) are actually available, not just `resultSnap`. Under
+              -- `Elab.async` (the server default) a theorem's signature commits synchronously but
+              -- its proof body and kernel check finish on a background task chained via
+              -- `BaseIO.mapTask checkAct env.checked` (`AddDecl.lean`): `resultSnap` finishing only
+              -- means the signature is in, the proof/tactic execution (and hence `.checked`) can
+              -- still be running. `Reuse.waitFinished`'s short bounded poll gives an ordinary,
+              -- instantly-checkable declaration a real chance to finish (a single non-blocking check
+              -- here, with no intervening real time since the check task was just scheduled, loses
+              -- that race almost always) while staying deadlock-safe: a tactic genuinely blocked on a
+              -- later command's progress still cannot finish within the bound, so grafting still
+              -- declines, just after a short, fixed delay instead of none.
+              if (← Reuse.waitFinished old.elabSnap.resultSnap.task) then
+                let oldResult := old.elabSnap.resultSnap.task.get
+                if (← Reuse.waitFinished oldResult.cmdState.env.checked) &&
+                    (← Reuse.waitFinished cmdState.env.checked) then
+                  let thmStx := Reuse.unwrapCommand stx
+                  let identStx := ((thmStx.getArg 1).getArg 1).getArg 0
+                  let declName := scope.currNamespace ++ identStx.getId
+                  Reuse.startGraft declName scope.opts envBeforeD oldResult.cmdState.env cmdState.env
+                else
+                  pure none
+              else
+                pure none
             else pure none
           | none => pure none
+        -- grafting was attempted (`proofOnlyEdit`) but did not start -- either
+        -- `old`'s elaboration of this theorem had not finished yet (see above) or `startGraft`
+        -- declined (non-`Prop` type, re-elaborated type/levelParams mismatch). Either way we are
+        -- falling back to full re-elaboration from here on, so `old`'s downstream chain -- not
+        -- cancelled above because `proofOnlyEdit` looked promising at the time -- must be cancelled
+        -- now, exactly as the non-`proofOnlyEdit` branch above already does.
+        if proofOnlyEdit && graft?'.isNone then
+          old?.forM (·.nextCmdSnap?.forM (·.cancelRec))
         -- lean-build-perf#20: when grafting started, the old chain's tail is still meaningful: pass
         -- the old chain's next-command snapshot along so the recursive call's fast/semi-fast paths
         -- can compare syntax and invoke `graftedContinue` instead of discarding it outright (today's

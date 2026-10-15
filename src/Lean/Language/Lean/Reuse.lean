@@ -264,6 +264,42 @@ partial def mentionsAnyName (names : Array String) (stx : Syntax) : Bool :=
   | _ => false
 
 /--
+`stx` (already unwrapped of `X in` wrappers) is an `instance` declaration, a declaration carrying at
+least one `@[...]` attribute, or a standalone `attribute [...] name` command -- i.e. a command that
+could register an entry into a *scoped* environment extension (`Meta.instanceExtension`, the simp set,
+or any other `registerScopedEnvExtension`/attribute-backed table). `Environment.replayConsts`
+(`Environment.lean`) only merges `asyncConstsMap` (the plain constants a command added) and the subset
+of *kernel*-level extensions that register a `replay?`; `ScopedEnvExtension`s such as
+`Meta.instanceExtension` or the simp set use `asyncMode := .mainOnly` and never register a `replay?`
+(`ScopedEnvExtension.lean`), so a kept command's own registration into one of these never reaches the
+grafted environment's `base` field -- the field elaboration actually reads for instance resolution and
+`simp` lookups. A command flagged here must be re-elaborated rather than kept, even if it does not
+reference the edited theorem at all: the gap is about losing the command's own extension-table entry,
+not about reading `D`'s value.
+-/
+def addsExtensionState (stx : Syntax) : Bool :=
+  let stx := unwrapCommand stx
+  if stx.isOfKind ``Lean.Parser.Command.attribute then
+    true
+  else if stx.isOfKind ``Lean.Parser.Command.declaration && stx.getNumArgs == 2 then
+    (stx.getArg 1).getKind == ``Lean.Parser.Command.instance ||
+      !((stx.getArg 0).getArg 1).isNone
+  else
+    false
+
+/--
+Whether `ci` is a constant kind `Environment.replayConsts` (`Environment.lean`) can actually replay onto
+a grafted environment: its kernel-replay step (`replayKernel`) only knows how to re-add
+`.thmInfo`/`.defnInfo`/`.axiomInfo` declarations and panics on anything else. A `class`/`structure`/
+`inductive` command's own declaration produces `.inductInfo`/`.ctorInfo`/`.recInfo` constants (and
+`opaque` produces `.opaqueInfo`), none of which `replayKernel` supports -- grafting such a command would
+crash, not just lose data, so it must always be re-elaborated rather than kept.
+-/
+def isReplayableConst : ConstantInfo → Bool
+  | .thmInfo _ | .defnInfo _ | .axiomInfo _ => true
+  | .opaqueInfo _ | .quotInfo _ | .inductInfo _ | .ctorInfo _ | .recInfo _ => false
+
+/--
 Per-command safety verdict for keeping `old`'s prior result when `names` (the edited theorem plus any
 of its auxiliary declarations whose names did not survive the edit) must be treated as having a
 possibly-new value: `none` means unsafe (`old` must be fully re-elaborated, abandoning the grafting
@@ -277,11 +313,18 @@ expose `D`'s value through them -- e.g. `theorem usesD := D` is safe to keep, bu
 `isDeclaration` marks whether the command is a plain `theorem`/`def`/`instance`/`abbrev`/... whose own
 newly-added declarations (`cConsts`) can be walked; non-declaration commands (`#print`, `#eval`, ...),
 which add nothing to walk, are safe only if they do not mention any name in `names` at all.
+`addsExtensionState` and `isReplayableConst` are checked first and unconditionally: a kept command's own
+scoped-extension registration (an `instance`, an attribute, `attribute [...] name`) is lost by grafting
+regardless of whether the command references `D`, and a command adding a constant `replayConsts` cannot
+replay (`class`/`structure`/`inductive`/`opaque`) would crash grafting outright -- both always force
+re-elaboration.
 -/
 def commandVerdict (env : Environment) (names : NameSet) (nameStrs : Array String)
     (isDeclaration : Bool) (stx : Syntax) (cConsts : Array (Name × ConstantInfo)) :
     Option (Array Name) :=
-  if isDeclaration then
+  if addsExtensionState stx || cConsts.any fun (_, ci) => !isReplayableConst ci then
+    none
+  else if isDeclaration then
     if cConsts.any fun (_, ci) => constReferencesAny names ci && constUnsafelyUsesValue env names ci then
       none
     else
@@ -306,6 +349,27 @@ structure GraftState where
   /-- The old run's environment right before the next old command to consider: the `oldEnv` baseline for
   `Environment.replayConsts`/`newConstants`. -/
   oldBeforeEnv : Environment
+
+/--
+Waits (with bounded polling, never indefinitely) for `task` to finish, up to `maxMs` milliseconds.
+`Environment.checked`'s background kernel-check task is typically already finished or finishes within
+microseconds for an ordinary declaration (the proof body/kernel check start running on a background
+task the instant the command's signature commits, see the issue's `elabAsync`/`commitCheckEnv` notes);
+a single non-blocking `IO.hasFinished` check immediately after that, with no intervening real time,
+loses this race almost every time even though the task is never actually stuck. Bounded polling gives it
+a real but capped chance to finish. This stays deadlock-safe: a tactic that is *genuinely* blocked on a
+later command's progress (the hazard `startGraft`'s caller is guarding against, see
+`Language.Lean.lean`) still cannot finish within `maxMs`, so the bound is still honored and grafting
+still declines, just after a short, fixed delay instead of none.
+-/
+partial def waitFinished (task : Task α) (maxMs : Nat := 50) : BaseIO Bool := do
+  if (← IO.hasFinished task) then
+    return true
+  else if maxMs == 0 then
+    return false
+  else
+    IO.sleep 1
+    waitFinished task (maxMs - 1)
 
 /--
 Whether `type` (a declaration's full, possibly-binder-headed type) is ultimately `Prop`-sorted. A
@@ -337,6 +401,8 @@ def startGraft (declName : Name) (opts : Options) (envBeforeD oldAfterD newAfter
   -- but its *value*/kernel-check can still be finishing on a background task at this point (see the
   -- issue's investigation notes on `elabAsync`/`commitSignature`/`commitCheckEnv`), so `find?` on the
   -- raw `Environment` can transiently see the declaration with no value yet.
+  -- Callers guarantee `oldAfterD.checked`/`newAfterD.checked` have already finished (see the
+  -- deadlock comment in `Language.Lean.lean` where this is called), so `.get` here does not block.
   let some oldD := oldAfterD.checked.get.constants.find? declName | return none
   let some newD := newAfterD.checked.get.constants.find? declName | return none
   unless oldD.type == newD.type && oldD.levelParams == newD.levelParams do
