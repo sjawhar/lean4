@@ -737,6 +737,7 @@ def ModuleOutputDescrs.resolve
     ltar? := ← descrs.ltar?.mapM resolve
     usage? := ← resolveSidecar? descrs.usage?
     usekey? := ← resolveSidecar? descrs.usekey?
+    skipped := descrs.skipped
   }
   if Lean.Internal.hasLLVMBackend () then
     let some descr := descrs.bc?
@@ -759,15 +760,30 @@ where
       logVerbose <| log.entries.foldl (s!"{·}\n- {·.message}") s!"dropped usage sidecar {descr}:"
       return none
 
+/-- Usage cutoff is on unless `LAKE_USAGE_CUTOFF=0`. -/
+def usageCutoffEnabled : BaseIO Bool :=
+  return (← IO.getEnv "LAKE_USAGE_CUTOFF") != some "0"
+
+/--
+Fails on outputs a usage-cutoff skip stored (`ModuleOutputDescrs.skipped`) when the cutoff is off,
+so a build with the cutoff off never restores them: it treats them as a cache miss and builds.
+-/
+def checkSkipped (descrs : ModuleOutputDescrs) : JobM Unit := do
+  if descrs.skipped && !(← usageCutoffEnabled) then
+    error "outputs of a usage-cutoff skip, and usage cutoff is off"
+
 def resolveModuleOutputArtifacts (out : CacheOutput) : JobM ModuleOutputArtifacts := do
   match fromJson? out.data with
-  | .ok (descrs : ModuleOutputDescrs) => descrs.resolve out.service? out.scope?
+  | .ok (descrs : ModuleOutputDescrs) =>
+    checkSkipped descrs
+    descrs.resolve out.service? out.scope?
   | .error e => error s!"ill-formed module outputs:\n{out.data.render.pretty 80 2}\n{e}"
 
 instance : ResolveOutputs ModuleOutputArtifacts := ⟨resolveModuleOutputArtifacts⟩
 
 inductive ModuleOutputs
-| ltar (art : Artifact)
+/-- Only the archive, and whether the entry was marked as a skip's (`ModuleOutputDescrs.skipped`). -/
+| ltar (art : Artifact) (skipped : Bool)
 | arts (arts : ModuleOutputArtifacts)
 
 instance : Coe ModuleOutputArtifacts ModuleOutputs := ⟨.arts⟩
@@ -776,18 +792,20 @@ def resolveModuleOutputs (out : CacheOutput) : JobM ModuleOutputs := do
   if let .str descr := out.data then
     match ArtifactDescr.ofFilePath? descr with
     | .ok descr =>
-      return .ltar (← resolveArtifact descr out.service? out.scope?)
+      -- A bare archive entry comes from `-o` maps, which a skip never writes to.
+      return .ltar (← resolveArtifact descr out.service? out.scope?) false
     | .error e =>
       error s!"ill-formed module archive output:\n{out.data.render.pretty 80 2}\n{e}"
   else
     match fromJson? out.data with
     | .ok (descrs : ModuleOutputDescrs) =>
+      checkSkipped descrs
       if let some descr := descrs.ltar? then
         try
           descrs.resolve out.service? out.scope?
         catch e =>
           dropLogFrom e
-          return .ltar (← resolveArtifact descr out.service? out.scope?)
+          return .ltar (← resolveArtifact descr out.service? out.scope?) descrs.skipped
       else
         descrs.resolve out.service? out.scope?
     | .error e => error s!"ill-formed module outputs:\n{out.data.render.pretty 80 2}\n{e}"
@@ -1192,10 +1210,6 @@ def Module.buildLean
   mod.writeUsekey presetup setup.importArts arts.olean.hash
   return arts
 
-/-- Usage cutoff is on unless `LAKE_USAGE_CUTOFF=0`. -/
-def usageCutoffEnabled : BaseIO Bool :=
-  return (← IO.getEnv "LAKE_USAGE_CUTOFF") != some "0"
-
 /--
 Whether nothing the module used changed meaning since Lean wrote its `.usage`: its `.olean` and
 local inputs are unchanged, no module-system module in its closure (`importArts`) changed
@@ -1235,11 +1249,37 @@ def Module.usageCutoffApplies (mod : Module) (presetup : ModulePreSetup) : JobM 
   unless (← usageCutoffEnabled) do return false
   mod.checkArtifactsExist presetup.isModule
 
+/-- Whether a module trace's outputs are a usage-cutoff skip's (`ModuleOutputDescrs.skipped`). -/
+def SavedTrace.isSkip : SavedTrace → Bool
+  | .ok data => match data.outputs? with
+    | some j => (j.getObjValAs? Bool "s").toOption.getD false
+    | none => false
+  | _ => false
+
+/-- Marks module outputs (`ModuleOutputDescrs` JSON) as a usage-cutoff skip's. -/
+def markSkipOutputs : Json → Json
+  | j@(.obj _) => j.setObjVal! "s" (.bool true)
+  | j => j
+
+/-- Marks the outputs recorded in the module trace at `traceFile` as a usage-cutoff skip's. -/
+def markSkipTrace (traceFile : FilePath) : JobM Unit := do
+  if let .ok data ← readTraceFile traceFile then
+    BuildMetadata.writeFile traceFile {data with outputs? := data.outputs?.map markSkipOutputs}
+
+/--
+Reads a module's trace file. With usage cutoff off, a skip's trace (`SavedTrace.isSkip`) reads as
+missing, so the module builds as in stock Lake instead of keeping the skip's outputs.
+-/
+def readModuleTrace (traceFile : FilePath) : JobM SavedTrace := do
+  let trace ← readTraceFile traceFile
+  if trace.isSkip && !(← usageCutoffEnabled) then return .missing
+  return trace
+
 /--
 Skips compiling a module whose trace is stale if usage cutoff applies to it
 (`Module.usageCutoffApplies`) and nothing it used changed meaning (`Module.usageUpToDate`):
-replays its saved log and rewrites its trace with `depTrace`. Otherwise, builds it, reusing the
-module setup the check computed.
+replays its saved log and rewrites its trace with `depTrace`, its outputs marked as a skip's.
+Otherwise, builds it, reusing the module setup the check computed.
 -/
 def Module.skipOrBuild (mod : Module) (presetup : ModulePreSetup) (savedTrace : SavedTrace)
     (depTrace : BuildTrace) : JobM ModuleOutputArtifacts := do
@@ -1252,9 +1292,9 @@ def Module.skipOrBuild (mod : Module) (presetup : ModulePreSetup) (savedTrace : 
   updateAction .replay
   data.log.replay
   unless (← getNoBuild) do
-    writeBuildTrace mod.traceFile depTrace (data.outputs?.getD .null) data.log
+    writeBuildTrace mod.traceFile depTrace (markSkipOutputs (data.outputs?.getD .null)) data.log
     removeFileIfExists (mod.traceFile.addExtension "nobuild")
-  mod.computeArtifacts presetup.isModule
+  return {← mod.computeArtifacts presetup.isModule with skipped := true}
 
 /--
 Recursively build a Lean module.
@@ -1281,20 +1321,22 @@ where
     let some ltarOrArts ← getArtifacts? inputHash savedTrace mod.pkg
       | return .inr savedTrace
     match (ltarOrArts : ModuleOutputs) with
-    | .ltar ltar =>
+    | .ltar ltar skipped =>
       updateAction .unpack
       mod.clearOutputArtifacts
       mod.unpackLtar ltar.path inputHash
+      -- The archive's trace is its build's: a skip's entry marks it, so every path below keeps the mark.
+      if skipped then markSkipTrace mod.traceFile
       -- Note: This branch implies that only the ltar output is (validly) cached.
       -- Thus, we use only the new trace unpacked from the ltar to resolve further artifacts.
-      let savedTrace ← readTraceFile mod.traceFile
+      let savedTrace ← readModuleTrace mod.traceFile
       let arts? ← getArtifactsUsingTrace? inputHash savedTrace mod.pkg
       if let some (arts : ModuleOutputArtifacts) := arts? then
         -- on initial unpack from cache ensure all artifacts uniformly
         -- end up in the build directory and, if writable, the cache
         let arts ← mod.restoreAllArtifacts {arts with ltar? := some ltar}
         if (← mod.pkg.isArtifactCacheWritable) then
-          let arts ← mod.cacheOutputArtifacts presetup.isModule restoreAll
+          let arts := {← mod.cacheOutputArtifacts presetup.isModule restoreAll with skipped := arts.skipped}
           -- Note: Cache service metadata is not preserved on an output update because it would
           -- result in downloading module outputs that are not available on the remote.
           (← getLakeCache).writeOutputs mod.pkg.cacheScope inputHash arts.descrs (overwrite := true)
@@ -1319,7 +1361,7 @@ where
     let depTrace ← getTrace
     have : GetMTime Module := ⟨Module.getMTime (isModule := presetup.isModule)⟩
     have : CheckExists Module := ⟨Module.checkExists (isModule := presetup.isModule)⟩
-    let savedTrace ← readTraceFile mod.traceFile
+    let savedTrace ← readModuleTrace mod.traceFile
     if (← mod.pkg.isArtifactCacheWritable) then
       let restore ← mod.pkg.restoreAllArtifacts
       match (← fetchFromCache? presetup savedTrace restore) with
@@ -1327,34 +1369,40 @@ where
         return arts
       | .inr savedTrace =>
         let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
-        if status.isUpToDate then
-          unless (← mod.checkArtifactsExist presetup.isModule) do
+        -- Whether this tree's outputs are now a skip's, for the entry written below.
+        let skipped ← if status.isUpToDate then do
+            if (← mod.checkArtifactsExist presetup.isModule) then
+              pure savedTrace.isSkip
             -- Restoring from the archive stamps the trace with the current input
             -- hash, so only do it on a verified hash match; an mtime-only match
             -- leaves the hash unconfirmed, so rebuild instead.
-            if status == .hashUpToDate then
+            else if status == .hashUpToDate then
               mod.unpackLtar mod.ltarFile depTrace.hash
+              if savedTrace.isSkip then markSkipTrace mod.traceFile
+              pure savedTrace.isSkip
             else
-              discard <| mod.buildLean presetup
-        else
-          discard <| mod.skipOrBuild presetup savedTrace depTrace
+              (·.skipped) <$> mod.buildLean presetup
+          else
+            (·.skipped) <$> mod.skipOrBuild presetup savedTrace depTrace
         if status.isCacheable then
-          let arts ← mod.cacheOutputArtifacts presetup.isModule restore
+          let arts := {← mod.cacheOutputArtifacts presetup.isModule restore with skipped}
           (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs
           return arts
         else
-          mod.computeArtifacts presetup.isModule
+          return {← mod.computeArtifacts presetup.isModule with skipped}
     else
       let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
       if status.isUpToDate then
-        unless (← mod.checkArtifactsExist presetup.isModule) do
-          -- As above: restore only on a verified hash match; an mtime-only match
-          -- rebuilds instead.
-          if status == .hashUpToDate then
-            mod.unpackLtar mod.ltarFile depTrace.hash
-          else
-            discard <| mod.buildLean presetup
-        mod.computeArtifacts presetup.isModule
+        if (← mod.checkArtifactsExist presetup.isModule) then
+          return {← mod.computeArtifacts presetup.isModule with skipped := savedTrace.isSkip}
+        -- As above: restore only on a verified hash match; an mtime-only match
+        -- rebuilds instead.
+        else if status == .hashUpToDate then
+          mod.unpackLtar mod.ltarFile depTrace.hash
+          if savedTrace.isSkip then markSkipTrace mod.traceFile
+          return {← mod.computeArtifacts presetup.isModule with skipped := savedTrace.isSkip}
+        else
+          mod.buildLean presetup
       else
         if (← mod.pkg.isArtifactCacheReadable) then
           match (← fetchFromCache? presetup savedTrace true) with
@@ -1362,13 +1410,14 @@ where
               return arts
           | .inr savedTrace =>
             if (← savedTrace.replayIfUpToDate (oldTrace := presetup.srcMTime) mod depTrace) then
-              mod.computeArtifacts presetup.isModule
+              return {← mod.computeArtifacts presetup.isModule with skipped := savedTrace.isSkip}
             else
               mod.skipOrBuild presetup savedTrace depTrace
         else
           mod.skipOrBuild presetup savedTrace depTrace
   trackOutputsIfEnabled arts : JobM ModuleOutputArtifacts := do
-    if mod.pkg.isRoot then
+    -- The `-o` map records only an archive, which carries no skip mark: a skip stays out of it.
+    if mod.pkg.isRoot && !arts.skipped then
       if let some ref := (← getBuildContext).outputsRef? then
         let inputHash := (← getTrace).hash
         if let some ltar := arts.ltar? then

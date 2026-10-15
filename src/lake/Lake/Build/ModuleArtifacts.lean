@@ -28,6 +28,8 @@ public structure ModuleOutputDescrs where
   /-- Usage-cutoff sidecars (`.usage`, `.usekey`), when the build wrote them. -/
   usage? : Option ArtifactDescr := none
   usekey? : Option ArtifactDescr := none
+  /-- The outputs are a usage-cutoff skip's (kept from an earlier build, not built from these inputs). -/
+  skipped : Bool := false
 
 public def ModuleOutputDescrs.oleanParts (self : ModuleOutputDescrs) : Array ArtifactDescr := Id.run do
   let mut descrs := #[self.olean]
@@ -55,6 +57,8 @@ public protected def ModuleOutputDescrs.toJson (self : ModuleOutputDescrs) : Jso
     obj := obj.insert "u" usage
   if let some usekey := self.usekey? then
     obj := obj.insert "k" usekey
+  if self.skipped then
+    obj := obj.insert "s" true
   return obj
 
 public instance : ToJson ModuleOutputDescrs := ⟨ModuleOutputDescrs.toJson⟩
@@ -77,6 +81,7 @@ public protected def ModuleOutputDescrs.fromJson? (val : Json) : Except String M
     ltar? := ← obj.get? "l"
     usage? := ← obj.get? "u"
     usekey? := ← obj.get? "k"
+    skipped := (← obj.get? "s").getD false
   }
 
 public instance : FromJson ModuleOutputDescrs := ⟨ModuleOutputDescrs.fromJson?⟩
@@ -96,6 +101,8 @@ public structure ModuleOutputArtifacts where
   /-- Usage-cutoff sidecars (`.usage`, `.usekey`), when the build wrote them. -/
   usage? : Option Artifact := none
   usekey? : Option Artifact := none
+  /-- The outputs are a usage-cutoff skip's (`ModuleOutputDescrs.skipped`). -/
+  skipped : Bool := false
 
 /-- Content hashes of the artifacts. -/
 public def ModuleOutputArtifacts.descrs (arts : ModuleOutputArtifacts) : ModuleOutputDescrs where
@@ -111,3 +118,4 @@ public def ModuleOutputArtifacts.descrs (arts : ModuleOutputArtifacts) : ModuleO
   ltar? := arts.ltar?.map (·.descr)
   usage? := arts.usage?.map (·.descr)
   usekey? := arts.usekey?.map (·.descr)
+  skipped := arts.skipped
