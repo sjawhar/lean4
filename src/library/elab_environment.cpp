@@ -5,6 +5,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 Authors: Leonardo de Moura, Sebastian Ullrich
 */
 #include "runtime/interrupt.h"
+#include "kernel/census.h"
 #include "kernel/type_checker.h"
 #include "kernel/kernel_exception.h"
 #include "library/elab_environment.h"
@@ -24,13 +25,21 @@ elab_environment elab_environment::add(declaration const & d, bool check) const 
     return elab_environment(lean_elab_environment_update_base_after_kernel_add(this->to_obj_arg(), kenv.to_obj_arg(), d.to_obj_arg()));
 }
 
+/* lean-build-perf#15: this is the real elaborator's dispatch point (`Lean.Environment.addDeclCheck`),
+   used by `Lean.Elab.AddDecl.addDeclCore`/`doAdd` for every `theorem`/`def` a normal compile adds --
+   `kernel/environment.cpp`'s `lean_add_decl` (`Kernel.Environment.addDeclCore`) is a separate,
+   lower-level entry point some metaprogram code calls directly, and instrumenting only that one
+   missed the overwhelming majority of real kernel-checking work. Same `census_decl_scope` pattern,
+   left uninstrumented on `lean_elab_add_decl_without_checking` below to match. */
 extern "C" LEAN_EXPORT object * lean_elab_add_decl(object * env, size_t max_heartbeat, size_t max_rec_depth,
     object * decl, object * opt_cancel_tk) {
     scope_max_heartbeat s(max_heartbeat);
     scope_max_rec_depth s2(max_rec_depth);
     scope_cancel_tk s3(is_scalar(opt_cancel_tk) ? nullptr : cnstr_get(opt_cancel_tk, 0));
+    declaration d(decl, true);
+    census_decl_scope census_scope(census_enabled() ? decl_repr_name(d) : name());
     return catch_kernel_exceptions<elab_environment>([&]() {
-            return elab_environment(env).add(declaration(decl, true));
+            return elab_environment(env).add(d);
         });
 }
 

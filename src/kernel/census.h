@@ -17,12 +17,26 @@ dumps, across modules) far more often than within one declaration's own cache, w
 when its `type_checker` is destroyed.
 */
 #pragma once
+#include "kernel/declaration.h"
 #include "runtime/object.h"
 #include "util/name.h"
 
 namespace lean {
 
 bool census_enabled();
+
+/* A declaration's representative name, for per-declaration census records: a mutual block is
+   attributed to its first member. Shared between `kernel/environment.cpp`'s `lean_add_decl`
+   (the low-level `Kernel.Environment.addDeclCore` API, called directly by metaprogram code) and
+   `library/elab_environment.cpp`'s `lean_elab_add_decl` -- the real elaborator dispatch
+   (`Lean.Environment.addDeclCheck`) every `theorem`/`def` a normal compile adds goes through
+   exclusively. Both need the same `census_decl_scope` wrapping: with only `lean_add_decl`
+   instrumented, every kernel census counter (`kernel_decl`, infer/whnf repeats, top-unfolded
+   constants) missed the overwhelming majority of real kernel-checking work -- confirmed against
+   Lean's own `-Dprofiler=true` "type checking" category on `IrqentryNmiEnter.Proof`: 63.9s there
+   vs. 5 unrelated equation-lemma records (max 265us) in the census dump, with or without
+   `Elab.async`. */
+name decl_repr_name(declaration const & d);
 
 /* Monotonic nanosecond clock reading, for timing a span across two call sites (e.g. around
    `instantiate_value_lparams` in `unfold_definition_core`, or around `reduce_nat`). Cheap even

@@ -30,6 +30,19 @@ bool census_enabled() {
     return v == static_cast<int>(tri::on);
 }
 
+name decl_repr_name(declaration const & d) {
+    switch (d.kind()) {
+    case declaration_kind::Axiom:            return d.to_axiom_val().get_name();
+    case declaration_kind::Definition:       return d.to_definition_val().get_name();
+    case declaration_kind::Theorem:          return d.to_theorem_val().get_name();
+    case declaration_kind::Opaque:           return d.to_opaque_val().get_name();
+    case declaration_kind::Quot:             return name("Quot");
+    case declaration_kind::MutualDefinition: return head(d.to_definition_vals()).get_name();
+    case declaration_kind::Inductive:        return head(inductive_decl(d).get_types()).get_name();
+    }
+    lean_unreachable();
+}
+
 double census_now_ns() {
     return std::chrono::duration<double, std::nano>(
         std::chrono::steady_clock::now().time_since_epoch()).count();

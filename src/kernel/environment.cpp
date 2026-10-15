@@ -281,21 +281,10 @@ environment environment::add(declaration const & d, bool check) const {
     lean_unreachable();
 }
 
-/* A declaration's representative name, for per-declaration census records (lean-build-perf#15).
-   A mutual block is attributed to its first member; good enough for a per-declaration breakdown,
-   since mutual blocks are rare and its members' kernel costs are usually similar in kind. */
-static name decl_repr_name(declaration const & d) {
-    switch (d.kind()) {
-    case declaration_kind::Axiom:            return d.to_axiom_val().get_name();
-    case declaration_kind::Definition:       return d.to_definition_val().get_name();
-    case declaration_kind::Theorem:          return d.to_theorem_val().get_name();
-    case declaration_kind::Opaque:           return d.to_opaque_val().get_name();
-    case declaration_kind::Quot:             return name("Quot");
-    case declaration_kind::MutualDefinition: return head(d.to_definition_vals()).get_name();
-    case declaration_kind::Inductive:        return head(inductive_decl(d).get_types()).get_name();
-    }
-    lean_unreachable();
-}
+/* `decl_repr_name` moved to `kernel/census.cpp` (lean-build-perf#15): shared with
+   `library/elab_environment.cpp`'s `lean_elab_add_decl`, the real elaborator's dispatch point,
+   which needs the identical per-declaration census wrapping this file's `lean_add_decl` already
+   had. */
 /*
 addDeclCore (env : Environment) (maxHeartbeats : USize) (maxRecDepth : USize) (decl : @& Declaration)
   (cancelTk? : @& Option IO.CancelToken) : Except Kernel.Exception Environment
