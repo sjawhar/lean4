@@ -18,4 +18,5 @@ add_library(
   llvm.cpp
   ir_interpreter.cpp
   instantiate_mvars.cpp
+  usage_digest.cpp
 )

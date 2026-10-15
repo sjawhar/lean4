@@ -14,66 +14,109 @@ import Lean.Server.InfoUtils
 public section
 namespace Lean.ModuleUsage
 
-def levelHash : Level → UInt64
-  | .zero => 3
-  | .succ l => mixHash 5 (levelHash l)
-  | .max a b => mixHash 7 (mixHash (levelHash a) (levelHash b))
-  | .imax a b => mixHash 11 (mixHash (levelHash a) (levelHash b))
-  | .param n => mixHash 13 (hash n)
-  | .mvar m => mixHash 17 (hash m.name)
+/-- A meaning digest: the first 128 bits of a SHA-256, read big-endian into `hi` then `lo`
+(`src/library/usage_digest.cpp`). -/
+structure Digest where
+  hi : UInt64
+  lo : UInt64
+  deriving BEq, Hashable, Inhabited
 
-/-- 64-bit structural hash, cached by pointer. Ignores `mdata`. With `binders`, binder names and infos count
-(types: they steer elaboration downstream); without, it sees what the kernel sees. -/
-unsafe def exprHashImpl (binders : Bool) (e : Expr) : UInt64 :=
-  (go e).run' mkPtrMap
+/-- The SHA-256 of `bytes`, truncated to a `Digest`. -/
+@[extern "lean_usage_digest_bytes"]
+opaque Digest.ofBytes (bytes : @& ByteArray) : Digest
+
+def hex16 (v : UInt64) : String :=
+  let s := String.ofList (Nat.toDigits 16 v.toNat); "".pushn '0' (16 - s.length) ++ s
+
+/-- 32 lowercase hex digits. -/
+def Digest.hex (d : Digest) : String := hex16 d.hi ++ hex16 d.lo
+
+/-- Parses exactly 32 lowercase hex digits. -/
+def Digest.ofHex? (s : String) : Option Digest := do
+  let cs := s.toList
+  guard (cs.length == 32)
+  let v ← cs.foldlM (init := 0) fun (n : Nat) c =>
+    if '0' ≤ c && c ≤ '9' then some (16 * n + (c.toNat - '0'.toNat))
+    else if 'a' ≤ c && c ≤ 'f' then some (16 * n + (c.toNat - 'a'.toNat + 10))
+    else none
+  return ⟨(v >>> 64).toUInt64, v.toUInt64⟩
+
+instance : ToJson Digest := ⟨fun d => .str d.hex⟩
+instance : FromJson Digest := ⟨fun j => do
+  let s ← j.getStr?
+  (Digest.ofHex? s).elim (throw s!"expected a digest of 32 hex digits, got {s}") pure⟩
+
+/-- An injective byte encoding, hashed by `finish`: every variable-length field is length-prefixed and
+every alternative tagged, so different values never encode to the same bytes. -/
+structure Enc where
+  buf : ByteArray := .emptyWithCapacity 256
+
+namespace Enc
+@[inline] def u8 (e : Enc) (v : UInt8) : Enc := ⟨e.buf.push v⟩
+def u64 (e : Enc) (v : UInt64) : Enc :=
+  ⟨e.buf.push v.toUInt8 |>.push (v >>> 8).toUInt8 |>.push (v >>> 16).toUInt8 |>.push (v >>> 24).toUInt8
+    |>.push (v >>> 32).toUInt8 |>.push (v >>> 40).toUInt8 |>.push (v >>> 48).toUInt8 |>.push (v >>> 56).toUInt8⟩
+def bool (e : Enc) (v : Bool) : Enc := e.u8 (if v then 1 else 0)
+def str (e : Enc) (s : String) : Enc := let b := s.toUTF8; ⟨(e.u64 b.size.toUInt64).buf ++ b⟩
+def nat (e : Enc) (n : Nat) : Enc := e.str (toString n)
+def digest (e : Enc) (d : Digest) : Enc := e.u64 d.hi |>.u64 d.lo
+/-- The component count, then each component root first, tagged string or number. -/
+def name (e : Enc) (n : Name) : Enc :=
+  go n (e.nat n.getNumParts)
 where
-  binderHash (tag : UInt64) (n : Name) (bi : BinderInfo) : UInt64 :=
-    if binders then mixHash tag (mixHash (hash n) (hash bi)) else tag
-  go (e : Expr) : StateM (PtrMap Expr UInt64) UInt64 := do
-    if let some h := (← get).find? e then return h
-    let h ← match e with
-      | .bvar i => pure (mixHash 19 (hash i))
-      | .fvar f => pure (mixHash 23 (hash f.name))
-      | .mvar m => pure (mixHash 29 (hash m.name))
-      | .sort l => pure (mixHash 31 (levelHash l))
-      | .const n ls => pure (ls.foldl (fun h l => mixHash h (levelHash l)) (mixHash 37 (hash n)))
-      | .app f a => pure (mixHash 41 (mixHash (← go f) (← go a)))
-      | .lam n t b bi => pure (mixHash (binderHash 43 n bi) (mixHash (← go t) (← go b)))
-      | .forallE n t b bi => pure (mixHash (binderHash 47 n bi) (mixHash (← go t) (← go b)))
-      | .letE n t v b nd =>
-        pure (mixHash (binderHash 53 n .default) (mixHash (hash nd) (mixHash (← go t) (mixHash (← go v) (← go b)))))
-      | .lit (.natVal n) => pure (mixHash 59 (hash (toString n)))
-      | .lit (.strVal s) => pure (mixHash 61 (hash s))
-      | .mdata _ b => go b
-      | .proj s i b => pure (mixHash 67 (mixHash (hash s) (mixHash (hash i) (← go b))))
-    modify (·.insert e h)
-    return h
+  go : Name → Enc → Enc
+    | .anonymous, e => e
+    | .str p s, e => (go p e).u8 1 |>.str s
+    | .num p k, e => (go p e).u8 2 |>.nat k
+def names (e : Enc) (ns : List Name) : Enc := ns.foldl name (e.nat ns.length)
+def opt {α : Type} (e : Enc) (o : Option α) (f : Enc → α → Enc) : Enc :=
+  match o with
+  | none => e.u8 0
+  | some a => f (e.u8 1) a
+def finish (e : Enc) : Digest := Digest.ofBytes e.buf
+end Enc
 
-@[implemented_by exprHashImpl] opaque exprHash (binders : Bool) (e : Expr) : UInt64
+/-- A Merkle SHA-256 digest of `e`'s structure (`src/library/usage_digest.cpp`), linear in its distinct
+subterms. Ignores `mdata`. With `binders`, binder names and infos count (types: they steer elaboration
+downstream); without, it sees what the kernel sees. -/
+@[extern "lean_usage_expr_digest"]
+opaque exprDigest (binders : Bool) (e : @& Expr) : Digest
 
-def hintsHash : ReducibilityHints → UInt64
-  | .opaque => 11 | .abbrev => 13 | .regular h => mixHash 17 h.toUInt64
-def safetyHash : DefinitionSafety → UInt64
-  | .safe => 19 | .unsafe => 23 | .partial => 29
+def externEnc (e : Enc) (d : ExternAttrData) : Enc :=
+  d.entries.foldl (init := e.nat d.entries.length) fun e x => match x with
+    | .adhoc b => e.u8 1 |>.name b
+    | .inline b p => e.u8 2 |>.name b |>.str p
+    | .standard b f => e.u8 3 |>.name b |>.str f
+    | .opaque => e.u8 4
 
-/-- Everything of `c` except the meaning of the constants it refers to, including what its importers' compiled
-code links against: the `@[extern]` entries and the `@[export]` name. -/
-def localHash (env : Environment) (c : ConstantInfo) : UInt64 :=
-  let base := mixHash (hash c.levelParams) (exprHash true c.type)
-  let base := mixHash base (mixHash (hash (Compiler.getImplementedBy? env c.name))
-    (mixHash (hash (getExternAttrData? env c.name)) (hash (isNoncomputable env c.name))))
-  let base := mixHash base (hash (getExportNameFor? env c.name))
-  let v := exprHash false
-  mixHash base <| match c with
-  | .defnInfo d => mixHash (v d.value) (mixHash (hintsHash d.hints) (safetyHash d.safety))
-  | .thmInfo t => mixHash 71 (v t.value)
-  | .opaqueInfo o => mixHash (v o.value) (hash o.isUnsafe)
-  | .axiomInfo a => mixHash 73 (hash a.isUnsafe)
-  | .quotInfo _ => 79
-  | .inductInfo i => hash (i.ctors, i.all, i.numParams, i.numIndices, i.numNested, i.isRec, i.isUnsafe, i.isReflexive)
-  | .ctorInfo k => hash (k.induct, k.cidx, k.numParams, k.numFields, k.isUnsafe)
-  | .recInfo r => r.rules.foldl (init := hash (r.all, r.numParams, r.numIndices, r.numMotives, r.numMinors, r.k,
-      r.isUnsafe)) fun h rl => mixHash h (mixHash (hash (rl.ctor, rl.nfields)) (v rl.rhs))
+def hintsEnc (e : Enc) : ReducibilityHints → Enc
+  | .opaque => e.u8 0 | .abbrev => e.u8 1 | .regular h => e.u8 2 |>.u64 h.toUInt64
+def safetyEnc (e : Enc) : DefinitionSafety → Enc
+  | .safe => e.u8 0 | .unsafe => e.u8 1 | .partial => e.u8 2
+
+/-- Everything of `c` except its own name and the meaning of the constants it refers to, including what its
+importers' compiled code links against: the `@[extern]` entries and the `@[export]` name. -/
+def localHash (env : Environment) (c : ConstantInfo) : Digest :=
+  let v := exprDigest false
+  let e := ({} : Enc).names c.levelParams |>.digest (exprDigest true c.type)
+    |>.opt (Compiler.getImplementedBy? env c.name) Enc.name
+    |>.opt (getExternAttrData? env c.name) externEnc
+    |>.bool (isNoncomputable env c.name)
+    |>.opt (getExportNameFor? env c.name) Enc.name
+  let e := match c with
+    | .defnInfo d => hintsEnc (e.u8 1 |>.digest (v d.value)) d.hints |> (safetyEnc · d.safety)
+    | .thmInfo t => e.u8 2 |>.digest (v t.value)
+    | .opaqueInfo o => e.u8 3 |>.digest (v o.value) |>.bool o.isUnsafe
+    | .axiomInfo a => e.u8 4 |>.bool a.isUnsafe
+    | .quotInfo q => e.u8 5 |>.u8 (match q.kind with | .type => 0 | .ctor => 1 | .lift => 2 | .ind => 3)
+    | .inductInfo i => e.u8 6 |>.names i.ctors |>.names i.all |>.nat i.numParams |>.nat i.numIndices
+      |>.nat i.numNested |>.bool i.isRec |>.bool i.isUnsafe |>.bool i.isReflexive
+    | .ctorInfo k => e.u8 7 |>.name k.induct |>.nat k.cidx |>.nat k.numParams |>.nat k.numFields
+      |>.bool k.isUnsafe
+    | .recInfo r => r.rules.foldl (init := e.u8 8 |>.names r.all |>.nat r.numParams |>.nat r.numIndices
+        |>.nat r.numMotives |>.nat r.numMinors |>.bool r.k |>.bool r.isUnsafe |>.nat r.rules.length)
+      fun e (rl : RecursorRule) => e.name rl.ctor |>.nat rl.nfields |>.digest (v rl.rhs)
+  e.finish
 
 /-- The constants `c`'s meaning depends on: those in its type and value, its inductive's block and constructors,
 its recursor rules' right-hand sides, its `implemented_by` target, and the `_unsafe_rec` definition holding a
@@ -95,17 +138,17 @@ structure State where
   /-- Per imported module: empty if the module was not written by this extension; otherwise a marker entry at
   index 0, then the module's digests sorted by name. The marker's own name is never looked up, so no user
   constant can collide with it. -/
-  importedModuleEntries : Array (Array (Name × UInt64)) := #[]
+  importedModuleEntries : Array (Array (Name × Digest)) := #[]
   /-- The current module's digests, if `setLocalDigests` stored them for the `.olean` write. -/
-  localDigests? : Option (Array (Name × UInt64)) := none
+  localDigests? : Option (Array (Name × Digest)) := none
 instance : Inhabited State := ⟨{}⟩
 
 /-- The digest of `c` if module `i` (the module defining `c`) wrote one. -/
-def State.findAt? (s : State) (i : ModuleIdx) (c : Name) : Option UInt64 := do
+def State.findAt? (s : State) (i : ModuleIdx) (c : Name) : Option Digest := do
   let es ← s.importedModuleEntries[i.toNat]?
-  (·.2) <$> es.binSearch (c, 0) (fun a b => Name.quickLt a.1 b.1) (lo := 1)
+  (·.2) <$> es.binSearch (c, default) (fun a b => Name.quickLt a.1 b.1) (lo := 1)
 
-def State.find? (s : State) (env : Environment) (c : Name) : Option UInt64 := do
+def State.find? (s : State) (env : Environment) (c : Name) : Option Digest := do
   s.findAt? (← env.getModuleIdxFor? c) c
 
 /-- Whether module `i` was written by this extension (it has the marker entry). -/
@@ -116,26 +159,29 @@ def State.hasEntries (s : State) (i : ModuleIdx) : Bool :=
 def ownConsts (env : Environment) : Array (Name × ConstantInfo × Array Name) :=
   env.checked.get.constants.foldStage2 (fun cs n ci => cs.push (n, ci, refs env ci)) #[]
 
-/-- Digests of the current module's constants: SCCs in dependency order; each SCC mixes its members' names and
-local hashes with the name and digest of every constant outside it that they refer to. -/
-def compute (env : Environment) (s : State) (consts := ownConsts env) : Array (Name × UInt64) := Id.run do
+/-- Digests of the current module's constants: SCCs in dependency order; each SCC's digest hashes its members'
+names and local hashes with the name and digest of every constant outside it that they refer to (tagged absent
+if that constant has no digest). -/
+def compute (env : Environment) (s : State) (consts := ownConsts env) : Array (Name × Digest) := Id.run do
   let byName : Std.HashMap Name (ConstantInfo × Array Name) :=
     consts.foldl (fun m (n, ci, rs) => m.insert n (ci, rs)) {}
   let sccs := SCC.scc (consts.map (·.1)).toList fun n => byName[n]!.2.toList.filter byName.contains
-  let mut out : Std.HashMap Name UInt64 := {}
+  let mut out : Std.HashMap Name Digest := {}
   for scc in sccs do
     let members := NameSet.ofList scc
-    let mut h : UInt64 := 83
-    for m in scc.toArray.qsort Name.quickLt do
+    let sorted := scc.toArray.qsort Name.quickLt
+    let mut e : Enc := ({} : Enc).nat sorted.size
+    for m in sorted do
       let (ci, rs) := byName[m]!
-      h := mixHash h (mixHash (hash m) (localHash env ci))
-      for r in rs do
-        unless members.contains r do
-          h := mixHash h (mixHash (hash r) ((out[r]? <|> s.find? env r).getD (mixHash 97 (hash r))))
-    for m in scc do out := out.insert m h
+      let outside := rs.filter (!members.contains ·)
+      e := e.name m |>.digest (localHash env ci) |>.nat outside.size
+      for r in outside do
+        e := e.name r |>.opt (out[r]? <|> s.find? env r) Enc.digest
+    let d := e.finish
+    for m in scc do out := out.insert m d
   return (consts.map fun (n, _) => (n, out[n]!)).qsort fun a b => Name.quickLt a.1 b.1
 
-builtin_initialize ext : PersistentEnvExtension (Name × UInt64) (Name × UInt64) State ←
+builtin_initialize ext : PersistentEnvExtension (Name × Digest) (Name × Digest) State ←
   registerPersistentEnvExtension {
     mkInitial := pure {}
     addImportedFn := fun es => pure { importedModuleEntries := es }
@@ -143,37 +189,34 @@ builtin_initialize ext : PersistentEnvExtension (Name × UInt64) (Name × UInt64
     -- Private level only: digests cover private constants and unexposed bodies, which must not change the
     -- exported `.olean` of a `module` file. Non-module files are written and read at the private level.
     exportEntriesFnEx := fun env s =>
-      let es := #[(.anonymous, 1)] ++ s.localDigests?.getD (compute env s)
+      let es := #[(.anonymous, default)] ++ s.localDigests?.getD (compute env s)
       { exported := #[], server := #[], «private» := es }
     asyncMode := .mainOnly
   }
 
 def state (env : Environment) : State := ext.getState (asyncMode := .mainOnly) env
 
-def localDigests (env : Environment) (consts := ownConsts env) : Array (Name × UInt64) :=
+def localDigests (env : Environment) (consts := ownConsts env) : Array (Name × Digest) :=
   compute env (state env) consts
 
 /-- Stores `own` (`localDigests env`) for the extension to export, so writing the `.olean` does not compute
 them again. -/
-def setLocalDigests (env : Environment) (own : Array (Name × UInt64)) : Environment :=
+def setLocalDigests (env : Environment) (own : Array (Name × Digest)) : Environment :=
   ext.modifyState (asyncMode := .mainOnly) env ({ · with localDigests? := some own })
 
 /-- Per defining module, sorted: every imported constant that the current module's own constants refer to or
 that is in `extra`, with its digest. Constants without a digest (from a module built without this extension) are
 left out. -/
 def moduleUsed (env : Environment) (extra : NameSet) (consts := ownConsts env) :
-    Array (Name × Array (Name × UInt64)) :=
+    Array (Name × Array (Name × Digest)) :=
   let s := state env
   let used := consts.foldl (init := extra) fun u (_, _, rs) => rs.foldl (·.insert ·) u
-  let byMod := used.foldl (init := (∅ : Std.HashMap Name (Array (Name × UInt64)))) fun m c => Id.run do
+  let byMod := used.foldl (init := (∅ : Std.HashMap Name (Array (Name × Digest)))) fun m c => Id.run do
     let some i := env.getModuleIdxFor? c | return m
     let some d := s.findAt? i c | return m
     m.alter env.header.modules[i.toNat]!.module fun o => some ((o.getD #[]).push (c, d))
   byMod.toArray.map (fun (k, v) => (k, v.qsort fun a b => Name.quickLt a.1 b.1))
     |>.qsort fun a b => Name.quickLt a.1 b.1
-
-def hex16 (v : UInt64) : String :=
-  let s := String.ofList (Nat.toDigits 16 v.toNat); "".pushn '0' (16 - s.length) ++ s
 
 /-- A name as the JSON array of its components, root first: each a string or a number. Unlike `toJson Name`
 (`Name.toString`), this round-trips macro-scoped names and components containing `»`. -/
@@ -233,22 +276,20 @@ keep a constant that instantiation's beta reduction would drop: a superset, neve
 @[implemented_by usedFromInfoTreesImpl]
 opaque usedFromInfoTrees (trees : Array Elab.InfoTree) (init : NameSet) : NameSet
 
-/-- A digest of the module's import closure: its sorted module names, each mixed in component by component. -/
-def closureDigest (env : Environment) : UInt64 :=
+/-- A digest of the module's import closure: its sorted module names. -/
+def closureDigest (env : Environment) : Digest :=
   let names := env.header.moduleNames.qsort Name.quickLt
-  names.foldl (init := 101) fun h n => mixHash h (go n 103)
-where
-  go : Name → UInt64 → UInt64
-    | .anonymous, h => h
-    | .str p s, h => mixHash (go p h) (mixHash 107 (hash s))
-    | .num p k, h => mixHash (go p h) (mixHash 109 (hash k))
+  (({} : Enc).nat names.size |> names.foldl Enc.name).finish
+
+/-- The `.usage` format version; Lake reads a sidecar of any other version as absent. -/
+def usageVersion : Nat := 3
 
 /-- `own` is `localDigests env consts`. `extra` lists the extra module uses of the environment and of
 `extraModUsesByChecksRef` (those of commands whose environment was discarded). With `incrLoaded` (the run reused
 commands from an `--incr-load` snapshot), `noskip` is set: reused commands never call `addDecl` in this process,
 so `extra` may miss constants they used. -/
 def writeUsage (env : Environment) (consts : Array (Name × ConstantInfo × Array Name))
-    (own : Array (Name × UInt64)) (extra : NameSet) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
+    (own : Array (Name × Digest)) (extra : NameSet) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
   let noskip := incrLoaded || consts.any fun (_, _, rs) => rs.any
     (· matches ``Lean.reduceBool | ``Lean.reduceNat | ``Lean.ofReduceBool | ``Lean.ofReduceNat)
   let s := state env
@@ -256,10 +297,11 @@ def writeUsage (env : Environment) (consts : Array (Name × ConstantInfo × Arra
   let extraMods := allExtra.toArray.filter (fun u => (env.getModuleIdx? u.module).any s.hasEntries)
     |>.qsort fun a b => let k (u : ExtraModUse) := 2 * u.isExported.toNat + u.isMeta.toNat
       Name.quickLt a.module b.module || (a.module == b.module && k a < k b)
-  let pair (n : Name) (d : UInt64) := Json.arr #[nameToJson n, hex16 d]
-  let j := Json.mkObj [("version", 2), ("noskip", noskip),
-    ("moduleDigest", hex16 (own.foldl (fun h (_, d) => mixHash h d) 7)),
-    ("closure", hex16 (closureDigest env)),
+  let pair (n : Name) (d : Digest) := Json.arr #[nameToJson n, toJson d]
+  let moduleDigest := (own.foldl (fun e (n, d) => e.name n |>.digest d) (({} : Enc).nat own.size)).finish
+  let j := Json.mkObj [("version", usageVersion), ("noskip", noskip),
+    ("moduleDigest", toJson moduleDigest),
+    ("closure", toJson (closureDigest env)),
     ("own", Json.arr (own.map fun (n, d) => pair n d)),
     ("used", Json.arr ((moduleUsed env extra consts).map fun (m, cs) =>
       Json.arr #[nameToJson m, Json.arr (cs.map fun (n, d) => pair n d)])),
