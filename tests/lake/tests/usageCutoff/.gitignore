@@ -4,11 +4,6 @@
 /stock/
 /stock.tgz
 /B.tmp
-/cache1/
-/cache2/
-/cache3/
-/cache4/
-/cache5/
-/cache3.jsonl
-/cache4.jsonl
+/cache*/
+/cache*.jsonl
 /lakecache/
