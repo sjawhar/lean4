@@ -61,6 +61,22 @@ inline bool kc_is_closed(expr const & t, expr const & s) {
     carries a global-declaration name the kernel consults directly (`reduce_proj_core`'s
     `env().get(sname)`). Full soundness argument: lean-build-perf#16.
 
+    **Checking the value, not just trusting the key.** A shareable `e` guarantees the *input* is
+    closed and built only from permanently-fixed, imported material, which is the right thing to
+    check before doing any work. It does not, on its own, guarantee that every possible way of
+    computing a result from `e` lands on an equally safe value: declarations realized on demand
+    (via `Environment.realizeConst`, used e.g. by `fun_induction`/`fun_cases`'s auxiliary
+    "unfolding" lemmas) can be type-checked against a view that, in rare cases, differs from the
+    reduction's own assumptions, and a result built along that path can still carry a leftover
+    bound variable or metavariable the key's check never saw, or mention a name that looked
+    settled when the result was built but was not in fact permanently fixed the way a real import
+    is. Each `insert_*` therefore takes the environment and re-runs the *full* `is_shareable`
+    check -- closedness and "every name imported" together -- on the *value*, not just the
+    already-vetted key, right before it enters a table every later declaration will reuse; failing
+    that check just drops the insert (a sound miss, same as hitting `LEAN_KC_MAX_ENTRIES`) instead
+    of poisoning the shared cache for the rest of the process. See `kernel_cache.cpp`'s
+    `insert_infer`/`insert_whnf_core`/`insert_whnf`/`insert_unfold`.
+
     Thread-safe: each table (six, including `m_shareable_stats`'s backing table) is split into
     64 shards, each behind its own `std::shared_mutex`: a lookup takes a `shared_lock` (readers
     don't block each other), an insert takes a `unique_lock` on just that one shard (so
@@ -100,17 +116,20 @@ public:
 
     counters m_infer_stats, m_whnf_core_stats, m_whnf_stats, m_unfold_stats, m_defeq_stats;
 
+    /* Each `insert_*` re-runs `is_shareable(env, r)` on the *value*, not just the already-vetted
+       key, and drops the insert if it fails; see the class comment's "Checking the value, not
+       just trusting the key". */
     optional<expr> find_infer(expr const & e);
-    void insert_infer(expr const & e, expr const & r);
+    void insert_infer(environment const & env, expr const & e, expr const & r);
 
     optional<expr> find_whnf_core(expr const & e);
-    void insert_whnf_core(expr const & e, expr const & r);
+    void insert_whnf_core(environment const & env, expr const & e, expr const & r);
 
     optional<expr> find_whnf(expr const & e);
-    void insert_whnf(expr const & e, expr const & r);
+    void insert_whnf(environment const & env, expr const & e, expr const & r);
 
     optional<expr> find_unfold(expr const & e);
-    void insert_unfold(expr const & e, expr const & r);
+    void insert_unfold(environment const & env, expr const & e, expr const & r);
 
     /* `t`, `s` are assumed already ordered (`hash(t) <= hash(s)`), matching
        `type_checker::cache_success`/`cache_failure`'s existing convention. */

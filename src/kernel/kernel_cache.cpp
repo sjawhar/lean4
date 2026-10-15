@@ -4,6 +4,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 */
 #include <cstdio>
 #include <cstdlib>
+#include <execinfo.h>
 #include <mutex>
 #include <memory>
 #include <vector>
@@ -172,17 +173,55 @@ static kc_pair_table *  g_success_table    = nullptr;
 static kc_pair_table *  g_failure_table    = nullptr;
 static kc_bool_table *  g_shareable_table  = nullptr;
 
+// `is_shareable(env, e)` guarantees `e` itself is closed and built only from names that look
+// permanently fixed, but a reduction step over such an `e` is not guaranteed to land on an
+// equally safe value in every case: a term touched by lazy constant realization (`realizeConst`)
+// can still carry a leftover bound variable or metavariable the key's own check never saw, or
+// mention a name that looked settled at the time but is not in fact permanent the way a real
+// import is. Re-running the *full* `is_shareable` check -- not just `kc_is_closed` -- on the
+// value here, before it enters a table every later declaration reuses, turns that case into a
+// dropped insert -- as sound as any other cache miss -- instead of a poisoned shared entry.
+// Decisive wiring-bug finder: if the key `e` is closed (a precondition every caller here already
+// satisfies via `is_shareable(env, e)`), a *correct* infer/whnf/unfold result for it must also be
+// closed in a fixed environment. A closed key whose computed value is not closed means this call
+// site stored a value computed for a *different* expression than its key -- a wiring bug, not a
+// soundness hole -- so this aborts with the table, key, value and a backtrace instead of silently
+// tolerating it.
+static void kc_assert_value_closed(char const * table, expr const & e, expr const & r) {
+    if (kc_is_closed(r)) return;
+    fprintf(stderr, "[kc-wiring-bug] table=%s key_hash=%u key_kind=%d value_hash=%u value_kind=%d "
+                     "value_has_loose_bvars=%d value_has_fvar=%d value_has_mvar=%d\n",
+            table, hash(e), (int)e.kind(), hash(r), (int)r.kind(),
+            (int)has_loose_bvars(r), (int)has_fvar(r), (int)has_mvar(r));
+    void * bt[64];
+    int n = backtrace(bt, 64);
+    backtrace_symbols_fd(bt, n, 2);
+    abort();
+}
+
 optional<expr> kc_cache::find_infer(expr const & e) { return g_infer_table->find(e); }
-void kc_cache::insert_infer(expr const & e, expr const & r) { g_infer_table->insert(e, r); }
+void kc_cache::insert_infer(environment const & env, expr const & e, expr const & r) {
+    kc_assert_value_closed("infer", e, r);
+    if (is_shareable(env, r)) g_infer_table->insert(e, r);
+}
 
 optional<expr> kc_cache::find_whnf_core(expr const & e) { return g_whnf_core_table->find(e); }
-void kc_cache::insert_whnf_core(expr const & e, expr const & r) { g_whnf_core_table->insert(e, r); }
+void kc_cache::insert_whnf_core(environment const & env, expr const & e, expr const & r) {
+    kc_assert_value_closed("whnf_core", e, r);
+    if (is_shareable(env, r)) g_whnf_core_table->insert(e, r);
+}
 
 optional<expr> kc_cache::find_whnf(expr const & e) { return g_whnf_table->find(e); }
-void kc_cache::insert_whnf(expr const & e, expr const & r) { g_whnf_table->insert(e, r); }
+void kc_cache::insert_whnf(environment const & env, expr const & e, expr const & r) {
+    kc_assert_value_closed("whnf", e, r);
+    if (is_shareable(env, r)) g_whnf_table->insert(e, r);
+}
 
 optional<expr> kc_cache::find_unfold(expr const & e) { return g_unfold_table->find(e); }
-void kc_cache::insert_unfold(expr const & e, expr const & r) { g_unfold_table->insert(e, r); }
+void kc_cache::insert_unfold(environment const & env, expr const & e, expr const & r) {
+    kc_assert_value_closed("unfold", e, r);
+    if (is_shareable(env, r)) g_unfold_table->insert(e, r);
+}
 
 bool kc_cache::succeeded_before(expr const & t, expr const & s) { return g_success_table->contains(t, s); }
 void kc_cache::cache_success(expr const & t, expr const & s) { g_success_table->insert(t, s); }
@@ -192,26 +231,35 @@ void kc_cache::cache_failure(expr const & t, expr const & s) { g_failure_table->
 bool kc_cache::is_shareable(environment const & env, expr const & e) {
     if (!g_kc_enabled || !kc_is_closed(e)) return false;
     if (auto cached = g_shareable_table->find(e)) return *cached;
-    bool all_imported = true;
-    for_each(e, [&](expr const & sub) -> bool {
-        // Mirrors `lean_find_expr`'s early-exit idiom: once `all_imported` is false, every
-        // subsequent callback invocation (already-scheduled sibling calls included) returns
-        // `false` immediately without descending further, so the walk cost is bounded by the
-        // nodes visited up to and including the first non-imported name, not the whole term.
-        if (!all_imported) return false;
-        if (is_const(sub)) {
-            if (!env.is_imported(const_name(sub))) { all_imported = false; return false; }
+    bool safe = true;
+    // Offset-tracked walk: `offset` is the number of binders crossed to reach `sub`, so
+    // `bvar_idx(sub) >= offset` means `sub` refers to something *outside* `e` itself -- i.e. `e`
+    // is not actually closed, whatever its own packed `bvarRange` metadata (what `kc_is_closed`
+    // trusts) says. That packed value is computed once per expr-building path; this walk is the
+    // ground truth it is supposed to agree with, checked explicitly here because a term that
+    // slips through as "closed" when it still depends on an enclosing binder is exactly what a
+    // process-wide, cross-declaration cache cannot tolerate.
+    for_each(e, [&](expr const & sub, unsigned offset) -> bool {
+        // Mirrors `lean_find_expr`'s early-exit idiom: once `safe` is false, every subsequent
+        // callback invocation (already-scheduled sibling calls included) returns `false`
+        // immediately without descending further, so the walk cost is bounded by the nodes
+        // visited up to and including the first disqualifying node, not the whole term.
+        if (!safe) return false;
+        if (is_bvar(sub)) {
+            if (bvar_idx(sub) >= offset) { safe = false; return false; }
+        } else if (is_const(sub)) {
+            if (!env.is_imported(const_name(sub))) { safe = false; return false; }
         } else if (is_proj(sub)) {
             // `Expr.proj`'s struct name is a global-declaration name the kernel consults
             // directly (`reduce_proj_core`'s `env().get(sname)`), not wrapped in `Expr.const` --
             // the gap v1 didn't need to find because it shared every closed term regardless of
-            // import status. lean-build-perf#16.
-            if (!env.is_imported(proj_sname(sub))) { all_imported = false; return false; }
+            // import status.
+            if (!env.is_imported(proj_sname(sub))) { safe = false; return false; }
         }
         return true;
     });
-    g_shareable_table->insert(e, all_imported);
-    return all_imported;
+    g_shareable_table->insert(e, safe);
+    return safe;
 }
 
 static void kc_dump_one(char const * name, kc_cache::counters & c) {
