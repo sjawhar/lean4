@@ -87,6 +87,14 @@ public:
 
     bool is_quot_initialized() const;
 
+    /** \brief Return true iff \c n was already present in the environment before this module's
+        own declarations started being elaborated (i.e. imported, not module-local). Wraps
+        `Kernel.Environment.isImportedConst`, which reads only the import-time-fixed
+        `allImportedConsts`/`importedExtraConsts` views -- never touched by `add` -- so the
+        answer is identical on every `Elab.async` branch and permanent once true
+        (lean-build-perf#16). */
+    bool is_imported(name const & n) const;
+
     /** \brief Return information for the constant with name \c n (if it is defined in this environment). */
     optional<constant_info> find(name const & n) const;
 
