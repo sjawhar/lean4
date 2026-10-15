@@ -1001,8 +1001,8 @@ def Module.verifyUnpackedArtifacts
   let ilean ← save mod.ileanFile "ilean" false descrs.ilean ileanHash
   let irSig? ← saveIf descrs.irSig? irSigHash? mod.irSigFile "ir.sig" false
   let ir? ← saveIf descrs.ir? irHash? mod.irFile "ir" false
-  let c ← save mod.cFile "c" true descrs.c cHash
-  let bc? ← saveIf descrs.bc? bcHash? mod.bcFile "bc" true
+  let c ← save mod.cFile "c" false descrs.c cHash
+  let bc? ← saveIf descrs.bc? bcHash? mod.bcFile "bc" false
   return {isModule := descrs.isModule, olean, oleanServer?, oleanPrivate?, ilean, irSig?, ir?, c, bc?}
 
 /--
@@ -1148,6 +1148,8 @@ where
             {mod.traceFile} has no decodable output descriptors"
       let writable ← mod.pkg.isArtifactCacheWritable
       let arts ← mod.verifyUnpackedArtifacts descrs ltar.path writable restoreAll
+      -- The archive carries the module's build log: replay it as a rebuild or a replay would.
+      discard <| savedTrace.replayCachedIfUpToDate inputHash
       let arts := {arts with ltar? := some ltar}
       if writable then
         -- Note: Cache service metadata is not preserved on an output update because it would
@@ -1195,7 +1197,9 @@ where
           discard <| mod.buildLean presetup
         if status.isCacheable then
           let arts ← match verified? with
-            | some arts => pure arts
+            | some arts => do
+              let ltar ← cacheArtifact mod.ltarFile "ltar" (useLocalFile := restore)
+              pure {arts with ltar? := some ltar}
             | none => mod.cacheOutputArtifacts presetup.isModule restore
           (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs
           return arts

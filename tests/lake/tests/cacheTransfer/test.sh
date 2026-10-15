@@ -615,5 +615,38 @@ test_exp ! -e "$BASIC_OLEAN"
 test_run build Test --no-build
 test_cmd sed_i '1a enableArtifactCache = true' lakefile.toml
 
+# Verify a writable local `.ltar` restore still caches the `.ltar` itself, so that an outputs
+# file recorded by that build can be staged (`cache stage` needs each recorded artifact cached)
+test_cmd rm -rf .lake/build "$CACHE_DIR"
+test_run build Test -o outputs.jsonl
+test_cmd rm -rf "$CACHE_DIR"
+test_cmd rm -f "$BASIC_OLEAN" "$BASIC_ILEAN" "$BASIC_C"
+test_run build Test -o outputs2.jsonl
+test_exp -f "$BASIC_OLEAN"
+test_cmd rm -rf staging2
+test_run cache stage outputs2.jsonl staging2
+# Verify the C file that restore saved, and its cache entry, are not executable
+test_exp ! -x "$BASIC_C"
+for c in "$CACHE_DIR"/artifacts/*.c; do test_exp ! -x "$c"; done
+
+# Verify the same for the C files of a fresh `.ltar` restore from a writable cache
+test_cmd rm -rf .lake/build "$CACHE_DIR"
+test_run cache get --scope=test --service=ok
+test_run build Test --no-build
+test_exp ! -x "$BASIC_C"
+for c in "$CACHE_DIR"/artifacts/*.c; do test_exp ! -x "$c"; done
+
+# Verify the first restore of a module from a `.ltar` replays the module's archived build log,
+# so that a `--wfail` build fails on a module with a warning, as a rebuild or a replay does
+echo 'theorem warns : True := sorry' >> Test/Basic.lean
+test_cmd rm -rf .lake/build "$CACHE_DIR"
+test_run build Test -o outputs.jsonl
+test_cmd rm -rf .lake/build
+test_cmd find "$CACHE_DIR/artifacts" -type f ! -name '*.ltar' -delete
+test_cmd rm -rf "$CACHE_DIR/outputs"
+test_run cache add outputs.jsonl --scope=test --service=ok
+test_err 'sorry' build Test --no-build --wfail
+test_err 'sorry' build Test --no-build --wfail
+
 unset LAKE_OVERRIDE_LEAN
 unset LEAN_SYSROOT
