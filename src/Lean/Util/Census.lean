@@ -124,6 +124,15 @@ def addSimpCacheMiss : BaseIO Unit := do
 def recordImportExt (extName : Name) (ns : Nat) : BaseIO Unit :=
   record s!"\{\"k\":\"import_ext\",\"name\":\"{jesc (toString extName)}\",\"ns\":{ns}}"
 
+/-- One top-level command's elaboration time (`Lean.Language.Lean.process.doElab`'s call to
+    `Elab.Command.elabCommandTopLevel`), tagged by its specific syntax kind: a `declaration`
+    command's outer wrapper kind is unwrapped at the call site to the inner keyword's kind
+    (e.g. `` `Lean.Parser.Command.theorem ``, `` `Lean.Parser.Command.instance ``), so the report
+    can break "interface elaboration" time down by what kind of command fills it (definitions and
+    structures, instances, `#eval`/`example`, etc.) instead of only by repeated-work kind. -/
+def recordCommand (kind : Name) (ns : Nat) : BaseIO Unit :=
+  record s!"\{\"k\":\"command\",\"kind\":\"{jesc (toString kind)}\",\"ns\":{ns}}"
+
 /-- Running total of time spent forcing the lazily-merged imported-constant tries
     (`ImportedConsts.mergeModuleTreesLazy`'s results, lean-build-perf#7), accumulated over the
     whole process: forcing can happen well after `importModules` returns (that fork's whole

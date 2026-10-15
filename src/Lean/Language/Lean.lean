@@ -14,6 +14,7 @@ prelude
 public import Lean.Language.Util
 public import Lean.Language.Lean.Types
 public import Lean.Elab.Import
+import Lean.Util.Census
 
 public section
 
@@ -763,12 +764,15 @@ where
       snap?        := if internal.cmdlineSnapshots.get scope.opts then none else snap
       cancelTk?    := some cancelTk
     }
+    let censusT0 ← IO.monoNanosNow
     let (output, _) ←
       IO.FS.withIsolatedStreams (isolateStderr := Core.stderrAsMessages.get scope.opts) do
         EIO.toBaseIO do
           withLoggingExceptions
             (getResetInfoTrees *> Elab.Command.elabCommandTopLevel stx cmds)
             cmdCtx cmdStateRef
+    let censusKind := if stx.isOfKind ``Lean.Parser.Command.declaration then stx[1].getKind else stx.getKind
+    Lean.Census.recordCommand censusKind ((← IO.monoNanosNow) - censusT0)
     let cmdState ← cmdStateRef.get
     let mut messages := cmdState.messages
     if !output.isEmpty then
