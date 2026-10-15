@@ -165,6 +165,15 @@ printf 'import Test.RX\nset_option linter.deprecated false\ntheorem t : c = true
 test_run build Test.RM
 printf 'partial def f (n : Nat) : Nat := if n = 0 then 3 else f (n - 1)\ndef c : Bool := f 1 == 2\n' > Test/RX.lean
 test_err "error: Test/RM.lean" build -v Test.RM
+# `reduceBool` one module up (adversarial case a05c): RY's `rbc` is `noskip` and always rebuilds, and RN's
+# `rfl` proof of `rbc = true` names no `reduceBool`; `rbc`'s digest folds in `f`'s compiled body, so RN must
+# rebuild and fail
+printf 'partial def f (n : Nat) : Nat := if n = 0 then 2 else f (n - 1)\ndef c : Bool := f 1 == 2\n' > Test/RX.lean
+printf 'import Test.RX\ndef rbc : Bool := Lean.reduceBool c\n' > Test/RY.lean
+printf 'import Test.RY\ntheorem t : rbc = true := rfl\n' > Test/RN.lean
+test_run build Test.RN
+printf 'partial def f (n : Nat) : Nat := if n = 0 then 3 else f (n - 1)\ndef c : Bool := f 1 == 2\n' > Test/RX.lean
+test_err "error: Test/RN.lean" build -v Test.RN
 # `bv_decide` checks its certificate with compiled toolchain code only: its module stays skippable
 printf 'def y := 1\n' > Test/BY.lean
 printf 'import Test.BY\nimport Std.Tactic.BVDecide\ntheorem tb (x : BitVec 8) : x + 0#8 = x := by bv_decide\n' \
