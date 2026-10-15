@@ -5,7 +5,8 @@ keeps later, unrelated commands' results instead of re-elaborating them.
 
 theorem reuseProofOnly_early : True := by
   trivial
-  --^ insert: "; skip"
+--^ sync
+       --^ insert: "; skip"
 
 theorem reuseProofOnly_later : 1 + 1 = 2 := by
   dbg_trace "reuseProofOnly_later: elaborated"
@@ -29,7 +30,8 @@ mentioning `reuseAxiomPrint_uses` is correctly forced to re-elaborate.
 
 theorem reuseAxiomPrint_base : True := by
   trivial
-  --^ change: "trivial" "sorry"
+--^ sync
+--^ change: "trivial" "sorry"
 
 theorem reuseAxiomPrint_uses : True := reuseAxiomPrint_base
 
@@ -47,32 +49,31 @@ theorem reuseAxiomPrint_uses : True := reuseAxiomPrint_base
 /-!
 lean-build-perf#20: a proof-only edit whose new proof needs a *different set* of generated auxiliary
 declarations than the old one (not just different content under the same names) must invalidate any
-later command that referenced an auxiliary name the edit drops. Nested `match` terms inside a tactic
-proof are compiled to numbered `match_N` auxiliary definitions; changing the number of match arms
-changes how many of these a proof needs.
-
-NOTE: the exact auxiliary names Lean's equation/match compiler assigns are an implementation detail
-this test deliberately does not hard-code (`reuseAuxRename_helper.match_1` is referenced only if it
-actually exists after the first elaboration; if the compiler's actual naming differs in this Lean
-version, `fix_expected.py` run after a real build is how to confirm and, if needed, adjust the second
-tactic's shape so the aux-name set genuinely differs between the two versions -- that is an empirical
-check this static test cannot replace, see lean-build-perf#20).
+later command that referenced an auxiliary name the edit drops. A `match` term elaborated as part of
+a declaration's value is compiled to a numbered `match_N` auxiliary definition hanging off that
+declaration's name; adding an unrelated second `match` to the proof adds a new such auxiliary name to
+`reuseAuxRename_helper`'s aux-decl set without changing the name of the original match (confirmed
+empirically against this toolchain: a lone `match` in this shape is named
+`reuseAuxRename_helper.match_1_1` both before and after, and the added `match` is a distinct name) --
+i.e. this is a genuine symmetric-difference case (an added name), not a same-name content change.
 -/
 
-theorem reuseAuxRename_helper (x : Bool ⊕ Bool) : Bool :=
-  match x with
-  | .inl b => b
-  | .inr b => b
-  --^ change: "| .inr b => b" "| .inr b => !b"
+theorem reuseAuxRename_helper (b : Bool) : True :=
+  match b with
+  | true => trivial
+  | false => trivial
+--^ sync
+--^ insert: "let _ := match b with | true => (0:Nat) | false => 1\n  "
 
-theorem reuseAuxRename_later : reuseAuxRename_helper (.inl true) = true := by
+theorem reuseAuxRename_later : True := by
   dbg_trace "reuseAuxRename_later: elaborated"
-  rfl
+  exact reuseAuxRename_helper true
 --^ collectDiagnostics
--- `reuseAuxRename_later` does not reference `reuseAuxRename_helper.match_1` directly, so this
--- specific pair is actually expected to be *kept* (it only cites `reuseAuxRename_helper` by name,
--- handled by the ordinary reference-not-elimination path) -- this case is here primarily to confirm
--- the overall feature does not regress on a theorem whose auxiliary-declaration set is unstable
--- across edits, and `reuseAuxRename_later`'s single trace line in the expected output is itself the
--- check that it was *not* forced to re-elaborate (a "same name, same type" aux-set edit alone is not
--- a soundness hazard unless something later names the dropped auxiliary declaration directly).
+-- `reuseAuxRename_later` does not reference `reuseAuxRename_helper.match_1_1` (or any aux name)
+-- directly, so this specific pair is actually expected to be *kept* (it only cites
+-- `reuseAuxRename_helper` by name, handled by the ordinary reference-not-elimination path) -- this
+-- case is here primarily to confirm the overall feature does not regress on a theorem whose
+-- auxiliary-declaration set grows across edits, and `reuseAuxRename_later`'s single trace line in the
+-- expected output is itself the check that it was *not* forced to re-elaborate (an aux-set edit alone
+-- is not a soundness hazard unless something later names the added/dropped auxiliary declaration
+-- directly).

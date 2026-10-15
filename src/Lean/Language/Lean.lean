@@ -657,8 +657,14 @@ where
     if let some old := old? then
       -- NOTE: as `parserState.pos` includes trailing whitespace, this forces reprocessing even if
       -- only that whitespace changes, which is wasteful but still necessary because it may
-      -- influence the range of error messages such as from a trailing `exact`
-      if stx.eqWithInfo old.stx then
+      -- influence the range of error messages such as from a trailing `exact`. When grafting is in
+      -- progress (`graft?` is `some`), compare ignoring position instead: an earlier proof-only edit
+      -- shifts every later command's absolute byte offsets even when its own text is untouched, so a
+      -- position-sensitive comparison would never match except by coincidence (lean-build-perf#20).
+      let sameStx := match graft? with
+        | some _ => Reuse.eqIgnoringPos stx old.stx
+        | none => stx.eqWithInfo old.stx
+      if sameStx then
         -- Here we must make sure to pass the *new* parser state; see NOTE in `unchanged`
         return (← match graft? with
           | none => unchanged old parserState
@@ -743,7 +749,6 @@ where
       let cmdState ← doElab stx cmds cmdState beginPos
         { old? := old?.map fun old => ⟨old.stx, old.elabSnap.elabSnap⟩, new := elabPromise }
         elabCmdCancelTk ctx
-
       let mut reportedCmdState := cmdState
       let cmdline := internal.cmdlineSnapshots.get scope.opts && !Parser.isTerminalCommand stx
       if cmdline then
@@ -822,8 +827,13 @@ where
               Reuse.startGraft declName scope.opts envBeforeD oldResult.cmdState.env cmdState.env
             else pure none
           | none => pure none
-        -- We're definitely off the fast-forwarding path now
-        parseCmd none parserState cmdState next (sync := false) elabCmdCancelTk (cmds.push stx)
+        -- lean-build-perf#20: when grafting started, the old chain's tail is still meaningful: pass
+        -- the old chain's next-command snapshot along so the recursive call's fast/semi-fast paths
+        -- can compare syntax and invoke `graftedContinue` instead of discarding it outright (today's
+        -- behavior for a genuine syntax change, hence `none` when grafting did not start).
+        let nextOld? := if graft?'.isSome then old?.bind (·.nextCmdSnap?) |>.map (·.task.get) else none
+        -- We're definitely off the fast-forwarding path now, unless grafting is continuing it
+        parseCmd nextOld? parserState cmdState next (sync := false) elabCmdCancelTk (cmds.push stx)
           graft?' ctx
 
   doElab (stx : Syntax) (cmds : Array Syntax) (cmdState : Command.State) (beginPos : String.Pos.Raw)

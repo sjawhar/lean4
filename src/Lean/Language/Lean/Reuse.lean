@@ -88,6 +88,24 @@ partial def peelInWrappers (old new : Syntax) : Option (Syntax × Syntax) :=
   else
     some (old, new)
 
+/--
+Like `Syntax.eqWithInfo`, but ignoring `SourceInfo` (source positions/trivia) entirely: two commands
+compare equal here iff they have the same structure (node kinds, atom text, identifier `rawVal`/`val`/
+`preresolved`), regardless of where in the file they sit. `Syntax.eqWithInfo` cannot be used for this:
+after a proof-only edit changes an earlier theorem's length, every later command's absolute byte
+position shifts even when its own text is untouched, so a position-sensitive comparison would always
+report "changed" and grafting would never fire except by coincidence (equal-length edits). This is the
+comparison `graftedContinue`'s "is this later command's text still exactly what we last saw" check
+needs; `Reuse.commandVerdict`'s own occurrence/eliminator analysis is still what decides *safety*.
+-/
+partial def eqIgnoringPos : Syntax → Syntax → Bool
+  | .missing, .missing => true
+  | .node _ k args, .node _ k' args' => k == k' && args.isEqv args' eqIgnoringPos
+  | .atom _ val, .atom _ val' => val == val'
+  | .ident _ rawVal val pre, .ident _ rawVal' val' pre' =>
+    rawVal == rawVal' && val == val' && pre == pre'
+  | _, _ => false
+
 /-- `stx` is a `theorem` command: a `Lean.Parser.Command.declaration` node whose second child is a
 `Lean.Parser.Command.theorem` node (`"theorem " declId declSig declVal`). -/
 def isTheoremDeclaration (stx : Syntax) : Bool :=
@@ -300,7 +318,7 @@ is treated conservatively as "not provably `Prop`".
 def isPropType (env : Environment) (opts : Options) (type : Expr) : BaseIO Bool := do
   let ctxCore : Core.Context := { fileName := "<lean-build-perf#20>", fileMap := default, options := opts }
   let sCore : Core.State := { env }
-  match (← (Lean.Meta.isPropFormerType type).toIO ctxCore sCore |>.toBaseIO) with
+  match (← (Lean.Meta.isProp type).toIO ctxCore sCore |>.toBaseIO) with
   | .ok (b, _, _) => pure b
   | .error _ => pure false
 
@@ -314,8 +332,13 @@ defensively) or isn't `Prop`-sorted, so proof irrelevance does not apply to it a
 -/
 def startGraft (declName : Name) (opts : Options) (envBeforeD oldAfterD newAfterD : Environment) :
     BaseIO (Option GraftState) := do
-  let some oldD := oldAfterD.find? declName | return none
-  let some newD := newAfterD.find? declName | return none
+  -- Look up via the kernel-checked environment (like `newConstants` already does), not the plain
+  -- `Environment.find?`: a just-elaborated async `theorem`'s *signature* is committed synchronously
+  -- but its *value*/kernel-check can still be finishing on a background task at this point (see the
+  -- issue's investigation notes on `elabAsync`/`commitSignature`/`commitCheckEnv`), so `find?` on the
+  -- raw `Environment` can transiently see the declaration with no value yet.
+  let some oldD := oldAfterD.checked.get.constants.find? declName | return none
+  let some newD := newAfterD.checked.get.constants.find? declName | return none
   unless oldD.type == newD.type && oldD.levelParams == newD.levelParams do
     return none
   unless (← isPropType newAfterD opts newD.type) do
