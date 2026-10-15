@@ -748,19 +748,26 @@ optional<expr> type_checker::to_nat_offset(expr e, nat & k) {
 /* `Nat.ble`/`Nat.beq` with one argument a literal `n` and the other `a + k` (`to_nat_offset`): both recurse by
    stripping a `Nat.succ` from each argument, so strip `min(n, k)` at once:
    `n ≤ a + k` is `true` if `n ≤ k`, else `Nat.ble (n - k) a`; `a + k ≤ n` is `false` if `n < k`, else
-   `Nat.ble a (n - k)`; `n = a + k` is `false` if `n < k`, else `Nat.beq (n - k) a` (and symmetrically). */
+   `Nat.ble a (n - k)`; `n = a + k` is `false` if `n < k`, else `Nat.beq (n - k) a` (and symmetrically).
+   Both match on their first argument first, so the second is evaluated only when the first is a literal or an
+   offset: a stuck first argument leaves the second, which can be arbitrarily expensive to evaluate, untouched. */
 optional<expr> type_checker::reduce_nat_offset_pred(expr const & e, bool is_ble) {
     expr const & f = app_fn(app_fn(e));
-    /* Both arguments in whnf (cached; `reduce_bin_nat_pred` has just computed at least the first): exactly one must
-       be a literal. */
     expr lhs = whnf(app_arg(app_fn(e)));
-    expr rhs = whnf(app_arg(e));
     bool off_right = is_nat_lit_ext(lhs);
+    nat k;
+    optional<expr> a;
+    if (!off_right) {
+        a = to_nat_offset(lhs, k);
+        if (!a) return none_expr();
+    }
+    expr rhs = whnf(app_arg(e));
     if (off_right == is_nat_lit_ext(rhs))
         return none_expr();
-    nat k;
-    optional<expr> a = to_nat_offset(off_right ? rhs : lhs, k);
-    if (!a) return none_expr();
+    if (off_right) {
+        a = to_nat_offset(rhs, k);
+        if (!a) return none_expr();
+    }
     nat n = get_nat_val(off_right ? lhs : rhs);
     if (is_ble && off_right && n <= k)
         return some_expr(mk_bool_true());

@@ -9,6 +9,9 @@ reduction does not finish in reasonable time.
 The last section checks `a + k` against a successor whose argument is `a + (k - 1)` already unfolded to `Nat.add`'s
 compiled recursor, the shape of the validity proofs in Batteries' `Char.all`/`Char.any`. Stripping one `Nat.succ` per
 nested check there exceeds the kernel's recursion limit when `k ≥ 2^16`.
+
+The `Nat.ble`/`Nat.beq` offset rule must not evaluate the second argument when the first is stuck: `Nat.ble` and
+`Nat.beq` match on their first argument first, and evaluating `y * 2^64 + z` unfolds `Nat.mul` `2^64` times.
 -/
 open Lean Meta Elab Term Command
 
@@ -87,3 +90,8 @@ def allShifted (p : (n : Nat) → n < 0x200000 → Bool) : Bool :=
 
 def anyShifted (p : (n : Nat) → n < 0x200000 → Bool) : Bool :=
   Nat.any 0x100000 fun i h => p (i + 0x1FFFF + 1) (by grind)
+
+/-- info: false -/
+#guard_msgs in #kdefeq (fun x y z : Nat => Nat.ble x (y * 2^64 + z)) =?= (fun _ _ _ : Nat => true)
+/-- info: false -/
+#guard_msgs in #kdefeq (fun x y z : Nat => Nat.beq x (y * 2^64 + z)) =?= (fun _ _ _ : Nat => false)
