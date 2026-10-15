@@ -513,12 +513,12 @@ test_run build Test --no-build
 
 # Verify a corrupted `.ltar` unpack (the cross-machine `cache get` round trip, e.g.
 # leantar's `ByteArray` element-size bug) is caught and fails loudly, rather than
-# Lake reporting "All targets up-to-date" over silently drifted bytes (lean-build-perf#7)
+# Lake reporting "All targets up-to-date" over silently drifted bytes
 test_cmd rm -rf .lake/build "$CACHE_DIR"
 test_run cache get --scope=test --service=ok
 CORRUPT_LEANTAR_FILE="$BASIC_OLEAN" \
   test_err 'restored artifact does not match its recorded hash' build Test --no-build
-match_text 'module:.*Basic' produced.out
+match_pat 'module:.*Basic' produced.out
 match_text 'archive:' produced.out
 match_text 'expected:' produced.out
 match_text 'actual:' produced.out
@@ -528,17 +528,21 @@ test_exp ! -e "$BASIC_OLEAN"
 test_run build Test --no-build
 
 # Verify the same for a local restore from an already-built `.ltar`
-# (`LAKE_RESTORE_ARTIFACTS=true`, as in machcsl's `tools/lakecache.sh`): delete only
+# (`LAKE_RESTORE_ARTIFACTS=true`, as used by a large downstream project): delete only
 # the module's build outputs, keeping its local `.ltar` and trace, so Lake unpacks the
 # local archive instead of rebuilding or re-fetching
 test_cmd rm -rf .lake/build "$CACHE_DIR"
 test_run build Test -o outputs.jsonl
-test_exp -f .lake/build/lib/lean/Test/Basic.ltar
+test_exp -f .lake/build/ir/Test/Basic.ltar
+# Clear the local artifact cache too, so Lake can't shortcut through a cache-dir hit
+# (a plain hardlink/copy, safe by construction) and must unpack the local `.ltar` instead
+test_cmd rm -rf "$CACHE_DIR"
 test_cmd rm -f "$BASIC_OLEAN" .lake/build/lib/lean/Test/Basic.ilean .lake/build/ir/Test/Basic.c
 CORRUPT_LEANTAR_FILE="$BASIC_OLEAN" LAKE_RESTORE_ARTIFACTS=true \
   test_err 'restored artifact does not match its recorded hash' build Test --no-build
 test_exp ! -e "$BASIC_OLEAN"
 # A clean retry (no corruption) restores correctly from the local archive
+test_cmd rm -rf "$CACHE_DIR"
 test_cmd rm -f "$BASIC_OLEAN" .lake/build/lib/lean/Test/Basic.ilean .lake/build/ir/Test/Basic.c
 LAKE_RESTORE_ARTIFACTS=true test_run build Test --no-build
 test_exp -f "$BASIC_OLEAN"
