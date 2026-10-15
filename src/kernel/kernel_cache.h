@@ -98,14 +98,54 @@ inline bool kc_is_closed(expr const & t, expr const & s) {
     eviction, and a lookup after the cap is simply a miss, exactly as if there were no cache at
     all -- always sound, only a missed optimization.
 
+    **Marking shared objects thread-safe, not just the tables that hold them.** The mutex
+    discipline above protects this cache's own `std::unordered_map` bookkeeping; it says nothing
+    about the Lean *objects* the tables store. `expr`'s base class (`object_ref`,
+    `runtime/object_ref.h`) increments/decrements the underlying object's raw `m_rc` field
+    directly in its copy constructor and destructor (`lean_inc_ref`/`lean_dec_ref`), and those
+    operations are a plain, non-atomic `m_rc +=/-= 1` unless the object has been marked
+    thread-shared (`lean_mark_mt`) -- this cache's own lock only serializes its own insert/find
+    calls, not a key or value's *originating* thread later dropping its own, completely unguarded
+    local copy, nor a second declaration that happens to share the same subterm object doing its
+    own independent inc/dec. Two threads racing a plain `+=`/`-=` on the same `int` is a genuine
+    data race that can drop an increment -- freeing a still-referenced object out from under
+    another thread -- exactly the shape of lean-build-perf#16's `funInduction.lean` failure (a
+    verified-closed, verified-imported key whose own computed value, built in part from an
+    earlier shared-cache hit, turned up with a corrupted subterm: a stray metavariable or an
+    escaping bound variable that was never actually produced by any correct computation, and a
+    SIGSEGV reading memory `reduce_recursor` had every reason to think was still a live `expr`).
+    Every low-level `insert` (`kc_expr_table`, `kc_pair_table`, `kc_bool_table`, in
+    `kernel_cache.cpp`) therefore calls `lean_mark_mt` on each key and value before it is copied
+    into the table, recursively marking the whole reachable subterm graph thread-shared so every
+    later inc/dec on it -- this cache's own, and the inserting thread's own about-to-be-dropped
+    local copy -- goes through the atomic path instead. This is the same thing `alloc_task`
+    already does unconditionally for whatever is handed to a `Task`; `lean_mark_mt` is a no-op on
+    an already-shared node, so re-marking a subterm two tables (or two inserts) share costs
+    nothing extra. `LEAN_KC_STATS=1`'s `st_marked` counter records how many of these calls found a
+    genuinely single-threaded object -- i.e. would have raced without this call -- which was never
+    zero on any real run (including `funInduction.lean` itself): this is not a hypothetical hole,
+    it is what every prior crash was.
+
+    A nested hypothesis -- that `fun_induction`'s on-demand-realized auxiliary declarations
+    (`Environment.realizeConst`) could make `environment::is_imported` answer differently for the
+    same name depending on which environment asks -- does not hold up: `getModuleIdxFor?`
+    (`src/Lean/Environment.lean`) reads only `allImportedConsts`/`importedExtraConsts`, both
+    populated once at import-finalization and never written again by
+    `Kernel.Environment.add`/`environment::add_core`, so every branch and every realization's own
+    captured environment (`RealizationContext.env`) shares the identical, immutable view for the
+    whole process. Instrumented confirmation (temporary, not in this tree): logging every
+    `is_imported` verdict seen through `is_shareable` and flagging a name whose verdict ever
+    changed found zero disagreements across repeated `funInduction.lean` runs, with and without
+    the MT-marking fix above.
+
     **Env-var toggle for same-binary A/B measurement** (no build difference between "cache on"
     and "cache off" runs, so a CPU comparison isn't confounded by anything but the cache itself):
     `LEAN_KCACHE=0` disables all of `is_shareable`'s sharing at `initialize_kernel_cache()` time
     (checked once, into a plain `bool`, not re-read per call); default is enabled (`1`). When
     disabled, every call site behaves exactly as upstream Lean: the per-declaration tables only.
 
-    Counters (hits, misses, entries) are always maintained (plain atomic increments); they are
-    only *printed*, at process exit, when `LEAN_KC_STATS=1` is set. */
+    Counters (hits, misses, entries, and marking's own `st_marked`) are always maintained (plain
+    atomic increments); they are only *printed*, at process exit, when `LEAN_KC_STATS=1` is set. */
 class kc_cache {
 public:
     struct counters {
