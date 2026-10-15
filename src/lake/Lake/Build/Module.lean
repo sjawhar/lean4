@@ -10,14 +10,11 @@ public import Lake.Config.FacetConfig
 public import Lake.Build.Job.Monad
 public import Lake.Build.Infos
 import Lean.Elab.ParseImportsFast
-import Lake.Util.BuildSlots
 import Lake.Util.Proc
 import Lake.Build.Job.Register
 import Lake.Build.Common
-import Lake.Build.RemoteCache
 import Lake.Build.Target
 import Init.Omega
-import Std.Sync.Mutex
 
 /-! # Module Build Definitions -/
 
@@ -77,8 +74,10 @@ Build function definitions for a module's builtin facets.
 /-- Parse the header of a Lean file from its source. -/
 def Module.recFetchInput (mod : Module) : FetchM (Job ModuleInput) := Job.async do
   let path := mod.leanFile
+  -- mtime before contents: `buildLean` compares it after `lean` exits
+  let mtime ← getMTime path
   let contents ← IO.FS.readFile path
-  let trace := {caption := path.toString, mtime := ← getMTime path, hash := .ofText contents}
+  let trace := {caption := path.toString, mtime, hash := .ofText contents}
   setTrace trace
   let header ← Lean.parseImports' contents path.toString
   let imports ← header.imports.mapM fun imp => do
@@ -714,7 +713,6 @@ def Module.recFetchPreSetup (mod : Module) : FetchM (Job ModulePreSetup) := ensu
       trace := ← getTrace
       srcFile := input.path
       srcMTime := input.trace.mtime
-      srcHash := input.trace.hash
       isModule := input.header.isModule
       directImports := input.imports
       directImportArts := info.directArts
@@ -838,7 +836,6 @@ public def Module.cacheOutputHashes (mod : Module) : IO PUnit := do
 
 def ModuleOutputDescrs.resolve
   (descrs : ModuleOutputDescrs) (service? : Option CacheServiceName) (scope? : Option CacheServiceScope)
-  (sha256? : Option Sha256Map := none)
 : JobM ModuleOutputArtifacts := do
   let arts : ModuleOutputArtifacts := {
     isModule := descrs.isModule
@@ -857,12 +854,11 @@ def ModuleOutputDescrs.resolve
     return {arts with bc? := some (← resolve descr)}
   else
     return arts
-where @[inline] resolve descr := resolveArtifact descr service? scope? (sha256? := sha256?)
+where @[inline] resolve descr := resolveArtifact descr service? scope?
 
 def resolveModuleOutputArtifacts (out : CacheOutput) : JobM ModuleOutputArtifacts := do
   match fromJson? out.data with
-  | .ok (descrs : ModuleOutputDescrs) =>
-    descrs.resolve out.service? out.scope? (sha256? := out.sha256?)
+  | .ok (descrs : ModuleOutputDescrs) => descrs.resolve out.service? out.scope?
   | .error e => error s!"ill-formed module outputs:\n{out.data.render.pretty 80 2}\n{e}"
 
 instance : ResolveOutputs ModuleOutputArtifacts := ⟨resolveModuleOutputArtifacts⟩
@@ -877,7 +873,7 @@ def resolveModuleOutputs (out : CacheOutput) : JobM ModuleOutputs := do
   if let .str descr := out.data then
     match ArtifactDescr.ofFilePath? descr with
     | .ok descr =>
-      return .ltar (← resolveArtifact descr out.service? out.scope? (sha256? := out.sha256?))
+      return .ltar (← resolveArtifact descr out.service? out.scope?)
     | .error e =>
       error s!"ill-formed module archive output:\n{out.data.render.pretty 80 2}\n{e}"
   else
@@ -885,12 +881,12 @@ def resolveModuleOutputs (out : CacheOutput) : JobM ModuleOutputs := do
     | .ok (descrs : ModuleOutputDescrs) =>
       if let some descr := descrs.ltar? then
         try
-          descrs.resolve out.service? out.scope? (sha256? := out.sha256?)
+          descrs.resolve out.service? out.scope?
         catch e =>
           dropLogFrom e
-          return .ltar (← resolveArtifact descr out.service? out.scope? (sha256? := out.sha256?))
+          return .ltar (← resolveArtifact descr out.service? out.scope?)
       else
-        descrs.resolve out.service? out.scope? (sha256? := out.sha256?)
+        descrs.resolve out.service? out.scope?
     | .error e => error s!"ill-formed module outputs:\n{out.data.render.pretty 80 2}\n{e}"
 
 instance : ResolveOutputs ModuleOutputs := ⟨resolveModuleOutputs⟩
@@ -1059,44 +1055,6 @@ where
 
 instance : ToOutputJson ModuleOutputArtifacts := ⟨(toJson ·.descrs)⟩
 
-/--
-The outputs that a module's archive (`.ltar`) holds after its trace, in archive order, each with
-the base directory it is relative to: `false` for the library directory (the `.olean` parts,
-`.ilean` and IR), `true` for the IR directory (the `.c` and `.bc`).
--/
-public def ModuleOutputDescrs.ltarFiles
-  (descrs : ModuleOutputDescrs)
-: Except String (Array (ArtifactDescr × Bool)) := do
-  -- Note: oleans parts must be in the order of `.olean`, `.olean.server`, `.olean.private`
-  let mut files := descrs.oleanParts.map (·, false)
-  files := files.push (descrs.ilean, false)
-  if let some descr := descrs.irSig? then
-    files := files.push (descr, false)
-  if let some descr := descrs.ir? then
-    files := files.push (descr, false)
-  if let some descr := descrs.c? then
-    files := files.push (descr, true)
-  if Lean.Internal.hasLLVMBackend () then
-    let some descr := descrs.bc?
-      | throw "LLVM backend enabled but module outputs lack bitcode"
-    files := files.push (descr, true)
-  return files
-
-/--
-The `leantar` arguments that pack a module's outputs into the archive `ltar`: its trace,
-`fileName "trace"`, then the file `fileName ext` of each output of `files` (see `ltarFiles`),
-relative to `libDir` or `irDir`.
-
-`-s` strips the trace's `depHash`, so that the archive's bytes depend only on the outputs.
-Consumers supply the hash again on unpack (see `Module.unpackLtar`).
--/
-public def ltarPackArgs
-  (files : Array (ArtifactDescr × Bool)) (fileName : String → String) (libDir irDir ltar : FilePath)
-: Array String :=
-  let args := #["-s", "-C", libDir.toString, "-C", irDir.toString, ltar.toString, fileName "trace"]
-  files.foldl (init := args) fun args (descr, inIrDir) =>
-    args.push "-i" |>.push (if inIrDir then "1" else "0") |>.push (fileName descr.ext)
-
 def Module.packLtar
   (self : Module) (arts : ModuleOutputArtifacts)
 : JobM Artifact := do
@@ -1104,11 +1062,37 @@ def Module.packLtar
     if (← self.checkArtifactsExist arts.isModule arts.c?.isNone) then
       return arts
     else self.restoreAllArtifacts arts
-  let files ← match arts.descrs.ltarFiles with
-    | .ok files => pure files
-    | .error e => error e
-  let args := ltarPackArgs files self.fileName self.leanLibDir self.irDir self.ltarFile
-  withBuildSlot <| proc (quiet := true) (lend := true) {cmd := (← getLeantar).toString, args}
+  let args ← id do
+    -- `-s` strips the `depHash` so archive bytes depend only on outputs.
+    -- Consumers reinject the hash on unpack (see `Module.unpackLtar`).
+    let mut args := #[
+      "-s",
+      "-C", self.leanLibDir.toString,
+      "-C", self.irDir.toString,
+      self.ltarFile.toString,
+      self.fileName "trace"
+    ]
+    let addArt args idx art :=
+      args.push "-i" |>.push idx |>.push (self.fileName art.ext)
+    -- Note: oleans parts must be in the order of `.olean`, `.olean.server`, `.olean.private`
+    args := addArt args "0" arts.olean
+    if let some art := arts.oleanServer? then
+      args := addArt args "0" art
+    if let some art := arts.oleanPrivate? then
+      args := addArt args "0" art
+    args := addArt args "0" arts.ilean
+    if let some art := arts.irSig? then
+      args := addArt args "0" art
+    if let some art := arts.ir? then
+      args := addArt args "0" art
+    if let some art := arts.c? then
+      args := addArt args "1" art
+    if Lean.Internal.hasLLVMBackend () then
+      let some art := arts.bc?
+        | error "LLVM backend enabled but module outputs lack bitcode"
+      args := addArt args "1" art
+    return args
+  proc (quiet := true) {cmd := (← getLeantar).toString, args}
   if (← self.pkg.isArtifactCacheWritable) then
     cacheArtifact self.ltarFile "ltar" (useLocalFile := ← self.pkg.restoreAllArtifacts)
   else
@@ -1125,123 +1109,7 @@ def Module.unpackLtar (self : Module) (ltar : FilePath) (inputHash : Hash) : Job
     "-C", self.irDir.toString,
     "-x", "-j", "-"
   ]
-  withBuildSlot <| proc (quiet := true) (input? := input.compress) (lend := true)
-    {cmd := (← getLeantar).toString, args}
-
-/--
-The cached archives that this process could not unpack, as `<cache scope>/<input hash>`: a build
-that met one compiles the module and does not restore that input's archive again (see
-`Module.rejectArchive`).
--/
-builtin_initialize rejectedArchives : Std.Mutex (Std.HashSet String) ← Std.Mutex.new {}
-
-/-- The key of `mod`'s input `inputHash` in `rejectedArchives`. -/
-def Module.archiveKey (mod : Module) (inputHash : Hash) : String :=
-  s!"{mod.pkg.cacheScope}/{inputHash}"
-
-/--
-Whether this process has removed the witnesses (see `Module.rejectArchive`) that killed builds
-left in the cache's quarantine directory (see `reapWitnesses`).
--/
-builtin_initialize witnessesReaped : IO.Ref Bool ← IO.mkRef false
-
-/-- The day of the Unix epoch of `secs` seconds, which a witness's name holds. -/
-def witnessDay (secs : Int) : Int := secs / (24 * 60 * 60)
-
-/--
-Removes, once per process, the witnesses in `cache`'s quarantine directory that were made before
-yesterday: a build removes each witness it makes after the unpack, so these are the ones of
-builds killed during an unpack. Each would keep its archive's bytes on disk after the cache
-removed the archive. A witness's name holds the day it was made (`witness.<day>.…`, see
-`witnessDay`), as its modification time is the archive's (it is a hard link). No unpack takes a
-day, so a witness in use is never removed.
--/
-def reapWitnesses (cache : Cache) : BaseIO Unit := do
-  if ← witnessesReaped.modifyGet (fun done => (done, true)) then
-    return
-  let .ok entries ← cache.quarantineDir.readDir.toBaseIO
-    | return
-  let .ok now ← wallClockSecs.toBaseIO
-    | return
-  let today := s!"witness.{witnessDay now}."
-  let yesterday := s!"witness.{witnessDay now - 1}."
-  for entry in entries do
-    let name := entry.fileName
-    if name.startsWith "witness." && !name.startsWith today && !name.startsWith yesterday then
-      discard <| (IO.FS.removeFile entry.path).toBaseIO
-
-/-- Unpacks `ltar` (see `Module.unpackLtar`), and returns the messages of its log if it failed. -/
-def Module.tryUnpackLtar (mod : Module) (ltar : FilePath) (inputHash : Hash) :
-    JobM (Except Log Unit) := do
-  try
-    mod.unpackLtar ltar inputHash
-    return .ok ()
-  catch e =>
-    return .error (← takeLogFrom e)
-
-/--
-Handles a cached archive of `mod`'s input that did not unpack (`log` is the failure), though its
-digests matched: the build treats it as a cache miss and compiles. It removes what the unpack left
-(the outputs and the trace), takes the archive out of the cache, records the failure in the read
-status (see `RemoteReadStatus`) at verbose level, and does not restore this input's archive again
-in this process.
-
-As the push does with an entry it found wrong (see `Lake.quarantineUnlessReplaced`), it takes the
-archive away from its name only by renaming it into the cache's quarantine directory, which
-captures exactly the file that is there, and then checks that it took the file that did not
-unpack: `witness?` is a hard link to that file, made before the unpack, and
-`System.FilePath.isSameFile` compares the device and inode, so a file that another process
-installed in the meantime differs however it was written (a size and a modification time cannot
-tell a same-size replacement written within one kernel tick from the original). Such a file goes
-back to its name, so this build removes only the bytes it tested. Without a witness (a cache
-this package does not write, or the link failed) the archive stays where it is: this build could
-not tell it from a replacement, and this process does not restore it again. The archive is also
-left where it is when it is not in this cache's artifacts.
--/
-def Module.rejectArchive
-  (mod : Module) (inputHash : Hash) (ltar : FilePath) (witness? : Option FilePath)
-  (log : Log)
-: JobM Unit := do
-  rejectedArchives.atomically (modify (·.insert (mod.archiveKey inputHash)))
-  discard <| mod.clearOutputArtifacts.toBaseIO
-  discard <| (removeFileIfExists mod.traceFile).toBaseIO
-  let cache ← getLakeCache
-  let moved ←
-    if !ltar.toString.startsWith (cache.artifactDir.toString ++ "/") then
-      pure "it is not in the cache"
-    else if let some witness := witness? then
-      let take : IO String := do
-        IO.FS.createDirAll cache.quarantineDir
-        let name := ltar.fileName.getD "archive.ltar"
-        let captured ← uniqueTmpPath (cache.quarantineDir / name)
-        try
-          IO.FS.rename ltar captured
-        catch
-          | .noFileOrDirectory .. => return "another process moved it away first"
-          | e => throw e
-        let tested ← (· matches .ok true) <$> (captured.isSameFile witness).toBaseIO
-        unless tested do
-          -- Another process installed an archive after the unpack failed: it is not this
-          -- build's to remove
-          discard <| (IO.FS.rename captured ltar).toBaseIO
-          return "another process replaced it, which this build kept"
-        match (← (cache.quarantine captured name).toBaseIO) with
-        | .ok (some dest) => return s!"moved it to: {dest}"
-        | .ok none => return s!"moved it to: {captured}"
-        | .error e => return s!"moved it to: {captured} ({e})"
-      match (← take.toBaseIO) with
-      | .ok msg => pure msg
-      | .error e => pure s!"could not move it into quarantine: {e}"
-    else
-      pure "left where it is: this build has no link to tell it from a replacement"
-  let why := log.entries.foldl (init := "") fun msg entry =>
-    if msg.isEmpty then entry.message else s!"{msg}\n- {entry.message}"
-  let msg := s!"{mod.name}: the cached archive {ltar} did not unpack ({moved}); \
-    compiling the module instead:\n{why}"
-  let status := (← getBuildContext).remoteReadStatus
-  liftM (m := BaseIO) <| status.modify (·.add msg)
-  -- A cache failure, not a build failure: verbose, so `--wfail` builds still compile
-  logVerbose msg
+  proc (quiet := true) (input? := input.compress) {cmd := (← getLeantar).toString, args}
 
 def Module.recBuildLtar (self : Module) : FetchM (Job FilePath) := do
   withRegisterJob s!"{self.name}:ltar" <| withCurrPackage self.pkg do
@@ -1270,8 +1138,13 @@ def Module.buildLean
   let arts := mod.mkArtifacts presetup.srcFile presetup.isModule
   mod.clearOutputArtifacts
   mod.clearOutputHashes
-  withJobBuildSlot <| compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile arts args
-    (← getLeanPath) (← getLean) (takeSlot := false)
+  compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile arts args
+    (← getLeanPath) (← getLean)
+  -- The input hash covers the source as `recFetchInput` read it, but `lean` reads it again.
+  if (← getMTime presetup.srcFile) != presetup.srcMTime then
+    mod.clearOutputArtifacts
+    error s!"{relSrcFile}: source file was modified during the build; \
+      its outputs were discarded (build again to compile the current version)"
   mod.computeArtifacts setup.isModule presetup.postponeCompile
 
 def  adjustMTime (arts : ModuleOutputArtifacts) (traceFile : FilePath) : JobM ModuleOutputArtifacts := do
@@ -1300,60 +1173,26 @@ def Module.recBuildElabArts (mod : Module) : FetchM (Job ModuleOutputArtifacts) 
   -/
   withRegisterJob mod.name.toString do
   let presetupJob ← mod.presetup.fetch
-  -- While another build holds the claim of the module's input, the job waits without a thread,
-  -- and then fetches again (see `runWithClaimWaits`)
-  presetupJob.bindM fun presetup => do
+  presetupJob.mapM fun presetup => do
     setTrace presetup.trace
-    runWithClaimWaits fun sawDone => do
-      match ← fetchCore presetup sawDone with
-      | .done arts => return .done (← adjustMTime arts mod.traceFile)
-      | .wait wait => return .wait wait
+    let arts ← fetchCore presetup
+    let arts ← adjustMTime arts mod.traceFile
+    return arts
 where
   fetchFromCache? presetup savedTrace restoreAll : JobM ModuleFetchState := do
     let inputHash := (← getTrace).hash
-    -- An archive of this input that this process could not unpack is not tried again
-    if (← rejectedArchives.atomically (return (← get).contains (mod.archiveKey inputHash)) : Bool) then
-      return .incomplete savedTrace none
-    let some ((ltarOrArts : ModuleOutputs), log) ←
-      getArtifacts? inputHash savedTrace mod.pkg mod.name.toString (some presetup.srcHash)
+    let some ltarOrArts ← getArtifacts? inputHash savedTrace mod.pkg
       | return .incomplete savedTrace none
-    match ltarOrArts with
+    match (ltarOrArts : ModuleOutputs) with
     | .ltar ltar =>
       updateAction .unpack
       mod.clearOutputArtifacts
-      -- A cached archive whose digests match but which does not unpack is a cache miss: the
-      -- module compiles, and this process does not restore that archive again. A hard link made
-      -- now names the exact file that the unpack reads, whatever another process later puts at
-      -- the entry's name (see `Module.rejectArchive`). Only an archive in the cache's artifacts
-      -- can be taken out of the cache, and only a cache this package writes gets a link (by
-      -- default the artifact cache is read and not written): any failure leaves no witness, and
-      -- the unpack goes on.
-      let cache ← getLakeCache
-      let witness? ← do
-        if (← mod.pkg.isArtifactCacheWritable) &&
-            ltar.path.toString.startsWith (cache.artifactDir.toString ++ "/") then
-          let make : IO FilePath := do
-            let day := witnessDay (← wallClockSecs)
-            let witness ← uniqueTmpPath (cache.quarantineDir / s!"witness.{day}")
-            createParentDirs witness
-            reapWitnesses cache
-            IO.FS.hardLink ltar.path witness
-            return witness
-          pure (← make.toBaseIO).toOption
-        else
-          pure none
-      if let .error log ← mod.tryUnpackLtar ltar.path inputHash then
-        mod.rejectArchive inputHash ltar.path witness? log
-        discard <| (removeFileIfExists (witness?.getD "")).toBaseIO
-        return .incomplete .missing none
-      discard <| (removeFileIfExists (witness?.getD "")).toBaseIO
+      mod.unpackLtar ltar.path inputHash
       -- Note: This branch implies that only the ltar output is (validly) cached.
       -- Thus, we use only the new trace unpacked from the ltar to resolve further artifacts.
       let savedTrace ← readTraceFile mod.traceFile
       let arts? ← getArtifactsUsingTrace? inputHash savedTrace mod.pkg
       if let some (arts : ModuleOutputArtifacts) := arts? then
-        -- The archive's trace holds the log of the module's build
-        savedTrace.log.replay
         -- On initial unpack from cache ensure all artifacts uniformly
         -- end up in the build directory and, if writable, the cache
         let arts ← mod.restoreAllArtifacts {arts with ltar? := some ltar}
@@ -1361,8 +1200,7 @@ where
           let arts ← mod.cacheOutputArtifacts presetup.isModule restoreAll presetup.postponeCompile
           -- Note: Cache service metadata is not preserved on an output update because it would
           -- result in downloading module outputs that are not available on the remote.
-          (← getLakeCache).writeOutputs mod.pkg.cacheScope inputHash arts.descrs
-            (log := savedTrace.log) (overwrite := true)
+          (← getLakeCache).writeOutputs mod.pkg.cacheScope inputHash arts.descrs (overwrite := true)
           return .complete arts
         else
           return .complete arts
@@ -1372,7 +1210,7 @@ where
     | .arts arts =>
       unless (← savedTrace.replayCachedIfUpToDate inputHash) do
         mod.clearOutputArtifacts
-        writeFetchTrace mod.traceFile inputHash (toJson arts.descrs) log
+        writeFetchTrace mod.traceFile inputHash (toJson arts.descrs)
       let arts ←
         if restoreAll then
           mod.restoreAllArtifacts arts
@@ -1384,10 +1222,7 @@ where
           let ltar ← computeArtifact mod.ltarFile "ltar"
           return .complete {arts with ltar? := some ltar}
       return .complete arts
-  fetchCore (presetup : ModulePreSetup) (sawDone : Bool) :
-      JobM (ClaimLoop ModuleOutputArtifacts) := do
-    -- Whether this call compiles the module (not an earlier action of the job it continues)
-    let compiledHere ← trackBuilds
+  fetchCore (presetup : ModulePreSetup) : JobM ModuleOutputArtifacts := do
     let depTrace ← getTrace
     have : GetMTime Module := ⟨(·.getMTime presetup.isModule presetup.postponeCompile)⟩
     have : CheckExists Module := ⟨(·.checkExists presetup.isModule presetup.postponeCompile)⟩
@@ -1396,10 +1231,9 @@ where
       let restore ← mod.pkg.restoreAllArtifacts
       match (← fetchFromCache? presetup savedTrace restore) with
       | .complete arts =>
-        return .done arts
+        return arts
       | .incomplete savedTrace ltar? =>
         let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
-        let mut claim? : Option HeldClaim := none
         if status.isUpToDate then
           unless (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) do
             -- Restoring from the archive stamps the trace with the current input
@@ -1410,33 +1244,16 @@ where
             else
               discard <| mod.buildLean presetup
         else
-          -- Before it compiles, a build that writes the shared remote cache claims the input.
-          -- While another build holds the claim, the job waits, then fetches again.
-          match ← claimInput mod.pkg depTrace.hash sawDone with
-          | .wait wait => return .wait wait
-          | .compile c? => claim? := c?
-        withClaim claim? do
-          unless status.isUpToDate do
-            discard <| mod.buildLean presetup
-          if status.isCacheable then
-            let arts ← mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile
-            let arts := {arts with ltar? := arts.ltar? <|> ltar?}
-            -- The trace holds the log of the action that produced the outputs: their replay,
-            -- unpack or build
-            let log := (← readTraceFile mod.traceFile).log
-            -- Queued before the local mapping is written: a build that finds the mapping never
-            -- compiles (or queues) this input. After a crash between the two, the next build
-            -- restores the outputs through the trace without queueing them, so they stay queued once.
-            if (← compiledHere) then
-              -- `lake cache push` packs the per-file outputs into the archive it uploads
-              queueCompiledOutputs claim? mod.pkg depTrace.hash mod.name.toString
-                (some presetup.srcHash) (toJson {arts.descrs with ltar? := none}) log
-            (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs (log := log)
-            return .done arts
-          else
-            let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
-            return .done {arts with ltar? := arts.ltar? <|> ltar?}
-    else .done <$> do
+          discard <| mod.buildLean presetup
+        if status.isCacheable then
+          let arts ← mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile
+          let arts := {arts with ltar? := arts.ltar? <|> ltar?}
+          (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs
+          return arts
+        else
+          let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
+          return {arts with ltar? := arts.ltar? <|> ltar?}
+    else
       let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
       if status.isUpToDate then
         unless (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) do
