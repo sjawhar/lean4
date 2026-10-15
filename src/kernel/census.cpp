@@ -171,4 +171,94 @@ extern "C" LEAN_EXPORT object * lean_census_kernel_dump() {
     return mk_string(out);
 }
 
+/* Lean-side census state (`Lean.Util.Census`): see census.h's comment on why this mirrors
+   `g_mutex`/`g_lines` above instead of a Lean `IO.Ref`. Kept separate from the kernel's own
+   mutex/buffer since `Lean.Census.record` runs orders of magnitude more often (every `simp`
+   rewrite attempt, not every declaration). */
+namespace {
+std::mutex g_lean_mutex;
+std::vector<std::string> g_lean_lines;
+std::atomic<uint64_t> g_simp_cache_hits{0};
+std::atomic<uint64_t> g_simp_cache_misses{0};
+std::atomic<uint64_t> g_const_map_force_ns{0};
+}
+
+std::string const & census_dir() {
+    static std::string const dir = [] {
+        char const * d = std::getenv("LEAN_CENSUS_DIR");
+        return std::string(d ? d : "");
+    }();
+    return dir;
+}
+
+void census_record_line(std::string line) {
+    if (!census_enabled()) return;
+    std::lock_guard<std::mutex> lk(g_lean_mutex);
+    g_lean_lines.push_back(std::move(line));
+}
+
+void census_add_simp_cache_hit() {
+    if (!census_enabled()) return;
+    g_simp_cache_hits.fetch_add(1, std::memory_order_relaxed);
+}
+void census_add_simp_cache_miss() {
+    if (!census_enabled()) return;
+    g_simp_cache_misses.fetch_add(1, std::memory_order_relaxed);
+}
+void census_add_const_map_force_ns(uint64_t ns) {
+    if (!census_enabled()) return;
+    g_const_map_force_ns.fetch_add(ns, std::memory_order_relaxed);
+}
+uint64_t census_const_map_force_ns() {
+    return g_const_map_force_ns.load(std::memory_order_relaxed);
+}
+
+extern "C" LEAN_EXPORT uint8_t lean_census_enabled() {
+    return census_enabled() ? 1 : 0;
+}
+
+extern "C" LEAN_EXPORT object * lean_census_dir_str() {
+    return mk_string(census_dir());
+}
+
+extern "C" LEAN_EXPORT object * lean_census_record_line(b_obj_arg line) {
+    census_record_line(string_to_std(line));
+    return box(0);
+}
+
+extern "C" LEAN_EXPORT object * lean_census_add_simp_cache_hit() {
+    census_add_simp_cache_hit();
+    return box(0);
+}
+extern "C" LEAN_EXPORT object * lean_census_add_simp_cache_miss() {
+    census_add_simp_cache_miss();
+    return box(0);
+}
+extern "C" LEAN_EXPORT object * lean_census_add_const_map_force_ns(uint64_t ns) {
+    census_add_const_map_force_ns(ns);
+    return box(0);
+}
+extern "C" LEAN_EXPORT uint64_t lean_census_const_map_force_ns() {
+    return census_const_map_force_ns();
+}
+
+extern "C" LEAN_EXPORT object * lean_census_lean_dump() {
+    std::vector<std::string> lines;
+    {
+        std::lock_guard<std::mutex> lk(g_lean_mutex);
+        lines = std::move(g_lean_lines);
+        g_lean_lines.clear();
+    }
+    uint64_t hits = g_simp_cache_hits.exchange(0, std::memory_order_relaxed);
+    uint64_t misses = g_simp_cache_misses.exchange(0, std::memory_order_relaxed);
+    std::string out;
+    for (auto const & l : lines) { out += l; out += "\n"; }
+    if (hits + misses > 0) {
+        std::ostringstream os;
+        os << "{\"k\":\"simp_cache\",\"hits\":" << hits << ",\"misses\":" << misses << "}\n";
+        out += os.str();
+    }
+    return mk_string(out);
+}
+
 }

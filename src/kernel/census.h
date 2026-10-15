@@ -60,4 +60,42 @@ void census_record_closed_term(unsigned kind, unsigned h);
    once per process, when `Lean.Elab.Frontend.runFrontend` flushes the module's whole census. */
 extern "C" LEAN_EXPORT object * lean_census_kernel_dump();
 
+/* `src/Lean/Util/Census.lean`'s process-wide state: a `std::mutex`-protected buffer for JSON
+   lines and lock-free atomic counters, not a plain Lean `IO.Ref`. lean-build-perf#15: under
+   `Elab.async`'s concurrent per-declaration tasks, `IO.Ref.modify`'s compiled implementation
+   (`lean_st_ref_take`, runtime/io.cpp) busy-spins an atomic CAS with no backoff whenever another
+   thread holds the ref; on `MachCSL.WpStagesMPart1` (wide `simp only […]` calls driving
+   `Census.record` into the tens of millions) that spin loop and the `Array String` it kept
+   re-copying were 97% of the module's whole census-on compile time (2.8s -> 1200s+). */
+
+/* `LEAN_CENSUS_DIR`'s value, read once (not a `getenv`/`IO.Ref` per call) and cached; empty if
+   census collection is off. Shares `census_enabled()`'s gate (same env var). */
+std::string const & census_dir();
+
+/* Appends one pre-built compact-JSON line (`Lean.Census.record`'s callers already build the
+   JSON) to the buffer `lean_census_lean_dump` drains. No-op if census is disabled. */
+void census_record_line(std::string line);
+
+/* `Lean.Census.addSimpCacheHit`/`addSimpCacheMiss`: lock-free, since `simpLoop` checks its
+   per-term cache on every subterm `simp` visits. */
+void census_add_simp_cache_hit();
+void census_add_simp_cache_miss();
+
+/* `Lean.Census.addConstMapForceNs`/`recordImportTotal`'s process-lifetime running total. */
+void census_add_const_map_force_ns(uint64_t ns);
+uint64_t census_const_map_force_ns();
+
+/* `@[extern]` entry points for the above, called from `src/Lean/Util/Census.lean`. */
+extern "C" LEAN_EXPORT uint8_t lean_census_enabled();
+extern "C" LEAN_EXPORT object * lean_census_dir_str();
+extern "C" LEAN_EXPORT object * lean_census_record_line(b_obj_arg line);
+extern "C" LEAN_EXPORT object * lean_census_add_simp_cache_hit();
+extern "C" LEAN_EXPORT object * lean_census_add_simp_cache_miss();
+extern "C" LEAN_EXPORT object * lean_census_add_const_map_force_ns(uint64_t ns);
+extern "C" LEAN_EXPORT uint64_t lean_census_const_map_force_ns();
+/* Drains `census_record_line`'s buffer (newline-separated JSON objects) plus one `simp_cache`
+   summary line if either counter moved, and clears both: the Lean-side counterpart to
+   `lean_census_kernel_dump`. */
+extern "C" LEAN_EXPORT object * lean_census_lean_dump();
+
 }
