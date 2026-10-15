@@ -83,6 +83,7 @@ builtin_facet imports : Module => Array Module
 /-- Dynamic information computed about a module before building. -/
 public structure ModulePreSetup where
   trace : BuildTrace
+  localTrace : BuildTrace
   srcMTime : MTime
   srcFile : FilePath
   isModule : Bool

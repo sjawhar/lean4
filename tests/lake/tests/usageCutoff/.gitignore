@@ -1,0 +1,9 @@
+/Test/
+/lakefile.toml.bak
+/outside/
+/stock/
+/stock.tgz
+/B.tmp
+/cache*/
+/cache*.jsonl
+/lakecache/

@@ -147,6 +147,7 @@ def Package.fetchBuildArchive
     download url archiveFile headers
   unless upToDate && (← self.buildDir.pathExists) do
     updateAction .unpack
+    removeUsageSidecars self.buildDir
     untar archiveFile self.buildDir
 
 @[inline]
