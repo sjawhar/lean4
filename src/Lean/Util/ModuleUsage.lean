@@ -91,9 +91,10 @@ def refs (env : Environment) (c : ConstantInfo) : Array Name :=
   let s := if env.contains unsafeRec then s.insert unsafeRec else s
   s.toArray.qsort Name.quickLt
 
-def markerName : Name := `_moduleUsage
-
 structure State where
+  /-- Per imported module: empty if the module was not written by this extension; otherwise a marker entry at
+  index 0, then the module's digests sorted by name. The marker's own name is never looked up, so no user
+  constant can collide with it. -/
   importedModuleEntries : Array (Array (Name × UInt64)) := #[]
   /-- The current module's digests, if `setLocalDigests` stored them for the `.olean` write. -/
   localDigests? : Option (Array (Name × UInt64)) := none
@@ -102,11 +103,12 @@ instance : Inhabited State := ⟨{}⟩
 /-- The digest of `c` if module `i` (the module defining `c`) wrote one. -/
 def State.findAt? (s : State) (i : ModuleIdx) (c : Name) : Option UInt64 := do
   let es ← s.importedModuleEntries[i.toNat]?
-  (·.2) <$> es.binSearch (c, 0) (fun a b => Name.quickLt a.1 b.1)
+  (·.2) <$> es.binSearch (c, 0) (fun a b => Name.quickLt a.1 b.1) (lo := 1)
 
 def State.find? (s : State) (env : Environment) (c : Name) : Option UInt64 := do
   s.findAt? (← env.getModuleIdxFor? c) c
 
+/-- Whether module `i` was written by this extension (it has the marker entry). -/
 def State.hasEntries (s : State) (i : ModuleIdx) : Bool :=
   !(s.importedModuleEntries[i.toNat]?.getD #[]).isEmpty
 
@@ -141,8 +143,7 @@ builtin_initialize ext : PersistentEnvExtension (Name × UInt64) (Name × UInt64
     -- Private level only: digests cover private constants and unexposed bodies, which must not change the
     -- exported `.olean` of a `module` file. Non-module files are written and read at the private level.
     exportEntriesFnEx := fun env s =>
-      let es := (s.localDigests?.getD (compute env s)).push (markerName, 1)
-        |>.qsort fun a b => Name.quickLt a.1 b.1
+      let es := #[(.anonymous, 1)] ++ s.localDigests?.getD (compute env s)
       { exported := #[], server := #[], «private» := es }
     asyncMode := .mainOnly
   }
