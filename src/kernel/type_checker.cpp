@@ -371,7 +371,7 @@ expr type_checker::infer_type_core(expr const & e, bool infer_only) {
     }
 
     if (shared)
-        get_kc_cache().insert_infer(e, r);
+        get_kc_cache().insert_infer(env(), e, r);
     else
         m_st->m_infer_type[infer_only].insert(mk_pair(e, r));
     return r;
@@ -574,7 +574,7 @@ expr type_checker::whnf_core(expr const & e, bool cheap_rec, bool cheap_proj) {
 
     if (!cheap_rec && !cheap_proj) {
         if (shared)
-            get_kc_cache().insert_whnf_core(e, r);
+            get_kc_cache().insert_whnf_core(env(), e, r);
         else
             m_st->m_whnf_core.insert(mk_pair(e, r));
     }
@@ -607,7 +607,7 @@ optional<expr> type_checker::unfold_definition_core(expr const & e) {
                     if (auto cached = get_kc_cache().find_unfold(e))
                         return cached;
                     expr result = instantiate_value_lparams(*d, us);
-                    get_kc_cache().insert_unfold(e, result);
+                    get_kc_cache().insert_unfold(env(), e, result);
                     return some_expr(result);
                 }
                 auto it = m_st->m_unfold.find(e);
@@ -807,16 +807,16 @@ expr type_checker::whnf(expr const & e) {
     while (true) {
         expr t1 = whnf_core(t);
         if (auto v = reduce_native(env(), t1)) {
-            if (shared) get_kc_cache().insert_whnf(e, *v); else m_st->m_whnf.insert(mk_pair(e, *v));
+            if (shared) get_kc_cache().insert_whnf(env(), e, *v); else m_st->m_whnf.insert(mk_pair(e, *v));
             return *v;
         } else if (auto v = reduce_nat(t1)) {
-            if (shared) get_kc_cache().insert_whnf(e, *v); else m_st->m_whnf.insert(mk_pair(e, *v));
+            if (shared) get_kc_cache().insert_whnf(env(), e, *v); else m_st->m_whnf.insert(mk_pair(e, *v));
             return *v;
         } else if (auto next_t = unfold_definition(t1)) {
             t = *next_t;
         } else {
             auto r = t1;
-            if (shared) get_kc_cache().insert_whnf(e, r); else m_st->m_whnf.insert(mk_pair(e, r));
+            if (shared) get_kc_cache().insert_whnf(env(), e, r); else m_st->m_whnf.insert(mk_pair(e, r));
             return r;
         }
     }
