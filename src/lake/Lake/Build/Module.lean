@@ -10,6 +10,7 @@ public import Lake.Config.FacetConfig
 public import Lake.Build.Job.Monad
 public import Lake.Build.Infos
 import Lean.Elab.ParseImportsFast
+import Lean.Util.ModuleUsage
 import Lake.Util.Proc
 import Lake.Build.Job.Register
 import Lake.Build.Common
@@ -1055,8 +1056,9 @@ structure UsekeySidecar where
   extra : NameMap (Hash × Hash)
 
 /--
-A name in a usage sidecar: the JSON array of its components, root first, each a string or a
-number (`Lean.ModuleUsage.nameToJson`). Unlike `toJson Name`, this round-trips macro-scoped names.
+A name in a usage sidecar, as `Lean.ModuleUsage.nameToJson` writes it: the JSON array of its
+components, root first, each a string or a number. Unlike `toJson Name`, this round-trips
+macro-scoped names.
 -/
 structure SidecarName where
   name : Name
@@ -1069,17 +1071,6 @@ instance : FromJson SidecarName where
       | .num _ => return Name.mkNum p (← fromJson? c)
       | _ => throw s!"expected a name component, got {c.compress}"
     return ⟨n⟩
-
-/-- Encodes a name as `Lean.ModuleUsage.nameToJson` does. -/
-def SidecarName.toJson (n : SidecarName) : Json :=
-  .arr (go n.name #[])
-where
-  go : Name → Array Json → Array Json
-    | .anonymous, acc => acc
-    | .str p s, acc => (go p acc).push (.str s)
-    | .num p k, acc => (go p acc).push (Lean.toJson k)
-
-instance : ToJson SidecarName := ⟨SidecarName.toJson⟩
 
 def checkUsageVersion (j : Json) : Except String Unit := do
   let v ← j.getObjValAs? Nat "version"
@@ -1190,7 +1181,7 @@ def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     if (← findModule? m).isNone then continue
     let some (olean, imp) ← importUsage? importArts m | return
     extra := extra.push <|
-      Json.arr #[toJson (SidecarName.mk m), toJson (← fetchFileHash olean).hex,
+      Json.arr #[ModuleUsage.nameToJson m, toJson (← fetchFileHash olean).hex,
         toJson imp.moduleDigest.hex]
   let key := Json.mkObj [
     ("version", 2),
