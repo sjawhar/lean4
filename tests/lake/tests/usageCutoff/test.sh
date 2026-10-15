@@ -165,5 +165,11 @@ cp cache3/Test/E.lean cache7/Test/
 (cd cache6 && test_out "Reused Test.E" build -v Test.E -o ../cache6.jsonl)
 test_exp -f cache5/.lake/build/lib/lean/Test/E.usekey
 test_cmd cmp cache5/.lake/build/ir/Test/E.ltar cache6/.lake/build/ir/Test/E.ltar
+# a sidecar missing from the cache (e.g. pruned) does not turn the entry into a miss: the module
+# restores without it, and its dependents build normally once
+rm "$LAKE_CACHE_DIR"/artifacts/*.usekey
+(cd cache7 && test_out "Reused Test.E" build -v Test.E)
+test_exp -f cache7/.lake/build/lib/lean/Test/E.usage
+test_exp ! -f cache7/.lake/build/lib/lean/Test/E.usekey
 
 rm -f produced.out

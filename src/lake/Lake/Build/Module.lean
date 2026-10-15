@@ -735,8 +735,8 @@ def ModuleOutputDescrs.resolve
     ilean := ← resolve descrs.ilean
     c := ← resolve descrs.c
     ltar? := ← descrs.ltar?.mapM resolve
-    usage? := ← descrs.usage?.mapM resolve
-    usekey? := ← descrs.usekey?.mapM resolve
+    usage? := ← resolveSidecar? descrs.usage?
+    usekey? := ← resolveSidecar? descrs.usekey?
   }
   if Lean.Internal.hasLLVMBackend () then
     let some descr := descrs.bc?
@@ -744,7 +744,20 @@ def ModuleOutputDescrs.resolve
     return {arts with bc? := some (← resolve descr)}
   else
     return arts
-where @[inline] resolve descr := resolveArtifact descr service? scope?
+where
+  @[inline] resolve descr := resolveArtifact descr service? scope?
+  /-
+  A sidecar that does not resolve (e.g., pruned from the cache) is dropped rather than failing the
+  entry: the module restores without it, and its dependents build normally once.
+  -/
+  resolveSidecar? (descr? : Option ArtifactDescr) : JobM (Option Artifact) := do
+    let some descr := descr? | return none
+    try
+      some <$> resolve descr
+    catch e =>
+      let log ← takeLogFrom e
+      logVerbose <| log.entries.foldl (s!"{·}\n- {·.message}") s!"dropped usage sidecar {descr}:"
+      return none
 
 def resolveModuleOutputArtifacts (out : CacheOutput) : JobM ModuleOutputArtifacts := do
   match fromJson? out.data with
