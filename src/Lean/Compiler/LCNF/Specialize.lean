@@ -17,7 +17,16 @@ import Init.Omega
 namespace Lean.Compiler.LCNF
 namespace Specialize
 
-public abbrev Cache := SMap Expr Name
+/--
+Specialization cache: specialization keys to the names of their specialized declarations. The
+imported part is built on first lookup, as most modules never run the specializer on a call that
+consults it, while building it eagerly hashes and compares every imported key at every import.
+-/
+public structure Cache where
+  imported : Thunk (Std.HashMap Expr Name) := .pure {}
+  /-- Entries added in the current module. -/
+  map₂ : PHashMap Expr Name := {}
+  deriving Inhabited
 
 public structure CacheEntry where
   key : Expr
@@ -25,12 +34,21 @@ public structure CacheEntry where
   deriving Inhabited
 
 public def addEntry (cache : Cache) (e : CacheEntry) : Cache :=
-  cache.insert e.key e.declName
+  { cache with map₂ := cache.map₂.insert e.key e.declName }
+
+public def Cache.find? (cache : Cache) (key : Expr) : Option Name :=
+  (cache.map₂.find? key).orElse fun _ => cache.imported.get[key]?
+
+public def Cache.contains (cache : Cache) (key : Expr) : Bool :=
+  cache.map₂.contains key || cache.imported.get.contains key
 
 builtin_initialize specCacheExt : SimplePersistentEnvExtension CacheEntry Cache ←
   registerSimplePersistentEnvExtension {
     addEntryFn    := addEntry
-    addImportedFn := fun es => (mkStateFromImportedEntries addEntry {} es).switch
+    addImportedFn := fun es => {
+      imported := Thunk.mk fun _ =>
+        mkStateFromImportedEntries (fun (m : Std.HashMap Expr Name) e => m.insert e.key e.declName) {} es
+    }
     exportEntriesFnEx? := some fun _ _ entries =>
       { exported := #[], server := #[], «private» := entries.toArray }
     asyncMode     := .sync
