@@ -315,5 +315,48 @@ rm "$LAKE_CACHE_DIR"/artifacts/*.usekey
 (cd cache7 && test_out "Reused Test.E" build -v Test.E)
 test_exp -f cache7/.lake/build/lib/lean/Test/E.usage
 test_exp ! -f cache7/.lake/build/lib/lean/Test/E.usekey
+# a skip's cache entry is marked `s`, and a build with the cutoff off never restores it: it treats the entry
+# as a miss and builds, and its build replaces the entry unmarked
+# (sed, not jq: entries and traces are pretty-printed, one key per line)
+depHash() { sed -n 's/.*"depHash": *"\([0-9a-f]*\)".*/\1/p' "$1"; }
+entryArt() { sed -n "s/.*\"$2\": *\"\\([^\"]*\\)\".*/\\1/p" "$1"; }
+mkdir -p cache12/Test cache13/Test cache14/Test cache15/Test cache16/Test
+for d in cache12 cache13 cache14 cache15 cache16; do cp lakefile.toml $d/; done
+printf 'def sa := 1\n' > cache12/Test/SA.lean
+printf 'import Test.SA\ndef sb := sa + 1\n' > cache12/Test/SB.lean
+# `-o` packs SB's archive, which stays in the build dir, so the skip's entry names it (`l`)
+(cd cache12 && test_run build Test.SB -o ../cache12.jsonl)
+printf 'def sa := 1\ndef unrelated := 2\n' > cache12/Test/SA.lean
+(cd cache12 && test_out "Replayed Test.SB" build -v Test.SB -o ../cache12b.jsonl)
+hashSB=$(depHash cache12/.lake/build/lib/lean/Test/SB.trace)
+entry="$LAKE_CACHE_DIR/outputs/test/$hashSB.json"
+match_text '"s": true' "$entry"
+match_text '"l":' "$entry"
+# the skip puts no entry in the `-o` map, which records a bare archive that cannot carry the mark
+no_match_text "$hashSB" cache12b.jsonl
+cp "$entry" skipentry.json
+# a fresh tree with the cutoff off builds SB instead of restoring the skip's outputs
+cp cache12/Test/*.lean cache13/Test/
+(cd cache13 && LAKE_USAGE_CUTOFF=0 test_out "Built Test.SB" build -v Test.SB)
+no_match_text '"s": true' "$entry"
+# control: that built (unmarked) entry is restored with the cutoff off
+cp cache12/Test/*.lean cache14/Test/
+(cd cache14 && LAKE_USAGE_CUTOFF=0 test_out "Reused Test.SB" build -v Test.SB)
+# the marked entry with an artifact pruned, so it resolves only through its archive: a cutoff-on restore
+# unpacks the archive and the rewritten entry keeps the mark; with the cutoff off, SB builds instead
+cp -f skipentry.json "$entry"
+rm -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" c)"
+cp cache12/Test/*.lean cache15/Test/
+(cd cache15 && test_out "Unpacked Test.SB" build -v Test.SB)
+match_text '"s": true' "$entry"
+rm -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" c)"
+cp cache12/Test/*.lean cache16/Test/
+(cd cache16 && LAKE_USAGE_CUTOFF=0 test_out "Built Test.SB" build -v Test.SB)
+no_match_text '"s": true' "$entry"
+# the tree that skipped, with the cutoff off and its sources unchanged since the skip, builds SB rather
+# than keep the skip's outputs, as a stock build of those sources would
+printf 'def sa := 1\ndef unrelated := 3\n' > cache12/Test/SA.lean
+(cd cache12 && test_out "Replayed Test.SB" build -v Test.SB)
+(cd cache12 && LAKE_USAGE_CUTOFF=0 test_out "Built Test.SB" build -v Test.SB)
 
 rm -f produced.out
