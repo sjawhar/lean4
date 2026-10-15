@@ -268,9 +268,10 @@ static std::vector<std::pair<size_t, ptrdiff_t>> read_lib_table_from_buffer(char
 extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_obj_arg mod, b_obj_arg odata,
                                                            b_obj_arg odep_regions, obj_arg oprev,
                                                            uint8 allow_closures_u8, object *) {
-    // `mmap` addresses must be page-aligned. The default (non-huge) page size on x86-64 is 4KB;
-    // `MapViewOfFileEx` addresses must be aligned to the "memory allocation granularity" (64KB).
-    const size_t ALIGN = 1LL<<16;
+    // `mmap` addresses must be page-aligned and `MapViewOfFileEx` addresses must be aligned to the
+    // "memory allocation granularity" (64KB). 2MB, the x86-64 PMD size, satisfies both and lets the
+    // kernel map each 2MB page-cache folio of the file with one huge-page entry.
+    const size_t ALIGN = 1LL<<21;
     bool allow_closures = allow_closures_u8 != 0;
 
     option_ref<object_ref> prev(oprev);
@@ -534,6 +535,11 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_o
             mmap_flags, fd.get(), 0));
         if (buffer != MAP_FAILED && buffer == base_addr) {
             is_mmap = true;
+#ifdef MADV_HUGEPAGE
+            // With THP in `madvise` mode, a file-backed VMA gets PMD-sized page-cache folios on a
+            // cold read only when it is marked `VM_HUGEPAGE`. Failure only loses the hint.
+            madvise(buffer, size, MADV_HUGEPAGE);
+#endif
         } else {
             if (buffer != MAP_FAILED) munmap(buffer, size);
             buffer = nullptr;
