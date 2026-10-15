@@ -797,6 +797,31 @@ where
     if c then return some (← cache art ext) else return none
 
 /--
+Save a module's already-restored build artifacts to the local Lake cache without re-hashing
+them: each artifact keeps the hash it was resolved with (from the archive's own cache key),
+rather than one freshly computed from the files just written to disk. See `Cache.linkArtifact`
+for why re-hashing a freshly-restored artifact is unsafe.
+-/
+def Module.cacheRestoredArtifacts
+  (mod : Module) (isModule : Bool) (useLocalFile : Bool) (arts : ModuleOutputArtifacts)
+: JobM ModuleOutputArtifacts := do
+  return {
+    isModule
+    olean := ← link mod.oleanFile arts.olean
+    oleanServer? := ← linkIf? mod.oleanServerFile arts.oleanServer?
+    oleanPrivate? := ← linkIf? mod.oleanPrivateFile arts.oleanPrivate?
+    irSig? := ← linkIf? mod.irSigFile arts.irSig?
+    ir? := ← linkIf? mod.irFile arts.ir?
+    ilean := ← link mod.ileanFile arts.ilean
+    c := ← link mod.cFile arts.c
+    bc? := ← linkIf? mod.bcFile arts.bc?
+    ltar? := ← linkIf? mod.ltarFile arts.ltar?
+  }
+where
+  @[inline] link file (art : Artifact) := linkArtifact file art.descr (useLocalFile := useLocalFile)
+  @[inline] linkIf? file art? := art?.mapM (link file ·)
+
+/--
 Some module build artifacts must be located in the build directory (e.g., ILeans).
 This copies the required artifacts from the local Lake cache to the build directory and
 updates the data structure with the new paths.
@@ -1040,7 +1065,7 @@ where
         -- end up in the build directory and, if writable, the cache
         let arts ← mod.restoreAllArtifacts {arts with ltar? := some ltar}
         if (← mod.pkg.isArtifactCacheWritable) then
-          let arts ← mod.cacheOutputArtifacts presetup.isModule restoreAll
+          let arts ← mod.cacheRestoredArtifacts presetup.isModule restoreAll arts
           -- Note: Cache service metadata is not preserved on an output update because it would
           -- result in downloading module outputs that are not available on the remote.
           (← getLakeCache).writeOutputs mod.pkg.cacheScope inputHash arts.descrs (overwrite := true)

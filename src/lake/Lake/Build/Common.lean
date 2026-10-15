@@ -505,6 +505,46 @@ public def cacheArtifact
   (file : FilePath) (ext := "art") (text exe useLocalFile := false)
 : m Artifact := do (← getLakeCache).saveArtifact file ext text exe useLocalFile
 
+/--
+Like `Cache.saveArtifact`, but uses a known artifact descriptor (`descr`) instead of recomputing
+the hash from `file`'s current contents. Used to cache an artifact that was just restored from
+the cache itself (e.g. unpacked from a `.ltar`): re-hashing it from disk can diverge from the
+hash it was uploaded under even though its semantics are unchanged, because the archive format
+can normalize a handful of persistence/relocation marker bytes in a compacted `.olean` region.
+Re-hashing such a restored artifact would desync its hash from every trace that already
+references the original, uploaded hash.
+-/
+public def Cache.linkArtifact
+  (cache : Cache) (file : FilePath) (descr : ArtifactDescr) (exe useLocalFile := false)
+: IO Artifact := do
+  try
+    let cacheFile := cache.artifactDir / descr.relPath
+    -- make the local file unwritable where possible to discourage users from
+    -- writing to such paths as this can corrupt the cache if the file is hard linked
+    let r := {read := true, write := false, execution := exe}
+    IO.setAccessRights file ⟨r, r, r⟩
+    unless (← cacheFile.pathExists) do
+      createParentDirs cacheFile
+      if let .error e ← (IO.FS.hardLink file cacheFile).toBaseIO then
+        -- other functions can race to create the file
+        unless e matches .alreadyExists .. do
+          let contents ← IO.FS.readBinFile file
+          -- use `writeBinFileIfNew` to prevent errors on races
+          writeBinFileIfNew cacheFile contents
+    IO.setAccessRights cacheFile ⟨r, r, r⟩
+    writeFileHash file descr.hash
+    let mtime ← getMTime cacheFile
+    let path := if useLocalFile then file else cacheFile
+    return {descr, name := file.toString, path, mtime}
+  catch e =>
+    error s!"failed to cache artifact: {e}"
+
+@[inline, inherit_doc Cache.linkArtifact]
+public def linkArtifact
+  [MonadWorkspace m] [MonadLiftT IO m] [Monad m]
+  (file : FilePath) (descr : ArtifactDescr) (exe useLocalFile := false)
+: m Artifact := do (← getLakeCache).linkArtifact file descr exe useLocalFile
+
 /-- **For internal use only.** -/
 public class ResolveOutputs (α : Type) where
   /-- **For internal use only.** -/

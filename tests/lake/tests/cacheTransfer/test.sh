@@ -196,6 +196,11 @@ export LAKE_CONFIG="$WORK_DIR/services.toml"
 test_run build Test -o outputs.jsonl
 test_exp -s outputs.jsonl
 
+# Record the uploaded hash of an importee's `.olean`, to verify a restore keeps it stable:
+# re-hashing a restored artifact can diverge from the hash it was uploaded under, even though
+# its semantics are unchanged, desyncing every importer that already depends on the original hash
+BASIC_OLEAN_HASH="$(cat .lake/build/lib/lean/Test/Basic.olean.hash)"
+
 # Verify artifacts and outputs are uploaded to the default upload service
 test_run cache put outputs.jsonl --scope=test
 REV="$(git rev-parse HEAD)"
@@ -214,6 +219,10 @@ test_out 'downloaded artifact' cache get --scope=test --service=ok
 test_artifacts "$NUM_ARTS"
 test_exp -d "$CACHE_DIR/revisions/test"
 test_run build Test --no-build
+
+# Verify the restore did not re-hash `Basic.olean` to a different value: an importer's (`Test`'s)
+# dependency trace would otherwise desync from the hash it was built against, and need to rebuild
+test_exp "$(cat .lake/build/lib/lean/Test/Basic.olean.hash)" = "$BASIC_OLEAN_HASH"
 
 # Verify cached outputs and artifacts are not fetched again
 test_not_out 'downloading' cache get --scope=test --service=ok
