@@ -1,0 +1,81 @@
+reuseProofOnly_later: elaborated
+{"version": 2,
+ "uri": "file:///reuseProofOnly.lean",
+ "isIncremental": false,
+ "diagnostics":
+ [{"source": "Lean 4",
+   "severity": 3,
+   "range":
+   {"start": {"line": 5, "character": 0}, "end": {"line": 6, "character": 0}},
+   "message": "Goals accomplished!",
+   "leanTags": [2],
+   "isSilent": true,
+   "fullRange":
+   {"start": {"line": 5, "character": 0}, "end": {"line": 6, "character": 15}}},
+  {"source": "Lean 4",
+   "severity": 3,
+   "range":
+   {"start": {"line": 10, "character": 0}, "end": {"line": 11, "character": 0}},
+   "message": "Goals accomplished!",
+   "leanTags": [2],
+   "isSilent": true,
+   "fullRange":
+   {"start": {"line": 10, "character": 0},
+    "end": {"line": 12, "character": 5}}}]}
+{"version": 2,
+ "uri": "file:///reuseProofOnly.lean",
+ "isIncremental": false,
+ "diagnostics":
+ [{"source": "Lean 4",
+   "severity": 2,
+   "range":
+   {"start": {"line": 12, "character": 8},
+    "end": {"line": 12, "character": 28}},
+   "message": "declaration uses `sorry`",
+   "fullRange":
+   {"start": {"line": 12, "character": 8},
+    "end": {"line": 12, "character": 28}}},
+  {"source": "Lean 4",
+   "severity": 3,
+   "range":
+   {"start": {"line": 17, "character": 0},
+    "end": {"line": 17, "character": 59}},
+   "message": "Goals accomplished!",
+   "leanTags": [2],
+   "isSilent": true,
+   "fullRange":
+   {"start": {"line": 17, "character": 0},
+    "end": {"line": 17, "character": 59}}},
+  {"source": "Lean 4",
+   "severity": 3,
+   "range":
+   {"start": {"line": 19, "character": 2}, "end": {"line": 19, "character": 8}},
+   "message": "'reuseAxiomPrint_uses' depends on axioms: [sorryAx]",
+   "fullRange":
+   {"start": {"line": 19, "character": 2},
+    "end": {"line": 19, "character": 8}}}]}
+reuseAuxRename_later: elaborated
+{"version": 2,
+ "uri": "file:///reuseProofOnly.lean",
+ "isIncremental": false,
+ "diagnostics":
+ [{"source": "Lean 4",
+   "severity": 3,
+   "range":
+   {"start": {"line": 14, "character": 0}, "end": {"line": 15, "character": 0}},
+   "message": "Goals accomplished!",
+   "leanTags": [2],
+   "isSilent": true,
+   "fullRange":
+   {"start": {"line": 14, "character": 0},
+    "end": {"line": 16, "character": 51}}},
+  {"source": "Lean 4",
+   "severity": 3,
+   "range":
+   {"start": {"line": 19, "character": 0}, "end": {"line": 20, "character": 0}},
+   "message": "Goals accomplished!",
+   "leanTags": [2],
+   "isSilent": true,
+   "fullRange":
+   {"start": {"line": 19, "character": 0},
+    "end": {"line": 21, "character": 34}}}]}

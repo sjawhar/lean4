@@ -627,11 +627,42 @@ where
               elabSnap := { old.elabSnap with
                 resultSnap := .finished old.elabSnap.resultSnap.stx? patchedResult } }
         | none => do
-          -- unsafe: abandon grafting from here on, same as today's genuine-syntax-change handling.
+          -- unsafe: abandon grafting from here on. `old.stx`'s text is already known unchanged (this
+          -- branch is only reached after `sameStx`/`eqIgnoringPos` confirmed it), so re-elaborate it
+          -- directly against the patched environment instead of recursing into `parseCmd` starting at
+          -- `newParserState` -- that position is *after* this command, so doing that would silently
+          -- skip ever re-running `old.stx` and only process whatever comes next (the bug this
+          -- replaces: a later `#print axioms` that must change after an unsafe reference never did).
           old.nextCmdSnap?.forM (·.cancelRec)
-          let cancelTk ← IO.CancelToken.new
-          parseCmd none newParserState { oldResult.cmdState with env := g.newEnvSoFar } prom sync
-            cancelTk (cmds.push old.stx) none ctx
+          let elabPromise ← IO.Promise.new
+          let elabCancelTk ← IO.CancelToken.new
+          let beginPos := old.stx.getPos?.getD 0
+          let freshCmdState ← doElab old.stx cmds { oldResult.cmdState with env := g.newEnvSoFar }
+            beginPos { old? := none, new := elabPromise } elabCancelTk ctx
+          let patchedResult := {
+            diagnostics := (← Snapshot.Diagnostics.ofMessageLog freshCmdState.messages)
+            traces := freshCmdState.traceState
+            cmdState := freshCmdState
+          }
+          if let some oldNext := old.nextCmdSnap? then
+            let newProm ← IO.Promise.new
+            let cancelTk ← IO.CancelToken.new
+            BaseIO.chainTask (sync := true) oldNext.task fun _oldNextSnap =>
+              parseCmd none newParserState freshCmdState newProm sync cancelTk
+                (cmds.push old.stx) none ctx
+            prom.resolve <| { old with
+              elabSnap := { old.elabSnap with
+                resultSnap := .finished old.elabSnap.resultSnap.stx? patchedResult }
+              nextCmdSnap? := some {
+                stx? := none
+                reportingRange := .some ⟨newParserState.pos, ctx.endPos⟩
+                task := newProm.result!
+                cancelTk? := cancelTk
+              } }
+          else
+            prom.resolve <| { old with
+              elabSnap := { old.elabSnap with
+                resultSnap := .finished old.elabSnap.resultSnap.stx? patchedResult } }
 
     -- fast path, do not even start new task for this snapshot (see [Incremental Parsing])
     if let some old := old? then

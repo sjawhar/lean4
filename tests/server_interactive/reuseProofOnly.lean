@@ -59,9 +59,7 @@ i.e. this is a genuine symmetric-difference case (an added name), not a same-nam
 -/
 
 theorem reuseAuxRename_helper (b : Bool) : True :=
-  match b with
-  | true => trivial
-  | false => trivial
+  match b with | true => trivial | false => trivial
 --^ sync
 --^ insert: "let _ := match b with | true => (0:Nat) | false => 1\n  "
 
