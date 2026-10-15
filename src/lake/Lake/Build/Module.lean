@@ -699,6 +699,8 @@ public def Module.clearOutputHashes (mod : Module) : IO PUnit := do
     clearFileHash mod.irFile
     clearFileHash mod.cFile
     clearFileHash mod.bcFile
+    clearFileHash mod.usageFile
+    clearFileHash mod.usekeyFile
   catch e =>
     error s!"failed to remove output hashes: {e}"
 
@@ -733,6 +735,8 @@ def ModuleOutputDescrs.resolve
     ilean := ← resolve descrs.ilean
     c := ← resolve descrs.c
     ltar? := ← descrs.ltar?.mapM resolve
+    usage? := ← resolveSidecar? descrs.usage?
+    usekey? := ← resolveSidecar? descrs.usekey?
   }
   if Lean.Internal.hasLLVMBackend () then
     let some descr := descrs.bc?
@@ -740,7 +744,20 @@ def ModuleOutputDescrs.resolve
     return {arts with bc? := some (← resolve descr)}
   else
     return arts
-where @[inline] resolve descr := resolveArtifact descr service? scope?
+where
+  @[inline] resolve descr := resolveArtifact descr service? scope?
+  /-
+  A sidecar that does not resolve (e.g., pruned from the cache) is dropped rather than failing the
+  entry: the module restores without it, and its dependents build normally once.
+  -/
+  resolveSidecar? (descr? : Option ArtifactDescr) : JobM (Option Artifact) := do
+    let some descr := descr? | return none
+    try
+      some <$> resolve descr
+    catch e =>
+      let log ← takeLogFrom e
+      logVerbose <| log.entries.foldl (s!"{·}\n- {·.message}") s!"dropped usage sidecar {descr}:"
+      return none
 
 def resolveModuleOutputArtifacts (out : CacheOutput) : JobM ModuleOutputArtifacts := do
   match fromJson? out.data with
@@ -792,6 +809,8 @@ def Module.cacheOutputArtifacts
     c := ← cache mod.cFile "c"
     bc? := ← cacheIf? (Lean.Internal.hasLLVMBackend ()) mod.bcFile "bc"
     ltar? := ← cacheIf? (← mod.ltarFile.pathExists) mod.ltarFile "ltar"
+    usage? := ← cacheIf? (← mod.usageFile.pathExists) mod.usageFile "usage"
+    usekey? := ← cacheIf? (← mod.usekeyFile.pathExists) mod.usekeyFile "usekey"
   }
 where
   @[inline] cache file ext := do
@@ -821,6 +840,8 @@ def Module.restoreAllArtifacts (mod : Module) (cached : ModuleOutputArtifacts) :
     c := ← restoreArtifact mod.cFile cached.c
     bc? := ← restoreSome mod.bcFile cached.bc?
     ltar? := ← restoreSome mod.ltarFile cached.ltar?
+    usage? := ← restoreSome mod.usageFile cached.usage?
+    usekey? := ← restoreSome mod.usekeyFile cached.usekey?
   }
 where
   @[inline] restoreSome file art? := art?.mapM (restoreArtifact file ·)
@@ -1285,7 +1306,9 @@ where
     | .arts arts =>
       unless (← savedTrace.replayCachedIfUpToDate inputHash) do
         mod.clearOutputArtifacts
-        writeFetchTrace mod.traceFile inputHash (toJson arts.descrs)
+        -- The sidecars stay out of the trace, which `.ltar` archives include: a `.usekey` records
+        -- an input hash, and an archive depends only on outputs.
+        writeFetchTrace mod.traceFile inputHash (toJson {arts.descrs with usage? := none, usekey? := none})
       let arts ←
         if restoreAll then
           mod.restoreAllArtifacts arts
@@ -1314,7 +1337,7 @@ where
             else
               discard <| mod.buildLean presetup
         else
-          discard <| mod.buildLean presetup
+          discard <| mod.skipOrBuild presetup savedTrace depTrace
         if status.isCacheable then
           let arts ← mod.cacheOutputArtifacts presetup.isModule restore
           (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs
