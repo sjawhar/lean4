@@ -9,6 +9,7 @@ public import Std.Data.HashMap
 import Std.Data.HashSet
 public import Lake.Util.IO
 import Init.Data.Array.QSort
+import Init.Data.String.Compare
 import Init.Data.ToString.Macro
 import Init.While
 
@@ -57,21 +58,21 @@ public def moduleTimesHeader : String := "lake-module-times 3"
 
 /-! ## Bytes -/
 
-@[inline] private def byteAt (s : String) (i : Nat) : UInt8 :=
+@[inline] def byteAt (s : String) (i : Nat) : UInt8 :=
   if h : i < s.utf8ByteSize then s.getUTF8Byte ⟨i⟩ h else 0
 
-@[inline] private def slice (s : String) (b e : Nat) : String :=
+@[inline] def slice (s : String) (b e : Nat) : String :=
   String.Pos.Raw.extract s ⟨b⟩ ⟨e⟩
 
 /-- The first index in `[i, stop)` holding byte `c`, or `stop`. -/
-private partial def findByte (s : String) (c : UInt8) (i stop : Nat) : Nat :=
+partial def findByte (s : String) (c : UInt8) (i stop : Nat) : Nat :=
   if i < stop then
     if byteAt s i == c then i else findByte s c (i + 1) stop
   else
     stop
 
 /-- The first index in `[i, stop)` holding a tab or a line feed, or `stop`. -/
-private partial def findFieldEnd (s : String) (i stop : Nat) : Nat :=
+partial def findFieldEnd (s : String) (i stop : Nat) : Nat :=
   if i < stop then
     let c := byteAt s i
     if c == 9 || c == 10 then i else findFieldEnd s (i + 1) stop
@@ -79,14 +80,14 @@ private partial def findFieldEnd (s : String) (i stop : Nat) : Nat :=
     stop
 
 /-- The length of the common prefix of `s[a, ae)` and `s[b, be)`. -/
-private partial def commonPrefix (s : String) (a ae b be : Nat) (n : Nat := 0) : Nat :=
+partial def commonPrefix (s : String) (a ae b be : Nat) (n : Nat := 0) : Nat :=
   if a + n < ae && b + n < be && byteAt s (a + n) == byteAt s (b + n) then
     commonPrefix s a ae b be (n + 1)
   else
     n
 
 /-- Compares `s[b, e)` with `t`, byte by byte. -/
-private partial def compareRange (s : String) (b e : Nat) (t : String) (j : Nat := 0) : Ordering :=
+partial def compareRange (s : String) (b e : Nat) (t : String) (j : Nat := 0) : Ordering :=
   if b < e then
     if j < t.utf8ByteSize then
       let x := byteAt s b
@@ -97,7 +98,7 @@ private partial def compareRange (s : String) (b e : Nat) (t : String) (j : Nat 
   else if j < t.utf8ByteSize then .lt else .eq
 
 /-- The number written in `s[b, e)`: decimal digits, no leading zero unless it is `0`. -/
-private def parseNat? (s : String) (b e : Nat) : Option Nat := Id.run do
+def parseNat? (s : String) (b e : Nat) : Option Nat := Id.run do
   if b ≥ e || (byteAt s b == 48 && e > b + 1) then return none
   let mut n := 0
   for i in [b:e] do
@@ -106,23 +107,23 @@ private def parseNat? (s : String) (b e : Nat) : Option Nat := Id.run do
     n := 10 * n + (c - 48).toNat
   return some n
 
-private partial def pushNat (out : String) (n : Nat) : String :=
+partial def pushNat (out : String) (n : Nat) : String :=
   if n < 10 then out.push (Char.ofNat (48 + n))
   else (pushNat out (n / 10)).push (Char.ofNat (48 + n % 10))
 
 /-! ## Names -/
 
-@[inline] private def isEscapedByte (c : UInt8) : Bool :=
+@[inline] def isEscapedByte (c : UInt8) : Bool :=
   c == 37 || c == 46 || c == 32 || c == 9 || c == 10 || c == 13
 
-@[inline] private def isEscaped (c : Char) : Bool :=
+@[inline] def isEscaped (c : Char) : Bool :=
   c.toNat < 128 && isEscapedByte c.toNat.toUInt8
 
-private def hexDigit (n : Nat) : Char :=
+def hexDigit (n : Nat) : Char :=
   if n < 10 then Char.ofNat (48 + n) else Char.ofNat (55 + n)
 
 /-- Appends `s[i, e)` to `out`, escaping its special bytes (all ASCII, so never inside a character). -/
-private partial def pushEscaped (out s : String) (i e : Nat) : String :=
+partial def pushEscaped (out s : String) (i e : Nat) : String :=
   if i < e then
     let c := byteAt s i
     if isEscapedByte c then
@@ -137,10 +138,10 @@ where
   findSpecial (s : String) (i e : Nat) : Nat :=
     if i < e && !isEscapedByte (byteAt s i) then findSpecial s (i + 1) e else i
 
-private def pushComponent (out s : String) : String :=
+def pushComponent (out s : String) : String :=
   if s.utf8ByteSize == 0 then out ++ "%-" else pushEscaped out s 0 s.utf8ByteSize
 
-private def pushNameCore (out : String) : Name → String
+def pushNameCore (out : String) : Name → String
   | .anonymous => out
   | .str p s => pushComponent (sep (pushNameCore out p) p) s
   | .num p k => pushNat (sep (pushNameCore out p) p ++ "%#") k
@@ -154,24 +155,24 @@ public def encodeModuleName : Name → String
   | .anonymous => "%!"
   | n => pushNameCore "" n
 
-private def hexVal? (c : UInt8) : Option Nat :=
+def hexVal? (c : UInt8) : Option Nat :=
   if 48 ≤ c && c ≤ 57 then some (c - 48).toNat
   else if 65 ≤ c && c ≤ 70 then some (c - 55).toNat
   else none
 
 /-- 0 if `s[i, e)` holds no `%`, space or CR; 1 if it holds a `%` but no space or CR; 2 otherwise. -/
-private partial def componentKind (s : String) (i e : Nat) (k : UInt8 := 0) : UInt8 :=
+partial def componentKind (s : String) (i e : Nat) (k : UInt8 := 0) : UInt8 :=
   if i < e then
     let c := byteAt s i
     if c == 32 || c == 13 then 2 else componentKind s (i + 1) e (if c == 37 then 1 else k)
   else
     k
 
-private def badComponent (s : String) (b e : Nat) : Except String α :=
+def badComponent (s : String) (b e : Nat) : Except String α :=
   throw s!"bad name component '{slice s b e}'"
 
 /-- Decodes the component `s[b, e)` and appends it to `p`. -/
-private def decodeComponent (s : String) (b e : Nat) (p : Name) : Except String Name := do
+def decodeComponent (s : String) (b e : Nat) (p : Name) : Except String Name := do
   let bad {α} (_ : Unit) : Except String α := badComponent s b e
   if b ≥ e then
     throw "empty name component (an empty component is written %-)"
@@ -226,7 +227,7 @@ public structure ModuleTimeRecord where
 Checks the imports field from `i` (space-separated line indices) and returns where the line ends
 and the largest index in it.
 -/
-private def scanImports (s : String) (i size : Nat) : Except String (Nat × Nat) := do
+def scanImports (s : String) (i size : Nat) : Except String (Nat × Nat) := do
   let mut p := i
   let mut top := 0
   if p < size && byteAt s p != 10 then
@@ -249,7 +250,7 @@ private def scanImports (s : String) (i size : Nat) : Except String (Nat × Nat)
   return (p, top)
 
 /-- The previous line's name: where it is, its components' ends (relative to its start), and its prefixes. -/
-private structure PrevName where
+structure PrevName where
   start : Nat := 0
   stop : Nat := 0
   ends : Array Nat := #[]
@@ -259,7 +260,7 @@ private structure PrevName where
 Decodes the name `s[kb, ke)`, reusing the components it shares with the previous line's name, and
 checks that it comes after that name (if `ordered`).
 -/
-private def decodeKey (s : String) (kb ke : Nat) (ordered : Bool) (prev : PrevName) :
+def decodeKey (s : String) (kb ke : Nat) (ordered : Bool) (prev : PrevName) :
     Except String (Name × PrevName) := do
   let lcp := commonPrefix s prev.start prev.stop kb ke
   if ordered && (lcp == ke - kb ||
@@ -289,7 +290,7 @@ private def decodeKey (s : String) (kb ke : Nat) (ordered : Bool) (prev : PrevNa
   return (name, {start := kb, stop := ke, ends, prefixes})
 
 /-- Parses a record. -/
-private def parseModuleTimes (s : String) : Except String ModuleTimeRecord := do
+def parseModuleTimes (s : String) : Except String ModuleTimeRecord := do
   let size := s.utf8ByteSize
   let hdrEnd := findByte s 10 0 size
   let hdr := slice s 0 hdrEnd
@@ -344,7 +345,7 @@ public def readModuleTimes (path : FilePath) : IO ModuleTimeRecord := do
   | .error e => throw <| IO.userError s!"{path}: {e}; delete it to start a new record"
 
 /-- The import indices in `s[b, e)` (already checked by `parseModuleTimes`). -/
-private def importIndices (s : String) (b e : Nat) : Array Nat := Id.run do
+def importIndices (s : String) (b e : Nat) : Array Nat := Id.run do
   let mut out := #[]
   let mut n := 0
   let mut digits := false
@@ -386,12 +387,12 @@ public def moduleTimesStamp? (path : FilePath) : IO (Option (UInt64 × IO.FS.Sys
 
 /-! ## Remaining paths -/
 
-private structure RemState where
+structure RemState where
   rem : Array Nat
   /-- Per module: 0 not visited, 1 on the current path, 2 done. -/
   mark : ByteArray
 
-private partial def visitRemaining (ms : Array Nat) (importers : Array (Array Nat))
+partial def visitRemaining (ms : Array Nat) (importers : Array (Array Nat))
     (n : Nat) : StateM RemState Nat := do
   let m := (← get).mark.get! n
   if m == 2 then return (← get).rem[n]!
@@ -466,7 +467,7 @@ exists. The names are resolved serially and the files checked in parallel chunks
 touches the shared workspace, whose reference counts parallel tasks would contend on, while a
 chunk of paths is the task's own.
 -/
-private def keepRows (rows : Array ModuleTimeRow) (fresh seen : Name → Bool)
+def keepRows (rows : Array ModuleTimeRow) (fresh seen : Name → Bool)
     (sourceOf : Name → Option FilePath) : BaseIO ByteArray := do
   let mut flags := ByteArray.emptyWithCapacity rows.size
   let mut ask : Array Nat := #[]
@@ -498,7 +499,7 @@ A line of the record being written: a row of the file kept as it is, a row of th
 as an import (`hollow`: no time, no imports), an entry from this build, or a module that is only
 imported by one (`extra`: no time, no imports).
 -/
-private inductive OutLine
+inductive OutLine
   | kept (row : Nat)
   | hollow (row : Nat)
   | fresh (entry : Nat)
@@ -506,7 +507,7 @@ private inductive OutLine
   deriving Inhabited
 
 /-- The index `i < n` where `cmp i` is `.eq`, if any, for `cmp` increasing in `i`. -/
-private def bsearch (n : Nat) (cmp : Nat → Ordering) : Option Nat := Id.run do
+def bsearch (n : Nat) (cmp : Nat → Ordering) : Option Nat := Id.run do
   let mut lo := 0
   let mut hi := n
   while lo < hi do
