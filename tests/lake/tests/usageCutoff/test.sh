@@ -157,7 +157,7 @@ test_run unpack stock.tgz
 test_exp ! -f .lake/build/lib/lean/Test/A.usage
 test_exp ! -f .lake/build/lib/lean/Test/A.usekey
 test_exp -f outside/keep.usage
-# Under a writable artifact cache with restored artifacts (machcsl's `tools/lakecache.sh`), in fresh
+# Under a writable artifact cache populated by a restore script (restored artifacts), in fresh
 # package dirs sharing a cache of their own. Restored and cached outputs are read-only hard links
 # into the cache, so a test edits one by replacing it, never by writing through it.
 export LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true LAKE_CACHE_DIR="$PWD/lakecache"
