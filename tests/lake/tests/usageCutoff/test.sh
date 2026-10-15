@@ -146,6 +146,63 @@ printf 'def ta1 := 1\ndef ta2 := 2\n' > Test/TA.lean
 lake_out build -v Test.TB
 match_text "Built Test.TA" produced.out
 match_text "Replayed Test.TB" produced.out
+# a recursive `partial def` runs its compiled body `f._unsafe_rec`, which `native_decide` trusts: a change to
+# that body alone must rebuild M, which then fails as it does with cutoff off
+printf 'partial def f (n : Nat) : Nat := if n = 0 then 2 else f (n - 1)\n' > Test/PX.lean
+printf 'import Test.PX\ntheorem t : f 1 = 2 := by native_decide\n' > Test/PM.lean
+test_run build Test.PM
+printf 'partial def f (n : Nat) : Nat := if n = 0 then 3 else f (n - 1)\n' > Test/PX.lean
+test_err "error: Test/PM.lean" build -v Test.PM
+printf 'partial def f (n : Nat) : Nat := if n = 0 then 2 else f (n - 1)\n' > Test/PX.lean
+test_run build Test.PM
+printf 'partial def f (n : Nat) : Nat := if n = 0 then 3 else f (n - 1)\n' > Test/PX.lean
+LAKE_USAGE_CUTOFF=0 test_err "error: Test/PM.lean" build -v Test.PM
+# the same through `Lean.ofReduceBool` (adversarial case a05b): the proof term never names `reduceBool`, and the
+# decided `c` runs `f`'s compiled body; M must rebuild and fail
+printf 'partial def f (n : Nat) : Nat := if n = 0 then 2 else f (n - 1)\ndef c : Bool := f 1 == 2\n' > Test/RX.lean
+printf 'import Test.RX\nset_option linter.deprecated false\ntheorem t : c = true := Lean.ofReduceBool c true (@rfl Bool true)\n' \
+  > Test/RM.lean
+test_run build Test.RM
+printf 'partial def f (n : Nat) : Nat := if n = 0 then 3 else f (n - 1)\ndef c : Bool := f 1 == 2\n' > Test/RX.lean
+test_err "error: Test/RM.lean" build -v Test.RM
+# `bv_decide` checks its certificate with compiled toolchain code only: its module stays skippable
+printf 'def y := 1\n' > Test/BY.lean
+printf 'import Test.BY\nimport Std.Tactic.BVDecide\ntheorem tb (x : BitVec 8) : x + 0#8 = x := by bv_decide\n' \
+  > Test/BV.lean
+test_run build Test.BV
+printf 'def y := 1\ndef y2 := 2\n' > Test/BY.lean
+lake_out build -v Test.BV
+match_text "Built Test.BY" produced.out
+match_text "Replayed Test.BV" produced.out
+# control: a C body change behind a precompiled module's `@[extern]` reaches M only through `libext_X.so`, which
+# links `libleanext.so` dynamically, so its bytes and M's trace do not change. Stock Lake replays M too; cutoff
+# must match stock here, not do worse
+mkdir -p ext/X ext/M
+cat > ext/lakefile.lean <<'EOF'
+import Lake
+open System Lake DSL
+package ext
+lean_lib X where
+  precompileModules := true
+lean_lib M
+target ext.o pkg : FilePath := do
+  let srcJob ← inputTextFile <| pkg.dir / "ext.c"
+  buildO (pkg.buildDir / "c" / "ext.o") srcJob #["-I", (← getLeanIncludeDir).toString] #["-fPIC"] "cc" getLeanTrace
+extern_lib libleanext pkg := do
+  buildStaticLib (pkg.staticLibDir / nameToStaticLib "leanext") #[← ext.o.fetch]
+EOF
+printf '@[extern "ext_val"] opaque extVal : Unit → UInt32\n' > ext/X.lean
+printf 'import X\ntheorem t : extVal () = 1 := by native_decide\n' > ext/M.lean
+printf '#include <stdint.h>\nuint32_t ext_val(void *u) { return 1; }\n' > ext/ext.c
+test_run -d ext build M
+printf '#include <stdint.h>\nuint32_t ext_val(void *u) { return 2; }\n' > ext/ext.c
+lake_out -d ext build -v M
+match_text "Replayed M" produced.out
+printf '#include <stdint.h>\nuint32_t ext_val(void *u) { return 1; }\n' > ext/ext.c
+test_run -d ext build M
+printf '#include <stdint.h>\nuint32_t ext_val(void *u) { return 2; }\n' > ext/ext.c
+LAKE_USAGE_CUTOFF=0 lake_out -d ext build -v M
+match_text "Replayed M" produced.out
 # `lake unpack` of an archive that ships no sidecars (e.g. built by another toolchain) drops the
 # old ones, without following a symlink out of the build directory
 test_exp -f .lake/build/lib/lean/Test/A.usage

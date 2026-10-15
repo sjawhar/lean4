@@ -9,6 +9,7 @@ public import Lean.Compiler.ExportAttr
 public import Lean.Compiler.NoncomputableAttr
 public import Lean.Elab.InfoTree.Types
 import Lean.ExtraModUses
+import Lean.Compiler.Old
 import Lean.Server.InfoUtils
 public section
 namespace Lean.ModuleUsage
@@ -75,7 +76,9 @@ def localHash (env : Environment) (c : ConstantInfo) : UInt64 :=
       r.isUnsafe)) fun h rl => mixHash h (mixHash (hash (rl.ctor, rl.nfields)) (v rl.rhs))
 
 /-- The constants `c`'s meaning depends on: those in its type and value, its inductive's block and constructors,
-its recursor rules' right-hand sides, its `implemented_by` target. -/
+its recursor rules' right-hand sides, its `implemented_by` target, and the `_unsafe_rec` definition holding a
+`partial def`'s compiled body (the kernel constant is an opaque with an inhabitant value, while compiled code and
+`native_decide` run the body). -/
 def refs (env : Environment) (c : ConstantInfo) : Array Name :=
   let s : NameSet := c.getUsedConstantsAsSet
   let s : NameSet := match c with
@@ -84,6 +87,8 @@ def refs (env : Environment) (c : ConstantInfo) : Array Name :=
     | .recInfo r => r.rules.foldl (fun s rl => rl.rhs.getUsedConstants.foldl (·.insert ·) (s.insert rl.ctor)) s
     | _ => s
   let s := match Compiler.getImplementedBy? env c.name with | some t => s.insert t | none => s
+  let unsafeRec := Compiler.mkUnsafeRecName c.name
+  let s := if env.contains unsafeRec then s.insert unsafeRec else s
   s.toArray.qsort Name.quickLt
 
 def markerName : Name := `_moduleUsage
@@ -243,7 +248,8 @@ commands from an `--incr-load` snapshot), `noskip` is set: reused commands never
 so `extra` may miss constants they used. -/
 def writeUsage (env : Environment) (consts : Array (Name × ConstantInfo × Array Name))
     (own : Array (Name × UInt64)) (extra : NameSet) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
-  let noskip := incrLoaded || consts.any fun (_, _, rs) => rs.any (· matches ``Lean.reduceBool | ``Lean.reduceNat)
+  let noskip := incrLoaded || consts.any fun (_, _, rs) => rs.any
+    (· matches ``Lean.reduceBool | ``Lean.reduceNat | ``Lean.ofReduceBool | ``Lean.ofReduceNat)
   let s := state env
   let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecksRef.get)
   let extraMods := allExtra.toArray.filter (fun u => (env.getModuleIdx? u.module).any s.hasEntries)
