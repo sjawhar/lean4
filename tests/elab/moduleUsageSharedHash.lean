@@ -18,4 +18,4 @@ run_cmd liftCoreM <| addDecl <| .defnDecl {
   let env ← getEnv
   let h := ModuleUsage.localHash env (env.find? `big).get!
   let ds := ModuleUsage.localDigests env
-  logInfo m!"{h != 0} {(ds.find? (·.1 == `big)).isSome}"
+  logInfo m!"{h != default} {(ds.find? (·.1 == `big)).isSome}"
