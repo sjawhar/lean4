@@ -55,6 +55,39 @@ checks syntactic equivalence, not semantic independence), carry the same class o
 
 namespace Lean.Language.Lean.Reuse
 
+/--
+Unwraps `X in command` wrappers (`set_option foo in theorem ...`, `open Foo in theorem ...`,
+`omit [...] in theorem ...`, nested arbitrarily) to find the innermost command. Best-effort: every
+built-in `in`-combinator puts the wrapped command last, but if that assumption is ever wrong for some
+wrapper this simply fails to unwrap and the caller falls back to its more conservative, non-declaration
+handling -- a missed optimization, never a soundness issue.
+-/
+partial def unwrapCommand (stx : Syntax) : Syntax :=
+  if stx.isOfKind ``Lean.Parser.Command.in then
+    match stx.getArgs.back? with
+    | some inner => unwrapCommand inner
+    | none => stx
+  else
+    stx
+
+/--
+Peels matching `X in` wrappers off `old`/`new` together, requiring every wrapper level's own clause
+(everything but the nested command) to be `eqWithInfo`-identical between the two (so e.g. a changed
+`set_option maxHeartbeats` value disqualifies the edit, same as a changed `declModifiers`/`declSig`
+would). Returns `none` if the wrapper structure or any wrapper clause differs.
+-/
+partial def peelInWrappers (old new : Syntax) : Option (Syntax × Syntax) :=
+  if old.isOfKind ``Lean.Parser.Command.in && new.isOfKind ``Lean.Parser.Command.in then
+    let n := old.getNumArgs
+    if n == 0 || n != new.getNumArgs then none
+    else if (List.range (n - 1)).all (fun i => (old.getArg i).eqWithInfo (new.getArg i)) then
+      peelInWrappers (old.getArg (n - 1)) (new.getArg (n - 1))
+    else none
+  else if old.isOfKind ``Lean.Parser.Command.in || new.isOfKind ``Lean.Parser.Command.in then
+    none -- wrapper added or removed
+  else
+    some (old, new)
+
 /-- `stx` is a `theorem` command: a `Lean.Parser.Command.declaration` node whose second child is a
 `Lean.Parser.Command.theorem` node (`"theorem " declId declSig declVal`). -/
 def isTheoremDeclaration (stx : Syntax) : Bool :=
@@ -64,14 +97,15 @@ def isTheoremDeclaration (stx : Syntax) : Bool :=
   (stx.getArg 1).getNumArgs == 4
 
 /--
-`old` and `new` are both `theorem` commands whose `declModifiers`, `theorem` token, `declId` and
-`declSig` are syntactically identical (`Syntax.eqWithInfo`): only `declVal` (the proof, including any
-`termination_by`/`where` suffix) may differ. This is purely syntactic; the caller still has to re-elaborate
-`new` and confirm the resulting type/levelParams/attributes actually match before treating this as a safe
-proof-only edit (guaranteed by construction here, since nothing before `D` in the file changed, but cheap
-to assert).
+`old` and `new` are both `theorem` commands (after peeling any matching `X in` wrappers, see
+`peelInWrappers`) whose `declModifiers`, `theorem` token, `declId` and `declSig` are syntactically
+identical (`Syntax.eqWithInfo`): only `declVal` (the proof, including any `termination_by`/`where`
+suffix) may differ. This is purely syntactic; the caller still has to re-elaborate `new` and confirm the
+resulting type/levelParams/attributes actually match before treating this as a safe proof-only edit
+(guaranteed by construction here, since nothing before `D` in the file changed, but cheap to assert).
 -/
 def isProofOnlyEdit (old new : Syntax) : Bool := Id.run do
+  let some (old, new) := peelInWrappers old new | return false
   unless isTheoremDeclaration old && isTheoremDeclaration new do
     return false
   unless (old.getArg 0).eqWithInfo (new.getArg 0) do

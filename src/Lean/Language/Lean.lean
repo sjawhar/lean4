@@ -594,7 +594,7 @@ where
     -- today's handling of a genuine syntax change.
     let graftedContinue (g : Reuse.GraftState) (old : CommandParsedSnapshot) (newParserState) :
         BaseIO Unit := do
-      let isDeclaration := old.stx.isOfKind ``Lean.Parser.Command.declaration
+      let isDeclaration := (Reuse.unwrapCommand old.stx).isOfKind ``Lean.Parser.Command.declaration
       BaseIO.chainTask (sync := true) old.elabSnap.resultSnap.task fun oldResult => do
         let cConsts := Reuse.newConstants g.oldBeforeEnv oldResult.cmdState.env
         match Reuse.commandVerdict oldResult.cmdState.env g.unsafeNames g.unsafeNameStrs isDeclaration
@@ -815,7 +815,8 @@ where
         let graft?' ← match old? with
           | some old =>
             if proofOnlyEdit then
-              let identStx := ((stx.getArg 1).getArg 1).getArg 0
+              let thmStx := Reuse.unwrapCommand stx
+              let identStx := ((thmStx.getArg 1).getArg 1).getArg 0
               let declName := scope.currNamespace ++ identStx.getId
               let oldResult := old.elabSnap.resultSnap.task.get
               Reuse.startGraft declName scope.opts envBeforeD oldResult.cmdState.env cmdState.env
