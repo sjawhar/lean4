@@ -1,7 +1,7 @@
 import Lean
 /-! A module whose proof applies `Lean.ofReduceBool` directly gets `noskip`: the kernel runs compiled code for it,
 and the term `Lean.ofReduceBool c true (@rfl Bool true)` never mentions `Lean.reduceBool` itself (the decided `c`
-goes through a recursive `partial def`, as in the adversarial case a05b). The same module proved by `rfl` does not. -/
+goes through a recursive `partial def`). The same module proved by `rfl` does not. -/
 open Lean
 
 def noskipOf (dir : System.FilePath) (src : String) : IO Bool := do
