@@ -309,17 +309,77 @@ cp cache3/Test/E.lean cache7/Test/
 (cd cache6 && test_out "Reused Test.E" build -v Test.E -o ../cache6.jsonl)
 test_exp -f cache5/.lake/build/lib/lean/Test/E.usekey
 test_cmd cmp cache5/.lake/build/ir/Test/E.ltar cache6/.lake/build/ir/Test/E.ltar
-# a sidecar missing from the cache (e.g. pruned) does not turn the entry into a miss: the module
+# a `.usekey` missing from the cache (e.g. pruned) does not turn the entry into a miss: the module
 # restores without it, and its dependents build normally once
 rm "$LAKE_CACHE_DIR"/artifacts/*.usekey
 (cd cache7 && test_out "Reused Test.E" build -v Test.E)
 test_exp -f cache7/.lake/build/lib/lean/Test/E.usage
 test_exp ! -f cache7/.lake/build/lib/lean/Test/E.usekey
-# a skip's cache entry is marked `s`, and a build with the cutoff off never restores it: it treats the entry
-# as a miss and builds, and its build replaces the entry unmarked
 # (sed, not jq: entries and traces are pretty-printed, one key per line)
 depHash() { sed -n 's/.*"depHash": *"\([0-9a-f]*\)".*/\1/p' "$1"; }
 entryArt() { sed -n "s/.*\"$2\": *\"\\([^\"]*\\)\".*/\\1/p" "$1"; }
+# a restored entry whose `.usage` was pruned from the cache is a miss: the module rebuilds and its rewritten
+# entry names a `.usage` again, so its dependents keep skipping (C imports B and X; B does not import X)
+mkdir -p cache8/Test cache9/Test
+for d in cache8 cache9; do cp lakefile.toml $d/; done
+printf 'def x := 1\n' > cache8/Test/X.lean
+printf 'def pb := 1\n' > cache8/Test/B.lean
+printf 'import Test.B\nimport Test.X\ndef pc := pb + x\n' > cache8/Test/C.lean
+(cd cache8 && test_run build Test.C)
+entry="$LAKE_CACHE_DIR/outputs/test/$(depHash cache8/.lake/build/lib/lean/Test/B.trace).json"
+usage=$(entryArt "$entry" u)
+test_exp -n "$usage"
+rm "$LAKE_CACHE_DIR/artifacts/$usage"
+cp cache8/Test/*.lean cache9/Test/
+(cd cache9 && test_run build Test.C)
+printf 'def x := 1\ndef x2 := 2\n' > cache9/Test/X.lean
+(cd cache9 && test_run build Test.C)
+printf 'def x := 1\ndef x2 := 3\n' > cache9/Test/X.lean
+(cd cache9 && test_out "Replayed Test.C" build -v Test.C)
+test_exp -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" u)"
+# B's entry from a `-o` build in a fresh dir $1 (B and X valued $2), naming an archive (`l`): `-o` packs the
+# archive after the build writes the entry, so the entry gets its `l` by hand, from the `-o` map. Sets `entry`,
+# and copies the sources to a second fresh dir $1b.
+ltarEntry() {
+  mkdir -p "$1/Test" "$1b/Test"
+  cp lakefile.toml "$1/"; cp lakefile.toml "$1b/"
+  printf 'def x := %s\n' "$2" > "$1/Test/X.lean"
+  printf 'def pb := %s\n' "$2" > "$1/Test/B.lean"
+  printf 'import Test.B\nimport Test.X\ndef pc := pb + x\n' > "$1/Test/C.lean"
+  cp "$1"/Test/*.lean "$1b/Test/"
+  (cd "$1" && test_run build Test.C -o "../$1.jsonl")
+  local hashB ltar
+  hashB=$(depHash "$1/.lake/build/lib/lean/Test/B.trace")
+  entry="$LAKE_CACHE_DIR/outputs/test/$hashB.json"
+  ltar=$(sed -n "s/^\[\"$hashB\", *\"\\([0-9a-f]*\\.ltar\\)\"\]$/\\1/p" "$1.jsonl")
+  test_exp -f "$LAKE_CACHE_DIR/artifacts/$ltar"
+  grep -q '"l":' "$entry" || sed_i "s/\"o\":/\"l\": \"$ltar\", \"o\":/" "$entry"
+  match_text "\"l\": \"$ltar\"" "$entry"
+}
+# the same miss for an entry that names an archive: it must not fall back to the archive, which ships no
+# sidecars. B rebuilds, and its rewritten entry names both sidecars
+ltarEntry cache10 10
+rm "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" u)"
+(cd cache10b && test_out "Built Test.B" build -v Test.C)
+test_exp -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" u)"
+test_exp -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" k)"
+# with its `.c` pruned too, so that only the archive resolves: still a miss
+ltarEntry cache11 11
+rm "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" u)" "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" c)"
+(cd cache11b && test_out "Built Test.B" build -v Test.C)
+test_exp -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" u)"
+test_exp -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" k)"
+# with only its `.c` pruned, B unpacks the archive and keeps the entry's sidecars, in the tree and in the
+# rewritten entry
+ltarEntry cache17 17
+rm "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" c)"
+(cd cache17b && test_out "Unpacked Test.B" build -v Test.C)
+test_exp -f cache17b/.lake/build/lib/lean/Test/B.usage
+test_exp -f cache17b/.lake/build/lib/lean/Test/B.usekey
+test_exp -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" u)"
+test_exp -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" k)"
+# a skip's cache entry is marked `s`, and a build with the cutoff off never restores it: it treats the entry
+# as a miss and builds, and its build replaces the entry unmarked
 mkdir -p cache12/Test cache13/Test cache14/Test cache15/Test cache16/Test
 for d in cache12 cache13 cache14 cache15 cache16; do cp lakefile.toml $d/; done
 printf 'def sa := 1\n' > cache12/Test/SA.lean

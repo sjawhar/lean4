@@ -722,9 +722,29 @@ public def Module.cacheOutputHashes (mod : Module) : IO PUnit := do
   if Lean.Internal.hasLLVMBackend () then
     cacheFileHash mod.bcFile
 
+/--
+Resolves module outputs' usage-cutoff sidecars. A `.usage` that does not resolve (e.g., pruned from
+the cache) fails, so the entry is a miss: the module rebuilds and writes one again, and its
+dependents keep skipping. A `.usekey` that does not resolve is dropped: the module restores without
+it, and its dependents build normally once.
+-/
+def ModuleOutputDescrs.resolveSidecars
+  (descrs : ModuleOutputDescrs) (service? : Option CacheServiceName) (scope? : Option CacheServiceScope)
+: JobM (Option Artifact × Option Artifact) := do
+  let usage? ← descrs.usage?.mapM (resolveArtifact · service? scope?)
+  let usekey? ← descrs.usekey?.bindM fun descr => do
+    try
+      some <$> resolveArtifact descr service? scope?
+    catch e =>
+      let log ← takeLogFrom e
+      logVerbose <| log.entries.foldl (s!"{·}\n- {·.message}") s!"dropped usage key {descr}:"
+      return none
+  return (usage?, usekey?)
+
 def ModuleOutputDescrs.resolve
   (descrs : ModuleOutputDescrs) (service? : Option CacheServiceName) (scope? : Option CacheServiceScope)
 : JobM ModuleOutputArtifacts := do
+  let (usage?, usekey?) ← descrs.resolveSidecars service? scope?
   let arts : ModuleOutputArtifacts := {
     isModule := descrs.isModule
     olean := ← resolve descrs.olean
@@ -735,8 +755,7 @@ def ModuleOutputDescrs.resolve
     ilean := ← resolve descrs.ilean
     c := ← resolve descrs.c
     ltar? := ← descrs.ltar?.mapM resolve
-    usage? := ← resolveSidecar? descrs.usage?
-    usekey? := ← resolveSidecar? descrs.usekey?
+    usage?, usekey?
     skipped := descrs.skipped
   }
   if Lean.Internal.hasLLVMBackend () then
@@ -747,18 +766,6 @@ def ModuleOutputDescrs.resolve
     return arts
 where
   @[inline] resolve descr := resolveArtifact descr service? scope?
-  /-
-  A sidecar that does not resolve (e.g., pruned from the cache) is dropped rather than failing the
-  entry: the module restores without it, and its dependents build normally once.
-  -/
-  resolveSidecar? (descr? : Option ArtifactDescr) : JobM (Option Artifact) := do
-    let some descr := descr? | return none
-    try
-      some <$> resolve descr
-    catch e =>
-      let log ← takeLogFrom e
-      logVerbose <| log.entries.foldl (s!"{·}\n- {·.message}") s!"dropped usage sidecar {descr}:"
-      return none
 
 /-- Usage cutoff is on unless `LAKE_USAGE_CUTOFF=0`. -/
 def usageCutoffEnabled : BaseIO Bool :=
@@ -782,8 +789,11 @@ def resolveModuleOutputArtifacts (out : CacheOutput) : JobM ModuleOutputArtifact
 instance : ResolveOutputs ModuleOutputArtifacts := ⟨resolveModuleOutputArtifacts⟩
 
 inductive ModuleOutputs
-/-- Only the archive, and whether the entry was marked as a skip's (`ModuleOutputDescrs.skipped`). -/
-| ltar (art : Artifact) (skipped : Bool)
+/--
+Only the archive, whether the entry was marked as a skip's (`ModuleOutputDescrs.skipped`), and the
+entry's sidecars, which the archive does not include.
+-/
+| ltar (art : Artifact) (skipped : Bool) (usage? usekey? : Option Artifact)
 | arts (arts : ModuleOutputArtifacts)
 
 instance : Coe ModuleOutputArtifacts ModuleOutputs := ⟨.arts⟩
@@ -793,7 +803,7 @@ def resolveModuleOutputs (out : CacheOutput) : JobM ModuleOutputs := do
     match ArtifactDescr.ofFilePath? descr with
     | .ok descr =>
       -- A bare archive entry comes from `-o` maps, which a skip never writes to.
-      return .ltar (← resolveArtifact descr out.service? out.scope?) false
+      return .ltar (← resolveArtifact descr out.service? out.scope?) false none none
     | .error e =>
       error s!"ill-formed module archive output:\n{out.data.render.pretty 80 2}\n{e}"
   else
@@ -805,7 +815,8 @@ def resolveModuleOutputs (out : CacheOutput) : JobM ModuleOutputs := do
           descrs.resolve out.service? out.scope?
         catch e =>
           dropLogFrom e
-          return .ltar (← resolveArtifact descr out.service? out.scope?) descrs.skipped
+          let (usage?, usekey?) ← descrs.resolveSidecars out.service? out.scope?
+          return .ltar (← resolveArtifact descr out.service? out.scope?) descrs.skipped usage? usekey?
       else
         descrs.resolve out.service? out.scope?
     | .error e => error s!"ill-formed module outputs:\n{out.data.render.pretty 80 2}\n{e}"
@@ -1321,12 +1332,16 @@ where
     let some ltarOrArts ← getArtifacts? inputHash savedTrace mod.pkg
       | return .inr savedTrace
     match (ltarOrArts : ModuleOutputs) with
-    | .ltar ltar skipped =>
+    | .ltar ltar skipped usage? usekey? =>
       updateAction .unpack
       mod.clearOutputArtifacts
       mod.unpackLtar ltar.path inputHash
       -- The archive's trace is its build's: a skip's entry marks it, so every path below keeps the mark.
       if skipped then markSkipTrace mod.traceFile
+      -- The archive ships no sidecars, so the entry's go to the build directory, from which the entry
+      -- below is rewritten.
+      if let some art := usage? then discard <| restoreArtifact mod.usageFile art
+      if let some art := usekey? then discard <| restoreArtifact mod.usekeyFile art
       -- Note: This branch implies that only the ltar output is (validly) cached.
       -- Thus, we use only the new trace unpacked from the ltar to resolve further artifacts.
       let savedTrace ← readModuleTrace mod.traceFile
