@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 source ../common.sh
 ./clean.sh
+# Store the Lake cache in the package, never the system cache (cache-env runs set their own directory below)
+export LAKE_CACHE_DIR=
 mkdir -p Test
 printf 'def a := 1\ntheorem ta : a = 1 := sorry\n' > Test/A.lean
 printf 'import Test.A\ndef b := a + 1\n' > Test/B.lean
@@ -157,7 +159,7 @@ printf 'partial def f (n : Nat) : Nat := if n = 0 then 2 else f (n - 1)\n' > Tes
 test_run build Test.PM
 printf 'partial def f (n : Nat) : Nat := if n = 0 then 3 else f (n - 1)\n' > Test/PX.lean
 LAKE_USAGE_CUTOFF=0 test_err "error: Test/PM.lean" build -v Test.PM
-# the same through `Lean.ofReduceBool` (adversarial case a05b): the proof term never names `reduceBool`, and the
+# the same through `Lean.ofReduceBool`: the proof term never names `reduceBool`, and the
 # decided `c` runs `f`'s compiled body; M must rebuild and fail
 printf 'partial def f (n : Nat) : Nat := if n = 0 then 2 else f (n - 1)\ndef c : Bool := f 1 == 2\n' > Test/RX.lean
 printf 'import Test.RX\nset_option linter.deprecated false\ntheorem t : c = true := Lean.ofReduceBool c true (@rfl Bool true)\n' \
@@ -165,7 +167,7 @@ printf 'import Test.RX\nset_option linter.deprecated false\ntheorem t : c = true
 test_run build Test.RM
 printf 'partial def f (n : Nat) : Nat := if n = 0 then 3 else f (n - 1)\ndef c : Bool := f 1 == 2\n' > Test/RX.lean
 test_err "error: Test/RM.lean" build -v Test.RM
-# `reduceBool` one module up (adversarial case a05c): RY's `rbc` is `noskip` and always rebuilds, and RN's
+# `reduceBool` one module up: RY's `rbc` is `noskip` and always rebuilds, and RN's
 # `rfl` proof of `rbc = true` names no `reduceBool`; `rbc`'s digest folds in `f`'s compiled body, so RN must
 # rebuild and fail
 printf 'partial def f (n : Nat) : Nat := if n = 0 then 2 else f (n - 1)\ndef c : Bool := f 1 == 2\n' > Test/RX.lean
@@ -174,7 +176,7 @@ printf 'import Test.RY\ntheorem t : rbc = true := rfl\n' > Test/RN.lean
 test_run build Test.RN
 printf 'partial def f (n : Nat) : Nat := if n = 0 then 3 else f (n - 1)\ndef c : Bool := f 1 == 2\n' > Test/RX.lean
 test_err "error: Test/RN.lean" build -v Test.RN
-# a user constant with the name the extension once used for its marker entry (adversarial case a09d) has its
+# a user constant with the name the extension once used for its marker entry (`_moduleUsage`) has its
 # own digest: a change to its value rebuilds a module that proved it through an intermediate `def`. The same
 # for a name declared by `addDecl` from `run_cmd`, which can declare any name (no compiled code, so the
 # intermediate is `noncomputable`)
@@ -242,9 +244,10 @@ test_run unpack stock.tgz
 test_exp ! -f .lake/build/lib/lean/Test/A.usage
 test_exp ! -f .lake/build/lib/lean/Test/A.usekey
 test_exp -f outside/keep.usage
-# Under a writable artifact cache with restored artifacts (machcsl's `tools/lakecache.sh`), in fresh
-# package dirs sharing a cache of their own. Restored and cached outputs are read-only hard links
-# into the cache, so a test edits one by replacing it, never by writing through it.
+# Under a writable artifact cache with restored artifacts (`LAKE_ARTIFACT_CACHE` and
+# `LAKE_RESTORE_ARTIFACTS`), in fresh package dirs sharing a cache of their own. Restored and cached
+# outputs are read-only hard links into the cache, so a test edits one by replacing it, never by
+# writing through it.
 export LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true LAKE_CACHE_DIR="$PWD/lakecache"
 mkdir -p cache1/Test cache2/Test
 cp lakefile.toml cache1/
