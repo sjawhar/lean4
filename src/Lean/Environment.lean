@@ -2091,6 +2091,10 @@ private def setImportedIREntries (states : Array EnvExtensionState) (mods : Arra
           { s with importedEntries := importedEntries.set! modIdx entries }
   return states
 
+/-- `profileitIO` for import steps; the category name is only built when `profiler` is set. -/
+@[inline] private def profileImport (opts : Options) (category : Unit → String) (act : IO α) : IO α :=
+  if profiler.get opts then profileitIO (category ()) opts act else act
+
 set_option compiler.ignoreBorrowAnnotation true in
 /--
   "Forward declaration" needed for updating the attribute table with user-defined attributes.
@@ -2128,20 +2132,20 @@ where
       let s := extDescr.toEnvExtension.getState (asyncMode := .sync) env
       let prevSize := (← persistentEnvExtensionsRef.get).size
       let prevAttrSize ← getNumBuiltinAttributes
-      let newState ← profileitIO s!"import ext {extDescr.name}" opts <|
+      let newState ← profileImport opts (fun _ => s!"import ext {extDescr.name}") <|
         extDescr.addImportedFn s.importedEntries { env := env, opts := opts }
       let mut env := extDescr.toEnvExtension.setState (asyncMode := .sync) env { s with state := newState }
       if extDescr.name == `Lean.regularInitAttr then
         -- Run `[init]` attributes now. We do this after `setState` so `runInitAttrs` can access
         -- `getModule(IR)Entries` but we should also do it before attempting to run user-defined
         -- extensions further down in `pExtDescrs` so they can access initialized declarations.
-        profileitIO "import runInitAttrs" opts <| runInitAttrs env opts
+        profileImport opts (fun _ => "import runInitAttrs") <| runInitAttrs env opts
       env ← ensureExtensionsArraySize env
       if (← persistentEnvExtensionsRef.get).size > prevSize || (← getNumBuiltinAttributes) > prevAttrSize then
         -- This branch is executed when `pExtDescrs[i]` is the extension associated with the `init` attribute, and
         -- a user-defined persistent extension is imported.
         -- Thus, we invoke `setImportedEntries` to update the array `importedEntries` with the entries for the new extensions.
-        env := env.setCheckedSync { env.base.private with extensions := (← profileitIO "import setImportedEntries" opts <| setImportedEntries env.base.private.extensions mods prevSize) }
+        env := env.setCheckedSync { env.base.private with extensions := (← profileImport opts (fun _ => "import setImportedEntries") <| setImportedEntries env.base.private.extensions mods prevSize) }
         -- See comment at `updateEnvAttributesRef`
         env ← updateEnvAttributes env
       loop (i + 1) env
@@ -2547,7 +2551,7 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
   -- Merge the region-resident per-module prefix trees lazily instead of building hash maps over
   -- all imported constants; only name prefixes shared between modules get fresh nodes, on first
   -- access. Conflicts are checked separately up front, so entry resolution cannot fail.
-  profileitIO "import checkImportConflicts" opts <| checkImportConflicts s imports modules moduleData
+  profileImport opts (fun _ => "import checkImportConflicts") <| checkImportConflicts s imports modules moduleData
   let privFind? := fun n => moduleData.findSome? fun d => d.constTrie.find? n
   let privImported :=
     ImportedConsts.mergeModuleTreesLazy
@@ -2580,17 +2584,17 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
     }
   }
   let publicBase := { privateBase with constants := { map₁ := publicImported }, header.regions := #[] }
-  let extensions ← profileitIO "import setImportedEntries" opts <| setImportedEntries privateBase.extensions moduleData
+  let extensions ← profileImport opts (fun _ => "import setImportedEntries") <| setImportedEntries privateBase.extensions moduleData
   -- fall back to basic data when not in server
   let serverData := modules.mapIdx (fun idx mod => mod.serverData? level |>.getD moduleData[idx]!)
   -- `serverData?` selects a different part than `mainModule?` only at `.server`: at `.private`,
   -- `importModulesCore` loads every module as `importAll`. Assumes `level` is the `globalLevel`
   -- the modules were loaded with.
   let serverIsMain := level != .server
-  let irBaseExts ← profileitIO "import setImportedEntries" opts <| setImportedIREntries privateBase.extensions irData
+  let irBaseExts ← profileImport opts (fun _ => "import setImportedEntries") <| setImportedIREntries privateBase.extensions irData
   let serverBaseExts ←
     if serverIsMain then pure extensions
-    else profileitIO "import setImportedEntries" opts <| setImportedEntries privateBase.extensions serverData
+    else profileImport opts (fun _ => "import setImportedEntries") <| setImportedEntries privateBase.extensions serverData
   let privateBase := { privateBase with extensions, irBaseExts }
   let mut env : Environment := {
     base.private := privateBase
@@ -2611,7 +2615,7 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
        `markPersistent` multiple times like this.
 
        Safety: There are no concurrent accesses to `env` at this point. -/
-    env ← profileitIO "import markPersistent" opts <| unsafe Runtime.markPersistent env
+    env ← profileImport opts (fun _ => "import markPersistent") <| unsafe Runtime.markPersistent env
   if loadExts then
     env ← finalizePersistentExtensions env moduleData opts
     if leakEnv then
@@ -2620,7 +2624,7 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
 
         Safety: There are no concurrent accesses to `env` at this point, assuming
         extensions' `addImportFn`s did not spawn any unbound tasks. -/
-      env ← profileitIO "import markPersistent" opts <| unsafe Runtime.markPersistent env
+      env ← profileImport opts (fun _ => "import markPersistent") <| unsafe Runtime.markPersistent env
   return { env with importRealizationCtx? := some {
     -- safety: `RealizationContext` is private
     env := unsafe unsafeCast env
@@ -2655,8 +2659,8 @@ def importModules (imports : Array Import) (opts : Options) (trustLevel : UInt32
     if imp.module matches .anonymous then
       throw <| IO.userError "import failed, trying to import module with anonymous name"
   withImporting do
-    profileitIO "import plugins" opts <| plugins.forM fun {path, initFn?} => Lean.loadPlugin path initFn?
-    let (_, s) ← profileitIO "import readModules" opts <| (importModulesCore (globalLevel := level) imports arts).run
+    profileImport opts (fun _ => "import plugins") <| plugins.forM fun {path, initFn?} => Lean.loadPlugin path initFn?
+    let (_, s) ← profileImport opts (fun _ => "import readModules") <| (importModulesCore (globalLevel := level) imports arts).run
     finalizeImport (leakEnv := leakEnv) (loadExts := loadExts) (level := level)
       s imports opts trustLevel
 
