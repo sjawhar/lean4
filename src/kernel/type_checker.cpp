@@ -1289,24 +1289,20 @@ lbool type_checker::is_def_eq_offset(expr const & t, expr const & s) {
     if (pred_t && pred_s) {
         return to_lbool(is_def_eq_core(*pred_t, *pred_s));
     }
-    /* `n =?= a + k` (`n` a literal, `k` a literal offset) and `Nat.succ e =?= a + k`: strip the common `Nat.succ`s
-       at once instead of one per unfolding of `Nat.add` (`a + k` is `Nat.succ^k a`, `n` is `Nat.succ^n 0`).
-       `n < k` leaves `0 =?= Nat.succ^(k-n) a`, two different constructors. */
+    /* `n =?= a + k` with `n` a literal and `k` a literal offset: `a + k` is `Nat.succ^k a` and `n` is `Nat.succ^n 0`,
+       so strip the `k` common `Nat.succ`s at once instead of one per unfolding of `Nat.add`; `n < k` leaves
+       `0 =?= Nat.succ^(k-n) a`, two different constructors. When `lazy_delta_reduction` evaluates `Nat` literals
+       (no free variables, or `eagerReduce`) and `a` reduces to a literal, leave the sum to `reduce_nat`. */
     bool t_lit = is_nat_lit_ext(t), s_lit = is_nat_lit_ext(s);
-    if (t_lit || s_lit || pred_t || pred_s) {
+    if (t_lit != s_lit) {
         nat k;
-        if (optional<expr> a = (t_lit || pred_t) ? is_nat_add_lit(s, k) : is_nat_add_lit(t, k)) {
-            expr const & other = (t_lit || pred_t) ? t : s;
-            if (is_nat_lit_ext(other)) {
-                nat n = get_nat_val(other);
-                if (n < k) return l_false;
-                expr r = mk_lit(literal(n - k));
-                return to_lbool((t_lit || pred_t) ? is_def_eq_core(r, *a) : is_def_eq_core(*a, r));
-            } else {
-                expr const & pred = pred_t ? *pred_t : *pred_s;
-                expr r = mk_nat_add_lit(*a, k - nat(1u));
-                return to_lbool(pred_t ? is_def_eq_core(pred, r) : is_def_eq_core(r, pred));
-            }
+        if (optional<expr> a = is_nat_add_lit(t_lit ? s : t, k)) {
+            if (((!has_fvar(t) && !has_fvar(s)) || m_eager_reduce) && is_nat_lit_ext(whnf(*a)))
+                return l_undef;
+            nat n = get_nat_val(t_lit ? t : s);
+            if (n < k) return l_false;
+            expr r = mk_lit(literal(n - k));
+            return to_lbool(t_lit ? is_def_eq_core(r, *a) : is_def_eq_core(*a, r));
         }
     }
     return l_undef;
