@@ -149,5 +149,21 @@ test_run build Test.N
 printf 'module\npublic def d : Nat := 2\n' > Test/U.lean
 test_err "Building Test.N" build -v Test.N
 cd ..
+# the archive of a module restored from the cache depends only on its outputs: two trees whose E
+# differs by a comment restore E and pack the same `.ltar` (the archive includes the fetch trace,
+# which therefore lists no sidecar: a `.usekey` records an input hash)
+mkdir -p cache3/Test cache4/Test cache5/Test cache6/Test cache7/Test
+for d in cache3 cache4 cache5 cache6 cache7; do cp lakefile.toml $d/; done
+printf 'def e := 1\n' > cache3/Test/E.lean
+printf 'def e := 1\n-- a comment\n' > cache4/Test/E.lean
+cp cache3/Test/E.lean cache5/Test/
+cp cache4/Test/E.lean cache6/Test/
+cp cache3/Test/E.lean cache7/Test/
+(cd cache3 && test_run build Test.E)
+(cd cache4 && test_run build Test.E)
+(cd cache5 && test_out "Reused Test.E" build -v Test.E -o ../cache5.jsonl)
+(cd cache6 && test_out "Reused Test.E" build -v Test.E -o ../cache6.jsonl)
+test_exp -f cache5/.lake/build/lib/lean/Test/E.usekey
+test_cmd cmp cache5/.lake/build/ir/Test/E.ltar cache6/.lake/build/ir/Test/E.ltar
 
 rm -f produced.out
