@@ -198,18 +198,6 @@ def compute (env : Environment) (imported : ImportedDigests) (consts := ownConst
     for m in scc do out := out.insert m d
   return (consts.map fun (n, _) => (n, out[n]!)).qsort fun a b => Name.quickLt a.1 b.1
 
-/--
-Retained under the original extension name so old `.olean` files remain readable. New files export no
-entries: imported digests live only in `.usage`.
--/
-builtin_initialize ext : PersistentEnvExtension (Name × Digest) (Name × Digest) Unit ←
-  registerPersistentEnvExtension {
-    mkInitial := pure ()
-    addImportedFn := fun _ => pure ()
-    addEntryFn := fun s _ => s
-    exportEntriesFnEx := fun _ _ => { exported := #[], server := #[], «private» := #[] }
-    asyncMode := .mainOnly
-  }
 
 def localDigests (env : Environment) (imported : ImportedDigests) (consts := ownConsts env) :
     Array (Name × Digest) :=
