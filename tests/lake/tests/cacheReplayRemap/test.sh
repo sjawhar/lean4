@@ -45,7 +45,11 @@ if [ -d "$SHM_DIR" ] && [ -w "$SHM_DIR" ] && [ "$(stat -c %d "$SHM_DIR")" != "$(
   (cd t2 && test_cmd "$LAKE" env lean -o .lake/build/lib/lean/P/X.olean \
     -i .lake/build/lib/lean/P/X.ilean P/X.lean)
   setx t2 2
+  test_cmd cp t2/.lake/build/lib/lean/P/X.olean t2.substitute
   LAKE_CACHE_DIR="$SHM_CACHE" test_out 'does not match its trace' -d t2 build P.E
+  # The substituted bytes are kept in the quarantine directory, on the cache's file system
+  test_cmd sh -c 'for f in "$1"/quarantine/*; do cmp -s "$f" "$2" && exit 0; done; exit 1' \
+    _ "$SHM_CACHE" t2.substitute
   LAKE_CACHE_DIR="$SHM_CACHE" test_truth t2
   rm -rf "$SHM_CACHE"
 else
