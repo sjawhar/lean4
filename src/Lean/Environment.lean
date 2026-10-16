@@ -103,6 +103,18 @@ abbrev ConstMap := SMap Name ConstantInfo
 opaque EnvExtensionEntrySpec : NonemptyType.{0}
 @[expose] def EnvExtensionEntry : Type := EnvExtensionEntrySpec.type
 instance : Nonempty EnvExtensionEntry := EnvExtensionEntrySpec.property
+private unsafe def eraseEnvExtensionEntryImpl (b : β) : EnvExtensionEntry := unsafeCast b
+
+/-- Type-erases an extension entry for storage in generic command payloads. -/
+@[implemented_by eraseEnvExtensionEntryImpl]
+opaque eraseEnvExtensionEntry (b : β) : EnvExtensionEntry
+
+private unsafe def envExtensionStateOfEntryImpl (entry : EnvExtensionEntry) : EnvExtensionState :=
+  unsafeCast entry
+
+/-- Restores a type-erased environment state stored in a command payload. -/
+@[implemented_by envExtensionStateOfEntryImpl]
+opaque envExtensionStateOfEntry (entry : EnvExtensionEntry) : EnvExtensionState
 
 /-- Content of a .olean file.
    We use `compact.cpp` to generate the image of this object in disk. -/
@@ -1327,6 +1339,8 @@ structure EnvExtension (σ : Type) where private mk ::
 namespace EnvExtension
 
 private builtin_initialize envExtensionsRef : IO.Ref (Array (EnvExtension EnvExtensionState)) ← IO.mkRef #[]
+/-- The index allocated to an environment extension. -/
+def index (ext : EnvExtension σ) : Nat := ext.idx
 
 /--
   User-defined environment extensions are declared using the `initialize` command.
@@ -1437,6 +1451,18 @@ different environment branches are reconciled.
 -/
 def setState {σ : Type} (ext : EnvExtension σ) (env : Environment) (s : σ) (asyncMode := ext.asyncMode) : Environment :=
   inline <| modifyState (asyncMode := asyncMode) ext env fun _ => s
+/-- Restores one type-erased extension state using the extension's storage mode. Async extension state is
+restored to the joined synchronous state because a command payload has no live async branch. -/
+def restoreStateAt (env : Environment) (idx : Nat) (state : EnvExtensionState) : IO Environment := do
+  let exts ← envExtensionsRef.get
+  if h : idx < exts.size then
+    let ext := exts[idx]
+    let mode := match ext.asyncMode with
+      | .async _ => .sync
+      | mode => mode
+    return ext.setState env state (asyncMode := mode)
+  else
+    throw <| IO.userError s!"unknown environment extension index {idx}"
 
 -- `unsafe` fails to infer `Nonempty` here
 private unsafe def getStateUnsafe {σ : Type} [Inhabited σ] (ext : EnvExtension σ)
@@ -1503,6 +1529,15 @@ only for important optimizations.
 @[implemented_by getStateUnsafe]
 opaque getState {σ : Type} [Inhabited σ] (ext : EnvExtension σ) (env : Environment)
   (asyncMode := ext.asyncMode) (asyncDecl : Name := .anonymous) : σ
+
+/-- Captures every extension's current state, using the joined state for asynchronous extensions. -/
+def snapshotStates (env : Environment) : IO (Array EnvExtensionState) := do
+  let exts ← envExtensionsRef.get
+  return exts.map fun ext =>
+    let mode := match ext.asyncMode with
+      | .async _ => .sync
+      | mode => mode
+    ext.getState env (asyncMode := mode)
 
 end EnvExtension
 
@@ -1660,6 +1695,7 @@ instance {α β σ} [Inhabited σ] : Inhabited (PersistentEnvExtension α β σ)
      statsFn := fun _ => Format.nil
   }
 
+
 namespace PersistentEnvExtension
 
 /--
@@ -1685,7 +1721,7 @@ def getModuleIREntries {α β σ : Type} [Inhabited σ] (ext : PersistentEnvExte
 def addEntry {α β σ : Type} (ext : PersistentEnvExtension α β σ) (env : Environment) (b : β)
     (asyncMode := ext.toEnvExtension.asyncMode) (asyncDecl : Name := .anonymous) : Environment :=
   ext.toEnvExtension.modifyState (asyncMode := asyncMode) (asyncDecl := asyncDecl) env fun s =>
-    let state   := ext.addEntryFn s.state b;
+    let state := ext.addEntryFn s.state b
     { s with state := state }
 
 /-- Get the current state of the given extension in the given environment. -/
@@ -1834,7 +1870,7 @@ private opaque getIRExtraConstNames (env : Environment) (level : OLeanLevel) (in
 Compute extension entries for all levels at once by calling `exportEntriesFn` once per extension.
 Returns an `OLeanEntries` of arrays mapping extension names to their exported data.
 -/
-private def computeExtEntries (env : Environment) :
+def Environment.computeExtEntries (env : Environment) :
     IO (OLeanEntries (Array (Name × Array EnvExtensionEntry))) := do
   let pExts ← persistentEnvExtensionsRef.get
   let allEntries := pExts.map fun pExt =>
@@ -1862,7 +1898,7 @@ def mkModuleData (env : Environment) (level : OLeanLevel := .private)
   let entries ← match extEntries? with
     | some ee => pure (ee.get level)
     | none => do
-      let ee ← computeExtEntries env
+      let ee ← env.computeExtEntries
       pure (ee.get level)
   let kenv := env.toKernelEnv
   let constNames := kenv.constants.foldStage2 (fun names name _ => names.push name) #[]
@@ -1900,7 +1936,7 @@ private def mkIRData (env : Environment) : ModuleData :=
 
 def writeModule (env : Environment) (fname : System.FilePath) (writeIR := true) : IO Unit := do
   if env.header.isModule then
-    let extEntries ← computeExtEntries env
+    let extEntries ← env.computeExtEntries
     let mkPart (level : OLeanLevel) :=
       return (level.adjustFileName fname, (← mkModuleData env level extEntries))
     saveModuleDataParts env.mainModule #[

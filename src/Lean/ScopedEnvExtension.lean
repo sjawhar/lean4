@@ -17,7 +17,7 @@ namespace ScopedEnvExtension
 inductive Entry (α : Type) where
   | global : α → Entry α
   | scoped : Name → α → Entry α
-
+  deriving Nonempty
 structure State (σ : Type) where
   state        : σ
   activeScopes : NameSet := {}
@@ -122,6 +122,28 @@ structure ScopedEnvExtension (α : Type) (β : Type) (σ : Type) where
 
 builtin_initialize scopedEnvExtensionsRef : IO.Ref (Array (ScopedEnvExtension EnvExtensionEntry EnvExtensionEntry EnvExtensionState)) ← IO.mkRef #[]
 
+builtin_initialize localEntriesExt :
+    EnvExtension (Array (Nat × Name × EnvExtensionEntry)) ←
+  registerEnvExtension (pure #[]) (asyncMode := .local)
+
+builtin_initialize scopeDepthExt : EnvExtension Nat ←
+  registerEnvExtension (pure 0) (asyncMode := .local)
+
+def localEntryCount (env : Environment) : Nat :=
+  (localEntriesExt.getState (asyncMode := .local) env).size
+
+def scopeDepth (env : Environment) : Nat :=
+  scopeDepthExt.getState (asyncMode := .local) env
+
+def appendLocalEntries (env : Environment) (es : Array (Nat × Name × EnvExtensionEntry)) : Environment :=
+  localEntriesExt.modifyState (asyncMode := .local) env (· ++ es)
+
+private def reachedDepth (states : List (ScopedEnvExtension.State σ)) (depth : Nat) : Nat :=
+  match states with
+  | [] => depth
+  | state :: rest => if state.delimitsLocal then depth else reachedDepth rest (depth - 1)
+
+
 unsafe def registerScopedEnvExtensionUnsafe (descr : Descr α β σ) : IO (ScopedEnvExtension α β σ) := do
   let ext ← registerPersistentEnvExtension {
     name            := descr.name
@@ -189,6 +211,10 @@ def stateStackModify (ext : ScopedEnvExtension α β σ) (states : List (State �
     top :: bot
 
 def ScopedEnvExtension.addLocalEntry (ext : ScopedEnvExtension α β σ) (env : Environment) (b : β) : Environment :=
+  let states := (ext.ext.getState (asyncMode := .local) env).stateStack
+  let depth := reachedDepth states (states.length - 1)
+  let env := localEntriesExt.modifyState (asyncMode := .local) env
+    (·.push (depth, ext.ext.name, eraseEnvExtensionEntry (ext.descr.toOLeanEntry b)))
   ext.ext.modifyState (asyncMode := .local) env fun s =>
     {s with stateStack := stateStackModify ext s.stateStack b}
 
@@ -237,11 +263,11 @@ def ScopedEnvExtension.modifyState (ext : ScopedEnvExtension α β σ) (env : En
 def pushScope [Monad m] [MonadEnv m] [MonadLiftT (ST IO.RealWorld) m] : m Unit := do
   for ext in (← scopedEnvExtensionsRef.get) do
     modifyEnv ext.pushScope
-
+  modifyEnv fun env => scopeDepthExt.modifyState (asyncMode := .local) env (· + 1)
 def popScope [Monad m] [MonadEnv m] [MonadLiftT (ST IO.RealWorld) m] : m Unit := do
   for ext in (← scopedEnvExtensionsRef.get) do
     modifyEnv ext.popScope
-
+  modifyEnv fun env => scopeDepthExt.modifyState (asyncMode := .local) env (· - 1)
 /-- Used to implement `end_local_scope` command, that disables delimiting local entries of ScopedEnvExtension
 across `depth` scope levels.
 -/

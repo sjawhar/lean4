@@ -16,6 +16,7 @@ import Lean.Linter.PersistentLintLog
 import Lean.Util.ProfilerServer
 import Lean.Util.ModuleUsage
 import Lean.Util.UsedByChecks
+import Lean.Util.CommandEntries
 
 public section
 
@@ -286,7 +287,13 @@ def runFrontend
     (incrHeaderSaveFileName? : Option System.FilePath := none)
     : IO (Option Environment) := do
   let startTime := (← IO.monoNanosNow).toFloat / 1000000000
-  if oleanFileName?.isSome then usageRecordingRef.set true
+  if oleanFileName?.isSome then
+    usageRecordingRef.set true
+    usedByChecksRef.set {}
+    extraModUsesByChecksRef.set {}
+    extraModUsesByCmdRef.set {}
+    resetCommandUsageRefs
+    ModuleUsage.commandObservationsRef.set #[]
   let inputCtx := Parser.mkInputContext input fileName
   -- default `cmdlineSnapshots` to true (not done as default value for API back-compat reasons)
   -- except when full-snapshotting so that enough information for resumption is available
@@ -385,14 +392,23 @@ def runFrontend
   if let some oleanFileName := oleanFileName? then
     let consts := ModuleUsage.ownConsts env
     let own := ModuleUsage.localDigests env consts
+    let stmt := ModuleUsage.computeStmt env (ModuleUsage.stmtState env) own consts
+    let observations ← ModuleUsage.commandObservationsRef.get
+    let mut entries := #[]
+    for obs in observations.qsort (·.i < ·.i) do
+      let recorded ← recordCommandDelta obs.before.env obs.after.env obs.i
+      if let some entry := (commandEntriesExt.getState recorded).back? then
+        entries := entries.push entry
+    let env := setCommandEntries env entries
+    let commands ← ModuleUsage.commandRecords env own stmt entries
     profileitIO ".olean serialization" finalOpts do
       let commandLints := collectCommandLints snaps none #[]
       let env ← Linter.recordLints inputCtx.fileMap env commandLints
       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts)
-        (ModuleUsage.setLocalDigests env own) oleanFileName
+        (ModuleUsage.setLocalStmt (ModuleUsage.setLocalDigests env own) stmt) oleanFileName
     let used := ModuleUsage.usedFromInfoTrees trees (← usedByChecksRef.get)
-    ModuleUsage.writeUsage env consts own used (incrLoaded := incrLoadFileName?.isSome)
-      (oleanFileName.withExtension "usage")
+    ModuleUsage.writeUsage env consts own stmt used commands
+      (incrLoaded := incrLoadFileName?.isSome) (oleanFileName.withExtension "usage")
 
   if let some ileanFileName := ileanFileName? then
     let references := Lean.Server.findModuleRefs inputCtx.fileMap trees (localVars := false)

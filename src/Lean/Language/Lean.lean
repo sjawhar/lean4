@@ -14,6 +14,7 @@ prelude
 public import Lean.Language.Util
 public import Lean.Language.Lean.Types
 public import Lean.Elab.Import
+import Lean.Util.ModuleUsage
 
 public section
 
@@ -754,6 +755,10 @@ where
       (snap : SnapshotBundle DynamicSnapshot) (cancelTk : IO.CancelToken) :
       LeanProcessingM Command.State := do
     let ctx ← read
+    let cmdIdx := cmds.size
+    if ← usageRecordingRef.get then
+      currentCommandRef.set cmdIdx
+    let cmdStateBefore := cmdState
     let scope := cmdState.scopes.head!
     -- reset per-command state
     let cmdStateRef ← IO.mkRef { cmdState with
@@ -762,6 +767,7 @@ where
       cmdPos       := beginPos
       snap?        := if internal.cmdlineSnapshots.get scope.opts then none else snap
       cancelTk?    := some cancelTk
+      cmdIdx?      := some cmdIdx
     }
     let (output, _) ←
       IO.FS.withIsolatedStreams (isolateStderr := Core.stderrAsMessages.get scope.opts) do
@@ -779,6 +785,8 @@ where
         data     := output
       }
     let cmdState : Command.State := { cmdState with messages }
+    if ← usageRecordingRef.get then
+      ModuleUsage.recordCommandObservation cmdIdx stx cmdStateBefore cmdState
     -- definitely resolve eventually
     snap.new.resolve <| .ofTyped { diagnostics := .empty : SnapshotLeaf }
 

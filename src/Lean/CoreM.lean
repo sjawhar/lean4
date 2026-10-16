@@ -88,6 +88,18 @@ def ofPrefix (namePrefix : Name) : DeclNameGenerator :=
 private def idxs (g : DeclNameGenerator) : List Nat :=
   g.idx :: g.parentIdxs
 
+structure Record where
+  namePrefix : Name
+  idx : Nat
+  parentIdxs : List Nat
+  deriving Inhabited, BEq
+
+def toRecord (g : DeclNameGenerator) : Record :=
+  { namePrefix := g.namePrefix, idx := g.idx, parentIdxs := g.parentIdxs }
+
+def ofRecord (r : Record) : DeclNameGenerator :=
+  { namePrefix := r.namePrefix, idx := r.idx, parentIdxs := r.parentIdxs }
+
 def next (g : DeclNameGenerator) : DeclNameGenerator :=
   { g with idx := g.idx + 1 }
 
@@ -229,6 +241,8 @@ structure Context where
   maxHeartbeats  : Nat := getMaxHeartbeats options
   quotContext    : Name := .anonymous
   currMacroScope : MacroScope := firstFrontendMacroScope
+  /-- Index of the top-level command whose elaboration created this context. -/
+  cmdIdx?        : Option Nat := none
   /--
   If `diag := true`, different parts of the system collect diagnostics.
   Use the `set_option diag true` to set it to true.

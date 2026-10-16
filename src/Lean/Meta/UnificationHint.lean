@@ -7,6 +7,7 @@ module
 
 prelude
 public import Lean.Meta.SynthInstance
+import Lean.Util.UsedByChecks
 
 public section
 
@@ -105,6 +106,7 @@ def tryUnificationHints (t s : Expr) : MetaM Bool := do
   let hints := unificationHintExtension.getState (← getEnv)
   let candidates ← withConfigWithKey config <| hints.discrTree.getMatch t
   for candidate in candidates do
+    recordUsedByCommand candidate
     if (← tryCandidate candidate) then
       return true
   return false

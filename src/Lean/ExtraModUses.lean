@@ -92,10 +92,16 @@ public def copyExtraModUses (src dest : Environment) : Environment := Id.run do
 /-- Every extra module use recorded in this process, including those of commands whose environment is then
 discarded (`example`, `#check`, `#eval`, `#synth`, `#reduce`), which `getLocalExtraModUses` loses. -/
 public builtin_initialize extraModUsesByChecksRef : IO.Ref (Std.HashSet ExtraModUse) ← IO.mkRef {}
+/-- Every extra module use attributed to the command that requested it, before environment-level deduplication. -/
+public builtin_initialize extraModUsesByCmdRef :
+    IO.Ref (Std.HashSet (Nat × ExtraModUse)) ← IO.mkRef {}
 
 def recordExtraModUseCore [MonadLiftT IO m] (mod : Name) (isMeta : Bool) (hint : Name := .anonymous) :
     m Unit := do
   let entry := { module := mod, isExported := (← getEnv).isExporting, isMeta }
+  if (← (usageRecordingRef.get : IO Bool)) then
+    let idx ← (currentCommandRef.get : IO Nat)
+    (extraModUsesByCmdRef.modify (·.insert (idx, entry)) : IO Unit)
   if !(extraModUses.getState (asyncMode := .local) (← getEnv)).contains entry then
     trace[extraModUses] "recording {if entry.isExported then "public" else "private"} \
       {if isMeta then "meta" else "regular"} extra mod use {mod}\
