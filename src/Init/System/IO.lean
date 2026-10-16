@@ -1166,6 +1166,14 @@ does not exist or the metadata cannot be accessed.
 opaque symlinkMetadata : @& FilePath → IO IO.FS.Metadata
 
 /--
+Returns whether the two paths name the same file: the same device and file identifier (the inode
+on Unix-like systems), following symlinks. Hard links to one file name the same file. Throws an
+exception if either file does not exist or its metadata cannot be accessed.
+-/
+@[extern "lean_io_is_same_file"]
+opaque isSameFile (p₁ p₂ : @& FilePath) : IO Bool
+
+/--
 Checks whether the indicated path can be read and is a directory. This function will traverse
 symlinks.
 -/

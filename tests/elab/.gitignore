@@ -3,4 +3,5 @@
 /getline_crash.lean.tmp
 /handleInheritable.lean.lock
 /handleLocking.lean.lock
+/isSameFile.lean.dir/
 /stdio.lean.stdout*.txt

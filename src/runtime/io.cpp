@@ -1198,6 +1198,27 @@ extern "C" LEAN_EXPORT obj_res lean_io_symlink_metadata(b_obj_arg filename) {
 #endif
 }
 
+/* System.FilePath.isSameFile : (@& FilePath) → (@& FilePath) → IO Bool */
+extern "C" LEAN_EXPORT obj_res lean_io_is_same_file(b_obj_arg p1, b_obj_arg p2) {
+    uv_stat_t st[2];
+    b_obj_arg ps[2] = {p1, p2};
+    for (int i = 0; i < 2; i++) {
+        const char* fname = string_cstr(ps[i]);
+        if (strlen(fname) != lean_string_size(ps[i]) - 1) {
+            return mk_embedded_nul_error(ps[i]);
+        }
+        uv_fs_t req;
+        int ret = uv_fs_stat(NULL, &req, fname, NULL);
+        if (ret < 0) {
+            uv_fs_req_cleanup(&req);
+            return io_result_mk_error(decode_uv_error(ret, ps[i]));
+        }
+        st[i] = req.statbuf;
+        uv_fs_req_cleanup(&req);
+    }
+    return io_result_mk_ok(box(st[0].st_dev == st[1].st_dev && st[0].st_ino == st[1].st_ino));
+}
+
 extern "C" LEAN_EXPORT obj_res lean_io_create_dir(b_obj_arg p) {
     const char* str = string_cstr(p);
     if (strlen(str) != lean_string_size(p) - 1) {
