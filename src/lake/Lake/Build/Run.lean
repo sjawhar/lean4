@@ -22,6 +22,7 @@ open System
 
 namespace Lake
 
+
 /-- Unicode icons that make up the spinner in animation order. -/
 def Monitor.spinnerFrames :=
   #['⣾','⣷','⣯','⣟','⡿','⢿','⣻','⣽']
@@ -363,6 +364,7 @@ def mkBuildContext
     else
       return none
   registeredJobs := jobs
+  sidecarCache := ← Std.Mutex.new {}
   leanTrace := .ofHash (pureHash ws.lakeEnv.leanGithash)
     s!"Lean {Lean.versionStringCore}, commit {ws.lakeEnv.leanGithash}"
   cancelTk?

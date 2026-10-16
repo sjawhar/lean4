@@ -1193,6 +1193,7 @@ structure UsageSidecar where
   own : NameMap ModuleUsage.Digest
   used : Array (Name × Array (Name × ModuleUsage.Digest))
   extra : Array Name
+  deriving TypeName
 
 /-- A module's `.usekey` sidecar: what Lake saw of the module's build when Lean wrote its `.usage`. -/
 structure UsekeySidecar where
@@ -1205,6 +1206,7 @@ structure UsekeySidecar where
   closure : ModuleUsage.Digest
   /-- For each workspace `extra` module of the `.usage`: the hash of its `.olean` and its `moduleDigest`. -/
   extra : NameMap (Hash × ModuleUsage.Digest)
+  deriving TypeName
 
 /--
 A name in a usage sidecar, as `Lean.ModuleUsage.nameToJson` writes it: the JSON array of its
@@ -1255,24 +1257,36 @@ Reads a usage-cutoff sidecar. Returns `none` if it does not exist or has another
 than `Lean.ModuleUsage.usageVersion` (an older toolchain wrote it). If it exists but is not valid,
 logs a warning and returns `none`, so the module builds normally.
 -/
-def readUsageSidecar (α : Type) [FromJson α] (path : FilePath) : JobM (Option α) := do
-  match (← IO.FS.readFile path |>.toBaseIO) with
-  | .ok contents =>
-    let parsed := do
-      let j ← Json.parse contents
-      let v ← j.getObjValAs? Nat "version"
-      if v != ModuleUsage.usageVersion then return none
-      some <$> fromJson? (α := α) j
-    match parsed with
-    | .ok a =>
-      return a
-    | .error e =>
-      logWarning s!"{path}: {e}"
+def readUsageSidecar (α : Type) [FromJson α] [TypeName α] (path : FilePath) :
+    JobM (Option α) := do
+  (← getBuildContext).sidecarCache.atomically do
+    if let some cached := (← getThe (Std.HashMap FilePath Dynamic)).get? path then
+      let some value := cached.get? α | error s!"{path}: cached sidecar has the wrong type"
+      return some value
+    match (← IO.FS.readFile path |>.toBaseIO) with
+    | .ok contents =>
+      let parsed := do
+        let j ← Json.parse contents
+        let v ← j.getObjValAs? Nat "version"
+        if v != ModuleUsage.usageVersion then return none
+        some <$> fromJson? (α := α) j
+      match parsed with
+      | .ok value =>
+        if let some value := value then
+          modifyThe (Std.HashMap FilePath Dynamic) (·.insert path (Dynamic.mk value))
+        return value
+      | .error e =>
+        logWarning s!"{path}: {e}"
+        return none
+    | .error (.noFileOrDirectory ..) =>
       return none
-  | .error (.noFileOrDirectory ..) =>
-    return none
-  | .error e =>
-    error s!"{path}: read failed: {e}"
+    | .error e =>
+      error s!"{path}: read failed: {e}"
+
+/-- Drops cached contents before a build may replace a sidecar. -/
+def invalidateSidecar (path : FilePath) : JobM Unit := do
+  (← getBuildContext).sidecarCache.atomically do
+    modifyThe (Std.HashMap FilePath Dynamic) (·.erase path)
 
 /--
 A hash of every artifact of every module-system module in an import closure, with its name.
@@ -1354,6 +1368,8 @@ def Module.buildLean
   let relSrcFile := relPathFrom mod.pkg.dir presetup.srcFile
   let setup ← setup?.getDM (mkModuleSetup mod presetup)
   let outputPaths := mod.mkArtifacts presetup.srcFile presetup.isModule
+  invalidateSidecar mod.usageFile
+  invalidateSidecar mod.usekeyFile
   mod.clearOutputArtifacts
   mod.clearOutputHashes
   compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile outputPaths args
