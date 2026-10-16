@@ -6,7 +6,7 @@ open Lean
 
 def noskipOf (dir : System.FilePath) (src : String) : IO Bool := do
   IO.FS.writeFile (dir / "A.lean") src
-  let out ← IO.Process.output { cmd := "lean", args := #[s!"--root={dir}", "-o", "A.olean", "A.lean"], cwd := dir }
+  let out ← IO.Process.output { cmd := "lean", args := #[s!"--root={dir}", "-o", "A.olean", "--usage=A.usage", "A.lean"], cwd := dir }
   unless out.exitCode = 0 do
     throw <| IO.userError s!"lean failed ({out.exitCode}):\n{out.stdout}\n{out.stderr}"
   let j ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "A.usage"))
