@@ -8,6 +8,7 @@ prelude
 public import Std.Data.HashMap
 import Std.Data.HashSet
 public import Lake.Util.IO
+public import Lake.Util.Log
 import Init.Data.Array.QSort
 import Init.Data.String.Compare
 import Init.Data.ToString.Macro
@@ -50,7 +51,7 @@ public structure ModuleTimeEntry where
 /-- The record's file name inside the workspace's Lake directory. -/
 public def moduleTimesFileName : FilePath := "module-times.tsv"
 
-/-- The file name of the records of older Lakes (formats 1 and 2), which this one does not read. -/
+/-- The file name of the records of older Lakes (formats 1 and 2), which this one ignores. -/
 public def legacyModuleTimesFileName : String := "module-times.json"
 
 /-- The record's first line. -/
@@ -329,20 +330,25 @@ def parseModuleTimes (s : String) : Except String ModuleTimeRecord := do
   return {contents := s, rows}
 
 /--
-Reads the record. A missing file is an empty record, unless an older Lake's record
-(`legacyModuleTimesFileName`) is beside it; that, and a file that does not parse, is an error naming
-the file.
+Reads the record. A missing file is an empty record. An older Lake's record
+(`legacyModuleTimesFileName`) beside a missing file, or a file that does not parse, is logged as a
+warning naming the file and read as an empty record: the record only orders compiles, so the build
+goes on, and its save starts a new record.
 -/
-public def readModuleTimes (path : FilePath) : IO ModuleTimeRecord := do
+@[nospecialize] public def readModuleTimes [logger : MonadLog BaseIO] (path : FilePath) :
+    IO ModuleTimeRecord := do
+  let ignore (why : String) : BaseIO Unit :=
+    logWarning s!"{why}; ignoring it and starting a new record (delete it to silence this warning)"
   unless (← path.pathExists) do
     let legacy := path.withFileName legacyModuleTimesFileName
     if ← legacy.pathExists then
-      throw <| IO.userError s!"{legacy}: a module-times record from an older Lake; \
-        delete it to start a new record"
+      ignore s!"{legacy}: a module-times record from an older Lake"
     return {}
   match parseModuleTimes (← IO.FS.readFile path) with
   | .ok r => return r
-  | .error e => throw <| IO.userError s!"{path}: {e}; delete it to start a new record"
+  | .error e =>
+    ignore s!"{path}: {e}"
+    return {}
 
 /-- The import indices in `s[b, e)` (already checked by `parseModuleTimes`). -/
 def importIndices (s : String) (b e : Nat) : Array Nat := Id.run do
@@ -441,7 +447,8 @@ public structure ModuleTimes where
   /-- Modules whose compile job ran in this build (compiled or up to date), so their sources exist. -/
   seen : IO.Ref (List Name)
 
-public def ModuleTimes.load (path : FilePath) : IO ModuleTimes := do
+@[nospecialize] public def ModuleTimes.load [logger : MonadLog BaseIO] (path : FilePath) :
+    IO ModuleTimes := do
   -- Stamp before reading: a write that lands in between makes the stamp stale, never the record.
   let stamp? ← moduleTimesStamp? path
   let file ← readModuleTimes path
@@ -521,8 +528,8 @@ def bsearch (n : Nat) (cmp : Nat → Ordering) : Option Nat := Id.run do
 /--
 Writes this build's entries over the record as it is on disk now, and recomputes every remaining
 path. If the file's size or modification time changed since `load` (another Lake process saved it
-during this build), the file is read again, so that process's entries survive; otherwise the
-record read by `load` is reused.
+during this build), the file is read again, so that process's entries survive (a file that no
+longer parses is replaced, as `readModuleTimes` says); otherwise the record read by `load` is reused.
 
 A row of the file is kept if its module was not compiled again and either its compile job ran in
 this build or `sourceOf` resolves it to a source file that exists. A row with a compile time keeps
@@ -533,7 +540,8 @@ new line takes the importer's path into its remaining path.
 Writes nothing and returns 0 when this build compiled nothing; otherwise returns how many entries
 this build recorded.
 -/
-public def ModuleTimes.save (self : ModuleTimes) (sourceOf : Name → Option FilePath) : IO Nat := do
+@[nospecialize] public def ModuleTimes.save [logger : MonadLog BaseIO] (self : ModuleTimes)
+    (sourceOf : Name → Option FilePath) : IO Nat := do
   let new ← self.new.get
   if new.isEmpty then return 0
   let file ←
