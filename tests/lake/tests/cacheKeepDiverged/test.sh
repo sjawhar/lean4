@@ -67,3 +67,21 @@ test_exp -f "$LAKE_CACHE_DIR/quarantine/$(basename "$ENTRY").0"
 test_cmd cmp x.genuine "$ENTRY"
 mkp v3; setx v3 2
 test_truth v3
+
+# A tree whose intact `X.olean` is not the cache entry, while the entry cannot be read: the tree
+# keeps its file and the build says why it did not link it to the entry
+mkp t4; setx t4 2
+test_run -d t4 build P.X
+test_cmd cp "t4/$X_OLEAN" x.copy
+test_cmd rm -f "t4/$X_OLEAN"
+test_cmd mv x.copy "t4/$X_OLEAN"
+ENTRY="$(entry t4)"
+test_cmd chmod 000 "$ENTRY"
+if cat "$ENTRY" > /dev/null 2>&1; then
+  echo "SKIPPED: the entry is still readable (running as root?)"
+else
+  test_err 'could not read the cache entry' -d t4 build P.D
+  test_run -d t4 build P.E
+  test_cmd cmp x.genuine "t4/$X_OLEAN"
+fi
+test_cmd chmod 444 "$ENTRY"

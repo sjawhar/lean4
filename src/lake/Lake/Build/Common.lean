@@ -856,7 +856,10 @@ public def restoreArtifact
         else
           logWarning s!"{art.path}: cached artifact does not match its content hash; \
             {← quarantineEntry art}"
-      | .error _ => pure () -- the entry is gone: keep the file
+      | .error (.noFileOrDirectory ..) => pure () -- the entry is gone: keep the file
+      | .error e =>
+        logWarning s!"{art.path}: could not read the cache entry to link {file} to it; \
+          keeping the file: {e}"
       writeFileHash file art.hash
       return art.useLocalFile file
     logWarning s!"{file}: does not match the cache entry its trace names; restoring the entry\
