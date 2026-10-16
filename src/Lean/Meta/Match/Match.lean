@@ -1079,8 +1079,11 @@ private structure MatcherKey where
   isPrivate : Bool
 deriving BEq, Hashable
 
-private builtin_initialize matcherExt : EnvExtension (PHashMap MatcherKey Name) ←
-  registerEnvExtension (pure {}) (asyncMode := .local)  -- mere cache, keep it local
+private builtin_initialize matcherExt : EnvExtension (PHashMap MatcherKey Name) ← do
+  let ext ← registerEnvExtension (pure {}) (asyncMode := .local)
+  registerCommandCacheExtension `Lean.Meta.Match.matcherExt ext
+    (fun before after => after.toList.toArray.filter fun (k, _) => !before.contains k)
+    (fun state (k, n) => state.insert k n)
 
 /-- Serializable view of the matcher cache used by per-command usage recording. -/
 def matcherCacheEntries (env : Environment) : Array (Expr × Bool × Bool × Name) :=

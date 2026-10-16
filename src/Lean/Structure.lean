@@ -419,8 +419,12 @@ structure StructureResolutionState where
 We use an environment extension to cache resolution orders.
 These are not expensive to compute, but worth caching, and we save olean storage space.
 -/
-builtin_initialize structureResolutionExt : EnvExtension StructureResolutionState ←
-  registerEnvExtension (pure {}) (asyncMode := .local)  -- mere cache
+builtin_initialize structureResolutionExt : EnvExtension StructureResolutionState ← do
+  let ext ← registerEnvExtension (pure {}) (asyncMode := .local)  -- mere cache
+  registerCommandCacheExtension `Lean.structureResolutionExt ext
+    (fun before after =>
+      after.resolutions.toList.toArray.filter fun (k, _) => !before.resolutions.contains k)
+    (fun state (k, v) => { resolutions := state.resolutions.insert k v })
 
 /-- Structure-resolution cache entries used by per-command usage recording. -/
 def structureResolutionCacheEntries (env : Environment) : Array (Name × Array Name) :=

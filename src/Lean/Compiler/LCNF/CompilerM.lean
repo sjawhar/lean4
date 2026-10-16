@@ -554,13 +554,19 @@ deriving Inhabited
 
 namespace CacheExtension
 
-def register [BEq α] [Hashable α] [Inhabited β] :
-    IO (CacheExtension α β) :=
-  CacheExtension.mk <$> registerEnvExtension (pure ([], {})) (asyncMode := .sync)  -- compilation is non-parallel anyway
+def register [BEq α] [Hashable α] [Inhabited β] (name : Name) :
+    IO (CacheExtension α β) := do
+  let ext ← registerEnvExtension (pure ([], {})) (asyncMode := .sync)
     (replay? := some fun oldState newState _ s =>
       let newEntries := newState.1.take (newState.1.length - oldState.1.length)
       newEntries.foldl (init := s) fun s e =>
         (e :: s.1, s.2.insert e (newState.2.find! e)))
+  let ext ← registerCommandCacheExtension name ext
+    (fun before after =>
+      (after.1.take (after.1.length - before.1.length)).reverse.toArray.map fun key =>
+        (key, after.2.find! key))
+    (fun state (key, value) => (key :: state.1, state.2.insert key value))
+  return CacheExtension.mk ext
 
 def insert [BEq α] [Hashable α] [Inhabited β] (ext : CacheExtension α β) (a : α) (b : β) : CoreM Unit := do
   modifyEnv (ext.modifyState · fun ⟨as, m⟩ => (a :: as, m.insert a b))

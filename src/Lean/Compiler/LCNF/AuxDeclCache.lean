@@ -18,7 +18,8 @@ structure  AuxDeclCacheKey where
   decl : Decl pu
   deriving BEq, Hashable
 
-builtin_initialize auxDeclCacheExt : CacheExtension AuxDeclCacheKey Name ← CacheExtension.register
+builtin_initialize auxDeclCacheExt : CacheExtension AuxDeclCacheKey Name ←
+  CacheExtension.register `Lean.Compiler.LCNF.auxDeclCacheExt
 
 inductive CacheAuxDeclResult where
   | new

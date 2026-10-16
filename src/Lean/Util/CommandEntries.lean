@@ -11,11 +11,10 @@ public import Lean.ScopedEnvExtension
 public section
 namespace Lean
 
-/-- Changed non-persistent extension states made by a command, keyed by their stable extension index. Whole
-states are required because environment extensions have no common entry API; D-ctx guarantees the pre-state is
-identical before a payload can be replayed. -/
+/-- The entries a command added to each non-persistent cache, keyed by the cache's registered name
+(`registerCommandCacheExtension`), each erased from the cache's own entry type. -/
 structure CommandCaches where
-  states : Array (Nat × EnvExtensionEntry) := #[]
+  deltas : Array (Name × Array EnvExtensionEntry) := #[]
   deriving Nonempty
 private unsafe def scopedEntryOfEntryImpl (entry : EnvExtensionEntry) :
     ScopedEnvExtension.Entry EnvExtensionEntry :=
@@ -59,12 +58,6 @@ private def compactEntryBytes (path : System.FilePath) (entry : EnvExtensionEntr
   let _ ← unsafe CompactedRegion.save path `commandEntry entry #[] none (allowClosures := allowClosures)
   IO.FS.readBinFile path
 
-private unsafe def envStatePtrEqImpl (a b : EnvExtensionState) : Bool :=
-  ptrEq a b
-
-@[implemented_by envStatePtrEqImpl]
-private opaque envStatePtrEq (a b : EnvExtensionState) : Bool
-
 private def entryDelta (dir : System.FilePath) (extName : Name)
     (before after : Array EnvExtensionEntry) : IO (Array EnvExtensionEntry) := do
   let mut counts : Std.HashMap ByteArray Nat := {}
@@ -80,8 +73,9 @@ private def entryDelta (dir : System.FilePath) (extName : Name)
     | _ => delta := delta.push entry
   return delta
 
-/-- Captures one command's exported-entry multiset delta. Comparing compacted bytes works for arbitrary
-type-erased extension entries and does not rely on sorted exporters preserving an array prefix. -/
+/-- Captures one command's exported-entry multiset delta, its scoped local entries, and its typed cache
+deltas. Comparing compacted bytes works for arbitrary type-erased extension entries and does not rely on
+sorted exporters preserving an array prefix. -/
 def recordCommandDelta (before after : Environment) (idx : Nat) : IO Environment :=
   IO.FS.withTempDir fun dir => do
     let beforeEntries := (← before.computeExtEntries).private
@@ -104,22 +98,11 @@ def recordCommandDelta (before after : Environment) (idx : Nat) : IO Environment
     let beforeLocals := localEntriesExt.getState (asyncMode := .local) before |>.size
     let afterLocals := localEntriesExt.getState (asyncMode := .local) after
     let locals := afterLocals.extract beforeLocals afterLocals.size
-    let pExts ← persistentEnvExtensionsRef.get
-    let persistentIdxs := pExts.foldl
-      (fun s ext => s.insert ext.toEnvExtension.index) ({} : Std.HashSet Nat)
-    let beforeStates ← EnvExtension.snapshotStates before
-    let afterStates ← EnvExtension.snapshotStates after
-    let mut states := #[]
-    for i in [:afterStates.size] do
-      if i < beforeStates.size && !persistentIdxs.contains i &&
-          i != localEntriesExt.index && i != scopeDepthExt.index &&
-          !envStatePtrEq beforeStates[i]! afterStates[i]! then
-        let b := eraseEnvExtensionEntry beforeStates[i]!
-        let a := eraseEnvExtensionEntry afterStates[i]!
-        let bb ← compactEntryBytes (dir / s!"cache-before-{i}") b (allowClosures := true)
-        let ab ← compactEntryBytes (dir / s!"cache-after-{i}") a (allowClosures := true)
-        unless bb == ab do states := states.push (i, a)
-    return commandEntriesExt.addEntry after { idx, entries, locals, caches := { states }, unreplayable }
+    let caches := (← commandCacheExtensionsRef.get).filterMap fun ext =>
+      let delta := ext.delta before after
+      if delta.isEmpty then none else some (ext.name, delta)
+    return commandEntriesExt.addEntry after
+      { idx, entries, locals, caches := { deltas := caches }, unreplayable }
 
 /-- Replaces the current module's command payload with `entries` before writing its `.olean`. -/
 def setCommandEntries (env : Environment) (entries : Array CommandEntries) : Environment :=
@@ -178,8 +161,12 @@ def replayCommandEntries (env : Environment) (ce : CommandEntries) (dStart : Nat
       env := ext.addLocalEntry env b
     else
       env := appendLocalEntries env #[(depth, name, entry)]
-  for (idx, state) in ce.caches.states do
-    env ← EnvExtension.restoreStateAt env idx (envExtensionStateOfEntry state)
+  let cacheByName : Std.HashMap Name CommandCacheExtension :=
+    (← commandCacheExtensionsRef.get).foldl (fun m ext => m.insert ext.name ext) {}
+  for (name, delta) in ce.caches.deltas do
+    let some ext := cacheByName[name]? |
+      throw <| IO.userError s!"unknown command cache extension {name}"
+    env := ext.replay env delta
   return env
 
 end Lean
