@@ -365,6 +365,7 @@ def mkBuildContext
       return none
   registeredJobs := jobs
   sidecarCache := ← Std.Mutex.new {}
+  fileHashCache := ← Std.Mutex.new {}
   leanTrace := .ofHash (pureHash ws.lakeEnv.leanGithash)
     s!"Lean {Lean.versionStringCore}, commit {ws.lakeEnv.leanGithash}"
   cancelTk?
