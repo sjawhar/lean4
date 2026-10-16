@@ -61,7 +61,9 @@ test_cmd cp u/$X_OLEAN "$ENTRY.new"
 test_cmd mv -f "$ENTRY.new" "$ENTRY"
 test_truth t3
 test_cmd cmp x.genuine "t3/$X_OLEAN"
-# The bad entry is out of the cache, so a fresh tree does not restore it
-test_exp ! -e "$ENTRY"
+# The bad entry is in quarantine, and the tree's next re-cache put its genuine file back under the
+# entry's name, so a fresh tree restores genuine bytes
+test_exp -f "$LAKE_CACHE_DIR/quarantine/$(basename "$ENTRY").0"
+test_cmd cmp x.genuine "$ENTRY"
 mkp v3; setx v3 2
 test_truth v3
