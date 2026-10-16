@@ -255,9 +255,8 @@ echo "# REPUBLISH, RESTORING TREE FIRST"
 
 # (j') The same, but tree B retries (and rebuilds, re-caching genuine bytes under the original
 # hash) before tree A builds again. The mappings still name only the original hashes and no new
-# artifact appears. Tree A then keeps its corrupt hard-linked file without any message: its trace
-# replays and its file exists, so nothing is restored and nothing is checked. That is corruption
-# of a file after its restore, which this check does not cover; this records it as residual state.
+# artifact appears. Tree A's trace then resolves to the new entry, which its corrupt file (the
+# old, quarantined inode) no longer shares a modification time with: A restores the entry over it.
 reset_work
 new_tree A
 test_run -d "$WORK_DIR/A" build
@@ -271,9 +270,10 @@ test_quarantined 1 "$ENTRY"
 test_out 'Built Test.Basic' -d "$WORK_DIR/B" build
 test_cache_unchanged
 test_cmd cmp "$GENUINE" "$(in_tree B $OLEAN)"
-test_not_out "$RECACHE_MSG" -d "$WORK_DIR/A" build
+test_out 'does not match the cache entry its trace names' -d "$WORK_DIR/A" build
+no_match_text "$RECACHE_MSG" produced.out
 test_cache_unchanged
-test_cmd_fails cmp -s "$GENUINE" "$(in_tree A $OLEAN)" # residual: A's file is still corrupt
+test_cmd cmp "$GENUINE" "$(in_tree A $OLEAN)"
 test_cmd cmp "$GENUINE" "$ENTRY"
 
 echo "# REPUBLISH OF AN ARCHIVE"
