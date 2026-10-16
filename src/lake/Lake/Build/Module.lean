@@ -1337,9 +1337,7 @@ where
             -- hash, so only do it on a verified hash match. An mtime-only match
             -- leaves the hash unconfirmed, so rebuild instead.
             if status == .hashUpToDate then
-              if (← localLtarIntact) then
-                mod.unpackLtar mod.ltarFile depTrace.hash
-              else
+              unless (← unpackLocalLtar depTrace.hash) do
                 discard <| mod.buildLean presetup
             else
               discard <| mod.buildLean presetup
@@ -1367,9 +1365,7 @@ where
         unless (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) do
           -- As above: restore on a hash match and rebuild on a mtime match.
           if status == .hashUpToDate then
-            if (← localLtarIntact) then
-              mod.unpackLtar mod.ltarFile depTrace.hash
-            else
+            unless (← unpackLocalLtar depTrace.hash) do
               discard <| mod.buildLean presetup
           else
             discard <| mod.buildLean presetup
@@ -1387,17 +1383,27 @@ where
               mod.buildLean presetup
         else
           mod.buildLean presetup
-  -- Whether the module's own `.ltar` may be unpacked: the archive carries its own trace, which
-  -- vouches only for the archive, so it must still have the hash recorded when it was packed. If
-  -- it does not, or none is recorded, removes it (the caller then rebuilds).
-  localLtarIntact : JobM Bool := do
+  -- Unpacks the module's own `.ltar` (stamped with `inputHash`) into the build directory and
+  -- returns whether it did. The archive carries its own trace, which vouches only for the archive,
+  -- so it must still have the hash recorded when it was packed; if it does not, or none is
+  -- recorded, it is removed instead (the caller then rebuilds). The old trace is removed first:
+  -- leantar skips members that already exist when the trace's input hash matches, so it would keep
+  -- outputs that are not the archive's. If the unpack fails, the module's outputs, their `.hash`
+  -- files and its trace are removed, so that a retry cannot replay a partial result.
+  unpackLocalLtar (inputHash : Hash) : JobM Bool := do
     let expected? ← Hash.load? (mod.ltarFile.toString ++ ".hash")
-    if expected? == some (← computeFileHash mod.ltarFile) then
-      return true
-    logWarning s!"{mod.ltarFile}: does not match the hash recorded when it was packed; rebuilding"
-    removeFileIfExists mod.ltarFile
-    clearFileHash mod.ltarFile
-    return false
+    unless expected? == some (← computeFileHash mod.ltarFile) do
+      logWarning s!"{mod.ltarFile}: does not match the hash recorded when it was packed; rebuilding"
+      removeFileIfExists mod.ltarFile
+      clearFileHash mod.ltarFile
+      return false
+    removeFileIfExists mod.traceFile
+    try mod.unpackLtar mod.ltarFile inputHash catch e =>
+      mod.clearOutputArtifacts
+      mod.clearOutputHashes
+      removeFileIfExists mod.traceFile
+      throw e
+    return true
 
 /-- The `ModuleFacetConfig` for the builtin `elabArtsFacet`. -/
 public def Module.elabArtsFacetConfig : ModuleFacetConfig elabArtsFacet :=
