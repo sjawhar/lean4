@@ -459,3 +459,195 @@ test_cmd rm -rf .lake/build "$CACHE_DIR"
 test_out "for revision $OLD_REV" cache get --scope=staged --service=ok --rev="$OLD_REV"
 test_artifacts "$NUM_ARTS"
 test_run build Test --no-build
+
+echo "# INTEGRITY TESTS"
+
+# A `LEAN_SYSROOT` farm whose `leantar` wrapper can corrupt one byte of each file named in
+# `CORRUPT_LEANTAR_FILES` (colon-separated) immediately after an unpack (`-x`), simulating a
+# leantar round-trip bug (e.g. its `ByteArray` element-size bug) deterministically, without
+# depending on a real bug being present in the toolchain's own `leantar`.
+FARM_DIR="$WORK_DIR/leantar-farm"
+mkdir -p "$FARM_DIR/bin"
+for entry in "$LEAN_SYSROOT"/*; do
+  name="$(basename "$entry")"
+  [ "$name" = bin ] || ln -s "$entry" "$FARM_DIR/$name"
+done
+for entry in "$LEAN_SYSROOT/bin"/*; do
+  name="$(basename "$entry")"
+  case "$name" in
+    leantar|leantar.exe) ;;
+    *) ln -s "$entry" "$FARM_DIR/bin/$name" ;;
+  esac
+done
+REAL_LEANTAR="$(norm_path "$LEAN_SYSROOT")/bin/leantar"
+if [ -f "$REAL_LEANTAR.exe" ]; then REAL_LEANTAR="$REAL_LEANTAR.exe"; fi
+cat > "$FARM_DIR/bin/leantar" << EOF
+#!/usr/bin/env bash
+set -euo pipefail
+"$REAL_LEANTAR" "\$@"
+if [ -n "\${CORRUPT_LEANTAR_FILES:-}" ]; then
+  is_unpack=false
+  for arg; do [ "\$arg" = "-x" ] && is_unpack=true; done
+  if \$is_unpack; then
+    IFS=: read -ra files <<< "\$CORRUPT_LEANTAR_FILES"
+    for f in "\${files[@]}"; do
+      marker="\$f.corrupted-once"
+      if [ -f "\$f" ] && [ ! -f "\$marker" ]; then
+        "$PYTHON" -c "
+path = '\$f'
+with open(path, 'r+b') as h:
+    b = h.read(1)
+    h.seek(0)
+    h.write(bytes([b[0] ^ 0xFF]))
+"
+        touch "\$marker"
+      fi
+    done
+  fi
+fi
+EOF
+chmod +x "$FARM_DIR/bin/leantar"
+export LAKE_OVERRIDE_LEAN=true
+export LEAN_SYSROOT="$FARM_DIR"
+
+BASIC_OLEAN="$WORK_DIR/.lake/build/lib/lean/Test/Basic.olean"
+BASIC_ILEAN="$WORK_DIR/.lake/build/lib/lean/Test/Basic.ilean"
+BASIC_C="$WORK_DIR/.lake/build/ir/Test/Basic.c"
+BASIC_LTAR="$WORK_DIR/.lake/build/ir/Test/Basic.ltar"
+MISMATCH_MSG='restored artifacts do not match their recorded hashes'
+
+# Verify the farm itself changes nothing when corruption is not requested
+# (a negative control for the farm wrapper, separate from the fix under test below)
+test_cmd rm -rf .lake/build "$CACHE_DIR"
+test_run cache get --scope=test --service=ok
+test_run build Test --no-build
+
+# Verify a corrupted `.ltar` unpack (the cross-machine `cache get` round trip, e.g.
+# leantar's `ByteArray` element-size bug) is caught and fails loudly, rather than
+# Lake reporting "All targets up-to-date" over silently drifted bytes
+test_cmd rm -rf .lake/build "$CACHE_DIR"
+test_run cache get --scope=test --service=ok
+CORRUPT_LEANTAR_FILES="$BASIC_OLEAN" test_err "$MISMATCH_MSG" build Test --no-build
+match_text 'Test.Basic:' produced.out
+match_text 'archive:' produced.out
+match_text 'expected:' produced.out
+match_text 'actual:' produced.out
+# The corrupted build-directory copy is removed, not silently kept or re-cached
+test_exp ! -e "$BASIC_OLEAN"
+# A clean retry (no corruption) then restores correctly: the cache's own outputs mapping and
+# artifact survive (only the build-directory copy and trace were removed), so this still works
+# under `--no-build`
+test_run build Test --no-build
+
+# Verify two artifacts of the same module drifting at once (leantar's ByteArray bug drifts every
+# olean part of a module-system module) are both caught and both removed in a single failure,
+# not just the first — otherwise a retry could silently serve the second drifted file
+test_cmd rm -rf .lake/build "$CACHE_DIR"
+test_run cache get --scope=test --service=ok
+test_run build Test --no-build
+BASIC_C_HASH="$(cat "$BASIC_C.hash")"
+test_cmd rm -rf .lake/build
+test_run cache get --scope=test --service=ok
+CORRUPT_LEANTAR_FILES="$BASIC_OLEAN:$BASIC_C" test_err "$MISMATCH_MSG" build Test --no-build
+test_exp "$(grep -c 'artifact:' produced.out)" = 2
+test_exp ! -e "$BASIC_OLEAN"
+test_exp ! -e "$BASIC_C"
+test_run build Test --no-build
+test_cmd cmp -s "$BASIC_C" "$CACHE_DIR/artifacts/$BASIC_C_HASH.c"
+
+# Verify the `.ltar` branch also checks when individual genuine artifacts (not only the
+# archive) are already in the local cache from the build that produced them: a normal writable
+# build caches both, so registering just the bare `.ltar` mapping (as `cache put`/`get` do)
+# over that cache reproduces it; verification no longer depends on how that mapping resolves,
+# so this must catch a corruption exactly as readily as a fresh download does
+test_cmd rm -rf .lake/build "$CACHE_DIR"
+test_run build Test -o outputs.jsonl
+test_cmd rm -rf .lake/build
+test_run cache add outputs.jsonl --scope=test --service=ok
+CORRUPT_LEANTAR_FILES="$BASIC_OLEAN" test_err "$MISMATCH_MSG" build Test --no-build
+test_exp ! -e "$BASIC_OLEAN"
+test_run build Test --no-build
+
+# Verify a corrupted restore fails loudly without `--no-build` too, rather than silently
+# recompiling the importer against the corrupted importee
+test_cmd rm -rf .lake/build "$CACHE_DIR"
+test_run cache get --scope=test --service=ok
+CORRUPT_LEANTAR_FILES="$BASIC_OLEAN" test_err "$MISMATCH_MSG" build Test
+no_match_text 'Built Test' produced.out
+test_run build Test --no-build
+
+# Verify the same for a local restore from an already-built `.ltar`
+# (`LAKE_RESTORE_ARTIFACTS=true`): delete only the module's build outputs, keeping its local
+# `.ltar` and trace, so Lake unpacks the local archive instead of rebuilding or re-fetching
+test_cmd rm -rf .lake/build "$CACHE_DIR"
+test_run build Test -o outputs.jsonl
+test_exp -f "$BASIC_LTAR"
+# Clear the local artifact cache too, so Lake can't shortcut through a cache-dir hit
+# and must unpack the local `.ltar` instead
+test_cmd rm -rf "$CACHE_DIR"
+test_cmd rm -f "$BASIC_OLEAN" "$BASIC_ILEAN" "$BASIC_C"
+CORRUPT_LEANTAR_FILES="$BASIC_OLEAN" LAKE_RESTORE_ARTIFACTS=true \
+  test_err "$MISMATCH_MSG" build Test --no-build
+test_exp ! -e "$BASIC_OLEAN"
+# Removing the local `.ltar`'s own trace on a mismatch means `--no-build` can no longer resolve
+# this module at all (there is nothing left to verify a restore against), so recovery needs a
+# real (non---no-build) build; confirm it recompiles cleanly rather than failing or recurring
+LAKE_RESTORE_ARTIFACTS=true test_run build Test
+test_exp -f "$BASIC_OLEAN"
+
+# Verify the non-writable, readable-cache path (the default when `enableArtifactCache` is unset,
+# e.g. a dependency's own packages): a fresh `.ltar` restore here must verify too, not just
+# trust the archive because nothing will be re-cached
+test_cmd rm -rf .lake/build "$CACHE_DIR"
+test_run build Test -o outputs.jsonl
+test_cmd sed_i '/enableArtifactCache/d' lakefile.toml
+test_cmd rm -rf .lake/build
+test_cmd find "$CACHE_DIR/artifacts" -type f ! -name '*.ltar' -delete
+test_cmd rm -rf "$CACHE_DIR/outputs"
+test_run cache add outputs.jsonl --scope=test --service=ok
+CORRUPT_LEANTAR_FILES="$BASIC_OLEAN" test_err "$MISMATCH_MSG" build Test --no-build
+test_exp ! -e "$BASIC_OLEAN"
+test_run build Test --no-build
+
+# Verify the same for the non-writable local unpack of an already-built `.ltar`
+test_cmd rm -f "$BASIC_OLEAN" "$BASIC_ILEAN" "$BASIC_C" "$BASIC_OLEAN.corrupted-once"
+test_exp -f "$BASIC_LTAR"
+CORRUPT_LEANTAR_FILES="$BASIC_OLEAN" test_err "$MISMATCH_MSG" build Test --no-build
+test_exp ! -e "$BASIC_OLEAN"
+test_cmd sed_i '1a enableArtifactCache = true' lakefile.toml
+
+# Verify a writable local `.ltar` restore still caches the `.ltar` itself, so that an outputs
+# file recorded by that build can be staged (`cache stage` needs each recorded artifact cached)
+test_cmd rm -rf .lake/build "$CACHE_DIR"
+test_run build Test -o outputs.jsonl
+test_cmd rm -rf "$CACHE_DIR"
+test_cmd rm -f "$BASIC_OLEAN" "$BASIC_ILEAN" "$BASIC_C"
+test_run build Test -o outputs2.jsonl
+test_exp -f "$BASIC_OLEAN"
+test_cmd rm -rf staging2
+test_run cache stage outputs2.jsonl staging2
+# Verify the C file that restore saved, and its cache entry, are not executable
+test_exp ! -x "$BASIC_C"
+for c in "$CACHE_DIR"/artifacts/*.c; do test_exp ! -x "$c"; done
+
+# Verify the same for the C files of a fresh `.ltar` restore from a writable cache
+test_cmd rm -rf .lake/build "$CACHE_DIR"
+test_run cache get --scope=test --service=ok
+test_run build Test --no-build
+test_exp ! -x "$BASIC_C"
+for c in "$CACHE_DIR"/artifacts/*.c; do test_exp ! -x "$c"; done
+
+# Verify the first restore of a module from a `.ltar` replays the module's archived build log,
+# so that a `--wfail` build fails on a module with a warning, as a rebuild or a replay does
+echo 'theorem warns : True := sorry' >> Test/Basic.lean
+test_cmd rm -rf .lake/build "$CACHE_DIR"
+test_run build Test -o outputs.jsonl
+test_cmd rm -rf .lake/build
+test_cmd find "$CACHE_DIR/artifacts" -type f ! -name '*.ltar' -delete
+test_cmd rm -rf "$CACHE_DIR/outputs"
+test_run cache add outputs.jsonl --scope=test --service=ok
+test_err 'sorry' build Test --no-build --wfail
+test_err 'sorry' build Test --no-build --wfail
+
+unset LAKE_OVERRIDE_LEAN
+unset LEAN_SYSROOT
