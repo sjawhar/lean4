@@ -743,34 +743,89 @@ public def computeArtifact (path : FilePath) (ext := "art") (text := false) : Jo
   let mtime := (← getMTime path |>.toBaseIO).toOption.getD 0
   return {descr := artifactWithExt hash ext, name := path.toString, path, mtime}
 
+/-- Hashes `bytes` as `computeFileHash` does; text that is not valid UTF-8 has no hash. -/
+def hashBytes? (bytes : ByteArray) (text : Bool) : Option Hash :=
+  if text then Hash.ofText <$> String.fromUTF8? bytes else some (Hash.ofByteArray bytes)
+
+/--
+Moves the cache entry of `art` into the cache's quarantine directory if it is an entry of the
+cache's artifact directory, and describes what happened to it.
+-/
+def quarantineEntry (art : Artifact) : JobM String := do
+  let cache ← getLakeCache
+  -- Never move a path that a mapping could point outside the artifact directory.
+  if art.descr.relPath.components.length == 1 &&
+      art.path == cache.artifactDir / art.descr.relPath then
+    describeQuarantine cache art.path art.descr.relPath.toString
+  else
+    return "left it in place: it is not an entry of the cache's artifact directory"
+
 /--
 Makes an artifact from the cache, `art`, available at the local path, `file` and returns an
 altered artifact using `file` as the preferred path.
 
-If `file` already exists, it is used. Otherwise, the function first attempts to create `file`
-as hard link to the artifact. If this fails (e.g., because the artifact and path are on differets
-drives and/or file systems), falls back to copying the artifact to the new path.
+If `file` already exists and is the cache entry (e.g., a hard link to it), it is used. Any other
+existing `file` is hashed (as text if `text := true`): if it has the artifact's hash, it is used,
+and replaced by a hard link to the entry if the entry has that hash too (otherwise the entry is
+moved into the cache's quarantine directory, with a warning); if it does not, it was changed after
+it was produced, and it is replaced by the cache entry, with a warning.
+
+To restore `file`, the function attempts to create it as hard link to the artifact. If this fails
+(e.g., because the artifact and path are on differets drives and/or file systems), falls back to
+copying the artifact to the new path.
 
 **For internal use.**
 -/
-public def restoreArtifact (file : FilePath) (art : Artifact) (exe := false) : LogIO Artifact := do
-  unless (← file.pathExists) do
-    logVerbose s!"found artifact in cache: {art.path}"
-    createParentDirs file
-    if let .error e ← (IO.FS.hardLink art.path file).toBaseIO then
-      logVerbose s!"could not hard link artifact, copying from cache instead; error: {e}"
-      copyFile art.path file
-      -- make the local file unwritable where possible to discourage users from
-      -- writing to such paths as this can corrupt the cache if the file was hard linked instead
-      let r := {read := true, write := false, execution := exe}
-      IO.setAccessRights file ⟨r, r, r⟩
-    else if exe then
-      -- Ensure restored executables are executable
-      -- They may not have been if acquired through `lake cache get`
-      let r := {read := true, write := false, execution := exe}
-      IO.setAccessRights file ⟨r, r, r⟩
-    logVerbose s!"restored artifact from cache to: {file}"
-    writeFileHash file art.hash
+public def restoreArtifact
+  (file : FilePath) (art : Artifact) (exe text := false)
+: JobM Artifact := do
+  let isEntry ← if art.path == file then file.pathExists else
+    (· matches .ok true) <$> (file.isSameFile art.path).toBaseIO
+  if isEntry then
+    return art.useLocalFile file
+  if art.path != file && (← file.pathExists) then
+    if hashBytes? (← IO.FS.readBinFile file) text == some art.hash then
+      -- Link it to the entry, so that later builds take the identity path above, but only to an
+      -- entry with the same hash: the file's own bytes say nothing about the entry's
+      match (← (IO.FS.readBinFile art.path).toBaseIO) with
+      | .ok entry =>
+        if hashBytes? entry text == some art.hash then
+          let tmp := file.addExtension "relink"
+          removeFileIfExists tmp
+          if let .ok _ ← (IO.FS.hardLink art.path tmp).toBaseIO then
+            IO.FS.rename tmp file
+            if exe then
+              let r := {read := true, write := false, execution := exe}
+              IO.setAccessRights file ⟨r, r, r⟩
+        else
+          logWarning s!"{art.path}: cached artifact does not match its content hash; \
+            {← quarantineEntry art}"
+      | .error (.noFileOrDirectory ..) => pure () -- the entry is gone: keep the file
+      | .error e =>
+        logWarning s!"{art.path}: could not read the cache entry to link {file} to it; \
+          keeping the file: {e}"
+      writeFileHash file art.hash
+      return art.useLocalFile file
+    logWarning s!"{file}: does not match the cache entry its trace names; restoring the entry\
+      \n  cache entry: {art.path}"
+    removeFileIfExists file
+    clearFileHash file
+  logVerbose s!"found artifact in cache: {art.path}"
+  createParentDirs file
+  if let .error e ← (IO.FS.hardLink art.path file).toBaseIO then
+    logVerbose s!"could not hard link artifact, copying from cache instead; error: {e}"
+    copyFile art.path file
+    -- make the local file unwritable where possible to discourage users from
+    -- writing to such paths as this can corrupt the cache if the file was hard linked instead
+    let r := {read := true, write := false, execution := exe}
+    IO.setAccessRights file ⟨r, r, r⟩
+  else if exe then
+    -- Ensure restored executables are executable
+    -- They may not have been if acquired through `lake cache get`
+    let r := {read := true, write := false, execution := exe}
+    IO.setAccessRights file ⟨r, r, r⟩
+  logVerbose s!"restored artifact from cache to: {file}"
+  writeFileHash file art.hash
   return art.useLocalFile file
 
 /-- **For internal use only.** -/
@@ -811,7 +866,7 @@ public def buildArtifactUnlessUpToDate
         removeFileIfExists file
         writeFetchTrace traceFile inputHash (toJson art.descr)
       if restore then
-        some <$> restoreArtifact file art exe
+        some <$> restoreArtifact file art exe text
       else
         return some art
     let art ← id do
