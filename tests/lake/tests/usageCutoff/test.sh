@@ -160,14 +160,16 @@ test_err "error: Test/OJ.lean" build -v Test.OJ
 no_match_text "Replayed Test.OJ" produced.out
 # an import's .olean compiled from other contents behind Lake's back, with its source and sidecars as
 # they were: under `--rehash` its importer, compiled against the old .olean, is checked against the new
-# one, not against the old `.usage` (which its key binds to the old .olean), so it compiles again and fails
+# one, not against the old `.usage` (which its key binds to the old .olean), so it compiles again and fails.
+# With the artifact cache on, Lake takes VA's hash from its cache entry, not the rewritten file, so VM's
+# trace stays up to date and VM replays with the cutoff off too: this block runs with the cache off
 printf 'def va := 1\n' > Test/VA.lean
 printf 'import Test.VA\ntheorem vm : va = 1 := rfl\n' > Test/VM.lean
-test_run build Test.VM
+LAKE_ARTIFACT_CACHE=false test_run build Test.VM
 printf 'def va := 2\n' > Test/VA.lean
 "$LAKE" env lean Test/VA.lean -o .lake/build/lib/lean/Test/VA.olean
 printf 'def va := 1\n' > Test/VA.lean
-test_err "error: Test/VM.lean" --rehash build -v Test.VM
+LAKE_ARTIFACT_CACHE=false test_err "error: Test/VM.lean" --rehash build -v Test.VM
 no_match_text "Replayed Test.VM" produced.out
 # without `--rehash`, such an .olean keeps its old `.hash`, which the check never reads: it hashes the
 # bytes. HM's trace goes stale through an unrelated edit to HX, so a build without the cutoff compiles HM
