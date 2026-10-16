@@ -29,6 +29,7 @@ public def mkBuildContext (ws : Workspace) (config : BuildConfig) : BaseIO Build
     opaqueWs := ws,
     toBuildConfig := config,
     registeredJobs := ← IO.mkRef #[],
+    sidecarCache := ← Std.Mutex.new {}
     leanTrace := .ofHash (pureHash ws.lakeEnv.leanGithash)
       s!"Lean {Lean.versionStringCore}, commit {ws.lakeEnv.leanGithash}"
   }
@@ -353,6 +354,7 @@ def mkBuildContext'
     else
       return none
   registeredJobs := jobs
+  sidecarCache := ← Std.Mutex.new {}
   leanTrace := .ofHash (pureHash ws.lakeEnv.leanGithash)
     s!"Lean {Lean.versionStringCore}, commit {ws.lakeEnv.leanGithash}"
 }

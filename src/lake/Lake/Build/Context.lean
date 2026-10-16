@@ -9,6 +9,7 @@ prelude
 public import Lake.Config.Cache
 public import Lake.Config.Context
 public import Lake.Build.Job.Basic
+public import Std.Sync.Mutex
 
 open System
 namespace Lake
@@ -87,6 +88,8 @@ public structure BuildContext extends BuildConfig, Context where
   If `none`, tracking outputs is disabled for this build.
   -/
   outputsRef? : Option CacheRef := none
+  /-- Parsed usage-cutoff sidecars, shared by every module job in this build. -/
+  sidecarCache : Std.Mutex (Std.HashMap FilePath Dynamic)
 
 /-- A transformer to equip a monad with a `BuildContext`. -/
 public abbrev BuildT := ReaderT BuildContext
