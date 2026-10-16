@@ -6,12 +6,18 @@ of a locked handle keeps the lock after the parent has freed that handle, until 
 
 def testFile := "handleInheritable.lean.lock"
 
-/-- Locks `testFile` through a handle that is freed on return, after spawning a child that sleeps. -/
+/--
+Locks `testFile` through a handle that is freed (without unlocking it) on return, after spawning
+a child that sleeps.
+-/
 def lockAndSpawn (inheritable : Bool) : IO (IO.Process.Child {}) := do
   let h ← IO.FS.Handle.mk testFile .write
   h.lock
   h.setInheritable inheritable
-  IO.Process.spawn {cmd := "sleep", args := #["30"]}
+  let child ← IO.Process.spawn {cmd := "sleep", args := #["30"]}
+  -- a use after the spawn, so that the handle is not freed before it
+  h.flush
+  return child
 
 /-- Whether the lock outlives the parent's handle while the child runs; it is released after. -/
 def lockHeldByChild (inheritable : Bool) : IO Bool := do

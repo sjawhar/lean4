@@ -1,5 +1,6 @@
 /IO_test.lean.dir/
 /file_not_found.lean.readonly.txt
 /getline_crash.lean.tmp
+/handleInheritable.lean.lock
 /handleLocking.lean.lock
 /stdio.lean.stdout*.txt
