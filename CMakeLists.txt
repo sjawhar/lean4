@@ -163,6 +163,9 @@ if(NOT CMAKE_SYSTEM_NAME MATCHES "Emscripten")
       GIT_REPOSITORY https://github.com/digama0/leangz
       # v0.1.21
       GIT_TAG ae32f35b8c1bee986bc8d8cad4bcc5a9788fc7bc
+      # The source is a fixed commit, so there is nothing to update; an update step would also re-run the patch on
+      # every build, on top of the already patched source.
+      UPDATE_COMMAND ""
       PATCH_COMMAND git apply ${CMAKE_SOURCE_DIR}/script/leantar/leangz-sarray-elem-size.patch
       CONFIGURE_COMMAND ""
       BUILD_COMMAND ${CMAKE_COMMAND} -E env ${LEANTAR_ENV} ${CARGO} build --release --locked --bin leantar
