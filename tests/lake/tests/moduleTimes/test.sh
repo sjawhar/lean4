@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 source ../common.sh
 ./clean.sh
+copy_to_work lakefile.toml Main.lean Test.lean Test WriteFails.lean
 
 REC=.lake/module-times.tsv
 
@@ -215,5 +216,3 @@ has_row Test
 has_row Test.Quick1 0
 mv Test.lean.bak Test.lean
 rm .lake/module-times.json
-
-./clean.sh
