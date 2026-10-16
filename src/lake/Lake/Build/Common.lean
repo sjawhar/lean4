@@ -925,12 +925,13 @@ public def buildArtifactUnlessUpToDate
             discard <| doBuild depTrace traceFile
           if status.isCacheable then
             let art ← id do
-              -- On a replay, `file` is the one the saved trace describes, unless it changed since
+              -- On a replay, `file` is the one the saved trace describes, unless it changed since;
+              -- with no hash recorded there is nothing to check it against, so rebuild it
               if status.isUpToDate then
                 if let some descr := savedTrace.artifactDescr? then
                   if let some art ← recacheArtifact? none file descr.hash ext text exe restore then
                     return art
-                  discard <| doBuild depTrace traceFile
+                discard <| doBuild depTrace traceFile
               cacheArtifact file ext text exe restore
             (← getLakeCache).writeOutputs pkg.cacheScope inputHash art.descr
             return art

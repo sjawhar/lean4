@@ -33,3 +33,15 @@ test_truth t
 # A fresh tree with the same source restores what the cache holds for it
 mkp v; setx v 2
 test_truth v
+# A replayed trace that records no outputs (as one written by an older Lake) gives nothing to
+# check the tree's files against: they are rebuilt, not published
+if command -v python3 > /dev/null; then
+  mkp t3; setx t3 2
+  LAKE_ARTIFACT_CACHE=false test_run -d t3 build P.X
+  test_cmd python3 -c 'import json, sys
+p = sys.argv[1]; d = json.load(open(p)); d.pop("outputs", None); json.dump(d, open(p, "w"))' \
+    t3/.lake/build/lib/lean/P/X.trace
+  LAKE_CACHE_DIR="$PWD/cache-t3" test_out 'Built P.X' -d t3 build P.X
+else
+  echo "SKIPPED: python3 not found"
+fi
