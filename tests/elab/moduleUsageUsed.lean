@@ -1,7 +1,8 @@
 import Lean
 /-! Used-constant capture: without an `.olean` to write (the language server, or `lean` without `-o`)
 `usedByChecksRef` stays empty; with recording on, constants of discarded declarations (`example`) reach it.
-The stage-2 standard library carries module-usage entries, so `moduleUsed` finds the imported `Nat.succ`. -/
+Imported digests come only from `.usage` sidecars (`loadImportedDigests`), never from the environment, so
+`moduleUsed` with no loaded digests is empty even though `Nat.succ` is used. -/
 open Lean Elab Command
 example : Nat.pred 1 = 0 := rfl
 #eval show CommandElabM Unit from do
