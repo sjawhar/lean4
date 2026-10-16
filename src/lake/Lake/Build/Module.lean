@@ -1446,6 +1446,12 @@ def Module.skipOrBuild (mod : Module) (presetup : ModulePreSetup) (savedTrace : 
   let setup ← mkModuleSetup mod presetup
   unless (← mod.usageUpToDate presetup setup.importArts) do
     return ← mod.buildLean presetup setup
+  -- The input hash covers the source as `recFetchInput` read it, but a usage skip keeps old outputs.
+  if (← getMTime presetup.srcFile) != presetup.srcMTime then
+    mod.clearOutputArtifacts
+    let relSrcFile := relPathFrom mod.pkg.dir presetup.srcFile
+    error s!"{relSrcFile}: source file was modified during the build; \
+      its outputs were discarded (build again to compile the current version)"
   updateAction .replay
   data.log.replay
   unless (← getNoBuild) do
