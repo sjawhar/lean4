@@ -158,6 +158,17 @@ test_exp ! -f .lake/build/lib/lean/Test/OJ.usekey
 printf 'def ot := 2\n' > Test/OT.lean
 test_err "error: Test/OJ.lean" build -v Test.OJ
 no_match_text "Replayed Test.OJ" produced.out
+# an import's .olean compiled from other contents behind Lake's back, with its source and sidecars as
+# they were: under `--rehash` its importer, compiled against the old .olean, is checked against the new
+# one, not against the old `.usage` (which its key binds to the old .olean), so it compiles again and fails
+printf 'def va := 1\n' > Test/VA.lean
+printf 'import Test.VA\ntheorem vm : va = 1 := rfl\n' > Test/VM.lean
+test_run build Test.VM
+printf 'def va := 2\n' > Test/VA.lean
+"$LAKE" env lean Test/VA.lean -o .lake/build/lib/lean/Test/VA.olean
+printf 'def va := 1\n' > Test/VA.lean
+test_err "error: Test/VM.lean" --rehash build -v Test.VM
+no_match_text "Replayed Test.VM" produced.out
 # a failed rebuild leaves no sidecars behind
 printf 'import Test.A\ndef b : Bool := a\n' > Test/B.lean
 test_err "Test.B" build Test.B
@@ -374,15 +385,16 @@ cp cache3/Test/E.lean cache7/Test/
 (cd cache6 && test_out "Reused Test.E" build -v Test.E -o ../cache6.jsonl)
 test_exp -f cache5/.lake/build/lib/lean/Test/E.usekey
 test_cmd cmp cache5/.lake/build/ir/Test/E.ltar cache6/.lake/build/ir/Test/E.ltar
-# a `.usekey` missing from the cache (e.g. pruned) does not turn the entry into a miss: the module
-# restores without it, and builds rather than skips the next time it is checked
-rm "$LAKE_CACHE_DIR"/artifacts/*.usekey
-(cd cache7 && test_out "Reused Test.E" build -v Test.E)
-test_exp -f cache7/.lake/build/lib/lean/Test/E.usage
-test_exp ! -f cache7/.lake/build/lib/lean/Test/E.usekey
 # (sed, not jq: entries and traces are pretty-printed, one key per line)
 depHash() { sed -n 's/.*"depHash": *"\([0-9a-f]*\)".*/\1/p' "$1"; }
 entryArt() { sed -n "s/.*\"$2\": *\"\\([^\"]*\\)\".*/\\1/p" "$1"; }
+# a `.usekey` pruned from the cache makes the entry a miss, as a pruned `.usage` does (below): importers
+# use a module's `.usage` only with its key, so the module rebuilds, and its rewritten entry names a key again
+entry="$LAKE_CACHE_DIR/outputs/test/$(depHash cache3/.lake/build/lib/lean/Test/E.trace).json"
+rm "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" k)"
+(cd cache7 && test_out "Built Test.E" build -v Test.E)
+test_exp -f cache7/.lake/build/lib/lean/Test/E.usekey
+test_exp -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" k)"
 # a restored entry whose `.usage` was pruned from the cache is a miss: the module rebuilds and its rewritten
 # entry names a `.usage` again, so its dependents keep skipping (C imports B and X; B does not import X)
 mkdir -p cache8/Test cache9/Test
@@ -442,6 +454,11 @@ rm "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" c)"
 test_exp -f cache17b/.lake/build/lib/lean/Test/B.usage
 test_exp -f cache17b/.lake/build/lib/lean/Test/B.usekey
 test_exp -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" u)"
+test_exp -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" k)"
+# a pruned `.usekey` with an archive: also a miss
+ltarEntry cache20 20
+rm "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" k)"
+(cd cache20b && test_out "Built Test.B" build -v Test.C)
 test_exp -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" k)"
 # a skip's cache entry is marked `s`; a build with the cutoff off has other input hashes, so it never
 # finds that entry: it builds, and stores an entry of its own, unmarked

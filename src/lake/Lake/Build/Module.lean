@@ -851,22 +851,16 @@ public def Module.cacheOutputHashes (mod : Module) : IO PUnit := do
     error s!"failed to save output hashes: {e}"
 
 /--
-Resolves module outputs' usage-cutoff sidecars. A `.usage` that does not resolve (e.g., pruned from
-the cache) fails, so the entry is a miss: the module rebuilds and writes one again, and its
-dependents keep skipping. A `.usekey` that does not resolve is dropped: the module restores without
-it, so it builds rather than skips the next time it is checked; its dependents do not read it.
+Resolves module outputs' usage-cutoff sidecars. A sidecar the entry names that does not resolve
+(e.g., pruned from the cache) fails, so the entry is a miss: the module rebuilds and writes its
+sidecars again, and its dependents, which use its `.usage` only with its `.usekey` (`importUsage?`),
+keep skipping.
 -/
 def ModuleOutputDescrs.resolveSidecars
   (descrs : ModuleOutputDescrs) (service? : Option CacheServiceName) (scope? : Option CacheServiceScope)
 : JobM (Option Artifact × Option Artifact) := do
   let usage? ← descrs.usage?.mapM (resolveArtifact · service? scope?)
-  let usekey? ← descrs.usekey?.bindM fun descr => do
-    try
-      some <$> resolveArtifact descr service? scope?
-    catch e =>
-      let log ← takeLogFrom e
-      logVerbose <| log.entries.foldl (s!"{·}\n- {·.message}") s!"dropped usage key {descr}:"
-      return none
+  let usekey? ← descrs.usekey?.mapM (resolveArtifact · service? scope?)
   return (usage?, usekey?)
 
 def ModuleOutputDescrs.resolve
@@ -1313,21 +1307,30 @@ def modsysHash (importArts : NameMap ImportArtifacts) : JobM Hash := do
   return h
 
 /--
-The `.olean` of importee `m` in `importArts` and its `.usage`, or `none` if either is missing or
-the `.usage` is invalid.
+The `.olean` of importee `m` in `importArts` and its `.usage`, or `none` if either is missing, the
+`.usage` is invalid, or nothing shows that the `.usage` describes that `.olean`: unless `m` is a
+module-system file, its `.usekey` (written from the `.usage` and `.olean` Lean wrote together, or
+restored with them) must record the `.olean`'s current hash. An `.olean` rewritten behind Lake's
+back (e.g., by `lean -o` of other contents, which leaves the old sidecars) is therefore not checked
+against the old `.usage`. A module-system file's bytes are pinned by `modsysHash` instead.
 -/
 def importUsage? (importArts : NameMap ImportArtifacts) (m : Name) :
     JobM (Option (FilePath × UsageSidecar)) := do
-  let some olean := (importArts.find? m).bind (·.olean?) | return none
+  let some arts := importArts.find? m | return none
+  let some olean := arts.olean? | return none
   let some usage ← readUsageSidecar UsageSidecar (olean.withExtension "usage") | return none
+  if arts.oleanServer?.isNone then
+    let some key ← readUsageSidecar UsekeySidecar (olean.withExtension "usekey") | return none
+    unless key.olean == (← fetchFileHash olean) do return none
   return some (olean, usage)
 
 /--
 A digest of the recorded `closure` digest of each direct workspace import, with its name, or `none`
-if one has no `.usage`. A module's closure is its direct imports plus their closures; a direct
-toolchain import is pinned by the source text and the Lean githash (local trace). A module is
-replayed only if this digest is unchanged, so every workspace module's recorded closure digest
-stays equal to its current closure, and this digest covers the importer's whole closure.
+if `importUsage?` accepts no `.usage` for one. A module's closure is its direct imports plus their
+closures; a direct toolchain import is pinned by the source text and the Lean githash (local
+trace). A module is replayed only if this digest is unchanged, so every workspace module's recorded
+closure digest stays equal to its current closure, and this digest covers the importer's whole
+closure.
 -/
 def closureHash (presetup : ModulePreSetup) (importArts : NameMap ImportArtifacts) :
     JobM (Option ModuleUsage.Digest) := do
@@ -1358,8 +1361,8 @@ Writes the module's `.usekey` from the `.usage` Lean just wrote: the module's lo
 hash of its `.olean` (`oleanHash`), the `modsysHash` of its closure, the `closureHash` of its
 direct imports and, for each workspace `extra` module, the hash of its `.olean` and its current
 `moduleDigest`. Writes nothing if the `.usage` does not cover the closure
-(`UsageSidecar.coversClosure`), or if the `.usage`, a direct import's `.usage`, or a workspace
-`extra` module's `.usage` is missing, so the module is never skipped.
+(`UsageSidecar.coversClosure`) or is missing, or if `importUsage?` accepts no `.usage` for a direct
+import or a workspace `extra` module, so the module is never skipped.
 -/
 def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     (importArts : NameMap ImportArtifacts) (oleanHash : Hash) : JobM Unit := do
@@ -1414,8 +1417,8 @@ Whether nothing the module used changed meaning since Lean wrote its `.usage`: i
 its closure (`importArts`, `UsageSidecar.coversClosure`), its `.olean` and local inputs are
 unchanged, no module-system module in its closure changed (`modsysHash`), its closure is unchanged
 (`closureHash`), every constant it used from a workspace module has the same digest in that
-module's current `.usage`, and every workspace `extra` module has the same `.olean` hash and
-`moduleDigest`.
+module's current `.usage` (one its key binds to its current `.olean`, `importUsage?`), and every
+workspace `extra` module has the same `.olean` hash and `moduleDigest`.
 -/
 def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
     (importArts : NameMap ImportArtifacts) : JobM Bool := do
