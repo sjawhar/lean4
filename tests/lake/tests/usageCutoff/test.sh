@@ -99,6 +99,17 @@ printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 4\ndef unrelated
 LAKE_USAGE_CUTOFF=0 test_run build Test.A
 test_exp ! -f .lake/build/lib/lean/Test/A.usage
 test_out "Built Test.B" build -v Test.B
+# the same through an intermediate import: WC uses `wa` through WB while WA has no digests, so WC's `.usage`
+# cannot record it, and once WA changes WC compiles (and fails) instead of replaying
+printf 'def wa := 1\n' > Test/WA.lean
+printf 'import Test.WA\ndef wb := 0\n' > Test/WB.lean
+printf 'import Test.WB\ntheorem wc : wa = 1 := rfl\n' > Test/WC.lean
+LAKE_USAGE_CUTOFF=0 test_run build Test.WA
+test_run build Test.WC
+printf 'def wa := 2\n' > Test/WA.lean
+test_run build Test.WA
+test_err "Test/WC.lean" build -v Test.WC
+no_match_text "Replayed Test.WC" produced.out
 # a corrupt key is reported and the module builds normally
 printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 5\n' > Test/A.lean
 rm -f .lake/build/lib/lean/Test/B.usekey
@@ -326,7 +337,7 @@ cp cache3/Test/E.lean cache7/Test/
 test_exp -f cache5/.lake/build/lib/lean/Test/E.usekey
 test_cmd cmp cache5/.lake/build/ir/Test/E.ltar cache6/.lake/build/ir/Test/E.ltar
 # a `.usekey` missing from the cache (e.g. pruned) does not turn the entry into a miss: the module
-# restores without it, and its dependents build normally once
+# restores without it, and its dependents build normally until it is built again
 rm "$LAKE_CACHE_DIR"/artifacts/*.usekey
 (cd cache7 && test_out "Reused Test.E" build -v Test.E)
 test_exp -f cache7/.lake/build/lib/lean/Test/E.usage
