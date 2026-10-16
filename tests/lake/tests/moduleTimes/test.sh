@@ -144,12 +144,21 @@ test_run build
 has_row Test.Quick1 777777
 mv Test.lean.bak Test.lean; rm inject.tsv
 
-# A save that fails warns, naming the file, and the build still succeeds. Here `Test`'s compile
-# leaves a record that does not parse, so the save's re-read of the changed file fails.
+# A record that stops parsing during the build (here `Test`'s compile leaves one) is replaced by the
+# save: it warns, naming the file, and writes a new record with this build's entries.
 cp Test.lean Test.lean.bak
 printf '#eval IO.FS.writeFile ".lake/module-times.tsv" "{"\n' >> Test.lean
+test_out "module-times.tsv: line 1: expected 'lake-module-times 3', got '{'; ignoring it and starting a new record" build
+has_row Test
+mv Test.lean.bak Test.lean
+
+# A save that fails warns, naming the file, and the build still succeeds. Here `Test`'s compile
+# turns the record into a directory, so the save's re-read of the changed file fails.
+cp Test.lean Test.lean.bak
+printf '#eval do IO.FS.removeFile ".lake/module-times.tsv"; IO.FS.createDirAll ".lake/module-times.tsv/sub"\n' >> Test.lean
 test_out "module-times.tsv: failed to save module compile times" build
 mv Test.lean.bak Test.lean
+rm -rf $REC
 
 # A write that fails (here the rename, onto a directory) leaves no temporary file behind.
 test_cmd_out "write failed" "$LAKE" env lean --run WriteFails.lean
@@ -193,7 +202,7 @@ test_out "module-times.tsv: line 1: expected 'lake-module-times 3', got 'lake-mo
 printf 'lake-module-times 3\n1\t1\tTest.Quick1\t5\n' > $REC
 test_out "module-times.tsv: line 2: import index 5, but there are 1 lines$WARN" build
 printf 'lake-module-times 3\n1\t1\tTest.Quick2\t\n1\t1\tTest.Quick1\t\n' > $REC
-test_out "line 3: 'Test.Quick1' is not after 'Test.Quick2'$WARN" build
+test_out "line 3: 'Test.Quick1' is not after 'Test.Quick2' (lines are sorted by name)$WARN" build
 
 # An older Lake's record, with no record of this format beside it, only warns, naming the old file
 # to delete, and the build starts a new record beside it.
