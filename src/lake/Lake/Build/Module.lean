@@ -1255,16 +1255,19 @@ instance : FromJson UsekeySidecar where
 /--
 Reads a usage-cutoff sidecar. Returns `none` if it does not exist or has another format version
 than `Lean.ModuleUsage.usageVersion` (an older toolchain wrote it). If it exists but is not valid,
-logs a warning and returns `none`, so the module builds normally.
+logs a warning and returns `none`, so the module builds normally. Reuses the build's parse of the
+same contents (`BuildContext.sidecarCache`).
 -/
 def readUsageSidecar (α : Type) [FromJson α] [TypeName α] (path : FilePath) :
     JobM (Option α) := do
-  (← getBuildContext).sidecarCache.atomically do
-    if let some cached := (← getThe (Std.HashMap FilePath Dynamic)).get? path then
-      let some value := cached.get? α | error s!"{path}: cached sidecar has the wrong type"
-      return some value
-    match (← IO.FS.readFile path |>.toBaseIO) with
-    | .ok contents =>
+  match (← IO.FS.readFile path |>.toBaseIO) with
+  | .ok contents =>
+    (← getBuildContext).sidecarCache.atomically do
+      let cache ← getThe (Std.HashMap FilePath (String × Dynamic))
+      if let some (parsedFrom, cached) := cache.get? path then
+        if parsedFrom == contents then
+          let some value := cached.get? α | error s!"{path}: cached sidecar has the wrong type"
+          return some value
       let parsed := do
         let j ← Json.parse contents
         let v ← j.getObjValAs? Nat "version"
@@ -1273,20 +1276,16 @@ def readUsageSidecar (α : Type) [FromJson α] [TypeName α] (path : FilePath) :
       match parsed with
       | .ok value =>
         if let some value := value then
-          modifyThe (Std.HashMap FilePath Dynamic) (·.insert path (Dynamic.mk value))
+          modifyThe (Std.HashMap FilePath (String × Dynamic))
+            (·.insert path (contents, Dynamic.mk value))
         return value
       | .error e =>
         logWarning s!"{path}: {e}"
         return none
-    | .error (.noFileOrDirectory ..) =>
-      return none
-    | .error e =>
-      error s!"{path}: read failed: {e}"
-
-/-- Drops cached contents before a build may replace a sidecar. -/
-def invalidateSidecar (path : FilePath) : JobM Unit := do
-  (← getBuildContext).sidecarCache.atomically do
-    modifyThe (Std.HashMap FilePath Dynamic) (·.erase path)
+  | .error (.noFileOrDirectory ..) =>
+    return none
+  | .error e =>
+    error s!"{path}: read failed: {e}"
 
 /--
 A hash of every artifact of every module-system module in an import closure, with its name.
@@ -1368,8 +1367,6 @@ def Module.buildLean
   let relSrcFile := relPathFrom mod.pkg.dir presetup.srcFile
   let setup ← setup?.getDM (mkModuleSetup mod presetup)
   let outputPaths := mod.mkArtifacts presetup.srcFile presetup.isModule
-  invalidateSidecar mod.usageFile
-  invalidateSidecar mod.usekeyFile
   mod.clearOutputArtifacts
   mod.clearOutputHashes
   compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile outputPaths args
