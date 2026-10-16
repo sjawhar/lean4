@@ -462,19 +462,23 @@ public def buildFileUnlessUpToDate'
 
 /--
 Like `Cache.saveArtifact`, but if `expected?` is a hash that `file`'s contents do not have,
-caches nothing, leaves `file` and its `.hash` untouched, and returns `file`'s actual hash.
+caches nothing, leaves `file` and its `.hash` untouched, and returns `file`'s actual hash (`none`
+for text that is not valid UTF-8, which has no hash).
 -/
 public def Cache.saveArtifactIfMatches
   (cache : Cache) (file : FilePath) (expected? : Option Hash)
   (ext := "art") (text exe useLocalFile := false)
-: IO (Except Hash Artifact) := do
+: IO (Except (Option Hash) Artifact) := do
   try
     if text then
-      let contents ← IO.FS.readFile file
+      let bytes ← IO.FS.readBinFile file
+      let some contents := String.fromUTF8? bytes
+        | if expected?.isSome then return .error none else
+            throw <| IO.userError s!"Tried to read file '{file}' containing non UTF-8 data."
       let normalized := contents.crlfToLf
       let hash := Hash.ofString normalized
       if let some expected := expected? then
-        if hash != expected then return .error hash
+        if hash != expected then return .error (some hash)
       let descr := artifactWithExt hash ext
       let cacheFile := cache.artifactDir / descr.relPath
       -- make the local file unwritable where possible to discourage users from
@@ -495,7 +499,7 @@ public def Cache.saveArtifactIfMatches
       let contents ← IO.FS.readBinFile file
       let hash := Hash.ofByteArray contents
       if let some expected := expected? then
-        if hash != expected then return .error hash
+        if hash != expected then return .error (some hash)
       let descr := artifactWithExt hash ext
       let cacheFile := cache.artifactDir / descr.relPath
       -- make the local file unwritable where possible to discourage users from
@@ -555,7 +559,19 @@ partial def quarantineAs (dir file : FilePath) (name : String) (n : Nat) : IO (O
     return some dest
   | .error (.alreadyExists ..) => quarantineAs dir file name (n + 1)
   | .error (.noFileOrDirectory ..) => return none
-  | .error e => throw e
+  | .error _ =>
+    -- e.g., `file` is on another file system: keep a copy of its bytes, then remove it
+    let bytes ← match (← (IO.FS.readBinFile file).toBaseIO) with
+      | .ok bytes => pure bytes
+      | .error (.noFileOrDirectory ..) => return none
+      | .error e => throw e
+    let h ← try IO.FS.Handle.mk dest .writeNew catch
+      | .alreadyExists .. => return ← quarantineAs dir file name (n + 1)
+      | e => throw e
+    h.write bytes
+    h.flush
+    removeFileIfExists file
+    return some dest
 
 /--
 Moves `file` into the cache's quarantine directory as `<name>.<n>`, with the least `n` not yet
@@ -565,6 +581,13 @@ taken, so an earlier quarantined file is never replaced. Returns the new path, o
 public def Cache.quarantine (cache : Cache) (file : FilePath) (name : String) : IO (Option FilePath) := do
   IO.FS.createDirAll cache.quarantineDir
   quarantineAs cache.quarantineDir file name 0
+
+/-- Describes the outcome of `Cache.quarantine`; a failure to quarantine is reported, not thrown. -/
+def describeQuarantine (cache : Cache) (file : FilePath) (name : String) : BaseIO String := do
+  match (← (cache.quarantine file name).toBaseIO) with
+  | .ok (some dest) => return s!"moved it to: {dest}"
+  | .ok none => return "it was already moved away by another process"
+  | .error e => return s!"could not move it into quarantine: {e}"
 
 /--
 Caches `file` like `cacheArtifact`, unless its contents no longer hash to `expected`, the hash
@@ -581,13 +604,11 @@ public def recacheArtifact?
   let cache ← getLakeCache
   match (← cache.saveArtifactIfMatches file expected ext text exe useLocalFile) with
   | .ok art => return some art
-  | .error actual =>
+  | .error actual? =>
     clearFileHash file
-    let moved :=
-      match (← cache.quarantine file (artifactPath expected ext).toString) with
-      | some dest => s!"moved to {dest}"
-      | none => "already removed"
+    let moved ← describeQuarantine cache file (artifactPath expected ext).toString
     let pre := match owner? with | some owner => s!"{owner}: " | none => ""
+    let actual := match actual? with | some hash => hash.toString | none => "not UTF-8 text"
     logWarning s!"{pre}build output {file} does not match its trace \
       (expected {expected}, got {actual}); {moved}, rebuilding"
     return none
@@ -768,9 +789,7 @@ def quarantineEntry (art : Artifact) : JobM String := do
   -- Never move a path that a mapping could point outside the artifact directory.
   if art.descr.relPath.components.length == 1 &&
       art.path == cache.artifactDir / art.descr.relPath then
-    match (← cache.quarantine art.path art.descr.relPath.toString) with
-    | some dest => return s!"moved it to: {dest}"
-    | none => return "it was already moved out of the cache by another process"
+    describeQuarantine cache art.path art.descr.relPath.toString
   else
     return "left it in place: it is not an entry of the cache's artifact directory"
 

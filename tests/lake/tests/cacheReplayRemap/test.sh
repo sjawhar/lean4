@@ -33,6 +33,25 @@ test_truth t
 # A fresh tree with the same source restores what the cache holds for it
 mkp v; setx v 2
 test_truth v
+
+# The same with the cache on another file system than the tree, where the tree's file cannot be
+# moved into the cache's quarantine directory by a hard link
+SHM_DIR=/dev/shm
+if [ -d "$SHM_DIR" ] && [ -w "$SHM_DIR" ] && [ "$(stat -c %d "$SHM_DIR")" != "$(stat -c %d .)" ]; then
+  SHM_CACHE="$(mktemp -d "$SHM_DIR/lake-cacheReplayRemap.XXXXXX")"
+  mkp t2; setx t2 2
+  LAKE_ARTIFACT_CACHE=false test_run -d t2 build P.X
+  setx t2 1
+  (cd t2 && test_cmd "$LAKE" env lean -o .lake/build/lib/lean/P/X.olean \
+    -i .lake/build/lib/lean/P/X.ilean P/X.lean)
+  setx t2 2
+  LAKE_CACHE_DIR="$SHM_CACHE" test_out 'does not match its trace' -d t2 build P.E
+  LAKE_CACHE_DIR="$SHM_CACHE" test_truth t2
+  rm -rf "$SHM_CACHE"
+else
+  echo "SKIPPED: no writable $SHM_DIR on another file system"
+fi
+
 # A replayed trace that records no outputs (as one written by an older Lake) gives nothing to
 # check the tree's files against: they are rebuilt, not published
 if command -v python3 > /dev/null; then
