@@ -490,6 +490,16 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_unlock(b_obj_arg h) {
     }
 }
 
+/* Handle.setInheritable : (@& Handle) → (inheritable : Bool) → IO Unit */
+extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_set_inheritable(b_obj_arg h, uint8_t x) {
+    HANDLE wh = win_handle(io_get_handle(h));
+    if (SetHandleInformation(wh, HANDLE_FLAG_INHERIT, x ? HANDLE_FLAG_INHERIT : 0)) {
+        return io_result_mk_ok(box(0));
+    } else {
+        return io_result_mk_error((sstream() << GetLastError()).str());
+    }
+}
+
 #else
 
 /* Handle.lock : (@& Handle) → (exclusive : Bool) → IO Unit */
@@ -524,6 +534,16 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_unlock(b_obj_arg h) {
     } else {
         return io_result_mk_error(decode_io_error(errno, nullptr));
     }
+}
+
+/* Handle.setInheritable : (@& Handle) → (inheritable : Bool) → IO Unit */
+extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_set_inheritable(b_obj_arg h, uint8_t x) {
+    int fd = fileno(io_get_handle(h));
+    int flags = fcntl(fd, F_GETFD);
+    if (flags == -1 || fcntl(fd, F_SETFD, x ? (flags & ~FD_CLOEXEC) : (flags | FD_CLOEXEC)) == -1) {
+        return io_result_mk_error(decode_io_error(errno, nullptr));
+    }
+    return io_result_mk_ok(box(0));
 }
 
 #endif
