@@ -12,6 +12,6 @@ def noskipOf (dir : System.FilePath) (args : Array String) : IO Bool := do
 
 #eval IO.FS.withTempDir fun dir => do
   IO.FS.writeFile (dir / "A.lean") "def a := 1\nexample : a = 1 := rfl\n"
-  let plain ← noskipOf dir #["--incr-save=A.snap", "-o", "A.olean", "A.lean"]
-  let loaded ← noskipOf dir #["--incr-load=A.snap", "-o", "A.olean", "A.lean"]
+  let plain ← noskipOf dir #["--incr-save=A.snap", "-o", "A.olean", "--usage=A.usage", "A.lean"]
+  let loaded ← noskipOf dir #["--incr-load=A.snap", "-o", "A.olean", "--usage=A.usage", "A.lean"]
   IO.println s!"{plain} {loaded}"
