@@ -1716,15 +1716,17 @@ where
     else
       return allArtsTrace.mix arts.olean.trace
   trackOutputsIfEnabled arts : JobM ModuleOutputArtifacts := do
-    if let some ref ← Internal.getOutputsRef? mod.pkg then
-      let inputHash := (← getTrace).hash
-      if let some ltar := arts.ltar? then
-        ref.insert inputHash ltar.descr (mod.platformIndependent.getD false)
-        return arts
-      else
-        let ltar ← mod.packLtar arts
-        ref.insert inputHash ltar.descr (mod.platformIndependent.getD false)
-        return {arts with ltar? := some ltar}
+    -- The `-o` map records only an archive, which carries no skip mark: a skip stays out of it.
+    if !arts.skipped then
+      if let some ref ← Internal.getOutputsRef? mod.pkg then
+        let inputHash := (← getTrace).hash
+        if let some ltar := arts.ltar? then
+          ref.insert inputHash ltar.descr (mod.platformIndependent.getD false)
+          return arts
+        else
+          let ltar ← mod.packLtar arts
+          ref.insert inputHash ltar.descr (mod.platformIndependent.getD false)
+          return {arts with ltar? := some ltar}
     return arts
 
 /-- The `ModuleFacetConfig` for the builtin `irArtsFacet`. -/
