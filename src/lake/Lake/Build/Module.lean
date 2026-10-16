@@ -1364,7 +1364,9 @@ Compiles the module. `setup?` is its `ModuleSetup` if the caller already compute
 def Module.buildLean
   (mod : Module) (presetup : ModulePreSetup) (setup? : Option ModuleSetup := none)
 : JobM ModuleOutputArtifacts := do buildAction (← getTrace) mod.traceFile do
-  let args := mod.weakLeanArgs ++ mod.leanArgs
+  let mut args := mod.weakLeanArgs ++ mod.leanArgs
+  if !presetup.isModule && !mod.shouldPrecompile then
+    args := args.push s!"--usage={mod.usageFile}"
   let relSrcFile := relPathFrom mod.pkg.dir presetup.srcFile
   let setup ← setup?.getDM (mkModuleSetup mod presetup)
   let outputPaths := mod.mkArtifacts presetup.srcFile presetup.isModule

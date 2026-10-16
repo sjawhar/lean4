@@ -139,6 +139,7 @@ def displayHelp (useStderr : Bool) : IO Unit := do
   out.putStrLn    "      --run <file>       call the 'main' definition in the given file with the remaining arguments"
   out.putStrLn    "  -o, --o=oname          create olean file"
   out.putStrLn    "  -i, --i=iname          create ilean file"
+  out.putStrLn    "      --usage=file      create usage-cutoff sidecar"
   out.putStrLn    "  -c, --c=fname          name of the C output file"
   out.putStrLn    "  -b, --bc=fname         name of the LLVM bitcode file"
   out.putStrLn    "      --stdin            take input from stdin"
@@ -229,6 +230,7 @@ structure ShellOptions where
   rootDir? : Option System.FilePath := none
   setupFileName? : Option System.FilePath := none
   oleanFileName? : Option System.FilePath := none
+  usageFileName? : Option System.FilePath := none
   ileanFileName? : Option System.FilePath := none
   cFileName? : Option System.FilePath := none
   bcFileName? : Option System.FilePath := none
@@ -340,6 +342,8 @@ def ShellOptions.process (opts : ShellOptions)
     return {opts with oleanFileName? := ← checkOptArg "o" optArg?}
   | 'i' => -- `--i, ilean=fname`
     return {opts with ileanFileName? := ← checkOptArg "i" optArg?}
+  | 'U' => -- `--usage=file`
+    return {opts with usageFileName? := ← checkOptArg "U" optArg?}
   | 'R' => -- `-R, --root=dir`
     let arg ← checkOptArg "R" optArg?
     let forwardedArgs := opts.forwardedArgs.push s!"-R{arg}"
@@ -546,6 +550,7 @@ def shellMain (args : List String) (opts : ShellOptions) : IO UInt32 := do
     (incrSaveFileName? := opts.incrSaveFileName?)
     (incrLoadFileName? := opts.incrLoadFileName?)
     (incrHeaderSaveFileName? := opts.incrHeaderSaveFileName?)
+    (usageFileName? := opts.usageFileName?)
   if let some env := env? then
     if opts.run then
       return ← runMain env opts.leanOpts args

@@ -24,6 +24,8 @@ open Lean
 EOF
 # Per-constant usage digests live in `.usage`; no persistent extension allocates per-import state.
 test_cmd_out "false" "$LAKE" env lean Test/Inspect.lean
+"$LAKE" env lean Test/A.lean -o Test/Direct.olean
+test_exp ! -e Test/Direct.usage
 test_exp -f .lake/build/lib/lean/Test/B.usage
 test_cmd_out '[["Test","A"],[[["a"],"' cat .lake/build/lib/lean/Test/B.usage
 # `example` (C) reaches `used` through `usedByChecksRef`, `#print axioms` (D) through its `TermInfo`.
