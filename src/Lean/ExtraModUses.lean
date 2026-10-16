@@ -96,11 +96,11 @@ public builtin_initialize extraModUsesByChecksRef : IO.Ref (Std.HashSet ExtraMod
 public builtin_initialize extraModUsesByCmdRef :
     IO.Ref (Std.HashSet (Nat × ExtraModUse)) ← IO.mkRef {}
 
-def recordExtraModUseCore [MonadLiftT IO m] (mod : Name) (isMeta : Bool) (hint : Name := .anonymous) :
-    m Unit := do
+def recordExtraModUseCore [MonadLiftT IO m] [MonadCommandIdx m] (mod : Name) (isMeta : Bool)
+    (hint : Name := .anonymous) : m Unit := do
   let entry := { module := mod, isExported := (← getEnv).isExporting, isMeta }
   if (← (usageRecordingRef.get : IO Bool)) then
-    let idx ← (currentCommandRef.get : IO Nat)
+    let idx ← commandIdx
     (extraModUsesByCmdRef.modify (·.insert (idx, entry)) : IO Unit)
   if !(extraModUses.getState (asyncMode := .local) (← getEnv)).contains entry then
     trace[extraModUses] "recording {if entry.isExported then "public" else "private"} \
@@ -117,7 +117,8 @@ the visibility level.
 NOTE: Directly recording a module name does not trigger including indirect dependencies recorded via
 `recordIndirectModUse`, prefer `recordExtraModUseFromDecl` instead.
 -/
-public def recordExtraModUse [MonadLiftT IO m] (modName : Name) (isMeta : Bool) : m Unit := do
+public def recordExtraModUse [MonadLiftT IO m] [MonadCommandIdx m] (modName : Name) (isMeta : Bool) :
+    m Unit := do
   if modName != (← getEnv).mainModule then
     recordExtraModUseCore modName isMeta
 
@@ -126,7 +127,8 @@ Records the module of the given declaration as an additional import dependency f
 module, using `Environment.isExporting` as the visibility level. If the declaration itself is
 already `meta`, the module dependency is recorded as a non-`meta` dependency.
 -/
-public def recordExtraModUseFromDecl [MonadLiftT IO m] (declName : Name) (isMeta : Bool) : m Unit := do
+public def recordExtraModUseFromDecl [MonadLiftT IO m] [MonadCommandIdx m] (declName : Name)
+    (isMeta : Bool) : m Unit := do
   let env ← getEnv
   if let some mod := env.getModuleIdxFor? declName |>.bind (env.header.modules[·]?) then
     -- If the declaration itself is already `meta`, no need to mark the import.

@@ -202,7 +202,7 @@ def expandOptDocComment? [Monad m] [MonadError m] (optDocComment : Syntax) : m (
 
 section Methods
 
-variable [Monad m] [MonadEnv m] [MonadResolveName m] [MonadError m] [MonadFinally m] [MonadMacroAdapter m] [MonadRecDepth m] [MonadTrace m] [MonadOptions m] [AddMessageContext m] [MonadLog m] [MonadInfoTree m] [MonadLiftT IO m]
+variable [Monad m] [MonadEnv m] [MonadResolveName m] [MonadError m] [MonadFinally m] [MonadMacroAdapter m] [MonadRecDepth m] [MonadTrace m] [MonadOptions m] [AddMessageContext m] [MonadLog m] [MonadInfoTree m] [MonadLiftT IO m] [MonadCommandIdx m]
 
 /-- Elaborate declaration modifiers (i.e., attributes, `partial`, `private`, `protected`, `unsafe`, `meta`, `noncomputable`, doc string)-/
 def elabModifiers (stx : TSyntax ``Parser.Command.declModifiers) : m Modifiers := do

@@ -220,6 +220,9 @@ instance : MonadEnv CommandElabM where
 instance : MonadOptions CommandElabM where
   getOptions := do pure (← get).scopes.head!.opts
 
+instance : MonadCommandIdx CommandElabM where
+  getCommandIdx? := return (← read).cmdIdx?
+
 protected def getRef : CommandElabM Syntax :=
   return (← read).ref
 
