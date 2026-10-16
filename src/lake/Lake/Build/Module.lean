@@ -1292,9 +1292,28 @@ def readUsageSidecar (α : Type) [FromJson α] [TypeName α] (path : FilePath) :
     error s!"{path}: read failed: {e}"
 
 /--
+The hash of `file`'s bytes, as `fetchFileHash` computes it, but never read from its `.hash` file: an
+`.olean` rewritten behind Lake's back (e.g., by `lean -o`) keeps its old `.hash`, and a usage-cutoff
+decision must see the new bytes. Computed at most once per build for each contents of the file,
+identified by its stamp (`System.FilePath.stamp`, `BuildContext.fileHashCache`).
+-/
+def contentHash (file : FilePath) : JobM Hash := do
+  let cache := (← getBuildContext).fileHashCache
+  let stamp ← file.stamp
+  let cached? ← cache.atomically do
+    return (← get)[file]?.bind fun (s, hash) => if s == stamp then some hash else none
+  if let some hash := cached? then return hash
+  let hash ← computeBinFileHash file
+  -- Cache it only if the file did not change while it was read.
+  if (← file.stamp) == stamp then
+    cache.atomically <| modify (·.insert file (stamp, hash))
+  return hash
+
+/--
 A hash of every artifact of every module-system module in an import closure, with its name.
 Module-system files carry no meaning digests (Lean writes them at the private level only), so a
-non-module importer's digest chain cannot see through one; its skip requires these bytes unchanged.
+non-module importer's digest chain cannot see through one; its skip requires these bytes unchanged
+(`contentHash`).
 -/
 def modsysHash (importArts : NameMap ImportArtifacts) : JobM Hash := do
   let mut h := Hash.nil
@@ -1303,16 +1322,17 @@ def modsysHash (importArts : NameMap ImportArtifacts) : JobM Hash := do
       h := h.mix (Hash.ofHashable m)
       for paths in arts.toArrays do
         for path in paths do
-          h := h.mix (← fetchFileHash path)
+          h := h.mix (← contentHash path)
   return h
 
 /--
 The `.olean` of importee `m` in `importArts` and its `.usage`, or `none` if either is missing, the
 `.usage` is invalid, or nothing shows that the `.usage` describes that `.olean`: unless `m` is a
 module-system file, its `.usekey` (written from the `.usage` and `.olean` Lean wrote together, or
-restored with them) must record the `.olean`'s current hash. An `.olean` rewritten behind Lake's
-back (e.g., by `lean -o` of other contents, which leaves the old sidecars) is therefore not checked
-against the old `.usage`. A module-system file's bytes are pinned by `modsysHash` instead.
+restored with them) must record the hash of the `.olean`'s current bytes (`contentHash`). An `.olean`
+rewritten behind Lake's back (e.g., by `lean -o` of other contents, which leaves the old sidecars and
+`.hash`) is therefore not checked against the old `.usage`. A module-system file's bytes are pinned
+by `modsysHash` instead.
 -/
 def importUsage? (importArts : NameMap ImportArtifacts) (m : Name) :
     JobM (Option (FilePath × UsageSidecar)) := do
@@ -1321,7 +1341,7 @@ def importUsage? (importArts : NameMap ImportArtifacts) (m : Name) :
   let some usage ← readUsageSidecar UsageSidecar (olean.withExtension "usage") | return none
   if arts.oleanServer?.isNone then
     let some key ← readUsageSidecar UsekeySidecar (olean.withExtension "usekey") | return none
-    unless key.olean == (← fetchFileHash olean) do return none
+    unless key.olean == (← contentHash olean) do return none
   return some (olean, usage)
 
 /--
@@ -1358,14 +1378,14 @@ def UsageSidecar.coversClosure (usage : UsageSidecar) (importArts : NameMap Impo
 
 /--
 Writes the module's `.usekey` from the `.usage` Lean just wrote: the module's local trace hash, the
-hash of its `.olean` (`oleanHash`), the `modsysHash` of its closure, the `closureHash` of its
-direct imports and, for each workspace `extra` module, the hash of its `.olean` and its current
-`moduleDigest`. Writes nothing if the `.usage` does not cover the closure
-(`UsageSidecar.coversClosure`) or is missing, or if `importUsage?` accepts no `.usage` for a direct
-import or a workspace `extra` module, so the module is never skipped.
+hash of its `.olean`, the `modsysHash` of its closure, the `closureHash` of its direct imports and,
+for each workspace `extra` module, the hash of its `.olean` and its current `moduleDigest`. Each
+`.olean` hash is of its bytes (`contentHash`). Writes nothing if the `.usage` does not cover the
+closure (`UsageSidecar.coversClosure`) or is missing, or if `importUsage?` accepts no `.usage` for a
+direct import or a workspace `extra` module, so the module is never skipped.
 -/
 def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
-    (importArts : NameMap ImportArtifacts) (oleanHash : Hash) : JobM Unit := do
+    (importArts : NameMap ImportArtifacts) : JobM Unit := do
   let some usage ← readUsageSidecar UsageSidecar mod.usageFile | return
   unless usage.coversClosure importArts do return
   let some closure ← closureHash presetup importArts | return
@@ -1374,11 +1394,11 @@ def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     if (← findModule? m).isNone then continue
     let some (olean, imp) ← importUsage? importArts m | return
     extra := extra.push <|
-      Json.arr #[ModuleUsage.nameToJson m, toJson (← fetchFileHash olean).hex, toJson imp.moduleDigest]
+      Json.arr #[ModuleUsage.nameToJson m, toJson (← contentHash olean).hex, toJson imp.moduleDigest]
   let key := Json.mkObj [
     ("version", ModuleUsage.usageVersion),
     ("local", toJson presetup.localTrace.hash.hex),
-    ("olean", toJson oleanHash.hex),
+    ("olean", toJson (← contentHash mod.oleanFile).hex),
     ("modsys", toJson (← modsysHash importArts).hex),
     ("closure", toJson closure),
     ("extra", Json.arr extra)
@@ -1409,7 +1429,7 @@ def Module.buildLean
     error s!"{relSrcFile}: source file was modified during the build; \
       its outputs were discarded (build again to compile the current version)"
   let arts ← mod.computeArtifacts setup.isModule presetup.postponeCompile
-  if usage then mod.writeUsekey presetup setup.importArts arts.olean.hash
+  if usage then mod.writeUsekey presetup setup.importArts
   return arts
 
 /--
@@ -1418,7 +1438,8 @@ its closure (`importArts`, `UsageSidecar.coversClosure`), its `.olean` and local
 unchanged, no module-system module in its closure changed (`modsysHash`), its closure is unchanged
 (`closureHash`), every constant it used from a workspace module has the same digest in that
 module's current `.usage` (one its key binds to its current `.olean`, `importUsage?`), and every
-workspace `extra` module has the same `.olean` hash and `moduleDigest`.
+workspace `extra` module has the same `.olean` hash and `moduleDigest`. Every `.olean` hash is of
+the file's bytes (`contentHash`), never read from a `.hash` file.
 -/
 def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
     (importArts : NameMap ImportArtifacts) : JobM Bool := do
@@ -1426,7 +1447,7 @@ def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
   let some key ← readUsageSidecar UsekeySidecar mod.usekeyFile | return false
   if usage.noskip || key.localHash != presetup.localTrace.hash || !usage.coversClosure importArts then
     return false
-  unless (← fetchFileHash mod.oleanFile) == key.olean do return false
+  unless (← contentHash mod.oleanFile) == key.olean do return false
   unless (← modsysHash importArts) == key.modsys do return false
   unless (← closureHash presetup importArts) == some key.closure do return false
   -- A module outside the workspace is a toolchain module, pinned by the Lean githash in `localTrace`.
@@ -1439,7 +1460,7 @@ def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
     if (← findModule? m).isNone then continue
     let some (oleanHash, digest) := key.extra.find? m | return false
     let some (olean, imp) ← importUsage? importArts m | return false
-    unless (← fetchFileHash olean) == oleanHash do return false
+    unless (← contentHash olean) == oleanHash do return false
     unless imp.moduleDigest == digest do return false
   return true
 

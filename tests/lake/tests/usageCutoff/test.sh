@@ -169,6 +169,40 @@ printf 'def va := 2\n' > Test/VA.lean
 printf 'def va := 1\n' > Test/VA.lean
 test_err "error: Test/VM.lean" --rehash build -v Test.VM
 no_match_text "Replayed Test.VM" produced.out
+# without `--rehash`, such an .olean keeps its old `.hash`, which the check never reads: it hashes the
+# bytes. HM's trace goes stale through an unrelated edit to HX, so a build without the cutoff compiles HM
+# again against the real HA.olean (and fails); with the cutoff HM must do the same, not replay
+printf 'def ha := 1\n' > Test/HA.lean
+printf 'def hx := 0\n' > Test/HX.lean
+printf 'import Test.HA\nimport Test.HX\ntheorem hm : ha = 1 := rfl\n' > Test/HM.lean
+test_run build Test.HM
+printf 'def ha := 2\n' > Test/HA.lean
+"$LAKE" env lean Test/HA.lean -o .lake/build/lib/lean/Test/HA.olean
+printf 'def ha := 1\n' > Test/HA.lean
+printf 'def hx := 0\ndef hx2 := 0\n' > Test/HX.lean
+test_err "error: Test/HM.lean" build -v Test.HM
+no_match_text "Replayed Test.HM" produced.out
+# the same for the module's own .olean: GM compiles again instead of keeping the rewritten one
+printf 'def gx := 0\n' > Test/GX.lean
+printf 'import Test.GX\ndef gm := 1\n' > Test/GM.lean
+test_run build Test.GM
+printf 'import Test.GX\ndef gm := 2\n' > Test/GM.lean
+"$LAKE" env lean Test/GM.lean -o .lake/build/lib/lean/Test/GM.olean
+printf 'import Test.GX\ndef gm := 1\n' > Test/GM.lean
+printf 'def gx := 0\ndef gx2 := 0\n' > Test/GX.lean
+lake_out build -v Test.GM
+match_text "Built Test.GM" produced.out
+# and for a module-system import, whose bytes the check compares instead of digests (`modsysHash`)
+printf 'module\npublic def du : Nat := 1\n' > Test/UH.lean
+printf 'def ux := 0\n' > Test/UX.lean
+printf 'import Test.UH\nimport Test.UX\ntheorem un : du = 1 := rfl\n' > Test/UN.lean
+test_run build Test.UN
+printf 'module\npublic def du : Nat := 2\n' > Test/UH.lean
+"$LAKE" env lean Test/UH.lean -o .lake/build/lib/lean/Test/UH.olean
+printf 'module\npublic def du : Nat := 1\n' > Test/UH.lean
+printf 'def ux := 0\ndef ux2 := 0\n' > Test/UX.lean
+test_err "error: Test/UN.lean" build -v Test.UN
+no_match_text "Replayed Test.UN" produced.out
 # a failed rebuild leaves no sidecars behind
 printf 'import Test.A\ndef b : Bool := a\n' > Test/B.lean
 test_err "Test.B" build Test.B
