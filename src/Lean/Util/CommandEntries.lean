@@ -32,6 +32,9 @@ structure CommandEntries where
   entries : Array (Name × Array EnvExtensionEntry)
   locals : Array (Nat × Name × EnvExtensionEntry)
   caches : CommandCaches := {}
+  /-- Persistent extensions this command changed that have no conversion from their `.olean` entries back to
+  the entries `addEntryFn` accepts (`PersistentEnvExtension.ofOLeanEntry?`). -/
+  unreplayable : Array Name := #[]
   deriving Nonempty
 
 builtin_initialize commandEntriesExt :
@@ -85,11 +88,19 @@ def recordCommandDelta (before after : Environment) (idx : Nat) : IO Environment
     let afterEntries := (← after.computeExtEntries).private
     let beforeByName : Std.HashMap Name (Array EnvExtensionEntry) :=
       beforeEntries.foldl (fun m (n, es) => m.insert n es) {}
+    let pExtByName : Std.HashMap Name
+        (PersistentEnvExtension EnvExtensionEntry EnvExtensionEntry EnvExtensionState) :=
+      (← persistentEnvExtensionsRef.get).foldl (fun m ext => m.insert ext.name ext) {}
+    let scopedNames := (← scopedEnvExtensionsRef.get).foldl (fun s ext => s.insert ext.ext.name) ({} : NameSet)
     let mut entries := #[]
+    let mut unreplayable := #[]
     for (name, es) in afterEntries do
       unless excludedExtension name do
         let delta ← entryDelta dir name (beforeByName.getD name #[]) es
-        unless delta.isEmpty do entries := entries.push (name, delta)
+        unless delta.isEmpty do
+          entries := entries.push (name, delta)
+          unless scopedNames.contains name || (pExtByName[name]?.any (·.ofOLeanEntry?.isSome)) do
+            unreplayable := unreplayable.push name
     let beforeLocals := localEntriesExt.getState (asyncMode := .local) before |>.size
     let afterLocals := localEntriesExt.getState (asyncMode := .local) after
     let locals := afterLocals.extract beforeLocals afterLocals.size
@@ -108,11 +119,16 @@ def recordCommandDelta (before after : Environment) (idx : Nat) : IO Environment
         let bb ← compactEntryBytes (dir / s!"cache-before-{i}") b (allowClosures := true)
         let ab ← compactEntryBytes (dir / s!"cache-after-{i}") a (allowClosures := true)
         unless bb == ab do states := states.push (i, a)
-    return commandEntriesExt.addEntry after { idx, entries, locals, caches := { states } }
+    return commandEntriesExt.addEntry after { idx, entries, locals, caches := { states }, unreplayable }
 
 /-- Replaces the current module's command payload with `entries` before writing its `.olean`. -/
 def setCommandEntries (env : Environment) (entries : Array CommandEntries) : Environment :=
   commandEntriesExt.modifyState env fun _ => entries
+
+/-- Why the module's command payloads cannot be replayed, if a command changed an unreplayable extension. -/
+def commandEntriesNoskipReason? (entries : Array CommandEntries) : Option String := do
+  let name ← entries.findSome? (·.unreplayable[0]?)
+  return s!"unreplayable extension {name}"
 
 private def isIR (n : Name) : Bool := n == `Lean.IR.declMapExt
 private def isLCNF (n : Name) : Bool := (`Lean.Compiler.LCNF).isPrefixOf n
@@ -145,10 +161,14 @@ def replayCommandEntries (env : Environment) (ce : CommandEntries) (dStart : Nat
     else
       let some i := byName[name]? | throw <| IO.userError s!"unknown environment extension {name}"
       let ext := pExts[i]!
+      let some ofOLeanEntry := ext.ofOLeanEntry? |
+        throw <| IO.userError s!"unreplayable extension {name}"
       let mode := match ext.toEnvExtension.asyncMode with
         | .async _ => .sync
         | mode => mode
-      for entry in entries do env := ext.addEntry env entry (asyncMode := mode)
+      for entry in entries do
+        let b ← ofOLeanEntry (ext.getState env (asyncMode := mode)) entry |>.run { env, opts }
+        env := ext.addEntry env b (asyncMode := mode)
   for (depth, name, entry) in ce.locals do
     if depth ≤ dStart then
       let some ext := scopedByName[name]? |

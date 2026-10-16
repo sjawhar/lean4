@@ -29,6 +29,7 @@ def mkExistingToIncorrect : IO (PersistentEnvExtension (Name × Array Name) (Nam
     table.alter trueName fun old =>
       altNames.foldl (β := NameSet) (init := old.getD {}) fun accum altName =>
         accum.insert altName
+  ofOLeanEntry? := some fun _ entry => pure entry
   exportEntriesFn table :=
     table.toArray.map (fun (trueName, altNames) =>(trueName, altNames.toArray))
       |>.qsort (lt := fun a b => Name.quickLt a.1 b.1)
@@ -47,6 +48,7 @@ def mkIncorrectToExisting : IO (PersistentEnvExtension (Name × Array Name) (Nam
     altNames.foldl (init := table) fun accum altName =>
       accum.alter altName fun old =>
         old.getD {} |>.insert trueName
+  ofOLeanEntry? := some fun _ entry => pure entry
   exportEntriesFn table :=
     table.toArray.map (fun (altName, trueNames) => (altName, trueNames.toArray))
       |>.qsort (lt := fun a b => Name.quickLt a.1 b.1)

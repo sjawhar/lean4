@@ -3,7 +3,9 @@ import Lean
 component covers `@[simp]` membership and instance priority, which the full digest does not. `computeStmt`
 folds in the full digest of a definition the type mentions (its value decides what the type means) and the
 statement digest of a theorem it mentions (its proof does not). A `.usage` written by `lean -o` is version 4
-with `stmt`, `usedAttrs` (the importee's attrs digest of each used constant) and `commands`. -/
+with `stmt`, `usedAttrs` (the importee's attrs digest of each used constant) and `commands`; a module that adds
+entries to an extension whose `.olean` entries cannot be converted back for replay is `noskip`, with the
+extension named in `noskipReason`. -/
 open Lean Elab Command
 theorem t : 1 = 1 := rfl
 theorem t' : 1 = 1 := by rfl
@@ -33,8 +35,8 @@ def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
     throw <| IO.userError s!"lean {args} failed ({out.exitCode}):\n{out.stdout}\n{out.stderr}"
 
 #eval IO.FS.withTempDir fun dir => do
-  IO.FS.writeFile (dir / "X.lean") "@[simp] theorem xs : 1 = 1 := rfl\ndef xd := 1\n"
-  IO.FS.writeFile (dir / "M.lean") "import X\ndef m := xd\ntheorem m2 : 1 = 1 := xs\n"
+  IO.FS.writeFile (dir / "X.lean") "import Lean\nopen Lean\n@[simp] theorem xs : 1 = 1 := rfl\ndef xd := 1\ninitialize unreplayableExt : PersistentEnvExtension Name (Name × Nat) (Array Name) ← registerPersistentEnvExtension { mkInitial := pure #[], addImportedFn := fun _ => pure #[], addEntryFn := fun s (n, _) => s.push n, exportEntriesFn := fun s => s }\ninitialize registerBuiltinAttribute { name := `unreplayable, descr := \"test\", add := fun decl _ _ => modifyEnv (unreplayableExt.addEntry · (decl, 0)) }\n"
+  IO.FS.writeFile (dir / "M.lean") "import X\ndef m := xd\ntheorem m2 : 1 = 1 := xs\n@[unreplayable] def unsupported := 0\n"
   runLean dir #["-o", "X.olean", "X.lean"]
   runLean dir #["-o", "M.olean", "M.lean"]
   let rd (f : String) : IO Json := do IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / f))
@@ -47,6 +49,11 @@ def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
   let usedAttrsX := (arr m "usedAttrs").find? (named `X) |>.bind (at? · 1)
     |>.bind (·.getArr? |>.toOption) |>.getD #[]
   let xsUsed := usedAttrsX.find? (named `xs) |>.bind (at? · 1)
+  -- an extension whose `.olean` entries (`Name`) differ from its state entries (`Name × Nat`) and that has no
+  -- conversion back cannot be replayed, so the module is declined with the extension's name
+  let declined := (m.getObjValAs? Bool "noskip").toOption == some true &&
+    (m.getObjValAs? String "noskipReason").toOption ==
+      some "unreplayable extension unreplayableExt"
   IO.println s!"{(m.getObjValAs? Nat "version").toOption == some 4} {(arr m "stmt").any (named `m2)} \
     {xsAttrs.isSome && xsUsed == xsAttrs} {usedAttrsX.any (named `xd)} \
-    {(m.getObjValAs? (Array Json) "commands").toOption.isSome}"
+    {declined} {(m.getObjValAs? (Array Json) "commands").toOption.isSome}"

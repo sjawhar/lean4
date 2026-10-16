@@ -1,6 +1,8 @@
 import Lean
 /-! Per-command `.olean` payloads include all persistent extension additions and scoped local entries,
-including dynamically registered extensions and parser/macro state. -/
+including dynamically registered extensions and parser/macro state, and replaying them reproduces every
+extension's export, also for an extension whose `.olean` entries differ from its state entries
+(`@[cpass]`: `passManagerExt` exports installer names and rebuilds the pass manager from them). -/
 open Lean
 
 unsafe def commandEntriesOf (e : EnvExtensionEntry) : CommandEntries := unsafeCast e
@@ -29,7 +31,7 @@ def sameParse (expected actual : Environment) (input : String) : Bool :=
 
 unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   IO.FS.writeFile (dir / "X.lean") "import Lean\nopen Lean\ndef v := 5\nregister_simp_attr my_set\ninitialize myExt : SimplePersistentEnvExtension Name (Array Name) ← registerSimplePersistentEnvExtension { addEntryFn := Array.push, addImportedFn := fun as => as.foldl (· ++ ·) #[] }\ninitialize registerBuiltinAttribute { name := `my_tag, descr := \"test\", add := fun decl _ _ => modifyEnv (myExt.addEntry · decl) }\n"
-  IO.FS.writeFile (dir / "M.lean") "import X\n\ntheorem a : True := trivial\n\ndef h : Nat → Nat | 0 => 1 | n + 1 => n\n\n@[simp] theorem s : v = 5 := rfl\nattribute [local simp] s\n@[local simp] theorem ls : 2 = 2 := rfl\nattribute [local simp] s in theorem tin : 3 = 3 := by simp\nnamespace Foo\nend Foo\nattribute [local simp] a in open Foo in @[local simp] theorem t2 : True := trivial\nnamespace A.B\ntheorem tn : True := trivial\nend A.B\n\ntheorem d : 2 + 2 = 4 := by decide +kernel\ndef e1 : Fin 5 := ⟨3, by decide +kernel⟩\ninstance : Inhabited Nat := ⟨v⟩\n\n/-- A reducible definition with a docstring. -/\n@[reducible] def r : Nat := v + 1\n\nstructure P where\n  x : Nat\n  y : Nat\n\ninductive T where\n  | leaf\n  | node (l : T) (n : Nat) (r : T)\n\ndef T.size : T → Nat\n  | .leaf => 0\n  | .node l _ r => l.size + 1 + r.size\n\ndef k : Nat → Nat | 0 => 2 | n + 1 => n + 3\ndef e2 : Fin 5 := ⟨3, by decide +kernel⟩\ntheorem d2 : 2 + 2 = 4 := by decide +kernel\n\nnoncomputable def cl : Decidable (∀ n : Nat, n = n) := by classical exact inferInstance\nnamespace Prot\nprotected def p := 1\nend Prot\n@[my_set] theorem ms : 5 = 5 := rfl\n@[my_tag] def myTagged := 1\nsyntax \"⊕⊕\" term : term\nmacro_rules | `(⊕⊕ $x) => `($x + 1)\nnotation \"⊗⊗\" => Nat.add\n"
+  IO.FS.writeFile (dir / "M.lean") "import X\n\n@[cpass] meta def testPassInstaller : Lean.Compiler.LCNF.PassInstaller := { phase := .base, install := pure }\n\ntheorem a : True := trivial\n\ndef h : Nat → Nat | 0 => 1 | n + 1 => n\n\n@[simp] theorem s : v = 5 := rfl\nattribute [local simp] s\n@[local simp] theorem ls : 2 = 2 := rfl\nattribute [local simp] s in theorem tin : 3 = 3 := by simp\nnamespace Foo\nend Foo\nattribute [local simp] a in open Foo in @[local simp] theorem t2 : True := trivial\nnamespace A.B\ntheorem tn : True := trivial\nend A.B\n\ntheorem d : 2 + 2 = 4 := by decide +kernel\ndef e1 : Fin 5 := ⟨3, by decide +kernel⟩\ninstance : Inhabited Nat := ⟨v⟩\n\n/-- A reducible definition with a docstring. -/\n@[reducible] def r : Nat := v + 1\n\nstructure P where\n  x : Nat\n  y : Nat\n\ninductive T where\n  | leaf\n  | node (l : T) (n : Nat) (r : T)\n\ndef T.size : T → Nat\n  | .leaf => 0\n  | .node l _ r => l.size + 1 + r.size\n\ndef k : Nat → Nat | 0 => 2 | n + 1 => n + 3\ndef e2 : Fin 5 := ⟨3, by decide +kernel⟩\ntheorem d2 : 2 + 2 = 4 := by decide +kernel\n\nnoncomputable def cl : Decidable (∀ n : Nat, n = n) := by classical exact inferInstance\nnamespace Prot\nprotected def p := 1\nend Prot\n@[my_set] theorem ms : 5 = 5 := rfl\n@[my_tag] def myTagged := 1\nsyntax \"⊕⊕\" term : term\nmacro_rules | `(⊕⊕ $x) => `($x + 1)\nnotation \"⊗⊗\" => Nat.add\n"
   runLean dir #["-o", "X.olean", "X.lean"]
   initSearchPath (← getBuildDir) [dir]
   enableInitializersExecution
@@ -52,6 +54,9 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   IO.println s!"custom simp set: {names.any fun name => name.toString.startsWith "ext._@.X."}"
   IO.println s!"parser extension: {names.contains `Lean.Parser.parserExtension}"
   IO.println s!"macro attribute: {names.contains `Lean.Elab.macroAttribute}"
+  IO.println s!"cpass extension: {names.contains `Lean.Compiler.LCNF.passManagerExt}"
+  let unreplayable := entries.foldl (fun s entry => entry.unreplayable.foldl (·.insert ·) s) ({} : NameSet)
+  IO.println s!"unreplayable: {unreplayable.toArray}"
   IO.println s!"local entries: {locals.size}"
   IO.println s!"local simp: {locals.any (fun (_, n, _) => n == `Lean.Meta.simpExtension)}"
   let localDepths : Array Nat := locals.map fun entry => entry.1

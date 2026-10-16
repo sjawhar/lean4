@@ -88,6 +88,7 @@ private builtin_initialize structureExt : PersistentEnvExtension StructureInfo S
   mkInitial       := pure ((), {})
   addImportedFn   := fun _ => pure ((), {})
   addEntryFn      := fun (_, s) e => ((), { s with map := s.map.insert e.structName e })
+  ofOLeanEntry?   := some fun _ entry => pure entry
   exportEntriesFn := fun (_, s) => s.map.toArray |>.map (·.snd) |>.qsort StructureInfo.lt
 }
 
