@@ -1,0 +1,44 @@
+commands: 32
+payload extensions: 166
+user extension: true
+custom simp set: true
+parser extension: true
+macro attribute: true
+local entries: 6
+local simp: true
+transient local depth: true
+cache payloads: true
+0 extensions=#[Lean.declRangeExt] locals=#[] caches=#[]
+1 extensions=#[Lean.declRangeExt, _private.Lean.Namespace.0.Lean.namespacesExt, reducibilityCore, Lean.Compiler.inlineAttrs, Lean.Meta.Match.Extension.extension, Lean.IR.declMapExt, _private.Lean.ExtraModUses.0.Lean.extraModUses, Lean.Compiler.LCNF.baseExt, Lean.Compiler.LCNF.monoExt, Lean.Compiler.LCNF.impureSigExt, Lean.Compiler.LCNF.UnreachableBranches.functionSummariesExt] locals=#[] caches=#[55, 67, 69, 123]
+2 extensions=#[Lean.declRangeExt, _private.Lean.ExtraModUses.0.Lean.extraModUses, Lean.backwardDefeqAttr, Lean.defeqAttr, Lean.Meta.simpExtension] locals=#[] caches=#[]
+3 extensions=#[] locals=#[(0, Lean.Meta.simpExtension)] caches=#[]
+4 extensions=#[Lean.declRangeExt, Lean.backwardDefeqAttr, Lean.defeqAttr] locals=#[(0, Lean.Meta.simpExtension)] caches=#[]
+5 extensions=#[Lean.declRangeExt, _private.Lean.Namespace.0.Lean.namespacesExt, _private.Lean.ExtraModUses.0.Lean.extraModUses] locals=#[(1, Lean.Meta.simpExtension)] caches=#[]
+6 extensions=#[_private.Lean.Namespace.0.Lean.namespacesExt] locals=#[] caches=#[]
+7 extensions=#[] locals=#[] caches=#[]
+8 extensions=#[Lean.declRangeExt] locals=#[(1, Lean.Meta.simpExtension), (0, Lean.Meta.simpExtension)] caches=#[107]
+9 extensions=#[_private.Lean.Namespace.0.Lean.namespacesExt] locals=#[] caches=#[]
+10 extensions=#[Lean.declRangeExt] locals=#[] caches=#[]
+11 extensions=#[] locals=#[] caches=#[]
+12 extensions=#[Lean.declRangeExt] locals=#[] caches=#[]
+13 extensions=#[Lean.declRangeExt, Lean.IR.declMapExt, Lean.Compiler.LCNF.baseExt, Lean.Compiler.LCNF.monoExt, Lean.Compiler.LCNF.impureSigExt, Lean.Compiler.LCNF.UnreachableBranches.functionSummariesExt] locals=#[] caches=#[55, 67, 69, 107]
+14 extensions=#[Lean.declRangeExt, reducibilityCore, Lean.Meta.instanceExtension, Lean.IR.declMapExt, Lean.Compiler.LCNF.baseExt, Lean.Compiler.LCNF.monoExt, Lean.Compiler.LCNF.impureSigExt, Lean.Compiler.LCNF.UnreachableBranches.functionSummariesExt] locals=#[] caches=#[55, 67, 69]
+15 extensions=#[Lean.declRangeExt, Lean.docStringExt, reducibilityCore, Lean.IR.declMapExt, Lean.Compiler.LCNF.baseExt, Lean.Compiler.LCNF.monoExt, Lean.Compiler.LCNF.impureSigExt, Lean.Compiler.LCNF.UnreachableBranches.functionSummariesExt] locals=#[] caches=#[55, 67, 69]
+16 extensions=#[Lean.auxRecExt, Lean.noConfusionExt, Lean.declRangeExt, Lean.protectedExt, _private.Lean.Namespace.0.Lean.namespacesExt, reducibilityCore, Lean.Compiler.inlineAttrs, Lean.projectionFnInfoExt, _private.Lean.Structure.0.Lean.structureExt, Lean.Meta.instanceExtension, _private.Lean.Compiler.LCNF.MonoTypes.0.Lean.Compiler.LCNF.trivialStructureInfoExt, Lean.Compiler.LCNF.monoTypeExt, _private.Lean.Compiler.LCNF.ToImpureType.0.Lean.Compiler.LCNF.impureTypeExt, _private.Lean.Compiler.LCNF.ToImpureType.0.Lean.Compiler.LCNF.impureTrivialStructureInfoExt, _private.Lean.Compiler.LCNF.ToImpureType.0.Lean.Compiler.LCNF.ctorLayoutExt, Lean.Meta.simpExtension, Lean.Meta.completionBlackListExt, Lean.Meta.Grind.grindExt] locals=#[] caches=#[42, 55]
+17 extensions=#[Lean.auxRecExt, _private.Lean.AuxRecursor.0.Lean.sparseCasesOnExt, Lean.noConfusionExt, Lean.declRangeExt, Lean.protectedExt, _private.Lean.Namespace.0.Lean.namespacesExt, reducibilityCore, Lean.Meta.instanceExtension, Lean.IR.declMapExt, _private.Lean.Compiler.LCNF.MonoTypes.0.Lean.Compiler.LCNF.trivialStructureInfoExt, Lean.Compiler.LCNF.monoTypeExt, Lean.Compiler.LCNF.baseExt, Lean.Compiler.LCNF.monoExt, Lean.Compiler.LCNF.impureSigExt, _private.Lean.Compiler.LCNF.ToImpureType.0.Lean.Compiler.LCNF.impureTypeExt, _private.Lean.Compiler.LCNF.ToImpureType.0.Lean.Compiler.LCNF.impureTrivialStructureInfoExt, _private.Lean.Compiler.LCNF.ToImpureType.0.Lean.Compiler.LCNF.ctorLayoutExt, Lean.Compiler.LCNF.UnreachableBranches.functionSummariesExt, Lean.Meta.simpExtension, Lean.Meta.completionBlackListExt, Lean.Elab.Term.elabAsElim, Lean.Meta.Grind.grindExt] locals=#[] caches=#[55, 67, 69]
+18 extensions=#[Lean.declRangeExt, _private.Lean.Namespace.0.Lean.namespacesExt, reducibilityCore, recExt, Lean.Compiler.inlineAttrs, Lean.Meta.Match.Extension.extension, Lean.IR.declMapExt, Lean.Compiler.LCNF.baseExt, Lean.Compiler.LCNF.monoExt, Lean.Compiler.LCNF.impureSigExt, Lean.Compiler.LCNF.UnreachableBranches.functionSummariesExt, Lean.Elab.Structural.eqnInfoExt] locals=#[] caches=#[0, 55, 67, 69, 123]
+19 extensions=#[Lean.declRangeExt, Lean.IR.declMapExt, Lean.Compiler.LCNF.baseExt, Lean.Compiler.LCNF.monoExt, Lean.Compiler.LCNF.impureSigExt, Lean.Compiler.LCNF.UnreachableBranches.functionSummariesExt] locals=#[] caches=#[67, 69]
+20 extensions=#[Lean.declRangeExt, Lean.IR.declMapExt, Lean.Compiler.LCNF.baseExt, Lean.Compiler.LCNF.monoExt, Lean.Compiler.LCNF.impureSigExt, Lean.Compiler.LCNF.UnreachableBranches.functionSummariesExt] locals=#[] caches=#[67, 69]
+21 extensions=#[Lean.declRangeExt] locals=#[] caches=#[]
+22 extensions=#[Lean.declRangeExt, Lean.noncomputableExt] locals=#[(1, Lean.Meta.instanceExtension)] caches=#[]
+23 extensions=#[_private.Lean.Namespace.0.Lean.namespacesExt] locals=#[] caches=#[]
+24 extensions=#[Lean.declRangeExt, Lean.protectedExt, Lean.IR.declMapExt, Lean.Compiler.LCNF.baseExt, Lean.Compiler.LCNF.monoExt, Lean.Compiler.LCNF.impureSigExt, Lean.Compiler.LCNF.UnreachableBranches.functionSummariesExt] locals=#[] caches=#[67, 69]
+25 extensions=#[] locals=#[] caches=#[]
+26 extensions=#[Lean.declRangeExt, _private.Lean.ExtraModUses.0.Lean.extraModUses, Lean.backwardDefeqAttr, Lean.defeqAttr, ext._@.X.1733490467._hygCtx._hyg.3] locals=#[] caches=#[]
+27 extensions=#[Lean.declRangeExt, Lean.IR.declMapExt, _private.Lean.ExtraModUses.0.Lean.extraModUses, Lean.Compiler.LCNF.baseExt, Lean.Compiler.LCNF.monoExt, Lean.Compiler.LCNF.impureSigExt, Lean.Compiler.LCNF.UnreachableBranches.functionSummariesExt, myExt] locals=#[] caches=#[67, 69]
+28 extensions=#[Lean.declRangeExt, _private.Lean.Compiler.MetaAttr.0.Lean.metaExt, Lean.IR.declMapExt, Lean.Compiler.LCNF.baseExt, Lean.Compiler.LCNF.monoExt, Lean.Compiler.LCNF.impureSigExt, Lean.Compiler.LCNF.UnreachableBranches.functionSummariesExt, Lean.Parser.parserExtension] locals=#[] caches=#[31, 55, 67, 69, 79]
+29 extensions=#[Lean.declRangeExt, _private.Lean.Compiler.MetaAttr.0.Lean.metaExt, Lean.IR.declMapExt, _private.Lean.ExtraModUses.0.Lean.extraModUses, Lean.Compiler.LCNF.baseExt, Lean.Compiler.LCNF.monoExt, Lean.Compiler.LCNF.impureSigExt, Lean.Compiler.LCNF.UnreachableBranches.functionSummariesExt, Lean.Elab.macroAttribute] locals=#[] caches=#[31, 55, 67, 69, 79]
+30 extensions=#[Lean.declRangeExt, _private.Lean.Compiler.MetaAttr.0.Lean.metaExt, Lean.IR.declMapExt, _private.Lean.ExtraModUses.0.Lean.extraModUses, Lean.Compiler.LCNF.baseExt, Lean.Compiler.LCNF.monoExt, Lean.Compiler.LCNF.impureSigExt, Lean.Compiler.LCNF.UnreachableBranches.functionSummariesExt, Lean.Parser.parserExtension, Lean.PrettyPrinter.Delaborator.appUnexpanderAttribute, Lean.Elab.macroAttribute] locals=#[] caches=#[31, 55, 67, 69, 79]
+31 extensions=#[] locals=#[] caches=#[]
+scoped identical: true
+identical: true

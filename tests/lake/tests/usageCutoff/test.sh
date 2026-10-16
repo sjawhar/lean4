@@ -32,13 +32,18 @@ match_text "Replayed Test.HU" produced.out
 # (sidecars are removed before being rewritten: under an artifact cache they are read-only links)
 printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 1\n' > Test/H.lean
 rm -f .lake/build/lib/lean/Test/HU.usage
-printf '{"version":3,"noskip":false,"moduleDigest":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","own":[],"used":[[[true],[]]],"extra":[]}' > .lake/build/lib/lean/Test/HU.usage
+printf '{"version":4,"noskip":false,"moduleDigest":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","own":[],"used":[[[true],[]]],"extra":[]}' > .lake/build/lib/lean/Test/HU.usage
 test_out "expected a name component" build Test.HU
 match_text "Built Test.HU" produced.out
 # a sidecar of another format version (an older toolchain wrote it) reads as absent: built, no warning
 rm -f .lake/build/lib/lean/Test/HU.usage
 printf '{"version":2,"noskip":false,"moduleDigest":"0000000000000000","closure":"0000000000000000","own":[],"used":[],"extra":[]}' > .lake/build/lib/lean/Test/HU.usage
 printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 2\n' > Test/H.lean
+test_not_out "warning" build -v Test.HU
+match_text "Built Test.HU" produced.out
+rm -f .lake/build/lib/lean/Test/HU.usage
+printf '{"version":3,"noskip":false,"moduleDigest":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","own":[],"used":[[[true],[]]],"extra":[]}' > .lake/build/lib/lean/Test/HU.usage
+printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 3\n' > Test/H.lean
 test_not_out "warning" build -v Test.HU
 match_text "Built Test.HU" produced.out
 # unrelated addition: A recompiles, nothing below it does

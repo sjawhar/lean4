@@ -7,10 +7,14 @@ public import Lean.Compiler.ImplementedByAttr
 public import Lean.Compiler.ExternAttr
 public import Lean.Compiler.ExportAttr
 public import Lean.Compiler.NoncomputableAttr
-public import Lean.Elab.InfoTree.Types
+public import Lean.Elab.Command
 import Lean.ExtraModUses
 import Lean.Compiler.Old
 import Lean.Server.InfoUtils
+import Lean.Meta.Instances
+import Lean.Meta.Tactic.Simp.Attr
+public import Lean.Util.CommandEntries
+import Lean.Util.ValueSensitive
 public section
 namespace Lean.ModuleUsage
 
@@ -204,6 +208,95 @@ them again. -/
 def setLocalDigests (env : Environment) (own : Array (Name × Digest)) : Environment :=
   ext.modifyState (asyncMode := .mainOnly) env ({ · with localDigests? := some own })
 
+def reducibilityEnc (e : Enc) : ReducibilityStatus → Enc
+  | .reducible => e.u8 0 | .semireducible => e.u8 1 | .irreducible => e.u8 2
+  | .implicitReducible => e.u8 3 | .instanceReducible => e.u8 4
+
+/-- `c`'s statement digests `(core, attrs)`. `core` covers its level params and type, binders included, never
+its value. `attrs` covers what steers its users without changing the kernel constant: reducibility, instance
+membership and priority, `@[simp]` membership, `protected`, `private` and `noncomputable`. -/
+def stmtHash (env : Environment) (c : ConstantInfo) : Digest × Digest :=
+  let core := ({} : Enc).names c.levelParams |>.digest (exprDigest true c.type) |>.finish
+  let simp := Meta.simpExtension.getState env
+  let prio := (Meta.instanceExtension.getState env).instanceNames.find? c.name |>.map (·.priority)
+  let attrs := reducibilityEnc {} (getReducibilityStatusCore env c.name)
+    |>.opt prio Enc.nat
+    |>.bool (simp.isLemma (.decl c.name) || simp.isLemma (.decl c.name (inv := true)) ||
+      simp.isDeclToUnfold c.name)
+    |>.bool (isProtected env c.name) |>.bool (isPrivateName c.name) |>.bool (isNoncomputable env c.name)
+    |>.finish
+  (core, attrs)
+
+/-- The kernel never unfolds a theorem, opaque or axiom, so a type mentioning one depends on its statement
+only. -/
+def isStmtOnly : ConstantInfo → Bool
+  | .thmInfo _ | .opaqueInfo _ | .axiomInfo _ => true
+  | _ => false
+
+structure StmtState where
+  /-- Per imported module: as `State.importedModuleEntries`, with `(core, attrs)` per constant. -/
+  importedModuleEntries : Array (Array (Name × Digest × Digest)) := #[]
+  /-- The current module's statement digests, if `setLocalStmt` stored them for the `.olean` write. -/
+  localStmt? : Option (Array (Name × Digest × Digest)) := none
+instance : Inhabited StmtState := ⟨{}⟩
+
+def StmtState.findAt? (s : StmtState) (i : ModuleIdx) (c : Name) : Option (Digest × Digest) := do
+  let es ← s.importedModuleEntries[i.toNat]?
+  (·.2) <$> es.binSearch (c, default, default) (fun a b => Name.quickLt a.1 b.1) (lo := 1)
+
+def StmtState.find? (s : StmtState) (env : Environment) (c : Name) : Option (Digest × Digest) := do
+  s.findAt? (← env.getModuleIdxFor? c) c
+
+/-- Statement digests of the current module's constants, sorted by name: per SCC, as `compute` does, each
+member's name and `stmtHash` core with the name of every constant its type mentions and, for a theorem, opaque
+or axiom, that constant's statement digest, for anything else its full digest (`own` for the current module's),
+since a definition's value decides what a type mentioning it means. `attrs` is `stmtHash`'s, per constant. -/
+def computeStmt (env : Environment) (s : StmtState) (own : Array (Name × Digest)) (consts := ownConsts env) :
+    Array (Name × Digest × Digest) := Id.run do
+  let full : Std.HashMap Name Digest := own.foldl (fun m (n, d) => m.insert n d) {}
+  let fs := state env
+  let byName : Std.HashMap Name (ConstantInfo × (Digest × Digest) × Array Name) :=
+    consts.foldl (init := {}) fun m (n, ci, _) =>
+      m.insert n (ci, stmtHash env ci, ci.type.getUsedConstantsAsSet.toArray.qsort Name.quickLt)
+  let stmtOnly (r : Name) : Bool := ((byName[r]?.map (·.1)) <|> env.find? r).any isStmtOnly
+  let sccs := SCC.scc (consts.map (·.1)).toList fun n =>
+    byName[n]!.2.2.toList.filter fun r => byName.contains r && stmtOnly r
+  let mut out : Std.HashMap Name Digest := {}
+  for scc in sccs do
+    let members := NameSet.ofList scc
+    let sorted := scc.toArray.qsort Name.quickLt
+    let mut e : Enc := ({} : Enc).nat sorted.size
+    for m in sorted do
+      let (_, (core, _), rs) := byName[m]!
+      let outside := rs.filter (!members.contains ·)
+      e := e.name m |>.digest core |>.nat outside.size
+      for r in outside do
+        let so := stmtOnly r
+        let d := if so then out[r]? <|> (s.find? env r).map (·.1) else full[r]? <|> fs.find? env r
+        e := e.name r |>.bool so |>.opt d Enc.digest
+    let d := e.finish
+    for m in scc do out := out.insert m d
+  return (consts.map fun (n, _) => (n, out[n]!, byName[n]!.2.1.2)).qsort fun a b => Name.quickLt a.1 b.1
+
+builtin_initialize stmtExt : PersistentEnvExtension (Name × Digest × Digest) (Name × Digest × Digest) StmtState ←
+  registerPersistentEnvExtension {
+    mkInitial := pure {}
+    addImportedFn := fun es => pure { importedModuleEntries := es }
+    addEntryFn := fun s _ => s
+    -- Private level only, as `ext`.
+    exportEntriesFnEx := fun env s =>
+      let own := (ext.getState (asyncMode := .mainOnly) env).localDigests?.getD (localDigests env)
+      let es := #[(.anonymous, default, default)] ++ s.localStmt?.getD (computeStmt env s own)
+      { exported := #[], server := #[], «private» := es }
+    asyncMode := .mainOnly
+  }
+
+def stmtState (env : Environment) : StmtState := stmtExt.getState (asyncMode := .mainOnly) env
+
+/-- Stores `computeStmt`'s result for the extension to export. -/
+def setLocalStmt (env : Environment) (stmt : Array (Name × Digest × Digest)) : Environment :=
+  stmtExt.modifyState (asyncMode := .mainOnly) env ({ · with localStmt? := some stmt })
+
 /-- Per defining module, sorted: every imported constant that the current module's own constants refer to or
 that is in `extra`, with its digest. Constants without a digest (from a module built without this extension) are
 left out. -/
@@ -227,6 +320,220 @@ where
     | .anonymous, acc => acc
     | .str p s, acc => (go p acc).push (.str s)
     | .num p k, acc => (go p acc).push (.num k)
+
+/-- Inverse of `nameToJson`. -/
+def nameOfJson? (j : Json) : Except String Name := do
+  (← j.getArr?).foldlM (init := .anonymous) fun n c => match c with
+    | .str s => pure (.str n s)
+    | .num k => do
+      unless k.exponent == 0 && k.mantissa ≥ 0 do throw s!"expected a name component, got {c.compress}"
+      pure (.num n k.mantissa.toNat)
+    | _ => throw s!"expected a name component, got {c.compress}"
+
+/-- A `Name` (de)serialized as `nameToJson`. -/
+structure JName where
+  name : Name
+  deriving Inhabited, BEq
+instance : ToJson JName := ⟨(nameToJson ·.name)⟩
+instance : FromJson JName := ⟨fun j => JName.mk <$> nameOfJson? j⟩
+
+/-- How a command of the previous build is matched to one of this build: a declaration command by the sorted
+top-level names it declared, any other command by its kind, text digest and occurrence index among commands with
+that kind and text. -/
+inductive CommandKey where
+  | names (ns : Array Name)
+  | kind (kind : Name) (text : Digest) (occ : Nat)
+  deriving Inhabited, BEq, Hashable
+
+instance : ToJson CommandKey where
+  toJson
+    | .names ns => .arr #["N", .arr (ns.map nameToJson)]
+    | .kind k t o => .arr #["K", nameToJson k, toJson t, o]
+instance : FromJson CommandKey where
+  fromJson? j := do
+    match ← j.getArr? with
+    | #["N", ns] => return .names ((← fromJson? (α := Array JName) ns).map (·.name))
+    | #["K", k, t, o] => return .kind (← nameOfJson? k) (← fromJson? t) (← fromJson? o)
+    | _ => throw s!"expected a command key, got {j.compress}"
+
+/-- The `DeclNameGenerator` state after a command. -/
+structure DeclNGenRecord where
+  namePrefix : Name
+  idx : Nat
+  parentIdxs : List Nat
+  deriving Inhabited, BEq
+
+instance : ToJson DeclNGenRecord := ⟨fun r => Json.mkObj [("prefix", nameToJson r.namePrefix), ("idx", r.idx),
+  ("parentIdxs", toJson r.parentIdxs)]⟩
+instance : FromJson DeclNGenRecord := ⟨fun j => return {
+  namePrefix := ← nameOfJson? (← j.getObjVal? "prefix")
+  idx := ← j.getObjValAs? Nat "idx"
+  parentIdxs := ← j.getObjValAs? (List Nat) "parentIdxs" }⟩
+
+/-- The `Command.State` counters a kept command must restore. -/
+structure CommandPost where
+  auxDeclNGen : DeclNGenRecord
+  /-- The quotation contexts the command added to `usedQuotCtxts`, sorted. -/
+  quotCtxts : Array Name
+  /-- The length of the local-entry log after the command. -/
+  localEntries : Nat
+  deriving Inhabited, BEq
+
+instance : ToJson CommandPost := ⟨fun p => Json.mkObj [("auxDeclNGen", toJson p.auxDeclNGen),
+  ("quotCtxts", .arr (p.quotCtxts.map nameToJson)), ("localEntries", p.localEntries)]⟩
+instance : FromJson CommandPost := ⟨fun j => return {
+  auxDeclNGen := ← j.getObjValAs? DeclNGenRecord "auxDeclNGen"
+  quotCtxts := (← j.getObjValAs? (Array JName) "quotCtxts").map (·.name)
+  localEntries := ← j.getObjValAs? Nat "localEntries" }⟩
+
+/-- A summary of the non-persistent cache entries a command added. Keys that hold `Expr`s are digests here; the
+`.olean` payload carries the objects. -/
+structure CommandCachesRecord where
+  matcher : Array (Digest × Name) := #[]
+  auxLemma : Array (Digest × Name × List Name) := #[]
+  eqnsInv : Array (Name × Name) := #[]
+  sparseCasesOn : Array (Digest × Name) := #[]
+  structRes : Array (Name × Array Name) := #[]
+  deriving Inhabited, BEq
+
+/-- A flat JSON triple `[a, b, c]`, as the writers below emit (`Prod`'s codec nests: `[a, [b, c]]`). -/
+def tripleOfJson? [FromJson α] [FromJson β] [FromJson γ] (j : Json) : Except String (α × β × γ) := do
+  let #[a, b, c] ← j.getArr? | throw s!"expected a triple, got {j.compress}"
+  return (← fromJson? a, ← fromJson? b, ← fromJson? c)
+
+def triplesOfJson? [FromJson α] [FromJson β] [FromJson γ] (j : Json) (k : String) :
+    Except String (Array (α × β × γ)) := do
+  (← j.getObjValAs? (Array Json) k).mapM tripleOfJson?
+
+instance : ToJson CommandCachesRecord := ⟨fun c => Json.mkObj [
+  ("matcher", .arr (c.matcher.map fun (d, n) => .arr #[toJson d, nameToJson n])),
+  ("auxLemma", .arr (c.auxLemma.map fun (d, n, ls) =>
+    .arr #[toJson d, nameToJson n, .arr (ls.toArray.map nameToJson)])),
+  ("eqnsInv", .arr (c.eqnsInv.map fun (a, b) => .arr #[nameToJson a, nameToJson b])),
+  ("sparseCasesOn", .arr (c.sparseCasesOn.map fun (d, n) => .arr #[toJson d, nameToJson n])),
+  ("structRes", .arr (c.structRes.map fun (s, o) => .arr #[nameToJson s, .arr (o.map nameToJson)]))]⟩
+instance : FromJson CommandCachesRecord := ⟨fun j => return {
+  matcher := (← j.getObjValAs? (Array (Digest × JName)) "matcher").map fun (d, n) => (d, n.name)
+  auxLemma := (← triplesOfJson? (α := Digest) (β := JName) (γ := Array JName) j "auxLemma").map
+    fun (d, n, ls) => (d, n.name, (ls.map (·.name)).toList)
+  eqnsInv := (← j.getObjValAs? (Array (JName × JName)) "eqnsInv").map fun (a, b) => (a.name, b.name)
+  sparseCasesOn := (← j.getObjValAs? (Array (Digest × JName)) "sparseCasesOn").map fun (d, n) => (d, n.name)
+  structRes := (← j.getObjValAs? (Array (JName × Array JName)) "structRes").map
+    fun (s, o) => (s.name, o.map (·.name)) }⟩
+
+/-- One top-level command's record in `.usage` version 4. -/
+structure CommandRecord where
+  i : Nat
+  key : CommandKey
+  /-- D-text: the command's syntax without source positions. -/
+  text : Digest
+  /-- D-ctx: the scope stack, the counters and this module's entries before the command. -/
+  ctx : Digest
+  /-- Whether the command added a constant to the environment. -/
+  isDecl : Bool
+  /-- Whether the command is an `initialize`/`builtin_initialize` (JSON `initialize`). -/
+  isInit : Bool
+  decls : Array Name
+  aux : Array Name
+  /-- Theorems, opaques and axioms the command's constants use only through value-opaque edges, with their
+  statement digest. -/
+  usesStmt : Array (Name × Digest)
+  /-- Every other constant the command used, with its full digest and attrs digest. -/
+  usesFull : Array (Name × Digest × Digest)
+  extra : Array (Name × Bool)
+  post : CommandPost
+  caches : CommandCachesRecord
+  deriving Inhabited, BEq
+
+instance : ToJson CommandRecord := ⟨fun r => Json.mkObj [
+  ("i", r.i), ("key", toJson r.key), ("text", toJson r.text), ("ctx", toJson r.ctx),
+  ("kind", if r.isDecl then "decl" else "other"), ("initialize", r.isInit),
+  ("decls", .arr (r.decls.map nameToJson)), ("aux", .arr (r.aux.map nameToJson)),
+  ("usesStmt", .arr (r.usesStmt.map fun (n, d) => .arr #[nameToJson n, toJson d])),
+  ("usesFull", .arr (r.usesFull.map fun (n, d, a) => .arr #[nameToJson n, toJson d, toJson a])),
+  ("extra", .arr (r.extra.map fun (m, isMeta) => .arr #[nameToJson m, isMeta])),
+  ("post", toJson r.post), ("caches", toJson r.caches)]⟩
+
+instance : FromJson CommandRecord := ⟨fun j => return {
+  i := ← j.getObjValAs? Nat "i"
+  key := ← j.getObjValAs? CommandKey "key"
+  text := ← j.getObjValAs? Digest "text"
+  ctx := ← j.getObjValAs? Digest "ctx"
+  isDecl := ← do match ← j.getObjValAs? String "kind" with
+    | "decl" => pure true | "other" => pure false
+    | k => throw s!"expected a command kind, got {k}"
+  isInit := ← j.getObjValAs? Bool "initialize"
+  decls := (← j.getObjValAs? (Array JName) "decls").map (·.name)
+  aux := (← j.getObjValAs? (Array JName) "aux").map (·.name)
+  usesStmt := (← j.getObjValAs? (Array (JName × Digest)) "usesStmt").map fun (n, d) => (n.name, d)
+  usesFull := (← triplesOfJson? (α := JName) (β := Digest) (γ := Digest) j "usesFull").map
+    fun (n, d, a) => (n.name, d, a)
+  extra := (← j.getObjValAs? (Array (JName × Bool)) "extra").map fun (m, b) => (m.name, b)
+  post := ← j.getObjValAs? CommandPost "post"
+  caches := ← j.getObjValAs? CommandCachesRecord "caches" }⟩
+
+partial def syntaxEnc (e : Enc) (stx : Syntax) : Enc :=
+  match stx with
+  | .missing => e.u8 0
+  | .node _ k args => args.foldl syntaxEnc (e.u8 1 |>.name k |>.nat args.size)
+  | .atom _ val => e.u8 2 |>.str val
+  | .ident _ rawVal val preresolved =>
+    preresolved.foldl (fun e p => match p with
+      | .namespace ns => e.u8 0 |>.name ns
+      | .decl n fields => fields.foldl Enc.str (e.u8 1 |>.name n |>.nat fields.length))
+      (e.u8 3 |>.str (Substring.Raw.Internal.toString rawVal) |>.name val |>.nat preresolved.length)
+
+/-- D-text: syntax structure and values, excluding source positions. -/
+def textDigest (stx : Syntax) : Digest :=
+  (syntaxEnc {} stx.unsetTrailing).finish
+
+def dataValueEnc (e : Enc) : DataValue → Enc
+  | .ofString v => e.u8 0 |>.str v
+  | .ofBool v => e.u8 1 |>.bool v
+  | .ofName v => e.u8 2 |>.name v
+  | .ofNat v => e.u8 3 |>.nat v
+  | .ofInt v => e.u8 4 |>.str (toString v)
+  | .ofSyntax v => e.u8 5 |> (syntaxEnc · v)
+
+def openDeclEnc (e : Enc) : OpenDecl → Enc
+  | .simple ns except => e.u8 0 |>.name ns |>.names except
+  | .explicit id decl => e.u8 1 |>.name id |>.name decl
+
+/-- The command-context portion available before payload recording is folded in by the reuse frontend. -/
+def ctxDigest (st : Elab.Command.State) (entries : Digest) : Digest := Id.run do
+  let mut e : Enc := ({} : Enc).nat st.scopes.length
+  for scope in st.scopes do
+    e := e.str scope.header
+    let mut opts := #[]
+    for p in scope.opts do opts := opts.push p
+    opts := opts.qsort fun a b => Name.quickLt a.1 b.1
+    e := e.nat opts.size
+    for (n, v) in opts do e := dataValueEnc (e.name n) v
+    e := scope.openDecls.foldl openDeclEnc (e.name scope.currNamespace |>.nat scope.openDecls.length)
+    e := e.names scope.levelNames
+    e := scope.varDecls.foldl (fun e s => syntaxEnc e s) (e.nat scope.varDecls.size)
+    e := scope.varUIds.foldl Enc.name (e.nat scope.varUIds.size)
+    e := e.names scope.includedVars |>.names scope.omittedVars
+      |>.bool scope.isNoncomputable |>.bool scope.isPublic |>.bool scope.isMeta
+    e := scope.attrs.foldl (fun e s => syntaxEnc e s.raw) (e.nat scope.attrs.length)
+  let g := st.auxDeclNGen.toRecord
+  let quotCtxts := st.usedQuotCtxts.toArray.qsort Name.quickLt
+  return e.nat st.nextMacroScope |>.name g.namePrefix |>.nat g.idx |>.nat g.parentIdxs.length
+    |> g.parentIdxs.foldl Enc.nat |>.nat quotCtxts.size |> quotCtxts.foldl Enc.name
+    |>.digest entries |>.finish
+
+structure CommandObservation where
+  i : Nat
+  stx : Syntax
+  before : Elab.Command.State
+  after : Elab.Command.State
+  deriving Nonempty
+
+builtin_initialize commandObservationsRef : IO.Ref (Array CommandObservation) ← IO.mkRef #[]
+
+def recordCommandObservation (i : Nat) (stx : Syntax) (before after : Elab.Command.State) :
+    BaseIO Unit :=
+  commandObservationsRef.modify (·.push { i, stx, before, after })
 
 unsafe structure WalkState where
   /-- Visited metavariable-free subterms: their constants do not depend on any assignment. -/
@@ -276,36 +583,151 @@ keep a constant that instantiation's beta reduction would drop: a superset, neve
 @[implemented_by usedFromInfoTreesImpl]
 opaque usedFromInfoTrees (trees : Array Elab.InfoTree) (init : NameSet) : NameSet
 
+def isAuxName (env : Environment) (n : Name) : Bool :=
+  let s := n.toString
+  isAuxRecursor env n || Meta.isMatcherCore env n || isNoConfusion env n ||
+    (Compiler.isUnsafeRecName? n).isSome || n.isInternalDetail ||
+    s.contains "._auxLemma" || s.contains "._proof_" || s.contains "._eq_" ||
+    s.endsWith "._sunfold" || s.endsWith "._native"
+
+
+def commandRecords (env : Environment) (own : Array (Name × Digest))
+    (stmt : Array (Name × Digest × Digest)) (payloads : Array CommandEntries) :
+    IO (Array CommandRecord) := IO.FS.withTempDir fun dir => do
+  let observations ← commandObservationsRef.get
+  let declEntries ← declsByCommandRef.get
+  let explicitUses ← usedByCommandRef.get
+  let extras ← extraModUsesByCmdRef.get
+  let fullLocal : Std.HashMap Name Digest := own.foldl (fun m (n, d) => m.insert n d) {}
+  let stmtLocal : Std.HashMap Name (Digest × Digest) :=
+    stmt.foldl (fun m (n, d, a) => m.insert n (d, a)) {}
+  let fs := state env
+  let ss := stmtState env
+  let fullOf n := fullLocal[n]? <|> fs.find? env n
+  let stmtOf n := stmtLocal[n]? <|> ss.find? env n
+  let mut occurrences : Std.HashMap (Name × Digest) Nat := {}
+  let payloadByIdx : Std.HashMap Nat CommandEntries :=
+    payloads.foldl (fun m p => m.insert p.idx p) {}
+  let mut entriesEnc : Enc := {}
+  let mut out := #[]
+  for obs in observations.qsort (·.i < ·.i) do
+    let before := obs.before.env.checked.get
+    let after := obs.after.env.checked.get
+    let added := after.constants.foldStage2 (fun s n _ =>
+      if before.constants.contains n then s else s.insert n) ({} : NameSet)
+    let addedNames := added.toArray.qsort Name.quickLt
+    let decls := addedNames.filter (!isAuxName env ·)
+    let aux := addedNames.filter (isAuxName env)
+    let mut refsSet : NameSet := {}
+    let mut full : NameSet := {}
+    for n in addedNames do
+      if let some ci := env.find? n then
+        let rs := refs env ci
+        refsSet := rs.foldl (·.insert ·) refsSet
+        for r in rs do
+          if let some ri := env.find? r then
+            let stmtOnly := isStmtOnly ri && !env.contains (Compiler.mkUnsafeRecName r)
+            if !stmtOnly ||
+                ValueSensitive.constUnsafelyUsesValue env (({} : NameSet).insert r) ci ||
+                (isAuxName env n && ci matches .defnInfo _) then
+              full := full.insert r
+    for (i, _, used) in declEntries do
+      if i == obs.i then refsSet := used.foldl (·.insert ·) refsSet
+    for (i, n) in explicitUses do
+      if i == obs.i then full := full.insert n
+    let infoSt := obs.after.infoState.substituteLazy.get
+    let infoUsed := usedFromInfoTrees infoSt.trees.toArray {}
+    for n in infoUsed do
+      unless refsSet.contains n do full := full.insert n
+    for n in refsSet do
+      if let some ci := env.find? n then
+        if !isStmtOnly ci then full := full.insert n
+    let used := refsSet.foldl (·.insert ·) full
+    let used := added.foldl (fun s n => s.erase n) used
+    let usesFull := (used.toArray.filterMap fun n => do
+      guard (full.contains n)
+      let d ← fullOf n
+      let (_, a) ← stmtOf n
+      return (n, d, a)).qsort fun a b => Name.quickLt a.1 b.1
+    let usesStmt := (used.toArray.filterMap fun n => do
+      guard (!full.contains n)
+      let (d, _) ← stmtOf n
+      return (n, d)).qsort fun a b => Name.quickLt a.1 b.1
+    let text := textDigest obs.stx
+    let kind := obs.stx.getKind
+    let key ← if !decls.isEmpty then
+      pure (.names decls)
+    else
+      let occ := occurrences[(kind, text)]?.getD 0
+      occurrences := occurrences.insert (kind, text) (occ + 1)
+      pure (.kind kind text occ)
+    let extra := (extras.toArray.filterMap fun (i, u) =>
+      if i == obs.i && (env.getModuleIdx? u.module).any fs.hasEntries then some (u.module, u.isMeta)
+      else none).qsort fun a b => Name.quickLt a.1 b.1 ||
+        (a.1 == b.1 && a.2.toNat < b.2.toNat)
+    let g := obs.after.auxDeclNGen.toRecord
+    let quotCtxts := obs.after.usedQuotCtxts.toArray.filter (!obs.before.usedQuotCtxts.contains ·)
+      |>.qsort Name.quickLt
+    let matcher := aux.filter (Meta.isMatcherCore env) |>.filterMap fun n =>
+      (fullOf n).map (·, n)
+    out := out.push {
+      i := obs.i, key, text, ctx := ctxDigest obs.before entriesEnc.finish
+      isDecl := !decls.isEmpty
+      isInit := kind == ``Lean.Parser.Command.«initialize»
+      decls, aux, usesStmt, usesFull, extra
+      post := {
+        auxDeclNGen := { namePrefix := g.namePrefix, idx := g.idx, parentIdxs := g.parentIdxs }
+        quotCtxts
+        localEntries := localEntryCount obs.after.env
+      }
+      caches := { matcher }
+    }
+    if let some payload := payloadByIdx[obs.i]? then
+      let path := dir / s!"command-{obs.i}"
+      let _ ← unsafe CompactedRegion.save path `commandEntries payload #[] none
+      entriesEnc := entriesEnc.digest (Digest.ofBytes (← IO.FS.readBinFile path))
+  return out
+
 /-- A digest of the module's import closure: its sorted module names. -/
 def closureDigest (env : Environment) : Digest :=
   let names := env.header.moduleNames.qsort Name.quickLt
   (({} : Enc).nat names.size |> names.foldl Enc.name).finish
 
 /-- The `.usage` format version; Lake reads a sidecar of any other version as absent. -/
-def usageVersion : Nat := 3
+def usageVersion : Nat := 4
 
-/-- `own` is `localDigests env consts`. `extra` lists the extra module uses of the environment and of
-`extraModUsesByChecksRef` (those of commands whose environment was discarded). With `incrLoaded` (the run reused
-commands from an `--incr-load` snapshot), `noskip` is set: reused commands never call `addDecl` in this process,
-so `extra` may miss constants they used. -/
+/-- `own` is `localDigests env consts` and `stmt` is `computeStmt` over them. `extra` lists the extra module
+uses of the environment and of `extraModUsesByChecksRef` (those of commands whose environment was discarded). With
+`incrLoaded` (the run reused commands from an `--incr-load` snapshot), `noskip` is set: reused commands never call
+`addDecl` in this process, so `extra` may miss constants they used. `usedAttrs` holds, beside each `used` entry,
+the attrs digest the defining module recorded for it in `stmt`. -/
 def writeUsage (env : Environment) (consts : Array (Name × ConstantInfo × Array Name))
-    (own : Array (Name × Digest)) (extra : NameSet) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
+    (own : Array (Name × Digest)) (stmt : Array (Name × Digest × Digest)) (extra : NameSet)
+    (commands : Array CommandRecord) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
   let noskip := incrLoaded || consts.any fun (_, _, rs) => rs.any
     (· matches ``Lean.reduceBool | ``Lean.reduceNat | ``Lean.ofReduceBool | ``Lean.ofReduceNat)
   let s := state env
+  let ss := stmtState env
   let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecksRef.get)
   let extraMods := allExtra.toArray.filter (fun u => (env.getModuleIdx? u.module).any s.hasEntries)
     |>.qsort fun a b => let k (u : ExtraModUse) := 2 * u.isExported.toNat + u.isMeta.toNat
       Name.quickLt a.module b.module || (a.module == b.module && k a < k b)
   let pair (n : Name) (d : Digest) := Json.arr #[nameToJson n, toJson d]
   let moduleDigest := (own.foldl (fun e (n, d) => e.name n |>.digest d) (({} : Enc).nat own.size)).finish
+  let used := moduleUsed env extra consts
+  let usedAttrs : Array (Name × Array (Name × Digest)) := used.map fun (m, cs) =>
+    (m, cs.filterMap fun (n, _) => (ss.find? env n).map (n, ·.2))
   let j := Json.mkObj [("version", usageVersion), ("noskip", noskip),
     ("moduleDigest", toJson moduleDigest),
     ("closure", toJson (closureDigest env)),
     ("own", Json.arr (own.map fun (n, d) => pair n d)),
-    ("used", Json.arr ((moduleUsed env extra consts).map fun (m, cs) =>
+    ("used", Json.arr (used.map fun (m, cs) =>
       Json.arr #[nameToJson m, Json.arr (cs.map fun (n, d) => pair n d)])),
-    ("extra", Json.arr (extraMods.map fun u => Json.arr #[nameToJson u.module, u.isMeta]))]
+    ("usedAttrs", Json.arr (usedAttrs.map fun (m, cs) =>
+      Json.arr #[nameToJson m, Json.arr (cs.map fun (n, d) => pair n d)])),
+    ("extra", Json.arr (extraMods.map fun u => Json.arr #[nameToJson u.module, u.isMeta])),
+    ("stmt", Json.arr (stmt.map fun (n, c, a) => Json.arr #[nameToJson n, toJson c, toJson a])),
+    ("commands", Json.arr (commands.map toJson))]
   IO.FS.writeFile path j.compress
 
 end Lean.ModuleUsage

@@ -231,6 +231,7 @@ def addDecl (decl : Declaration) (forceExpose := false) : CoreM Unit := do
   if (← usageRecordingRef.get) then
     let used := decl.foldExprM (m := Id) (fun s e => e.foldConsts s fun c s => s.insert c) ({} : NameSet)
     usedByChecksRef.modify fun acc => used.foldl (·.insert ·) acc
+    declsByCommandRef.modify (·.push (← commandIdx, decl.getNames.toArray, used))
   addDeclCore decl forceExpose
   discard <| decl.getTopLevelNames.mapM snapshotEnvLinterOptions
 
