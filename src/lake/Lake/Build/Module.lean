@@ -915,6 +915,57 @@ where
     if c then return some (← cache art ext) else return none
 
 /--
+Saves module build artifacts to the local Lake cache like `cacheOutputArtifacts`, checking each
+against the hash recorded for it (see `recacheArtifact?`): its descriptor in `descrs`, the saved
+trace's record of the module's outputs, or, for the module's `.ltar` (which a build trace does not
+describe), the `.hash` written when it was packed. Returns `none` if any of them does not match or
+has no recorded hash, after checking (and caching or quarantining) all. A `.ltar` without a
+recorded hash is removed instead (it is packed again when needed).
+-/
+def Module.recacheOutputArtifacts?
+  (mod : Module) (isModule useLocalFile postponesCompile : Bool) (descrs : ModuleOutputDescrs)
+: JobM (Option ModuleOutputArtifacts) := do
+  let olean? ← recache mod.oleanFile "olean" descrs.olean.hash
+  let oleanServer? ← recacheIf isModule mod.oleanServerFile "olean.server" descrs.oleanServer?
+  let oleanPrivate? ← recacheIf isModule mod.oleanPrivateFile "olean.private" descrs.oleanPrivate?
+  let irSig? ← recacheIf (isModule && !postponesCompile) mod.irSigFile "ir.sig" descrs.irSig?
+  let ir? ← recacheIf (isModule && !postponesCompile) mod.irFile "ir" descrs.ir?
+  let ilean? ← recache mod.ileanFile "ilean" descrs.ilean.hash
+  let c? ← recacheIf (!(isModule && postponesCompile)) mod.cFile "c" descrs.c?
+  let bc? ← recacheIf (Lean.Internal.hasLLVMBackend ()) mod.bcFile "bc" descrs.bc?
+  let ltar? : Option (Option Artifact) ← id do
+    unless (← mod.ltarFile.pathExists) do return some none
+    match (← Hash.load? (mod.ltarFile.toString ++ ".hash")) with
+    | some hash => return (some ·) <$> (← recache mod.ltarFile "ltar" hash)
+    | none =>
+      removeFileIfExists mod.ltarFile
+      return some none
+  let arts? : Option ModuleOutputArtifacts := do
+    return {
+      isModule
+      olean := ← olean?
+      oleanServer? := ← oleanServer?
+      oleanPrivate? := ← oleanPrivate?
+      irSig? := ← irSig?
+      ir? := ← ir?
+      ilean := ← ilean?
+      c? := ← c?
+      bc? := ← bc?
+      ltar? := ← ltar?
+    }
+  return arts?
+where
+  @[inline] recache file ext (expected : Hash) : JobM (Option Artifact) :=
+    recacheArtifact? (some mod.name.toString) file expected ext (useLocalFile := useLocalFile)
+  recacheIf c file ext (descr? : Option ArtifactDescr) : JobM (Option (Option Artifact)) := do
+    if c then
+      match descr? with
+      | some descr => return (some ·) <$> (← recache file ext descr.hash)
+      | none => return none
+    else
+      return some none
+
+/--
 Some module build artifacts must be located in the build directory (e.g., ILeans).
 This copies the required artifacts from the local Lake cache to the build directory and
 updates the data structure with the new paths.
@@ -1054,6 +1105,15 @@ where
      if c then return some (← compute file ext) else return none
 
 instance : ToOutputJson ModuleOutputArtifacts := ⟨(toJson ·.descrs)⟩
+
+/--
+Decodes a module's output descriptors (as recorded by `buildAction`/`writeFetchTrace`, see
+`ToOutputJson ModuleOutputArtifacts`) from a saved trace, if present and well-formed.
+-/
+def SavedTrace.moduleOutputDescrs? (self : SavedTrace) : Option ModuleOutputDescrs := do
+  let .ok data := self | none
+  let some outputs := data.outputs? | none
+  (ModuleOutputDescrs.fromJson? outputs).toOption
 
 def Module.packLtar
   (self : Module) (arts : ModuleOutputArtifacts)
@@ -1234,8 +1294,12 @@ where
         return arts
       | .incomplete savedTrace ltar? =>
         let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
+        -- Whether the build directory holds the outputs the saved trace describes
+        let mut replayed := false
         if status.isUpToDate then
-          unless (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) do
+          if (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) then
+            replayed := true
+          else
             -- Restoring from the archive stamps the trace with the current input
             -- hash, so only do it on a verified hash match. An mtime-only match
             -- leaves the hash unconfirmed, so rebuild instead.
@@ -1246,7 +1310,15 @@ where
         else
           discard <| mod.buildLean presetup
         if status.isCacheable then
-          let arts ← mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile
+          let arts ← id do
+            if replayed then
+              -- with no outputs recorded in the trace there is nothing to check them against
+              if let some descrs := savedTrace.moduleOutputDescrs? then
+                if let some arts ← mod.recacheOutputArtifacts?
+                    presetup.isModule restore presetup.postponeCompile descrs then
+                  return arts
+              discard <| mod.buildLean presetup
+            mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile
           let arts := {arts with ltar? := arts.ltar? <|> ltar?}
           (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs
           return arts
