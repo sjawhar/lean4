@@ -37,7 +37,7 @@ match_text "Replayed Test.HU" produced.out
 # (sidecars are removed before being rewritten: under an artifact cache they are read-only links)
 printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 1\n' > Test/H.lean
 rm -f .lake/build/lib/lean/Test/HU.usage
-printf '{"version":3,"noskip":false,"moduleDigest":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","own":[],"used":[[[true],[]]],"extra":[]}' > .lake/build/lib/lean/Test/HU.usage
+printf '{"version":4,"noskip":false,"moduleDigest":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","digested":[],"own":[],"used":[[[true],[]]],"extra":[]}' > .lake/build/lib/lean/Test/HU.usage
 test_out "expected a name component" build Test.HU
 match_text "Built Test.HU" produced.out
 # so is a sidecar that is not UTF-8
@@ -48,7 +48,7 @@ test_out "Test/HU.usage" build Test.HU
 match_text "Built Test.HU" produced.out
 # a sidecar of another format version (an older toolchain wrote it) reads as absent: built, no warning
 rm -f .lake/build/lib/lean/Test/HU.usage
-printf '{"version":2,"noskip":false,"moduleDigest":"0000000000000000","closure":"0000000000000000","own":[],"used":[],"extra":[]}' > .lake/build/lib/lean/Test/HU.usage
+printf '{"version":3,"noskip":false,"moduleDigest":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","own":[],"used":[],"extra":[]}' > .lake/build/lib/lean/Test/HU.usage
 printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 2\n' > Test/H.lean
 test_not_out "warning" build -v Test.HU
 match_text "Built Test.HU" produced.out
@@ -125,17 +125,52 @@ printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 6\n' > Test/A.le
 mv -f B.tmp .lake/build/lib/lean/Test/B.olean
 rm .lake/build/lib/lean/Test/B.olean.hash
 test_out "Built Test.B" build Test.B
+# `lean -o` without `--usage` rewrites an .olean without digests and keeps its old sidecars (and, without
+# `--rehash`, its old `.hash`): a module compiled against it records nothing it uses from it, so it gets no
+# key and compiles again (and fails) once that import changes
+printf 'def ow := 1\n' > Test/OW.lean
+test_run build Test.OW
+"$LAKE" env lean Test/OW.lean -o .lake/build/lib/lean/Test/OW.olean
+printf 'import Test.OW\ntheorem om : ow = 1 := rfl\n' > Test/OM.lean
+test_run build Test.OM
+test_exp ! -f .lake/build/lib/lean/Test/OM.usekey
+printf 'def ow := 2\n' > Test/OW.lean
+test_err "error: Test/OM.lean" build -v Test.OM
+no_match_text "Replayed Test.OM" produced.out
+# the same with `--rehash`
+printf 'def rw1 := 1\n' > Test/RW.lean
+test_run build Test.RW
+"$LAKE" env lean Test/RW.lean -o .lake/build/lib/lean/Test/RW.olean
+printf 'import Test.RW\ntheorem rm : rw1 = 1 := rfl\n' > Test/RM.lean
+test_run --rehash build Test.RM
+test_exp ! -f .lake/build/lib/lean/Test/RM.usekey
+printf 'def rw1 := 2\n' > Test/RW.lean
+test_err "error: Test/RM.lean" --rehash build -v Test.RM
+no_match_text "Replayed Test.RM" produced.out
+# the same through an intermediate import, compiled while OT still had digests
+printf 'def ot := 1\n' > Test/OT.lean
+printf 'import Test.OT\ndef oi := 0\n' > Test/OI.lean
+test_run build Test.OI
+"$LAKE" env lean Test/OT.lean -o .lake/build/lib/lean/Test/OT.olean
+printf 'import Test.OI\ntheorem oj : ot = 1 := rfl\n' > Test/OJ.lean
+test_run build Test.OJ
+test_exp ! -f .lake/build/lib/lean/Test/OJ.usekey
+printf 'def ot := 2\n' > Test/OT.lean
+test_err "error: Test/OJ.lean" build -v Test.OJ
+no_match_text "Replayed Test.OJ" produced.out
 # a failed rebuild leaves no sidecars behind
 printf 'import Test.A\ndef b : Bool := a\n' > Test/B.lean
 test_err "Test.B" build Test.B
 test_exp ! -f .lake/build/lib/lean/Test/B.usekey
 test_exp ! -f .lake/build/lib/lean/Test/B.usage
-# a module-system file in a non-module file's closure carries no digests: an edit to its
-# private body must still rebuild the non-module importer (here N's proof becomes false)
+# module-system files in a non-module file's closure: K imports U's exported level, which carries no
+# digests, so an edit to U's private body must still rebuild the non-module importer (here N's proof
+# becomes false). N still has a key: it loads its whole closure at the private level, with digests
 printf 'module\npublic def d : Nat := 1\n' > Test/U.lean
 printf 'module\npublic import Test.U\npublic def c : Nat := d\n' > Test/K.lean
 printf 'import Test.K\ntheorem t : c = 1 := rfl\n' > Test/N.lean
 test_run build Test.N
+test_exp -f .lake/build/lib/lean/Test/N.usekey
 printf 'module\npublic def d : Nat := 2\n' > Test/U.lean
 test_err "Building Test.N" build -v Test.N
 # toolchain modules in the closure: KS drops `import Std.Data.HashMap`, which MS reaches only through KS.
@@ -340,7 +375,7 @@ cp cache3/Test/E.lean cache7/Test/
 test_exp -f cache5/.lake/build/lib/lean/Test/E.usekey
 test_cmd cmp cache5/.lake/build/ir/Test/E.ltar cache6/.lake/build/ir/Test/E.ltar
 # a `.usekey` missing from the cache (e.g. pruned) does not turn the entry into a miss: the module
-# restores without it, and its dependents build normally until it is built again
+# restores without it, and builds rather than skips the next time it is checked
 rm "$LAKE_CACHE_DIR"/artifacts/*.usekey
 (cd cache7 && test_out "Reused Test.E" build -v Test.E)
 test_exp -f cache7/.lake/build/lib/lean/Test/E.usage

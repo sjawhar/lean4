@@ -283,8 +283,14 @@ def closureDigest (env : Environment) : Digest :=
   let names := env.header.moduleNames.qsort Name.quickLt
   (({} : Enc).nat names.size |> names.foldl Enc.name).finish
 
+/-- The imported modules whose `.olean` carries digests (`State.hasEntries`), sorted. -/
+def digestedModules (env : Environment) : Array Name :=
+  let s := state env
+  env.header.moduleNames.zipIdx.filterMap (fun (m, i) => if s.hasEntries i then some m else none)
+    |>.qsort Name.quickLt
+
 /-- The `.usage` format version; Lake reads a sidecar of any other version as absent. -/
-def usageVersion : Nat := 3
+def usageVersion : Nat := 4
 
 /-- `own` is `localDigests env consts`. `extra` lists the extra module uses of the environment and of
 `extraModUsesByChecksRef` (those of commands whose environment was discarded). `noskip` is set when the run
@@ -308,6 +314,7 @@ def writeUsage (env : Environment) (consts : Array (Name × ConstantInfo × Arra
   let j := Json.mkObj [("version", usageVersion), ("noskip", noskip),
     ("moduleDigest", toJson moduleDigest),
     ("closure", toJson (closureDigest env)),
+    ("digested", Json.arr ((digestedModules env).map nameToJson)),
     ("own", Json.arr (own.map fun (n, d) => pair n d)),
     ("used", Json.arr ((moduleUsed env extra consts).map fun (m, cs) =>
       Json.arr #[nameToJson m, Json.arr (cs.map fun (n, d) => pair n d)])),
