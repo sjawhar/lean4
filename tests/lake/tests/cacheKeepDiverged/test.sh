@@ -35,3 +35,33 @@ test_truth t
 # A fresh tree with the same source restores what the cache holds for it
 mkp v; setx v 2
 test_truth v
+
+X_OLEAN=.lake/build/lib/lean/P/X.olean
+entry() { echo "$LAKE_CACHE_DIR/artifacts/$(cat "$1/$X_OLEAN.hash").olean"; }
+
+# The same, with the replacement given the cache entry's modification time (as `cp -p`,
+# `rsync -a` or `tar -x` can): a timestamp is not the identity of the file
+mkp t2; setx t2 2
+test_run -d t2 build P.X
+test_cmd rm -f "t2/$X_OLEAN"
+test_cmd cp u/$X_OLEAN "t2/$X_OLEAN"
+test_cmd touch -r "$(entry t2)" "t2/$X_OLEAN"
+test_truth t2
+
+# A tree whose own `X.olean` is intact but no longer the cache entry, while the entry itself was
+# replaced by other contents under its name: the tree must keep its file, not link it to the entry
+mkp t3; setx t3 2
+test_run -d t3 build P.X
+test_cmd cp "t3/$X_OLEAN" x.genuine
+test_cmd cp "t3/$X_OLEAN" x.copy
+test_cmd rm -f "t3/$X_OLEAN"
+test_cmd mv x.copy "t3/$X_OLEAN"
+ENTRY="$(entry t3)"
+test_cmd cp u/$X_OLEAN "$ENTRY.new"
+test_cmd mv -f "$ENTRY.new" "$ENTRY"
+test_truth t3
+test_cmd cmp x.genuine "t3/$X_OLEAN"
+# The bad entry is out of the cache, so a fresh tree does not restore it
+test_exp ! -e "$ENTRY"
+mkp v3; setx v3 2
+test_truth v3

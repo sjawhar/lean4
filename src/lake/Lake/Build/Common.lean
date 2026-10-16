@@ -760,13 +760,49 @@ def hashBytes? (bytes : ByteArray) (text : Bool) : Option Hash :=
   if text then Hash.ofText <$> String.fromUTF8? bytes else some (Hash.ofByteArray bytes)
 
 /--
+Moves the cache entry of `art` into the cache's quarantine directory if it is an entry of the
+cache's artifact directory, and describes what happened to it.
+-/
+def quarantineEntry (art : Artifact) : JobM String := do
+  let cache ← getLakeCache
+  -- Never move a path that a mapping could point outside the artifact directory.
+  if art.descr.relPath.components.length == 1 &&
+      art.path == cache.artifactDir / art.descr.relPath then
+    match (← cache.quarantine art.path art.descr.relPath.toString) with
+    | some dest => return s!"moved it to: {dest}"
+    | none => return "it was already moved out of the cache by another process"
+  else
+    return "left it in place: it is not an entry of the cache's artifact directory"
+
+/--
+Reads the cache entry of `art` and checks that it has the content hash it was resolved by (hashing
+it as text if `text := true`). If it does not, moves the entry into the cache's quarantine
+directory (see `quarantineEntry`) and fails, naming `what` (e.g., the file it was to be restored to).
+
+**For internal use only.**
+-/
+public def readVerifiedEntry (what : String) (art : Artifact) (text := false) : JobM ByteArray := do
+  let bytes ← IO.FS.readBinFile art.path
+  let hash? := hashBytes? bytes text
+  if hash? != some art.hash then
+    let disposition ← quarantineEntry art
+    let actual := match hash? with | some hash => hash.toString | none => "(not UTF-8 text)"
+    error s!"{what}: cached artifact does not match its content hash\
+      \n  cache entry: {art.path}\
+      \n  expected: {art.hash}\
+      \n  actual:   {actual}\
+      \n  {disposition}"
+  return bytes
+
+/--
 Makes an artifact from the cache, `art`, available at the local path, `file` and returns an
 altered artifact using `file` as the preferred path.
 
-If `file` already exists and is the cache entry (a hard link shares its modification time), it
-is used. An existing `file` with another modification time is hashed (as text if `text := true`):
-if it has the artifact's hash, it is replaced by a hard link to the entry and used; otherwise it
-was changed after it was produced, and it is replaced by the cache entry, with a warning.
+If `file` already exists and is the cache entry (e.g., a hard link to it), it is used. Any other
+existing `file` is hashed (as text if `text := true`): if it has the artifact's hash, it is used,
+and replaced by a hard link to the entry if the entry has that hash too (otherwise the entry is
+moved into the cache's quarantine directory, with a warning); if it does not, it was changed after
+it was produced, and it is replaced by the cache entry, with a warning.
 
 To restore `file`, the function first checks that the cached artifact still has the content hash
 it was resolved by. If it does not, the function moves the cache entry into the cache's
@@ -780,18 +816,28 @@ file systems), falls back to copying the artifact to the new path.
 public def restoreArtifact
   (file : FilePath) (art : Artifact) (exe text := false)
 : JobM Artifact := do
-  if let .ok mtime ← (getMTime file).toBaseIO then
-    if art.path == file || mtime == art.mtime then
-      return art.useLocalFile file
+  let isEntry ← if art.path == file then file.pathExists else
+    (· matches .ok true) <$> (file.isSameFile art.path).toBaseIO
+  if isEntry then
+    return art.useLocalFile file
+  if art.path != file && (← file.pathExists) then
     if hashBytes? (← IO.FS.readBinFile file) text == some art.hash then
-      -- Link it to the entry, so that later builds take the modification time path above
-      let tmp := file.addExtension "relink"
-      removeFileIfExists tmp
-      if let .ok _ ← (IO.FS.hardLink art.path tmp).toBaseIO then
-        IO.FS.rename tmp file
-        if exe then
-          let r := {read := true, write := false, execution := exe}
-          IO.setAccessRights file ⟨r, r, r⟩
+      -- Link it to the entry, so that later builds take the identity path above, but only to an
+      -- entry with the same hash: the file's own bytes say nothing about the entry's
+      match (← (IO.FS.readBinFile art.path).toBaseIO) with
+      | .ok entry =>
+        if hashBytes? entry text == some art.hash then
+          let tmp := file.addExtension "relink"
+          removeFileIfExists tmp
+          if let .ok _ ← (IO.FS.hardLink art.path tmp).toBaseIO then
+            IO.FS.rename tmp file
+            if exe then
+              let r := {read := true, write := false, execution := exe}
+              IO.setAccessRights file ⟨r, r, r⟩
+        else
+          logWarning s!"{art.path}: cached artifact does not match its content hash; \
+            {← quarantineEntry art}"
+      | .error _ => pure () -- the entry is gone: keep the file
       writeFileHash file art.hash
       return art.useLocalFile file
     logWarning s!"{file}: does not match the cache entry its trace names; restoring the entry\
@@ -799,26 +845,9 @@ public def restoreArtifact
     removeFileIfExists file
     clearFileHash file
   logVerbose s!"found artifact in cache: {art.path}"
-  let bytes ← IO.FS.readBinFile art.path
-  let hash? := hashBytes? bytes text
-  if hash? != some art.hash then
+  let bytes ← try readVerifiedEntry file.toString art text catch e =>
     clearFileHash file
-    let cache ← getLakeCache
-    let disposition ← id do
-      -- Never move a path that a mapping could point outside the artifact directory.
-      if art.descr.relPath.components.length == 1 &&
-          art.path == cache.artifactDir / art.descr.relPath then
-        match (← cache.quarantine art.path art.descr.relPath.toString) with
-        | some dest => return s!"moved it to: {dest}"
-        | none => return "it was already moved out of the cache by another process"
-      else
-        return "left it in place: it is not an entry of the cache's artifact directory"
-    let actual := match hash? with | some hash => hash.toString | none => "(not UTF-8 text)"
-    error s!"{file}: cached artifact does not match its content hash\
-      \n  cache entry: {art.path}\
-      \n  expected: {art.hash}\
-      \n  actual:   {actual}\
-      \n  {disposition}"
+    throw e
   createParentDirs file
   if let .error e ← (IO.FS.hardLink art.path file).toBaseIO then
     logVerbose s!"could not hard link artifact, copying from cache instead; error: {e}"
