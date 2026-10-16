@@ -76,36 +76,51 @@ mixed_case mixoff off
 # writes the `.olean`: the `.olean` must not keep its replaced contents next to the freshly
 # unpacked trace and `.ilean`, where a cache-off retry would take every output as unpacked. A
 # `LEAN_SYSROOT` farm's `leantar` runs the real one, then puts the `.olean` path back as it was
-# before the unpack (its old bytes, or no file) and kills Lake and itself.
-FARM="$PWD/farm"
-mkdir -p "$FARM/bin"
-for e in "$LEAN_SYSROOT"/*; do [ "$(basename "$e")" = bin ] || ln -s "$e" "$FARM/$(basename "$e")"; done
-for e in "$LEAN_SYSROOT"/bin/*; do
-  [ "$(basename "$e")" = leantar ] || ln -s "$e" "$FARM/bin/$(basename "$e")"
-done
-cat > "$FARM/bin/leantar" << EOF
+# before the unpack (its old bytes, or no file), leaves a marker, and kills Lake and itself.
+if [ "$OS" = Windows_NT ]; then
+  echo "SKIPPED: killing Lake from a leantar shim is not supported on Windows"
+else
+  FARM="$PWD/farm"
+  KILLED="$PWD/leantar-killed"
+  mkdir -p "$FARM/bin"
+  for e in "$LEAN_SYSROOT"/*; do [ "$(basename "$e")" = bin ] || ln -s "$e" "$FARM/$(basename "$e")"; done
+  for e in "$LEAN_SYSROOT"/bin/*; do
+    [ "$(basename "$e")" = leantar ] || ln -s "$e" "$FARM/bin/$(basename "$e")"
+  done
+  cat > "$FARM/bin/leantar" << EOF
 #!/usr/bin/env bash
 unpack=false; for a; do [ "\$a" = -x ] && unpack=true; done
 \$unpack && [ -n "\${LEANTAR_KILL_BEFORE:-}" ] || exec "$LEAN_SYSROOT/bin/leantar" "\$@"
 f=\$LEANTAR_KILL_BEFORE; had=false
 if [ -e "\$f" ]; then cp -p "\$f" "\$f.before-unpack"; had=true; fi
-"$LEAN_SYSROOT/bin/leantar" "\$@"
+"$LEAN_SYSROOT/bin/leantar" "\$@" || exit 3
 rm -f "\$f"; if \$had; then mv "\$f.before-unpack" "\$f"; fi
+touch "$KILLED"
 kill -9 \$PPID \$\$
 EOF
-chmod +x "$FARM/bin/leantar"
-export LAKE_CACHE_DIR="$PWD/cache-kill"
-mkp k; setx k 2
-test_run -d k build P.X -o "$PWD/k.jsonl"
-test_exp -f "k/$X_LTAR"
-test_cmd cp "k/$X_OLEAN" k.genuine
-test_cmd rm -f "k/$X_OLEAN" "k/$X_ILEAN"
-test_cmd cp "u/$X_OLEAN" "k/$X_OLEAN"
-echo "# lake -d k build P.X, killed during the unpack"
-LAKE_OVERRIDE_LEAN=true LEAN_SYSROOT="$FARM" LEANTAR_KILL_BEFORE="$PWD/k/$X_OLEAN" \
-  LAKE_ARTIFACT_CACHE=false "$LAKE" -d k build P.X && exit 1
-LAKE_ARTIFACT_CACHE=false test_truth k
-test_cmd cmp k.genuine "k/$X_OLEAN"
+  chmod +x "$FARM/bin/leantar"
+  export LAKE_CACHE_DIR="$PWD/cache-kill"
+  mkp k; setx k 2
+  test_run -d k build P.X -o "$PWD/k.jsonl"
+  test_exp -f "k/$X_LTAR"
+  test_cmd cp "k/$X_OLEAN" k.genuine
+  test_cmd rm -f "k/$X_OLEAN" "k/$X_ILEAN"
+  test_cmd cp "u/$X_OLEAN" "k/$X_OLEAN"
+  echo "# lake -d k build P.X, killed during the unpack"
+  rc=0
+  LAKE_OVERRIDE_LEAN=true LEAN_SYSROOT="$FARM" LEANTAR_KILL_BEFORE="$PWD/k/$X_OLEAN" \
+    LAKE_ARTIFACT_CACHE=false "$LAKE" -d k build P.X || rc=$?
+  # Lake was killed (128 + SIGKILL) at the injection point, after a successful real extraction
+  test_exp "$rc" = 137
+  test_exp -f "$KILLED"
+  # What the kill left: the archive, the unpacked trace and `.ilean`, and no `.olean`
+  test_exp -f "k/$X_LTAR"
+  test_exp -f k/.lake/build/lib/lean/P/X.trace
+  test_exp -f "k/$X_ILEAN"
+  test_exp ! -e "k/$X_OLEAN"
+  LAKE_ARTIFACT_CACHE=false test_truth k
+  test_cmd cmp k.genuine "k/$X_OLEAN"
+fi
 
 # The module's local archive replaced while all its other outputs stay intact, so a build is a
 # complete hit on them and reuses the local archive for `-o`: with no hash recorded for it, or
