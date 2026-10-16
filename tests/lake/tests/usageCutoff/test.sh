@@ -161,6 +161,7 @@ match_text "Replayed Test.TB" produced.out
 printf 'partial def f (n : Nat) : Nat := if n = 0 then 2 else f (n - 1)\n' > Test/PX.lean
 printf 'import Test.PX\ntheorem t : f 1 = 2 := by native_decide\n' > Test/PM.lean
 test_run build Test.PM
+test_cmd_out '"noskip":true' cat .lake/build/lib/lean/Test/PM.usage
 printf 'partial def f (n : Nat) : Nat := if n = 0 then 3 else f (n - 1)\n' > Test/PX.lean
 test_err "error: Test/PM.lean" build -v Test.PM
 printf 'partial def f (n : Nat) : Nat := if n = 0 then 2 else f (n - 1)\n' > Test/PX.lean
