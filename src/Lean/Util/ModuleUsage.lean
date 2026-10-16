@@ -287,12 +287,17 @@ def closureDigest (env : Environment) : Digest :=
 def usageVersion : Nat := 3
 
 /-- `own` is `localDigests env consts`. `extra` lists the extra module uses of the environment and of
-`extraModUsesByChecksRef` (those of commands whose environment was discarded). With `incrLoaded` (the run reused
-commands from an `--incr-load` snapshot), `noskip` is set: reused commands never call `addDecl` in this process,
-so `extra` may miss constants they used. -/
+`extraModUsesByChecksRef` (those of commands whose environment was discarded). `noskip` is set when the run
+reused commands from an `--incr-load` snapshot, since reused commands never call `addDecl` in this process
+and `extra` may miss constants they used. It is also set for modules containing a native evaluation axiom:
+the compiled closure trusted by such an axiom can include compiler-only dependencies that are not represented
+in its type. -/
 def writeUsage (env : Environment) (consts : Array (Name × ConstantInfo × Array Name))
     (own : Array (Name × Digest)) (extra : NameSet) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
-  let noskip := incrLoaded
+  let noskip := incrLoaded || consts.any fun (n, ci, _) =>
+    match n, ci with
+    | .str p s, .axiomInfo _ => s.startsWith "ax_" && p.anyS (· == "_native")
+    | _, _ => false
   let s := state env
   let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecksRef.get)
   let extraMods := allExtra.toArray.filter (fun u => (env.getModuleIdx? u.module).any s.hasEntries)
