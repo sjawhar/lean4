@@ -104,48 +104,76 @@ if(NOT CMAKE_SYSTEM_NAME MATCHES "Emscripten")
     endif()
     list(APPEND EXTRA_DEPENDS cadical)
   endif()
+  # Lake packs and unpacks `.ltar` artifacts with leantar. leantar releases up to at least v0.1.21 unpack every
+  # ByteArray of an `.olean` with element size 0, which corrupts `.olean` files holding constant prefix trees. Unless
+  # LEANTAR names one, leantar is built here from the pinned leangz source with the fix in `script/leantar`; any
+  # leantar must then reproduce `script/leantar/probe.olean` through an `.ltar` round trip.
   find_program(LEANTAR leantar)
   if(NOT LEANTAR)
-    set(LEANTAR_VERSION v0.1.20)
-    if(CMAKE_SYSTEM_NAME MATCHES "Windows")
-      set(LEANTAR_ARCHIVE_SUFFIX .zip)
-      set(LEANTAR_TARGET x86_64-pc-windows-msvc)
-    else()
-      set(LEANTAR_ARCHIVE_SUFFIX .tar.gz)
-      if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
-        set(LEANTAR_TARGET_ARCH aarch64)
-      else()
-        set(LEANTAR_TARGET_ARCH x86_64)
-      endif()
-      if(CMAKE_SYSTEM_NAME MATCHES "Darwin")
-        set(LEANTAR_TARGET_OS apple-darwin)
-      else()
-        set(LEANTAR_TARGET_OS unknown-linux-musl)
-      endif()
-      set(LEANTAR_TARGET ${LEANTAR_TARGET_ARCH}-${LEANTAR_TARGET_OS})
-    endif()
-    set(
-      LEANTAR
-      ${CMAKE_BINARY_DIR}/leantar/leantar-${LEANTAR_VERSION}-${LEANTAR_TARGET}/leantar${CMAKE_EXECUTABLE_SUFFIX}
-    )
+    set(LEANGZ_REPO https://github.com/digama0/leangz)
+    set(LEANGZ_TAG v0.1.21)
+    set(LEANGZ_COMMIT ae32f35b8c1bee986bc8d8cad4bcc5a9788fc7bc)
+    set(LEANGZ_DIR ${CMAKE_BINARY_DIR}/leangz)
+    set(LEANTAR ${LEANGZ_DIR}/target/release/leantar${CMAKE_EXECUTABLE_SUFFIX})
     if(NOT EXISTS "${LEANTAR}")
-      file(
-        DOWNLOAD
-          https://github.com/digama0/leangz/releases/download/${LEANTAR_VERSION}/leantar-${LEANTAR_VERSION}-${LEANTAR_TARGET}${LEANTAR_ARCHIVE_SUFFIX}
-        ${CMAKE_BINARY_DIR}/leantar${LEANTAR_ARCHIVE_SUFFIX}
-        STATUS LEANTAR_DOWNLOAD_STATUS
-      )
-      list(GET LEANTAR_DOWNLOAD_STATUS 0 LEANTAR_DOWNLOAD_CODE)
-      if(NOT LEANTAR_DOWNLOAD_CODE EQUAL 0)
-        list(GET LEANTAR_DOWNLOAD_STATUS 1 LEANTAR_DOWNLOAD_ERROR)
-        message(FATAL_ERROR "Failed to download leantar: ${LEANTAR_DOWNLOAD_ERROR}")
+      find_package(Git REQUIRED)
+      find_program(CARGO cargo)
+      if(NOT CARGO)
+        message(
+          FATAL_ERROR
+          "Building leantar needs cargo. Install it, or pass -DLEANTAR=<leantar built with script/leantar/leangz-sarray-elem-size.patch>."
+        )
       endif()
-      file(
-        ARCHIVE_EXTRACT
-        INPUT ${CMAKE_BINARY_DIR}/leantar${LEANTAR_ARCHIVE_SUFFIX}
-        DESTINATION ${CMAKE_BINARY_DIR}/leantar
+      file(REMOVE_RECURSE ${LEANGZ_DIR})
+      execute_process(
+        COMMAND ${GIT_EXECUTABLE} clone --quiet --depth 1 --branch ${LEANGZ_TAG} ${LEANGZ_REPO} ${LEANGZ_DIR}
+        COMMAND_ERROR_IS_FATAL ANY
+      )
+      execute_process(
+        COMMAND ${GIT_EXECUTABLE} -C ${LEANGZ_DIR} rev-parse HEAD
+        OUTPUT_VARIABLE LEANGZ_HEAD
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        COMMAND_ERROR_IS_FATAL ANY
+      )
+      if(NOT LEANGZ_HEAD STREQUAL LEANGZ_COMMIT)
+        message(FATAL_ERROR "${LEANGZ_REPO} tag ${LEANGZ_TAG} is at ${LEANGZ_HEAD}, expected ${LEANGZ_COMMIT}")
+      endif()
+      execute_process(
+        COMMAND ${GIT_EXECUTABLE} -C ${LEANGZ_DIR} apply ${CMAKE_SOURCE_DIR}/script/leantar/leangz-sarray-elem-size.patch
+        COMMAND_ERROR_IS_FATAL ANY
+      )
+      execute_process(
+        COMMAND ${CARGO} build --release --locked --manifest-path ${LEANGZ_DIR}/Cargo.toml --bin leantar
+        COMMAND_ERROR_IS_FATAL ANY
       )
     endif()
+  endif()
+  set(LEANTAR_PROBE ${CMAKE_BINARY_DIR}/leantar-probe)
+  file(REMOVE_RECURSE ${LEANTAR_PROBE})
+  file(MAKE_DIRECTORY ${LEANTAR_PROBE}/out)
+  execute_process(
+    COMMAND ${LEANTAR} ${LEANTAR_PROBE}/probe.ltar probe.trace probe.olean
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/script/leantar
+    RESULT_VARIABLE LEANTAR_PACK_RESULT
+    OUTPUT_QUIET
+    ERROR_QUIET
+  )
+  execute_process(
+    COMMAND ${LEANTAR} -C ${LEANTAR_PROBE}/out -x ${LEANTAR_PROBE}/probe.ltar
+    RESULT_VARIABLE LEANTAR_UNPACK_RESULT
+    OUTPUT_QUIET
+    ERROR_QUIET
+  )
+  file(SHA256 ${CMAKE_SOURCE_DIR}/script/leantar/probe.olean LEANTAR_PROBE_WANT)
+  set(LEANTAR_PROBE_GOT "")
+  if(EXISTS ${LEANTAR_PROBE}/out/probe.olean)
+    file(SHA256 ${LEANTAR_PROBE}/out/probe.olean LEANTAR_PROBE_GOT)
+  endif()
+  if(NOT (LEANTAR_PACK_RESULT EQUAL 0 AND LEANTAR_UNPACK_RESULT EQUAL 0 AND LEANTAR_PROBE_GOT STREQUAL LEANTAR_PROBE_WANT))
+    message(
+      FATAL_ERROR
+      "leantar ${LEANTAR} does not reproduce script/leantar/probe.olean through an .ltar round trip (pack exit ${LEANTAR_PACK_RESULT}, unpack exit ${LEANTAR_UNPACK_RESULT}); it would corrupt .olean files holding ByteArrays. Pass -DLEANTAR=<leantar built with script/leantar/leangz-sarray-elem-size.patch>, or remove it from PATH and unset LEANTAR to build one."
+    )
   endif()
   set(
     CADICAL_ARGS
