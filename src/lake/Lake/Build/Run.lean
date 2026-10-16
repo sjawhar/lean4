@@ -410,7 +410,9 @@ def finalizeBuild
 /--
 Runs `act` holding an exclusive `flock` on the workspace's `.lake/build.lock`, so that two Lake
 processes never build the same workspace at once (they would delete, rewrite, and cache each
-other's outputs mid-build). The OS releases the lock when the process exits.
+other's outputs mid-build). The OS releases the lock when the process exits, and not before the
+processes it spawned have exited too: they inherit the lock, so the compiler of a Lake that was
+killed cannot write into the workspace while another Lake builds it.
 Setting `LAKE_NO_BUILD_LOCK=1` disables it.
 -/
 public def Workspace.withBuildLock (ws : Workspace) (act : IO α) : IO α := do
@@ -428,6 +430,7 @@ public def Workspace.withBuildLock (ws : Workspace) (act : IO α) : IO α := do
     IO.eprintln s!"waiting for another Lake process building this workspace to finish \
       (lock: {lockFile})"
     h.lock
+  h.setInheritable true
   try act finally h.unlock
 
 /--
