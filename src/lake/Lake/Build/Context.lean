@@ -100,8 +100,12 @@ public structure BuildContext extends BuildConfig, Context where
    Only the build monitor should set this token: reporting assumes that a counted failure exists when the token is set.
   -/
   cancelTk? : Option IO.CancelToken := none
-  /-- Parsed usage-cutoff sidecars, shared by every module job in this build. -/
-  sidecarCache : Std.Mutex (Std.HashMap FilePath Dynamic)
+  /--
+  Parsed usage-cutoff sidecars, shared by every module job in this build, each with the contents it was
+  parsed from. Another process may rewrite a sidecar during the build (e.g., a build of another workspace
+  that requires the same path dependency), so a cached parse serves only a read of the same contents.
+  -/
+  sidecarCache : Std.Mutex (Std.HashMap FilePath (String × Dynamic))
 
 /-- A transformer to equip a monad with a `BuildContext`. -/
 public abbrev BuildT := ReaderT BuildContext
