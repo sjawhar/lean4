@@ -72,6 +72,41 @@ mixed_case() {
 mixed_case mixon on
 mixed_case mixoff off
 
+# The same, with the unpack killed (Lake and leantar, so Lake cleans up nothing) before leantar
+# writes the `.olean`: the `.olean` must not keep its replaced contents next to the freshly
+# unpacked trace and `.ilean`, where a cache-off retry would take every output as unpacked. A
+# `LEAN_SYSROOT` farm's `leantar` runs the real one, then puts the `.olean` path back as it was
+# before the unpack (its old bytes, or no file) and kills Lake and itself.
+FARM="$PWD/farm"
+mkdir -p "$FARM/bin"
+for e in "$LEAN_SYSROOT"/*; do [ "$(basename "$e")" = bin ] || ln -s "$e" "$FARM/$(basename "$e")"; done
+for e in "$LEAN_SYSROOT"/bin/*; do
+  [ "$(basename "$e")" = leantar ] || ln -s "$e" "$FARM/bin/$(basename "$e")"
+done
+cat > "$FARM/bin/leantar" << EOF
+#!/usr/bin/env bash
+unpack=false; for a; do [ "\$a" = -x ] && unpack=true; done
+\$unpack && [ -n "\${LEANTAR_KILL_BEFORE:-}" ] || exec "$LEAN_SYSROOT/bin/leantar" "\$@"
+f=\$LEANTAR_KILL_BEFORE; had=false
+if [ -e "\$f" ]; then cp -p "\$f" "\$f.before-unpack"; had=true; fi
+"$LEAN_SYSROOT/bin/leantar" "\$@"
+rm -f "\$f"; if \$had; then mv "\$f.before-unpack" "\$f"; fi
+kill -9 \$PPID \$\$
+EOF
+chmod +x "$FARM/bin/leantar"
+export LAKE_CACHE_DIR="$PWD/cache-kill"
+mkp k; setx k 2
+test_run -d k build P.X -o "$PWD/k.jsonl"
+test_exp -f "k/$X_LTAR"
+test_cmd cp "k/$X_OLEAN" k.genuine
+test_cmd rm -f "k/$X_OLEAN" "k/$X_ILEAN"
+test_cmd cp "u/$X_OLEAN" "k/$X_OLEAN"
+echo "# lake -d k build P.X, killed during the unpack"
+LAKE_OVERRIDE_LEAN=true LEAN_SYSROOT="$FARM" LEANTAR_KILL_BEFORE="$PWD/k/$X_OLEAN" \
+  LAKE_ARTIFACT_CACHE=false "$LAKE" -d k build P.X && exit 1
+LAKE_ARTIFACT_CACHE=false test_truth k
+test_cmd cmp k.genuine "k/$X_OLEAN"
+
 # The module's local archive replaced while all its other outputs stay intact, so a build is a
 # complete hit on them and reuses the local archive for `-o`: with no hash recorded for it, or
 # under `--rehash`, it must not be recorded under this input's hash (both archives are cached
