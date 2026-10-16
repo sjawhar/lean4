@@ -159,6 +159,10 @@ structure EqnsExtState where
 builtin_initialize eqnsExt : EnvExtension EqnsExtState ←
   registerEnvExtension (pure {}) (asyncMode := .local)
 
+/-- Equational-theorem cache entries used by per-command usage recording. -/
+def eqnsCacheEntries (env : Environment) : Array (Name × Name) :=
+  (eqnsExt.getState env).mapInv.toList.toArray
+
 /--
 Runs `act` with the equation-affecting options restored to the values stored for `declName`
 at definition time (or reset to their defaults if none were stored). Use this inside

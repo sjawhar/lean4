@@ -421,6 +421,10 @@ These are not expensive to compute, but worth caching, and we save olean storage
 builtin_initialize structureResolutionExt : EnvExtension StructureResolutionState ←
   registerEnvExtension (pure {}) (asyncMode := .local)  -- mere cache
 
+/-- Structure-resolution cache entries used by per-command usage recording. -/
+def structureResolutionCacheEntries (env : Environment) : Array (Name × Array Name) :=
+  (structureResolutionExt.getState env).resolutions.toList.toArray
+
 /-- Gets the resolution order if it has already been cached. -/
 private def getStructureResolutionOrder? (env : Environment) (structName : Name) : Option (Array Name) :=
   (structureResolutionExt.getState env).resolutions.find? structName

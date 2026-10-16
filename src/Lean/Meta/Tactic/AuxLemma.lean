@@ -29,6 +29,11 @@ structure AuxLemmas where
 builtin_initialize auxLemmasExt : EnvExtension AuxLemmas ←
   registerEnvExtension (pure {}) (asyncMode := .local)  -- a mere cache, keep local
 
+/-- Serializable view of the auxiliary-lemma cache used by per-command usage recording. -/
+def auxLemmaCacheEntries (env : Environment) : Array (Expr × Bool × Bool × Name × List Name) :=
+  (auxLemmasExt.getState env).lemmas.toList.toArray.map fun (k, n, ls) =>
+    (k.type, k.isPrivate, k.defeq, n, ls)
+
 /--
   Helper method for creating auxiliary lemmas in the environment.
 

@@ -15,6 +15,11 @@ import Lean.Meta.Instances
 import Lean.Meta.Tactic.Simp.Attr
 public import Lean.Util.CommandEntries
 import Lean.Util.ValueSensitive
+import Lean.Meta.Match.Match
+import Lean.Meta.Tactic.AuxLemma
+import Lean.Meta.Eqns
+import Lean.Meta.Constructions.SparseCasesOn
+import Lean.Structure
 public section
 namespace Lean.ModuleUsage
 
@@ -472,6 +477,18 @@ instance : FromJson CommandRecord := ⟨fun j => return {
   post := ← j.getObjValAs? CommandPost "post"
   caches := ← j.getObjValAs? CommandCachesRecord "caches" }⟩
 
+private def cacheDelta [BEq α] (before after : Array α) : Array α :=
+  after.filter (!before.contains ·)
+
+private def matcherKeyDigest (value : Expr) (compile isPrivate : Bool) : Digest :=
+  (({} : Enc).digest (exprDigest true value) |>.bool compile |>.bool isPrivate).finish
+
+private def auxLemmaKeyDigest (type : Expr) (isPrivate defeq : Bool) : Digest :=
+  (({} : Enc).digest (exprDigest true type) |>.bool isPrivate |>.bool defeq).finish
+
+private def sparseCasesOnKeyDigest (indName : Name) (ctors : Array Name) (isPrivate : Bool) : Digest :=
+  (({} : Enc).name indName |>.names ctors.toList |>.bool isPrivate).finish
+
 partial def syntaxEnc (e : Enc) (stx : Syntax) : Enc :=
   match stx with
   | .missing => e.u8 0
@@ -668,8 +685,25 @@ def commandRecords (env : Environment) (own : Array (Name × Digest))
     let g := obs.after.auxDeclNGen.toRecord
     let quotCtxts := obs.after.usedQuotCtxts.toArray.filter (!obs.before.usedQuotCtxts.contains ·)
       |>.qsort Name.quickLt
-    let matcher := aux.filter (Meta.isMatcherCore env) |>.filterMap fun n =>
-      (fullOf n).map (·, n)
+    let matcher := cacheDelta (Meta.Match.matcherCacheEntries obs.before.env)
+      (Meta.Match.matcherCacheEntries obs.after.env)
+    let matcher := matcher.map fun (value, compile, isPrivate, n) =>
+      (matcherKeyDigest value compile isPrivate, n)
+    let matcher := matcher.qsort fun a b => Name.quickLt a.2 b.2
+    let auxLemma := cacheDelta (Meta.auxLemmaCacheEntries obs.before.env)
+      (Meta.auxLemmaCacheEntries obs.after.env)
+    let auxLemma := auxLemma.map fun (type, isPrivate, defeq, n, ls) =>
+      (auxLemmaKeyDigest type isPrivate defeq, n, ls)
+    let auxLemma := auxLemma.qsort fun a b => Name.quickLt a.2.1 b.2.1
+    let eqnsInv := cacheDelta (Meta.eqnsCacheEntries obs.before.env)
+      (Meta.eqnsCacheEntries obs.after.env) |>.qsort fun a b => Name.quickLt a.1 b.1
+    let sparseCasesOn := cacheDelta (Meta.sparseCasesOnCacheEntries obs.before.env)
+      (Meta.sparseCasesOnCacheEntries obs.after.env)
+    let sparseCasesOn := sparseCasesOn.map fun (indName, ctors, isPrivate, n) =>
+      (sparseCasesOnKeyDigest indName ctors isPrivate, n)
+    let sparseCasesOn := sparseCasesOn.qsort fun a b => Name.quickLt a.2 b.2
+    let structRes := cacheDelta (structureResolutionCacheEntries obs.before.env)
+      (structureResolutionCacheEntries obs.after.env) |>.qsort fun a b => Name.quickLt a.1 b.1
     out := out.push {
       i := obs.i, key, text, ctx := ctxDigest obs.before entriesEnc.finish
       isDecl := !decls.isEmpty
@@ -680,7 +714,7 @@ def commandRecords (env : Environment) (own : Array (Name × Digest))
         quotCtxts
         localEntries := localEntryCount obs.after.env
       }
-      caches := { matcher }
+      caches := { matcher, auxLemma, eqnsInv, sparseCasesOn, structRes }
     }
     if let some payload := payloadByIdx[obs.i]? then
       let path := dir / s!"command-{obs.i}"
