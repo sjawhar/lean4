@@ -60,7 +60,13 @@ def u (x : Nat) : Nat := uhMul x x
     IO.println s!"{r.i} {if r.isDecl then "decl" else "other"} decls={showNames r.decls} aux={showNames r.aux} \
       stmt={showNames (r.usesStmt.map fun (entry : Name × ModuleUsage.Digest) => entry.1)} \
       full∋[a,h,f,S.x._default,uh1,uh2]={[`a, `h, `f, `S.x._default, `uh1, `uh2].filter full.contains} \
-      matcher={showNames (r.caches.matcher.map fun (entry : ModuleUsage.Digest × Name) => entry.2)}"
+      matcher={showNames (r.caches.matcher.map fun (entry : ModuleUsage.Digest × Name) => entry.2)} \
+      auxLemma={showNames (r.caches.auxLemma.map fun
+        (entry : ModuleUsage.Digest × Name × List Name) => entry.2.1)} \
+      eqnsInv={showNames (r.caches.eqnsInv.map fun (entry : Name × Name) => entry.1)} \
+      sparse={showNames (r.caches.sparseCasesOn.map fun
+        (entry : ModuleUsage.Digest × Name) => entry.2)} \
+      structRes={showNames (r.caches.structRes.map fun (entry : Name × Array Name) => entry.1)}"
     steps := steps.push (r.post.auxDeclNGen.idx - prevIdx)
     prevIdx := r.post.auxDeclNGen.idx
   IO.println s!"records={cmds.size} idx advances every command: {steps.all (· ≥ 1)}"

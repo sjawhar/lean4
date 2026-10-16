@@ -1082,6 +1082,10 @@ deriving BEq, Hashable
 private builtin_initialize matcherExt : EnvExtension (PHashMap MatcherKey Name) ←
   registerEnvExtension (pure {}) (asyncMode := .local)  -- mere cache, keep it local
 
+/-- Serializable view of the matcher cache used by per-command usage recording. -/
+def matcherCacheEntries (env : Environment) : Array (Expr × Bool × Bool × Name) :=
+  (matcherExt.getState env).toList.toArray.map fun (k, n) => (k.value, k.compile, k.isPrivate, n)
+
 /-- Similar to `mkAuxDefinition`, but uses the cache `matcherExt`.
    It also returns an Boolean that indicates whether a new matcher function was added to the environment or not. -/
 def mkMatcherAuxDefinition (name : Name) (type : Expr) (value : Expr) (isSplitter : Bool) : MetaM (Expr × Option (MatcherInfo → MetaM Unit)) := do

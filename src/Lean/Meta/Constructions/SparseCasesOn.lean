@@ -26,6 +26,11 @@ deriving BEq, Hashable
 builtin_initialize sparseCasesOnCacheExt : EnvExtension (PHashMap SparseCasesOnKey Name) ←
   registerEnvExtension (pure {}) (asyncMode := .local)  -- mere cache, keep it local
 
+/-- Serializable view of the sparse-`casesOn` cache used by per-command usage recording. -/
+public def sparseCasesOnCacheEntries (env : Environment) : Array (Name × Array Name × Bool × Name) :=
+  (sparseCasesOnCacheExt.getState env).toList.toArray.map fun (k, n) =>
+    (k.indName, k.ctors, k.isPrivate, n)
+
 /-- Information necessary to recognize and split on sparse casesOn (in particular in MatchEqs) -/
 public structure SparseCasesOnInfo where
   indName : Name
