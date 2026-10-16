@@ -1,0 +1,9 @@
+m2 uses m: true
+toolchain constant recorded iff its module carries digests: true
+transient base.dep absent from the environment: true
+example uses base.dep's value xd2: true
+local constant without a digest: usage: command 1 uses `m`, a constant of this module without a full digest
+imported constant without a full digest (command): usage: `xd` from `X` has no full digest in that module's usage entries
+imported constant without a full digest (module): usage: `xd` from `X` has no full digest in that module's usage entries
+imported constant without a statement digest (command): usage: `xd` from `X` has no statement digest in that module's usage entries
+imported constant without a statement digest (module): usage: `xd` from `X` has no statement digest in that module's usage entries
