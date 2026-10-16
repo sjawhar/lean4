@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 source ../common.sh
 ./clean.sh
-copy_to_work lakefile.toml Main.lean Test.lean Test WriteFails.lean
+copy_to_work lakefile.toml Main.lean Test.lean Test WriteFails.lean FlushFails.lean
 
 REC=.lake/module-times.tsv
 
@@ -166,6 +166,15 @@ test_cmd_out "write failed" "$LAKE" env lean --run WriteFails.lean
 match_text "left: module-times.tsv" produced.out
 no_match_pat "^left: .*\.tmp$" produced.out
 
+# A write whose bytes fail only when the buffer is flushed (a 1 KiB file size limit, with SIGXFSZ
+# ignored so the write returns an error) fails, leaves the old record as it was, and leaves no
+# temporary file behind.
+mkdir -p flushFails
+printf 'lake-module-times 3\n1\t1\tTest.Old\t\n' > flushFails/module-times.tsv
+test_cmd_out "write failed" "$LAKE" env bash -c "ulimit -f 1; trap '' XFSZ; exec lean --run FlushFails.lean"
+match_text "record: lake-module-times 3|1	1	Test.Old	|" produced.out
+no_match_pat "^left: .*\.tmp$" produced.out
+
 # A stale import cycle in the record does not hang or fail the build: the rows of the two modules,
 # which this build does not compile, are kept, and the save computes remaining paths around them.
 printf 'lake-module-times 3\n5000\t10000\tTest.Quick1\t1\n5000\t10000\tTest.Quick2\t0\n' > $REC
@@ -216,3 +225,32 @@ has_row Test
 has_row Test.Quick1 0
 mv Test.lean.bak Test.lean
 rm .lake/module-times.json
+
+# A record that cannot be read at all only warns too, naming it, and the build goes on in stock
+# order. Here a directory stands in its place, which the save at the end cannot replace either.
+rm $REC
+mkdir -p $REC/sub
+cp Test.lean Test.lean.bak
+printf -- '-- touched for a record that cannot be read\n' >> Test.lean
+test_out "$WARN" build
+match_text "module-times.tsv: " produced.out
+match_text "module-times.tsv: failed to save module compile times" produced.out
+mv Test.lean.bak Test.lean
+test_out "$WARN" setup-file Test/SlowTop.lean
+match_text '"name":"Test.SlowTop"' produced.out
+rm -rf $REC
+
+# So does a record its user may not read (skipped when the user can read a mode-000 file anyway).
+printf 'lake-module-times 3\n' > $REC
+chmod 000 $REC
+if [ -r $REC ]; then
+  echo "skipped: this user can read a mode-000 file"
+else
+  cp Test.lean Test.lean.bak
+  printf -- '-- touched for a record that may not be read\n' >> Test.lean
+  test_out "$WARN" build
+  match_text "module-times.tsv: " produced.out
+  mv Test.lean.bak Test.lean
+fi
+chmod 644 $REC
+rm $REC
