@@ -1488,7 +1488,6 @@ def Module.recBuildElabArts (mod : Module) : FetchM (Job ModuleOutputArtifacts) 
   presetupJob.mapM fun presetup => do
     setTrace presetup.trace
     let arts ← fetchCore presetup
-    let arts ← trackOutputsIfEnabled arts
     let arts ← adjustMTime arts mod.traceFile
     return arts
 where
@@ -1608,23 +1607,6 @@ where
               mod.skipOrBuild presetup savedTrace depTrace
         else
           mod.skipOrBuild presetup savedTrace depTrace
-  trackOutputsIfEnabled arts : JobM ModuleOutputArtifacts := do
-    -- The `-o` map records only an archive, which carries no skip mark: a skip stays out of it.
-    if mod.pkg.isRoot && !arts.skipped then
-      if let some ref := (← getBuildContext).outputsRef? then
-        let inputHash := (← getTrace).hash
-        if let some ltar := arts.ltar? then
-          ref.insert inputHash ltar.descr
-          return arts
-        else
-          let ltar ← id do
-            if (← mod.ltarFile.pathExists) then
-              computeArtifact mod.ltarFile "ltar"
-            else
-              mod.packLtar arts
-          ref.insert inputHash ltar.descr (mod.platformIndependent.getD false)
-          return {arts with ltar? := some ltar}
-    return arts
 
 /-- The `ModuleFacetConfig` for the builtin `elabArtsFacet`. -/
 public def Module.elabArtsFacetConfig : ModuleFacetConfig elabArtsFacet :=
