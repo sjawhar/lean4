@@ -106,74 +106,61 @@ if(NOT CMAKE_SYSTEM_NAME MATCHES "Emscripten")
   endif()
   # Lake packs and unpacks `.ltar` artifacts with leantar. leantar releases up to at least v0.1.21 unpack every
   # ByteArray of an `.olean` with element size 0, which corrupts `.olean` files holding constant prefix trees. Unless
-  # LEANTAR names one, leantar is built here from the pinned leangz source with the fix in `script/leantar`; any
-  # leantar must then reproduce `script/leantar/probe.olean` through an `.ltar` round trip.
-  find_program(LEANTAR leantar)
-  if(NOT LEANTAR)
-    set(LEANGZ_REPO https://github.com/digama0/leangz)
-    set(LEANGZ_TAG v0.1.21)
-    set(LEANGZ_COMMIT ae32f35b8c1bee986bc8d8cad4bcc5a9788fc7bc)
-    set(LEANGZ_DIR ${CMAKE_BINARY_DIR}/leangz)
-    set(LEANTAR ${LEANGZ_DIR}/target/release/leantar${CMAKE_EXECUTABLE_SUFFIX})
-    if(NOT EXISTS "${LEANTAR}")
-      find_package(Git REQUIRED)
-      find_program(CARGO cargo)
-      if(NOT CARGO)
-        message(
-          FATAL_ERROR
-          "Building leantar needs cargo. Install it, or pass -DLEANTAR=<leantar built with script/leantar/leangz-sarray-elem-size.patch>."
-        )
-      endif()
-      file(REMOVE_RECURSE ${LEANGZ_DIR})
-      execute_process(
-        COMMAND ${GIT_EXECUTABLE} clone --quiet --depth 1 --branch ${LEANGZ_TAG} ${LEANGZ_REPO} ${LEANGZ_DIR}
-        COMMAND_ERROR_IS_FATAL ANY
-      )
-      execute_process(
-        COMMAND ${GIT_EXECUTABLE} -C ${LEANGZ_DIR} rev-parse HEAD
-        OUTPUT_VARIABLE LEANGZ_HEAD
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        COMMAND_ERROR_IS_FATAL ANY
-      )
-      if(NOT LEANGZ_HEAD STREQUAL LEANGZ_COMMIT)
-        message(FATAL_ERROR "${LEANGZ_REPO} tag ${LEANGZ_TAG} is at ${LEANGZ_HEAD}, expected ${LEANGZ_COMMIT}")
-      endif()
-      execute_process(
-        COMMAND ${GIT_EXECUTABLE} -C ${LEANGZ_DIR} apply ${CMAKE_SOURCE_DIR}/script/leantar/leangz-sarray-elem-size.patch
-        COMMAND_ERROR_IS_FATAL ANY
-      )
-      execute_process(
-        COMMAND ${CARGO} build --release --locked --manifest-path ${LEANGZ_DIR}/Cargo.toml --bin leantar
-        COMMAND_ERROR_IS_FATAL ANY
+  # LEANTAR names one, leantar is built here from the pinned leangz source with the fix in `script/leantar`, before
+  # stage 0, whose Lake builds stage 1 with the artifact cache. Either leantar must pass `script/leantar/probe.cmake`.
+  set(LEANTAR "" CACHE FILEPATH "leantar to use instead of building one")
+  set(LEANTAR_PROBE -DWORK=${CMAKE_BINARY_DIR}/leantar-probe -P ${CMAKE_SOURCE_DIR}/script/leantar/probe.cmake)
+  if(LEANTAR)
+    execute_process(COMMAND ${CMAKE_COMMAND} -DLEANTAR=${LEANTAR} ${LEANTAR_PROBE} RESULT_VARIABLE LEANTAR_PROBE_RESULT)
+    if(NOT LEANTAR_PROBE_RESULT EQUAL 0)
+      message(FATAL_ERROR "LEANTAR=${LEANTAR} failed the round-trip probe")
+    endif()
+  else()
+    find_program(CARGO cargo)
+    if(NOT CARGO)
+      message(
+        FATAL_ERROR
+        "Building leantar needs cargo. Install it, or pass -DLEANTAR=<leantar built with script/leantar/leangz-sarray-elem-size.patch>."
       )
     endif()
-  endif()
-  set(LEANTAR_PROBE ${CMAKE_BINARY_DIR}/leantar-probe)
-  file(REMOVE_RECURSE ${LEANTAR_PROBE})
-  file(MAKE_DIRECTORY ${LEANTAR_PROBE}/out)
-  execute_process(
-    COMMAND ${LEANTAR} ${LEANTAR_PROBE}/probe.ltar probe.trace probe.olean
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/script/leantar
-    RESULT_VARIABLE LEANTAR_PACK_RESULT
-    OUTPUT_QUIET
-    ERROR_QUIET
-  )
-  execute_process(
-    COMMAND ${LEANTAR} -C ${LEANTAR_PROBE}/out -x ${LEANTAR_PROBE}/probe.ltar
-    RESULT_VARIABLE LEANTAR_UNPACK_RESULT
-    OUTPUT_QUIET
-    ERROR_QUIET
-  )
-  file(SHA256 ${CMAKE_SOURCE_DIR}/script/leantar/probe.olean LEANTAR_PROBE_WANT)
-  set(LEANTAR_PROBE_GOT "")
-  if(EXISTS ${LEANTAR_PROBE}/out/probe.olean)
-    file(SHA256 ${LEANTAR_PROBE}/out/probe.olean LEANTAR_PROBE_GOT)
-  endif()
-  if(NOT (LEANTAR_PACK_RESULT EQUAL 0 AND LEANTAR_UNPACK_RESULT EQUAL 0 AND LEANTAR_PROBE_GOT STREQUAL LEANTAR_PROBE_WANT))
-    message(
-      FATAL_ERROR
-      "leantar ${LEANTAR} does not reproduce script/leantar/probe.olean through an .ltar round trip (pack exit ${LEANTAR_PACK_RESULT}, unpack exit ${LEANTAR_UNPACK_RESULT}); it would corrupt .olean files holding ByteArrays. Pass -DLEANTAR=<leantar built with script/leantar/leangz-sarray-elem-size.patch>, or remove it from PATH and unset LEANTAR to build one."
+    set(LEANTAR_ENV)
+    if(CMAKE_SYSTEM_NAME MATCHES "Windows")
+      # The runner's cargo targets MSVC, so the `cc` crate has to find `cl.exe` itself rather than take MSYS2's `CC`.
+      list(APPEND LEANTAR_ENV --unset=CC --unset=CXX)
+    else()
+      # Compile leantar's C dependencies like cadical, e.g. against the bundled sysroot of a standalone build.
+      list(APPEND LEANTAR_ENV "CC=${CMAKE_C_COMPILER}" "CFLAGS=${CMAKE_CXX_FLAGS}")
+    endif()
+    if(LEAN_STANDALONE AND CMAKE_SYSTEM_NAME MATCHES "Linux")
+      # Link like leanc does for every other shipped binary: against the bundled glibc in stage 1 and with the default
+      # ELF interpreter, not the build host's glibc.
+      string(REPLACE "ROOT" "${CMAKE_BINARY_DIR}/stage1" LEANTAR_LDFLAGS "${LEANC_INTERNAL_LINKER_FLAGS}")
+      separate_arguments(LEANTAR_LDFLAGS UNIX_COMMAND "${LEANTAR_LDFLAGS}")
+      list(TRANSFORM LEANTAR_LDFLAGS PREPEND "-Clink-arg=")
+      list(JOIN LEANTAR_LDFLAGS " " LEANTAR_RUSTFLAGS)
+      string(TOUPPER "${CMAKE_SYSTEM_PROCESSOR}_unknown_linux_gnu" LEANTAR_RUST_TARGET)
+      list(
+        APPEND
+        LEANTAR_ENV
+        "CARGO_TARGET_${LEANTAR_RUST_TARGET}_LINKER=${CMAKE_C_COMPILER}"
+        "CARGO_TARGET_${LEANTAR_RUST_TARGET}_RUSTFLAGS=${LEANTAR_RUSTFLAGS}"
+      )
+    endif()
+    set(LEANTAR ${CMAKE_BINARY_DIR}/leangz/src/leantar/target/release/leantar${CMAKE_EXECUTABLE_SUFFIX})
+    ExternalProject_Add(
+      leantar
+      PREFIX leangz
+      GIT_REPOSITORY https://github.com/digama0/leangz
+      # v0.1.21
+      GIT_TAG ae32f35b8c1bee986bc8d8cad4bcc5a9788fc7bc
+      PATCH_COMMAND git apply ${CMAKE_SOURCE_DIR}/script/leantar/leangz-sarray-elem-size.patch
+      CONFIGURE_COMMAND ""
+      BUILD_COMMAND ${CMAKE_COMMAND} -E env ${LEANTAR_ENV} ${CARGO} build --release --locked --bin leantar
+      BUILD_IN_SOURCE ON
+      INSTALL_COMMAND ${CMAKE_COMMAND} -DLEANTAR=${LEANTAR} ${LEANTAR_PROBE}
+      BUILD_BYPRODUCTS ${LEANTAR}
     )
+    list(APPEND EXTRA_DEPENDS leantar)
   endif()
   set(
     CADICAL_ARGS
