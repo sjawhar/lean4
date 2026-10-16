@@ -780,12 +780,14 @@ def usageVersion : Nat := 4
 /-- `own` is `localDigests env consts` and `stmt` is `computeStmt` over them. `extra` lists the extra module
 uses of the environment and of `extraModUsesByChecksRef` (those of commands whose environment was discarded). With
 `incrLoaded` (the run reused commands from an `--incr-load` snapshot), `noskip` is set: reused commands never call
-`addDecl` in this process, so `extra` may miss constants they used. `usedAttrs` holds, beside each `used` entry,
-the attrs digest the defining module recorded for it in `stmt`; `moduleUsed` fails on a constant missing either. -/
+`addDecl` in this process, so `extra` may miss constants they used. `noskipReason?` (a command payload that cannot
+be replayed) also sets `noskip` and is written as `noskipReason`. `usedAttrs` holds, beside each `used` entry, the
+attrs digest the defining module recorded for it in `stmt`; `moduleUsed` fails on a constant missing either. -/
 def writeUsage (env : Environment) (consts : Array (Name × ConstantInfo × Array Name))
     (own : Array (Name × Digest)) (stmt : Array (Name × Digest × Digest)) (extra : NameSet)
-    (commands : Array CommandRecord) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
-  let noskip := incrLoaded || consts.any fun (_, _, rs) => rs.any
+    (commands : Array CommandRecord) (incrLoaded : Bool) (path : System.FilePath)
+    (noskipReason? : Option String := none) : IO Unit := do
+  let noskip := noskipReason?.isSome || incrLoaded || consts.any fun (_, _, rs) => rs.any
     (· matches ``Lean.reduceBool | ``Lean.reduceNat | ``Lean.ofReduceBool | ``Lean.ofReduceNat)
   let s := state env
   let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecksRef.get)
@@ -795,7 +797,7 @@ def writeUsage (env : Environment) (consts : Array (Name × ConstantInfo × Arra
   let pair (n : Name) (d : Digest) := Json.arr #[nameToJson n, toJson d]
   let moduleDigest := (own.foldl (fun e (n, d) => e.name n |>.digest d) (({} : Enc).nat own.size)).finish
   let used ← IO.ofExcept (moduleUsed env extra consts)
-  let j := Json.mkObj [("version", usageVersion), ("noskip", noskip),
+  let fields : List (String × Json) := [("version", usageVersion), ("noskip", noskip),
     ("moduleDigest", toJson moduleDigest),
     ("closure", toJson (closureDigest env)),
     ("own", Json.arr (own.map fun (n, d) => pair n d)),
@@ -806,6 +808,9 @@ def writeUsage (env : Environment) (consts : Array (Name × ConstantInfo × Arra
     ("extra", Json.arr (extraMods.map fun u => Json.arr #[nameToJson u.module, u.isMeta])),
     ("stmt", Json.arr (stmt.map fun (n, c, a) => Json.arr #[nameToJson n, toJson c, toJson a])),
     ("commands", Json.arr (commands.map toJson))]
-  IO.FS.writeFile path j.compress
+  let fields := match noskipReason? with
+    | some reason => fields ++ [("noskipReason", toJson reason)]
+    | none => fields
+  IO.FS.writeFile path (Json.mkObj fields).compress
 
 end Lean.ModuleUsage

@@ -186,6 +186,7 @@ def registerTagAttribute (name : Name) (descr : String)
     mkInitial       := pure {}
     addImportedFn   := fun _ _ => pure {}
     addEntryFn      := fun (s : NameSet) n => s.insert n
+    ofOLeanEntry?  := some fun _ entry => pure entry
     exportEntriesFnEx := fun env es =>
       let all : Array Name := es.foldl (fun a e => a.push e) #[] |>.qsort Name.quickLt
       -- Do not export info for private defs at exported/server levels
@@ -269,6 +270,7 @@ def registerParametricAttributeExt (ref : Name) (preserveOrder : Bool := false)
     mkInitial       := pure ([], {})
     addImportedFn   := fun _ => pure ([], {})
     addEntryFn      := fun (decls, m) (p : Name × α) => (p.1 :: decls, m.insert p.1 p.2)
+    ofOLeanEntry?  := some fun _ entry => pure entry
     exportEntriesFnEx := fun env (decls, m) => Id.run do
       let all := if preserveOrder then
         decls.toArray.reverse.filterMap (fun n => return (n, ← m.find? n))
@@ -352,6 +354,7 @@ def registerEnumAttributes (attrDescrs : List (Name × String × α))
     mkInitial       := pure {}
     addImportedFn   := fun _ _ => pure {}
     addEntryFn      := fun (s : NameMap α) (p : Name × α) => s.insert p.1 p.2
+    ofOLeanEntry?  := some fun _ entry => pure entry
     exportEntriesFnEx := fun env m =>
       let all : Array (Name × α) := m.foldl (fun a n p => a.push (n, p)) #[] |>.qsort (fun a b => Name.quickLt a.1 b.1)
       -- Do not export info for private defs at exported/server levels
@@ -473,6 +476,8 @@ builtin_initialize attributeExtension : AttributeExtension ←
     mkInitial       := AttributeExtension.mkInitial
     addImportedFn   := AttributeExtension.addImported
     addEntryFn      := addAttrEntry
+    ofOLeanEntry? := some fun _ entry =>
+      return (entry, ← mkAttributeImplOfEntry entry)
     exportEntriesFn := fun s => s.newEntries.reverse.toArray
     statsFn         := fun s => format "number of local entries: " ++ format s.newEntries.length
   }

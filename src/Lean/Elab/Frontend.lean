@@ -409,6 +409,7 @@ def runFrontend
     let used := ModuleUsage.usedFromInfoTrees trees (← usedByChecksRef.get)
     ModuleUsage.writeUsage env consts own stmt used commands
       (incrLoaded := incrLoadFileName?.isSome) (oleanFileName.withExtension "usage")
+      (noskipReason? := commandEntriesNoskipReason? entries)
 
   if let some ileanFileName := ileanFileName? then
     let references := Lean.Server.findModuleRefs inputCtx.fileMap trees (localVars := false)

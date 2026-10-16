@@ -1668,6 +1668,9 @@ structure PersistentEnvExtension (α : Type) (β : Type) (σ : Type) where
   name            : Name
   addImportedFn   : Array (Array α) → ImportM σ
   addEntryFn      : σ → β → σ
+  /-- Converts an entry as exported to the `.olean` back to the entry `addEntryFn` accepts, for replaying a
+  command's recorded entries. `none` when the extension has no such conversion. -/
+  ofOLeanEntry?   : Option (σ → α → ImportM β)
   /--
   Function to transform state into data that should be imported into other modules. Returns entries
   for all three olean levels at once so that expensive computations can be shared. When using the
@@ -1691,6 +1694,7 @@ instance {α β σ} [Inhabited σ] : Inhabited (PersistentEnvExtension α β σ)
      name := default,
      addImportedFn := fun _ => default,
      addEntryFn := fun s _ => s,
+     ofOLeanEntry? := none,
      exportEntriesFn := fun _ _ => .uniform #[],
      statsFn := fun _ => Format.nil
   }
@@ -1748,6 +1752,9 @@ structure PersistentEnvExtensionDescrCore (α β σ : Type) where
   mkInitial         : IO σ
   addImportedFn     : Array (Array α) → ImportM σ
   addEntryFn        : σ → β → σ
+  /-- See `PersistentEnvExtension.ofOLeanEntry?`. Commands that add entries to an extension without it cannot
+  be replayed from their recorded entries. -/
+  ofOLeanEntry?     : Option (σ → α → ImportM β) := none
   exportEntriesFnEx : Environment → σ → OLeanEntries (Array α)
   statsFn           : σ → Format := fun _ => Format.nil
   asyncMode         : EnvExtension.AsyncMode := .mainOnly
@@ -1790,6 +1797,7 @@ unsafe def registerPersistentEnvExtensionUnsafe {α β σ : Type} [Inhabited σ]
     name            := descr.name,
     addImportedFn   := descr.addImportedFn,
     addEntryFn      := descr.addEntryFn,
+    ofOLeanEntry?   := descr.ofOLeanEntry?,
     exportEntriesFn := descr.exportEntriesFnEx,
     statsFn         := descr.statsFn
   }

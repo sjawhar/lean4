@@ -48,6 +48,7 @@ def registerSimplePersistentEnvExtension {α σ : Type} [Inhabited σ] (descr : 
     addImportedFn   := fun as => pure ([], descr.addImportedFn as),
     addEntryFn      := fun s e => match s with
       | (entries, s) => (e::entries, descr.addEntryFn s e),
+    ofOLeanEntry? := some fun _ e => pure e
     exportEntriesFnEx env s := match descr.exportEntriesFnEx? with
       | some fn => fn env s.2 s.1.reverse
       | none    => .uniform (descr.toArrayFn s.1.reverse)
@@ -142,6 +143,7 @@ def mkMapDeclarationExtension (name : Name := by exact decl_name%)
     mkInitial       := pure {}
     addImportedFn   := fun _ => pure {}
     addEntryFn      := fun s (n, v) => s.insert n v
+    ofOLeanEntry? := some fun _ entry => pure entry
     exportEntriesFnEx env s := exportEntriesFn env s
     asyncMode
     replay?         := some fun _ newState newConsts s =>

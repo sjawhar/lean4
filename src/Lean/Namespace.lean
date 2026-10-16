@@ -41,6 +41,7 @@ private builtin_initialize namespacesExt : PersistentEnvExtension Name Name Stat
       return SMap.fromHashMap map |>.switch
     -- local entries are not from private imports, so mark public
     addEntryFn      := fun s n => s.insert n .public
+    ofOLeanEntry?  := some fun _ entry => pure entry
     exportEntriesFn s :=
       let entries := s.map₂.toArray.map (·.1)
       entries.qsort (·.quickLt)
