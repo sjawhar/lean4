@@ -61,8 +61,8 @@ public:
     }
 };
 
-/* Open-addressing map from object pointers to digests. Keys are objects reachable from the borrowed root,
-so they stay alive, and distinct, for the whole call. */
+/* Open-addressing map from object pointers to digests. The caller keeps every borrowed root's
+environment alive for the cache's lifetime, so its reachable keys stay alive and distinct. */
 class ptr_digest_map {
     struct slot { object * k; digest v; };
     std::vector<slot> m_slots;
@@ -221,6 +221,27 @@ public:
         return child(root);
     }
 };
+
+struct digest_cache {
+    digester without_binders{false};
+    digester with_binders{true};
+};
+
+static void digest_cache_finalize(void * p) {
+    delete static_cast<digest_cache *>(p);
+}
+
+static void digest_cache_foreach(void *, b_lean_obj_arg) {}
+
+static external_object_class * digest_cache_class() {
+    static external_object_class * cls =
+        register_external_object_class(digest_cache_finalize, digest_cache_foreach);
+    return cls;
+}
+
+static digest_cache * to_digest_cache(b_obj_arg o) {
+    return static_cast<digest_cache *>(external_data(o));
+}
 #endif
 
 /* A `Lean.ModuleUsage.Digest`: a structure of two `UInt64`s, the digest's bytes read big-endian. */
@@ -250,6 +271,23 @@ extern "C" LEAN_EXPORT obj_res lean_usage_digest_bytes(b_obj_arg bytes) {
 #endif
 }
 
+extern "C" LEAN_EXPORT obj_res lean_usage_expr_digest_cache_new(obj_arg) {
+#ifdef LEAN_EMSCRIPTEN
+    lean_internal_panic("usage digests require OpenSSL");
+#else
+    return alloc_external(digest_cache_class(), new digest_cache);
+#endif
+}
+
+extern "C" LEAN_EXPORT obj_res lean_usage_expr_digest_cached(
+        b_obj_arg cache, uint8 binders, b_obj_arg e) {
+#ifdef LEAN_EMSCRIPTEN
+    lean_internal_panic("usage digests require OpenSSL");
+#else
+    digest_cache * c = to_digest_cache(cache);
+    return mk_digest_obj((binders ? c->with_binders : c->without_binders).expr_digest(TO_REF(expr, e)));
+#endif
+}
 extern "C" LEAN_EXPORT obj_res lean_usage_expr_digest(uint8 binders, b_obj_arg e) {
 #ifdef LEAN_EMSCRIPTEN
     lean_internal_panic("usage digests require OpenSSL");
