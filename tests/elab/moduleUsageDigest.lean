@@ -28,4 +28,4 @@ noncomputable def c1 : Nat := 0
 #eval show CommandElabM Unit from do
   let d := "0123456789abcdef0123456789abcdef"
   logInfo m!"{(ModuleUsage.Digest.ofHex? d).map (·.hex) == some d} \
-    {(ModuleUsage.Digest.ofHex? d.toUpper).isNone} {(ModuleUsage.Digest.ofHex? d.drop 1).isNone}"
+    {(ModuleUsage.Digest.ofHex? d.toUpper).isNone} {(ModuleUsage.Digest.ofHex? (d.drop 1).toString).isNone}"
