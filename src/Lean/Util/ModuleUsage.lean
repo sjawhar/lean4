@@ -146,25 +146,36 @@ def refs (env : Environment) (c : ConstantInfo) : Array Name :=
   s.toArray.qsort Name.quickLt
 
 structure State where
-  /-- Per imported module: empty if the module was not written by this extension; otherwise a marker entry at
-  index 0, then the module's digests sorted by name. The marker's own name is never looked up, so no user
-  constant can collide with it. -/
-  importedModuleEntries : Array (Array (Name × Digest)) := #[]
   /-- The current module's digests, if `setLocalDigests` stored them for the `.olean` write. -/
   localDigests? : Option (Array (Name × Digest)) := none
 instance : Inhabited State := ⟨{}⟩
 
+builtin_initialize ext : PersistentEnvExtension (Name × Digest) (Name × Digest) State ←
+  registerPersistentEnvExtension {
+    mkInitial := pure {}
+    addImportedFn := fun _ => pure {}
+    addEntryFn := fun s _ => s
+    -- Private level only: digests cover private constants and unexposed bodies, which must not change the
+    -- exported `.olean` of a `module` file. Non-module files are written and read at the private level.
+    exportEntriesFnEx := fun _ s => match s.localDigests? with
+      | none => { exported := #[], server := #[], «private» := #[] }
+      | some es => { exported := #[], server := #[], «private» := #[(.anonymous, default)] ++ es }
+    asyncMode := .mainOnly
+  }
+
+def state (env : Environment) : State := ext.getState (asyncMode := .mainOnly) env
+
 /-- The digest of `c` if module `i` (the module defining `c`) wrote one. -/
-def State.findAt? (s : State) (i : ModuleIdx) (c : Name) : Option Digest := do
-  let es ← s.importedModuleEntries[i.toNat]?
+def findAt? (env : Environment) (i : ModuleIdx) (c : Name) : Option Digest := do
+  let es := ext.getModuleEntries env i
   (·.2) <$> es.binSearch (c, default) (fun a b => Name.quickLt a.1 b.1) (lo := 1)
 
-def State.find? (s : State) (env : Environment) (c : Name) : Option Digest := do
-  s.findAt? (← env.getModuleIdxFor? c) c
+def find? (env : Environment) (c : Name) : Option Digest := do
+  findAt? env (← env.getModuleIdxFor? c) c
 
 /-- Whether module `i` was written by this extension (it has the marker entry). -/
-def State.hasEntries (s : State) (i : ModuleIdx) : Bool :=
-  !(s.importedModuleEntries[i.toNat]?.getD #[]).isEmpty
+def hasEntries (env : Environment) (i : ModuleIdx) : Bool :=
+  !(ext.getModuleEntries env i).isEmpty
 
 /-- The current module's own constants, from the kernel environment, each with its `refs`. -/
 def ownConsts (env : Environment) : Array (Name × ConstantInfo × Array Name) :=
@@ -173,7 +184,7 @@ def ownConsts (env : Environment) : Array (Name × ConstantInfo × Array Name) :
 /-- Digests of the current module's constants: SCCs in dependency order; each SCC's digest hashes its members'
 names and local hashes with the name and digest of every constant outside it that they refer to (tagged absent
 if that constant has no digest). -/
-def compute (env : Environment) (s : State) (consts := ownConsts env) : Array (Name × Digest) := Id.run do
+def compute (env : Environment) (consts := ownConsts env) : Array (Name × Digest) := Id.run do
   let byName : Std.HashMap Name (ConstantInfo × Array Name) :=
     consts.foldl (fun m (n, ci, rs) => m.insert n (ci, rs)) {}
   let sccs := SCC.scc (consts.map (·.1)).toList fun n => byName[n]!.2.toList.filter byName.contains
@@ -188,31 +199,16 @@ def compute (env : Environment) (s : State) (consts := ownConsts env) : Array (N
       let outside := rs.filter (!members.contains ·)
       e := e.name m |>.digest (localHash env ci cache) |>.nat outside.size
       for r in outside do
-        e := e.name r |>.opt (out[r]? <|> s.find? env r) Enc.digest
+        e := e.name r |>.opt (out[r]? <|> find? env r) Enc.digest
     let d := e.finish
     for m in scc do out := out.insert m d
   return (consts.map fun (n, _) => (n, out[n]!)).qsort fun a b => Name.quickLt a.1 b.1
 
-builtin_initialize ext : PersistentEnvExtension (Name × Digest) (Name × Digest) State ←
-  registerPersistentEnvExtension {
-    mkInitial := pure {}
-    addImportedFn := fun es => pure { importedModuleEntries := es }
-    addEntryFn := fun s _ => s
-    -- Private level only: digests cover private constants and unexposed bodies, which must not change the
-    -- exported `.olean` of a `module` file. Non-module files are written and read at the private level.
-    exportEntriesFnEx := fun env s =>
-      let es := #[(.anonymous, default)] ++ s.localDigests?.getD (compute env s)
-      { exported := #[], server := #[], «private» := es }
-    asyncMode := .mainOnly
-  }
-
-def state (env : Environment) : State := ext.getState (asyncMode := .mainOnly) env
 
 def localDigests (env : Environment) (consts := ownConsts env) : Array (Name × Digest) :=
-  compute env (state env) consts
+  compute env consts
 
-/-- Stores `own` (`localDigests env`) for the extension to export, so writing the `.olean` does not compute
-them again. -/
+/-- Stores `own` (`localDigests env`) for the extension to export. -/
 def setLocalDigests (env : Environment) (own : Array (Name × Digest)) : Environment :=
   ext.modifyState (asyncMode := .mainOnly) env ({ · with localDigests? := some own })
 
@@ -221,11 +217,10 @@ that is in `extra`, with its digest. Constants without a digest (from a module b
 left out. -/
 def moduleUsed (env : Environment) (extra : NameSet) (consts := ownConsts env) :
     Array (Name × Array (Name × Digest)) :=
-  let s := state env
   let used := consts.foldl (init := extra) fun u (_, _, rs) => rs.foldl (·.insert ·) u
   let byMod := used.foldl (init := (∅ : Std.HashMap Name (Array (Name × Digest)))) fun m c => Id.run do
     let some i := env.getModuleIdxFor? c | return m
-    let some d := s.findAt? i c | return m
+    let some d := findAt? env i c | return m
     m.alter env.header.modules[i.toNat]!.module fun o => some ((o.getD #[]).push (c, d))
   byMod.toArray.map (fun (k, v) => (k, v.qsort fun a b => Name.quickLt a.1 b.1))
     |>.qsort fun a b => Name.quickLt a.1 b.1
@@ -304,9 +299,8 @@ def writeUsage (env : Environment) (consts : Array (Name × ConstantInfo × Arra
     (own : Array (Name × Digest)) (extra : NameSet) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
   let noskip := incrLoaded || consts.any fun (_, _, rs) => rs.any
     (· matches ``Lean.reduceBool | ``Lean.reduceNat | ``Lean.ofReduceBool | ``Lean.ofReduceNat)
-  let s := state env
   let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecksRef.get)
-  let extraMods := allExtra.toArray.filter (fun u => (env.getModuleIdx? u.module).any s.hasEntries)
+  let extraMods := allExtra.toArray.filter (fun u => (env.getModuleIdx? u.module).any (hasEntries env))
     |>.qsort fun a b => let k (u : ExtraModUse) := 2 * u.isExported.toNat + u.isMeta.toNat
       Name.quickLt a.module b.module || (a.module == b.module && k a < k b)
   let pair (n : Name) (d : Digest) := Json.arr #[nameToJson n, toJson d]
