@@ -39,6 +39,7 @@ public def Package.unpack
   (pkg : Package) (file : FilePath := pkg.buildArchiveFile)
 : LogIO Unit := do
   logInfo s!"unpacking {file}"
+  removeUsageSidecars pkg.buildDir
   untar file pkg.buildDir
 
 public def Package.uploadRelease
