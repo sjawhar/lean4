@@ -82,6 +82,17 @@ downstream); without, it sees what the kernel sees. -/
 @[extern "lean_usage_expr_digest"]
 opaque exprDigest (binders : Bool) (e : @& Expr) : Digest
 
+/-- A process-local expression digest cache. Its entries are valid while the expressions' environment is live. -/
+opaque ExprDigestCacheSpec : NonemptyType.{0}
+def ExprDigestCache := ExprDigestCacheSpec.type
+instance : Nonempty ExprDigestCache := ExprDigestCacheSpec.property
+
+@[extern "lean_usage_expr_digest_cache_new"]
+opaque mkExprDigestCache : Unit → ExprDigestCache
+
+@[extern "lean_usage_expr_digest_cached"]
+opaque exprDigestCached (cache : @& ExprDigestCache) (binders : Bool) (e : @& Expr) : Digest
+
 def externEnc (e : Enc) (d : ExternAttrData) : Enc :=
   d.entries.foldl (init := e.nat d.entries.length) fun e x => match x with
     | .adhoc b => e.u8 1 |>.name b
@@ -96,9 +107,9 @@ def safetyEnc (e : Enc) : DefinitionSafety → Enc
 
 /-- Everything of `c` except its own name and the meaning of the constants it refers to, including what its
 importers' compiled code links against: the `@[extern]` entries and the `@[export]` name. -/
-def localHash (env : Environment) (c : ConstantInfo) : Digest :=
-  let v := exprDigest false
-  let e := ({} : Enc).names c.levelParams |>.digest (exprDigest true c.type)
+def localHash (env : Environment) (c : ConstantInfo) (cache := mkExprDigestCache ()) : Digest :=
+  let v := exprDigestCached cache false
+  let e := ({} : Enc).names c.levelParams |>.digest (exprDigestCached cache true c.type)
     |>.opt (Compiler.getImplementedBy? env c.name) Enc.name
     |>.opt (getExternAttrData? env c.name) externEnc
     |>.bool (isNoncomputable env c.name)
@@ -167,6 +178,7 @@ def compute (env : Environment) (s : State) (consts := ownConsts env) : Array (N
     consts.foldl (fun m (n, ci, rs) => m.insert n (ci, rs)) {}
   let sccs := SCC.scc (consts.map (·.1)).toList fun n => byName[n]!.2.toList.filter byName.contains
   let mut out : Std.HashMap Name Digest := {}
+  let cache := mkExprDigestCache ()
   for scc in sccs do
     let members := NameSet.ofList scc
     let sorted := scc.toArray.qsort Name.quickLt
@@ -174,7 +186,7 @@ def compute (env : Environment) (s : State) (consts := ownConsts env) : Array (N
     for m in sorted do
       let (ci, rs) := byName[m]!
       let outside := rs.filter (!members.contains ·)
-      e := e.name m |>.digest (localHash env ci) |>.nat outside.size
+      e := e.name m |>.digest (localHash env ci cache) |>.nat outside.size
       for r in outside do
         e := e.name r |>.opt (out[r]? <|> s.find? env r) Enc.digest
     let d := e.finish

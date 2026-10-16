@@ -16,6 +16,10 @@ run_cmd liftCoreM <| addDecl <| .defnDecl {
 
 #eval show CommandElabM Unit from do
   let env ← getEnv
-  let h := ModuleUsage.localHash env (env.find? `big).get!
+  let ci := (env.find? `big).get!
+  let cache := ModuleUsage.mkExprDigestCache ()
+  let h := ModuleUsage.localHash env ci cache
   let ds := ModuleUsage.localDigests env
-  logInfo m!"{h != default} {(ds.find? (·.1 == `big)).isSome}"
+  let cached := ModuleUsage.exprDigestCached cache false ci.type == ModuleUsage.exprDigest false ci.type
+    && ModuleUsage.exprDigestCached cache true ci.type == ModuleUsage.exprDigest true ci.type
+  logInfo m!"{h != default} {(ds.find? (·.1 == `big)).isSome} {cached}"
