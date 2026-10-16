@@ -36,6 +36,7 @@ Authors: Leonardo de Moura, Sebastian Ullrich
 #include <sstream>
 #include <fstream>
 #include <iomanip>
+#include <thread>
 #include <string>
 #include <cstdlib>
 #include <cctype>
@@ -1455,9 +1456,23 @@ static inline atomic<object*> * mt_ref_val_addr(object * o) {
 */
 static inline bool ref_maybe_mt(b_obj_arg ref) { return lean_is_mt(ref) || lean_is_persistent(ref); }
 
+/*
+A multi-threaded `ST.Ref` is "locked" while its slot holds `nullptr` (another thread took the value).
+The waiters used to spin on `exchange` with no backoff: when the holder is preempted (a loaded machine
+with more runnable threads than cores), every waiter burns its whole timeslice hammering the cache line,
+and the holder gets the CPU back later rather than sooner. Spin briefly for the common nanosecond-length
+hold, then yield the processor to whoever holds the value.
+*/
+static inline void ref_spin_backoff(unsigned & spins) {
+    if (++spins > 32) {
+        std::this_thread::yield();
+    }
+}
+
 extern "C" LEAN_EXPORT obj_res lean_st_ref_get(b_obj_arg ref) {
     if (ref_maybe_mt(ref)) {
         atomic<object *> * val_addr = mt_ref_val_addr(ref);
+        unsigned spins = 0;
         while (true) {
             /*
               We cannot simply read `val` from the ref and `inc` it like in the `else` branch since someone else could
@@ -1471,6 +1486,7 @@ extern "C" LEAN_EXPORT obj_res lean_st_ref_get(b_obj_arg ref) {
                 (void)tmp;
                 return val;
             }
+            ref_spin_backoff(spins);
         }
     } else {
         object * val = lean_to_ref(ref)->m_value;
@@ -1483,10 +1499,12 @@ extern "C" LEAN_EXPORT obj_res lean_st_ref_get(b_obj_arg ref) {
 extern "C" LEAN_EXPORT obj_res lean_st_ref_take(b_obj_arg ref) {
     if (ref_maybe_mt(ref)) {
         atomic<object *> * val_addr = mt_ref_val_addr(ref);
+        unsigned spins = 0;
         while (true) {
             object * val = val_addr->exchange(nullptr);
             if (val != nullptr)
                 return val;
+            ref_spin_backoff(spins);
         }
     } else {
         object * val = lean_to_ref(ref)->m_value;
@@ -1522,10 +1540,12 @@ extern "C" LEAN_EXPORT obj_res lean_st_ref_swap(b_obj_arg ref, obj_arg a) {
         /* See io_ref_write */
         mark_mt(a);
         atomic<object *> * val_addr = mt_ref_val_addr(ref);
+        unsigned spins = 0;
         while (true) {
             object * old_a = val_addr->load();
             if (old_a != nullptr && val_addr->compare_exchange_strong(old_a, a))
                 return old_a;
+            ref_spin_backoff(spins);
         }
     } else {
         object * old_a = lean_to_ref(ref)->m_value;
