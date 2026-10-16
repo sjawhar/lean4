@@ -83,3 +83,19 @@ reuse_case() {
 }
 reuse_case nohash
 reuse_case rehash --rehash
+
+# An intact local archive that is the cache entry itself (the hard link packing makes) is reused
+# without reading it: made unreadable, it must not fail a build that reuses it
+export LAKE_CACHE_DIR="$PWD/cache-noread"
+mkp n; setx n 2
+test_run -d n build P.X -o "$PWD/noread1.jsonl"
+test_exp -f "n/$X_LTAR"
+test_cmd chmod 000 "n/$X_LTAR"
+if cat "n/$X_LTAR" > /dev/null 2>&1; then
+  echo "SKIPPED: the archive is still readable (running as root?)"
+else
+  test_not_out 'discarding it' -d n build P.X -o "$PWD/noread2.jsonl"
+  # The outputs file still names the archive
+  match_text "$(cat "n/$X_LTAR.hash").ltar" noread2.jsonl
+fi
+test_cmd chmod 444 "n/$X_LTAR"

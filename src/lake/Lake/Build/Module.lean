@@ -1108,8 +1108,11 @@ def Module.verifiedLocalLtar? (mod : Module) : JobM (Option Artifact) := do
   unless (← mod.ltarFile.pathExists) do return none
   if let some hash ← Hash.load? (mod.ltarFile.toString ++ ".hash") then
     let entry := (← getLakeCache).artifactDir / artifactPath hash "ltar"
-    if (← (mod.ltarFile.isSameFile entry).toBaseIO) matches .ok true ||
-        (← computeFileHash mod.ltarFile) == hash then
+    let isEntry := (← (mod.ltarFile.isSameFile entry).toBaseIO) matches .ok true
+    -- `(← a) || (← b)` would run both: hash the archive only when it is not the entry
+    let intact ← if isEntry then pure true else do
+      pure ((← computeFileHash mod.ltarFile) == hash)
+    if intact then
       let mtime := (← getMTime mod.ltarFile |>.toBaseIO).toOption.getD 0
       let art : Artifact := {
         descr := artifactWithExt hash "ltar"
