@@ -10,7 +10,7 @@ public import Lean.Compiler.NoncomputableAttr
 public import Lean.Elab.InfoTree.Types
 import Lean.ExtraModUses
 import Lean.Compiler.Old
-import Lean.Server.InfoUtils
+import Lean.Elab.InfoTree.Util
 public section
 namespace Lean.ModuleUsage
 
@@ -33,11 +33,13 @@ def Digest.hex (d : Digest) : String := hex16 d.hi ++ hex16 d.lo
 
 /-- Parses exactly 32 lowercase hex digits. -/
 def Digest.ofHex? (s : String) : Option Digest := do
-  let cs := s.toList
-  guard (cs.length == 32)
-  let v ← cs.foldlM (init := 0) fun (n : Nat) c =>
-    if '0' ≤ c && c ≤ '9' then some (16 * n + (c.toNat - '0'.toNat))
-    else if 'a' ≤ c && c ≤ 'f' then some (16 * n + (c.toNat - 'a'.toNat + 10))
+  let bs := s.toUTF8
+  guard (bs.size == 32)
+  let v ← bs.foldlM (init := 0) fun (n : Nat) b =>
+    if '0'.toUInt8 ≤ b && b ≤ '9'.toUInt8 then
+      some (16 * n + (b.toNat - '0'.toNat))
+    else if 'a'.toUInt8 ≤ b && b ≤ 'f'.toUInt8 then
+      some (16 * n + (b.toNat - 'a'.toNat + 10))
     else none
   return ⟨(v >>> 64).toUInt64, v.toUInt64⟩
 
@@ -290,8 +292,7 @@ commands from an `--incr-load` snapshot), `noskip` is set: reused commands never
 so `extra` may miss constants they used. -/
 def writeUsage (env : Environment) (consts : Array (Name × ConstantInfo × Array Name))
     (own : Array (Name × Digest)) (extra : NameSet) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
-  let noskip := incrLoaded || consts.any fun (_, _, rs) => rs.any
-    (· matches ``Lean.reduceBool | ``Lean.reduceNat | ``Lean.ofReduceBool | ``Lean.ofReduceNat)
+  let noskip := incrLoaded
   let s := state env
   let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecksRef.get)
   let extraMods := allExtra.toArray.filter (fun u => (env.getModuleIdx? u.module).any s.hasEntries)

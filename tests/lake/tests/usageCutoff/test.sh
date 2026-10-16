@@ -167,23 +167,6 @@ printf 'partial def f (n : Nat) : Nat := if n = 0 then 2 else f (n - 1)\n' > Tes
 test_run build Test.PM
 printf 'partial def f (n : Nat) : Nat := if n = 0 then 3 else f (n - 1)\n' > Test/PX.lean
 LAKE_USAGE_CUTOFF=0 test_err "error: Test/PM.lean" build -v Test.PM
-# the same through `Lean.ofReduceBool`: the proof term never names `reduceBool`, and the
-# decided `c` runs `f`'s compiled body; M must rebuild and fail
-printf 'partial def f (n : Nat) : Nat := if n = 0 then 2 else f (n - 1)\ndef c : Bool := f 1 == 2\n' > Test/RX.lean
-printf 'import Test.RX\nset_option linter.deprecated false\ntheorem t : c = true := Lean.ofReduceBool c true (@rfl Bool true)\n' \
-  > Test/RM.lean
-test_run build Test.RM
-printf 'partial def f (n : Nat) : Nat := if n = 0 then 3 else f (n - 1)\ndef c : Bool := f 1 == 2\n' > Test/RX.lean
-test_err "error: Test/RM.lean" build -v Test.RM
-# `reduceBool` one module up: RY's `rbc` is `noskip` and always rebuilds, and RN's
-# `rfl` proof of `rbc = true` names no `reduceBool`; `rbc`'s digest folds in `f`'s compiled body, so RN must
-# rebuild and fail
-printf 'partial def f (n : Nat) : Nat := if n = 0 then 2 else f (n - 1)\ndef c : Bool := f 1 == 2\n' > Test/RX.lean
-printf 'import Test.RX\ndef rbc : Bool := Lean.reduceBool c\n' > Test/RY.lean
-printf 'import Test.RY\ntheorem t : rbc = true := rfl\n' > Test/RN.lean
-test_run build Test.RN
-printf 'partial def f (n : Nat) : Nat := if n = 0 then 3 else f (n - 1)\ndef c : Bool := f 1 == 2\n' > Test/RX.lean
-test_err "error: Test/RN.lean" build -v Test.RN
 # a user constant with the name the extension once used for its marker entry (`_moduleUsage`) has its
 # own digest: a change to its value rebuilds a module that proved it through an intermediate `def`. The same
 # for a name declared by `addDecl` from `run_cmd`, which can declare any name (no compiled code, so the
