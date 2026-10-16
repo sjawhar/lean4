@@ -1260,15 +1260,16 @@ same contents (`BuildContext.sidecarCache`).
 -/
 def readUsageSidecar (α : Type) [FromJson α] [TypeName α] (path : FilePath) :
     JobM (Option α) := do
-  match (← IO.FS.readFile path |>.toBaseIO) with
-  | .ok contents =>
+  match (← IO.FS.readBinFile path |>.toBaseIO) with
+  | .ok bytes =>
     (← getBuildContext).sidecarCache.atomically do
-      let cache ← getThe (Std.HashMap FilePath (String × Dynamic))
+      let cache ← getThe (Std.HashMap FilePath (ByteArray × Dynamic))
       if let some (parsedFrom, cached) := cache.get? path then
-        if parsedFrom == contents then
+        if parsedFrom == bytes then
           let some value := cached.get? α | error s!"{path}: cached sidecar has the wrong type"
           return some value
       let parsed := do
+        let some contents := String.fromUTF8? bytes | throw "not UTF-8"
         let j ← Json.parse contents
         let v ← j.getObjValAs? Nat "version"
         if v != ModuleUsage.usageVersion then return none
@@ -1276,8 +1277,8 @@ def readUsageSidecar (α : Type) [FromJson α] [TypeName α] (path : FilePath) :
       match parsed with
       | .ok value =>
         if let some value := value then
-          modifyThe (Std.HashMap FilePath (String × Dynamic))
-            (·.insert path (contents, Dynamic.mk value))
+          modifyThe (Std.HashMap FilePath (ByteArray × Dynamic))
+            (·.insert path (bytes, Dynamic.mk value))
         return value
       | .error e =>
         logWarning s!"{path}: {e}"

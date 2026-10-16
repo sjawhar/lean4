@@ -105,7 +105,7 @@ public structure BuildContext extends BuildConfig, Context where
   parsed from. Another process may rewrite a sidecar during the build (e.g., a build of another workspace
   that requires the same path dependency), so a cached parse serves only a read of the same contents.
   -/
-  sidecarCache : Std.Mutex (Std.HashMap FilePath (String × Dynamic))
+  sidecarCache : Std.Mutex (Std.HashMap FilePath (ByteArray × Dynamic))
 
 /-- A transformer to equip a monad with a `BuildContext`. -/
 public abbrev BuildT := ReaderT BuildContext
