@@ -399,7 +399,8 @@ def finalizeBuild
   reportResult cfg mctx.out result
   if let some mt := bctx.moduleTimes? then
     -- The record only orders compiles, so failing to save it warns instead of failing the build.
-    let saved ← (mt.save fun name => (·.leanFile) <$> bctx.workspace.findTargetModule? name).toBaseIO
+    let saved ← (mt.save (logger := mctx.logger)
+      fun name => (·.leanFile) <$> bctx.workspace.findTargetModule? name).toBaseIO
     match saved with
     | .ok n =>
       if n > 0 && cfg.verbosity matches .verbose then
@@ -451,7 +452,7 @@ public def Workspace.runFetchM
   let jobs ← mkJobQueue
   let cancelTk? ← if cfg.failFast then some <$> IO.CancelToken.new else pure none
   let mctx ← mkMonitorContext cfg jobs cancelTk?
-  let moduleTimes ← ModuleTimes.load (ws.lakeDir / moduleTimesFileName)
+  let moduleTimes ← ModuleTimes.load (logger := mctx.logger) (ws.lakeDir / moduleTimesFileName)
   let bctx ← mkBuildContext ws cfg jobs cancelTk? (moduleTimes? := some moduleTimes)
   let job ← startBuild bctx build caption
   let result ← monitorJob mctx job
@@ -493,7 +494,7 @@ public def Workspace.runBuild
   let jobs ← mkJobQueue
   let cancelTk? ← if cfg.failFast then some <$> IO.CancelToken.new else pure none
   let mctx ← mkMonitorContext cfg jobs cancelTk?
-  let moduleTimes ← ModuleTimes.load (ws.lakeDir / moduleTimesFileName)
+  let moduleTimes ← ModuleTimes.load (logger := mctx.logger) (ws.lakeDir / moduleTimesFileName)
   let bctx ← mkBuildContext ws cfg jobs cancelTk? (moduleTimes? := some moduleTimes)
   let job ← startBuild bctx build
   let result ← monitorBuild mctx job
