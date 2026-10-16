@@ -636,6 +636,14 @@ public def Module.importAllArtsFacetConfig : ModuleFacetConfig importAllArtsFace
       .ok i.arts {s with trace := i.allArtsTrace}
 
 /--
+Usage cutoff is on unless `LAKE_USAGE_CUTOFF=0`. Only with it on does Lean write usage data
+(`Module.buildLean`), so the setting is part of every module's trace: the two settings never reuse
+each other's outputs, and a build that switches compiles each module again.
+-/
+def usageCutoffEnabled : BaseIO Bool :=
+  return (← IO.getEnv "LAKE_USAGE_CUTOFF") != some "0"
+
+/--
 Recursively build a module's dependencies, including:
 * Transitive local imports
 * Shared libraries (e.g., `extern_lib` targets or precompiled modules)
@@ -707,7 +715,8 @@ def Module.recFetchPreSetup (mod : Module) : FetchM (Job ModulePreSetup) := ensu
     let localInputs := libTraces ++ #[
       ← getLeanTrace, input.trace, traceOptions leanOptions "options",
       pureTrace input.header.isModule "isModule", pureTrace mod.name "Module.name",
-      pureTrace mod.pkg.id? "Package.id?", pureTrace mod.leanArgs "Module.leanArgs"]
+      pureTrace mod.pkg.id? "Package.id?", pureTrace mod.leanArgs "Module.leanArgs",
+      pureTrace (← usageCutoffEnabled) "usage cutoff"]
     addTrace depTrace
     localInputs.forM addTrace
     let localTrace := localInputs.foldl (·.mix ·) ((BuildTrace.nil "local").mix extraDepJob.getTrace)
@@ -885,10 +894,6 @@ def ModuleOutputDescrs.resolve
     return arts
 where
   @[inline] resolve descr := resolveArtifact descr service? scope?
-
-/-- Usage cutoff is on unless `LAKE_USAGE_CUTOFF=0`. -/
-def usageCutoffEnabled : BaseIO Bool :=
-  return (← IO.getEnv "LAKE_USAGE_CUTOFF") != some "0"
 
 /--
 Fails on outputs a usage-cutoff skip stored (`ModuleOutputDescrs.skipped`) when the cutoff is off,

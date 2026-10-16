@@ -94,11 +94,14 @@ test_cmd_out "some (false)" "$LAKE" env lean Test/Inspect.lean
 printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 4\ndef unrelated4 := 0\n' > Test/A.lean
 test_out "Built Test.B" build -v Test.B
 test_cmd_out "some (true)" "$LAKE" env lean Test/Inspect.lean
-# an import rebuilt with the cutoff off has no `.usage`: a cutoff-on build compiles B instead of replaying it
-printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 4\ndef unrelated4 := 1\n' > Test/A.lean
+# the cutoff setting is part of the trace: a cutoff-on build compiles again an import last built with the
+# cutoff off, so B is checked against its new digests (here `a` changed, so B builds)
+printf 'def a := 3\ntheorem ta : a = 3 := rfl\ndef unrelated := 4\n' > Test/A.lean
 LAKE_USAGE_CUTOFF=0 test_run build Test.A
 test_exp ! -f .lake/build/lib/lean/Test/A.usage
-test_out "Built Test.B" build -v Test.B
+lake_out build -v Test.B
+match_text "Built Test.A" produced.out
+match_text "Built Test.B" produced.out
 # the same through an intermediate import: WC uses `wa` through WB while WA has no digests, so WC's `.usage`
 # cannot record it, and once WA changes WC compiles (and fails) instead of replaying
 printf 'def wa := 1\n' > Test/WA.lean
@@ -405,8 +408,8 @@ test_exp -f cache17b/.lake/build/lib/lean/Test/B.usage
 test_exp -f cache17b/.lake/build/lib/lean/Test/B.usekey
 test_exp -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" u)"
 test_exp -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" k)"
-# a skip's cache entry is marked `s`, and a build with the cutoff off never restores it: it treats the entry
-# as a miss and builds, and its build replaces the entry unmarked
+# a skip's cache entry is marked `s`; a build with the cutoff off has other input hashes, so it never
+# finds that entry: it builds, and stores an entry of its own, unmarked
 mkdir -p cache12/Test cache13/Test cache14/Test cache15/Test cache16/Test
 for d in cache12 cache13 cache14 cache15 cache16; do cp lakefile.toml $d/; done
 printf 'def sa := 1\n' > cache12/Test/SA.lean
@@ -425,12 +428,24 @@ cp "$entry" skipentry.json
 # a fresh tree with the cutoff off builds SB instead of restoring the skip's outputs
 cp cache12/Test/*.lean cache13/Test/
 (cd cache13 && LAKE_USAGE_CUTOFF=0 test_out "Built Test.SB" build -v Test.SB)
-no_match_text '"s": true' "$entry"
+entryOff="$LAKE_CACHE_DIR/outputs/test/$(depHash cache13/.lake/build/lib/lean/Test/SB.trace).json"
+test_exp "$entryOff" != "$entry"
+no_match_text '"s": true' "$entryOff"
+match_text '"s": true' "$entry"
 # control: that built (unmarked) entry is restored with the cutoff off
 cp cache12/Test/*.lean cache14/Test/
 (cd cache14 && LAKE_USAGE_CUTOFF=0 test_out "Reused Test.SB" build -v Test.SB)
+# an entry stored with the cutoff off has no usage data, and a fresh tree with the cutoff on does not find it
+mkdir -p cache18/Test cache19/Test
+for d in cache18 cache19; do cp lakefile.toml $d/; done
+printf 'def oa := 1\n' > cache18/Test/OA.lean
+cp cache18/Test/OA.lean cache19/Test/
+(cd cache18 && LAKE_USAGE_CUTOFF=0 test_run build Test.OA)
+(cd cache19 && test_out "Built Test.OA" build -v Test.OA)
+test_exp -f cache19/.lake/build/lib/lean/Test/OA.usage
 # the marked entry with an artifact pruned, so it resolves only through its archive: a cutoff-on restore
-# unpacks the archive and the rewritten entry keeps the mark; with the cutoff off, SB builds instead
+# unpacks the archive and the rewritten entry keeps the mark; with the cutoff off, SB looks up only its own
+# entry, which lost the same (content-addressed) artifact, so it builds
 cp -f skipentry.json "$entry"
 rm -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" c)"
 cp cache12/Test/*.lean cache15/Test/
@@ -439,7 +454,8 @@ match_text '"s": true' "$entry"
 rm -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" c)"
 cp cache12/Test/*.lean cache16/Test/
 (cd cache16 && LAKE_USAGE_CUTOFF=0 test_out "Built Test.SB" build -v Test.SB)
-no_match_text '"s": true' "$entry"
+test_exp "$(depHash cache16/.lake/build/lib/lean/Test/SB.trace)" = "$(depHash cache13/.lake/build/lib/lean/Test/SB.trace)"
+no_match_text '"s": true' "$entryOff"
 # the tree that skipped, with the cutoff off and its sources unchanged since the skip, builds SB rather
 # than keep the skip's outputs, as a stock build of those sources would
 printf 'def sa := 1\ndef unrelated := 3\n' > cache12/Test/SA.lean
