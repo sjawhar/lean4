@@ -60,3 +60,26 @@ test_err 'does not match its content hash' -d v2 build P.D
 test_truth v2
 mkp v3; setx v3 2
 test_truth v3
+
+# The module's local archive replaced while all its other outputs stay intact, so a build is a
+# complete hit on them and reuses the local archive for `-o`: with no hash recorded for it, or
+# under `--rehash`, it must not be recorded under this input's hash (both archives are cached
+# under their own names, so a mapping to the substitute would restore it)
+# reuse_case NAME LAKE_ARGS... -- run the case in fresh trees against a fresh cache
+reuse_case() {
+  local name=$1; shift
+  export LAKE_CACHE_DIR="$PWD/cache-$name"
+  mkp "$name-t"; setx "$name-t" 2
+  mkp "$name-u"; setx "$name-u" 1
+  test_run -d "$name-t" build P.X -o "$PWD/$name-good2.jsonl"
+  test_run -d "$name-u" build P.X -o "$PWD/$name-good1.jsonl"
+  test_cmd rm -f "$name-t/$X_LTAR"
+  test_cmd cp "$name-u/$X_LTAR" "$name-t/$X_LTAR"
+  if [ "$name" = nohash ]; then test_cmd rm -f "$name-t/$X_LTAR.hash"; fi
+  test_run -d "$name-t" "$@" build P.X -o "$PWD/$name-reused.jsonl"
+  test_run -d "$name-t" cache add "$PWD/$name-reused.jsonl"
+  mkp "$name-v"; setx "$name-v" 2
+  test_truth "$name-v"
+}
+reuse_case nohash
+reuse_case rehash --rehash

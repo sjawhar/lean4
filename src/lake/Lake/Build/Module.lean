@@ -1097,6 +1097,33 @@ where
     -- Note: Lean produces LF-only line endings for `.c` and `.ilean`, so no normalization.
     computeArtifact file ext (text := false)
 
+/--
+The module's existing `.ltar`, if it still has the hash recorded when it was packed (its `.hash`,
+which `--rehash` does not replace here). It is not read when it is the cache entry for that hash.
+An archive with no recorded hash or with other contents is removed, with its `.hash`, so that it is
+packed again from the module's own outputs when needed: an archive carries its own trace, so
+nothing else shows that it belongs to this module's input.
+-/
+def Module.verifiedLocalLtar? (mod : Module) : JobM (Option Artifact) := do
+  unless (← mod.ltarFile.pathExists) do return none
+  if let some hash ← Hash.load? (mod.ltarFile.toString ++ ".hash") then
+    let entry := (← getLakeCache).artifactDir / artifactPath hash "ltar"
+    if (← (mod.ltarFile.isSameFile entry).toBaseIO) matches .ok true ||
+        (← computeFileHash mod.ltarFile) == hash then
+      let mtime := (← getMTime mod.ltarFile |>.toBaseIO).toOption.getD 0
+      let art : Artifact := {
+        descr := artifactWithExt hash "ltar"
+        name := mod.ltarFile.toString
+        path := mod.ltarFile
+        mtime
+      }
+      return some art
+    logWarning s!"{mod.ltarFile}: does not match the hash recorded when it was packed; \
+      discarding it"
+  removeFileIfExists mod.ltarFile
+  clearFileHash mod.ltarFile
+  return none
+
 def Module.computeArtifacts
   (mod : Module) (isModule : Bool) (skipIR : Bool)
 : FetchM ModuleOutputArtifacts :=
@@ -1110,7 +1137,7 @@ def Module.computeArtifacts
     ir? := ← computeIf (isModule && !skipIR) mod.irFile "ir"
     c? := ← computeIf (!(isModule && skipIR)) mod.cFile "c"
     bc? := ← computeIf (Lean.Internal.hasLLVMBackend ()) mod.bcFile "bc"
-    ltar? :=  ← computeIf (← mod.ltarFile.pathExists) mod.ltarFile "ltar"
+    ltar? := ← mod.verifiedLocalLtar?
   }
 where
   @[inline] compute file ext := do
@@ -1373,10 +1400,9 @@ where
           mod.restoreAllArtifacts arts
         else
           mod.restoreNeededArtifacts arts
-      -- Reuse a previously packed ltar if one exists
+      -- Reuse a previously packed ltar if one exists and still is the one packed
       if arts.ltar?.isNone then
-        if (← mod.ltarFile.pathExists) then
-          let ltar ← computeArtifact mod.ltarFile "ltar"
+        if let some ltar ← mod.verifiedLocalLtar? then
           return .complete {arts with ltar? := some ltar}
       return .complete arts
   fetchCore (presetup : ModulePreSetup) : JobM ModuleOutputArtifacts := do
