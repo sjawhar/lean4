@@ -163,6 +163,7 @@ static struct option g_long_options[] = {
     {"run",          no_argument,       0, 'r'},
     {"o",            optional_argument, 0, 'o'},
     {"i",            optional_argument, 0, 'i'},
+    {"usage",        required_argument, 0, 'U'},
     {"stdin",        no_argument,       0, 'I'},
     {"root",         required_argument, 0, 'R'},
     {"memory",       required_argument, 0, 'M'},
@@ -201,7 +202,7 @@ static struct option g_long_options[] = {
 };
 
 static char const * g_opt_str =
-    "PdD:o:i:b:c:C:qgvVht:012j:012rR:M:012T:012ap:eE:Y:Z:H:"
+    "PdD:o:i:U:b:c:C:qgvVht:012j:012rR:M:012T:012ap:eE:Y:Z:H:"
 #if defined(LEAN_MULTI_THREAD)
     "s:012"
 #endif
