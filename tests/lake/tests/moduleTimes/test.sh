@@ -169,27 +169,42 @@ has_row Test.Quick2 5000
 rec_check 'rem("Test.Quick1") >= 5000 + ms("Test") and rem("Test.Quick2") >= 5000 + ms("Test") and (rem("Test.Quick1") == 5000 + rem("Test.Quick2")) != (rem("Test.Quick2") == 5000 + rem("Test.Quick1"))'
 mv Test.lean.bak Test.lean
 
-# A record that does not parse fails loudly, naming the file.
+# A record that does not parse only warns, naming the file to delete, and the build starts a new
+# record: it succeeds, and its save replaces the file with this build's entries alone (`Test`'s line,
+# and lines with no time for its imports).
+WARN='; ignoring it and starting a new record (delete it to silence this warning)'
 echo '{' > $REC
-test_err "module-times.tsv" build
+cp Test.lean Test.lean.bak
+printf -- '-- touched for a record that does not parse\n' >> Test.lean
+test_out "module-times.tsv: line 1: expected 'lake-module-times 3', got '{'$WARN" build
+has_row Test
+has_row Test.Quick1 0
+has_row Test.SlowTop 0
+mv Test.lean.bak Test.lean
 
-# The editor's `lake setup-file` names the file too.
-test_err "module-times.tsv" setup-file Test/SlowTop.lean
+# The editor's `lake setup-file` warns too, and still prints the module's setup.
+echo '{' > $REC
+test_out "module-times.tsv: line 1: expected 'lake-module-times 3', got '{'$WARN" setup-file Test/SlowTop.lean
+match_text '"name":"Test.SlowTop"' produced.out
 
-# A record with another version fails loudly, naming the file.
+# So does a record with another version, an import index past the last line, or lines out of order.
 printf 'lake-module-times 2\n' > $REC
-test_err "module-times.tsv: line 1: expected 'lake-module-times 3', got 'lake-module-times 2'" build
-
-# So do an import index past the last line, and lines out of order.
+test_out "module-times.tsv: line 1: expected 'lake-module-times 3', got 'lake-module-times 2'$WARN" build
 printf 'lake-module-times 3\n1\t1\tTest.Quick1\t5\n' > $REC
-test_err "module-times.tsv: line 2: import index 5, but there are 1 lines" build
+test_out "module-times.tsv: line 2: import index 5, but there are 1 lines$WARN" build
 printf 'lake-module-times 3\n1\t1\tTest.Quick2\t\n1\t1\tTest.Quick1\t\n' > $REC
-test_err "line 3: 'Test.Quick1' is not after 'Test.Quick2'" build
+test_out "line 3: 'Test.Quick1' is not after 'Test.Quick2'$WARN" build
 
-# An older Lake's record, with no record of this format beside it, fails loudly, naming the file.
+# An older Lake's record, with no record of this format beside it, only warns, naming the old file
+# to delete, and the build starts a new record beside it.
 rm $REC
 echo '{"version":2,"names":[],"modules":[]}' > .lake/module-times.json
-test_err "module-times.json: a module-times record from an older Lake; delete it to start a new record" build
+cp Test.lean Test.lean.bak
+printf -- '-- touched for an older record\n' >> Test.lean
+test_out "module-times.json: a module-times record from an older Lake$WARN" build
+has_row Test
+has_row Test.Quick1 0
+mv Test.lean.bak Test.lean
 rm .lake/module-times.json
 
 ./clean.sh
