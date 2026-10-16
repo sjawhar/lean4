@@ -17,15 +17,13 @@ test_run build Test.B Test.C Test.D Test.HU Test.Ex
 cat > Test/Inspect.lean <<'EOF'
 import Test.A
 import Lean.Util.ModuleUsage
-import Lean.Elab.Command
-open Lean Elab Command
-#eval show CommandElabM Unit from do
-  let env ← getEnv
-  let some i := env.getModuleIdx? `Test.A | throwError "imported module not found"
-  logInfo m!"{(ModuleUsage.ext.getModuleEntries env i).isEmpty}"
+open Lean
+#eval do
+  let extensions ← persistentEnvExtensionsRef.get
+  IO.println (extensions.any (·.name == `Lean.ModuleUsage.ext))
 EOF
-# Per-constant usage digests live in `.usage`, not in ordinary imported `.olean` pages.
-test_cmd_out "true" "$LAKE" env lean Test/Inspect.lean
+# Per-constant usage digests live in `.usage`; no persistent extension allocates per-import state.
+test_cmd_out "false" "$LAKE" env lean Test/Inspect.lean
 test_exp -f .lake/build/lib/lean/Test/B.usage
 test_cmd_out '[["Test","A"],[[["a"],"' cat .lake/build/lib/lean/Test/B.usage
 # `example` (C) reaches `used` through `usedByChecksRef`, `#print axioms` (D) through its `TermInfo`.
