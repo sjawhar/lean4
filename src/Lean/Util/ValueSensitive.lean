@@ -20,7 +20,7 @@ private def taintedHead (names : NameSet) (tainted : List Bool) (e : Expr) : Boo
   | _ => false
 
 private def eliminatorRisk (env : Environment) (f : Name) : Option Bool :=
-  if f.getString! == "rec" then
+  if f matches .str _ "rec" then
     match env.find? f with
     | some (.recInfo r) => some !r.k
     | _ => some true
@@ -43,7 +43,7 @@ private def riskyEliminatorUse (env : Environment) (names : NameSet) (tainted : 
       match eliminatorRisk env f with
       | none | some false => false
       | some true =>
-        if f.getString! == "rec" then
+        if f matches .str _ "rec" then
           match env.find? f with
           | some (.recInfo r) =>
             if h : r.getMajorIdx < args.size then taintedHead names tainted args[r.getMajorIdx]
