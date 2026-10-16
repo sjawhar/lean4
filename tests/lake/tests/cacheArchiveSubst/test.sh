@@ -24,6 +24,8 @@ setx() { rm -f "$1/P/X.lean"; printf 'def X.v : Nat := %s\n' "$2" > "$1/P/X.lean
 test_truth() { test_err 'P/D.lean' -d "$1" build P.D; test_run -d "$1" build P.E; }
 
 X_LTAR=.lake/build/ir/P/X.ltar
+X_OLEAN=.lake/build/lib/lean/P/X.olean
+X_ILEAN=.lake/build/lib/lean/P/X.ilean
 # An archive of `P.X` compiled from `X.v := 1`, without the cache
 mkp u; setx u 1
 LAKE_ARTIFACT_CACHE=false test_run -d u build +P.X:ltar
@@ -42,6 +44,33 @@ export LAKE_CACHE_DIR="$PWD/cache2"
 test_truth t
 mkp v; setx v 2
 test_truth v
+
+# The module's genuine local archive, with one output replaced by other contents and another
+# output removed: unpacking the archive must replace every output, not only the missing one, in
+# both the cache-on and the cache-off branch
+# mixed_case NAME on|off -- the build after the change runs with the cache on or off
+mixed_case() {
+  local name=$1 cache=$2
+  export LAKE_CACHE_DIR="$PWD/cache-$name-1"
+  mkp "$name"; setx "$name" 2
+  test_run -d "$name" build P.X -o "$PWD/$name.jsonl"
+  test_exp -f "$name/$X_LTAR"
+  test_cmd cp "$name/$X_OLEAN" "$name.genuine"
+  test_cmd rm -f "$name/$X_OLEAN" "$name/$X_ILEAN"
+  test_cmd cp "u/$X_OLEAN" "$name/$X_OLEAN"
+  export LAKE_CACHE_DIR="$PWD/cache-$name-2"
+  if [ "$cache" = on ]; then
+    test_truth "$name"
+    # A fresh tree restores what that build cached
+    mkp "$name-v"; setx "$name-v" 2
+    test_truth "$name-v"
+  else
+    LAKE_ARTIFACT_CACHE=false test_truth "$name"
+  fi
+  test_cmd cmp "$name.genuine" "$name/$X_OLEAN"
+}
+mixed_case mixon on
+mixed_case mixoff off
 
 # The module's local archive replaced while all its other outputs stay intact, so a build is a
 # complete hit on them and reuses the local archive for `-o`: with no hash recorded for it, or
