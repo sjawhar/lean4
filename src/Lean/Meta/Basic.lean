@@ -2650,6 +2650,8 @@ def realizeValue [BEq α] [Hashable α] [TypeName α] [TypeName β] (forConst : 
     fileName := coreCtx.fileName, fileMap := coreCtx.fileMap
     -- heartbeat limits inside `realizeAndReport` should be measured from this point on
     initHeartbeats := (← IO.getNumHeartbeats)
+    -- uses recorded by the realization belong to the command that requested it first
+    cmdIdx? := coreCtx.cmdIdx?
   }
   let res ← env.realizeValue forConst key (realizeAndReport (.mk <$> realize) coreCtx)
   let some res := res.get? RealizeValueResult | unreachable!
@@ -2739,6 +2741,8 @@ def realizeConst (forConst : Name) (constName : Name) (realize : MetaM Unit) :
       fileName := coreCtx.fileName, fileMap := coreCtx.fileMap
       -- heartbeat limits inside `realizeAndReport` should be measured from this point on
       initHeartbeats := (← IO.getNumHeartbeats)
+      -- uses and declarations recorded by the realization belong to the command that requested it first
+      cmdIdx? := coreCtx.cmdIdx?
     }
     let (env, exTask, dyn) ← env.realizeConst forConst constName (realizeAndReport coreCtx)
     -- Realizations cannot be cancelled as their result is shared across elaboration runs

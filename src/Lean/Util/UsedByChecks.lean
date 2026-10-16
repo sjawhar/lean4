@@ -11,16 +11,29 @@ builtin_initialize usageRecordingRef : IO.Ref Bool ← IO.mkRef false
 /-- Constants of every declaration given to `addDecl` in this process, including those elaborated in an
 environment that is then discarded (`example`, `#eval`, `#guard`). -/
 builtin_initialize usedByChecksRef : IO.Ref NameSet ← IO.mkRef {}
-/-- The index of the command currently being elaborated, used by generic recording code that does not run in
-`CoreM`. -/
+/-- The index of the command whose elaboration the frontend is currently running. Async elaboration outlives it:
+recorders read `MonadCommandIdx.getCommandIdx?` first and this ref only outside any command context. -/
 builtin_initialize currentCommandRef : IO.Ref Nat ← IO.mkRef 0
 /-- The declarations and dependencies submitted to `addDecl`, grouped by top-level command. -/
 builtin_initialize declsByCommandRef : IO.Ref (Array (Nat × Array Name × NameSet)) ← IO.mkRef #[]
 /-- Constants whose values were consulted without leaving a reference in the elaborated term. -/
 builtin_initialize usedByCommandRef : IO.Ref (Array (Nat × Name)) ← IO.mkRef #[]
 
-def commandIdx : CoreM Nat :=
-  return (← read).cmdIdx?.getD (← currentCommandRef.get)
+/-- Monads that know the top-level command whose elaboration they run (`Core.Context.cmdIdx?`). -/
+class MonadCommandIdx (m : Type → Type) where
+  getCommandIdx? : m (Option Nat)
+
+instance (m n) [MonadLift m n] [MonadCommandIdx m] : MonadCommandIdx n where
+  getCommandIdx? := liftM (MonadCommandIdx.getCommandIdx? : m _)
+
+instance : MonadCommandIdx CoreM where
+  getCommandIdx? := return (← read).cmdIdx?
+
+/-- The command a recorded use belongs to. -/
+def commandIdx [Monad m] [MonadLiftT IO m] [MonadCommandIdx m] : m Nat := do
+  match ← MonadCommandIdx.getCommandIdx? with
+  | some i => return i
+  | none => (currentCommandRef.get : IO Nat)
 
 def recordUsedByCommand (n : Name) : CoreM Unit := do
   unless ← usageRecordingRef.get do return
