@@ -284,9 +284,10 @@ def runFrontend
     (incrSaveFileName? : Option System.FilePath := none)
     (incrLoadFileName? : Option System.FilePath := none)
     (incrHeaderSaveFileName? : Option System.FilePath := none)
+    (usageFileName? : Option System.FilePath := none)
     : IO (Option Environment) := do
   let startTime := (← IO.monoNanosNow).toFloat / 1000000000
-  if oleanFileName?.isSome then usageRecordingRef.set true
+  if oleanFileName?.isSome && usageFileName?.isSome then usageRecordingRef.set true
   let inputCtx := Parser.mkInputContext input fileName
   -- default `cmdlineSnapshots` to true (not done as default value for API back-compat reasons)
   -- except when full-snapshotting so that enough information for resumption is available
@@ -390,16 +391,18 @@ def runFrontend
 
   let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
   if let some oleanFileName := oleanFileName? then
-    let consts := ModuleUsage.ownConsts env
-    let own := ModuleUsage.localDigests env consts
+    let usage? := usageFileName?.map fun usageFileName =>
+      let consts := ModuleUsage.ownConsts env
+      (usageFileName, consts, ModuleUsage.localDigests env consts)
     profileitIO ".olean serialization" finalOpts do
       let commandLints := collectCommandLints snaps none #[]
       let env ← Linter.recordLints inputCtx.fileMap env commandLints
-      writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts)
-        (ModuleUsage.setLocalDigests env own) oleanFileName
-    let used := ModuleUsage.usedFromInfoTrees trees (← usedByChecksRef.get)
-    ModuleUsage.writeUsage env consts own used (incrLoaded := incrLoadFileName?.isSome)
-      (oleanFileName.withExtension "usage")
+      let env := usage?.elim env fun (_, _, own) => ModuleUsage.setLocalDigests env own
+      writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
+    if let some (usageFileName, consts, own) := usage? then
+      let used := ModuleUsage.usedFromInfoTrees trees (← usedByChecksRef.get)
+      ModuleUsage.writeUsage env consts own used (incrLoaded := incrLoadFileName?.isSome)
+        usageFileName
 
   if let some ileanFileName := ileanFileName? then
     let references := Lean.Server.findModuleRefs inputCtx.fileMap trees (localVars := false)

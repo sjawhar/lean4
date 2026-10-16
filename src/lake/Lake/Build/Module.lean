@@ -1359,12 +1359,15 @@ def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
 
 /--
 Compiles the module. `setup?` is its `ModuleSetup` if the caller already computed it
-(`Module.skipOrBuild`); otherwise it is computed here.
+(`Module.skipOrBuild`); otherwise it is computed here. Only with usage cutoff enabled does Lean
+record usage (`--usage`: digests in the `.olean`, the `.usage`) and Lake write the `.usekey`.
 -/
 def Module.buildLean
   (mod : Module) (presetup : ModulePreSetup) (setup? : Option ModuleSetup := none)
 : JobM ModuleOutputArtifacts := do buildAction (← getTrace) mod.traceFile do
+  let usage ← usageCutoffEnabled
   let args := mod.weakLeanArgs ++ mod.leanArgs
+  let args := if usage then args.push s!"--usage={mod.usageFile}" else args
   let relSrcFile := relPathFrom mod.pkg.dir presetup.srcFile
   let setup ← setup?.getDM (mkModuleSetup mod presetup)
   let outputPaths := mod.mkArtifacts presetup.srcFile presetup.isModule
@@ -1378,7 +1381,7 @@ def Module.buildLean
     error s!"{relSrcFile}: source file was modified during the build; \
       its outputs were discarded (build again to compile the current version)"
   let arts ← mod.computeArtifacts setup.isModule presetup.postponeCompile
-  mod.writeUsekey presetup setup.importArts arts.olean.hash
+  if usage then mod.writeUsekey presetup setup.importArts arts.olean.hash
   return arts
 
 /--

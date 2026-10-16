@@ -16,6 +16,9 @@ printf 'import Test.Rules\nexample : (mk2 : Nat) = 2 := rfl\n' > Test/Ex.lean
 test_run build Test.B Test.C Test.D Test.HU Test.Ex
 test_exp -f .lake/build/lib/lean/Test/B.usage
 test_cmd_out '[["Test","A"],[[["a"],"' cat .lake/build/lib/lean/Test/B.usage
+# `lean -o` records usage only when asked (`--usage`)
+"$LAKE" env lean Test/A.lean -o Test/Direct.olean
+test_exp ! -e Test/Direct.usage
 # `example` (C) reaches `used` through `usedByChecksRef`, `#print axioms` (D) through its `TermInfo`.
 test_cmd_out '[["Test","A"],[[["a"],"' cat .lake/build/lib/lean/Test/C.usage
 test_cmd_out '[["Test","A"],[[["ta"],"' cat .lake/build/lib/lean/Test/D.usage
@@ -78,9 +81,24 @@ test_run build Test.B
 rm .lake/build/lib/lean/Test/B.usekey
 printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 3\n' > Test/A.lean
 test_out "Built Test.B" build Test.B
-# disabled
+# disabled: Lake asks Lean for no usage data, so B has no sidecars and its `.olean` no digests
 printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 4\n' > Test/A.lean
 LAKE_USAGE_CUTOFF=0 test_out "Built Test.B" build Test.B
+test_exp ! -f .lake/build/lib/lean/Test/B.usage
+test_exp ! -f .lake/build/lib/lean/Test/B.usekey
+printf '%s\n' 'import Lean' 'import Test.B' 'open Lean Elab Command' '#eval show CommandElabM Unit from do' \
+  '  logInfo m!"{((← getEnv).getModuleIdx? `Test.B).map (ModuleUsage.state (← getEnv)).hasEntries}"' \
+  > Test/Inspect.lean
+test_cmd_out "some (false)" "$LAKE" env lean Test/Inspect.lean
+# the next cutoff-on build compiles B instead of replaying it, and B has digests again
+printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 4\ndef unrelated4 := 0\n' > Test/A.lean
+test_out "Built Test.B" build -v Test.B
+test_cmd_out "some (true)" "$LAKE" env lean Test/Inspect.lean
+# an import rebuilt with the cutoff off has no `.usage`: a cutoff-on build compiles B instead of replaying it
+printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 4\ndef unrelated4 := 1\n' > Test/A.lean
+LAKE_USAGE_CUTOFF=0 test_run build Test.A
+test_exp ! -f .lake/build/lib/lean/Test/A.usage
+test_out "Built Test.B" build -v Test.B
 # a corrupt key is reported and the module builds normally
 printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 5\n' > Test/A.lean
 rm -f .lake/build/lib/lean/Test/B.usekey
@@ -227,7 +245,7 @@ printf '#include <stdint.h>\nuint32_t ext_val(void *u) { return 2; }\n' > ext/ex
 lake_out -d ext build -v M
 match_text "Replayed M" produced.out
 printf '#include <stdint.h>\nuint32_t ext_val(void *u) { return 1; }\n' > ext/ext.c
-test_run -d ext build M
+LAKE_USAGE_CUTOFF=0 test_run -d ext build M
 printf '#include <stdint.h>\nuint32_t ext_val(void *u) { return 2; }\n' > ext/ext.c
 LAKE_USAGE_CUTOFF=0 lake_out -d ext build -v M
 match_text "Replayed M" produced.out

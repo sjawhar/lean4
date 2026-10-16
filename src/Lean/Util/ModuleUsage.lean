@@ -137,9 +137,9 @@ def refs (env : Environment) (c : ConstantInfo) : Array Name :=
   s.toArray.qsort Name.quickLt
 
 structure State where
-  /-- Per imported module: empty if the module was not written by this extension; otherwise a marker entry at
-  index 0, then the module's digests sorted by name. The marker's own name is never looked up, so no user
-  constant can collide with it. -/
+  /-- Per imported module: empty if its `.olean` carries no digests (written without `lean --usage`, or by a
+  toolchain without this extension); otherwise a marker entry at index 0, then the module's digests sorted by
+  name. The marker's own name is never looked up, so no user constant can collide with it. -/
   importedModuleEntries : Array (Array (Name × Digest)) := #[]
   /-- The current module's digests, if `setLocalDigests` stored them for the `.olean` write. -/
   localDigests? : Option (Array (Name × Digest)) := none
@@ -153,7 +153,7 @@ def State.findAt? (s : State) (i : ModuleIdx) (c : Name) : Option Digest := do
 def State.find? (s : State) (env : Environment) (c : Name) : Option Digest := do
   s.findAt? (← env.getModuleIdxFor? c) c
 
-/-- Whether module `i` was written by this extension (it has the marker entry). -/
+/-- Whether module `i`'s `.olean` carries digests (it has the marker entry). -/
 def State.hasEntries (s : State) (i : ModuleIdx) : Bool :=
   !(s.importedModuleEntries[i.toNat]?.getD #[]).isEmpty
 
@@ -190,8 +190,8 @@ builtin_initialize ext : PersistentEnvExtension (Name × Digest) (Name × Digest
     addEntryFn := fun s _ => s
     -- Private level only: digests cover private constants and unexposed bodies, which must not change the
     -- exported `.olean` of a `module` file. Non-module files are written and read at the private level.
-    exportEntriesFnEx := fun env s =>
-      let es := #[(.anonymous, default)] ++ s.localDigests?.getD (compute env s)
+    exportEntriesFnEx := fun _ s =>
+      let es := s.localDigests?.elim #[] (#[(.anonymous, default)] ++ ·)
       { exported := #[], server := #[], «private» := es }
     asyncMode := .mainOnly
   }
@@ -201,13 +201,13 @@ def state (env : Environment) : State := ext.getState (asyncMode := .mainOnly) e
 def localDigests (env : Environment) (consts := ownConsts env) : Array (Name × Digest) :=
   compute env (state env) consts
 
-/-- Stores `own` (`localDigests env`) for the extension to export, so writing the `.olean` does not compute
-them again. -/
+/-- Stores `own` (`localDigests env`) for the extension to export. Without it, the `.olean` carries no
+digests. -/
 def setLocalDigests (env : Environment) (own : Array (Name × Digest)) : Environment :=
   ext.modifyState (asyncMode := .mainOnly) env ({ · with localDigests? := some own })
 
 /-- Per defining module, sorted: every imported constant that the current module's own constants refer to or
-that is in `extra`, with its digest. Constants without a digest (from a module built without this extension) are
+that is in `extra`, with its digest. Constants without a digest (from a module whose `.olean` carries none) are
 left out. -/
 def moduleUsed (env : Environment) (extra : NameSet) (consts := ownConsts env) :
     Array (Name × Array (Name × Digest)) :=
