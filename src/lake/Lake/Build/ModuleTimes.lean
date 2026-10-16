@@ -329,25 +329,27 @@ def parseModuleTimes (s : String) : Except String ModuleTimeRecord := do
     throw s!"line {topLine}: import index {top}, but there are {rows.size} lines"
   return {contents := s, rows}
 
+/-- Warns that the record at hand is not used: the build starts a new one. -/
+def logIgnoredRecord [MonadLog BaseIO] (why : String) : BaseIO Unit :=
+  logWarning s!"{why}; ignoring it and starting a new record (delete it to silence this warning)"
+
 /--
 Reads the record. A missing file is an empty record. An older Lake's record
 (`legacyModuleTimesFileName`) beside a missing file, or a file that does not parse, is logged as a
 warning naming the file and read as an empty record: the record only orders compiles, so the build
-goes on, and its save starts a new record.
+goes on, and its save starts a new record. A file that cannot be read is an error.
 -/
 @[nospecialize] public def readModuleTimes [logger : MonadLog BaseIO] (path : FilePath) :
     IO ModuleTimeRecord := do
-  let ignore (why : String) : BaseIO Unit :=
-    logWarning s!"{why}; ignoring it and starting a new record (delete it to silence this warning)"
   unless (← path.pathExists) do
     let legacy := path.withFileName legacyModuleTimesFileName
     if ← legacy.pathExists then
-      ignore s!"{legacy}: a module-times record from an older Lake"
+      logIgnoredRecord s!"{legacy}: a module-times record from an older Lake"
     return {}
   match parseModuleTimes (← IO.FS.readFile path) with
   | .ok r => return r
   | .error e =>
-    ignore s!"{path}: {e}"
+    logIgnoredRecord s!"{path}: {e}"
     return {}
 
 /-- The import indices in `s[b, e)` (already checked by `parseModuleTimes`). -/
@@ -376,7 +378,10 @@ public def writeModuleTimesFile (path : FilePath) (contents : String) : IO Unit 
   let tmp := path.addExtension s!"{← IO.Process.getPID}.tmp"
   createParentDirs path
   try
-    IO.FS.writeFile tmp contents
+    IO.FS.withFile tmp .write fun h => do
+      h.putStr contents
+      -- `putStr` is buffered, and closing a handle drops its errors: flush to see a failed write.
+      h.flush
     IO.FS.rename tmp path
   catch e =>
     discard <| (IO.FS.removeFile tmp).toBaseIO
@@ -447,11 +452,20 @@ public structure ModuleTimes where
   /-- Modules whose compile job ran in this build (compiled or up to date), so their sources exist. -/
   seen : IO.Ref (List Name)
 
+/--
+Reads the record at the start of a build. A record that cannot be read (a directory in its place, no
+permission, an I/O error) is logged as a warning naming it, like one that does not parse, and the
+build starts with no priorities.
+-/
 @[nospecialize] public def ModuleTimes.load [logger : MonadLog BaseIO] (path : FilePath) :
     IO ModuleTimes := do
   -- Stamp before reading: a write that lands in between makes the stamp stale, never the record.
-  let stamp? ← moduleTimesStamp? path
-  let file ← readModuleTimes path
+  let (stamp?, file) ← try
+      let stamp? ← moduleTimesStamp? path
+      pure (stamp?, ← readModuleTimes path)
+    catch e =>
+      logIgnoredRecord s!"{path}: {e}"
+      pure (none, ({} : ModuleTimeRecord))
   let mut prios : Std.HashMap Name Task.Priority := Std.HashMap.emptyWithCapacity file.rows.size
   for row in file.rows do
     prios := prios.insert row.name (compilePrio row.rem)
