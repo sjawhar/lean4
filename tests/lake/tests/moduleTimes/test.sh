@@ -63,8 +63,13 @@ has_row Test.Slow
 # A module name with a space, a dot and a percent sign in one component is escaped.
 has_row 'Test.a%20b%2Ec%25d'
 
-# The record survives a removed build directory, and the longest remaining path starts first.
+# The record survives a removed build directory.
 rm -rf .lake/build order.txt
+test_cmd test -f $REC
+# The longest remaining path starts first. Priorities are bands of `log₂` seconds, so the order is
+# checked against a record with fixed numbers rather than measured times: `Test.Slow` at 128 s
+# (priority 7), the other modules ready at the start at 0.
+printf 'lake-module-times 3\n0\t0\tTest.Quick1\t\n0\t0\tTest.Quick2\t\n0\t0\tTest.Quick3\t\n128000\t128000\tTest.Slow\t\n0\t0\tTest.a%%20b%%2Ec%%25d\t\n' > $REC
 LEAN_NUM_THREADS=1 test_run build
 test_cmd_eq "Test.Slow" head -n1 order.txt
 
@@ -168,12 +173,16 @@ no_match_pat "^left: .*\.tmp$" produced.out
 
 # A write whose bytes fail only when the buffer is flushed (a 1 KiB file size limit, with SIGXFSZ
 # ignored so the write returns an error) fails, leaves the old record as it was, and leaves no
-# temporary file behind.
-mkdir -p flushFails
-printf 'lake-module-times 3\n1\t1\tTest.Old\t\n' > flushFails/module-times.tsv
-test_cmd_out "write failed" "$LAKE" env bash -c "ulimit -f 1; trap '' XFSZ; exec lean --run FlushFails.lean"
-match_text "record: lake-module-times 3|1	1	Test.Old	|" produced.out
-no_match_pat "^left: .*\.tmp$" produced.out
+# temporary file behind. Windows has no file size limit to set.
+if [ "$OS" = Windows_NT ]; then
+  echo "skipped: no file size limit on Windows"
+else
+  mkdir -p flushFails
+  printf 'lake-module-times 3\n1\t1\tTest.Old\t\n' > flushFails/module-times.tsv
+  test_cmd_out "write failed" "$LAKE" env bash -c "ulimit -f 1 && trap '' XFSZ && exec lean --run FlushFails.lean"
+  match_text "record: lake-module-times 3|1	1	Test.Old	|" produced.out
+  no_match_pat "^left: .*\.tmp$" produced.out
+fi
 
 # A stale import cycle in the record does not hang or fail the build: the rows of the two modules,
 # which this build does not compile, are kept, and the save computes remaining paths around them.
