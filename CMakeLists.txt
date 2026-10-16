@@ -124,14 +124,11 @@ if(NOT CMAKE_SYSTEM_NAME MATCHES "Emscripten")
       )
     endif()
     set(LEANTAR_ENV)
-    if(CMAKE_SYSTEM_NAME MATCHES "Windows")
-      # The runner's cargo targets MSVC, so the `cc` crate has to find `cl.exe` itself rather than take MSYS2's `CC`.
-      list(APPEND LEANTAR_ENV --unset=CC --unset=CXX)
-    else()
-      # Compile leantar's C dependencies like cadical, e.g. against the bundled sysroot of a standalone build.
-      list(APPEND LEANTAR_ENV "CC=${CMAKE_C_COMPILER}" "CFLAGS=${CMAKE_CXX_FLAGS}")
-    endif()
+    # Compile leantar's C dependencies like cadical, e.g. against the bundled sysroot of a standalone build.
+    set(LEANTAR_CFLAGS "${CMAKE_CXX_FLAGS}")
     if(LEAN_STANDALONE AND CMAKE_SYSTEM_NAME MATCHES "Linux")
+      # The bundled clang's builtin headers are in stage 1's `include/clang`, which leanc adds the same way.
+      string(APPEND LEANTAR_CFLAGS " -isystem ${CMAKE_BINARY_DIR}/stage1/include/clang")
       # Link like leanc does for every other shipped binary: against the bundled glibc in stage 1 and with the default
       # ELF interpreter, not the build host's glibc.
       string(REPLACE "ROOT" "${CMAKE_BINARY_DIR}/stage1" LEANTAR_LDFLAGS "${LEANC_INTERNAL_LINKER_FLAGS}")
@@ -145,6 +142,12 @@ if(NOT CMAKE_SYSTEM_NAME MATCHES "Emscripten")
         "CARGO_TARGET_${LEANTAR_RUST_TARGET}_LINKER=${CMAKE_C_COMPILER}"
         "CARGO_TARGET_${LEANTAR_RUST_TARGET}_RUSTFLAGS=${LEANTAR_RUSTFLAGS}"
       )
+    endif()
+    if(CMAKE_SYSTEM_NAME MATCHES "Windows")
+      # The runner's cargo targets MSVC, so the `cc` crate has to find `cl.exe` itself rather than take MSYS2's `CC`.
+      list(APPEND LEANTAR_ENV --unset=CC --unset=CXX)
+    else()
+      list(APPEND LEANTAR_ENV "CC=${CMAKE_C_COMPILER}" "CFLAGS=${LEANTAR_CFLAGS}")
     endif()
     set(LEANTAR ${CMAKE_BINARY_DIR}/leangz/src/leantar/target/release/leantar${CMAKE_EXECUTABLE_SUFFIX})
     ExternalProject_Add(
