@@ -845,7 +845,7 @@ public def Module.cacheOutputHashes (mod : Module) : IO PUnit := do
 Resolves module outputs' usage-cutoff sidecars. A `.usage` that does not resolve (e.g., pruned from
 the cache) fails, so the entry is a miss: the module rebuilds and writes one again, and its
 dependents keep skipping. A `.usekey` that does not resolve is dropped: the module restores without
-it, and its dependents build normally once.
+it, and its dependents build normally until it is built again (`closureHash`).
 -/
 def ModuleOutputDescrs.resolveSidecars
   (descrs : ModuleOutputDescrs) (service? : Option CacheServiceName) (scope? : Option CacheServiceScope)
@@ -1315,10 +1315,17 @@ def importUsage? (importArts : NameMap ImportArtifacts) (m : Name) :
 
 /--
 A digest of the recorded `closure` digest of each direct workspace import, with its name, or `none`
-if one has no `.usage`. A module's closure is its direct imports plus their closures; a direct
-toolchain import is pinned by the source text and the Lean githash (local trace). A module is
-replayed only if this digest is unchanged, so every workspace module's recorded closure digest
-stays equal to its current closure, and this digest covers the importer's whole closure.
+if one has no `.usage` or no `.usekey`. A module's closure is its direct imports plus their
+closures; a direct toolchain import is pinned by the source text and the Lean githash (local
+trace). A module is replayed only if this digest is unchanged, so every workspace module's recorded
+closure digest stays equal to its current closure, and this digest covers the importer's whole
+closure.
+
+An import has a `.usekey` only if the same held for its own direct imports when it was built, so
+every workspace module in the closure has a `.usage` and digests in its `.olean` (`lean --usage`
+writes both). An importer's `.usage` records only constants that have digests: without this, a
+module whose closure has a module built with the cutoff off would be replayed without checking
+what it uses from that module.
 -/
 def closureHash (presetup : ModulePreSetup) (importArts : NameMap ImportArtifacts) :
     JobM (Option ModuleUsage.Digest) := do
@@ -1326,7 +1333,8 @@ def closureHash (presetup : ModulePreSetup) (importArts : NameMap ImportArtifact
     |>.qsort Name.quickLt |>.toList.eraseDups
   let mut e := ({} : ModuleUsage.Enc).nat mods.length
   for m in mods do
-    let some (_, imp) ← importUsage? importArts m | return none
+    let some (olean, imp) ← importUsage? importArts m | return none
+    if (← readUsageSidecar UsekeySidecar (olean.withExtension "usekey")).isNone then return none
     e := e.name m |>.digest imp.closure
   return some e.finish
 
@@ -1334,8 +1342,8 @@ def closureHash (presetup : ModulePreSetup) (importArts : NameMap ImportArtifact
 Writes the module's `.usekey` from the `.usage` Lean just wrote: the module's local trace hash, the
 hash of its `.olean` (`oleanHash`), the `modsysHash` of its closure, the `closureHash` of its
 direct imports and, for each workspace `extra` module, the hash of its `.olean` and its current
-`moduleDigest`. Writes nothing if the `.usage`, a direct import's `.usage` or a workspace `extra`
-module's `.usage` is missing, so the module is never skipped.
+`moduleDigest`. Writes nothing if the `.usage`, a direct import's `.usage` or `.usekey`, or a
+workspace `extra` module's `.usage` is missing, so the module is never skipped.
 -/
 def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     (importArts : NameMap ImportArtifacts) (oleanHash : Hash) : JobM Unit := do
