@@ -11,4 +11,5 @@ def a := 1
 example : Nat.succ 0 = 1 := rfl
 #eval show CommandElabM Unit from do
   let env ← getEnv
-  logInfo m!"{(← usedByChecksRef.get).contains ``Nat.succ} {(ModuleUsage.moduleUsed env {}).isEmpty}"
+  let noneUsed : Bool := match ModuleUsage.moduleUsed env {} with | .ok used => used.isEmpty | .error _ => false
+  logInfo m!"{(← usedByChecksRef.get).contains ``Nat.succ} {noneUsed}"

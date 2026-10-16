@@ -302,18 +302,35 @@ def stmtState (env : Environment) : StmtState := stmtExt.getState (asyncMode := 
 def setLocalStmt (env : Environment) (stmt : Array (Name × Digest × Digest)) : Environment :=
   stmtExt.modifyState (asyncMode := .mainOnly) env ({ · with localStmt? := some stmt })
 
-/-- Per defining module, sorted: every imported constant that the current module's own constants refer to or
-that is in `extra`, with its digest. Constants without a digest (from a module built without this extension) are
-left out. -/
-def moduleUsed (env : Environment) (extra : NameSet) (consts := ownConsts env) :
-    Array (Name × Array (Name × Digest)) :=
+/-- `(full, statement core, attrs)` digests of `c`, a constant of imported module `i`. `none` when `i` carries no
+usage digests for this import: a module compiled without these extensions (stage 0 compiles the stage-1
+toolchain's own `Init`, `Std` and `Lean`; Lake pins those by the Lean githash in the module's trace) or a
+`module` imported without its private level (Lake compares those through `modsysHash`). A module that carries
+digests has both for each of its constants, so a missing one is an error. -/
+def importedDigests? (env : Environment) (i : ModuleIdx) (c : Name) :
+    Except String (Option (Digest × Digest × Digest)) := do
   let s := state env
+  unless s.hasEntries i do return none
+  let mod := env.header.modules[i.toNat]!.module
+  let some full := s.findAt? i c |
+    throw s!"usage: `{c}` from `{mod}` has no full digest in that module's usage entries"
+  let some (core, attrs) := (stmtState env).findAt? i c |
+    throw s!"usage: `{c}` from `{mod}` has no statement digest in that module's usage entries"
+  return some (full, core, attrs)
+
+/-- Per defining module, sorted: every imported constant that the current module's own constants refer to or
+that is in `extra`, with its full and attrs digests. Constants of a module without digests are left out
+(`importedDigests?`). -/
+def moduleUsed (env : Environment) (extra : NameSet) (consts := ownConsts env) :
+    Except String (Array (Name × Array (Name × Digest × Digest))) := do
   let used := consts.foldl (init := extra) fun u (_, _, rs) => rs.foldl (·.insert ·) u
-  let byMod := used.foldl (init := (∅ : Std.HashMap Name (Array (Name × Digest)))) fun m c => Id.run do
-    let some i := env.getModuleIdxFor? c | return m
-    let some d := s.findAt? i c | return m
-    m.alter env.header.modules[i.toNat]!.module fun o => some ((o.getD #[]).push (c, d))
-  byMod.toArray.map (fun (k, v) => (k, v.qsort fun a b => Name.quickLt a.1 b.1))
+  let mut byMod : Std.HashMap Name (Array (Name × Digest × Digest)) := {}
+  for c in used do
+    -- the current module's constants are in `own`
+    let some i := env.getModuleIdxFor? c | continue
+    let some (d, _, attrs) ← importedDigests? env i c | continue
+    byMod := byMod.alter env.header.modules[i.toNat]!.module fun o => some ((o.getD #[]).push (c, d, attrs))
+  return byMod.toArray.map (fun (k, v) => (k, v.qsort fun a b => Name.quickLt a.1 b.1))
     |>.qsort fun a b => Name.quickLt a.1 b.1
 
 /-- A name as the JSON array of its components, root first: each a string or a number. Unlike `toJson Name`
@@ -607,6 +624,16 @@ def isAuxName (env : Environment) (n : Name) : Bool :=
     s.contains "._auxLemma" || s.contains "._proof_" || s.contains "._eq_" ||
     s.endsWith "._sunfold" || s.endsWith "._native"
 
+/-- The constants the transient declaration `n` stands for: what it used, each transient declaration among
+those replaced in turn. -/
+private partial def transientDeps (transient : Std.HashMap Name NameSet) (seen out : NameSet) :
+    List Name → NameSet
+  | [] => out
+  | c :: cs =>
+    if seen.contains c then transientDeps transient seen out cs
+    else match transient[c]? with
+      | some ds => transientDeps transient (seen.insert c) out (ds.toList ++ cs)
+      | none => transientDeps transient (seen.insert c) (out.insert c) cs
 
 def commandRecords (env : Environment) (own : Array (Name × Digest))
     (stmt : Array (Name × Digest × Digest)) (payloads : Array CommandEntries) :
@@ -619,9 +646,22 @@ def commandRecords (env : Environment) (own : Array (Name × Digest))
   let stmtLocal : Std.HashMap Name (Digest × Digest) :=
     stmt.foldl (fun m (n, d, a) => m.insert n (d, a)) {}
   let fs := state env
-  let ss := stmtState env
-  let fullOf n := fullLocal[n]? <|> fs.find? env n
-  let stmtOf n := stmtLocal[n]? <|> ss.find? env n
+  -- A declaration this module elaborated in an environment it then discarded (`example`, `#eval`, or a
+  -- realization first requested inside one) has no digest; a use of it stands for the uses of what it used.
+  let transient : Std.HashMap Name NameSet := declEntries.foldl (init := {}) fun m (_, ns, used) =>
+    ns.foldl (init := m) fun m n =>
+      if env.contains n then m else m.insert n (used.foldl (·.insert ·) (m.getD n {}))
+  let digestsOf (i : Nat) (n : Name) : Except String (Option (Digest × Digest × Digest)) := do
+    if let some m := env.getModuleIdxFor? n then
+      return ← importedDigests? env m n
+    let some full := fullLocal[n]? | throw <| if env.contains n then
+        s!"usage: command {i} uses `{n}`, a constant of this module without a full digest"
+      else
+        s!"usage: command {i} uses `{n}`, which is neither imported, a constant of this module, nor a \
+          declaration this module elaborated"
+    let some (core, attrs) := stmtLocal[n]? |
+      throw s!"usage: command {i} uses `{n}`, a constant of this module without a statement digest"
+    return some (full, core, attrs)
   let mut occurrences : Std.HashMap (Name × Digest) Nat := {}
   let payloadByIdx : Std.HashMap Nat CommandEntries :=
     payloads.foldl (fun m p => m.insert p.idx p) {}
@@ -659,17 +699,24 @@ def commandRecords (env : Environment) (own : Array (Name × Digest))
     for n in refsSet do
       if let some ci := env.find? n then
         if !isStmtOnly ci then full := full.insert n
-    let used := refsSet.foldl (·.insert ·) full
-    let used := added.foldl (fun s n => s.erase n) used
-    let usesFull := (used.toArray.filterMap fun n => do
-      guard (full.contains n)
-      let d ← fullOf n
-      let (_, a) ← stmtOf n
-      return (n, d, a)).qsort fun a b => Name.quickLt a.1 b.1
-    let usesStmt := (used.toArray.filterMap fun n => do
-      guard (!full.contains n)
-      let (d, _) ← stmtOf n
-      return (n, d)).qsort fun a b => Name.quickLt a.1 b.1
+    -- a transient declaration's uses count as full: it may have been evaluated
+    let mut usedAll : NameSet := {}
+    for n in refsSet.foldl (·.insert ·) full do
+      if transient.contains n then
+        for d in transientDeps transient {} {} [n] do
+          usedAll := usedAll.insert d
+          full := full.insert d
+      else
+        usedAll := usedAll.insert n
+    let used := added.foldl (fun s n => s.erase n) usedAll
+    let mut fullUses := #[]
+    let mut stmtUses := #[]
+    for n in used do
+      let some (d, core, attrs) ← IO.ofExcept (digestsOf obs.i n) | continue
+      if full.contains n then fullUses := fullUses.push (n, d, attrs)
+      else stmtUses := stmtUses.push (n, core)
+    let usesFull := fullUses.qsort fun a b => Name.quickLt a.1 b.1
+    let usesStmt := stmtUses.qsort fun a b => Name.quickLt a.1 b.1
     let text := textDigest obs.stx
     let kind := obs.stx.getKind
     let key ← if !decls.isEmpty then
@@ -734,31 +781,28 @@ def usageVersion : Nat := 4
 uses of the environment and of `extraModUsesByChecksRef` (those of commands whose environment was discarded). With
 `incrLoaded` (the run reused commands from an `--incr-load` snapshot), `noskip` is set: reused commands never call
 `addDecl` in this process, so `extra` may miss constants they used. `usedAttrs` holds, beside each `used` entry,
-the attrs digest the defining module recorded for it in `stmt`. -/
+the attrs digest the defining module recorded for it in `stmt`; `moduleUsed` fails on a constant missing either. -/
 def writeUsage (env : Environment) (consts : Array (Name × ConstantInfo × Array Name))
     (own : Array (Name × Digest)) (stmt : Array (Name × Digest × Digest)) (extra : NameSet)
     (commands : Array CommandRecord) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
   let noskip := incrLoaded || consts.any fun (_, _, rs) => rs.any
     (· matches ``Lean.reduceBool | ``Lean.reduceNat | ``Lean.ofReduceBool | ``Lean.ofReduceNat)
   let s := state env
-  let ss := stmtState env
   let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecksRef.get)
   let extraMods := allExtra.toArray.filter (fun u => (env.getModuleIdx? u.module).any s.hasEntries)
     |>.qsort fun a b => let k (u : ExtraModUse) := 2 * u.isExported.toNat + u.isMeta.toNat
       Name.quickLt a.module b.module || (a.module == b.module && k a < k b)
   let pair (n : Name) (d : Digest) := Json.arr #[nameToJson n, toJson d]
   let moduleDigest := (own.foldl (fun e (n, d) => e.name n |>.digest d) (({} : Enc).nat own.size)).finish
-  let used := moduleUsed env extra consts
-  let usedAttrs : Array (Name × Array (Name × Digest)) := used.map fun (m, cs) =>
-    (m, cs.filterMap fun (n, _) => (ss.find? env n).map (n, ·.2))
+  let used ← IO.ofExcept (moduleUsed env extra consts)
   let j := Json.mkObj [("version", usageVersion), ("noskip", noskip),
     ("moduleDigest", toJson moduleDigest),
     ("closure", toJson (closureDigest env)),
     ("own", Json.arr (own.map fun (n, d) => pair n d)),
     ("used", Json.arr (used.map fun (m, cs) =>
-      Json.arr #[nameToJson m, Json.arr (cs.map fun (n, d) => pair n d)])),
-    ("usedAttrs", Json.arr (usedAttrs.map fun (m, cs) =>
-      Json.arr #[nameToJson m, Json.arr (cs.map fun (n, d) => pair n d)])),
+      Json.arr #[nameToJson m, Json.arr (cs.map fun (n, d, _) => pair n d)])),
+    ("usedAttrs", Json.arr (used.map fun (m, cs) =>
+      Json.arr #[nameToJson m, Json.arr (cs.map fun (n, _, a) => pair n a)])),
     ("extra", Json.arr (extraMods.map fun u => Json.arr #[nameToJson u.module, u.isMeta])),
     ("stmt", Json.arr (stmt.map fun (n, c, a) => Json.arr #[nameToJson n, toJson c, toJson a])),
     ("commands", Json.arr (commands.map toJson))]
