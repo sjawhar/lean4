@@ -127,8 +127,15 @@ if(NOT CMAKE_SYSTEM_NAME MATCHES "Emscripten")
     # Compile leantar's C dependencies like cadical, e.g. against the bundled sysroot of a standalone build.
     set(LEANTAR_CFLAGS "${CMAKE_CXX_FLAGS}")
     if(LEAN_STANDALONE AND CMAKE_SYSTEM_NAME MATCHES "Linux")
-      # The bundled clang's builtin headers are in stage 1's `include/clang`, which leanc adds the same way.
-      string(APPEND LEANTAR_CFLAGS " -isystem ${CMAKE_BINARY_DIR}/stage1/include/clang")
+      # Stage 1 carries only some of the bundled clang's builtin headers; zstd also needs the intrinsics headers, which
+      # the resource directory of CMAKE_CXX_COMPILER, from the same LLVM, has.
+      execute_process(
+        COMMAND ${CMAKE_CXX_COMPILER} -print-resource-dir
+        OUTPUT_VARIABLE LEANTAR_RESOURCE_DIR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        COMMAND_ERROR_IS_FATAL ANY
+      )
+      string(APPEND LEANTAR_CFLAGS " -resource-dir ${LEANTAR_RESOURCE_DIR}")
       # Link like leanc does for every other shipped binary: against the bundled glibc in stage 1 and with the default
       # ELF interpreter, not the build host's glibc.
       string(REPLACE "ROOT" "${CMAKE_BINARY_DIR}/stage1" LEANTAR_LDFLAGS "${LEANC_INTERNAL_LINKER_FLAGS}")
