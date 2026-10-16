@@ -1386,10 +1386,11 @@ where
   -- Unpacks the module's own `.ltar` (stamped with `inputHash`) into the build directory and
   -- returns whether it did. The archive carries its own trace, which vouches only for the archive,
   -- so it must still have the hash recorded when it was packed; if it does not, or none is
-  -- recorded, it is removed instead (the caller then rebuilds). The old trace is removed first:
-  -- leantar skips members that already exist when the trace's input hash matches, so it would keep
-  -- outputs that are not the archive's. If the unpack fails, the module's outputs, their `.hash`
-  -- files and its trace are removed, so that a retry cannot replay a partial result.
+  -- recorded, it is removed instead (the caller then rebuilds). The old trace and outputs (but not
+  -- the archive) are removed first: leantar skips members that already exist when the trace's
+  -- input hash matches, and an unpack that is killed must not leave outputs that are not the
+  -- archive's next to its trace. If the unpack fails, the module's outputs, their `.hash` files and
+  -- its trace are removed, so that a retry cannot replay a partial result.
   unpackLocalLtar (inputHash : Hash) : JobM Bool := do
     let expected? ← Hash.load? (mod.ltarFile.toString ++ ".hash")
     unless expected? == some (← computeFileHash mod.ltarFile) do
@@ -1398,6 +1399,10 @@ where
       clearFileHash mod.ltarFile
       return false
     removeFileIfExists mod.traceFile
+    for file in #[mod.oleanFile, mod.oleanServerFile, mod.oleanPrivateFile, mod.ileanFile,
+        mod.irSigFile, mod.irFile, mod.cFile, mod.bcFile] do
+      removeFileIfExists file
+      clearFileHash file
     try mod.unpackLtar mod.ltarFile inputHash catch e =>
       mod.clearOutputArtifacts
       mod.clearOutputHashes
