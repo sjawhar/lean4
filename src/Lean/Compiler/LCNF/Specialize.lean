@@ -17,32 +17,52 @@ import Init.Omega
 namespace Lean.Compiler.LCNF
 namespace Specialize
 
-public abbrev Cache := SMap Expr Name
+/--
+Specialization keys mapped to the names of their specialized declarations; the imported part is
+built on first lookup.
+-/
+structure Cache where
+  imported : Thunk (Std.HashMap Expr Name) := .pure {}
+  current : PHashMap Expr Name := {}
+  deriving Inhabited
 
 public structure CacheEntry where
   key : Expr
   declName : Name
   deriving Inhabited
 
-public def addEntry (cache : Cache) (e : CacheEntry) : Cache :=
-  cache.insert e.key e.declName
+def addEntry (cache : Cache) (e : CacheEntry) : Cache :=
+  { cache with current := cache.current.insert e.key e.declName }
+
+def Cache.find? (cache : Cache) (key : Expr) : Option Name :=
+  (cache.current.find? key).orElse fun _ => cache.imported.get[key]?
 
 builtin_initialize specCacheExt : SimplePersistentEnvExtension CacheEntry Cache ←
   registerSimplePersistentEnvExtension {
     addEntryFn    := addEntry
-    addImportedFn := fun es => (mkStateFromImportedEntries addEntry {} es).switch
+    addImportedFn := fun es => {
+      imported := Thunk.mk fun _ => mkStateFromImportedEntries (fun m e => m.insert e.key e.declName) {} es
+    }
     exportEntriesFnEx? := some fun _ _ entries =>
       { exported := #[], server := #[], «private» := entries.toArray }
     asyncMode     := .sync
     replay?       := some <| SimplePersistentEnvExtension.replayOfFilter
-      (!·.contains ·.key) addEntry
+      (·.find? ·.key |>.isNone) addEntry
   }
 
 public def cacheSpec (key : Expr) (declName : Name) : CoreM Unit :=
   modifyEnv fun env => specCacheExt.addEntry env { key, declName }
 
-public def findSpecCache? (key : Expr) : CoreM (Option Name) :=
-  return specCacheExt.getState (← getEnv) |>.find? key
+public def findSpecCache? (key : Expr) : CoreM (Option Name) := do
+  let cache := specCacheExt.getState (← getEnv)
+  if let some declName := cache.current.find? key then
+    return some declName
+  -- Building the imported map is not charged to the caller's heartbeats. It is forced in an IO step
+  -- so that the compiler cannot move it past the restore.
+  let heartbeats ← IO.getNumHeartbeats
+  let imported ← IO.lazyPure fun _ => cache.imported.get
+  IO.setNumHeartbeats heartbeats
+  return imported[key]?
 
 structure Context where
   /--
