@@ -713,6 +713,7 @@ def Module.recFetchPreSetup (mod : Module) : FetchM (Job ModulePreSetup) := ensu
       trace := ← getTrace
       srcFile := input.path
       srcMTime := input.trace.mtime
+      srcHash := input.trace.hash
       isModule := input.header.isModule
       directImports := input.imports
       directImportArts := info.directArts
@@ -1230,8 +1231,11 @@ def Module.buildLean
   mod.clearOutputHashes
   compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile arts args
     (← getLeanPath) (← getLean)
-  -- The input hash covers the source as `recFetchInput` read it, but `lean` reads it again.
-  if (← getMTime presetup.srcFile) != presetup.srcMTime then
+  -- The input hash covers the source as `recFetchInput` read it, but `lean` reads it again. A
+  -- rewrite can keep the modification time (`cp -p`, `rsync -a`, or a read part-way through
+  -- one in-place `write`), so compare the contents too.
+  if (← getMTime presetup.srcFile) != presetup.srcMTime ||
+      Hash.ofText (← IO.FS.readFile presetup.srcFile) != presetup.srcHash then
     mod.clearOutputArtifacts
     error s!"{relSrcFile}: source file was modified during the build; \
       its outputs were discarded (build again to compile the current version)"
