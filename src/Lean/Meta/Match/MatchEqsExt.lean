@@ -29,11 +29,16 @@ structure MatchEqnsExtState where
   deriving Inhabited
 
 /- We generate the equations and splitter on demand, and do not save them on .olean files. -/
-builtin_initialize matchEqnsExt : EnvExtension MatchEqnsExtState ←
+builtin_initialize matchEqnsExt : EnvExtension MatchEqnsExtState ← do
   -- Using `local` allows us to use the extension in `realizeConst` without specifying `replay?`.
-  -- The resulting state can still be accessed on the generated declarations using `.asyncEnv`;
-  -- see below
-  registerEnvExtension (pure {}) (asyncMode := .local)
+  -- The resulting state can still be accessed on the generated declarations using `.asyncEnv`.
+  let ext ← registerEnvExtension (pure {}) (asyncMode := .local)
+  registerCommandCacheExtension `Lean.Meta.Match.matchEqnsExt ext
+    (fun before after => after.map.toList.toArray.filter fun (k, _) => !before.map.contains k)
+    (fun state (name, eqns) => {
+      map := state.map.insert name eqns
+      eqns := eqns.eqnNames.foldl (init := state.eqns) fun s n => s.insert n
+    })
 
 def registerMatchEqns (matchDeclName : Name) (matchEqns : MatchEqns) : CoreM Unit := do
   modifyEnv fun env => matchEqnsExt.modifyState env fun { map, eqns } => {

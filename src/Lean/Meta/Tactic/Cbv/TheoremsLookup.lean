@@ -36,8 +36,30 @@ public structure CbvTheoremsLookupState where
   matchTheorems : PHashMap Name Theorems := {}
   deriving Inhabited
 
-builtin_initialize cbvTheoremsLookup : EnvExtension CbvTheoremsLookupState ←
-  registerEnvExtension (pure {}) (asyncMode := .local)
+private inductive CbvTheoremsCacheEntry where
+  | eqn (name : Name) (theorems : Theorems)
+  | unfold (name : Name) (thm : Theorem)
+  | match (name : Name) (theorems : Theorems)
+
+builtin_initialize cbvTheoremsLookup : EnvExtension CbvTheoremsLookupState ← do
+  let ext ← registerEnvExtension (pure {}) (asyncMode := .local)
+  registerCommandCacheExtension `Lean.Meta.Tactic.Cbv.cbvTheoremsLookup ext
+    (fun before after => Id.run do
+      let mut entries : Array CbvTheoremsCacheEntry := #[]
+      for (n, v) in after.eqnTheorems do
+        unless before.eqnTheorems.contains n do entries := entries.push (.eqn n v)
+      for (n, v) in after.unfoldTheorems do
+        unless before.unfoldTheorems.contains n do entries := entries.push (.unfold n v)
+      for (n, v) in after.matchTheorems do
+        unless before.matchTheorems.contains n do entries := entries.push (.match n v)
+      return entries)
+    (fun state entry => match entry with
+      | CbvTheoremsCacheEntry.eqn n v =>
+        { state with eqnTheorems := state.eqnTheorems.insert n v }
+      | CbvTheoremsCacheEntry.unfold n v =>
+        { state with unfoldTheorems := state.unfoldTheorems.insert n v }
+      | CbvTheoremsCacheEntry.match n v =>
+        { state with matchTheorems := state.matchTheorems.insert n v })
 
 public def getEqnTheorems (fnName : Name) : MetaM Theorems := do
   let env ← getEnv

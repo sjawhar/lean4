@@ -111,8 +111,12 @@ def mkDeclExt (phase : Phase) (name : Name := by exact decl_name%) :
 
 builtin_initialize baseExt : DeclExt .pure ← mkDeclExt .base
 builtin_initialize monoExt : DeclExt .pure ← mkDeclExt .mono
-builtin_initialize impureExt : EnvExtension (DeclExtState .impure) ←
-  registerEnvExtension (mkInitial := pure {}) (asyncMode := .sync) (replay? := some (replayFn .impure))
+builtin_initialize impureExt : EnvExtension (DeclExtState .impure) ← do
+  let ext ← registerEnvExtension (mkInitial := pure {}) (asyncMode := .sync)
+    (replay? := some (replayFn .impure))
+  registerCommandCacheExtension `Lean.Compiler.LCNF.impureExt ext
+    (fun before after => after.toList.toArray.filter fun (n, _) => !before.contains n)
+    (fun state (n, decl) => state.insert n decl)
 
 
 abbrev SigExtState (pu : Purity) := AbstractDeclExtState pu Signature
@@ -223,7 +227,11 @@ def getLocalDecl? (declName : Name) : CompilerM (Option ((pu : Purity) × Decl p
   let some decl ← getLocalDeclAt? declName (← getPhase) | return none
   return some ⟨_, decl⟩
 
-builtin_initialize declOrderExt : EnvExtension (List Name × NameSet) ← mkOrderedDeclSetExt
+builtin_initialize declOrderExt : EnvExtension (List Name × NameSet) ← do
+  let ext ← mkOrderedDeclSetExt
+  registerCommandCacheExtension `Lean.Compiler.LCNF.declOrderExt ext
+    (fun before after => (after.1.take (after.1.length - before.1.length)).reverse.toArray)
+    (fun state n => (n :: state.1, state.2.insert n))
 
 def recordFinalImpureDecl (env : Environment) (name : Name) : Environment :=
   declOrderExt.modifyState env fun s =>

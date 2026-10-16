@@ -17,7 +17,8 @@ State for the environment extension used to save the LCNF base phase type for de
 that do not have code associated with them.
 Example: constructors, inductive types, foreign functions.
 -/
-builtin_initialize baseTypeExt : CacheExtension Name Expr ← CacheExtension.register
+builtin_initialize baseTypeExt : CacheExtension Name Expr ←
+  CacheExtension.register `Lean.Compiler.LCNF.baseTypeExt
 
 def getOtherDeclBaseType (declName : Name) (us : List Level) : CoreM Expr := do
   let info ← getConstInfo declName

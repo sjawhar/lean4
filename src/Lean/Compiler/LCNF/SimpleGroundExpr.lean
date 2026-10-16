@@ -86,14 +86,19 @@ public structure SimpleGroundExtState where
   revNames : List Name := []
   deriving Inhabited
 
-builtin_initialize simpleGroundDeclExt : EnvExtension SimpleGroundExtState ←
-  registerEnvExtension (pure {}) (asyncMode := .sync)
+builtin_initialize simpleGroundDeclExt : EnvExtension SimpleGroundExtState ← do
+  let ext ← registerEnvExtension (pure {}) (asyncMode := .sync)
     (replay? := some fun oldState newState _ s =>
       let newNames := newState.revNames.take (newState.revNames.length - oldState.revNames.length)
       newNames.foldl (init := s) fun s n =>
         let g := newState.constNames.find! n
-        { s with constNames := s.constNames.insert n g, revNames := n :: s.revNames }
-    )
+        { s with constNames := s.constNames.insert n g, revNames := n :: s.revNames })
+  registerCommandCacheExtension `Lean.Compiler.LCNF.simpleGroundDeclExt ext
+    (fun before after =>
+      let added := after.revNames.take (after.revNames.length - before.revNames.length)
+      added.reverse.toArray.map fun n => (n, after.constNames.find! n))
+    (fun state (n, value) =>
+      { constNames := state.constNames.insert n value, revNames := n :: state.revNames })
 
 /--
 Record `declName` as mapping to the simple ground expr `expr`.

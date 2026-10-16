@@ -109,13 +109,6 @@ private unsafe def eraseEnvExtensionEntryImpl (b : β) : EnvExtensionEntry := un
 @[implemented_by eraseEnvExtensionEntryImpl]
 opaque eraseEnvExtensionEntry (b : β) : EnvExtensionEntry
 
-private unsafe def envExtensionStateOfEntryImpl (entry : EnvExtensionEntry) : EnvExtensionState :=
-  unsafeCast entry
-
-/-- Restores a type-erased environment state stored in a command payload. -/
-@[implemented_by envExtensionStateOfEntryImpl]
-opaque envExtensionStateOfEntry (entry : EnvExtensionEntry) : EnvExtensionState
-
 /-- Content of a .olean file.
    We use `compact.cpp` to generate the image of this object in disk. -/
 structure ModuleData where
@@ -1451,18 +1444,6 @@ different environment branches are reconciled.
 -/
 def setState {σ : Type} (ext : EnvExtension σ) (env : Environment) (s : σ) (asyncMode := ext.asyncMode) : Environment :=
   inline <| modifyState (asyncMode := asyncMode) ext env fun _ => s
-/-- Restores one type-erased extension state using the extension's storage mode. Async extension state is
-restored to the joined synchronous state because a command payload has no live async branch. -/
-def restoreStateAt (env : Environment) (idx : Nat) (state : EnvExtensionState) : IO Environment := do
-  let exts ← envExtensionsRef.get
-  if h : idx < exts.size then
-    let ext := exts[idx]
-    let mode := match ext.asyncMode with
-      | .async _ => .sync
-      | mode => mode
-    return ext.setState env state (asyncMode := mode)
-  else
-    throw <| IO.userError s!"unknown environment extension index {idx}"
 
 -- `unsafe` fails to infer `Nonempty` here
 private unsafe def getStateUnsafe {σ : Type} [Inhabited σ] (ext : EnvExtension σ)
@@ -1530,15 +1511,6 @@ only for important optimizations.
 opaque getState {σ : Type} [Inhabited σ] (ext : EnvExtension σ) (env : Environment)
   (asyncMode := ext.asyncMode) (asyncDecl : Name := .anonymous) : σ
 
-/-- Captures every extension's current state, using the joined state for asynchronous extensions. -/
-def snapshotStates (env : Environment) : IO (Array EnvExtensionState) := do
-  let exts ← envExtensionsRef.get
-  return exts.map fun ext =>
-    let mode := match ext.asyncMode with
-      | .async _ => .sync
-      | mode => mode
-    ext.getState env (asyncMode := mode)
-
 end EnvExtension
 
 /-- Environment extensions can only be registered during initialization.
@@ -1559,6 +1531,45 @@ def registerEnvExtension {σ : Type} (mkInitial : IO σ)
   -- safety: `EnvExtensionState` is opaque, so we can upcast to it
   EnvExtension.envExtensionsRef.modify fun exts => exts.push (unsafe unsafeCast ext)
   pure ext
+
+/-- A non-persistent environment extension that caches results across commands, with the typed functions
+that let a command's additions be recorded and replayed. `name` identifies the cache across processes;
+entries are erased from the cache's own entry type only after `delta` computed them. -/
+structure CommandCacheExtension where
+  name : Name
+  /-- The entries the second environment's cache has beyond the first's. -/
+  delta : Environment → Environment → Array EnvExtensionEntry
+  /-- Inserts entries `delta` produced into the cache. -/
+  replay : Environment → Array EnvExtensionEntry → Environment
+  /-- The second environment with its cache state replaced by the first's. -/
+  copyState : Environment → Environment → Environment
+
+builtin_initialize commandCacheExtensionsRef : IO.Ref (Array CommandCacheExtension) ← IO.mkRef #[]
+
+private unsafe def registerCommandCacheExtensionUnsafe [Inhabited σ] (name : Name)
+    (ext : EnvExtension σ) (delta : σ → σ → Array α) (insert : σ → α → σ) : IO (EnvExtension σ) := do
+  if (← commandCacheExtensionsRef.get).any (·.name == name) then
+    throw (IO.userError s!"invalid command cache extension, '{name}' has already been used")
+  let mode := match ext.asyncMode with
+    | .async _ => .sync
+    | mode => mode
+  commandCacheExtensionsRef.modify (·.push {
+    name
+    delta := fun before after =>
+      (delta (ext.getState before (asyncMode := mode)) (ext.getState after (asyncMode := mode))).map
+        eraseEnvExtensionEntry
+    replay := fun env entries =>
+      ext.modifyState env (asyncMode := mode) fun s => entries.foldl (fun s e => insert s (unsafeCast e)) s
+    copyState := fun source target =>
+      ext.setState target (ext.getState source (asyncMode := mode)) (asyncMode := mode)
+  })
+  return ext
+
+/-- Registers `ext` as a cache whose per-command additions (`delta before after`) are recorded with the
+command and re-inserted (`insert`) when the command is replayed. -/
+@[implemented_by registerCommandCacheExtensionUnsafe]
+opaque registerCommandCacheExtension [Inhabited σ] (name : Name) (ext : EnvExtension σ)
+    (delta : σ → σ → Array α) (insert : σ → α → σ) : IO (EnvExtension σ)
 
 private def mkInitialExtensionStates : IO (Array EnvExtensionState) := EnvExtension.mkInitialExtStates
 
@@ -2924,8 +2935,11 @@ def mkThmOrUnsafeDef [Monad m] [MonadEnv m] (thm : TheoremVal) : m Declaration :
 This is consulted for all definitions regardless of their reducibility hints. Currently used by
 structural recursion to ensure that parent definitions get the correct height even though the
 `_f` helper definitions are marked as `.abbrev` (which `getMaxHeight` would otherwise ignore). -/
-builtin_initialize defHeightOverrideExt : EnvExtension (NameMap UInt32) ←
-  registerEnvExtension (pure {}) (asyncMode := .local)
+builtin_initialize defHeightOverrideExt : EnvExtension (NameMap UInt32) ← do
+  let ext ← registerEnvExtension (pure {}) (asyncMode := .local)
+  registerCommandCacheExtension `Lean.defHeightOverrideExt ext
+    (fun before after => after.toArray.filter fun (n, _) => !before.contains n)
+    (fun state (n, h) => state.insert n h)
 
 /-- Register a height override for a definition so that `getMaxHeight` uses it. -/
 def setDefHeightOverride (env : Environment) (declName : Name) (height : UInt32) : Environment :=

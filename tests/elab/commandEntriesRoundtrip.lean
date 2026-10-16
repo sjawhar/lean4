@@ -29,6 +29,21 @@ def sameParse (expected actual : Environment) (input : String) : Bool :=
   | .error a, .error b => a == b
   | _, _ => false
 
+/-- `target` with the state of every extension a command payload replays (persistent and scoped extensions,
+registered command caches, the local-entry log) taken from `source`. -/
+def withReplayStateOf (source target : Environment) : IO Environment := do
+  let mut target := target
+  for ext in ← persistentEnvExtensionsRef.get do
+    let mode := match ext.toEnvExtension.asyncMode with
+      | .async _ => .sync
+      | mode => mode
+    target := ext.toEnvExtension.setState target (ext.toEnvExtension.getState source (asyncMode := mode))
+      (asyncMode := mode)
+  for ext in ← commandCacheExtensionsRef.get do
+    target := ext.copyState source target
+  return localEntriesExt.setState target (localEntriesExt.getState source (asyncMode := .local))
+    (asyncMode := .local)
+
 unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   IO.FS.writeFile (dir / "X.lean") "import Lean\nopen Lean\ndef v := 5\nregister_simp_attr my_set\ninitialize myExt : SimplePersistentEnvExtension Name (Array Name) ← registerSimplePersistentEnvExtension { addEntryFn := Array.push, addImportedFn := fun as => as.foldl (· ++ ·) #[] }\ninitialize registerBuiltinAttribute { name := `my_tag, descr := \"test\", add := fun decl _ _ => modifyEnv (myExt.addEntry · decl) }\n"
   IO.FS.writeFile (dir / "M.lean") "import X\n\n@[cpass] meta def testPassInstaller : Lean.Compiler.LCNF.PassInstaller := { phase := .base, install := pure }\n\ntheorem a : True := trivial\n\ndef h : Nat → Nat | 0 => 1 | n + 1 => n\n\n@[simp] theorem s : v = 5 := rfl\nattribute [local simp] s\n@[local simp] theorem ls : 2 = 2 := rfl\nattribute [local simp] s in theorem tin : 3 = 3 := by simp\nnamespace Foo\nend Foo\nattribute [local simp] a in open Foo in @[local simp] theorem t2 : True := trivial\nnamespace A.B\ntheorem tn : True := trivial\nend A.B\n\ntheorem d : 2 + 2 = 4 := by decide +kernel\ndef e1 : Fin 5 := ⟨3, by decide +kernel⟩\ninstance : Inhabited Nat := ⟨v⟩\n\n/-- A reducible definition with a docstring. -/\n@[reducible] def r : Nat := v + 1\n\nstructure P where\n  x : Nat\n  y : Nat\n\ninductive T where\n  | leaf\n  | node (l : T) (n : Nat) (r : T)\n\ndef T.size : T → Nat\n  | .leaf => 0\n  | .node l _ r => l.size + 1 + r.size\n\ndef k : Nat → Nat | 0 => 2 | n + 1 => n + 3\ndef e2 : Fin 5 := ⟨3, by decide +kernel⟩\ntheorem d2 : 2 + 2 = 4 := by decide +kernel\n\nnoncomputable def cl : Decidable (∀ n : Nat, n = n) := by classical exact inferInstance\nnamespace Prot\nprotected def p := 1\nend Prot\n@[my_set] theorem ms : 5 = 5 := rfl\n@[my_tag] def myTagged := 1\nsyntax \"⊕⊕\" term : term\nmacro_rules | `(⊕⊕ $x) => `($x + 1)\nnotation \"⊗⊗\" => Nat.add\n"
@@ -61,15 +76,15 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   IO.println s!"local simp: {locals.any (fun (_, n, _) => n == `Lean.Meta.simpExtension)}"
   let localDepths : Array Nat := locals.map fun entry => entry.1
   IO.println s!"transient local depth: {localDepths.any fun depth => depth > 0}"
-  IO.println s!"cache payloads: {entries.any fun entry => !entry.caches.states.isEmpty}"
+  let cacheNames := entries.flatMap fun entry => entry.caches.deltas.map (·.1)
+  IO.println s!"cache payloads: {!cacheNames.isEmpty}"
+  let registeredCaches := (← commandCacheExtensionsRef.get).map (·.name)
+  IO.println s!"cache names resolve: {cacheNames.all registeredCaches.contains}"
   for entry in entries do
     IO.println s!"{entry.idx} extensions={entry.entries.map (·.1)} \
       locals={entry.locals.map fun (depth, name, _) => (depth, name)} \
-      caches={entry.caches.states.map (·.1)}"
-  let mut replayed := expectedEnv
-  let baseStates ← EnvExtension.snapshotStates baseEnv
-  for h : i in [:baseStates.size] do
-    replayed ← EnvExtension.restoreStateAt replayed i baseStates[i]
+      caches={entry.caches.deltas.map (·.1)}"
+  let mut replayed ← withReplayStateOf baseEnv expectedEnv
   replayed := replayed.setMainModule `M
   for entry in entries do
     replayed ← replayCommandEntries replayed entry (scopeDepth replayed) {}
@@ -131,10 +146,30 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let actualClassical := actualInstances.instanceNames.contains `Classical.propDecidable
   unless sameInstanceNames && !expectedClassical && !actualClassical do
     scopedMismatches := scopedMismatches.push `Lean.Meta.instanceExtension
+  -- every cache holds the same entries beyond the base state as after a full run; the list-backed caches
+  -- (the compiler's emission order and closed-term/ground-decl/aux-decl caches) also in the same order, the
+  -- map-backed ones in any order, since a hash map's traversal order depends on its insertion history
+  let orderedCaches := [`Lean.Compiler.LCNF.declOrderExt, `Lean.closedTermCacheExt,
+    `Lean.Compiler.LCNF.simpleGroundDeclExt, `Lean.Compiler.LCNF.auxDeclCacheExt,
+    `Lean.Compiler.LCNF.baseTypeExt]
+  let mut cacheMismatches := #[]
+  for ext in ← commandCacheExtensionsRef.get do
+    let added (env : Environment) (tag : String) : IO (Array ByteArray) := do
+      let es := ext.delta baseEnv env
+      let mut bytes := #[]
+      for h : i in [:es.size] do
+        bytes := bytes.push (← compactBytes dir s!"{tag}-{ext.name.hash}-{i}" es[i] (allowClosures := true))
+      return if orderedCaches.contains ext.name then bytes
+        else bytes.qsort fun a b => decide (a.toList < b.toList)
+    unless (← added expectedEnv "cache-expected") == (← added replayed "cache-actual") do
+      cacheMismatches := cacheMismatches.push ext.name
   IO.println s!"scoped identical: {scopedMismatches.isEmpty}"
-  IO.println s!"identical: {mismatches.isEmpty && scopedMismatches.isEmpty}"
-  unless mismatches.isEmpty && scopedMismatches.isEmpty do
-    throw <| IO.userError s!"extension mismatches: {mismatches}; scoped: {scopedMismatches}"
+  IO.println s!"caches identical: {cacheMismatches.isEmpty}"
+  let identical := mismatches.isEmpty && scopedMismatches.isEmpty && cacheMismatches.isEmpty
+  IO.println s!"identical: {identical}"
+  unless identical do
+    throw <| IO.userError s!"extension mismatches: {mismatches}; scoped: {scopedMismatches}; \
+      caches: {cacheMismatches}"
   Runtime.forget region
 
 #eval main

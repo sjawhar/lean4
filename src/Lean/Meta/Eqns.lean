@@ -156,8 +156,12 @@ structure EqnsExtState where
   deriving Inhabited
 
 /-- A mapping from equational theorem to the declaration it was derived from.  -/
-builtin_initialize eqnsExt : EnvExtension EqnsExtState ←
-  registerEnvExtension (pure {}) (asyncMode := .local)
+builtin_initialize eqnsExt : EnvExtension EqnsExtState ← do
+  let ext ← registerEnvExtension (pure {}) (asyncMode := .local)
+  registerCommandCacheExtension `Lean.Meta.eqnsExt ext
+    (fun before after =>
+      after.mapInv.toList.toArray.filter fun (k, _) => !before.mapInv.contains k)
+    (fun state (k, v) => { mapInv := state.mapInv.insert k v })
 
 /-- Equational-theorem cache entries used by per-command usage recording. -/
 def eqnsCacheEntries (env : Environment) : Array (Name × Name) :=
