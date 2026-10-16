@@ -84,6 +84,7 @@ builtin_facet imports : Module => Array Module
 public structure ModulePreSetup where
   trace : BuildTrace
   irSigTrace : BuildTrace
+  localTrace : BuildTrace
   srcMTime : MTime
   srcFile : FilePath
   isModule : Bool
