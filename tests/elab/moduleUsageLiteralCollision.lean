@@ -13,5 +13,5 @@ def u2 : String := "VXk9\u0187\u0221IB-\u005cxotE"
 
 #eval show CommandElabM Unit from do
   let env ← getEnv
-  let lh n := ModuleUsage.localHash env (env.find? n).get!
+  let lh n := ModuleUsage.localHash (env.find? n).get!
   logInfo m!"{hash s1 == hash s2 && hash u1 == hash u2} {lh ``s1 == lh ``s2 || lh ``u1 == lh ``u2}"

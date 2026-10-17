@@ -1,7 +1,8 @@
 import Lean
-/-! Meaning digests: `localHash` ignores the constant's own name but sees binder info, theorem proofs, Nat
-literals past 2^64, `noncomputable`, the `@[extern]` entries and the `@[export]` name; `localDigests` sees the
-names of referenced constants. The serialized digest parser accepts exactly 32 lowercase hexadecimal digits. -/
+/-! Meaning digests: `localHash` (a constant's kernel data) ignores the constant's own name but sees binder info,
+theorem proofs and Nat literals past 2^64; `attrsEnc` sees `noncomputable`, the `@[extern]` entries and the
+`@[export]` name, and is equal for declarations without attributes; `localDigests` sees the names of referenced
+constants. The serialized digest parser accepts exactly 32 lowercase hexadecimal digits. -/
 open Lean Elab Command
 def f (x : Nat) := x + 1
 def f' (x : Nat) := x + 1
@@ -21,10 +22,11 @@ noncomputable def c1 : Nat := 0
 @[export my_c_x1] def x1 (x : Nat) : Nat := x + 1
 #eval show CommandElabM Unit from do
   let env ← getEnv
-  let lh n := ModuleUsage.localHash env (env.find? n).get!
+  let lh n := ModuleUsage.localHash (env.find? n).get!
+  let la n := (ModuleUsage.attrsEnc env n { e := {} }).e.finish
   let ds := (ModuleUsage.localDigests env).toList
   let dg n := (ds.lookup n).get!
-  logInfo m!"{lh ``f == lh ``f'} {lh ``h == lh ``h'} {lh ``t1 == lh ``t2} {lh ``k0 == lh ``k1} {dg ``g == dg ``g'} {lh ``c0 == lh ``c1} {lh ``e0 == lh ``e1} {lh ``x0 == lh ``x1}"
+  logInfo m!"{lh ``f == lh ``f'} {lh ``h == lh ``h'} {lh ``t1 == lh ``t2} {lh ``k0 == lh ``k1} {dg ``g == dg ``g'} {la ``c0 == la ``c1} {la ``e0 == la ``e1} {la ``x0 == la ``x1} {la ``f == la ``f'}"
 #eval show CommandElabM Unit from do
   let d := "0123456789abcdef0123456789abcdef"
   logInfo m!"{(ModuleUsage.Digest.ofHex? d).map (·.hex) == some d} \

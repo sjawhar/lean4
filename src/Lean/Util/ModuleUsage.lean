@@ -7,139 +7,38 @@ prelude
 public import Lean.Util.SCC
 public import Lean.Util.FoldConsts
 public import Lean.Util.PtrSet
-public import Lean.Compiler.ImplementedByAttr
-public import Lean.Compiler.ExternAttr
-public import Lean.Compiler.ExportAttr
-public import Lean.Compiler.NoncomputableAttr
 public import Lean.Elab.InfoTree.Types
 public import Lean.Util.UsedByChecks
+public import Lean.Util.ModuleUsage.Basic
+public import Lean.Util.ModuleUsage.Compiled
 import Lean.ExtraModUses
-import Lean.Compiler.Old
-import Lean.Compiler.IR.CompilerM
-import Lean.Compiler.InlineAttrs
-import Lean.Compiler.NeverExtractAttr
-import Lean.Meta.Native
+import Lean.Compiler.ImplementedByAttr
+import Lean.Compiler.CSimpAttr
+import Lean.Compiler.ModPkgExt
+import Lean.Compiler.LCNF.Passes
+import Lean.Compiler.LCNF.Simp.ConstantFold
+import Lean.ReducibilityAttrs
+import Lean.Meta.Instances
+import Lean.Class
 import Lean.Elab.InfoTree.Util
 public section
 
 /-!
-Usage data for Lake's usage cutoff: meaning digests of a module's constants (written into its `.olean`
+Usage data for Lake's usage cutoff: meaning digests of a module's declarations (written into its `.olean`
 when Lean runs with `--usage`), and the `.usage` sidecar recording, per imported module, the digests of
-the constants the module used, from which Lake decides whether the module must be compiled again.
+the declarations the module used, from which Lake decides whether the module must be compiled again.
+
+A digest covers a declaration's kernel data and its compiled interface (`compiledEnc`), Merkle-closed over the
+declarations both refer to. Compiler-only names (`f._redArg`, `g._at_.h.spec_0`, ...) fold into an owner, a
+kernel constant of the same module (`ownerOf`), whose digest covers them.
 -/
 
 namespace Lean.ModuleUsage
 
-/-- A 128-bit digest, read big-endian into `hi` then `lo`: a meaning digest is the first 128 bits of a
-SHA-256 (`src/library/usage_digest.cpp`), a file's digest the XXH3-128 of its bytes (`fileDigest`). -/
-structure Digest where
-  hi : UInt64
-  lo : UInt64
-  deriving BEq, Hashable, Inhabited
-
-/-- The SHA-256 of `bytes`, truncated to a `Digest`. -/
-@[extern "lean_usage_digest_bytes"]
-opaque Digest.ofBytes (bytes : @& ByteArray) : Digest
-
-/-- The XXH3-128 hash of the file's bytes, read in fixed-size chunks: what Lake compares to tell whether
-a file it checks for usage cutoff is the one it recorded. -/
-@[extern "lean_usage_file_digest"]
-opaque fileDigest (path : @& System.FilePath) : IO Digest
-
-private def hex16 (v : UInt64) : String :=
-  let s := String.ofList (Nat.toDigits 16 v.toNat); "".pushn '0' (16 - s.length) ++ s
-
-/-- 32 lowercase hex digits. -/
-def Digest.hex (d : Digest) : String := hex16 d.hi ++ hex16 d.lo
-
-/-- Parses exactly 32 lowercase hex digits. -/
-def Digest.ofHex? (s : String) : Option Digest := do
-  let bs := s.toUTF8
-  guard (bs.size == 32)
-  let v ← bs.foldlM (init := 0) fun (n : Nat) b =>
-    if '0'.toUInt8 ≤ b && b ≤ '9'.toUInt8 then
-      some (16 * n + (b.toNat - '0'.toNat))
-    else if 'a'.toUInt8 ≤ b && b ≤ 'f'.toUInt8 then
-      some (16 * n + (b.toNat - 'a'.toNat + 10))
-    else none
-  return ⟨(v >>> 64).toUInt64, v.toUInt64⟩
-
-instance : ToJson Digest := ⟨fun d => .str d.hex⟩
-instance : FromJson Digest := ⟨fun j => do
-  let s ← j.getStr?
-  (Digest.ofHex? s).elim (throw s!"expected a digest of 32 hex digits, got {s}") pure⟩
-
-/-- An injective byte encoding, hashed by `finish`: every variable-length field is length-prefixed and
-every alternative tagged, so different values never encode to the same bytes. -/
-structure Enc where
-  buf : ByteArray := .emptyWithCapacity 256
-
-namespace Enc
-@[inline] def u8 (e : Enc) (v : UInt8) : Enc := ⟨e.buf.push v⟩
-def u64 (e : Enc) (v : UInt64) : Enc :=
-  ⟨e.buf.push v.toUInt8 |>.push (v >>> 8).toUInt8 |>.push (v >>> 16).toUInt8 |>.push (v >>> 24).toUInt8
-    |>.push (v >>> 32).toUInt8 |>.push (v >>> 40).toUInt8 |>.push (v >>> 48).toUInt8 |>.push (v >>> 56).toUInt8⟩
-def bool (e : Enc) (v : Bool) : Enc := e.u8 (if v then 1 else 0)
-def str (e : Enc) (s : String) : Enc := let b := s.toUTF8; ⟨(e.u64 b.size.toUInt64).buf ++ b⟩
-def nat (e : Enc) (n : Nat) : Enc := e.str (toString n)
-def digest (e : Enc) (d : Digest) : Enc := e.u64 d.hi |>.u64 d.lo
-/-- The component count, then each component root first, tagged string or number. -/
-def name (e : Enc) (n : Name) : Enc :=
-  go n (e.nat n.getNumParts)
-where
-  go : Name → Enc → Enc
-    | .anonymous, e => e
-    | .str p s, e => (go p e).u8 1 |>.str s
-    | .num p k, e => (go p e).u8 2 |>.nat k
-def names (e : Enc) (ns : List Name) : Enc := ns.foldl name (e.nat ns.length)
-def opt {α : Type} (e : Enc) (o : Option α) (f : Enc → α → Enc) : Enc :=
-  match o with
-  | none => e.u8 0
-  | some a => f (e.u8 1) a
-def finish (e : Enc) : Digest := Digest.ofBytes e.buf
-end Enc
-
-/-- A Merkle SHA-256 digest of `e`'s structure (`src/library/usage_digest.cpp`), linear in its distinct
-subterms. Ignores `mdata`. With `binders`, binder names and infos count (types: they steer elaboration
-downstream); without, it sees what the kernel sees. -/
-@[extern "lean_usage_expr_digest"]
-opaque exprDigest (binders : Bool) (e : @& Expr) : Digest
-
-def externEnc (e : Enc) (d : ExternAttrData) : Enc :=
-  d.entries.foldl (init := e.nat d.entries.length) fun e x => match x with
-    | .adhoc b => e.u8 1 |>.name b
-    | .inline b p => e.u8 2 |>.name b |>.str p
-    | .standard b f => e.u8 3 |>.name b |>.str f
-    | .opaque => e.u8 4
-
-def hintsEnc (e : Enc) : ReducibilityHints → Enc
-  | .opaque => e.u8 0 | .abbrev => e.u8 1 | .regular h => e.u8 2 |>.u64 h.toUInt64
-def safetyEnc (e : Enc) : DefinitionSafety → Enc
-  | .safe => e.u8 0 | .unsafe => e.u8 1 | .partial => e.u8 2
-
-/-- The parameter borrow flags of `c`'s IR declaration, explicit (`@&`) or inferred: its callers' compiled
-code follows them (who releases an argument), and `@&` is `mdata`, which `exprDigest` ignores. -/
-private def borrowEnc (e : Enc) (d : IR.Decl) : Enc :=
-  d.params.foldl (fun e p => e.bool p.borrow) (e.nat d.params.size)
-
-private def inlineEnc (e : Enc) : Compiler.InlineAttributeKind → Enc
-  | .inline => e.u8 0 | .noinline => e.u8 1 | .macroInline => e.u8 2 | .inlineIfReduce => e.u8 3
-  | .alwaysInline => e.u8 4
-
-/-- Everything of `c` except its own name and the meaning of the constants it refers to, including what its
-importers' compiled code depends on: the `@[extern]` entries, the `@[export]` name, the borrow flags of its
-IR parameters, its inline attribute (`@[macro_inline]` inlines it into callers and stops emitting it) and
-`@[never_extract]` (whether callers may share one evaluation of a closed application). -/
-def localHash (env : Environment) (c : ConstantInfo) : Digest :=
-  let v := exprDigest false
-  let e := ({} : Enc).names c.levelParams |>.digest (exprDigest true c.type)
-    |>.opt (Compiler.getImplementedBy? env c.name) Enc.name
-    |>.opt (getExternAttrData? env c.name) externEnc
-    |>.bool (isNoncomputable env c.name)
-    |>.opt (getExportNameFor? env c.name) Enc.name
-    |>.opt (IR.findEnvDecl env c.name) borrowEnc
-    |>.opt (Compiler.getInlineAttribute? env c.name) inlineEnc
-    |>.bool (hasNeverExtractAttribute env c.name)
+/-- Everything of `c`'s kernel data except its own name and the meaning of the constants it refers to. -/
+def localHash (c : ConstantInfo) : Digest :=
+  let v := exprDigest .none
+  let e := ({} : Enc).names c.levelParams |>.digest (exprDigest .namesInfos c.type)
   let e := match c with
     | .defnInfo d => hintsEnc (e.u8 1 |>.digest (v d.value)) d.hints |> (safetyEnc · d.safety)
     | .thmInfo t => e.u8 2 |>.digest (v t.value)
@@ -155,11 +54,9 @@ def localHash (env : Environment) (c : ConstantInfo) : Digest :=
       fun e (rl : RecursorRule) => e.name rl.ctor |>.nat rl.nfields |>.digest (v rl.rhs)
   e.finish
 
-/-- The constants `c`'s meaning depends on: those in its type and value, its inductive's block and constructors,
-its recursor rules' right-hand sides, its `implemented_by` target, and the `_unsafe_rec` definition holding a
-`partial def`'s compiled body (the kernel constant is an opaque with an inhabitant value, while compiled code and
-`native_decide` run the body). The constants of its type and value are `recorded`'s if it holds an equal type
-and value under `c`'s name (`declConstsRef`). -/
+/-- The constants `c`'s kernel meaning depends on: those in its type and value, its inductive's block and
+constructors, its recursor rules' right-hand sides, and its `implemented_by` target. The constants of its type
+and value are `recorded`'s if it holds an equal type and value under `c`'s name (`declConstsRef`). -/
 def refs (env : Environment) (c : ConstantInfo) (recorded : NameMap DeclConsts := {}) : Array Name :=
   let s : NameSet := match c, recorded.find? c.name with
     | .axiomInfo _, some r | .defnInfo _, some r | .thmInfo _, some r | .opaqueInfo _, some r =>
@@ -172,9 +69,43 @@ def refs (env : Environment) (c : ConstantInfo) (recorded : NameMap DeclConsts :
     | .recInfo r => r.rules.foldl (fun s rl => rl.rhs.getUsedConstants.foldl (·.insert ·) (s.insert rl.ctor)) s
     | _ => s
   let s := match Compiler.getImplementedBy? env c.name with | some t => s.insert t | none => s
-  let unsafeRec := Compiler.mkUnsafeRecName c.name
-  let s := if env.contains unsafeRec then s.insert unsafeRec else s
   s.toArray.qsort Name.quickLt
+
+/-- For `g._at_.o`, `o`: the components after the last `_at_`. -/
+def atOwner? (p : Name) : Option Name :=
+  let cs := p.components
+  match cs.reverse.findIdx? (· == `_at_) with
+  | some j =>
+    let o := (cs.drop (cs.length - j)).foldl Name.append .anonymous
+    if o.isAnonymous then none else some o
+  | none => none
+
+/-- `x` with one compiler suffix removed, or `none` at a single component. A specialization `g._at_.o.spec_N`
+gives `o`, the declaration that created it; otherwise the last component goes, before the macro scopes if `x`
+ends in them (`f._lam_0._@.M._hyg.3` gives `f._@.M._hyg.3`) and after them if not
+(`f._@.M._hyg.3._boxed` gives `f._@.M._hyg.3`). -/
+def stripSuffix? (x : Name) : Option Name :=
+  if x.hasMacroScopes then
+    let v := extractMacroScopes x
+    (go v.name).map fun n => ({ v with name := n } : MacroScopesView).review
+  else go x
+where
+  go : Name → Option Name
+    | .str p s =>
+      if s.startsWith "spec_" then (atOwner? p).orElse fun _ => if p.isAnonymous then none else some p
+      else if p.isAnonymous then none else some p
+    | .num p _ => if p.isAnonymous then none else some p
+    | .anonymous => none
+
+/-- The first of `x` and its successive `stripSuffix?` results that `isNode` accepts, or `x`. -/
+def ownerOf (isNode : Name → Bool) (x : Name) : Name := Id.run do
+  let mut c := x
+  for _ in [0:x.getNumParts + 1] do
+    if isNode c then return c
+    match stripSuffix? c with
+    | some p => c := p
+    | none => return x
+  return x
 
 structure State where
   /-- Per imported module: empty if its `.olean` carries no digests (written without `lean --usage`, or by a
@@ -185,7 +116,7 @@ structure State where
   localDigests? : Option (Array (Name × Digest)) := none
 instance : Inhabited State := ⟨{}⟩
 
-/-- The digest of `c` if module `i` (the module defining `c`) wrote one. -/
+/-- The digest of node `c` if module `i` (the module defining `c`) wrote one. -/
 def State.findAt? (s : State) (i : ModuleIdx) (c : Name) : Option Digest := do
   let es ← s.importedModuleEntries[i.toNat]?
   (·.2) <$> es.binSearch (c, default) (fun a b => Name.quickLt a.1 b.1) (lo := 1)
@@ -197,32 +128,14 @@ def State.find? (s : State) (env : Environment) (c : Name) : Option Digest := do
 def State.hasEntries (s : State) (i : ModuleIdx) : Bool :=
   !(s.importedModuleEntries[i.toNat]?.getD #[]).isEmpty
 
-/-- The current module's own constants, from the kernel environment, each with its `refs`. -/
-def ownConsts (env : Environment) (recorded : NameMap DeclConsts := {}) :
-    Array (Name × ConstantInfo × Array Name) :=
-  env.checked.get.constants.foldStage2 (fun cs n ci => cs.push (n, ci, refs env ci recorded)) #[]
-
-/-- Digests of the current module's constants: SCCs in dependency order; each SCC's digest hashes its members'
-names and local hashes with the name and digest of every constant outside it that they refer to (tagged absent
-if that constant has no digest). -/
-def compute (env : Environment) (s : State) (consts := ownConsts env) : Array (Name × Digest) := Id.run do
-  let byName : Std.HashMap Name (ConstantInfo × Array Name) :=
-    consts.foldl (fun m (n, ci, rs) => m.insert n (ci, rs)) {}
-  let sccs := SCC.scc (consts.map (·.1)).toList fun n => byName[n]!.2.toList.filter byName.contains
-  let mut out : Std.HashMap Name Digest := {}
-  for scc in sccs do
-    let members := NameSet.ofList scc
-    let sorted := scc.toArray.qsort Name.quickLt
-    let mut e : Enc := ({} : Enc).nat sorted.size
-    for m in sorted do
-      let (ci, rs) := byName[m]!
-      let outside := rs.filter (!members.contains ·)
-      e := e.name m |>.digest (localHash env ci) |>.nat outside.size
-      for r in outside do
-        e := e.name r |>.opt (out[r]? <|> s.find? env r) Enc.digest
-    let d := e.finish
-    for m in scc do out := out.insert m d
-  return (consts.map fun (n, _) => (n, out[n]!)).qsort fun a b => Name.quickLt a.1 b.1
+/-- The node of the imported name `x`, found in its defining module's digests: a module's nodes are its
+kernel constants and the compiler-only names that fold into none (`ownNodes`), so the first of `x`'s
+`ownerOf` candidates among them is the owner that module folded `x` into. `x` itself if `x` is local or its
+module carries no digests. -/
+def State.ownerOf (s : State) (env : Environment) (x : Name) : Name :=
+  match env.getModuleIdxFor? x with
+  | some i => if s.hasEntries i then ModuleUsage.ownerOf (fun c => (s.findAt? i c).isSome) x else x
+  | none => x
 
 builtin_initialize ext : PersistentEnvExtension (Name × Digest) (Name × Digest) State ←
   registerPersistentEnvExtension {
@@ -239,37 +152,94 @@ builtin_initialize ext : PersistentEnvExtension (Name × Digest) (Name × Digest
 
 def state (env : Environment) : State := ext.getState (asyncMode := .mainOnly) env
 
-def localDigests (env : Environment) (consts := ownConsts env) : Array (Name × Digest) :=
-  compute env (state env) consts
+/-- The current module's own constants, from the kernel environment, each with its `refs`. -/
+def ownConsts (env : Environment) (recorded : NameMap DeclConsts := {}) :
+    Array (Name × ConstantInfo × Array Name) :=
+  env.checked.get.constants.foldStage2 (fun cs n ci => cs.push (n, ci, refs env ci recorded)) #[]
+
+/-- A unit of the current module's digests: a kernel constant, or a compiler-only name with no kernel constant
+to fold into, with every compiler-only name folded into it. -/
+structure Node where
+  name : Name
+  /-- The node's kernel data and the compiled interfaces of its name and its folded names (sorted, each
+  named), with the module's package, which every native symbol of the module carries. -/
+  localDigest : Digest
+  /-- The nodes the node refers to (kernel references and compiled mentions, each mapped to its node), sorted,
+  without the node itself. -/
+  refs : Array Name
+  deriving Inhabited
+
+/-- The current module's nodes. -/
+def ownNodes (env : Environment) (consts : Array (Name × ConstantInfo × Array Name)) : Array Node := Id.run do
+  let s := state env
+  let lc := LocalCompiled.ofEnv env
+  let kernel : Std.HashMap Name (ConstantInfo × Array Name) :=
+    consts.foldl (fun m (n, ci, rs) => m.insert n (ci, rs)) {}
+  let mut folded : Std.HashMap Name (Array Name) := {}
+  for x in (compiledNames env lc).toArray do
+    unless kernel.contains x do
+      folded := folded.alter (ownerOf kernel.contains x) fun o => some ((o.getD #[]).push x)
+  let localOwner (x : Name) : Name :=
+    if kernel.contains x || folded.contains x then x else ownerOf kernel.contains x
+  let pkg := env.getModulePackage?
+  let names := consts.map (·.1) ++ (folded.toArray.filterMap fun (n, _) => if kernel.contains n then none else some n)
+  return names.map fun n => Id.run do
+    let k? := kernel[n]?
+    let mut c : CEnc := { e := ({} : Enc).opt pkg Enc.str |>.opt k? fun e (ci, _) => e.digest (localHash ci) }
+    c := compiledEnc env lc n c
+    let fs := (folded.getD n #[]).filter (· != n) |>.qsort Name.quickLt
+    c := c.nat fs.size
+    for x in fs do
+      c := compiledEnc env lc x (c.name x)
+    let mentions := (k?.elim #[] (·.2)).foldl (·.insert ·) c.ms
+    let rs : NameSet := mentions.foldl (init := {}) fun rs m =>
+      let o := if (env.getModuleIdxFor? m).isSome then s.ownerOf env m else localOwner m
+      if o == n then rs else rs.insert o
+    { name := n, localDigest := c.e.finish, refs := rs.toArray.qsort Name.quickLt }
+
+/-- Digests of the current module's nodes: SCCs in dependency order; each SCC's digest hashes its members'
+names and local digests with the name and digest of every node outside it that they refer to (tagged absent if
+it has no digest). -/
+def compute (env : Environment) (s : State) (nodes : Array Node) : Array (Name × Digest) := Id.run do
+  let byName : Std.HashMap Name Node := nodes.foldl (fun m n => m.insert n.name n) {}
+  let sccs := SCC.scc (nodes.map (·.name)).toList fun n => byName[n]!.refs.toList.filter byName.contains
+  let mut out : Std.HashMap Name Digest := {}
+  for scc in sccs do
+    let members := NameSet.ofList scc
+    let sorted := scc.toArray.qsort Name.quickLt
+    let mut e : Enc := ({} : Enc).nat sorted.size
+    for m in sorted do
+      let node := byName[m]!
+      let outside := node.refs.filter (!members.contains ·)
+      e := e.name m |>.digest node.localDigest |>.nat outside.size
+      for r in outside do
+        e := e.name r |>.opt (out[r]? <|> s.find? env r) Enc.digest
+    let d := e.finish
+    for m in scc do out := out.insert m d
+  return (nodes.map fun n => (n.name, out[n.name]!)).qsort fun a b => Name.quickLt a.1 b.1
+
+def localDigests (env : Environment) (nodes := ownNodes env (ownConsts env)) : Array (Name × Digest) :=
+  compute env (state env) nodes
 
 /-- Stores `own` (`localDigests env`) for the extension to export. Without it, the `.olean` carries no
 digests. -/
 def setLocalDigests (env : Environment) (own : Array (Name × Digest)) : Environment :=
   ext.modifyState (asyncMode := .mainOnly) env ({ · with localDigests? := some own })
 
-/-- Per defining module, sorted: every imported constant that the current module's own constants refer to or
-that is in `extra`, with its digest. Constants without a digest (from a module whose `.olean` carries none) are
-left out. -/
-def moduleUsed (env : Environment) (extra : NameSet) (consts := ownConsts env) :
+/-- Per defining module, sorted: the node of every imported name that the current module's nodes refer to or
+that is in `extra`, with its digest. Names without a digest (from a module whose `.olean` carries none) are left
+out. -/
+def moduleUsed (env : Environment) (extra : NameSet) (nodes := ownNodes env (ownConsts env)) :
     Array (Name × Array (Name × Digest)) :=
   let s := state env
-  let used := consts.foldl (init := extra) fun u (_, _, rs) => rs.foldl (·.insert ·) u
+  let used := extra.foldl (init := (∅ : NameSet)) fun u x => u.insert (s.ownerOf env x)
+  let used := nodes.foldl (init := used) fun u n => n.refs.foldl (·.insert ·) u
   let byMod := used.foldl (init := (∅ : Std.HashMap Name (Array (Name × Digest)))) fun m c => Id.run do
     let some i := env.getModuleIdxFor? c | return m
     let some d := s.findAt? i c | return m
     m.alter env.header.modules[i.toNat]!.module fun o => some ((o.getD #[]).push (c, d))
   byMod.toArray.map (fun (k, v) => (k, v.qsort fun a b => Name.quickLt a.1 b.1))
     |>.qsort fun a b => Name.quickLt a.1 b.1
-
-/-- A name as the JSON array of its components, root first: each a string or a number. Unlike `toJson Name`
-(`Name.toString`), this round-trips macro-scoped names and components containing `»`. -/
-def nameToJson (n : Name) : Json :=
-  .arr (go n #[])
-where
-  go : Name → Array Json → Array Json
-    | .anonymous, acc => acc
-    | .str p s, acc => (go p acc).push (.str s)
-    | .num p k, acc => (go p acc).push (.num k)
 
 unsafe structure WalkState where
   /-- Visited metavariable-free subterms: their constants do not depend on any assignment. -/
@@ -319,10 +289,93 @@ keep a constant that instantiation's beta reduction would drop: a superset, neve
 @[implemented_by usedFromInfoTreesImpl]
 opaque usedFromInfoTrees (trees : Array Elab.InfoTree) (init : NameSet) : NameSet
 
-/-- A digest of the module's import closure: its sorted module names. -/
-def closureDigest (env : Environment) : Digest :=
-  let names := env.header.moduleNames.qsort Name.quickLt
-  (({} : Enc).nat names.size |> names.foldl Enc.name).finish
+/-! Cross-module compiler tables: entries a module adds for declarations of other modules, which change how
+every importer compiles without changing any digest of those declarations. -/
+
+private def attrKindEnc (e : Enc) : AttributeKind → Enc
+  | .global => e.u8 0 | .local => e.u8 1 | .scoped => e.u8 2
+
+private def scopedEnc {α : Type} (f : Enc → α → Enc) (e : Enc) : ScopedEnvExtension.Entry α → Enc
+  | .global a => f (e.u8 0) a
+  | .scoped ns a => f (e.u8 1 |>.name ns) a
+
+/-- Whether `n` is defined in module `i` (`none`: the current module). -/
+private def definedIn (env : Environment) (i? : Option ModuleIdx) (n : Name) : Bool :=
+  env.getModuleIdxFor? n == i?
+
+/-- Module `i?`'s entries of an extension: `imported i` for an imported module, `loc` (the current module's,
+newest first) reversed for `none`. -/
+private def pickEntries {α : Type} (i? : Option ModuleIdx) (imported : ModuleIdx → Array α) (loc : List α) :
+    Array α :=
+  match i? with
+  | some i => imported i
+  | none => loc.reverse.toArray
+
+/-- A digest of one module's entries in the cross-module compiler tables: `@[csimp]` replacements, instances
+and classes declared for another module's declaration, reducibility set for another module's declaration,
+`@[cpass]` installers and constant folders, each installer and folder with its declaration's digest
+(`digestOf`). `i? = none` is the current module. -/
+def tableDigest (env : Environment) (i? : Option ModuleIdx) (digestOf : Name → Option Digest) : Digest := Id.run do
+  let csimp := pickEntries i? (Compiler.CSimp.ext.ext.getModuleEntries env ·)
+    (Compiler.CSimp.ext.ext.getState env).newEntries
+  let insts := pickEntries i? (Meta.instanceExtension.ext.getModuleEntries env ·)
+    (Meta.instanceExtension.ext.getState env).newEntries
+  let insts := insts.filter fun e => match e with
+    | .global a | .scoped _ a => a.globalName?.any (!definedIn env i? ·)
+  let reds := pickEntries i? (reducibilityExtraExt.ext.getModuleEntries env ·)
+    (reducibilityExtraExt.ext.getState env).newEntries
+  let classes := pickEntries i? (classExtension.getModuleEntries env ·) (classExtension.getEntries env)
+  let classes := classes.filter (!definedIn env i? ·.name)
+  let passes := pickEntries i? (Compiler.LCNF.passManagerExt.getModuleEntries env ·)
+    (Compiler.LCNF.passManagerExt.getState env).1
+  let folders := pickEntries i? (Compiler.LCNF.Simp.ConstantFold.folderExt.getModuleEntries env ·)
+    ((Compiler.LCNF.Simp.ConstantFold.folderExt.getState env).1.map (·.toFolderOleanEntry))
+  let withDigest (e : Enc) (n : Name) := e.name n |>.opt (digestOf n) Enc.digest
+  let mut e : Enc := ({} : Enc).nat csimp.size
+  for x in csimp do
+    e := scopedEnc (fun e (c : Compiler.CSimp.Entry) =>
+      let ⟨fromDeclName, toDeclName, thmName⟩ := c
+      e.name fromDeclName |>.name toDeclName |>.name thmName) e x
+  e := e.nat insts.size
+  for x in insts do
+    e := scopedEnc (fun e (a : Meta.InstanceEntry) =>
+      e.opt a.globalName? Enc.name |>.nat a.priority |> (attrKindEnc · a.attrKind)) e x
+  e := e.nat reds.size
+  for x in reds do
+    e := scopedEnc (fun e ((n, st) : Name × ReducibilityStatus) =>
+      e.name n |>.u8 (match st with
+        | .reducible => 0 | .semireducible => 1 | .irreducible => 2 | .implicitReducible => 3
+        | .instanceReducible => 4)) e x
+  e := e.nat classes.size
+  for c in classes do
+    let ⟨name, outParams, outLevelParams⟩ := c
+    e := e.name name |>.nats outParams |>.nats outLevelParams
+  e := e.nat passes.size
+  for p in passes do e := withDigest e p
+  e := e.nat folders.size
+  for f in folders do
+    let ⟨declName, folderDeclName⟩ := f
+    e := withDigest (e.name declName) folderDeclName
+  return e.finish
+
+/-- Whether module `i` adds `@[cpass]` installers or constant folders: code that runs inside the compiler. -/
+def addsCompilerCode (env : Environment) (i : ModuleIdx) : Bool :=
+  !(Compiler.LCNF.passManagerExt.getModuleEntries env i).isEmpty ||
+  !(Compiler.LCNF.Simp.ConstantFold.folderExt.getModuleEntries env i).isEmpty
+
+/-- A digest of the module's import closure: its sorted module names, and for every module (imported ones with
+digests, and the current one) the digest of its cross-module compiler tables (`tableDigest`). Importers compare
+it through Lake's `closureHash`, so a change to any module's tables rebuilds every module downstream. -/
+def closureDigest (env : Environment) (own : Array (Name × Digest)) : Digest := Id.run do
+  let s := state env
+  let ownMap : Std.HashMap Name Digest := own.foldl (fun m (n, d) => m.insert n d) {}
+  let digestOf (n : Name) : Option Digest := ownMap[n]? <|> s.find? env n
+  let mods := env.header.moduleNames.zipIdx.qsort (fun a b => Name.quickLt a.1 b.1)
+  let mut e : Enc := ({} : Enc).nat mods.size
+  for (m, i) in mods do
+    e := e.name m
+    e := e.opt (if s.hasEntries i then some (tableDigest env (some i) digestOf) else none) Enc.digest
+  return e.digest (tableDigest env none digestOf) |>.finish
 
 /-- The imported modules whose `.olean` carries digests (`State.hasEntries`), sorted. -/
 def digestedModules (env : Environment) : Array Name :=
@@ -332,31 +385,34 @@ def digestedModules (env : Environment) : Array Name :=
 
 /-- The format version of the `.usage` sidecar and of Lake's `.usekey`; Lake reads a sidecar of any other
 version as absent. -/
-def usageVersion : Nat := 5
+def usageVersion : Nat := 6
 
-/-- `own` is `localDigests env consts`. `extra` lists the extra module uses of the environment and of
-`extraModUsesByChecksRef` (those of commands whose environment was discarded). `noskip` is set when the run
-reused commands from an `--incr-load` snapshot, since reused commands never call `addDecl` in this process
-and `extra` may miss constants they used. It is also set for modules containing a native evaluation axiom:
-the compiled closure trusted by such an axiom can include compiler-only dependencies that are not represented
-in its type. -/
-def writeUsage (env : Environment) (consts : Array (Name × ConstantInfo × Array Name))
-    (own : Array (Name × Digest)) (extra : NameSet) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
-  let noskip := incrLoaded ||
-    consts.any fun (n, ci, _) => (ci matches .axiomInfo _) && Meta.isNativeAxiomName n
+/-- `own` is `localDigests env nodes`; `used` holds the imported names recorded while elaborating
+(`moduleUsed`'s `extra`). The extra module uses are the environment's and `extraModUsesByChecksRef`'s (those of
+commands whose environment was discarded). If an imported module with digests adds code that runs inside the
+compiler (`addsCompilerCode`), every imported module with digests is an extra use: whether a specialization is
+reused from another module's cache is then not known to be harmless. `noskip` is set when the run reused
+commands from an `--incr-load` snapshot, since reused commands never call `addDecl` in this process and `used`
+may miss constants they used. -/
+def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Digest)) (used : NameSet)
+    (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
   let s := state env
   let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecksRef.get)
+  let digested := env.header.moduleNames.zipIdx.filter fun (_, i) => s.hasEntries i
+  let allExtra := if digested.any (addsCompilerCode env ·.2) then
+      digested.foldl (fun u (m, _) => u.insert { module := m, isExported := false, isMeta := false }) allExtra
+    else allExtra
   let extraMods := allExtra.toArray.filter (fun u => (env.getModuleIdx? u.module).any s.hasEntries)
     |>.qsort fun a b => let k (u : ExtraModUse) := 2 * u.isExported.toNat + u.isMeta.toNat
       Name.quickLt a.module b.module || (a.module == b.module && k a < k b)
   let pair (n : Name) (d : Digest) := Json.arr #[nameToJson n, toJson d]
   let moduleDigest := (own.foldl (fun e (n, d) => e.name n |>.digest d) (({} : Enc).nat own.size)).finish
-  let j := Json.mkObj [("version", usageVersion), ("noskip", noskip),
+  let j := Json.mkObj [("version", usageVersion), ("noskip", incrLoaded),
     ("moduleDigest", toJson moduleDigest),
-    ("closure", toJson (closureDigest env)),
+    ("closure", toJson (closureDigest env own)),
     ("digested", Json.arr ((digestedModules env).map nameToJson)),
     ("own", Json.arr (own.map fun (n, d) => pair n d)),
-    ("used", Json.arr ((moduleUsed env extra consts).map fun (m, cs) =>
+    ("used", Json.arr ((moduleUsed env used nodes).map fun (m, cs) =>
       Json.arr #[nameToJson m, Json.arr (cs.map fun (n, d) => pair n d)])),
     ("extra", Json.arr (extraMods.map fun u => Json.arr #[nameToJson u.module, u.isMeta]))]
   IO.FS.writeFile path j.compress
