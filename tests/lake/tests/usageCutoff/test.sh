@@ -316,6 +316,36 @@ printf 'def y := 1\ndef y2 := 2\n' > Test/BY.lean
 lake_out build -v Test.BV
 match_text "Built Test.BY" produced.out
 match_text "Replayed Test.BV" produced.out
+# compiled code can call a specialization another module created (the specialization cache), a name no kernel
+# term mentions: when that module drops it, the importer compiles again, as from scratch
+printf '@[specialize] def specMap (f : Nat → Nat) : List Nat → List Nat\n  | [] => []\n  | x :: xs => f x :: specMap f xs\n' > Test/SpB.lean
+printf 'import Test.SpB\ndef sh (xs : List Nat) : List Nat := specMap Nat.succ xs\n' > Test/SpA.lean
+printf 'import Test.SpA\ndef sk (xs : List Nat) : List Nat := specMap Nat.succ xs\n' > Test/SpM.lean
+test_run build Test.SpM
+printf 'import Test.SpB\ndef sh (xs : List Nat) : List Nat := xs\n' > Test/SpA.lean
+lake_out build -v Test.SpM
+match_text "Built Test.SpM" produced.out
+printf 'import Test.SpM\n#eval sk [1, 2, 3]\n' > Test/SpCheck.lean
+test_cmd_out "[2, 3, 4]" "$LAKE" env lean Test/SpCheck.lean
+# ... when its specializations are renumbered (here of core `List.map`)
+printf 'def ch (xs : List Nat) : List Nat × List Nat :=\n  (xs.map (· + 1), xs.map (· * 10))\n' > Test/CoA.lean
+printf 'import Test.CoA\ndef ck (xs : List Nat) : List Nat := xs.map (· * 10)\n' > Test/CoM.lean
+test_run build Test.CoM
+printf 'def ch (xs : List Nat) : List Nat × List Nat :=\n  (xs.map (· * 10), xs.map (· + 1))\n' > Test/CoA.lean
+lake_out build -v Test.CoM
+match_text "Built Test.CoM" produced.out
+printf 'import Test.CoM\n#eval ck [1, 2, 3]\n' > Test/CoCheck.lean
+test_cmd_out "[10, 20, 30]" "$LAKE" env lean Test/CoCheck.lean
+# ... and when the name now denotes another function: a `native_decide` over the importer's code must fail
+# as it does from scratch, not prove a false equation
+printf '@[specialize] def wrMap (f : Nat → Nat) : List Nat → List Nat\n  | [] => []\n  | x :: xs => f x :: wrMap f xs\n' > Test/WrB.lean
+printf 'import Test.WrB\ndef wh (xs : List Nat) : List Nat := wrMap Nat.succ xs\n' > Test/WrA.lean
+printf 'import Test.WrA\ndef wk (xs : List Nat) : List Nat := wrMap Nat.succ xs\n' > Test/WrM.lean
+test_run build Test.WrM
+printf 'import Test.WrB\ndef wh (xs : List Nat) : List Nat := wrMap (· * 10) xs\n' > Test/WrA.lean
+printf 'import Test.WrM\ntheorem bad : wk [1, 2, 3] = [10, 20, 30] := by native_decide\n' > Test/WrN.lean
+test_err "error: Test/WrN.lean" build -v Test.WrN
+match_text "Built Test.WrM" produced.out
 # control: a C body change behind a precompiled module's `@[extern]` reaches M only through `libext_X.so`, which
 # links `libleanext.so` dynamically, so its bytes and M's trace do not change. Stock Lake replays M too; cutoff
 # must match stock here, not do worse

@@ -13,6 +13,7 @@ import Lean.Compiler.LCNF.ToExpr
 import Lean.Compiler.LCNF.Level
 import Lean.Compiler.LCNF.Closure
 import Lean.Meta.Transform
+import Lean.ExtraModUses
 import Init.Omega
 namespace Lean.Compiler.LCNF
 namespace Specialize
@@ -415,6 +416,9 @@ mutual
     let argsNew := params.map (.fvar ·.fvarId) ++ getRemainingArgs paramsInfo args
     if let some declName ← findSpecCache? key then
       trace[Compiler.specialize.step] "cached: {declName}"
+      -- The compiled code calls `declName`, possibly another module's specialization, which no kernel
+      -- term of this module mentions. This records that module (nothing for a local declaration).
+      recordExtraModUseFromDecl declName (isMeta := false)
       return some (.const declName usNew argsNew)
     else
       let specDecl ← mkSpecDecl decl us argMask params decls levelParamsNew
