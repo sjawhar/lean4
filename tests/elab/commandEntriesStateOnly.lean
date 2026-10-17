@@ -1,10 +1,10 @@
 import Lean
-/-! A command that changes an extension's state without adding an entry to it (`attribute [-simp] x`, or a
-declaration attribute that erases a simp lemma) records the extension in its payload's `stateOnly`, and
-`replayCommandEntries` refuses that payload instead of replaying it without the erasure. A declaration command
-with such a change declines the module (`noskip`). An erasure inside `attribute [-simp] x in theorem …` is undone
-by the command's own scope and is not recorded. The commands after an erasure see which lemma it erased in their
-context digest (`ctx`). -/
+/-! A command that changes an extension's state without adding an entry to it (`attribute [-simp] x`, a
+declaration attribute that erases a simp lemma, or one that edits the simp state through the scoped extension's
+underlying persistent extension) records the extension in its payload's `stateOnly`, and `replayCommandEntries`
+refuses that payload instead of replaying it without the erasure. A declaration command with such a change declines
+the module (`noskip`). An erasure inside `attribute [-simp] x in theorem …` is undone by the command's own scope and
+is not recorded. The commands after an erasure see which lemma it erased in their context digest (`ctx`). -/
 open Lean
 
 def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
@@ -51,7 +51,7 @@ unsafe def elabM (dir : System.FilePath) (src : String) :
 def source (erased : Name) : String :=
   s!"import X\n@[simp] def victim : Nat := 1\n@[simp] def keep : Nat := 2\n@[simp] def other : Nat := 3\n\
     attribute [-simp] {erased}\nattribute [-simp] keep in theorem t1 : True := trivial\n\
-    @[erase_probe] def d : Nat := 0\ntheorem t2 : True := trivial\n"
+    @[erase_probe] def d : Nat := 0\ntheorem t2 : True := trivial\n@[raw_erase] def d2 : Nat := 0\n"
 
 def unfolds (env : Environment) (n : Name) : Bool := (Meta.simpExtension.getState env).isDeclToUnfold n
 
@@ -69,14 +69,21 @@ def ctxs (usage : Json) : Array Json :=
   ((usage.getObjValAs? (Array Json) "commands").toOption.getD #[]).map fun c => (c.getObjVal? "ctx").toOption.getD .null
 
 unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
-  IO.FS.writeFile (dir / "X.lean") "import Lean\nopen Lean\ninitialize registerBuiltinAttribute { name := `erase_probe, descr := \"test\", add := fun _ _ _ => Attribute.erase `keep `simp }\n"
+  IO.FS.writeFile (dir / "X.lean") "import Lean\nopen Lean\n\
+    initialize registerBuiltinAttribute { name := `erase_probe, descr := \"test\", \
+      add := fun _ _ _ => Attribute.erase `keep `simp }\n\
+    initialize registerBuiltinAttribute { name := `raw_erase, descr := \"test\", \
+      add := fun _ _ _ => modifyEnv fun env => Meta.simpExtension.ext.modifyState env fun s => \
+        { s with stateStack := s.stateStack.map fun st => { st with state := st.state.eraseCore (.decl `other) } } }\n"
   runLean dir #["-o", "X.olean", "X.lean"]
   initSearchPath (← getBuildDir) [dir]
-  -- commands: 0 victim, 1 keep, 2 other, 3 attribute [-simp] victim, 4 … in theorem t1, 5 @[erase_probe] def d, 6 t2
+  -- commands: 0 victim, 1 keep, 2 other, 3 attribute [-simp] victim, 4 … in theorem t1, 5 @[erase_probe] def d, 6 t2,
+  -- 7 @[raw_erase] def d2
   let (obs, payloads, usage) ← elabM dir (source `victim)
   IO.println s!"command 3 (attribute [-simp] victim): {← replayed obs payloads 3 `victim}"
   IO.println s!"command 4 (attribute [-simp] keep in theorem t1): {← replayed obs payloads 4 `keep}"
   IO.println s!"command 5 (@[erase_probe] def d): {← replayed obs payloads 5 `keep}"
+  IO.println s!"command 7 (@[raw_erase] def d2): {← replayed obs payloads 7 `other}"
   IO.println s!"noskip: {(usage.getObjValAs? Bool "noskip").toOption}, \
     reason: {(usage.getObjValAs? String "noskipReason").toOption}"
   IO.FS.createDirAll (dir / "v2")
