@@ -10,6 +10,7 @@ public import Lean.Compiler.NoncomputableAttr
 public import Lean.Elab.InfoTree.Types
 import Lean.ExtraModUses
 import Lean.Compiler.Old
+import Lean.Compiler.IR.CompilerM
 import Lean.Elab.InfoTree.Util
 public section
 namespace Lean.ModuleUsage
@@ -101,8 +102,14 @@ def hintsEnc (e : Enc) : ReducibilityHints → Enc
 def safetyEnc (e : Enc) : DefinitionSafety → Enc
   | .safe => e.u8 0 | .unsafe => e.u8 1 | .partial => e.u8 2
 
+/-- The parameter borrow flags of `c`'s IR declaration, explicit (`@&`) or inferred: its callers' compiled
+code follows them (who releases an argument), and `@&` is `mdata`, which `exprDigest` ignores. -/
+private def borrowEnc (e : Enc) (d : IR.Decl) : Enc :=
+  d.params.foldl (fun e p => e.bool p.borrow) (e.nat d.params.size)
+
 /-- Everything of `c` except its own name and the meaning of the constants it refers to, including what its
-importers' compiled code links against: the `@[extern]` entries and the `@[export]` name. -/
+importers' compiled code links against: the `@[extern]` entries, the `@[export]` name and the borrow flags of
+its IR parameters. -/
 def localHash (env : Environment) (c : ConstantInfo) : Digest :=
   let v := exprDigest false
   let e := ({} : Enc).names c.levelParams |>.digest (exprDigest true c.type)
@@ -110,6 +117,7 @@ def localHash (env : Environment) (c : ConstantInfo) : Digest :=
     |>.opt (getExternAttrData? env c.name) externEnc
     |>.bool (isNoncomputable env c.name)
     |>.opt (getExportNameFor? env c.name) Enc.name
+    |>.opt (IR.findEnvDecl env c.name) borrowEnc
   let e := match c with
     | .defnInfo d => hintsEnc (e.u8 1 |>.digest (v d.value)) d.hints |> (safetyEnc · d.safety)
     | .thmInfo t => e.u8 2 |>.digest (v t.value)

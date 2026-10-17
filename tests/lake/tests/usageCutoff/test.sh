@@ -346,6 +346,16 @@ printf 'import Test.WrB\ndef wh (xs : List Nat) : List Nat := wrMap (· * 10) xs
 printf 'import Test.WrM\ntheorem bad : wk [1, 2, 3] = [10, 20, 30] := by native_decide\n' > Test/WrN.lean
 test_err "error: Test/WrN.lean" build -v Test.WrN
 match_text "Built Test.WrM" produced.out
+# an importee's calling convention: dropping `@&` makes `bf` consume its argument, so the importer's compiled
+# code, which still releases it after the call, must be compiled again
+printf '@[noinline] def bf (a : @& Array Nat) : Array Nat := a.set! 0 99\n' > Test/BoB.lean
+printf 'import Test.BoB\n@[noinline] def bk (n : Nat) : Nat :=\n  let a := Array.replicate 3 n\n  let b := bf a\n  a[0]! * 1000 + b[0]!\n' > Test/BoM.lean
+test_run build Test.BoM
+printf '@[noinline] def bf (a : Array Nat) : Array Nat := a.set! 0 99\n' > Test/BoB.lean
+lake_out build -v Test.BoM
+match_text "Built Test.BoM" produced.out
+printf 'import Test.BoM\n#eval bk 2\n' > Test/BoCheck.lean
+test_cmd_out "2099" "$LAKE" env lean Test/BoCheck.lean
 # control: a C body change behind a precompiled module's `@[extern]` reaches M only through `libext_X.so`, which
 # links `libleanext.so` dynamically, so its bytes and M's trace do not change. Stock Lake replays M too; cutoff
 # must match stock here, not do worse
