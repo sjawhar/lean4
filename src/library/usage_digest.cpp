@@ -4,8 +4,14 @@ Released under Apache 2.0 license as described in the file LICENSE.
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
 #include <memory>
 #include <vector>
+#if defined(LEAN_WINDOWS)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 #include "runtime/io.h"
 #include "runtime/object_ref.h"
 #include "kernel/expr.h"
@@ -265,18 +271,29 @@ extern "C" LEAN_EXPORT obj_res lean_usage_expr_digest(uint8 binders, b_obj_arg e
 }
 
 /* The XXH3-128 hash of a file's bytes, read in fixed-size chunks; `hi` is its high 64 bits, so `Digest.hex`
-prints it as `xxhsum -H2` does. */
+prints it as `xxhsum -H2` does. The file is opened as `lean_io_prim_handle_mk` opens it, so processes spawned
+meanwhile do not inherit the descriptor. */
 extern "C" LEAN_EXPORT obj_res lean_usage_file_digest(b_obj_arg path) {
     char const * fname = string_cstr(path);
     if (strlen(fname) != lean_string_size(path) - 1) {
         return mk_embedded_nul_error(path);
     }
-    FILE * f = fopen(fname, "rb");
-    if (f == nullptr) {
+    constexpr size_t chunk = 1 << 18;
+    std::unique_ptr<unsigned char[]> buf(new unsigned char[chunk]);  // not zero-filled: only bytes `fread` wrote are hashed
+#if defined(LEAN_WINDOWS)
+    int fd = open(fname, O_RDONLY | O_BINARY | O_NOINHERIT);
+#else
+    int fd = open(fname, O_RDONLY | O_CLOEXEC);
+#endif
+    if (fd == -1) {
         return io_result_mk_error(decode_io_error(errno, path));
     }
-    constexpr size_t chunk = 1 << 18;
-    std::unique_ptr<unsigned char[]> buf(new unsigned char[chunk]);
+    FILE * f = fdopen(fd, "rb");
+    if (f == nullptr) {
+        int err = errno;
+        close(fd);
+        return io_result_mk_error(decode_io_error(err, path));
+    }
     XXH3_state_t state;
     XXH3_128bits_reset(&state);
     size_t n;
