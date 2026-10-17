@@ -57,15 +57,28 @@ test_cmd_fails grep -qx P.A t1.log
 test_cmd grep -q '"kf"' "t1/$OUT/B.trace"
 test_run -d t1 build P --no-build
 
-# The request names the module, its `.olean` by absolute path, and its setup: the non-toolchain
-# import closure and the module's options
+# The request names the module, its `.olean` and source by absolute path, and its setup: the
+# non-toolchain import closure and the module's options
 grep -F '"module":"P.B"' t1.log.json > b1.req
 test_cmd grep -qE '"olean":"/[^"]*/t1/\.lake/build/lib/lean/P/B\.olean"' b1.req
+test_cmd grep -qE '"src":"/[^"]*/t1/P/B\.lean"' b1.req
 test_cmd grep -qF '"P.A"' b1.req
 test_cmd_fails grep -qF '"P.C"' b1.req
 test_cmd_fails grep -qF '"Init"' b1.req
 test_cmd grep -qF '"maxRecDepth":700' b1.req
 test_cmd grep -qF '"maxHeartbeats":300000' b1.req
+
+# The checker gets the toolchain's sysroot as `LEAN_SYSROOT`, also when Lake runs without one in its environment
+# (the test itself runs under `lake env`, which sets it) and without `lean` on PATH
+mkp t1s
+test_run -d t1s build P
+seta t1s 2
+SYSROOT=$("$LAKE" -d t1s env printenv LEAN_SYSROOT)
+test_exp -n "$SYSROOT"
+export STUB_LOG="$PWD/t1s.log"
+env -u LEAN_SYSROOT PATH=/usr/bin:/bin LAKE_KEPT_CHECKER="$STUB" "$(command -v "$LAKE")" -d t1s build P > t1s.out 2>&1
+test_cmd grep -q 'Checked P.B' t1s.out
+test_exp "$(sort -u t1s.log.sysroot)" = "$SYSROOT"
 
 # Rejected: compiled, and not marked kept
 mkp t2

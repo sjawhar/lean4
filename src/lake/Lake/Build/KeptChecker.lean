@@ -18,13 +18,14 @@ import Init.Data.String.TakeDrop
 A kept-module checker is an external process that decides whether a module's existing `.olean`
 still holds against the module's current imports, so that Lake can record it as up to date
 without compiling the module. Lake starts it on the first request of a build (the command in
-`LAKE_KEPT_CHECKER`), writes one JSON request per line to its standard input, and reads one JSON
-reply per line from its standard output, matched to requests by `id`. Requests may be answered in
-any order.
+`LAKE_KEPT_CHECKER`, with `LEAN_SYSROOT` set to the toolchain's sysroot), writes one JSON request per
+line to its standard input, and reads one JSON reply per line from its standard output, matched to
+requests by `id`. Requests may be answered in any order.
 
-Request: `{"v": 1, "id": N, "module": "<name>", "olean": "<absolute path>", "setup": <setup>}`,
-where `<setup>` is the module's `ModuleSetup` (its `.setup.json`), whose `importArts` names the
-`.olean` of every non-toolchain module in its import closure.
+Request: `{"v": 1, "id": N, "module": "<name>", "olean": "<absolute path>", "src": "<absolute path>",
+"setup": <setup>}`, where `src` is the module's source file and `<setup>` is the module's `ModuleSetup`
+(its `.setup.json`), whose `importArts` names the `.olean` of every non-toolchain module in its import
+closure.
 
 Reply: `{"id": N, "ok": true, "oleanHash": "<hash of the .olean bytes read>"}` or
 `{"id": N, "ok": false, "reason": "<text>"}`.
@@ -67,6 +68,8 @@ public structure KeptChecker.State where
 /-- A client of a kept-module checker, shared by the jobs of one build. -/
 public structure KeptChecker where
   cmd : String
+  /-- The toolchain's sysroot, passed to the checker as `LEAN_SYSROOT`. -/
+  sysroot : System.FilePath
   /-- Milliseconds without a reply, while requests are outstanding, before the checker is killed. -/
   timeoutMs : Nat
   state : Std.Mutex KeptChecker.State
@@ -76,8 +79,8 @@ namespace KeptChecker
 /-- Checkers started per build: the first, and three after one has died. -/
 public def maxSpawns : Nat := 4
 
-public def new (cmd : String) (timeoutMs : Nat) : BaseIO KeptChecker := do
-  return {cmd, timeoutMs, state := ← Std.Mutex.new {}}
+public def new (cmd : String) (sysroot : System.FilePath) (timeoutMs : Nat) : BaseIO KeptChecker := do
+  return {cmd, sysroot, timeoutMs, state := ← Std.Mutex.new {}}
 
 /-- Rejects every outstanding request of checker number `gen`, if it is still the running one. -/
 def died (self : KeptChecker) (gen : Nat) (reason : String) : BaseIO Unit := do
@@ -141,16 +144,17 @@ partial def watch (self : KeptChecker) : IO Unit := do
 def spawn (self : KeptChecker) : IO (Proc × IO.FS.Handle) := do
   let child ← IO.Process.spawn {
     cmd := self.cmd
+    env := #[("LEAN_SYSROOT", some self.sysroot.toString)]
     stdin := .piped, stdout := .piped, stderr := .inherit
   }
   let (stdin, proc) ← child.takeStdin
   return (proc, stdin)
 
 /--
-Asks the checker whether `olean`, the existing `.olean` of `module`, holds against the imports
-described by `setup`. Blocks until the checker answers or is found dead.
+Asks the checker whether `olean`, the existing `.olean` of `module` (compiled from `src`), holds
+against the imports described by `setup`. Blocks until the checker answers or is found dead.
 -/
-public def check (self : KeptChecker) (module : Name) (olean : System.FilePath) (setup : Json)
+public def check (self : KeptChecker) (module : Name) (olean src : System.FilePath) (setup : Json)
 : IO KeptVerdict := do
   let promise ← IO.Promise.new
   let failed? ← self.state.atomically do
@@ -173,7 +177,7 @@ public def check (self : KeptChecker) (module : Name) (olean : System.FilePath) 
     let id := s.nextId
     let request := Json.mkObj [
       ("v", toJson (1 : Nat)), ("id", toJson id), ("module", toJson module.toString),
-      ("olean", toJson olean.toString), ("setup", setup)
+      ("olean", toJson olean.toString), ("src", toJson src.toString), ("setup", setup)
     ]
     let lastProgress ← if s.pending.isEmpty then IO.monoMsNow else pure s.lastProgress
     set {s with nextId := id + 1, pending := s.pending.insert id promise, lastProgress}
