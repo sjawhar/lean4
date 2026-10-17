@@ -66,18 +66,27 @@ public structure BuildMetadata where
   log : Log
   /-- A trace file that was created from fetching an artifact from the cache. -/
   synthetic : Bool
+  /--
+  For a module, the hash of its inputs other than its imports (`ModulePreSetup.localTrace`). It is
+  kept out of `outputs?`, which a module archive (`.ltar`) carries,
+  so that an archive's contents depend only on the module's outputs.
+  -/
+  localHash? : Option Hash := none
 
 /-- The current version of the trace file format. -/
 def BuildMetadata.schemaVersion : String := "2025-09-10"
 
 public protected def BuildMetadata.toJson (self : BuildMetadata) : Json :=
-  ({} : JsonObject)
-  |>.insert "schemaVersion" schemaVersion
-  |>.insert "depHash" self.depHash
-  |>.insert "inputs" self.inputs
-  |>.insert "outputs" self.outputs?
-  |>.insert "log" self.log
-  |>.insert "synthetic" self.synthetic
+  let obj := ({} : JsonObject)
+    |>.insert "schemaVersion" schemaVersion
+    |>.insert "depHash" self.depHash
+    |>.insert "inputs" self.inputs
+    |>.insert "outputs" self.outputs?
+    |>.insert "log" self.log
+    |>.insert "synthetic" self.synthetic
+  match self.localHash? with
+  | some hash => obj.insert "localHash" hash
+  | none => obj
 
 public instance : ToJson BuildMetadata := ⟨BuildMetadata.toJson⟩
 
@@ -99,7 +108,8 @@ public def BuildMetadata.fromJsonObject? (obj : JsonObject) : Except String Buil
   let outputs? ← obj.getD "outputs" none
   let log ← obj.getD "log" {}
   let synthetic ← obj.getD "synthetic" false
-  return {depHash, inputs, outputs?, log, synthetic}
+  let localHash? ← obj.get? "localHash"
+  return {depHash, inputs, outputs?, log, synthetic, localHash?}
 
 public protected def BuildMetadata.fromJson? (json : Json) : Except String BuildMetadata := do
   match json with
@@ -128,8 +138,10 @@ public def BuildMetadata.parse (contents : String) : Except String BuildMetadata
   Json.parse contents >>= fromJson?
 
 /-- Construct build metadata from a cached input-to-output mapping. -/
-public def BuildMetadata.ofFetch (inputHash : Hash) (outputs : Json) : BuildMetadata :=
-  {depHash := inputHash, outputs? := outputs, synthetic := true, inputs := #[], log := {}}
+public def BuildMetadata.ofFetch
+  (inputHash : Hash) (outputs : Json) (localHash? : Option Hash := none)
+: BuildMetadata :=
+  {depHash := inputHash, outputs? := outputs, synthetic := true, inputs := #[], log := {}, localHash?}
 
 partial def serializeInputs (inputs : Array BuildTrace) : Array (String × Json) :=
   inputs.foldl (init := {}) fun r trace =>
@@ -141,18 +153,19 @@ partial def serializeInputs (inputs : Array BuildTrace) : Array (String × Json)
     r.push (trace.caption, val)
 
 def BuildMetadata.ofBuildCore
-  (depTrace : BuildTrace) (outputs : Json) (log : Log)
+  (depTrace : BuildTrace) (outputs : Json) (log : Log) (localHash? : Option Hash := none)
 : BuildMetadata where
   inputs := serializeInputs depTrace.inputs
   depHash := depTrace.hash
   outputs? := outputs
   synthetic := false
   log
+  localHash?
 
 /-- Construct trace file contents from a build's trace, outputs, and log. -/
 @[inline] public def BuildMetadata.ofBuild
-   [ToJson α]  (depTrace : BuildTrace) (outputs : α) (log : Log)
-:= BuildMetadata.ofBuildCore depTrace (toJson outputs) log
+   [ToJson α]  (depTrace : BuildTrace) (outputs : α) (log : Log) (localHash? : Option Hash := none)
+:= BuildMetadata.ofBuildCore depTrace (toJson outputs) log localHash?
 
 /-- The state of the trace file data saved on the file system. -/
 public inductive SavedTrace
@@ -184,13 +197,16 @@ public def BuildMetadata.writeFile (path : FilePath) (data : BuildMetadata) : IO
   IO.FS.writeFile path (toJson data).pretty
 
 /-- Write a trace file containing metadata on an artifact fetched from a cache. -/
-@[inline] public def writeFetchTrace (path : FilePath) (inputHash : Hash) (outputs : Json) : IO Unit :=
-  BuildMetadata.writeFile path (.ofFetch inputHash outputs)
+@[inline] public def writeFetchTrace
+  (path : FilePath) (inputHash : Hash) (outputs : Json) (localHash? : Option Hash := none)
+: IO Unit :=
+  BuildMetadata.writeFile path (.ofFetch inputHash outputs localHash?)
 
 /-- Write a trace file containing metadata about a build. -/
 @[inline] public def writeBuildTrace
   [ToJson α] (path : FilePath) (depTrace : BuildTrace) (outputs : α) (log : Log)
-: IO Unit := BuildMetadata.writeFile path (.ofBuild depTrace outputs log)
+  (localHash? : Option Hash := none)
+: IO Unit := BuildMetadata.writeFile path (.ofBuild depTrace outputs log localHash?)
 
 /-- Indicator of whether a build's output(s) are up-to-date. -/
 public inductive OutputStatus
@@ -312,13 +328,13 @@ open ToOutputJson in
 Runs `build` as a build action of kind `action`.
 
 The build's input trace (`depTrace`), JSON description of the result of `build`,
-and log are saved to `traceFile`, if the build completes without a fatal error
-(i.e., it does not `throw`).
+and log are saved to `traceFile` (with `localHash?`, see `BuildMetadata.localHash?`),
+if the build completes without a fatal error (i.e., it does not `throw`).
 -/
 @[specialize] public def buildAction
   [ToOutputJson α]
   (depTrace : BuildTrace) (traceFile : FilePath) (build : JobM α)
-  (action : JobAction := .build)
+  (action : JobAction := .build) (localHash? : Option Hash := none)
 : JobM α := do
   updateAction action
   let noBuildTraceFile := traceFile.addExtension "nobuild"
@@ -333,7 +349,7 @@ and log are saved to `traceFile`, if the build completes without a fatal error
       let iniPos ← getLogPos
       let a ← build -- fatal errors will abort here
       let log := (← getLog).takeFrom iniPos
-      writeBuildTrace traceFile depTrace (toOutputJson a) log
+      writeBuildTrace traceFile depTrace (toOutputJson a) log localHash?
       removeFileIfExists noBuildTraceFile
       return a
     finally

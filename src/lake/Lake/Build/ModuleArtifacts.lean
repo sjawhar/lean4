@@ -28,6 +28,12 @@ public structure ModuleOutputDescrs where
   /-- Usage-cutoff sidecars (`.usage`, `.usekey`), when the build wrote them. -/
   usage? : Option ArtifactDescr := none
   usekey? : Option ArtifactDescr := none
+  /--
+  Set when the outputs were not compiled for this input but kept: a kept-module checker accepted
+  them for imports other than those they were compiled against. The input hash of the build that
+  compiled them.
+  -/
+  keptFrom? : Option Hash := none
 
 public def ModuleOutputDescrs.oleanParts (self : ModuleOutputDescrs) : Array ArtifactDescr := Id.run do
   let mut descrs := #[self.olean]
@@ -56,6 +62,8 @@ public protected def ModuleOutputDescrs.toJson (self : ModuleOutputDescrs) : Jso
     obj := obj.insert "u" usage
   if let some usekey := self.usekey? then
     obj := obj.insert "k" usekey
+  if let some hash := self.keptFrom? then
+    obj := obj.insert "kf" hash
   return obj
 
 public instance : ToJson ModuleOutputDescrs := ⟨ModuleOutputDescrs.toJson⟩
@@ -78,6 +86,7 @@ public protected def ModuleOutputDescrs.fromJson? (val : Json) : Except String M
     ltar? := ← obj.get? "l"
     usage? := ← obj.get? "u"
     usekey? := ← obj.get? "k"
+    keptFrom? := ← obj.get? "kf"
   }
 
 public instance : FromJson ModuleOutputDescrs := ⟨ModuleOutputDescrs.fromJson?⟩
@@ -97,6 +106,8 @@ public structure ModuleOutputArtifacts where
   /-- Usage-cutoff sidecars (`.usage`, `.usekey`), when the build wrote them. -/
   usage? : Option Artifact := none
   usekey? : Option Artifact := none
+  /-- See `ModuleOutputDescrs.keptFrom?`. -/
+  keptFrom? : Option Hash := none
 
 /-- Content hashes of the artifacts. -/
 public def ModuleOutputArtifacts.descrs (arts : ModuleOutputArtifacts) : ModuleOutputDescrs where
@@ -112,3 +123,4 @@ public def ModuleOutputArtifacts.descrs (arts : ModuleOutputArtifacts) : ModuleO
   ltar? := arts.ltar?.map (·.descr)
   usage? := arts.usage?.map (·.descr)
   usekey? := arts.usekey?.map (·.descr)
+  keptFrom? := arts.keptFrom?

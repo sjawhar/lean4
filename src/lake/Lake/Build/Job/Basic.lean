@@ -40,6 +40,11 @@ Tried to fetch a build from a remote store (e.g., set when downloading an artifa
 on-demand from a cache service in `buildArtifactUnlessUpToDate`).
 -/
 | fetch
+/--
+Kept a module's existing outputs after a kept-module checker accepted them for the module's
+current imports (see `BuildContext.keptChecker?`).
+-/
+| check
 /-- Tried to perform a build action (e.g., set by `buildAction`). -/
 | build
 deriving Inhabited, Repr, DecidableEq, Ord
@@ -60,6 +65,7 @@ public def verb (failed : Bool) : (self : JobAction) → String
 | .replay => if failed then "Replaying" else "Replayed"
 | .unpack => if failed then "Unpacking" else "Unpacked"
 | .fetch => if failed then "Fetching" else "Fetched"
+| .check => if failed then "Checking" else "Checked"
 | .build => if failed then "Building" else "Built"
 
 end JobAction
