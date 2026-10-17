@@ -20,6 +20,7 @@ import Lean.Compiler.LCNF.Simp.ConstantFold
 import Lean.ReducibilityAttrs
 import Lean.Meta.Instances
 import Lean.Class
+import Lean.Meta.UnificationHint
 import Lean.Elab.InfoTree.Util
 public section
 
@@ -71,12 +72,16 @@ def refs (env : Environment) (c : ConstantInfo) (recorded : NameMap DeclConsts :
   let s := match Compiler.getImplementedBy? env c.name with | some t => s.insert t | none => s
   s.toArray.qsort Name.quickLt
 
-/-- For `g._at_.o`, `o`: the components after the last `_at_`. -/
+/-- For a specialization prefix `g._at_.o` (a specialization of `g` that `o` created), `o`: the components after
+the first `_at_`. A specialization created inside another specialization is `g._at_.g'._at_.o.spec_M`, whose
+creator `g'._at_.o.spec_M` is itself a specialization name that strips to `o`. Folding does not depend on the
+result being the creator: writer and reader strip the same way, and an owner's digest covers whatever folds into
+it. -/
 def atOwner? (p : Name) : Option Name :=
   let cs := p.components
-  match cs.reverse.findIdx? (· == `_at_) with
+  match cs.findIdx? (· == `_at_) with
   | some j =>
-    let o := (cs.drop (cs.length - j)).foldl Name.append .anonymous
+    let o := (cs.drop (j + 1)).foldl Name.append .anonymous
     if o.isAnonymous then none else some o
   | none => none
 
@@ -110,11 +115,17 @@ def ownerOf (isNode : Name → Bool) (x : Name) : Name := Id.run do
 structure State where
   /-- Per imported module: empty if its `.olean` carries no digests (written without `lean --usage`, or by a
   toolchain without this extension); otherwise a marker entry at index 0, then the module's digests sorted by
-  name. The marker's own name is never looked up, so no user constant can collide with it. -/
+  name. The marker's own name is never looked up, so no user constant can collide with it; its digest is
+  `compilerCodeMark` if the module's compiles ran code inside the compiler (`compilerCodeRef`), else zero. -/
   importedModuleEntries : Array (Array (Name × Digest)) := #[]
   /-- The current module's digests, if `setLocalDigests` stored them for the `.olean` write. -/
   localDigests? : Option (Array (Name × Digest)) := none
+  /-- Whether the current module's compiles ran code inside the compiler, stored by `setLocalDigests`. -/
+  localCompilerCode : Bool := false
 instance : Inhabited State := ⟨{}⟩
+
+/-- The marker entry's digest for a module whose compiles ran code inside the compiler. -/
+def compilerCodeMark : Digest := ⟨0, 1⟩
 
 /-- The digest of node `c` if module `i` (the module defining `c`) wrote one. -/
 def State.findAt? (s : State) (i : ModuleIdx) (c : Name) : Option Digest := do
@@ -127,6 +138,12 @@ def State.find? (s : State) (env : Environment) (c : Name) : Option Digest := do
 /-- Whether module `i`'s `.olean` carries digests (it has the marker entry). -/
 def State.hasEntries (s : State) (i : ModuleIdx) : Bool :=
   !(s.importedModuleEntries[i.toNat]?.getD #[]).isEmpty
+
+/-- Whether module `i`'s `.olean` carries digests and says its compiles ran code inside the compiler. -/
+def State.compilerCodeAt (s : State) (i : ModuleIdx) : Bool :=
+  match s.importedModuleEntries[i.toNat]?.bind (·[0]?) with
+  | some (_, d) => d == compilerCodeMark
+  | none => false
 
 /-- The node of the imported name `x`, found in its defining module's digests: a module's nodes are its
 kernel constants and the compiler-only names that fold into none (`ownNodes`), so the first of `x`'s
@@ -145,7 +162,8 @@ builtin_initialize ext : PersistentEnvExtension (Name × Digest) (Name × Digest
     -- Private level only: digests cover private constants and unexposed bodies, which must not change the
     -- exported `.olean` of a `module` file. Non-module files are written and read at the private level.
     exportEntriesFnEx := fun _ s =>
-      let es := s.localDigests?.elim #[] (#[(.anonymous, default)] ++ ·)
+      let mark := if s.localCompilerCode then compilerCodeMark else default
+      let es := s.localDigests?.elim #[] (#[(.anonymous, mark)] ++ ·)
       { exported := #[], server := #[], «private» := es }
     asyncMode := .mainOnly
   }
@@ -221,10 +239,11 @@ def compute (env : Environment) (s : State) (nodes : Array Node) : Array (Name �
 def localDigests (env : Environment) (nodes := ownNodes env (ownConsts env)) : Array (Name × Digest) :=
   compute env (state env) nodes
 
-/-- Stores `own` (`localDigests env`) for the extension to export. Without it, the `.olean` carries no
-digests. -/
-def setLocalDigests (env : Environment) (own : Array (Name × Digest)) : Environment :=
-  ext.modifyState (asyncMode := .mainOnly) env ({ · with localDigests? := some own })
+/-- Stores `own` (`localDigests env`) and whether the module's compiles ran code inside the compiler
+(`compilerCodeRef`) for the extension to export. Without it, the `.olean` carries no digests. -/
+def setLocalDigests (env : Environment) (own : Array (Name × Digest)) (compilerCode : Bool) : Environment :=
+  ext.modifyState (asyncMode := .mainOnly) env
+    ({ · with localDigests? := some own, localCompilerCode := compilerCode })
 
 /-- Per defining module, sorted: the node of every imported name that the current module's nodes refer to or
 that is in `extra`, with its digest. Names without a digest (from a module whose `.olean` carries none) are left
@@ -292,13 +311,6 @@ opaque usedFromInfoTrees (trees : Array Elab.InfoTree) (init : NameSet) : NameSe
 /-! Cross-module compiler tables: entries a module adds for declarations of other modules, which change how
 every importer compiles without changing any digest of those declarations. -/
 
-private def attrKindEnc (e : Enc) : AttributeKind → Enc
-  | .global => e.u8 0 | .local => e.u8 1 | .scoped => e.u8 2
-
-private def scopedEnc {α : Type} (f : Enc → α → Enc) (e : Enc) : ScopedEnvExtension.Entry α → Enc
-  | .global a => f (e.u8 0) a
-  | .scoped ns a => f (e.u8 1 |>.name ns) a
-
 /-- Whether `n` is defined in module `i` (`none`: the current module). -/
 private def definedIn (env : Environment) (i? : Option ModuleIdx) (n : Name) : Bool :=
   env.getModuleIdxFor? n == i?
@@ -313,9 +325,11 @@ private def pickEntries {α : Type} (i? : Option ModuleIdx) (imported : ModuleId
 
 /-- A digest of one module's entries in the cross-module compiler tables: `@[csimp]` replacements, instances
 and classes declared for another module's declaration, reducibility set for another module's declaration,
-`@[cpass]` installers and constant folders, each installer and folder with its declaration's digest
-(`digestOf`). `i? = none` is the current module. -/
-def tableDigest (env : Environment) (i? : Option ModuleIdx) (digestOf : Name → Option Digest) : Digest := Id.run do
+unification hints, `@[cpass]` installers and constant folders, each hint, installer and folder with its
+declaration's digest (`digestOf`), together with whether the module's compiles ran code inside the compiler
+(`compilerCode`). `i? = none` is the current module. -/
+def tableDigest (env : Environment) (i? : Option ModuleIdx) (digestOf : Name → Option Digest)
+    (compilerCode : Bool) : Digest := Id.run do
   let csimp := pickEntries i? (Compiler.CSimp.ext.ext.getModuleEntries env ·)
     (Compiler.CSimp.ext.ext.getState env).newEntries
   let insts := pickEntries i? (Meta.instanceExtension.ext.getModuleEntries env ·)
@@ -330,22 +344,20 @@ def tableDigest (env : Environment) (i? : Option ModuleIdx) (digestOf : Name →
     (Compiler.LCNF.passManagerExt.getState env).1
   let folders := pickEntries i? (Compiler.LCNF.Simp.ConstantFold.folderExt.getModuleEntries env ·)
     ((Compiler.LCNF.Simp.ConstantFold.folderExt.getState env).1.map (·.toFolderOleanEntry))
+  let hints := pickEntries i? (Meta.unificationHintExtension.ext.getModuleEntries env ·)
+    (Meta.unificationHintExtension.ext.getState env).newEntries
   let withDigest (e : Enc) (n : Name) := e.name n |>.opt (digestOf n) Enc.digest
-  let mut e : Enc := ({} : Enc).nat csimp.size
+  let mut e : Enc := ({} : Enc).bool compilerCode |>.nat csimp.size
   for x in csimp do
     e := scopedEnc (fun e (c : Compiler.CSimp.Entry) =>
       let ⟨fromDeclName, toDeclName, thmName⟩ := c
       e.name fromDeclName |>.name toDeclName |>.name thmName) e x
   e := e.nat insts.size
   for x in insts do
-    e := scopedEnc (fun e (a : Meta.InstanceEntry) =>
-      e.opt a.globalName? Enc.name |>.nat a.priority |> (attrKindEnc · a.attrKind)) e x
+    e := scopedEnc instanceEntryEnc e x
   e := e.nat reds.size
   for x in reds do
-    e := scopedEnc (fun e ((n, st) : Name × ReducibilityStatus) =>
-      e.name n |>.u8 (match st with
-        | .reducible => 0 | .semireducible => 1 | .irreducible => 2 | .implicitReducible => 3
-        | .instanceReducible => 4)) e x
+    e := scopedEnc (fun e ((n, st) : Name × ReducibilityStatus) => reducibilityEnc (e.name n) st) e x
   e := e.nat classes.size
   for c in classes do
     let ⟨name, outParams, outLevelParams⟩ := c
@@ -356,26 +368,27 @@ def tableDigest (env : Environment) (i? : Option ModuleIdx) (digestOf : Name →
   for f in folders do
     let ⟨declName, folderDeclName⟩ := f
     e := withDigest (e.name declName) folderDeclName
+  e := e.nat hints.size
+  for x in hints do
+    e := scopedEnc (fun e (h : Meta.UnificationHintEntry) => withDigest e h.val) e x
   return e.finish
 
-/-- Whether module `i` adds `@[cpass]` installers or constant folders: code that runs inside the compiler. -/
-def addsCompilerCode (env : Environment) (i : ModuleIdx) : Bool :=
-  !(Compiler.LCNF.passManagerExt.getModuleEntries env i).isEmpty ||
-  !(Compiler.LCNF.Simp.ConstantFold.folderExt.getModuleEntries env i).isEmpty
-
-/-- A digest of the module's import closure: its sorted module names, and for every module (imported ones with
-digests, and the current one) the digest of its cross-module compiler tables (`tableDigest`). Importers compare
-it through Lake's `closureHash`, so a change to any module's tables rebuilds every module downstream. -/
-def closureDigest (env : Environment) (own : Array (Name × Digest)) : Digest := Id.run do
+/-- A digest of the module's import closure: its modules in import order (`env.header.moduleNames`, the order
+in which every compiler table applies their entries, so that the last import wins where entries conflict), and
+for every module (imported ones with digests, and the current one) the digest of its cross-module compiler
+tables and compiler-code bit (`tableDigest`). Importers compare it through Lake's `closureHash`, so a change to
+any module's tables or bit, or to the import order, rebuilds every module downstream. -/
+def closureDigest (env : Environment) (own : Array (Name × Digest)) (compilerCode : Bool) : Digest := Id.run do
   let s := state env
   let ownMap : Std.HashMap Name Digest := own.foldl (fun m (n, d) => m.insert n d) {}
   let digestOf (n : Name) : Option Digest := ownMap[n]? <|> s.find? env n
-  let mods := env.header.moduleNames.zipIdx.qsort (fun a b => Name.quickLt a.1 b.1)
+  let mods := env.header.moduleNames
   let mut e : Enc := ({} : Enc).nat mods.size
-  for (m, i) in mods do
+  for (m, i) in mods.zipIdx do
     e := e.name m
-    e := e.opt (if s.hasEntries i then some (tableDigest env (some i) digestOf) else none) Enc.digest
-  return e.digest (tableDigest env none digestOf) |>.finish
+    e := e.opt (if s.hasEntries i then some (tableDigest env (some i) digestOf (s.compilerCodeAt i)) else none)
+      Enc.digest
+  return e.digest (tableDigest env none digestOf compilerCode) |>.finish
 
 /-- The imported modules whose `.olean` carries digests (`State.hasEntries`), sorted. -/
 def digestedModules (env : Environment) : Array Name :=
@@ -385,21 +398,22 @@ def digestedModules (env : Environment) : Array Name :=
 
 /-- The format version of the `.usage` sidecar and of Lake's `.usekey`; Lake reads a sidecar of any other
 version as absent. -/
-def usageVersion : Nat := 6
+def usageVersion : Nat := 7
 
 /-- `own` is `localDigests env nodes`; `used` holds the imported names recorded while elaborating
-(`moduleUsed`'s `extra`). The extra module uses are the environment's and `extraModUsesByChecksRef`'s (those of
-commands whose environment was discarded). If an imported module with digests adds code that runs inside the
-compiler (`addsCompilerCode`), every imported module with digests is an extra use: whether a specialization is
-reused from another module's cache is then not known to be harmless. `noskip` is set when the run reused
-commands from an `--incr-load` snapshot, since reused commands never call `addDecl` in this process and `used`
-may miss constants they used. -/
+(`moduleUsed`'s `extra`); `compilerCode` says whether the module's compiles ran code inside the compiler
+(`compilerCodeRef`). The extra module uses are the environment's and `extraModUsesByChecksRef`'s (those of
+commands whose environment was discarded). If the module's compiles or those of any imported module with
+digests ran code inside the compiler, every imported module with digests is an extra use: a specialization
+reused from another module's cache then need not compute what the module's own one does. `noskip` is set when
+the run reused commands from an `--incr-load` snapshot, since reused commands never call `addDecl` in this
+process and `used` may miss constants they used. -/
 def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Digest)) (used : NameSet)
-    (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
+    (compilerCode : Bool) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
   let s := state env
   let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecksRef.get)
   let digested := env.header.moduleNames.zipIdx.filter fun (_, i) => s.hasEntries i
-  let allExtra := if digested.any (addsCompilerCode env ·.2) then
+  let allExtra := if compilerCode || digested.any (s.compilerCodeAt ·.2) then
       digested.foldl (fun u (m, _) => u.insert { module := m, isExported := false, isMeta := false }) allExtra
     else allExtra
   let extraMods := allExtra.toArray.filter (fun u => (env.getModuleIdx? u.module).any s.hasEntries)
@@ -409,7 +423,7 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
   let moduleDigest := (own.foldl (fun e (n, d) => e.name n |>.digest d) (({} : Enc).nat own.size)).finish
   let j := Json.mkObj [("version", usageVersion), ("noskip", incrLoaded),
     ("moduleDigest", toJson moduleDigest),
-    ("closure", toJson (closureDigest env own)),
+    ("closure", toJson (closureDigest env own compilerCode)),
     ("digested", Json.arr ((digestedModules env).map nameToJson)),
     ("own", Json.arr (own.map fun (n, d) => pair n d)),
     ("used", Json.arr ((moduleUsed env used nodes).map fun (m, cs) =>

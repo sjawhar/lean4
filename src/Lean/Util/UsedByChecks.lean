@@ -25,6 +25,13 @@ the replacement of a `@[csimp]` theorem, and every declaration the IR interprete
 @[export lean_usage_record_used]
 def recordUsedName (n : Name) : BaseIO Unit := do
   if (← usageRecordingRef.get) then usedByChecksRef.modify (·.insert n)
+/-- Whether a compile in this process, while recording is on, ran with passes or constant folders beyond the
+built-in ones (`Lean.Compiler.LCNF.main`): code that runs inside the compiler and can change what a
+specialization computes. -/
+builtin_initialize compilerCodeRef : IO.Ref Bool ← IO.mkRef false
+/-- Sets `compilerCodeRef` when recording is on. -/
+def recordCompilerCode : BaseIO Unit := do
+  if (← usageRecordingRef.get) then compilerCodeRef.set true
 /-- The constants of a declaration's type and value, with that type and value. -/
 structure DeclConsts where
   type : Expr

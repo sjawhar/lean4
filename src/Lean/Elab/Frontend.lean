@@ -392,17 +392,18 @@ def runFrontend
   let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
   if let some oleanFileName := oleanFileName? then
     let recorded ← declConstsRef.get
+    let compilerCode ← compilerCodeRef.get
     let usage? := usageFileName?.map fun usageFileName =>
       let nodes := ModuleUsage.ownNodes env (ModuleUsage.ownConsts env recorded)
       (usageFileName, nodes, ModuleUsage.localDigests env nodes)
     profileitIO ".olean serialization" finalOpts do
       let commandLints := collectCommandLints snaps none #[]
       let env ← Linter.recordLints inputCtx.fileMap env commandLints
-      let env := usage?.elim env fun (_, _, own) => ModuleUsage.setLocalDigests env own
+      let env := usage?.elim env fun (_, _, own) => ModuleUsage.setLocalDigests env own compilerCode
       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
     if let some (usageFileName, nodes, own) := usage? then
       let used := ModuleUsage.usedFromInfoTrees trees (← usedByChecksRef.get)
-      ModuleUsage.writeUsage env nodes own used (incrLoaded := incrLoadFileName?.isSome)
+      ModuleUsage.writeUsage env nodes own used compilerCode (incrLoaded := incrLoadFileName?.isSome)
         usageFileName
 
   if let some ileanFileName := ileanFileName? then

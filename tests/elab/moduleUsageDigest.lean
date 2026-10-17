@@ -23,7 +23,7 @@ noncomputable def c1 : Nat := 0
 #eval show CommandElabM Unit from do
   let env ← getEnv
   let lh n := ModuleUsage.localHash (env.find? n).get!
-  let la n := (ModuleUsage.attrsEnc env n { e := {} }).e.finish
+  let la n := (ModuleUsage.attrsEnc env (ModuleUsage.LocalCompiled.ofEnv env) n { e := {} }).e.finish
   let ds := (ModuleUsage.localDigests env).toList
   let dg n := (ds.lookup n).get!
   logInfo m!"{lh ``f == lh ``f'} {lh ``h == lh ``h'} {lh ``t1 == lh ``t2} {lh ``k0 == lh ``k1} {dg ``g == dg ``g'} {la ``c0 == la ``c1} {la ``e0 == la ``e1} {la ``x0 == la ``x1} {la ``f == la ``f'}"

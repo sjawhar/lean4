@@ -19,8 +19,9 @@ import Lean.Compiler.InitAttr
 import Lean.Compiler.Specialize
 import Lean.Compiler.MetaAttr
 public import Lean.ReducibilityAttrs
-import Lean.Meta.Instances
+public import Lean.Meta.Instances
 import Lean.Class
+import Lean.Meta.Match.MatchPatternAttr
 public section
 
 /-!
@@ -281,39 +282,64 @@ partial def summaryEnc (s : CEnc) : LCNF.UnreachableBranches.Value → CEnc
   | .ctor i vs => vs.foldl summaryEnc (s.u8 2 |>.decl i |>.nat vs.size)
   | .choice vs => vs.foldl summaryEnc (s.u8 3 |>.nat vs.length)
 
-def reducibilityEnc (s : CEnc) : ReducibilityStatus → CEnc
-  | .reducible => s.u8 0 | .semireducible => s.u8 1 | .irreducible => s.u8 2
-  | .implicitReducible => s.u8 3 | .instanceReducible => s.u8 4
+def reducibilityEnc (e : Enc) : ReducibilityStatus → Enc
+  | .reducible => e.u8 0 | .semireducible => e.u8 1 | .irreducible => e.u8 2
+  | .implicitReducible => e.u8 3 | .instanceReducible => e.u8 4
 
-/-- The attributes of `x` that its users' compiled code depends on: how they call it (`implemented_by`,
-`@[extern]`, `@[export]`, `noncomputable`, the init function of a global), whether and how they inline or
-specialize it (inline kind, `@[never_extract]`, reducibility, instance status, `@[specialize]` arguments), and,
-for a type, how arguments of that type are specialized (class status with out-params, `@[nospecialize]`,
-`@[weak_specialize]`), plus its meta mark. (`@[tagged_return]` changes only the declaration's own impure signature
-and IR, which `compiledEnc` covers.) -/
-def attrsEnc (env : Environment) (x : Name) (s : CEnc) : CEnc :=
-  s.opt (getImplementedBy? env x) CEnc.decl
+def attrKindEnc (e : Enc) : AttributeKind → Enc
+  | .global => e.u8 0 | .local => e.u8 1 | .scoped => e.u8 2
+
+def scopedEnc {α : Type} (f : Enc → α → Enc) (e : Enc) : ScopedEnvExtension.Entry α → Enc
+  | .global a => f (e.u8 0) a
+  | .scoped ns a => f (e.u8 1 |>.name ns) a
+
+def instanceEntryEnc (e : Enc) (a : Meta.InstanceEntry) : Enc :=
+  e.opt a.globalName? Enc.name |>.nat a.priority |> (attrKindEnc · a.attrKind)
+
+/-- The current module's data that `compiledEnc` reads besides the per-name extension states. -/
+structure LocalCompiled where
+  /-- IR declarations, by name. -/
+  ir : Std.HashMap Name (Array IR.Decl) := {}
+  /-- The instance entries the module exports (global and scoped, oldest first), by declaration. -/
+  insts : NameMap (Array (ScopedEnvExtension.Entry Meta.InstanceEntry)) := {}
+
+def LocalCompiled.ofEnv (env : Environment) : LocalCompiled :=
+  -- `getDecls` lists the module's IR declarations newest first; every entry is kept, in that order.
+  { ir := (IR.getDecls env).foldl (init := {}) fun m d => m.alter d.name fun o => some ((o.getD #[]).push d)
+    insts := (Meta.instanceExtension.ext.getState env).newEntries.foldr (init := {}) fun e m =>
+      match e with
+      | .global a | .scoped _ a => match a.globalName? with
+        | some n => m.alter n fun o => some ((o.getD #[]).push e)
+        | none => m }
+
+/-- The attributes of `x` that its users' compiled code depends on, as importers read them: how they call it
+(`implemented_by`, `@[extern]`, `@[export]`, `noncomputable`, the init function of a global), whether and how
+they inline, unfold or specialize it (inline kind, `@[never_extract]`, `@[match_pattern]`, which whnf reads when
+unfolding at matchers, reducibility, instance entries, `@[specialize]` arguments), and, for a type, how arguments
+of that type are specialized (class status with out-params, `@[nospecialize]`, `@[weak_specialize]`), plus its
+meta mark. Instance and reducibility attributes can be local, scoped or erased, so the module's end state can
+differ from what importers see: those are read from what the module exports, the instance entries the module
+exports for `x` and `x`'s entry in the reducibility core extension (local and scoped reducibility live in
+`reducibilityExtraExt`, whose exported entries `tableDigest` covers). The other attributes reject every kind but
+global, cannot be erased, and are set only in the declaration's module. (`@[tagged_return]` changes only the
+declaration's own impure signature and IR, which `compiledEnc` covers.) -/
+def attrsEnc (env : Environment) (lc : LocalCompiled) (x : Name) (s : CEnc) : CEnc :=
+  let insts := lc.insts.getD x #[]
+  let red := (reducibilityCoreExt.getState (asyncDecl := x) env).find? x |>.getD .semireducible
+  let s := s.opt (getImplementedBy? env x) CEnc.decl
     |>.opt (getExternAttrData? env x) (fun s d => { s with e := externEnc s.e d })
     |>.bool (isNoncomputable env x)
     |>.opt (getExportNameFor? env x) CEnc.name
     |>.opt (getInitFnNameFor? env x) CEnc.decl
     |>.opt (getInlineAttribute? env x) (fun s k => { s with e := inlineEnc s.e k })
     |>.bool (hasNeverExtractAttribute env x)
-    |> (reducibilityEnc · (getReducibilityStatusCore env x))
-    |>.bool (Meta.isInstanceCore env x)
-    |>.opt (getSpecializationArgs? env x) CEnc.nats
+    |>.bool (hasMatchPatternAttribute env x)
+  let s := { s with e := insts.foldl (scopedEnc instanceEntryEnc) (reducibilityEnc s.e red |>.nat insts.size) }
+  s.opt (getSpecializationArgs? env x) CEnc.nats
     |>.opt (getOutParamPositions? env x) CEnc.nats
     |>.bool (hasNospecializeAttribute env x)
     |>.bool (hasWeakSpecializeAttribute env x)
     |>.bool (isMarkedMeta env x)
-
-/-- The current module's IR declarations, by name. -/
-structure LocalCompiled where
-  ir : Std.HashMap Name (Array IR.Decl) := {}
-
-def LocalCompiled.ofEnv (env : Environment) : LocalCompiled :=
-  -- `getDecls` lists the module's IR declarations newest first; every entry is kept, in that order.
-  { ir := (IR.getDecls env).foldl (init := {}) fun m d => m.alter d.name fun o => some ((o.getD #[]).push d) }
 
 /-- The names of the current module with compiled entries. -/
 def compiledNames (env : Environment) (lc : LocalCompiled) : NameSet :=
@@ -327,7 +353,7 @@ def compiledNames (env : Environment) (lc : LocalCompiled) : NameSet :=
 /-- The compiled interface of the current module's name `x`: its attributes, and its LCNF base and mono
 declarations, impure signature, IR declarations, specialization info and dead-branch summary. -/
 def compiledEnc (env : Environment) (lc : LocalCompiled) (x : Name) (s : CEnc) : CEnc :=
-  let s := attrsEnc env x s
+  let s := attrsEnc env lc x s
   let s := s.opt ((LCNF.baseExt.getState env).find? x) LCNFEnc.decl
   let s := s.opt ((LCNF.monoExt.getState env).find? x) LCNFEnc.decl
   let s := s.opt ((LCNF.impureSigExt.getState env).find? x) LCNFEnc.signature
