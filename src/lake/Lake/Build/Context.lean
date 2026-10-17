@@ -11,6 +11,7 @@ public import Lake.Config.Context
 public import Lake.Build.Job.Basic
 public import Std.Sync.Mutex
 public import Lean.Util.ModuleUsage
+public import Lake.Build.KeptChecker
 
 open System
 namespace Lake
@@ -108,6 +109,17 @@ public structure BuildContext extends BuildConfig, Context where
   so a cached parse serves only a read of the same contents.
   -/
   sidecarCache : Std.Mutex (Std.HashMap FilePath (Lean.ModuleUsage.Digest × Dynamic))
+  /--
+  The kept-module checker (`LAKE_KEPT_CHECKER`): a module whose own source and options did not
+  change since its outputs were built, but whose imports did, keeps those outputs if it accepts
+  them. If `none`, every such module is compiled.
+  -/
+  keptChecker? : Option KeptChecker := none
+  /--
+  Modules to decide as if no outputs had been kept for them (`LAKE_KEPT_EXCLUDE`): their kept
+  outputs, local or cached, are not used, and the checker is not asked about them.
+  -/
+  keptExclude : Lean.NameSet := {}
 
 /-- A transformer to equip a monad with a `BuildContext`. -/
 public abbrev BuildT := ReaderT BuildContext
