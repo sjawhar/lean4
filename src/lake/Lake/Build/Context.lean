@@ -9,6 +9,7 @@ prelude
 public import Lake.Config.Cache
 public import Lake.Config.Context
 public import Lake.Build.Job.Basic
+public import Lake.Build.KeptChecker
 
 open System
 namespace Lake
@@ -99,6 +100,17 @@ public structure BuildContext extends BuildConfig, Context where
    Only the build monitor should set this token: reporting assumes that a counted failure exists when the token is set.
   -/
   cancelTk? : Option IO.CancelToken := none
+  /--
+  The kept-module checker (`LAKE_KEPT_CHECKER`): a module whose own source and options did not
+  change since its outputs were built, but whose imports did, keeps those outputs if it accepts
+  them. If `none`, every such module is compiled.
+  -/
+  keptChecker? : Option KeptChecker := none
+  /--
+  Modules to decide as if no outputs had been kept for them (`LAKE_KEPT_EXCLUDE`): their kept
+  outputs, local or cached, are not used, and the checker is not asked about them.
+  -/
+  keptExclude : Lean.NameSet := {}
 
 /-- A transformer to equip a monad with a `BuildContext`. -/
 public abbrev BuildT := ReaderT BuildContext
