@@ -173,6 +173,7 @@ builtin_initialize passManagerExt : PersistentEnvExtension Name (Name × PassMan
     addEntryFn := fun (installerDeclNames, _) (installerDeclName, managerNew) => (installerDeclName :: installerDeclNames, managerNew)
     ofOLeanEntry? := some fun (_, manager) declName =>
       return (declName, ← ImportM.runCoreM <| runFromDecl manager declName)
+    stateDelta? := some StateDelta.ofLog
     exportEntriesFn := fun s => s.1.reverse.toArray
   }
 

@@ -42,6 +42,14 @@ private builtin_initialize namespacesExt : PersistentEnvExtension Name Name Stat
     -- local entries are not from private imports, so mark public
     addEntryFn      := fun s n => s.insert n .public
     ofOLeanEntry?  := some fun _ entry => pure entry
+    -- local entries live in the persistent stage and are always `.public` (`addEntryFn`)
+    stateDelta?    := some fun s₀ s₁ =>
+      match s₀.sharedDiff? s₁ with
+      | some (added, removed) =>
+        if removed.isEmpty && added.all (·.2 matches .public) then
+          .entries ((added.qsort (Name.quickLt ·.1 ·.1)).map (·.1))
+        else .stateOnly
+      | none => .stateOnly
     exportEntriesFn s :=
       let entries := s.map₂.toArray.map (·.1)
       entries.qsort (·.quickLt)
