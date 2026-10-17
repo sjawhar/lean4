@@ -494,9 +494,6 @@ instance : FromJson CommandRecord := ⟨fun j => return {
   post := ← j.getObjValAs? CommandPost "post"
   caches := ← j.getObjValAs? CommandCachesRecord "caches" }⟩
 
-private def cacheDelta [BEq α] (before after : Array α) : Array α :=
-  after.filter (!before.contains ·)
-
 private def matcherKeyDigest (value : Expr) (compile isPrivate : Bool) : Digest :=
   (({} : Enc).digest (exprDigest true value) |>.bool compile |>.bool isPrivate).finish
 
@@ -665,13 +662,23 @@ def commandRecords (env : Environment) (own : Array (Name × Digest))
   let mut occurrences : Std.HashMap (Name × Digest) Nat := {}
   let payloadByIdx : Std.HashMap Nat CommandEntries :=
     payloads.foldl (fun m p => m.insert p.idx p) {}
+  -- per-command lookups, so that each command's record costs what the command added
+  let usedByIdx : Std.HashMap Nat (Array NameSet) := declEntries.foldl (init := {})
+    fun m (i, _, used) => m.alter i fun us => some ((us.getD #[]).push used)
+  let explicitByIdx : Std.HashMap Nat (Array Name) := explicitUses.foldl (init := {})
+    fun m (i, n) => m.alter i fun ns => some ((ns.getD #[]).push n)
+  let extrasByIdx : Std.HashMap Nat (Array ExtraModUse) := extras.toArray.foldl (init := {})
+    fun m (i, u) => m.alter i fun us => some ((us.getD #[]).push u)
   let mut entriesEnc : Enc := {}
   let mut out := #[]
   for obs in observations.qsort (·.i < ·.i) do
     let before := obs.before.env.checked.get
     let after := obs.after.env.checked.get
-    let added := after.constants.foldStage2 (fun s n _ =>
-      if before.constants.contains n then s else s.insert n) ({} : NameSet)
+    let added : NameSet := match before.constants.sharedDiff? after.constants with
+      | some (changed, _) => changed.foldl (init := {}) fun (s : NameSet) (n, _) =>
+        if before.constants.contains n then s else s.insert n
+      | none => after.constants.foldStage2 (fun (s : NameSet) n _ =>
+        if before.constants.contains n then s else s.insert n) {}
     let addedNames := added.toArray.qsort Name.quickLt
     let decls := addedNames.filter (!isAuxName env ·)
     let aux := addedNames.filter (isAuxName env)
@@ -688,10 +695,10 @@ def commandRecords (env : Environment) (own : Array (Name × Digest))
                 ValueSensitive.constUnsafelyUsesValue env (({} : NameSet).insert r) ci ||
                 (isAuxName env n && ci matches .defnInfo _) then
               full := full.insert r
-    for (i, _, used) in declEntries do
-      if i == obs.i then refsSet := used.foldl (·.insert ·) refsSet
-    for (i, n) in explicitUses do
-      if i == obs.i then full := full.insert n
+    for used in usedByIdx.getD obs.i #[] do
+      refsSet := used.foldl (·.insert ·) refsSet
+    for n in explicitByIdx.getD obs.i #[] do
+      full := full.insert n
     let infoSt := obs.after.infoState.substituteLazy.get
     let infoUsed := usedFromInfoTrees infoSt.trees.toArray {}
     for n in infoUsed do
@@ -725,34 +732,32 @@ def commandRecords (env : Environment) (own : Array (Name × Digest))
       let occ := occurrences[(kind, text)]?.getD 0
       occurrences := occurrences.insert (kind, text) (occ + 1)
       pure (.kind kind text occ)
-    let extra := (extras.toArray.filterMap fun (i, u) =>
-      if i == obs.i && (env.getModuleIdx? u.module).any fs.hasEntries then some (u.module, u.isMeta)
+    let extra := ((extrasByIdx.getD obs.i #[]).filterMap fun u =>
+      if (env.getModuleIdx? u.module).any fs.hasEntries then some (u.module, u.isMeta)
       else none).qsort fun a b => Name.quickLt a.1 b.1 ||
         (a.1 == b.1 && a.2.toNat < b.2.toNat)
     let g := obs.after.auxDeclNGen.toRecord
-    let quotCtxts := obs.after.usedQuotCtxts.toArray.filter (!obs.before.usedQuotCtxts.contains ·)
+    let quotCtxts := (NameSet.sharedDiff obs.before.usedQuotCtxts obs.after.usedQuotCtxts).1
       |>.qsort Name.quickLt
-    let matcher := cacheDelta (Meta.Match.matcherCacheEntries obs.before.env)
-      (Meta.Match.matcherCacheEntries obs.after.env)
+    let matcher := Meta.Match.matcherCacheDelta obs.before.env obs.after.env
     let matcher := matcher.map fun (value, compile, isPrivate, n) =>
       (matcherKeyDigest value compile isPrivate, n)
     let matcher := matcher.qsort fun a b => Name.quickLt a.2 b.2
-    let auxLemma := cacheDelta (Meta.auxLemmaCacheEntries obs.before.env)
-      (Meta.auxLemmaCacheEntries obs.after.env)
+    let auxLemma := Meta.auxLemmaCacheDelta obs.before.env obs.after.env
     let auxLemma := auxLemma.map fun (type, isPrivate, defeq, n, ls) =>
       (auxLemmaKeyDigest type isPrivate defeq, n, ls)
     let auxLemma := auxLemma.qsort fun a b => Name.quickLt a.2.1 b.2.1
-    let eqnsInv := cacheDelta (Meta.eqnsCacheEntries obs.before.env)
-      (Meta.eqnsCacheEntries obs.after.env) |>.qsort fun a b => Name.quickLt a.1 b.1
-    let sparseCasesOn := cacheDelta (Meta.sparseCasesOnCacheEntries obs.before.env)
-      (Meta.sparseCasesOnCacheEntries obs.after.env)
+    let eqnsInv := Meta.eqnsCacheDelta obs.before.env obs.after.env
+      |>.qsort fun a b => Name.quickLt a.1 b.1
+    let sparseCasesOn := Meta.sparseCasesOnCacheDelta obs.before.env obs.after.env
     let sparseCasesOn := sparseCasesOn.map fun (indName, ctors, isPrivate, n) =>
       (sparseCasesOnKeyDigest indName ctors isPrivate, n)
     let sparseCasesOn := sparseCasesOn.qsort fun a b => Name.quickLt a.2 b.2
-    let structRes := cacheDelta (structureResolutionCacheEntries obs.before.env)
-      (structureResolutionCacheEntries obs.after.env) |>.qsort fun a b => Name.quickLt a.1 b.1
+    let structRes := structureResolutionCacheDelta obs.before.env obs.after.env
+      |>.qsort fun a b => Name.quickLt a.1 b.1
+    let ctx := ctxDigest obs.before entriesEnc.finish
     out := out.push {
-      i := obs.i, key, text, ctx := ctxDigest obs.before entriesEnc.finish
+      i := obs.i, key, text, ctx
       isDecl := !decls.isEmpty
       isInit := kind == ``Lean.Parser.Command.«initialize»
       decls, aux, usesStmt, usesFull, extra
@@ -767,6 +772,9 @@ def commandRecords (env : Environment) (own : Array (Name × Digest))
       let path := dir / s!"command-{obs.i}"
       let _ ← unsafe CompactedRegion.save path `commandEntries payload #[] none
       entriesEnc := entriesEnc.digest (Digest.ofBytes (← IO.FS.readBinFile path))
+      -- a change no entry expresses (an erasure) is determined by the command's text and context
+      unless payload.stateOnly.isEmpty do
+        entriesEnc := entriesEnc.digest text |>.digest ctx
   return out
 
 /-- A digest of the module's import closure: its sorted module names. -/
