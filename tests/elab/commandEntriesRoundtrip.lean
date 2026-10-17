@@ -2,7 +2,9 @@ import Lean
 /-! Per-command `.olean` payloads include all persistent extension additions and scoped local entries,
 including dynamically registered extensions and parser/macro state, and replaying them reproduces every
 extension's export, also for an extension whose `.olean` entries differ from its state entries
-(`@[cpass]`: `passManagerExt` exports installer names and rebuilds the pass manager from them). -/
+(`@[cpass]`: `passManagerExt` exports installer names and rebuilds the pass manager from them). Commands whose
+payload changes state no entry expresses (`namespace`, `end`: the scope stack) are refused by replay and stand
+for commands elaborated again; the replay takes the full run's state after them. -/
 open Lean
 
 unsafe def commandEntriesOf (e : EnvExtensionEntry) : CommandEntries := unsafeCast e
@@ -83,11 +85,31 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   for entry in entries do
     IO.println s!"{entry.idx} extensions={entry.entries.map (·.1)} \
       locals={entry.locals.map fun (depth, name, _) => (depth, name)} \
-      caches={entry.caches.deltas.map (·.1)}"
+      caches={entry.caches.deltas.map (·.1)} stateOnly={entry.stateOnly}"
+  let afterOf : Std.HashMap Nat Environment :=
+    observations.foldl (fun m obs => m.insert obs.i obs.after.env) {}
   let mut replayed ← withReplayStateOf baseEnv expectedEnv
   replayed := replayed.setMainModule `M
+  let mut elaborated := #[]
   for entry in entries do
-    replayed ← replayCommandEntries replayed entry (scopeDepth replayed) {}
+    if entry.stateOnly.isEmpty then
+      replayed ← replayCommandEntries replayed entry (scopeDepth replayed) {}
+    else
+      let refused ← try
+          discard <| replayCommandEntries replayed entry (scopeDepth replayed) {}; pure false
+        catch _ => pure true
+      unless refused do
+        throw <| IO.userError s!"payload {entry.idx} with state-only changes was replayed"
+      let some after := afterOf[entry.idx]? | throw <| IO.userError s!"no observation {entry.idx}"
+      replayed ← withReplayStateOf after replayed
+      elaborated := elaborated.push entry.idx
+  IO.println s!"elaborated again: {elaborated}"
+  let some myExt := (← persistentEnvExtensionsRef.get).find? (·.name == `myExt) |
+    throw <| IO.userError "myExt not registered"
+  let userState (env : Environment) := myExt.getState (asyncMode := .mainOnly) env
+  IO.println s!"user extension state identical: \
+    {(← compactBytes dir "user-expected" (userState expectedEnv)) ==
+      (← compactBytes dir "user-actual" (userState replayed))}"
   let replayedEntries := (← replayed.computeExtEntries).private
   let expected : Std.HashMap Name (Array EnvExtensionEntry) :=
     md.entries.foldl (fun m (n, es) => m.insert n es) {}
