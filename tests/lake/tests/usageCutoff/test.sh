@@ -536,8 +536,8 @@ ltarEntry cache20 20
 rm "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" k)"
 (cd cache20b && test_out "Built Test.B" build -v Test.C)
 test_exp -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" k)"
-# a skip's cache entry is marked `s`; a build with the cutoff off has other input hashes, so it never
-# finds that entry: it builds, and stores an entry of its own, unmarked
+# a build with the cutoff off has other input hashes than one with it on (the setting is in the trace), so
+# it never finds a skip's cache entry: it builds, and stores an entry of its own
 mkdir -p cache12/Test cache13/Test cache14/Test cache15/Test cache16/Test
 for d in cache12 cache13 cache14 cache15 cache16; do cp lakefile.toml $d/; done
 printf 'def sa := 1\n' > cache12/Test/SA.lean
@@ -548,19 +548,14 @@ printf 'def sa := 1\ndef unrelated := 2\n' > cache12/Test/SA.lean
 (cd cache12 && test_out "Replayed Test.SB" build -v Test.SB -o ../cache12b.jsonl)
 hashSB=$(depHash cache12/.lake/build/lib/lean/Test/SB.trace)
 entry="$LAKE_CACHE_DIR/outputs/test/$hashSB.json"
-match_text '"s": true' "$entry"
 match_text '"l":' "$entry"
-# the skip puts no entry in the `-o` map, which records a bare archive that cannot carry the mark
-no_match_text "$hashSB" cache12b.jsonl
 cp "$entry" skipentry.json
 # a fresh tree with the cutoff off builds SB instead of restoring the skip's outputs
 cp cache12/Test/*.lean cache13/Test/
 (cd cache13 && LAKE_USAGE_CUTOFF=0 test_out "Built Test.SB" build -v Test.SB)
 entryOff="$LAKE_CACHE_DIR/outputs/test/$(depHash cache13/.lake/build/lib/lean/Test/SB.trace).json"
 test_exp "$entryOff" != "$entry"
-no_match_text '"s": true' "$entryOff"
-match_text '"s": true' "$entry"
-# control: that built (unmarked) entry is restored with the cutoff off
+# control: that built entry is restored with the cutoff off
 cp cache12/Test/*.lean cache14/Test/
 (cd cache14 && LAKE_USAGE_CUTOFF=0 test_out "Reused Test.SB" build -v Test.SB)
 # an entry stored with the cutoff off has no usage data, and a fresh tree with the cutoff on does not find it
@@ -571,19 +566,17 @@ cp cache18/Test/OA.lean cache19/Test/
 (cd cache18 && LAKE_USAGE_CUTOFF=0 test_run build Test.OA)
 (cd cache19 && test_out "Built Test.OA" build -v Test.OA)
 test_exp -f cache19/.lake/build/lib/lean/Test/OA.usage
-# the marked entry with an artifact pruned, so it resolves only through its archive: a cutoff-on restore
-# unpacks the archive and the rewritten entry keeps the mark; with the cutoff off, SB looks up only its own
-# entry, which lost the same (content-addressed) artifact, so it builds
+# the skip's entry with an artifact pruned, so it resolves only through its archive: a cutoff-on restore
+# unpacks the archive; with the cutoff off, SB looks up only its own entry, which lost the same
+# (content-addressed) artifact, so it builds
 cp -f skipentry.json "$entry"
 rm -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" c)"
 cp cache12/Test/*.lean cache15/Test/
 (cd cache15 && test_out "Unpacked Test.SB" build -v Test.SB)
-match_text '"s": true' "$entry"
 rm -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" c)"
 cp cache12/Test/*.lean cache16/Test/
 (cd cache16 && LAKE_USAGE_CUTOFF=0 test_out "Built Test.SB" build -v Test.SB)
 test_exp "$(depHash cache16/.lake/build/lib/lean/Test/SB.trace)" = "$(depHash cache13/.lake/build/lib/lean/Test/SB.trace)"
-no_match_text '"s": true' "$entryOff"
 # the tree that skipped, with the cutoff off and its sources unchanged since the skip, builds SB rather
 # than keep the skip's outputs, as a stock build of those sources would
 printf 'def sa := 1\ndef unrelated := 3\n' > cache12/Test/SA.lean
