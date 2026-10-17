@@ -1292,21 +1292,22 @@ def readUsageSidecar (α : Type) [FromJson α] [TypeName α] (path : FilePath) :
     error s!"{path}: read failed: {e}"
 
 /--
-The hash of `file`'s bytes, as `fetchFileHash` computes it, but never read from its `.hash` file: an
-`.olean` rewritten behind Lake's back (e.g., by `lean -o`) keeps its old `.hash`, and a usage-cutoff
-decision must see the new bytes. Computed at most once per build for each contents of the file,
-identified by its stamp (`System.FilePath.stamp`, `BuildContext.fileHashCache`).
+The hashes of the files one usage-cutoff check (`Module.usageUpToDate`, `Module.writeUsekey`) has
+read, so that it reads each file once. A check never reuses another's: nothing about a file short of
+its bytes shows that they did not change since (e.g., a write through a shared mapping can leave its
+status-change time as it was).
 -/
-def contentHash (file : FilePath) : JobM Hash := do
-  let cache := (← getBuildContext).fileHashCache
-  let stamp ← file.stamp
-  let cached? ← cache.atomically do
-    return (← get)[file]?.bind fun (s, hash) => if s == stamp then some hash else none
-  if let some hash := cached? then return hash
+abbrev ContentHashes := IO.Ref (Std.HashMap FilePath Hash)
+
+/--
+The hash of `file`'s current bytes, as `fetchFileHash` computes it, but never read from its `.hash`
+file: an `.olean` rewritten behind Lake's back (e.g., by `lean -o`) keeps its old `.hash`, and a
+usage-cutoff decision must see the new bytes. Read at most once per check (`hashes`).
+-/
+def contentHash (hashes : ContentHashes) (file : FilePath) : JobM Hash := do
+  if let some hash := (← hashes.get)[file]? then return hash
   let hash ← computeBinFileHash file
-  -- Cache it only if the file did not change while it was read.
-  if (← file.stamp) == stamp then
-    cache.atomically <| modify (·.insert file (stamp, hash))
+  hashes.modify (·.insert file hash)
   return hash
 
 /--
@@ -1315,14 +1316,14 @@ Module-system files carry no meaning digests (Lean writes them at the private le
 non-module importer's digest chain cannot see through one; its skip requires these bytes unchanged
 (`contentHash`).
 -/
-def modsysHash (importArts : NameMap ImportArtifacts) : JobM Hash := do
+def modsysHash (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) : JobM Hash := do
   let mut h := Hash.nil
   for (m, arts) in importArts do
     if arts.oleanServer?.isSome then
       h := h.mix (Hash.ofHashable m)
       for paths in arts.toArrays do
         for path in paths do
-          h := h.mix (← contentHash path)
+          h := h.mix (← contentHash hashes path)
   return h
 
 /--
@@ -1334,14 +1335,14 @@ rewritten behind Lake's back (e.g., by `lean -o` of other contents, which leaves
 `.hash`) is therefore not checked against the old `.usage`. A module-system file's bytes are pinned
 by `modsysHash` instead.
 -/
-def importUsage? (importArts : NameMap ImportArtifacts) (m : Name) :
+def importUsage? (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) (m : Name) :
     JobM (Option (FilePath × UsageSidecar)) := do
   let some arts := importArts.find? m | return none
   let some olean := arts.olean? | return none
   let some usage ← readUsageSidecar UsageSidecar (olean.withExtension "usage") | return none
   if arts.oleanServer?.isNone then
     let some key ← readUsageSidecar UsekeySidecar (olean.withExtension "usekey") | return none
-    unless key.olean == (← contentHash olean) do return none
+    unless key.olean == (← contentHash hashes olean) do return none
   return some (olean, usage)
 
 /--
@@ -1352,13 +1353,13 @@ trace). A module is replayed only if this digest is unchanged, so every workspac
 closure digest stays equal to its current closure, and this digest covers the importer's whole
 closure.
 -/
-def closureHash (presetup : ModulePreSetup) (importArts : NameMap ImportArtifacts) :
-    JobM (Option ModuleUsage.Digest) := do
+def closureHash (hashes : ContentHashes) (presetup : ModulePreSetup)
+    (importArts : NameMap ImportArtifacts) : JobM (Option ModuleUsage.Digest) := do
   let mods := presetup.directImports.filterMap (·.module?) |>.map (·.name)
     |>.qsort Name.quickLt |>.toList.eraseDups
   let mut e := ({} : ModuleUsage.Enc).nat mods.length
   for m in mods do
-    let some (_, imp) ← importUsage? importArts m | return none
+    let some (_, imp) ← importUsage? hashes importArts m | return none
     e := e.name m |>.digest imp.closure
   return some e.finish
 
@@ -1388,18 +1389,19 @@ def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     (importArts : NameMap ImportArtifacts) : JobM Unit := do
   let some usage ← readUsageSidecar UsageSidecar mod.usageFile | return
   unless usage.coversClosure importArts do return
-  let some closure ← closureHash presetup importArts | return
+  let hashes ← IO.mkRef {}
+  let some closure ← closureHash hashes presetup importArts | return
   let mut extra := #[]
   for m in usage.extra do
     if (← findModule? m).isNone then continue
-    let some (olean, imp) ← importUsage? importArts m | return
+    let some (olean, imp) ← importUsage? hashes importArts m | return
     extra := extra.push <|
-      Json.arr #[ModuleUsage.nameToJson m, toJson (← contentHash olean).hex, toJson imp.moduleDigest]
+      Json.arr #[ModuleUsage.nameToJson m, toJson (← contentHash hashes olean).hex, toJson imp.moduleDigest]
   let key := Json.mkObj [
     ("version", ModuleUsage.usageVersion),
     ("local", toJson presetup.localTrace.hash.hex),
-    ("olean", toJson (← contentHash mod.oleanFile).hex),
-    ("modsys", toJson (← modsysHash importArts).hex),
+    ("olean", toJson (← contentHash hashes mod.oleanFile).hex),
+    ("modsys", toJson (← modsysHash hashes importArts).hex),
     ("closure", toJson closure),
     ("extra", Json.arr extra)
   ]
@@ -1447,20 +1449,21 @@ def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
   let some key ← readUsageSidecar UsekeySidecar mod.usekeyFile | return false
   if usage.noskip || key.localHash != presetup.localTrace.hash || !usage.coversClosure importArts then
     return false
-  unless (← contentHash mod.oleanFile) == key.olean do return false
-  unless (← modsysHash importArts) == key.modsys do return false
-  unless (← closureHash presetup importArts) == some key.closure do return false
+  let hashes ← IO.mkRef {}
+  unless (← contentHash hashes mod.oleanFile) == key.olean do return false
+  unless (← modsysHash hashes importArts) == key.modsys do return false
+  unless (← closureHash hashes presetup importArts) == some key.closure do return false
   -- A module outside the workspace is a toolchain module, pinned by the Lean githash in `localTrace`.
   for (m, consts) in usage.used do
     if (← findModule? m).isNone then continue
-    let some (_, imp) ← importUsage? importArts m | return false
+    let some (_, imp) ← importUsage? hashes importArts m | return false
     for (c, d) in consts do
       unless imp.own.find? c == some d do return false
   for m in usage.extra do
     if (← findModule? m).isNone then continue
     let some (oleanHash, digest) := key.extra.find? m | return false
-    let some (olean, imp) ← importUsage? importArts m | return false
-    unless (← contentHash olean) == oleanHash do return false
+    let some (olean, imp) ← importUsage? hashes importArts m | return false
+    unless (← contentHash hashes olean) == oleanHash do return false
     unless imp.moduleDigest == digest do return false
   return true
 

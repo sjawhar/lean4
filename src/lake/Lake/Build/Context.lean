@@ -106,11 +106,6 @@ public structure BuildContext extends BuildConfig, Context where
   that requires the same path dependency), so a cached parse serves only a read of the same contents.
   -/
   sidecarCache : Std.Mutex (Std.HashMap FilePath (ByteArray × Dynamic))
-  /--
-  Hashes of file contents computed by usage-cutoff checks, each with the stamp of the file it was
-  computed from (`System.FilePath.stamp`), which a rewrite or replacement of the file does not keep.
-  -/
-  fileHashCache : Std.Mutex (Std.HashMap FilePath (IO.FS.FileStamp × Hash))
 
 /-- A transformer to equip a monad with a `BuildContext`. -/
 public abbrev BuildT := ReaderT BuildContext
