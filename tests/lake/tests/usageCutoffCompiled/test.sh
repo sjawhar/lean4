@@ -9,9 +9,12 @@ cd work
 # usage cutoff on (`work/cut/CASE`); the state-1 sources are also built from scratch with the cutoff off
 # (`work/fresh/CASE`). Everything observable must agree: whether the build succeeds, the messages it logs,
 # what the executable `app` prints, what `lake env lean` prints for each `Check*.lean`, and the C file of
-# every module, which for a module the cutoff skipped must be what compiling its sources now produces (no case
-# here makes a module's specialization-cache miss a hit, the one difference the cutoff accepts). A case writes
-# its state-0 files with `CASE_s0` and the files state 1 changes with `CASE_s1`, both in the package directory.
+# every module, which for a module the cutoff skipped must be what compiling its sources now produces. The one
+# difference the cutoff accepts is a specialization a module created itself where a fresh build would reuse
+# another module's, of the same function at the same arguments: a case that makes one names the C files it
+# allows to differ (`CASE_c_exempt`) and checks them itself (`CASE_c_check`, run in the cutoff tree). A case
+# writes its state-0 files with `CASE_s0` and the files state 1 changes with `CASE_s1`, both in the package
+# directory.
 
 # Store the Lake cache in the test directory, never the system cache
 export LAKE_CACHE_DIR=
@@ -80,8 +83,11 @@ run_case() {
       echo "FAILURE: $n: $o (cutoff on) differs from a fresh build (fresh/$n.obs, above as ---)"
     fi
   done
+  local exempt=""
+  if declare -F "${c}_c_exempt" > /dev/null; then exempt=$("${c}_c_exempt"); fi
   for t in "$cut" ${mode:+"cut/$n.shared"}; do
     for f in $(cd "$fresh/.lake/build/ir" && find . -name '*.c' | LC_ALL=C sort); do
+      case " $exempt " in *" ${f#./} "*) continue;; esac
       if ! cmp -s "$fresh/.lake/build/ir/$f" "$t/.lake/build/ir/$f"; then
         ok=0
         echo "FAILURE: $n: $t/.lake/build/ir/${f#./} differs from the fresh build's:"
@@ -89,6 +95,10 @@ run_case() {
       fi
     done
   done
+  if declare -F "${c}_c_check" > /dev/null && ! (cd "$cut" && "${c}_c_check"); then
+    ok=0
+    echo "FAILURE: $n: ${c}_c_check failed in $cut"
+  fi
   if [ $ok = 0 ]; then
     echo "-- the cutoff build of state 1 (cut/$n.1.log):"
     grep -E 'Built|Replayed|Restored|Unpacked|Reused|error|undefined' "cut/$n.1.log" | grep -v 'c\.o' || true
@@ -238,6 +248,117 @@ e_d_s0() {
 specialize_attr_s0() { e_d_s0 'def e (f : Nat → Nat) (n : Nat) : Nat := f n + f n' 'e (· + 1) 10'; }
 specialize_attr_s1() { printf '@[specialize]\ndef e (f : Nat → Nat) (n : Nat) : Nat := f n + f n\n' > T/E.lean; }
 
+# A parameter type's class status decides whether the compiler specializes a function for that argument.
+# `Foo` becomes a class in its own module (`class_same`), or another module imported by `M` declares it one
+# (`class_cross`), or its own module marks the class `@[nospecialize]` (`nospec_type`); `M`'s source does not
+# change, and its output does not either, so only its C file shows the difference.
+class_m() {
+  lakefile_app; mkdir_t
+  printf 'import T.A\nimport T.Z\n%s\n' "$1" > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println h\n' > Main.lean
+}
+class_same_s0() {
+  class_m $'@[noinline] def g (f : Foo) (n : Nat) : Nat := n + 1\ndef h : Nat := g ⟨5⟩ 3'
+  printf 'structure Foo where\n  x : Nat\n' > T/A.lean
+  printf 'def zdummy : Nat := 1\n' > T/Z.lean
+}
+class_same_s1() { printf 'class Foo where\n  x : Nat\n' > T/A.lean; }
+class_cross_s0() {
+  class_m $'@[noinline] def g (f : Foo) (n : Nat) : Nat := n + 1\ndef h : Nat := g ⟨5⟩ 3'
+  printf 'structure Foo where\n  x : Nat\n' > T/A.lean
+  printf 'import T.A\ndef zdummy : Nat := 1\n' > T/Z.lean
+}
+class_cross_s1() { printf 'import T.A\ndef zdummy : Nat := 1\nattribute [class] Foo\n' > T/Z.lean; }
+nospec_type_s0() {
+  class_m $'@[noinline] def g [Foo] (n : Nat) : Nat := n + 1\ndef h : Nat := @g ⟨5⟩ 3'
+  printf 'class Foo where\n  x : Nat\n' > T/A.lean
+  printf 'def zdummy : Nat := 1\n' > T/Z.lean
+}
+nospec_type_s1() { printf 'class Foo where\n  x : Nat\nattribute [nospecialize] Foo\n' > T/A.lean; }
+
+# A constant folder another module registers for `A.k`: `M`'s compiled `h := k 3` folds to the folder's
+# result once `Z`, which `M` imports but uses nothing of, registers it.
+folder_z() {
+  printf 'import Lean\nimport T.A\nopen Lean.Compiler.LCNF.Simp.ConstantFold\n' > T/Z.lean
+  printf 'def myFolder : Folder := fun _ => return some (.lit (.nat 42))\n%s' "$1" >> T/Z.lean
+}
+folder_cross_s0() {
+  lakefile_app; mkdir_t
+  printf '@[noinline] def k (n : Nat) : Nat := n + 1\n' > T/A.lean
+  folder_z ''
+  printf 'import T.A\nimport T.Z\ndef h : Nat := k 3\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println h\n' > Main.lean
+}
+folder_cross_s1() { folder_z $'run_meta registerFolder ``k ``myFolder\n'; }
+
+# `Z`, which `B` imports but uses nothing of, marks `A`'s `f` `@[instance_reducible]`, which changes how `B`
+# compiles its use of `f` (as in `instance_reducible`, where `A` drops the attribute itself); only `B.c` shows it.
+reducible_cross_z() { printf 'import T.A\ndef zdummy : Nat := 1\n%s' "$1" > T/Z.lean; }
+reducible_cross_s0() {
+  chan_s0 "$(inst_red_a '')"
+  printf 'import T.A\nimport T.Z\nopen Chan\n@[noinline] def b : Nat :=\n  let g : Nat → Nat := f\n  g 1\n' > T/B.lean
+  reducible_cross_z ''
+}
+reducible_cross_s1() {
+  reducible_cross_z $'set_option allowUnsafeReducibility true in\nattribute [instance_reducible] Chan.f\n'
+}
+
+# A specialization-cache miss that becomes a hit. `M` specializes `myMap k` itself; then `Y`, which `M` imports
+# but uses nothing of, starts specializing the same call, so a fresh `M` reuses `Y`'s specialization instead.
+# Without code running inside the compiler both compute the same function (`d2_tolerated`): `M` may keep its
+# own, and only its C file differs. With a constant folder for `k` registered in `Z` (`d2_folder`), which is
+# not meaning-preserving (it returns 42) and which `Y` does not import, they differ, and `M` must compile again.
+d2_files() {
+  lakefile_app; mkdir_t
+  printf 'namespace T\n@[noinline] def k (n : Nat) : Nat := n + 1\n' > T/B.lean
+  printf '@[specialize] def myMap (f : Nat → Nat) : List Nat → List Nat\n  | [] => []\n' >> T/B.lean
+  printf '  | x :: xs => f x :: myMap f xs\nend T\n' >> T/B.lean
+  d2_y ''
+  printf 'import T.B\n%simport T.Y\nnamespace T\ndef h : List Nat := myMap k [1, 2, 3]\nend T\n' "$1" > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println T.h\n' > Main.lean
+}
+d2_y() { printf 'import T.B\nnamespace T\ndef y0 : Nat := 0\n%send T\n' "$1" > T/Y.lean; }
+d2_folder_s0() {
+  d2_files $'import T.Z\n'
+  cat > T/Z.lean <<'EOF'
+import Lean
+import T.B
+open Lean.Compiler.LCNF.Simp.ConstantFold
+def myFolder : Folder := fun args => do
+  let #[_] := args | return none
+  return some (.lit (.nat 42))
+run_meta registerFolder ``T.k ``myFolder
+EOF
+}
+d2_folder_s1() { d2_y $'def y : List Nat := myMap k [0]\n'; }
+d2_tolerated_s0() { d2_files ''; }
+d2_tolerated_s1() { d2_folder_s1; }
+d2_tolerated_c_exempt() { echo T/M.c; }
+# The kept `M` still calls the specialization it created.
+d2_tolerated_c_check() { grep -q 'myMap___at___00T_h_spec__0' .lake/build/ir/T/M.c; }
+# The same with a compiler pass (a no-op) registered in `Z`: code that runs inside the compiler is not known to
+# preserve meaning, so `M` must compile again and match the fresh build byte for byte.
+d2_cpass_s0() {
+  d2_files $'import T.Z\n'
+  cat > T/Z.lean <<'EOF'
+import Lean
+import T.B
+open Lean.Compiler.LCNF
+@[cpass] def myInstaller : PassInstaller :=
+  PassInstaller.installAtEnd .base (Pass.mkPerDeclaration `myNoop .base fun d => pure d)
+EOF
+}
+d2_cpass_s1() { d2_folder_s1; }
+
+# Binder names of an inlined body become C variable names in the importer's C file.
+binder_inline_s0() {
+  lakefile_app; mkdir_t
+  printf '@[inline] def e (n : Nat) : Nat := let fooname := n * 7; fooname + fooname\n' > T/E.lean
+  printf 'import T.E\n@[noinline] def d (m : Nat) : Nat := e m\n' > T/D.lean
+  printf 'import T.D\ndef main : IO Unit := IO.println (d 5)\n' > Main.lean
+}
+binder_inline_s1() { printf '@[inline] def e (n : Nat) : Nat := let barname := n * 7; barname + barname\n' > T/E.lean; }
+
 ## Code evaluated while elaborating.
 
 # `A` keeps the kernel definition `Chan.f := 0` and registers its compiled body directly, returning 10 and
@@ -277,6 +398,17 @@ EOF
   printf 'import T.M\ndef main : IO Unit := IO.println m\n' > Main.lean
 }
 ir_eval_s1() { ir_eval_a 20; }
+
+# `A`'s macro expands to 10, then 20; `B`'s kernel term is what the expansion produced.
+macro_eval_a() { printf 'macro "mkval" : term => `(%s)\n' "$1" > T/A.lean; }
+macro_eval_s0() {
+  lakefile_app; mkdir_t
+  macro_eval_a 10
+  printf 'import T.A\n@[noinline] def b : Nat := mkval\n' > T/B.lean
+  printf 'import T.B\n@[noinline] def m : Nat := b\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println m\n' > Main.lean
+}
+macro_eval_s1() { macro_eval_a 20; }
 
 # `A` initializes `counter` to 10, then 20; `B` reads it at elaboration time and bakes the value into `b`.
 init_eval_a() { printf 'initialize counter : IO.Ref Nat ← IO.mkRef %s\n' "$1" > T/A.lean; }
@@ -506,18 +638,26 @@ struct_repr_s0() {
 }
 struct_repr_s1() { struct_repr_c '  x : Nat' '⟨1⟩'; }
 
+all_cases="spec_transitive spec_link spec_type spec_precomp csimp_transitive csimp_late specialize_attr
+  class_same class_cross nospec_type folder_cross reducible_cross binder_inline d2_folder d2_tolerated d2_cpass
+  ir_eval macro_eval init_eval
+  inl_small inl_inline inl_instance spec_nested spec_derived spec_local spec_renumber
+  implemented_by csimp extern export noncomputable partial_body unsafe_body boxed_version structure_eta
+  instance_reducible reducible macro_inline_instance inline_instance specialize_args closed_extraction
+  decl_map enum_repr noinline_attr aux_local struct_repr"
 failed=()
-for c in spec_transitive spec_link spec_type spec_precomp csimp_transitive csimp_late specialize_attr \
-         ir_eval init_eval \
-         inl_small inl_inline inl_instance spec_nested spec_derived spec_local spec_renumber \
-         implemented_by csimp extern export noncomputable partial_body unsafe_body boxed_version structure_eta \
-         instance_reducible reducible macro_inline_instance inline_instance specialize_args closed_extraction \
-         decl_map enum_repr noinline_attr aux_local struct_repr; do
-  run_case $c || failed+=($c)
+# `CASES` runs a subset; `NAME:cache` runs a case with the artifact cache (see `run_case`).
+for c in ${CASES:-$all_cases}; do
+  case $c in
+    *:cache) run_case "${c%:cache}" cache || failed+=("$c") ;;
+    *) run_case $c || failed+=($c) ;;
+  esac
 done
 # The state the cutoff build of `spec_transitive` leaves behind, after another build and in a fresh tree that
 # shares its artifact cache.
-run_case spec_transitive cache || failed+=("spec_transitive (artifact cache)")
+if [ -z "${CASES:-}" ]; then
+  run_case spec_transitive cache || failed+=("spec_transitive (artifact cache)")
+fi
 if [ ${#failed[@]} -gt 0 ]; then
   echo "FAILURE: cases differing from a fresh build: ${failed[*]}"
   exit 1
