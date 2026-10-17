@@ -715,13 +715,15 @@ def commandRecords (env : Environment) (own : Array (Name × Digest))
       if let some ci := env.find? n then
         let rs := refs env ci
         refsSet := rs.foldl (·.insert ·) refsSet
+        let stmtOnlyRefs : NameSet := rs.foldl (init := {}) fun s r =>
+          match env.find? r with
+          | some ri => if isStmtOnly ri && !env.contains (Compiler.mkUnsafeRecName r) then s.insert r else s
+          | none => s
+        let valueUsed := ValueSensitive.unsafelyUsedValues env stmtOnlyRefs ci
+        let auxDefn := isAuxName env n && ci matches .defnInfo _
         for r in rs do
-          if let some ri := env.find? r then
-            let stmtOnly := isStmtOnly ri && !env.contains (Compiler.mkUnsafeRecName r)
-            if !stmtOnly ||
-                ValueSensitive.constUnsafelyUsesValue env (({} : NameSet).insert r) ci ||
-                (isAuxName env n && ci matches .defnInfo _) then
-              full := full.insert r
+          if (env.find? r).isSome && (!stmtOnlyRefs.contains r || valueUsed.contains r || auxDefn) then
+            full := full.insert r
     for used in usedByIdx.getD obs.i #[] do
       refsSet := used.foldl (·.insert ·) refsSet
     for n in explicitByIdx.getD obs.i #[] do
