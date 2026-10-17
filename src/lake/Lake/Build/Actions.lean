@@ -178,24 +178,6 @@ public def download
   let args := headers.foldl (init := args) (· ++ #["-H", ·])
   proc (quiet := true) {cmd := ← Internal.getCurl, args}
 
-/--
-Removes every usage-cutoff sidecar (`.usage`, `.usekey`) under `dir`, without following symlinks.
-An unpacked build archive may replace `.olean`s without shipping their sidecars, and usage cutoff
-would then compare against the digests of the replaced builds.
--/
-public partial def removeUsageSidecars (dir : FilePath) : IO Unit := do
-  let ents ← try dir.readDir catch
-    | .noFileOrDirectory .. => return
-    | e => throw e
-  for ent in ents do
-    let mdata ← try ent.path.symlinkMetadata catch
-      | .noFileOrDirectory .. => continue
-      | e => throw e
-    if mdata.type == .dir then
-      removeUsageSidecars ent.path
-    else if ent.path.extension == some "usage" || ent.path.extension == some "usekey" then
-      removeFileIfExists ent.path
-
 /-- Unpack an archive `file` using `tar` into the directory `dir`. -/
 public def untar (file : FilePath) (dir : FilePath) (gzip := true) : LogIO PUnit := do
   IO.FS.createDirAll dir
