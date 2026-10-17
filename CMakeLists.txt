@@ -123,10 +123,12 @@ if(NOT CMAKE_SYSTEM_NAME MATCHES "Emscripten")
         "Building leantar needs cargo. Install it, or pass -DLEANTAR=<leantar built with script/leantar/leangz-sarray-elem-size.patch>."
       )
     endif()
+    # As for the bundled Rust checkers (src/CMakeLists.txt), cargo and the `cc` crate use the host toolchain, except in
+    # a standalone Linux build, which builds leantar against the bundled sysroot like every other shipped binary.
     set(LEANTAR_ENV)
-    # Compile leantar's C dependencies like cadical, e.g. against the bundled sysroot of a standalone build.
-    set(LEANTAR_CFLAGS "${CMAKE_CXX_FLAGS}")
     if(LEAN_STANDALONE AND CMAKE_SYSTEM_NAME MATCHES "Linux")
+      # Compile leantar's C dependencies like cadical.
+      set(LEANTAR_CFLAGS "${CMAKE_CXX_FLAGS}")
       # Stage 1 carries only some of the bundled clang's builtin headers; zstd also needs the intrinsics headers, which
       # the resource directory of CMAKE_CXX_COMPILER, from the same LLVM, has.
       execute_process(
@@ -148,13 +150,12 @@ if(NOT CMAKE_SYSTEM_NAME MATCHES "Emscripten")
         LEANTAR_ENV
         "CARGO_TARGET_${LEANTAR_RUST_TARGET}_LINKER=${CMAKE_C_COMPILER}"
         "CARGO_TARGET_${LEANTAR_RUST_TARGET}_RUSTFLAGS=${LEANTAR_RUSTFLAGS}"
+        "CC=${CMAKE_C_COMPILER}"
+        "CFLAGS=${LEANTAR_CFLAGS}"
       )
-    endif()
-    if(CMAKE_SYSTEM_NAME MATCHES "Windows")
+    elseif(CMAKE_SYSTEM_NAME MATCHES "Windows")
       # The runner's cargo targets MSVC, so the `cc` crate has to find `cl.exe` itself rather than take MSYS2's `CC`.
       list(APPEND LEANTAR_ENV --unset=CC --unset=CXX)
-    else()
-      list(APPEND LEANTAR_ENV "CC=${CMAKE_C_COMPILER}" "CFLAGS=${LEANTAR_CFLAGS}")
     endif()
     set(LEANTAR ${CMAKE_BINARY_DIR}/leangz/src/leantar/target/release/leantar${CMAKE_EXECUTABLE_SUFFIX})
     ExternalProject_Add(
@@ -163,15 +164,23 @@ if(NOT CMAKE_SYSTEM_NAME MATCHES "Emscripten")
       GIT_REPOSITORY https://github.com/digama0/leangz
       # v0.1.21
       GIT_TAG ae32f35b8c1bee986bc8d8cad4bcc5a9788fc7bc
-      # The source is a fixed commit, so there is nothing to update; an update step would also re-run the patch on
-      # every build, on top of the already patched source.
+      # The source is a fixed commit, so there is nothing to update. The patch step resets the source before applying
+      # the patch, so that it can re-run when the patch changes.
       UPDATE_COMMAND ""
-      PATCH_COMMAND git apply ${CMAKE_SOURCE_DIR}/script/leantar/leangz-sarray-elem-size.patch
+      PATCH_COMMAND git checkout -q -- . COMMAND git apply ${CMAKE_SOURCE_DIR}/script/leantar/leangz-sarray-elem-size.patch
       CONFIGURE_COMMAND ""
       BUILD_COMMAND ${CMAKE_COMMAND} -E env ${LEANTAR_ENV} ${CARGO} build --release --locked --bin leantar
       BUILD_IN_SOURCE ON
       INSTALL_COMMAND ${CMAKE_COMMAND} -DLEANTAR=${LEANTAR} ${LEANTAR_PROBE}
       BUILD_BYPRODUCTS ${LEANTAR}
+    )
+    ExternalProject_Add_StepDependencies(leantar patch ${CMAKE_SOURCE_DIR}/script/leantar/leangz-sarray-elem-size.patch)
+    ExternalProject_Add_StepDependencies(
+      leantar
+      install
+      ${CMAKE_SOURCE_DIR}/script/leantar/probe.cmake
+      ${CMAKE_SOURCE_DIR}/script/leantar/probe.olean
+      ${CMAKE_SOURCE_DIR}/script/leantar/probe.trace
     )
     list(APPEND EXTRA_DEPENDS leantar)
   endif()
