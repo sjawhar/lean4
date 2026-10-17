@@ -356,6 +356,12 @@ lake_out build -v Test.BoM
 match_text "Built Test.BoM" produced.out
 printf 'import Test.BoM\n#eval bk 2\n' > Test/BoCheck.lean
 test_cmd_out "2099" "$LAKE" env lean Test/BoCheck.lean
+# `LAKE_USAGE_CUTOFF` takes Lake's boolean spellings: each of these turns the cutoff off (no `.usage`)
+for v in false off no; do
+  printf 'def ev := "%s"\n' "$v" > Test/EV.lean
+  LAKE_USAGE_CUTOFF=$v test_run build Test.EV
+  test_exp ! -f .lake/build/lib/lean/Test/EV.usage
+done
 # control: a C body change behind a precompiled module's `@[extern]` reaches M only through `libext_X.so`, which
 # links `libleanext.so` dynamically, so its bytes and M's trace do not change. Stock Lake replays M too; cutoff
 # must match stock here, not do worse

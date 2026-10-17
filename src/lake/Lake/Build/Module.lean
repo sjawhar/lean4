@@ -636,12 +636,13 @@ public def Module.importAllArtsFacetConfig : ModuleFacetConfig importAllArtsFace
       .ok i.arts {s with trace := i.allArtsTrace}
 
 /--
-Usage cutoff is on unless `LAKE_USAGE_CUTOFF=0`. Only with it on does Lean write usage data
+Whether usage cutoff is on (`Lake.Env.usageCutoff`). Only with it on does Lean write usage data
 (`Module.buildLean`), so the setting is part of every module's trace: the two settings never reuse
-each other's outputs, and a build that switches compiles each module again.
+each other's outputs (traces or cache entries, both keyed by the input hash), and a build that
+switches compiles each module again.
 -/
-def usageCutoffEnabled : BaseIO Bool :=
-  return (← IO.getEnv "LAKE_USAGE_CUTOFF") != some "0"
+@[inline] def usageCutoffEnabled [Functor m] [MonadLakeEnv m] : m Bool :=
+  (·.usageCutoff) <$> getLakeEnv
 
 /--
 Recursively build a module's dependencies, including:
