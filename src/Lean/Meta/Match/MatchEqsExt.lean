@@ -34,7 +34,7 @@ builtin_initialize matchEqnsExt : EnvExtension MatchEqnsExtState ← do
   -- The resulting state can still be accessed on the generated declarations using `.asyncEnv`.
   let ext ← registerEnvExtension (pure {}) (asyncMode := .local)
   registerCommandCacheExtension `Lean.Meta.Match.matchEqnsExt ext
-    (fun before after => after.map.toList.toArray.filter fun (k, _) => !before.map.contains k)
+    (fun before after => (PersistentHashMap.sharedDiff before.map after.map).1)
     (fun state (name, eqns) => {
       map := state.map.insert name eqns
       eqns := eqns.eqnNames.foldl (init := state.eqns) fun s n => s.insert n

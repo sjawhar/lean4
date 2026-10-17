@@ -77,7 +77,7 @@ structure StoredTrace where
 private meta initialize storedTracesExt : EnvExtension (NameMap StoredTrace) ← do
   let ext ← registerEnvExtension (pure {})
   registerCommandCacheExtension `Lean.storedTracesExt ext
-    (fun before after => after.toArray.filter fun (n, _) => !before.contains n)
+    (fun before after => (NameMap.sharedDiff before after).1)
     (fun state (n, trace) => state.insert n trace)
 
 /-- Returns the trace stored under the declaration `declName`, if any. -/

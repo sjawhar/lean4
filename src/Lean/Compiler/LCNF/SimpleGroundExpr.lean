@@ -95,8 +95,8 @@ builtin_initialize simpleGroundDeclExt : EnvExtension SimpleGroundExtState ← d
         { s with constNames := s.constNames.insert n g, revNames := n :: s.revNames })
   registerCommandCacheExtension `Lean.Compiler.LCNF.simpleGroundDeclExt ext
     (fun before after =>
-      let added := after.revNames.take (after.revNames.length - before.revNames.length)
-      added.reverse.toArray.map fun n => (n, after.constNames.find! n))
+      (List.addedSince after.revNames before.revNames).toArray.reverse.map fun n =>
+        (n, after.constNames.find! n))
     (fun state (n, value) =>
       { constNames := state.constNames.insert n value, revNames := n :: state.revNames })
 

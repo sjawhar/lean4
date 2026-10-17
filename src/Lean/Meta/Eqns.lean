@@ -159,13 +159,12 @@ structure EqnsExtState where
 builtin_initialize eqnsExt : EnvExtension EqnsExtState ← do
   let ext ← registerEnvExtension (pure {}) (asyncMode := .local)
   registerCommandCacheExtension `Lean.Meta.eqnsExt ext
-    (fun before after =>
-      after.mapInv.toList.toArray.filter fun (k, _) => !before.mapInv.contains k)
+    (fun before after => (PersistentHashMap.sharedDiff before.mapInv after.mapInv).1)
     (fun state (k, v) => { mapInv := state.mapInv.insert k v })
 
-/-- Equational-theorem cache entries used by per-command usage recording. -/
-def eqnsCacheEntries (env : Environment) : Array (Name × Name) :=
-  (eqnsExt.getState env).mapInv.toList.toArray
+/-- Equational-theorem cache entries `after` has and `before` lacks, for per-command usage recording. -/
+def eqnsCacheDelta (before after : Environment) : Array (Name × Name) :=
+  (PersistentHashMap.sharedDiff (eqnsExt.getState before).mapInv (eqnsExt.getState after).mapInv).1
 
 /--
 Runs `act` with the equation-affecting options restored to the values stored for `declName`

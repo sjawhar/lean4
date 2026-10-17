@@ -44,15 +44,13 @@ private inductive CbvTheoremsCacheEntry where
 builtin_initialize cbvTheoremsLookup : EnvExtension CbvTheoremsLookupState ← do
   let ext ← registerEnvExtension (pure {}) (asyncMode := .local)
   registerCommandCacheExtension `Lean.Meta.Tactic.Cbv.cbvTheoremsLookup ext
-    (fun before after => Id.run do
-      let mut entries : Array CbvTheoremsCacheEntry := #[]
-      for (n, v) in after.eqnTheorems do
-        unless before.eqnTheorems.contains n do entries := entries.push (.eqn n v)
-      for (n, v) in after.unfoldTheorems do
-        unless before.unfoldTheorems.contains n do entries := entries.push (.unfold n v)
-      for (n, v) in after.matchTheorems do
-        unless before.matchTheorems.contains n do entries := entries.push (.match n v)
-      return entries)
+    (fun before after =>
+      (PersistentHashMap.sharedDiff before.eqnTheorems after.eqnTheorems).1.map
+        (fun (n, v) => CbvTheoremsCacheEntry.eqn n v) ++
+      (PersistentHashMap.sharedDiff before.unfoldTheorems after.unfoldTheorems).1.map
+        (fun (n, v) => CbvTheoremsCacheEntry.unfold n v) ++
+      (PersistentHashMap.sharedDiff before.matchTheorems after.matchTheorems).1.map
+        (fun (n, v) => CbvTheoremsCacheEntry.match n v))
     (fun state entry => match entry with
       | CbvTheoremsCacheEntry.eqn n v =>
         { state with eqnTheorems := state.eqnTheorems.insert n v }
