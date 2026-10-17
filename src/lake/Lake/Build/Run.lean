@@ -345,8 +345,9 @@ def monitorJob (ctx : MonitorContext) (job : Job α) : BaseIO (BuildResult α) :
 The kept-module check settings from the environment: the checker command `LAKE_KEPT_CHECKER`, with
 `LAKE_KEPT_CHECKER_TIMEOUT` (seconds without a reply, while requests are outstanding, before the
 checker is killed; default 900), and `LAKE_KEPT_EXCLUDE`, a file of module names, one per line.
+The checker runs with the workspace toolchain's sysroot as `LEAN_SYSROOT`.
 -/
-def mkKeptCheck : IO (Option KeptChecker × Lean.NameSet) := do
+def mkKeptCheck (ws : Workspace) : IO (Option KeptChecker × Lean.NameSet) := do
   let checker? ← do
     let some cmd := (← IO.getEnv "LAKE_KEPT_CHECKER") | pure none
     if cmd.isEmpty then pure none else
@@ -355,7 +356,7 @@ def mkKeptCheck : IO (Option KeptChecker × Lean.NameSet) := do
       let some n := s.toNat?
         | throw <| IO.userError s!"LAKE_KEPT_CHECKER_TIMEOUT: expected seconds, got '{s}'"
       pure n
-    some <$> KeptChecker.new cmd (timeout * 1000)
+    some <$> KeptChecker.new cmd ws.lakeEnv.lean.sysroot (timeout * 1000)
   let mut exclude : Lean.NameSet := {}
   if let some file := (← IO.getEnv "LAKE_KEPT_EXCLUDE") then
     for line in (← IO.FS.lines file) do
@@ -475,7 +476,7 @@ public def Workspace.runFetchM
   let jobs ← mkJobQueue
   let cancelTk? ← if cfg.failFast then some <$> IO.CancelToken.new else pure none
   let mctx ← mkMonitorContext cfg jobs cancelTk?
-  let bctx ← mkBuildContext ws cfg jobs cancelTk? (← mkKeptCheck)
+  let bctx ← mkBuildContext ws cfg jobs cancelTk? (← mkKeptCheck ws)
   let job ← startBuild bctx build caption
   let result ← monitorJob mctx job
   if let some checker := bctx.keptChecker? then checker.close
@@ -517,7 +518,7 @@ public def Workspace.runBuild
   let jobs ← mkJobQueue
   let cancelTk? ← if cfg.failFast then some <$> IO.CancelToken.new else pure none
   let mctx ← mkMonitorContext cfg jobs cancelTk?
-  let bctx ← mkBuildContext ws cfg jobs cancelTk? (← mkKeptCheck)
+  let bctx ← mkBuildContext ws cfg jobs cancelTk? (← mkKeptCheck ws)
   let job ← startBuild bctx build
   let result ← monitorBuild mctx job
   if let some checker := bctx.keptChecker? then checker.close
