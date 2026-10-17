@@ -1200,14 +1200,15 @@ structure UsageSidecar where
 /-- A module's `.usekey` sidecar: what Lake saw of the module's build when Lean wrote its `.usage`. -/
 structure UsekeySidecar where
   localHash : Hash
-  /-- The hash of the module's own `.olean` when the key was written. -/
-  olean : Hash
+  /-- The `contentHash` of the module's own `.olean` when the key was written. -/
+  olean : ModuleUsage.Digest
   /-- `modsysHash` of the module's import closure. -/
-  modsys : Hash
+  modsys : ModuleUsage.Digest
   /-- `closureHash` of the module's direct imports. -/
   closure : ModuleUsage.Digest
-  /-- For each workspace `extra` module of the `.usage`: the hash of its `.olean` and its `moduleDigest`. -/
-  extra : NameMap (Hash × ModuleUsage.Digest)
+  /-- For each workspace `extra` module of the `.usage`: the `contentHash` of its `.olean` and its
+  `moduleDigest`. -/
+  extra : NameMap (ModuleUsage.Digest × ModuleUsage.Digest)
   deriving TypeName
 
 /--
@@ -1249,8 +1250,8 @@ instance : FromJson UsekeySidecar where
       return m.insert (← fromJson? (α := SidecarName) n).name (← fromJson? o, ← fromJson? d)
     return {
       localHash := ← j.getObjValAs? Hash "local"
-      olean := ← j.getObjValAs? Hash "olean"
-      modsys := ← j.getObjValAs? Hash "modsys"
+      olean := ← j.getObjValAs? ModuleUsage.Digest "olean"
+      modsys := ← j.getObjValAs? ModuleUsage.Digest "modsys"
       closure := ← j.getObjValAs? ModuleUsage.Digest "closure"
       extra
     }
@@ -1297,16 +1298,16 @@ read, so that it reads each file once. A check never reuses another's: nothing a
 its bytes shows that they did not change since (e.g., a write through a shared mapping can leave its
 status-change time as it was).
 -/
-abbrev ContentHashes := IO.Ref (Std.HashMap FilePath Hash)
+abbrev ContentHashes := IO.Ref (Std.HashMap FilePath ModuleUsage.Digest)
 
 /--
-The hash of `file`'s current bytes, as `fetchFileHash` computes it, but never read from its `.hash`
-file: an `.olean` rewritten behind Lake's back (e.g., by `lean -o`) keeps its old `.hash`, and a
-usage-cutoff decision must see the new bytes. Read at most once per check (`hashes`).
+The hash of `file`'s current bytes (`Lean.ModuleUsage.fileDigest`, 128 bits), never read from a
+`.hash` file: an `.olean` rewritten behind Lake's back (e.g., by `lean -o`) keeps its old `.hash`,
+and a usage-cutoff decision must see the new bytes. Read at most once per check (`hashes`).
 -/
-def contentHash (hashes : ContentHashes) (file : FilePath) : JobM Hash := do
+def contentHash (hashes : ContentHashes) (file : FilePath) : JobM ModuleUsage.Digest := do
   if let some hash := (← hashes.get)[file]? then return hash
-  let hash ← computeBinFileHash file
+  let hash ← ModuleUsage.fileDigest file
   hashes.modify (·.insert file hash)
   return hash
 
@@ -1316,15 +1317,16 @@ Module-system files carry no meaning digests (Lean writes them at the private le
 non-module importer's digest chain cannot see through one; its skip requires these bytes unchanged
 (`contentHash`).
 -/
-def modsysHash (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) : JobM Hash := do
-  let mut h := Hash.nil
+def modsysHash (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) :
+    JobM ModuleUsage.Digest := do
+  let mut e : ModuleUsage.Enc := {}
   for (m, arts) in importArts do
     if arts.oleanServer?.isSome then
-      h := h.mix (Hash.ofHashable m)
-      for paths in arts.toArrays do
-        for path in paths do
-          h := h.mix (← contentHash hashes path)
-  return h
+      let paths := arts.toArrays.flatten
+      e := e.name m |>.nat paths.size
+      for path in paths do
+        e := e.digest (← contentHash hashes path)
+  return e.finish
 
 /--
 The `.olean` of importee `m` in `importArts` and its `.usage`, or `none` if either is missing, the
@@ -1396,12 +1398,12 @@ def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     if (← findModule? m).isNone then continue
     let some (olean, imp) ← importUsage? hashes importArts m | return
     extra := extra.push <|
-      Json.arr #[ModuleUsage.nameToJson m, toJson (← contentHash hashes olean).hex, toJson imp.moduleDigest]
+      Json.arr #[ModuleUsage.nameToJson m, toJson (← contentHash hashes olean), toJson imp.moduleDigest]
   let key := Json.mkObj [
     ("version", ModuleUsage.usageVersion),
     ("local", toJson presetup.localTrace.hash.hex),
-    ("olean", toJson (← contentHash hashes mod.oleanFile).hex),
-    ("modsys", toJson (← modsysHash hashes importArts).hex),
+    ("olean", toJson (← contentHash hashes mod.oleanFile)),
+    ("modsys", toJson (← modsysHash hashes importArts)),
     ("closure", toJson closure),
     ("extra", Json.arr extra)
   ]

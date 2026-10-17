@@ -294,8 +294,9 @@ def digestedModules (env : Environment) : Array Name :=
   env.header.moduleNames.zipIdx.filterMap (fun (m, i) => if s.hasEntries i then some m else none)
     |>.qsort Name.quickLt
 
-/-- The `.usage` format version; Lake reads a sidecar of any other version as absent. -/
-def usageVersion : Nat := 4
+/-- The format version of the `.usage` sidecar and of Lake's `.usekey`; Lake reads a sidecar of any other
+version as absent. -/
+def usageVersion : Nat := 5
 
 /-- `own` is `localDigests env consts`. `extra` lists the extra module uses of the environment and of
 `extraModUsesByChecksRef` (those of commands whose environment was discarded). `noskip` is set when the run
