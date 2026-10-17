@@ -1178,38 +1178,6 @@ extern "C" LEAN_EXPORT obj_res lean_io_symlink_metadata(b_obj_arg filename) {
 #endif
 }
 
-/*
-structure FileStamp where
-  dev : UInt64
-  ino : UInt64
-  size : UInt64
-  ctimeSec : UInt64
-  ctimeNSec : UInt64
-
-constant stamp : @& FilePath → IO IO.FS.FileStamp
-*/
-extern "C" LEAN_EXPORT obj_res lean_io_file_stamp(b_obj_arg filename) {
-    const char* fname = string_cstr(filename);
-    if (strlen(fname) != lean_string_size(filename) - 1) {
-        return mk_embedded_nul_error(filename);
-    }
-    uv_fs_t req;
-    int ret = uv_fs_stat(NULL, &req, fname, NULL);
-    if (ret < 0) {
-        uv_fs_req_cleanup(&req);
-        return io_result_mk_error(decode_uv_error(ret, filename));
-    }
-    uv_stat_t const & st = req.statbuf;
-    object * stamp = alloc_cnstr(0, 0, 5 * sizeof(uint64));
-    cnstr_set_uint64(stamp, 0, st.st_dev);
-    cnstr_set_uint64(stamp, sizeof(uint64), st.st_ino);
-    cnstr_set_uint64(stamp, 2 * sizeof(uint64), st.st_size);
-    cnstr_set_uint64(stamp, 3 * sizeof(uint64), st.st_ctim.tv_sec);
-    cnstr_set_uint64(stamp, 4 * sizeof(uint64), st.st_ctim.tv_nsec);
-    uv_fs_req_cleanup(&req);
-    return io_result_mk_ok(stamp);
-}
-
 extern "C" LEAN_EXPORT obj_res lean_io_create_dir(b_obj_arg p) {
     const char* str = string_cstr(p);
     if (strlen(str) != lean_string_size(p) - 1) {

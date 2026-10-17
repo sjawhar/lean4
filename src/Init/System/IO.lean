@@ -1128,22 +1128,6 @@ structure Metadata where
   numLinks : UInt64
   deriving Repr
 
-/--
-What identifies a file's current contents to a reader that caches something computed from them: its
-device and inode numbers, its size, and its status-change time (`st_ctime`). Writing to the file, or
-replacing it, changes at least one of them; unlike the modification time, the status-change time
-cannot be set from user space, so a copy that preserves times does not keep the stamp.
-
-The stamp of a file can be accessed with `System.FilePath.stamp`.
--/
-structure FileStamp where
-  dev : UInt64
-  ino : UInt64
-  size : UInt64
-  ctimeSec : UInt64
-  ctimeNSec : UInt64
-  deriving Repr, BEq, Inhabited
-
 end FS
 end IO
 
@@ -1170,13 +1154,6 @@ does not exist or the metadata cannot be accessed.
 -/
 @[extern "lean_io_symlink_metadata"]
 opaque symlinkMetadata : @& FilePath → IO IO.FS.Metadata
-
-/--
-Returns the stamp of the indicated file, following symlinks. Throws an exception if the file does not
-exist or its metadata cannot be accessed.
--/
-@[extern "lean_io_file_stamp"]
-opaque stamp : @& FilePath → IO IO.FS.FileStamp
 
 /--
 Checks whether the indicated path can be read and is a directory. This function will traverse
