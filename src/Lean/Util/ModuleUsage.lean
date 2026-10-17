@@ -12,6 +12,7 @@ public import Lean.Compiler.ExternAttr
 public import Lean.Compiler.ExportAttr
 public import Lean.Compiler.NoncomputableAttr
 public import Lean.Elab.InfoTree.Types
+public import Lean.Util.UsedByChecks
 import Lean.ExtraModUses
 import Lean.Compiler.Old
 import Lean.Compiler.IR.CompilerM
@@ -157,9 +158,14 @@ def localHash (env : Environment) (c : ConstantInfo) : Digest :=
 /-- The constants `c`'s meaning depends on: those in its type and value, its inductive's block and constructors,
 its recursor rules' right-hand sides, its `implemented_by` target, and the `_unsafe_rec` definition holding a
 `partial def`'s compiled body (the kernel constant is an opaque with an inhabitant value, while compiled code and
-`native_decide` run the body). -/
-def refs (env : Environment) (c : ConstantInfo) : Array Name :=
-  let s : NameSet := c.getUsedConstantsAsSet
+`native_decide` run the body). The constants of its type and value are `recorded`'s if it holds an equal type
+and value under `c`'s name (`declConstsRef`). -/
+def refs (env : Environment) (c : ConstantInfo) (recorded : NameMap DeclConsts := {}) : Array Name :=
+  let s : NameSet := match c, recorded.find? c.name with
+    | .axiomInfo _, some r | .defnInfo _, some r | .thmInfo _, some r | .opaqueInfo _, some r =>
+      if r.type == c.type && r.value? == c.value? (allowOpaque := true) then r.consts
+      else c.getUsedConstantsAsSet
+    | _, _ => c.getUsedConstantsAsSet
   let s : NameSet := match c with
     | .inductInfo i => i.all.foldl (·.insert ·) s
     | .ctorInfo k => s.insert k.induct
@@ -192,8 +198,9 @@ def State.hasEntries (s : State) (i : ModuleIdx) : Bool :=
   !(s.importedModuleEntries[i.toNat]?.getD #[]).isEmpty
 
 /-- The current module's own constants, from the kernel environment, each with its `refs`. -/
-def ownConsts (env : Environment) : Array (Name × ConstantInfo × Array Name) :=
-  env.checked.get.constants.foldStage2 (fun cs n ci => cs.push (n, ci, refs env ci)) #[]
+def ownConsts (env : Environment) (recorded : NameMap DeclConsts := {}) :
+    Array (Name × ConstantInfo × Array Name) :=
+  env.checked.get.constants.foldStage2 (fun cs n ci => cs.push (n, ci, refs env ci recorded)) #[]
 
 /-- Digests of the current module's constants: SCCs in dependency order; each SCC's digest hashes its members'
 names and local hashes with the name and digest of every constant outside it that they refer to (tagged absent
