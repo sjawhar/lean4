@@ -10,6 +10,7 @@ public import Lake.Config.Cache
 public import Lake.Config.Context
 public import Lake.Build.Job.Basic
 public import Std.Sync.Mutex
+public import Lean.Util.ModuleUsage
 
 open System
 namespace Lake
@@ -101,11 +102,12 @@ public structure BuildContext extends BuildConfig, Context where
   -/
   cancelTk? : Option IO.CancelToken := none
   /--
-  Parsed usage-cutoff sidecars, shared by every module job in this build, each with the contents it was
-  parsed from. Another process may rewrite a sidecar during the build (e.g., a build of another workspace
-  that requires the same path dependency), so a cached parse serves only a read of the same contents.
+  Parsed usage-cutoff sidecars, shared by every module job in this build, each with the digest
+  (`Lean.ModuleUsage.Digest.ofBytes`) of the contents it was parsed from. Another process may rewrite a
+  sidecar during the build (e.g., a build of another workspace that requires the same path dependency),
+  so a cached parse serves only a read of the same contents.
   -/
-  sidecarCache : Std.Mutex (Std.HashMap FilePath (ByteArray × Dynamic))
+  sidecarCache : Std.Mutex (Std.HashMap FilePath (Lean.ModuleUsage.Digest × Dynamic))
 
 /-- A transformer to equip a monad with a `BuildContext`. -/
 public abbrev BuildT := ReaderT BuildContext

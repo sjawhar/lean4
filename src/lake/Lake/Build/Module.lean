@@ -1180,7 +1180,6 @@ structure UsageSidecar where
   own : NameMap ModuleUsage.Digest
   used : Array (Name × Array (Name × ModuleUsage.Digest))
   extra : Array Name
-  deriving TypeName
 
 /-- A module's `.usekey` sidecar: what Lake saw of the module's build when Lean wrote its `.usage`. -/
 structure UsekeySidecar where
@@ -1228,6 +1227,22 @@ instance : FromJson UsageSidecar where
       extra := extra.map (·.1.name)
     }
 
+/-- The parts of an imported module's `.usage` that its importers' checks read (`importUsage?`), which
+the build's sidecar cache keeps: a `UsageSidecar` without the lists only the module's own checks read. -/
+structure UsageImport where
+  moduleDigest : ModuleUsage.Digest
+  closure : ModuleUsage.Digest
+  own : NameMap ModuleUsage.Digest
+  deriving TypeName
+
+/-- The `UsageImport` view of a module's own `.usage`. -/
+def UsageSidecar.toImport (u : UsageSidecar) : UsageImport :=
+  { moduleDigest := u.moduleDigest, closure := u.closure, own := u.own }
+
+/-- Accepts exactly the sidecars `UsageSidecar` accepts. -/
+instance : FromJson UsageImport where
+  fromJson? j := (·.toImport) <$> fromJson? (α := UsageSidecar) j
+
 instance : FromJson UsekeySidecar where
   fromJson? j := do
     let extra ← (← j.getObjValAs? (Array Json) "extra").foldlM (init := {}) fun m e => do
@@ -1241,37 +1256,65 @@ instance : FromJson UsekeySidecar where
       extra
     }
 
+/-- Parses the bytes of a usage-cutoff sidecar: `none` if it has another format version than
+`Lean.ModuleUsage.usageVersion` (an older toolchain wrote it). -/
+def parseUsageSidecar (α : Type) [FromJson α] (bytes : ByteArray) : Except String (Option α) := do
+  let some contents := String.fromUTF8? bytes | throw "not UTF-8"
+  let j ← Json.parse contents
+  let v ← j.getObjValAs? Nat "version"
+  if v != ModuleUsage.usageVersion then return none
+  some <$> fromJson? (α := α) j
+
 /--
 Reads a usage-cutoff sidecar. Returns `none` if it does not exist or has another format version
-than `Lean.ModuleUsage.usageVersion` (an older toolchain wrote it). If it exists but is not valid,
-logs a warning and returns `none`, so the module builds normally. Reuses the build's parse of the
-same contents (`BuildContext.sidecarCache`).
+(`parseUsageSidecar`). If it exists but is not valid, logs a warning and returns `none`, so the
+module builds normally. Reuses the build's parse of the same contents (`BuildContext.sidecarCache`).
 -/
 def readUsageSidecar (α : Type) [FromJson α] [TypeName α] (path : FilePath) :
     JobM (Option α) := do
   match (← IO.FS.readBinFile path |>.toBaseIO) with
   | .ok bytes =>
+    let digest := ModuleUsage.Digest.ofBytes bytes
     (← getBuildContext).sidecarCache.atomically do
-      let cache ← getThe (Std.HashMap FilePath (ByteArray × Dynamic))
-      if let some (parsedFrom, cached) := cache.get? path then
-        if parsedFrom == bytes then
+      let entries ← getThe (Std.HashMap FilePath (ModuleUsage.Digest × Dynamic))
+      if let some (parsedFrom, cached) := entries.get? path then
+        if parsedFrom == digest then
           let some value := cached.get? α | error s!"{path}: cached sidecar has the wrong type"
           return some value
-      let parsed := do
-        let some contents := String.fromUTF8? bytes | throw "not UTF-8"
-        let j ← Json.parse contents
-        let v ← j.getObjValAs? Nat "version"
-        if v != ModuleUsage.usageVersion then return none
-        some <$> fromJson? (α := α) j
-      match parsed with
+      match parseUsageSidecar α bytes with
       | .ok value =>
         if let some value := value then
-          modifyThe (Std.HashMap FilePath (ByteArray × Dynamic))
-            (·.insert path (bytes, Dynamic.mk value))
+          modifyThe (Std.HashMap FilePath (ModuleUsage.Digest × Dynamic))
+            (·.insert path (digest, Dynamic.mk value))
         return value
       | .error e =>
         logWarning s!"{path}: {e}"
         return none
+  | .error (.noFileOrDirectory ..) =>
+    return none
+  | .error e =>
+    error s!"{path}: read failed: {e}"
+
+/--
+Reads a module's own `.usage` as `readUsageSidecar` does, but parses it on every read: only the
+module's own checks read all of it. Leaves its `UsageImport` in the build's sidecar cache for the
+module's importers (`importUsage?`).
+-/
+def readOwnUsage (path : FilePath) : JobM (Option UsageSidecar) := do
+  match (← IO.FS.readBinFile path |>.toBaseIO) with
+  | .ok bytes =>
+    match parseUsageSidecar UsageSidecar bytes with
+    | .ok (some usage) =>
+      let digest := ModuleUsage.Digest.ofBytes bytes
+      (← getBuildContext).sidecarCache.atomically do
+        modifyThe (Std.HashMap FilePath (ModuleUsage.Digest × Dynamic))
+          (·.insert path (digest, Dynamic.mk usage.toImport))
+      return some usage
+    | .ok none =>
+      return none
+    | .error e =>
+      logWarning s!"{path}: {e}"
+      return none
   | .error (.noFileOrDirectory ..) =>
     return none
   | .error e =>
@@ -1323,10 +1366,10 @@ rewritten behind Lake's back (e.g., by `lean -o` of other contents, which leaves
 by `modsysHash` instead.
 -/
 def importUsage? (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) (m : Name) :
-    JobM (Option (FilePath × UsageSidecar)) := do
+    JobM (Option (FilePath × UsageImport)) := do
   let some arts := importArts.find? m | return none
   let some olean := arts.olean? | return none
-  let some usage ← readUsageSidecar UsageSidecar (olean.withExtension "usage") | return none
+  let some usage ← readUsageSidecar UsageImport (olean.withExtension "usage") | return none
   if arts.oleanServer?.isNone then
     let some key ← readUsageSidecar UsekeySidecar (olean.withExtension "usekey") | return none
     unless key.olean == (← contentHash hashes olean) do return none
@@ -1374,7 +1417,7 @@ direct import or a workspace `extra` module, so the module is never skipped.
 -/
 def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     (importArts : NameMap ImportArtifacts) : JobM Unit := do
-  let some usage ← readUsageSidecar UsageSidecar mod.usageFile | return
+  let some usage ← readOwnUsage mod.usageFile | return
   unless usage.coversClosure importArts do return
   let hashes ← IO.mkRef {}
   let some closure ← closureHash hashes presetup importArts | return
@@ -1439,7 +1482,7 @@ the file's bytes (`contentHash`), never read from a `.hash` file.
 -/
 def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
     (importArts : NameMap ImportArtifacts) : JobM Bool := do
-  let some usage ← readUsageSidecar UsageSidecar mod.usageFile | return false
+  let some usage ← readOwnUsage mod.usageFile | return false
   let some key ← readUsageSidecar UsekeySidecar mod.usekeyFile | return false
   if usage.noskip || key.localHash != presetup.localTrace.hash || !usage.coversClosure importArts then
     return false
