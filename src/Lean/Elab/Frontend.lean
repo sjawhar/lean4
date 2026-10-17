@@ -391,8 +391,9 @@ def runFrontend
 
   let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
   if let some oleanFileName := oleanFileName? then
+    let recorded ← declConstsRef.get
     let usage? := usageFileName?.map fun usageFileName =>
-      let consts := ModuleUsage.ownConsts env
+      let consts := ModuleUsage.ownConsts env recorded
       (usageFileName, consts, ModuleUsage.localDigests env consts)
     profileitIO ".olean serialization" finalOpts do
       let commandLints := collectCommandLints snaps none #[]
