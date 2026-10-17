@@ -356,6 +356,27 @@ lake_out build -v Test.BoM
 match_text "Built Test.BoM" produced.out
 printf 'import Test.BoM\n#eval bk 2\n' > Test/BoCheck.lean
 test_cmd_out "2099" "$LAKE" env lean Test/BoCheck.lean
+# an importee's own `@[macro_inline]`: the callee is inlined into its callers and no longer compiled on its
+# own, so its callers compile again, and no longer evaluate the argument it ignores
+printf 'def mi (x y : Nat) : Nat := if x = 42 then x else y\n' > Test/MiB.lean
+printf 'import Test.MiB\ndef mk : Nat := mi 42 (dbg_trace "eager"; 0)\n' > Test/MiM.lean
+test_run build Test.MiM
+printf '@[macro_inline] def mi (x y : Nat) : Nat := if x = 42 then x else y\n' > Test/MiB.lean
+lake_out build -v Test.MiM
+match_text "Built Test.MiM" produced.out
+printf 'import Test.MiM\n#eval mk\n' > Test/MiCheck.lean
+test_out "42" env lean Test/MiCheck.lean
+no_match_text "eager" produced.out
+# an importee's own `@[never_extract]`: its callers must stop sharing one evaluation of a closed application
+printf 'def ne (n : Nat) : Nat := dbg_trace s!"ran {n}"; n + 1\n' > Test/NeB.lean
+printf 'import Test.NeB\ndef nk : Nat := ne 1 + ne 1\n' > Test/NeM.lean
+test_run build Test.NeM
+printf '@[never_extract] def ne (n : Nat) : Nat := dbg_trace s!"ran {n}"; n + 1\n' > Test/NeB.lean
+lake_out build -v Test.NeM
+match_text "Built Test.NeM" produced.out
+printf 'import Test.NeM\n#eval nk\n' > Test/NeCheck.lean
+test_out "4" env lean Test/NeCheck.lean
+test_exp "$(grep -c "ran 1" produced.out)" = 2
 # `LAKE_USAGE_CUTOFF` takes Lake's boolean spellings: each of these turns the cutoff off (no `.usage`)
 for v in false off no; do
   printf 'def ev := "%s"\n' "$v" > Test/EV.lean
