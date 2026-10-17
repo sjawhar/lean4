@@ -20,6 +20,7 @@ public import Lake.Build.Infos
 public import Lake.Build.InitFacets
 public import Lake.Build.InputFile
 public import Lake.Build.Job
+public import Lake.Build.KeptChecker
 public import Lake.Build.Key
 public import Lake.Build.Library
 public import Lake.Build.Module
