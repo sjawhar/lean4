@@ -94,6 +94,7 @@ def mkDeclExt (phase : Phase) (name : Name := by exact decl_name%) :
     addImportedFn := fun _ => pure {},
     addEntryFn := fun s decl => s.insert decl.name decl
     ofOLeanEntry? := some fun _ entry => pure entry
+    stateDelta? := some <| StateDelta.ofPHashMap Name.quickLt fun _ decl => decl
     exportEntriesFnEx env s := Id.run do
       let all := sortedEntries s declLt
       let exported := all.filterMap fun decl => do
@@ -115,7 +116,7 @@ builtin_initialize impureExt : EnvExtension (DeclExtState .impure) ← do
   let ext ← registerEnvExtension (mkInitial := pure {}) (asyncMode := .sync)
     (replay? := some (replayFn .impure))
   registerCommandCacheExtension `Lean.Compiler.LCNF.impureExt ext
-    (fun before after => after.toList.toArray.filter fun (n, _) => !before.contains n)
+    (fun before after => (PersistentHashMap.sharedDiff before after).1)
     (fun state (n, decl) => state.insert n decl)
 
 
@@ -143,6 +144,7 @@ def mkSigDeclExt (phase : Phase) (name : Name := by exact decl_name%) :
     addImportedFn := fun _ => pure {},
     addEntryFn := fun s sig => s.insert sig.name sig
     ofOLeanEntry? := some fun _ entry => pure entry
+    stateDelta? := some <| StateDelta.ofPHashMap Name.quickLt fun _ sig => sig
     exportEntriesFnEx env s := Id.run do
       let all := sortedEntries s sigLt
       let exported := all.filterMap fun sig => do
@@ -230,7 +232,7 @@ def getLocalDecl? (declName : Name) : CompilerM (Option ((pu : Purity) × Decl p
 builtin_initialize declOrderExt : EnvExtension (List Name × NameSet) ← do
   let ext ← mkOrderedDeclSetExt
   registerCommandCacheExtension `Lean.Compiler.LCNF.declOrderExt ext
-    (fun before after => (after.1.take (after.1.length - before.1.length)).reverse.toArray)
+    (fun before after => (List.addedSince after.1 before.1).toArray.reverse)
     (fun state n => (n :: state.1, state.2.insert n))
 
 def recordFinalImpureDecl (env : Environment) (name : Name) : Environment :=
