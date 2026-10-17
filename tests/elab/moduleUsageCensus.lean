@@ -6,7 +6,9 @@ piece of imported state the compiler reads while (re)compiling `M` must be cover
 
 This test enumerates every registered persistent environment extension, computes which of them are
 reachable from the compiler's code-generation entry points (BFS over
-`ConstantInfo.getUsedConstantsAsSet`, `@[implemented_by]` targets and `_unsafe_rec` definitions,
+`ConstantInfo.getUsedConstantsAsSet`, `@[implemented_by]` targets, `_unsafe_rec` definitions and
+extern-to-export edges: a reached constant with `@[extern "sym"]` data reaches the declaration
+marked `@[export sym]`, which is how `Meta.whnf`, `inferType` and the like are forward-declared,
 started from `Lean.Compiler.LCNF.main`, `Lean.IR.compile`, `Lean.Compiler.LCNF.emitC`,
 `Lean.Compiler.LCNF.builtinPassManager`, `Lean.Compiler.LCNF.Simp.ConstantFold.builtinFolders`, plus
 the Lean functions the C++ IR interpreter (`src/library/ir_interpreter.cpp`) calls by
@@ -22,7 +24,17 @@ usage/extra-module-use bookkeeping, never read to generate code). An extension a
 table defaults to `notRead` ("unreachable from the compiler entry points"), correct only when the
 BFS does not find it reachable; a reachable extension defaulting to (or explicitly classified)
 `notRead`, or explicitly marked `uncovered` (fits no class), fails the test. The table may not name
-an extension that is not registered.
+an extension that is not registered. Each registered extension's name, after the `aliases` table
+(names that are not the constant holding the extension), must be a constant of the environment,
+otherwise the BFS could never reach it and it would silently default to `notRead`.
+
+Every extension classified `R5`, `R1R5` or `specCache` also needs a row in `tableNotes`, and no other
+extension may have one. The row says whether the table can change what a specialization computes
+under a given key (`body`: covered by the compiler-code bit a module records at each compile, which
+turns off the tolerance of specialization reuse), only which keys exist and what the compiler
+decides to inline or specialize (`keysOrDecisions`), the cache itself (`cache`), or only whether a
+definitional-equality query succeeds (`defeqOutcome`), and whether a later entry overwrites an earlier
+one, so that import order matters (closure digests hash the closure in import order).
 -/
 open Lean
 
@@ -48,7 +60,19 @@ def aliases : List (Name × Name) := [
   (`recExt, `Lean.Meta.recExt), (`symSimpVariantExtension, `Lean.Meta.Sym.Simp.symSimpVariantExtension),
   (`symDSimpVariantExtension, `Lean.Meta.Sym.DSimp.symDSimpVariantExtension),
   (`cbvOpaqueExt, `Lean.Meta.Tactic.Cbv.cbvOpaqueExt), (`cbvEvalExt, `Lean.Meta.Tactic.Cbv.cbvEvalExt),
-  (`envLinterSnapshotExt, `Lean.Linter.envLinterSnapshotExt)]
+  (`envLinterSnapshotExt, `Lean.Linter.envLinterSnapshotExt),
+  (`Lean.PrettyPrinter.mkCombinatorFormatterAttribute, `Lean.PrettyPrinter.combinatorFormatterAttribute),
+  (`Lean.PrettyPrinter.mkCombinatorParenthesizerAttribute, `Lean.PrettyPrinter.combinatorParenthesizerAttribute),
+  (`Lean.identifierSuggestForAttr.existingToIncorrect,
+    Lean.mkPrivateNameCore `Lean.IdentifierSuggestion `Lean.identifierSuggestionsImpl),
+  (`Lean.identifierSuggestForAttr.incorrectToExisting,
+    Lean.mkPrivateNameCore `Lean.IdentifierSuggestion `Lean.identifierSuggestionsImpl),
+  (`cbvSimprocExt, `Lean.Meta.Tactic.Cbv.cbvSimprocExtension),
+  (`Lean.Meta.NormCast.normCastExt.up, `Lean.Meta.NormCast.normCastExt),
+  (`Lean.Meta.NormCast.normCastExt.down, `Lean.Meta.NormCast.normCastExt),
+  (`Lean.Meta.NormCast.normCastExt.squash, `Lean.Meta.NormCast.normCastExt),
+  (`specMap, `Lean.Elab.Tactic.Do.SpecAttr.specAttr),
+  (`internalSpecMap, `Lean.Elab.Tactic.VCGen.SpecAttr.specAttr)]
 
 /-- `extension name → (class, reason)`. Only extensions the BFS below finds reachable need to be
 present and non-`notRead`/`uncovered`; everything else defaults to `notRead`. -/
@@ -183,7 +207,78 @@ def classification : List (Name × UsageClass × String) := [
     src/Lean/Meta/Match/Match.lean:1126, run right after `addDecl` of the very matcher \
     (src/Lean/Meta/Match/Match.lean:1117) whose `MatcherInfo` it records; only the defining module \
     can write it, and the recorded discriminant/arity info follows from the match-compiler's own \
-    analysis of the matcher it just emitted.")
+    analysis of the matcher it just emitted."),
+  (`Lean.matchPatternAttr, .R1,
+    "`TagAttribute` on the tagged declaration itself (src/Lean/Meta/Match/MatchPatternAttr.lean:34-36); \
+    read by `canUnfoldAtMatcher` (src/Lean/Meta/GetUnfoldableConst.lean:42) inside `whnfMatcher`, so \
+    it changes what `whnf` unfolds, and the digest of the tagged declaration covers the tag \
+    through its attributes encoding (src/Lean/Util/ModuleUsage/Compiled.lean)."),
+  (`Lean.Meta.unificationHintExtension, .R5,
+    "Any module may add a hint for declarations it did not define \
+    (`addUnificationHint`, src/Lean/Meta/UnificationHint.lean:77-89); the writer's exported entries \
+    are part of the cross-module table digest, and `tryUnificationHints` reads the whole table \
+    (:104-119)."),
+  (`Lean.auxParentProjInfoExt, .kernelDerived,
+    "`addAuxParentProjectionInfo` (src/Lean/ProjFns.lean:77-78) has a single call site, \
+    `mkCoercionToCopiedParent` (src/Lean/Elab/Structure.lean:1440), run right after it adds the \
+    parent projection `declName` of the structure being declared; `numParams` is the structure's \
+    parameter count and `fromClass` follows from the structure's own `class` flag and the parent's \
+    class status (covered by `classExtension`). The only reader, `getStuckMVar?` \
+    (src/Lean/Meta/WHNF.lean:368-373), looks up the head projection and just reports a stuck \
+    metavariable."),
+  (`Lean.Elab.Structural.eqnInfoExt, .kernelDerived,
+    "`registerEqnsInfo` (src/Lean/Elab/PreDefinition/Structural/Eqns.lean:157-161) inserts the \
+    `EqnInfo` of the declaration the structural-recursion elaborator is defining, and only the \
+    defining module writes it. The only read on the compiler's path is `recArgPos`, through the \
+    `@[export lean_get_structural_rec_arg_pos]` implementation of `Meta.getStructuralRecArgPos?` \
+    (:190-193), by smart unfolding in `whnf` (src/Lean/Meta/WHNF.lean:899): the position of the \
+    argument whose `brecOn` the declaration's kernel value recurses on, so its kernel data fixes it.")
+]
+
+/-- How a cross-module table can affect a specialization another module reuses. `body`: the
+specialization's code under a fixed key; `keysOrDecisions`: which keys exist and what is inlined or
+specialized; `cache`: the specialization cache itself; `defeqOutcome`: only whether a `Meta`
+definitional-equality query succeeds (a unification hint can turn a failure into a success), never
+a body under a given key nor which keys exist. -/
+inductive SpecEffect where
+  | body | keysOrDecisions | cache | defeqOutcome
+deriving BEq
+
+/-- `extension name → (effect on reused specializations, a later entry overwrites an earlier one, reason)`. -/
+def tableNotes : List (Name × SpecEffect × Bool × String) := [
+  (`Lean.Compiler.LCNF.passManagerExt, .body, true,
+    "An installer's passes run on every declaration, specializations included, after their keys are \
+    fixed (src/Lean/Compiler/LCNF/Main.lean, `getPassManager`); installers run in import order \
+    (src/Lean/Compiler/LCNF/Passes.lean:162-167)."),
+  (`Lean.Compiler.LCNF.Simp.ConstantFold.folderExt, .body, true,
+    "Folders rewrite constant applications inside a specialization's body after its key is fixed \
+    (src/Lean/Compiler/LCNF/Simp/ConstantFold.lean:847-848); `insert` keeps the last folder per \
+    declaration (:827, :829)."),
+  (`Lean.Compiler.CSimp.ext, .keysOrDecisions, true,
+    "Replacement happens in toLCNF on the compiling module's own terms (src/Lean/Compiler/LCNF/ToLCNF.lean:519), \
+    before specialization keys are formed; a callee's saved body comes from its own module, so a \
+    different csimp state gives a different key, never a different body under one key. `map.insert` \
+    keeps the last entry per `fromDeclName` (src/Lean/Compiler/CSimpAttr.lean:36)."),
+  (`Lean.Meta.instanceExtension, .keysOrDecisions, true,
+    "Instance status decides base-phase inlining (src/Lean/Compiler/LCNF/Simp/InlineCandidate.lean:83), \
+    which changes code shape, not what the code computes; `instanceNames.insert` keeps the last \
+    entry per declaration."),
+  (`reducibilityExtra, .keysOrDecisions, true,
+    "`isInstanceReducible` decides whether to specialize or lambda-lift \
+    (src/Lean/Compiler/LCNF/Specialize.lean:402, LambdaLifting.lean:219, Basic.lean:1111, Simp/Main.lean:79); \
+    `d.insert` keeps the last status per declaration (src/Lean/ReducibilityAttrs.lean:78)."),
+  (`Lean.classExtension, .keysOrDecisions, true,
+    "Class status decides which parameters are specialized (src/Lean/Compiler/LCNF/Types.lean:329-343, \
+    SpecInfo.lean:216); the out-param map's `insert` keeps the last entry (`addClass` rejects a \
+    second declaration, src/Lean/Class.lean:168-169)."),
+  (Lean.mkPrivateNameCore `Lean.Compiler.LCNF.Specialize `Lean.Compiler.LCNF.Specialize.specCacheExt, .cache, true,
+    "The specialization cache itself: `SMap.insert` keeps the last module's specialization per key \
+    (src/Lean/Compiler/LCNF/Specialize.lean:31-46)."),
+  (`Lean.Meta.unificationHintExtension, .defeqOutcome, true,
+    "A hint is consulted only by `tryUnificationHints` (src/Lean/Meta/UnificationHint.lean:108-119) \
+    inside `Meta.isDefEq`, where it can only turn a failing query into a success; it never \
+    rewrites a specialization body under a given key nor decides which keys exist. Hints are tried \
+    in discrimination-tree match order and the first success wins (:116-118), so import order matters.")
 ]
 
 #eval show CoreM Unit from do
@@ -204,7 +299,14 @@ def classification : List (Name × UsageClass × String) := [
   let exts ← persistentEnvExtensionsRef.get
   let aliasMap : NameMap Name := aliases.foldl (fun m (a, c) => m.insert a c) {}
   let holderOf (n : Name) : Name := (aliasMap.find? n).getD n
-  -- BFS from `roots` over used constants, `@[implemented_by]` targets and `_unsafe_rec` definitions.
+  -- Symbol name -> declaration carrying `@[export sym]`, so a forward-declared `@[extern "sym"]`
+  -- constant reaches its implementation.
+  let exporters : Std.HashMap Name Name := env.constants.fold (init := {}) fun m n _ =>
+    match getExportNameFor? env n with
+    | some sym => m.insert sym n
+    | none => m
+  -- BFS from `roots` over used constants, `@[implemented_by]` targets, `_unsafe_rec` definitions
+  -- and extern-to-export edges.
   let mut parent : Std.HashMap Name Name := {}
   let mut queue : Array Name := #[]
   for r in roots do
@@ -219,6 +321,12 @@ def classification : List (Name × UsageClass × String) := [
     if let some t := Compiler.getImplementedBy? env c then next := next.insert t
     let ur := Compiler.mkUnsafeRecName c
     if env.contains ur then next := next.insert ur
+    if let some data := getExternAttrData? env c then
+      for entry in data.entries do
+        match entry with
+        | .standard _ sym =>
+          if let some y := exporters.get? (Name.mkSimple sym) then next := next.insert y
+        | _ => pure ()
     for n in next do
       unless parent.contains n do
         parent := parent.insert n c
@@ -239,5 +347,18 @@ def classification : List (Name × UsageClass × String) := [
     | some (.notRead, reason) => errors := errors.push s!"reachable extension `{n}` is classified `notRead`: {reason}"
     | some (.uncovered, reason) => errors := errors.push s!"reachable extension `{n}` is `uncovered`: {reason}"
     | some _ => pure ()
+  for (n, cls, _) in classification do
+    let needsNote := cls == .R5 || cls == .R1R5 || cls == .specCache
+    let hasNote := tableNotes.any (·.1 == n)
+    if needsNote && !hasNote then
+      errors := errors.push s!"`{n}` is classified {cls} but has no row in `tableNotes`"
+    if !needsNote && hasNote then
+      errors := errors.push s!"`{n}` has a row in `tableNotes` but is classified {cls}"
+  for (n, _, _, _) in tableNotes do
+    unless classification.any (·.1 == n) do
+      errors := errors.push s!"`tableNotes` names `{n}`, which the classification table does not"
+  for e in exts do
+    unless env.contains (holderOf e.name) do
+      errors := errors.push s!"registered extension `{e.name}` has no holder constant: `{holderOf e.name}` is not in the environment (add an entry to `aliases`)"
   unless errors.isEmpty do
     throwError "moduleUsageCensus found {errors.size} issue(s) (of {registered.size} registered, {reachedExts.size} reachable extensions):\n{"\n".intercalate errors.toList}"
