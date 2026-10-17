@@ -563,8 +563,7 @@ def register [BEq α] [Hashable α] [Inhabited β] (name : Name) :
         (e :: s.1, s.2.insert e (newState.2.find! e)))
   let ext ← registerCommandCacheExtension name ext
     (fun before after =>
-      (after.1.take (after.1.length - before.1.length)).reverse.toArray.map fun key =>
-        (key, after.2.find! key))
+      (List.addedSince after.1 before.1).toArray.reverse.map fun key => (key, after.2.find! key))
     (fun state (key, value) => (key :: state.1, state.2.insert key value))
   return CacheExtension.mk ext
 

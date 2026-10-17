@@ -28,8 +28,7 @@ builtin_initialize closedTermCacheExt : EnvExtension ClosedTermCache ← do
         { s with map := s.map.insert e c, constNames := s.constNames.insert c, revExprs := e :: s.revExprs })
   registerCommandCacheExtension `Lean.closedTermCacheExt ext
     (fun before after =>
-      let added := after.revExprs.take (after.revExprs.length - before.revExprs.length)
-      added.reverse.toArray.map fun e => (e, after.map.find! e))
+      (List.addedSince after.revExprs before.revExprs).toArray.reverse.map fun e => (e, after.map.find! e))
     (fun state (e, n) => {
       map := state.map.insert e n
       constNames := state.constNames.insert n

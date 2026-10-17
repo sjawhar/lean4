@@ -26,13 +26,14 @@ deriving BEq, Hashable
 builtin_initialize sparseCasesOnCacheExt : EnvExtension (PHashMap SparseCasesOnKey Name) ← do
   let ext ← registerEnvExtension (pure {}) (asyncMode := .local)
   registerCommandCacheExtension `Lean.Meta.sparseCasesOnCacheExt ext
-    (fun before after => after.toList.toArray.filter fun (k, _) => !before.contains k)
+    (fun before after => (PersistentHashMap.sharedDiff before after).1)
     (fun state (k, n) => state.insert k n)
 
-/-- Serializable view of the sparse-`casesOn` cache used by per-command usage recording. -/
-public def sparseCasesOnCacheEntries (env : Environment) : Array (Name × Array Name × Bool × Name) :=
-  (sparseCasesOnCacheExt.getState env).toList.toArray.map fun (k, n) =>
-    (k.indName, k.ctors, k.isPrivate, n)
+/-- Serializable view of the sparse-`casesOn` cache entries `after` has and `before` lacks, for per-command
+usage recording. -/
+public def sparseCasesOnCacheDelta (before after : Environment) : Array (Name × Array Name × Bool × Name) :=
+  (PersistentHashMap.sharedDiff (sparseCasesOnCacheExt.getState before) (sparseCasesOnCacheExt.getState after)).1.map
+    fun (k, n) => (k.indName, k.ctors, k.isPrivate, n)
 
 /-- Information necessary to recognize and split on sparse casesOn (in particular in MatchEqs) -/
 public structure SparseCasesOnInfo where
