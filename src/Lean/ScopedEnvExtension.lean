@@ -22,6 +22,11 @@ structure State (σ : Type) where
   state        : σ
   activeScopes : NameSet := {}
   delimitsLocal : Bool := true -- used for implementing `end_local_scope`.
+  /-- Writes to `state` that add no entry: `ScopedEnvExtension.modifyState`, and activations that apply
+  scoped entries. A scope push copies the count, so a pop restores it. -/
+  modCount     : Nat := 0
+  /-- Local entries applied to `state` (`ScopedEnvExtension.addLocalEntry`). -/
+  localCount   : Nat := 0
 
 structure ScopedEntries (β : Type) where
   map : SMap Name (PArray β) := {}
@@ -111,6 +116,25 @@ def exportEntriesFn (descr : Descr α β σ) (env : Environment) (s : StateStack
       if let some e := r.private  then priv     := priv.push     (.scoped ns e)
   return { exported, server, «private» := priv }
 
+/--
+The state delta of a scoped extension (`PersistentEnvExtension.stateDelta?`): the global and scoped entries in
+front of the old log, oldest first. `stateOnly` when the top state's `modCount` changed, when the old log is not
+a tail of the new one, or when the top state changed with no new entry and no local entry applied to it (a
+write through the underlying persistent extension).
+-/
+def stateDelta (s₀ s₁ : StateStack α β σ) : StateDelta (Entry α) :=
+  match s₀.stateStack, s₁.stateStack with
+  | top₀ :: _, top₁ :: _ =>
+    if top₀.modCount != top₁.modCount then .stateOnly else
+    match List.newPrefix? s₁.newEntries s₀.newEntries with
+    | some [] =>
+      if SharedDiff.sameObject top₀.state top₁.state || top₀.localCount != top₁.localCount then
+        .entries #[]
+      else .stateOnly
+    | some new => .entries new.toArray.reverse
+    | none => .stateOnly
+  | _, _ => .stateOnly
+
 end ScopedEnvExtension
 
 open ScopedEnvExtension
@@ -151,6 +175,7 @@ unsafe def registerScopedEnvExtensionUnsafe (descr : Descr α β σ) : IO (Scope
     addImportedFn   := addImportedFn descr
     addEntryFn      := addEntryFn descr
     exportEntriesFnEx := exportEntriesFn descr
+    stateDelta?     := some stateDelta
     statsFn         := fun s => format "number of local entries: " ++ format s.newEntries.length
     -- We restrict addition of global and `scoped` entries to the main thread but allow addition of
     -- scopes and local entries in any thread, which are visible only in that thread (see uses of
@@ -206,7 +231,7 @@ def stateStackModify (ext : ScopedEnvExtension α β σ) (states : List (State �
   match states with
   | [] => states
   | top :: states =>
-    let top := { top with state := ext.descr.addEntry top.state b }
+    let top := { top with state := ext.descr.addEntry top.state b, localCount := top.localCount + 1 }
     let bot := if top.delimitsLocal then states else stateStackModify ext states b
     top :: bot
 
@@ -250,14 +275,19 @@ def ScopedEnvExtension.activateScoped (ext : ScopedEnvExtension α β σ) (env :
             let mut state := top.state
             for b in bs do
               state := ext.descr.addEntry state b
-            { state := state, activeScopes := activeScopes }
+            { state, activeScopes, modCount := top.modCount + 1, localCount := top.localCount }
         { s with stateStack := top :: stack }
     | _ => s
 
+/-- Replaces the top state. Writes outside `addEntry`, `addScopedEntry` and `addLocalEntry` must go through this
+function (or `activateScoped`), which counts them in `State.modCount`, so that a command making one is recorded
+as `stateOnly` rather than replayed from its entries. A write through the underlying persistent extension
+(`ext.ext.modifyState`) is detected only in a command that adds no entry and no local entry to `ext`. -/
 def ScopedEnvExtension.modifyState (ext : ScopedEnvExtension α β σ) (env : Environment) (f : σ → σ) : Environment :=
   ext.ext.modifyState env fun s =>
     match s.stateStack with
-    | top :: stack => { s with stateStack := { top with state := f top.state } :: stack }
+    | top :: stack =>
+      { s with stateStack := { top with state := f top.state, modCount := top.modCount + 1 } :: stack }
     | _ => s
 
 def pushScope [Monad m] [MonadEnv m] [MonadLiftT (ST IO.RealWorld) m] : m Unit := do
