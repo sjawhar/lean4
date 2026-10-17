@@ -1,0 +1,6 @@
+command 3 (attribute [-simp] victim): refused: command 3 changed #[Lean.Meta.simpExtension] without entries; it must be elaborated again
+command 4 (attribute [-simp] keep in theorem t1): replayed: keep unfolds true (full run: true)
+command 5 (@[erase_probe] def d): refused: command 5 changed #[Lean.Meta.simpExtension] without entries; it must be elaborated again
+noskip: (some true), reason: (some (state-only change to Lean.Meta.simpExtension in declaration command 5))
+ctx after erasing victim vs other differs: [true, true, true]
+ctx before the erasure equal: [true, true, true, true]
