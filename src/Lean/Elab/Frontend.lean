@@ -393,16 +393,16 @@ def runFrontend
   if let some oleanFileName := oleanFileName? then
     let recorded ← declConstsRef.get
     let usage? := usageFileName?.map fun usageFileName =>
-      let consts := ModuleUsage.ownConsts env recorded
-      (usageFileName, consts, ModuleUsage.localDigests env consts)
+      let nodes := ModuleUsage.ownNodes env (ModuleUsage.ownConsts env recorded)
+      (usageFileName, nodes, ModuleUsage.localDigests env nodes)
     profileitIO ".olean serialization" finalOpts do
       let commandLints := collectCommandLints snaps none #[]
       let env ← Linter.recordLints inputCtx.fileMap env commandLints
       let env := usage?.elim env fun (_, _, own) => ModuleUsage.setLocalDigests env own
       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
-    if let some (usageFileName, consts, own) := usage? then
+    if let some (usageFileName, nodes, own) := usage? then
       let used := ModuleUsage.usedFromInfoTrees trees (← usedByChecksRef.get)
-      ModuleUsage.writeUsage env consts own used (incrLoaded := incrLoadFileName?.isSome)
+      ModuleUsage.writeUsage env nodes own used (incrLoaded := incrLoadFileName?.isSome)
         usageFileName
 
   if let some ileanFileName := ileanFileName? then

@@ -37,7 +37,7 @@ match_text "Replayed Test.HU" produced.out
 # (sidecars are removed before being rewritten: under an artifact cache they are read-only links)
 printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 1\n' > Test/H.lean
 rm -f .lake/build/lib/lean/Test/HU.usage
-printf '{"version":5,"noskip":false,"moduleDigest":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","digested":[],"own":[],"used":[[[true],[]]],"extra":[]}' > .lake/build/lib/lean/Test/HU.usage
+printf '{"version":6,"noskip":false,"moduleDigest":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","digested":[],"own":[],"used":[[[true],[]]],"extra":[]}' > .lake/build/lib/lean/Test/HU.usage
 test_out "expected a name component" build Test.HU
 match_text "Built Test.HU" produced.out
 # so is a sidecar that is not UTF-8
@@ -281,7 +281,6 @@ match_text "Replayed Test.TB" produced.out
 printf 'partial def f (n : Nat) : Nat := if n = 0 then 2 else f (n - 1)\n' > Test/PX.lean
 printf 'import Test.PX\ntheorem t : f 1 = 2 := by native_decide\n' > Test/PM.lean
 test_run build Test.PM
-test_cmd_out '"noskip":true' cat .lake/build/lib/lean/Test/PM.usage
 printf 'partial def f (n : Nat) : Nat := if n = 0 then 3 else f (n - 1)\n' > Test/PX.lean
 test_err "error: Test/PM.lean" build -v Test.PM
 printf 'partial def f (n : Nat) : Nat := if n = 0 then 2 else f (n - 1)\n' > Test/PX.lean

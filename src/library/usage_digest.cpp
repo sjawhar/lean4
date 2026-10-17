@@ -118,11 +118,14 @@ enum : unsigned char {
     tag_name = 1, tag_name_str, tag_name_num,
     tag_level_zero = 10, tag_level_succ, tag_level_max, tag_level_imax, tag_level_param, tag_level_mvar,
     tag_bvar = 20, tag_fvar, tag_mvar, tag_sort, tag_const, tag_app, tag_lam, tag_pi, tag_let, tag_nat_lit,
-    tag_str_lit, tag_proj
+    tag_str_lit, tag_proj, tag_exprs = 40
 };
 
+/* `Lean.ModuleUsage.BinderMode`: what of a binder counts besides its domain. */
+enum class binder_mode : unsigned char { none = 0, infos = 1, names_infos = 2 };
+
 class digester {
-    bool                  m_binders;
+    binder_mode           m_mode;
     ptr_digest_map        m_exprs, m_names, m_levels;
     std::vector<object *> m_todo;
     std::vector<object *> m_parts;
@@ -180,13 +183,13 @@ class digester {
         case expr_kind::App:   return hasher(tag_app).dig(child(app_fn(e))).dig(child(app_arg(e))).finish();
         case expr_kind::Lambda: case expr_kind::Pi: {
             hasher h(is_lambda(e) ? tag_lam : tag_pi);
-            if (m_binders)
-                h.dig(name_digest(binding_name(e))).u8(static_cast<unsigned char>(binding_info(e)));
+            if (m_mode == binder_mode::names_infos) h.dig(name_digest(binding_name(e)));
+            if (m_mode != binder_mode::none) h.u8(static_cast<unsigned char>(binding_info(e)));
             return h.dig(child(binding_domain(e))).dig(child(binding_body(e))).finish();
         }
         case expr_kind::Let: {
             hasher h(tag_let);
-            if (m_binders) h.dig(name_digest(let_name(e)));
+            if (m_mode == binder_mode::names_infos) h.dig(name_digest(let_name(e)));
             h.u8(let_nondep(e) ? 1 : 0);
             return h.dig(child(let_type(e))).dig(child(let_value(e))).dig(child(let_body(e))).finish();
         }
@@ -208,7 +211,7 @@ class digester {
     }
 
 public:
-    explicit digester(bool binders):m_binders(binders) {}
+    explicit digester(binder_mode mode):m_mode(mode) {}
 
     /* Children first, with an explicit stack: proof terms can nest deeper than the C stack allows. */
     digest expr_digest(expr const & root) {
@@ -263,11 +266,28 @@ extern "C" LEAN_EXPORT obj_res lean_usage_digest_bytes(b_obj_arg bytes) {
 #endif
 }
 
-extern "C" LEAN_EXPORT obj_res lean_usage_expr_digest(uint8 binders, b_obj_arg e) {
+extern "C" LEAN_EXPORT obj_res lean_usage_expr_digest(uint8 mode, b_obj_arg e) {
 #ifdef LEAN_EMSCRIPTEN
     lean_internal_panic("usage digests require OpenSSL");
 #else
-    return mk_digest_obj(digester(binders != 0).expr_digest(TO_REF(expr, e)));
+    return mk_digest_obj(digester(static_cast<binder_mode>(mode)).expr_digest(TO_REF(expr, e)));
+#endif
+}
+
+/* One digest of an array of expressions, by one digester, so subterms they share are digested once. */
+extern "C" LEAN_EXPORT obj_res lean_usage_exprs_digest(uint8 mode, b_obj_arg es) {
+#ifdef LEAN_EMSCRIPTEN
+    lean_internal_panic("usage digests require OpenSSL");
+#else
+    digester d(static_cast<binder_mode>(mode));
+    size_t n = lean_array_size(es);
+    std::vector<digest> ds;
+    ds.reserve(n);
+    for (size_t i = 0; i < n; i++) ds.push_back(d.expr_digest(TO_REF(expr, lean_array_cptr(es)[i])));
+    hasher h(tag_exprs);
+    h.u64(n);
+    for (digest const & x : ds) h.dig(x);
+    return mk_digest_obj(h.finish());
 #endif
 }
 
