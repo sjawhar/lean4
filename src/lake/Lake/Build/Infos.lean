@@ -87,6 +87,12 @@ public structure ModulePreSetup where
   srcMTime : MTime
   /-- The hash of the source's contents as Lake read them (see `Module.recFetchInput`). -/
   srcHash : Hash
+  /--
+  The hash of the module's inputs other than its imports and libraries: the toolchain, the
+  source's contents, the options, and the module's name, package and arguments. Outputs produced
+  for the same local hash differ only in the imports they were produced against.
+  -/
+  localHash : Hash
   srcFile : FilePath
   isModule : Bool
   directImports : Array ModuleImport

@@ -702,18 +702,29 @@ def Module.recFetchPreSetup (mod : Module) : FetchM (Job ModulePreSetup) := ensu
     let {dynlibs, plugins} ← computeModuleDeps impLibs externLibs dynlibs plugins
     let extra := (← getLeanOptOverrides).find? mod.pkg.baseName |>.getD {}
     let leanOptions := mod.leanOptions ++ extra
+    let optionsTrace := traceOptions leanOptions "options"
     addLeanTrace
     addTrace input.trace
-    addTrace <| traceOptions leanOptions "options"
+    addTrace optionsTrace
     addPureTrace input.header.isModule "isModule"
     addPureTrace mod.name "Module.name"
     addPureTrace mod.pkg.id? "Package.id?"
     addPureTrace mod.leanArgs "Module.leanArgs"
+    let localTrace := BuildTrace.nil "local"
+      |>.mix (if mod.platformIndependent == some false then platformTrace else .nil)
+      |>.mix (← getLeanTrace)
+      |>.mix (.ofHash input.trace.hash)
+      |>.mix optionsTrace
+      |>.mix (.ofHash (pureHash input.header.isModule))
+      |>.mix (.ofHash (pureHash mod.name))
+      |>.mix (.ofHash (pureHash mod.pkg.id?))
+      |>.mix (.ofHash (pureHash mod.leanArgs))
     return {
       trace := ← getTrace
       srcFile := input.path
       srcMTime := input.trace.mtime
       srcHash := input.trace.hash
+      localHash := localTrace.hash
       isModule := input.header.isModule
       directImports := input.imports
       directImportArts := info.directArts
@@ -848,6 +859,7 @@ def ModuleOutputDescrs.resolve
     ilean := ← resolve descrs.ilean
     c? := ← descrs.c?.mapM resolve
     ltar? := ← descrs.ltar?.mapM resolve
+    keptFrom? := descrs.keptFrom?
   }
   if Lean.Internal.hasLLVMBackend () then
     let some descr := descrs.bc?
@@ -953,6 +965,7 @@ def Module.recacheOutputArtifacts?
       c? := ← c?
       bc? := ← bc?
       ltar? := ← ltar?
+      keptFrom? := descrs.keptFrom?
     }
   return arts?
 where
@@ -1146,6 +1159,19 @@ def SavedTrace.moduleOutputDescrs? (self : SavedTrace) : Option ModuleOutputDesc
   let some outputs := data.outputs? | none
   (ModuleOutputDescrs.fromJson? outputs).toOption
 
+/-- The `keptFrom?` recorded with a saved trace's module outputs. -/
+def SavedTrace.keptFrom? (self : SavedTrace) : Option Hash :=
+  self.moduleOutputDescrs?.bind (·.keptFrom?)
+
+/--
+Gives `arts` the `keptFrom?` that the module's trace file records: outputs described again from the
+build directory lack it, while the trace written for them (by a compile, a kept-module check, or a
+restore) records it.
+-/
+def Module.withSavedKeptFrom (mod : Module) (arts : ModuleOutputArtifacts) : JobM ModuleOutputArtifacts := do
+  if arts.keptFrom?.isSome then return arts
+  return {arts with keptFrom? := (← readTraceFile mod.traceFile).keptFrom?}
+
 def Module.packLtar
   (self : Module) (arts : ModuleOutputArtifacts)
 : JobM Artifact := do
@@ -1222,7 +1248,8 @@ public def Module.ltarFacetConfig : ModuleFacetConfig ltarFacet :=
 
 def Module.buildLean
   (mod : Module) (presetup : ModulePreSetup)
-: JobM ModuleOutputArtifacts := do buildAction (← getTrace) mod.traceFile do
+: JobM ModuleOutputArtifacts := do
+  buildAction (← getTrace) mod.traceFile (localHash? := some presetup.localHash) do
   let args := mod.weakLeanArgs ++ mod.leanArgs
   let relSrcFile := relPathFrom mod.pkg.dir presetup.srcFile
   let setup ← mkModuleSetup mod presetup
@@ -1285,13 +1312,19 @@ where
       -- Note: This branch implies that only the ltar output is (validly) cached.
       -- Thus, we use only the new trace unpacked from the ltar to resolve further artifacts.
       let savedTrace ← readTraceFile mod.traceFile
+      if (← isKeptExcluded) && savedTrace.keptFrom?.isSome then
+        mod.clearOutputArtifacts
+        removeFileIfExists mod.traceFile
+        return .incomplete .missing none
       let arts? ← getArtifactsUsingTrace? inputHash savedTrace mod.pkg
       if let some (arts : ModuleOutputArtifacts) := arts? then
         -- On initial unpack from cache ensure all artifacts uniformly
         -- end up in the build directory and, if writable, the cache
         let arts ← mod.restoreAllArtifacts {arts with ltar? := some ltar}
         if (← mod.pkg.isArtifactCacheWritable) then
+          let keptFrom? := arts.keptFrom?
           let arts ← mod.cacheOutputArtifacts presetup.isModule restoreAll presetup.postponeCompile
+          let arts := {arts with keptFrom?}
           -- Note: Cache service metadata is not preserved on an output update because it would
           -- result in downloading module outputs that are not available on the remote.
           (← getLakeCache).writeOutputs mod.pkg.cacheScope inputHash arts.descrs (overwrite := true)
@@ -1302,9 +1335,11 @@ where
         let ltar ← if restoreAll then restoreArtifact mod.ltarFile ltar else pure ltar
         return .incomplete savedTrace (some ltar)
     | .arts arts =>
+      if (← isKeptExcluded) && arts.keptFrom?.isSome then
+        return .incomplete savedTrace none
       unless (← savedTrace.replayCachedIfUpToDate inputHash) do
         mod.clearOutputArtifacts
-        writeFetchTrace mod.traceFile inputHash (toJson arts.descrs)
+        writeFetchTrace mod.traceFile inputHash (toJson arts.descrs) (some presetup.localHash)
       let arts ←
         if restoreAll then
           mod.restoreAllArtifacts arts
@@ -1319,7 +1354,7 @@ where
     let depTrace ← getTrace
     have : GetMTime Module := ⟨(·.getMTime presetup.isModule presetup.postponeCompile)⟩
     have : CheckExists Module := ⟨(·.checkExists presetup.isModule presetup.postponeCompile)⟩
-    let savedTrace ← readTraceFile mod.traceFile
+    let savedTrace ← reviewKept (← readTraceFile mod.traceFile)
     if (← mod.pkg.isArtifactCacheWritable) then
       let restore ← mod.pkg.restoreAllArtifacts
       match (← fetchFromCache? presetup savedTrace restore) with
@@ -1342,7 +1377,7 @@ where
             else
               discard <| mod.buildLean presetup
         else
-          discard <| mod.buildLean presetup
+          discard <| checkOrBuild presetup savedTrace
         if status.isCacheable then
           let arts ← id do
             if replayed then
@@ -1353,23 +1388,25 @@ where
                   return arts
               discard <| mod.buildLean presetup
             mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile
-          let arts := {arts with ltar? := arts.ltar? <|> ltar?}
+          let arts ← mod.withSavedKeptFrom {arts with ltar? := arts.ltar? <|> ltar?}
           (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs
           return arts
         else
           let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
-          return {arts with ltar? := arts.ltar? <|> ltar?}
+          mod.withSavedKeptFrom {arts with ltar? := arts.ltar? <|> ltar?}
     else
       let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
       if status.isUpToDate then
-        unless (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) do
-          -- As above: restore on a hash match and rebuild on a mtime match.
-          if status == .hashUpToDate then
-            unless (← unpackLocalLtar depTrace.hash) do
-              discard <| mod.buildLean presetup
-          else
+        if (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) then
+          let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
+          return {arts with keptFrom? := savedTrace.keptFrom?}
+        -- As above: restore on a hash match and rebuild on a mtime match.
+        if status == .hashUpToDate then
+          unless (← unpackLocalLtar depTrace.hash) do
             discard <| mod.buildLean presetup
-        mod.computeArtifacts presetup.isModule presetup.postponeCompile
+        else
+          discard <| mod.buildLean presetup
+        mod.withSavedKeptFrom (← mod.computeArtifacts presetup.isModule presetup.postponeCompile)
       else
         if (← mod.pkg.isArtifactCacheReadable) then
           match (← fetchFromCache? presetup savedTrace true) with
@@ -1378,11 +1415,101 @@ where
           | .incomplete savedTrace ltar? =>
             if (← savedTrace.replayIfUpToDate (oldTrace := presetup.srcMTime) mod depTrace) then
               let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
-              return {arts with ltar? := arts.ltar? <|> ltar?}
+              mod.withSavedKeptFrom {arts with ltar? := arts.ltar? <|> ltar?}
             else
-              mod.buildLean presetup
+              checkOrBuild presetup savedTrace
         else
-          mod.buildLean presetup
+          checkOrBuild presetup savedTrace
+  isKeptExcluded : JobM Bool :=
+    return (← getBuildContext).keptExclude.contains mod.name
+  /-
+  A saved trace of outputs that a kept-module check accepted is set aside, so that the module is
+  decided again, when the module is excluded from kept checks, or when the cache maps the same
+  input to outputs compiled from source (which then replace the kept ones).
+  -/
+  reviewKept (savedTrace : SavedTrace) : JobM SavedTrace := do
+    unless savedTrace.keptFrom?.isSome do return savedTrace
+    if (← isKeptExcluded) then return .missing
+    let .ok data := savedTrace | return savedTrace
+    unless data.depHash == (← getTrace).hash && (← mod.pkg.isArtifactCacheReadable) do
+      return savedTrace
+    let some cached ← cachedDescrs? data.depHash | return savedTrace
+    return if cached.keptFrom?.isNone then .missing else savedTrace
+  cachedDescrs? (inputHash : Hash) : JobM (Option ModuleOutputDescrs) := do
+    try
+      let some out ← (← getLakeCache).readOutputs? mod.pkg.cacheScope inputHash | return none
+      let descrs? : Except String ModuleOutputDescrs := fromJson? out.data
+      return descrs?.toOption
+    catch e =>
+      dropLogFrom e
+      return none
+  /-
+  Compiles the module, unless its existing outputs are a kept candidate (`keptCandidate?`) and
+  the kept-module checker accepts them for the module's current imports.
+  -/
+  checkOrBuild (presetup : ModulePreSetup) (savedTrace : SavedTrace)
+  : JobM ModuleOutputArtifacts := do
+    if let some checker := (← getBuildContext).keptChecker? then
+      if let some (data, descrs) ← keptCandidate? presetup savedTrace then
+        let setup ← mkModuleSetup mod presetup
+        let olean ← id do
+          if mod.oleanFile.isAbsolute then pure mod.oleanFile
+          else return (← IO.currentDir) / mod.oleanFile
+        match (← checker.check mod.name olean (toJson setup)) with
+        | .accepted hash =>
+          if hash == descrs.olean.hash then
+            return ← acceptKept presetup setup data descrs
+          logInfo s!"kept-module check: the checker read an .olean with hash {hash}, \
+            not {descrs.olean.hash} as recorded in the module's trace; compiling"
+        | .rejected reason =>
+          logInfo s!"kept-module check: {reason}; compiling"
+    mod.buildLean presetup
+  /-
+  The saved trace and its output descriptions if the module's existing outputs may be kept for
+  its current input: they were produced from the same local inputs (`ModulePreSetup.localHash`),
+  so only the module's imports differ, and the files are the ones the trace describes. A
+  `module` file, a module linked into a shared library (`precompileModules`), and a module
+  excluded from kept checks are never candidates, nor is any module of a `--no-build` build.
+  -/
+  keptCandidate? (presetup : ModulePreSetup) (savedTrace : SavedTrace)
+  : JobM (Option (BuildMetadata × ModuleOutputDescrs)) := do
+    if (← getNoBuild) || presetup.isModule || mod.shouldPrecompile || (← isKeptExcluded) then
+      return none
+    let .ok data := savedTrace | return none
+    let some descrs := savedTrace.moduleOutputDescrs? | return none
+    unless data.localHash? == some presetup.localHash do return none
+    -- The `.hash` files are not trusted here: an output can change without them.
+    unless (← hashIs mod.oleanFile descrs.olean) && (← hashIs mod.ileanFile descrs.ilean) do
+      return none
+    if let some c := descrs.c? then
+      unless (← hashIs mod.cFile c) do return none
+    if let some bc := descrs.bc? then
+      unless (← hashIs mod.bcFile bc) do return none
+    return some (data, descrs)
+  hashIs (file : FilePath) (descr : ArtifactDescr) : BaseIO Bool := do
+    match (← (computeFileHash file).toBaseIO) with
+    | .ok hash => return hash == descr.hash
+    | .error _ => return false
+  /-
+  Records the module's existing outputs, which the kept-module checker accepted, as the outputs of
+  its current input. Their `.hash` files are rewritten from the hashes `keptCandidate?` computed.
+  The module's `.ltar` was packed with the previous trace, so it is removed.
+  -/
+  acceptKept (presetup : ModulePreSetup) (setup : ModuleSetup) (data : BuildMetadata)
+    (descrs : ModuleOutputDescrs)
+  : JobM ModuleOutputArtifacts := do
+    buildAction (← getTrace) mod.traceFile (action := .check) (localHash? := some presetup.localHash) do
+      data.log.replay
+      writeFileHash mod.oleanFile descrs.olean.hash
+      writeFileHash mod.ileanFile descrs.ilean.hash
+      if let some c := descrs.c? then writeFileHash mod.cFile c.hash
+      if let some bc := descrs.bc? then writeFileHash mod.bcFile bc.hash
+      removeFileIfExists mod.ltarFile
+      clearFileHash mod.ltarFile
+      createParentDirs mod.setupFile
+      IO.FS.writeFile mod.setupFile (toJson setup).pretty
+      let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
+      return {arts with keptFrom? := descrs.keptFrom? <|> some data.depHash}
   -- Unpacks the module's own `.ltar` (stamped with `inputHash`) into the build directory and
   -- returns whether it did. The archive carries its own trace, which vouches only for the archive,
   -- so it must still have the hash recorded when it was packed; if it does not, or none is
