@@ -14,8 +14,8 @@ import Lean.Elab.InfoTree.Util
 public section
 namespace Lean.ModuleUsage
 
-/-- A meaning digest: the first 128 bits of a SHA-256, read big-endian into `hi` then `lo`
-(`src/library/usage_digest.cpp`). -/
+/-- A 128-bit digest, read big-endian into `hi` then `lo`: a meaning digest is the first 128 bits of a
+SHA-256 (`src/library/usage_digest.cpp`), a file's digest the XXH3-128 of its bytes (`fileDigest`). -/
 structure Digest where
   hi : UInt64
   lo : UInt64
@@ -24,6 +24,11 @@ structure Digest where
 /-- The SHA-256 of `bytes`, truncated to a `Digest`. -/
 @[extern "lean_usage_digest_bytes"]
 opaque Digest.ofBytes (bytes : @& ByteArray) : Digest
+
+/-- The XXH3-128 hash of the file's bytes, read in fixed-size chunks: what Lake compares to tell whether
+a file it checks for usage cutoff is the one it recorded. -/
+@[extern "lean_usage_file_digest"]
+opaque fileDigest (path : @& System.FilePath) : IO Digest
 
 def hex16 (v : UInt64) : String :=
   let s := String.ofList (Nat.toDigits 16 v.toNat); "".pushn '0' (16 - s.length) ++ s

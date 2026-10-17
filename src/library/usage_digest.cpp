@@ -1,10 +1,16 @@
 /*
 Released under Apache 2.0 license as described in the file LICENSE.
 */
+#include <cerrno>
+#include <cstdio>
 #include <cstring>
+#include <memory>
 #include <vector>
+#include "runtime/io.h"
 #include "runtime/object_ref.h"
 #include "kernel/expr.h"
+#define XXH_INLINE_ALL
+#include "library/xxhash.h"
 #ifndef LEAN_EMSCRIPTEN
 // The low-level SHA-256 calls cost ~30% less per small message than a reused EVP context.
 #define OPENSSL_SUPPRESS_DEPRECATED
@@ -256,5 +262,36 @@ extern "C" LEAN_EXPORT obj_res lean_usage_expr_digest(uint8 binders, b_obj_arg e
 #else
     return mk_digest_obj(digester(binders != 0).expr_digest(TO_REF(expr, e)));
 #endif
+}
+
+/* The XXH3-128 hash of a file's bytes, read in fixed-size chunks; `hi` is its high 64 bits, so `Digest.hex`
+prints it as `xxhsum -H2` does. */
+extern "C" LEAN_EXPORT obj_res lean_usage_file_digest(b_obj_arg path) {
+    char const * fname = string_cstr(path);
+    if (strlen(fname) != lean_string_size(path) - 1) {
+        return mk_embedded_nul_error(path);
+    }
+    FILE * f = fopen(fname, "rb");
+    if (f == nullptr) {
+        return io_result_mk_error(decode_io_error(errno, path));
+    }
+    constexpr size_t chunk = 1 << 18;
+    std::unique_ptr<unsigned char[]> buf(new unsigned char[chunk]);
+    XXH3_state_t state;
+    XXH3_128bits_reset(&state);
+    size_t n;
+    while ((n = fread(buf.get(), 1, chunk, f)) > 0) {
+        XXH3_128bits_update(&state, buf.get(), n);
+    }
+    int err = ferror(f) ? errno : 0;
+    fclose(f);
+    if (err != 0) {
+        return io_result_mk_error(decode_io_error(err, path));
+    }
+    XXH128_hash_t h = XXH3_128bits_digest(&state);
+    object * r = lean_alloc_ctor(0, 0, 2 * sizeof(uint64_t));
+    lean_ctor_set_uint64(r, 0, h.high64);
+    lean_ctor_set_uint64(r, sizeof(uint64_t), h.low64);
+    return io_result_mk_ok(r);
 }
 }
