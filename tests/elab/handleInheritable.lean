@@ -26,7 +26,9 @@ def inheritedBy (settings : List Bool) : IO Bool := do
 #guard_msgs in
 #eval show IO (Bool × Bool × Bool × Bool) from do
   -- the child lists its descriptors through Linux's `/proc`
-  unless ← System.FilePath.pathExists "/proc/self/fd" do return (true, false, false, true)
+  unless System.Platform.isLinux do return (true, false, false, true)
+  unless ← System.FilePath.pathExists "/proc/self/fd" do
+    throw <| IO.userError "/proc/self/fd is not available"
   let r := (← inheritedBy [true], ← inheritedBy [false], ← inheritedBy [true, false],
     ← inheritedBy [false, true])
   IO.FS.removeFile testFile
