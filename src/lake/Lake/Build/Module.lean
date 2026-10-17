@@ -1605,10 +1605,9 @@ where
     if let some checker := (← getBuildContext).keptChecker? then
       if let some (data, descrs) ← keptCandidate? presetup savedTrace then
         let setup ← setup?.getDM (mkModuleSetup mod presetup)
-        let olean ← id do
-          if mod.oleanFile.isAbsolute then pure mod.oleanFile
-          else return (← IO.currentDir) / mod.oleanFile
-        match (← checker.check mod.name olean (toJson setup)) with
+        let cwd ← IO.currentDir
+        let abs (f : FilePath) := if f.isAbsolute then f else cwd / f
+        match (← checker.check mod.name (abs mod.oleanFile) (abs presetup.srcFile) (toJson setup)) with
         | .accepted hash =>
           if hash == descrs.olean.hash then
             return ← acceptKept presetup setup data descrs
