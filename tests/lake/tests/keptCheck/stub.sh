@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # A stand-in for a kept-module checker, for `test.sh`. It reads one JSON request per line on stdin
-# and answers each with one JSON line on stdout. Each start appends a line to `$STUB_LOG.spawns`;
-# each request appends its module to `$STUB_LOG` and the request itself to `$STUB_LOG.json`. It
+# and answers each with one JSON line on stdout. Each start appends a line to `$STUB_LOG.spawns`
+# and its `LEAN_SYSROOT` to `$STUB_LOG.sysroot`; each request appends its module to `$STUB_LOG` and
+# the request itself to `$STUB_LOG.json`. It
 # accepts every module except those listed as `<module> fail` in `$STUB_VERDICTS`, replying with
 # the hash recorded in the `.hash` file next to the `.olean` (a real checker hashes what it read).
 #
@@ -13,6 +14,7 @@
 # - `wait-go`: before answering for `P.B`, wait (at most 30 s) until the file `$STUB_GO` exists
 set -u
 echo spawn >> "$STUB_LOG.spawns"
+echo "${LEAN_SYSROOT-unset}" >> "$STUB_LOG.sysroot"
 while IFS= read -r line; do
   # Lean's JSON objects keep their keys sorted: `id`, `module` and `olean` come before `setup`
   [[ $line =~ \"id\":([0-9]+) ]] && id=${BASH_REMATCH[1]}
