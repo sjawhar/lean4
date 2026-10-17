@@ -845,9 +845,6 @@ private:
         if (e != m_symbol_cache.end()) {
             return e->second;
         }
-        // Every declaration the interpreter runs (and, through its digest, everything that one calls) counts as
-        // used by the module being elaborated.
-        record_used(fn);
         std::shared_lock<std::shared_mutex> lock(*g_native_symbol_cache_mutex);
         auto ne = g_native_symbol_cache->find(fn);
         if (ne != g_native_symbol_cache->end()) {
@@ -881,6 +878,11 @@ private:
             }
         }
         g_native_symbol_cache->insert({ fn, e_new.m_native });
+        unique_lock.unlock();
+        // The first resolution of `fn` in this process (later interpreter instances find it in the global cache
+        // above): every declaration the interpreter runs, and through its digest everything that one calls,
+        // counts as used by the module being elaborated.
+        record_used(fn);
         return m_symbol_cache.emplace(fn, std::move(e_new)).first->second;
     }
 
