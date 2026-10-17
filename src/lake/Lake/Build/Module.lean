@@ -1239,9 +1239,16 @@ structure UsageImport where
 def UsageSidecar.toImport (u : UsageSidecar) : UsageImport :=
   { moduleDigest := u.moduleDigest, closure := u.closure, own := u.own }
 
-/-- Accepts exactly the sidecars `UsageSidecar` accepts. -/
+/-- Reads only the fields an importer checks; a sidecar that fails `UsageSidecar` here is rejected by its own
+module's check (`readOwnUsage`), which runs before any importer reads it. -/
 instance : FromJson UsageImport where
-  fromJson? j := (·.toImport) <$> fromJson? (α := UsageSidecar) j
+  fromJson? j := do
+    let own ← j.getObjValAs? (Array (SidecarName × ModuleUsage.Digest)) "own"
+    return {
+      moduleDigest := ← j.getObjValAs? ModuleUsage.Digest "moduleDigest"
+      closure := ← j.getObjValAs? ModuleUsage.Digest "closure"
+      own := own.foldl (init := {}) fun m (n, d) => m.insert n.name d
+    }
 
 instance : FromJson UsekeySidecar where
   fromJson? j := do
