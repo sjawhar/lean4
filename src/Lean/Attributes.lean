@@ -187,6 +187,7 @@ def registerTagAttribute (name : Name) (descr : String)
     addImportedFn   := fun _ _ => pure {}
     addEntryFn      := fun (s : NameSet) n => s.insert n
     ofOLeanEntry?  := some fun _ entry => pure entry
+    stateDelta?    := some StateDelta.ofNameSet
     exportEntriesFnEx := fun env es =>
       let all : Array Name := es.foldl (fun a e => a.push e) #[] |>.qsort Name.quickLt
       -- Do not export info for private defs at exported/server levels
@@ -261,6 +262,18 @@ structure ParametricAttributeImpl (α : Type) extends AttributeImplCore where
   filterExport : Environment → Name → α → Bool := fun env n _ =>
     env.contains (skipRealize := false) n
 
+/-- The state delta of a parametric attribute: the declarations in front of the old key log, oldest first, each
+with its value in the new map. `stateOnly` when the map changed with no new key, or when the old log is not a
+tail of the new one. -/
+private def keyLogDelta (s₀ s₁ : List Name × NameMap α) : StateDelta (Name × α) :=
+  match List.newPrefix? s₁.1 s₀.1 with
+  | some [] => if SharedDiff.sameObject s₀.2 s₁.2 then .entries #[] else .stateOnly
+  | some new =>
+    match new.toArray.reverse.mapM fun k => (s₁.2.find? k).map (k, ·) with
+    | some es => .entries es
+    | none => .stateOnly
+  | none => .stateOnly
+
 def registerParametricAttributeExt (ref : Name) (preserveOrder : Bool := false)
     (filterExport : Environment → Name → α → Bool := fun env n _ =>
       env.contains (skipRealize := false) n) :
@@ -271,6 +284,7 @@ def registerParametricAttributeExt (ref : Name) (preserveOrder : Bool := false)
     addImportedFn   := fun _ => pure ([], {})
     addEntryFn      := fun (decls, m) (p : Name × α) => (p.1 :: decls, m.insert p.1 p.2)
     ofOLeanEntry?  := some fun _ entry => pure entry
+    stateDelta?    := some keyLogDelta
     exportEntriesFnEx := fun env (decls, m) => Id.run do
       let all := if preserveOrder then
         decls.toArray.reverse.filterMap (fun n => return (n, ← m.find? n))
@@ -355,6 +369,7 @@ def registerEnumAttributes (attrDescrs : List (Name × String × α))
     addImportedFn   := fun _ _ => pure {}
     addEntryFn      := fun (s : NameMap α) (p : Name × α) => s.insert p.1 p.2
     ofOLeanEntry?  := some fun _ entry => pure entry
+    stateDelta?    := some StateDelta.ofNameMap
     exportEntriesFnEx := fun env m =>
       let all : Array (Name × α) := m.foldl (fun a n p => a.push (n, p)) #[] |>.qsort (fun a b => Name.quickLt a.1 b.1)
       -- Do not export info for private defs at exported/server levels
