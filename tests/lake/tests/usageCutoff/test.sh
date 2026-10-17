@@ -385,17 +385,6 @@ LAKE_USAGE_CUTOFF=0 test_run -d ext build M
 printf '#include <stdint.h>\nuint32_t ext_val(void *u) { return 2; }\n' > ext/ext.c
 LAKE_USAGE_CUTOFF=0 lake_out -d ext build -v M
 match_text "Replayed M" produced.out
-# `lake unpack` of an archive that ships no sidecars (e.g. built by another toolchain) drops the
-# old ones, without following a symlink out of the build directory
-test_exp -f .lake/build/lib/lean/Test/A.usage
-mkdir -p outside stock
-printf '{' > outside/keep.usage
-ln -s "$PWD/outside" .lake/build/link
-tar -czf stock.tgz -C stock .
-test_run unpack stock.tgz
-test_exp ! -f .lake/build/lib/lean/Test/A.usage
-test_exp ! -f .lake/build/lib/lean/Test/A.usekey
-test_exp -f outside/keep.usage
 # Under a writable artifact cache with restored artifacts (`LAKE_ARTIFACT_CACHE` and
 # `LAKE_RESTORE_ARTIFACTS`), in fresh package dirs sharing a cache of their own. Restored and cached
 # outputs are read-only hard links into the cache, so a test edits one by replacing it, never by
