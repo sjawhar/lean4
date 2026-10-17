@@ -530,8 +530,31 @@ def openDeclEnc (e : Enc) : OpenDecl → Enc
   | .simple ns except => e.u8 0 |>.name ns |>.names except
   | .explicit id decl => e.u8 1 |>.name id |>.name decl
 
-/-- The command-context portion available before payload recording is folded in by the reuse frontend. -/
-def ctxDigest (st : Elab.Command.State) (entries : Digest) : Digest := Id.run do
+/-- An order-independent digest of a set of names: their count and the lane-wise sums of their digests, updated
+name by name, so that following a set across commands costs what each command added. -/
+structure NameSetDigest where
+  size : Nat := 0
+  hi : UInt64 := 0
+  lo : UInt64 := 0
+  deriving Inhabited
+
+namespace NameSetDigest
+
+private def nameDigest (n : Name) : Digest := (({} : Enc).name n).finish
+
+def insert (d : NameSetDigest) (n : Name) : NameSetDigest :=
+  let x := nameDigest n
+  { size := d.size + 1, hi := d.hi + x.hi, lo := d.lo + x.lo }
+
+def erase (d : NameSetDigest) (n : Name) : NameSetDigest :=
+  let x := nameDigest n
+  { size := d.size - 1, hi := d.hi - x.hi, lo := d.lo - x.lo }
+
+end NameSetDigest
+
+/-- The command-context portion available before payload recording is folded in by the reuse frontend.
+`quotCtxts` is the digest of `st.usedQuotCtxts`. -/
+def ctxDigest (st : Elab.Command.State) (quotCtxts : NameSetDigest) (entries : Digest) : Digest := Id.run do
   let mut e : Enc := ({} : Enc).nat st.scopes.length
   for scope in st.scopes do
     e := e.str scope.header
@@ -548,9 +571,8 @@ def ctxDigest (st : Elab.Command.State) (entries : Digest) : Digest := Id.run do
       |>.bool scope.isNoncomputable |>.bool scope.isPublic |>.bool scope.isMeta
     e := scope.attrs.foldl (fun e s => syntaxEnc e s.raw) (e.nat scope.attrs.length)
   let g := st.auxDeclNGen.toRecord
-  let quotCtxts := st.usedQuotCtxts.toArray.qsort Name.quickLt
   return e.nat st.nextMacroScope |>.name g.namePrefix |>.nat g.idx |>.nat g.parentIdxs.length
-    |> g.parentIdxs.foldl Enc.nat |>.nat quotCtxts.size |> quotCtxts.foldl Enc.name
+    |> g.parentIdxs.foldl Enc.nat |>.nat quotCtxts.size |>.u64 quotCtxts.hi |>.u64 quotCtxts.lo
     |>.digest entries |>.finish
 
 structure CommandObservation where
@@ -670,8 +692,13 @@ def commandRecords (env : Environment) (own : Array (Name × Digest))
   let extrasByIdx : Std.HashMap Nat (Array ExtraModUse) := extras.toArray.foldl (init := {})
     fun m (i, u) => m.alter i fun us => some ((us.getD #[]).push u)
   let mut entriesEnc : Enc := {}
+  let mut quotSet : NameSet := {}
+  let mut quotDigest : NameSetDigest := {}
   let mut out := #[]
   for obs in observations.qsort (·.i < ·.i) do
+    let (quotAdded, quotRemoved) := NameSet.sharedDiff quotSet obs.before.usedQuotCtxts
+    quotDigest := quotRemoved.foldl (·.erase ·) (quotAdded.foldl (·.insert ·) quotDigest)
+    quotSet := obs.before.usedQuotCtxts
     let before := obs.before.env.checked.get
     let after := obs.after.env.checked.get
     let added : NameSet := match before.constants.sharedDiff? after.constants with
@@ -755,7 +782,7 @@ def commandRecords (env : Environment) (own : Array (Name × Digest))
     let sparseCasesOn := sparseCasesOn.qsort fun a b => Name.quickLt a.2 b.2
     let structRes := structureResolutionCacheDelta obs.before.env obs.after.env
       |>.qsort fun a b => Name.quickLt a.1 b.1
-    let ctx := ctxDigest obs.before entriesEnc.finish
+    let ctx := ctxDigest obs.before quotDigest entriesEnc.finish
     out := out.push {
       i := obs.i, key, text, ctx
       isDecl := !decls.isEmpty
