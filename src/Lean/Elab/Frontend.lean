@@ -394,11 +394,13 @@ def runFrontend
     let own := ModuleUsage.localDigests env consts
     let stmt := ModuleUsage.computeStmt env (ModuleUsage.stmtState env) own consts
     let observations ← ModuleUsage.commandObservationsRef.get
+    -- module-system files are never partially re-elaborated, so their payloads would be unused
     let mut entries := #[]
-    for obs in observations.qsort (·.i < ·.i) do
-      let recorded ← recordCommandDelta obs.before.env obs.after.env obs.i
-      if let some entry := (commandEntriesExt.getState recorded).back? then
-        entries := entries.push entry
+    unless env.header.isModule do
+      for obs in observations.qsort (·.i < ·.i) do
+        let recorded ← recordCommandDelta obs.before.env obs.after.env obs.i
+        if let some entry := (commandEntriesExt.getState recorded).back? then
+          entries := entries.push entry
     let env := setCommandEntries env entries
     let commands ← ModuleUsage.commandRecords env own stmt entries
     profileitIO ".olean serialization" finalOpts do
@@ -407,9 +409,13 @@ def runFrontend
       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts)
         (ModuleUsage.setLocalStmt (ModuleUsage.setLocalDigests env own) stmt) oleanFileName
     let used := ModuleUsage.usedFromInfoTrees trees (← usedByChecksRef.get)
+    let declIdxs := commands.foldl (init := ({} : Std.HashSet Nat)) fun s c =>
+      if c.isDecl then s.insert c.i else s
+    let noskipReason? := if env.header.isModule then some "module-system"
+      else commandEntriesNoskipReason? entries declIdxs.contains
     ModuleUsage.writeUsage env consts own stmt used commands
       (incrLoaded := incrLoadFileName?.isSome) (oleanFileName.withExtension "usage")
-      (noskipReason? := commandEntriesNoskipReason? entries)
+      (noskipReason? := noskipReason?)
 
   if let some ileanFileName := ileanFileName? then
     let references := Lean.Server.findModuleRefs inputCtx.fileMap trees (localVars := false)
