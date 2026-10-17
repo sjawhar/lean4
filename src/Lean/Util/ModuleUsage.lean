@@ -15,6 +15,8 @@ public import Lean.Elab.InfoTree.Types
 import Lean.ExtraModUses
 import Lean.Compiler.Old
 import Lean.Compiler.IR.CompilerM
+import Lean.Compiler.InlineAttrs
+import Lean.Compiler.NeverExtractAttr
 import Lean.Meta.Native
 import Lean.Elab.InfoTree.Util
 public section
@@ -119,9 +121,14 @@ code follows them (who releases an argument), and `@&` is `mdata`, which `exprDi
 private def borrowEnc (e : Enc) (d : IR.Decl) : Enc :=
   d.params.foldl (fun e p => e.bool p.borrow) (e.nat d.params.size)
 
+private def inlineEnc (e : Enc) : Compiler.InlineAttributeKind → Enc
+  | .inline => e.u8 0 | .noinline => e.u8 1 | .macroInline => e.u8 2 | .inlineIfReduce => e.u8 3
+  | .alwaysInline => e.u8 4
+
 /-- Everything of `c` except its own name and the meaning of the constants it refers to, including what its
-importers' compiled code links against: the `@[extern]` entries, the `@[export]` name and the borrow flags of
-its IR parameters. -/
+importers' compiled code depends on: the `@[extern]` entries, the `@[export]` name, the borrow flags of its
+IR parameters, its inline attribute (`@[macro_inline]` inlines it into callers and stops emitting it) and
+`@[never_extract]` (whether callers may share one evaluation of a closed application). -/
 def localHash (env : Environment) (c : ConstantInfo) : Digest :=
   let v := exprDigest false
   let e := ({} : Enc).names c.levelParams |>.digest (exprDigest true c.type)
@@ -130,6 +137,8 @@ def localHash (env : Environment) (c : ConstantInfo) : Digest :=
     |>.bool (isNoncomputable env c.name)
     |>.opt (getExportNameFor? env c.name) Enc.name
     |>.opt (IR.findEnvDecl env c.name) borrowEnc
+    |>.opt (Compiler.getInlineAttribute? env c.name) inlineEnc
+    |>.bool (hasNeverExtractAttribute env c.name)
   let e := match c with
     | .defnInfo d => hintsEnc (e.u8 1 |>.digest (v d.value)) d.hints |> (safetyEnc · d.safety)
     | .thmInfo t => e.u8 2 |>.digest (v t.value)
