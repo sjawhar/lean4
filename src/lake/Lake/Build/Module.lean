@@ -1395,6 +1395,17 @@ def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
   IO.FS.writeFile mod.usekeyFile key.compress
 
 /--
+Fails, discarding the module's outputs, if its source changed since `recFetchInput` read it: the input
+hash covers the source as read then, while `lean` reads it again and a usage skip keeps old outputs.
+-/
+def Module.checkSourceUnchanged (mod : Module) (presetup : ModulePreSetup) : JobM Unit := do
+  if (← getMTime presetup.srcFile) != presetup.srcMTime then
+    mod.clearOutputArtifacts
+    let relSrcFile := relPathFrom mod.pkg.dir presetup.srcFile
+    error s!"{relSrcFile}: source file was modified during the build; \
+      its outputs were discarded (build again to compile the current version)"
+
+/--
 Compiles the module. `setup?` is its `ModuleSetup` if the caller already computed it
 (`Module.skipOrBuild`); otherwise it is computed here. Only with usage cutoff enabled does Lean
 record usage (`--usage`: digests in the `.olean`, the `.usage`) and Lake write the `.usekey`.
@@ -1412,11 +1423,7 @@ def Module.buildLean
   mod.clearOutputHashes
   compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile outputPaths args
     (← getLeanPath) (← getLean)
-  -- The input hash covers the source as `recFetchInput` read it, but `lean` reads it again.
-  if (← getMTime presetup.srcFile) != presetup.srcMTime then
-    mod.clearOutputArtifacts
-    error s!"{relSrcFile}: source file was modified during the build; \
-      its outputs were discarded (build again to compile the current version)"
+  mod.checkSourceUnchanged presetup
   let arts ← mod.computeArtifacts setup.isModule presetup.postponeCompile
   if usage then mod.writeUsekey presetup setup.importArts
   return arts
@@ -1477,12 +1484,7 @@ def Module.skipOrBuild (mod : Module) (presetup : ModulePreSetup) (savedTrace : 
   let setup ← mkModuleSetup mod presetup
   unless (← mod.usageUpToDate presetup setup.importArts) do
     return ← mod.buildLean presetup setup
-  -- The input hash covers the source as `recFetchInput` read it, but a usage skip keeps old outputs.
-  if (← getMTime presetup.srcFile) != presetup.srcMTime then
-    mod.clearOutputArtifacts
-    let relSrcFile := relPathFrom mod.pkg.dir presetup.srcFile
-    error s!"{relSrcFile}: source file was modified during the build; \
-      its outputs were discarded (build again to compile the current version)"
+  mod.checkSourceUnchanged presetup
   updateAction .replay
   data.log.replay
   unless (← getNoBuild) do

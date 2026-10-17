@@ -22,7 +22,6 @@ open System
 
 namespace Lake
 
-
 /-- Unicode icons that make up the spinner in animation order. -/
 def Monitor.spinnerFrames :=
   #['⣾','⣷','⣯','⣟','⡿','⢿','⣻','⣽']

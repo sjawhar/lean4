@@ -1,3 +1,7 @@
+/-
+Copyright (c) 2026 Theorem Labs. All rights reserved.
+Released under Apache 2.0 license as described in the file LICENSE.
+-/
 module
 prelude
 public import Lean.Util.SCC
@@ -11,8 +15,16 @@ public import Lean.Elab.InfoTree.Types
 import Lean.ExtraModUses
 import Lean.Compiler.Old
 import Lean.Compiler.IR.CompilerM
+import Lean.Meta.Native
 import Lean.Elab.InfoTree.Util
 public section
+
+/-!
+Usage data for Lake's usage cutoff: meaning digests of a module's constants (written into its `.olean`
+when Lean runs with `--usage`), and the `.usage` sidecar recording, per imported module, the digests of
+the constants the module used, from which Lake decides whether the module must be compiled again.
+-/
+
 namespace Lean.ModuleUsage
 
 /-- A 128-bit digest, read big-endian into `hi` then `lo`: a meaning digest is the first 128 bits of a
@@ -31,7 +43,7 @@ a file it checks for usage cutoff is the one it recorded. -/
 @[extern "lean_usage_file_digest"]
 opaque fileDigest (path : @& System.FilePath) : IO Digest
 
-def hex16 (v : UInt64) : String :=
+private def hex16 (v : UInt64) : String :=
   let s := String.ofList (Nat.toDigits 16 v.toNat); "".pushn '0' (16 - s.length) ++ s
 
 /-- 32 lowercase hex digits. -/
@@ -314,10 +326,8 @@ the compiled closure trusted by such an axiom can include compiler-only dependen
 in its type. -/
 def writeUsage (env : Environment) (consts : Array (Name × ConstantInfo × Array Name))
     (own : Array (Name × Digest)) (extra : NameSet) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
-  let noskip := incrLoaded || consts.any fun (n, ci, _) =>
-    match n, ci with
-    | .str p s, .axiomInfo _ => s.startsWith "ax_" && p.anyS (· == "_native")
-    | _, _ => false
+  let noskip := incrLoaded ||
+    consts.any fun (n, ci, _) => (ci matches .axiomInfo _) && Meta.isNativeAxiomName n
   let s := state env
   let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecksRef.get)
   let extraMods := allExtra.toArray.filter (fun u => (env.getModuleIdx? u.module).any s.hasEntries)
