@@ -82,18 +82,21 @@ if [ "$OS" = Windows_NT ]; then
 else
   FARM="$PWD/farm"
   KILLED="$PWD/leantar-killed"
+  # The sysroot Lake would use, whose `leantar` the farm's wraps
+  SYSROOT="$(norm_path "$("$LAKE" -d u env printenv LEAN_SYSROOT)")"
+  test_exp -x "$SYSROOT/bin/leantar"
   mkdir -p "$FARM/bin"
-  for e in "$LEAN_SYSROOT"/*; do [ "$(basename "$e")" = bin ] || ln -s "$e" "$FARM/$(basename "$e")"; done
-  for e in "$LEAN_SYSROOT"/bin/*; do
+  for e in "$SYSROOT"/*; do [ "$(basename "$e")" = bin ] || ln -s "$e" "$FARM/$(basename "$e")"; done
+  for e in "$SYSROOT"/bin/*; do
     [ "$(basename "$e")" = leantar ] || ln -s "$e" "$FARM/bin/$(basename "$e")"
   done
   cat > "$FARM/bin/leantar" << EOF
 #!/usr/bin/env bash
 unpack=false; for a; do [ "\$a" = -x ] && unpack=true; done
-\$unpack && [ -n "\${LEANTAR_KILL_BEFORE:-}" ] || exec "$LEAN_SYSROOT/bin/leantar" "\$@"
+\$unpack && [ -n "\${LEANTAR_KILL_BEFORE:-}" ] || exec "$SYSROOT/bin/leantar" "\$@"
 f=\$LEANTAR_KILL_BEFORE; had=false
 if [ -e "\$f" ]; then cp -p "\$f" "\$f.before-unpack"; had=true; fi
-"$LEAN_SYSROOT/bin/leantar" "\$@" || exit 3
+"$SYSROOT/bin/leantar" "\$@" || exit 3
 rm -f "\$f"; if \$had; then mv "\$f.before-unpack" "\$f"; fi
 touch "$KILLED"
 kill -9 \$PPID \$\$
