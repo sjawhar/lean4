@@ -11,6 +11,7 @@ public import Init.Data.Stream
 public import Init.System.Promise
 public import Init.System.CancelToken
 public import Lean.Data.NameTrie
+public import Lean.Data.SharedDiff
 public import Lean.Setup
 public import Lean.LocalContext
 public import Lean.Util.Path
@@ -1537,7 +1538,7 @@ that let a command's additions be recorded and replayed. `name` identifies the c
 entries are erased from the cache's own entry type only after `delta` computed them. -/
 structure CommandCacheExtension where
   name : Name
-  /-- The entries the second environment's cache has beyond the first's. -/
+  /-- The entries the second environment's cache has and the first's lacks: new keys and changed values. -/
   delta : Environment → Environment → Array EnvExtensionEntry
   /-- Inserts entries `delta` produced into the cache. -/
   replay : Environment → Array EnvExtensionEntry → Environment
@@ -1566,7 +1567,9 @@ private unsafe def registerCommandCacheExtensionUnsafe [Inhabited σ] (name : Na
   return ext
 
 /-- Registers `ext` as a cache whose per-command additions (`delta before after`) are recorded with the
-command and re-inserted (`insert`) when the command is replayed. -/
+command and re-inserted (`insert`) when the command is replayed. The recorder calls `delta` for every command,
+so it should cost in proportion to what changed (`List.newPrefix?`, `NameMap.sharedDiff`,
+`PersistentHashMap.sharedDiff`), not to the cache's size. -/
 @[implemented_by registerCommandCacheExtensionUnsafe]
 opaque registerCommandCacheExtension [Inhabited σ] (name : Name) (ext : EnvExtension σ)
     (delta : σ → σ → Array α) (insert : σ → α → σ) : IO (EnvExtension σ)
@@ -1630,6 +1633,57 @@ def OLeanEntries.get (e : OLeanEntries α) : OLeanLevel → α
   | .private  => e.private
 
 /--
+How one top-level command changed a persistent extension's state, as computed by
+`PersistentEnvExtension.stateDelta?` from the states before and after the command.
+-/
+inductive StateDelta (α : Type) where
+  /-- Replaying these entries, oldest first, through `ofOLeanEntry?` and `addEntryFn` onto the first state
+  yields the second. -/
+  | entries (es : Array α)
+  /-- The states differ in a way no entry sequence expresses: a removal, or a write that bypassed
+  `addEntry`. A command with such a change is not replayed from its recorded entries. -/
+  | stateOnly
+  deriving Inhabited
+
+namespace StateDelta
+
+/--
+The delta of an entry log (newest first) kept beside a state folded from it: the entries in front of the old
+log, oldest first. `stateOnly` when the log is unchanged but the state is not the same object, or when the old
+log is not a tail of the new one.
+-/
+def ofLog (s₀ s₁ : List α × σ) : StateDelta α :=
+  match List.newPrefix? s₁.1 s₀.1 with
+  | some [] => if SharedDiff.sameObject s₀.2 s₁.2 then .entries #[] else .stateOnly
+  | some new => .entries new.toArray.reverse
+  | none => .stateOnly
+
+/-- The delta of a `NameMap` state written by inserting bindings: the bindings not shared with the old map, in
+key order. `stateOnly` when a key was removed. -/
+def ofNameMap (m₀ m₁ : NameMap α) : StateDelta (Name × α) :=
+  let (changed, removed) := NameMap.sharedDiff m₀ m₁
+  if removed.isEmpty then .entries changed else .stateOnly
+
+/-- The delta of a `NameSet` state written by inserting names: the added names, in key order. `stateOnly` when
+a name was removed. -/
+def ofNameSet (s₀ s₁ : NameSet) : StateDelta Name :=
+  let (added, removed) := NameSet.sharedDiff s₀ s₁
+  if removed.isEmpty then .entries added else .stateOnly
+
+/--
+The delta of a `PHashMap` state written by inserting bindings, each binding turned into the entry `addEntryFn`
+inserts it with: the bindings not shared with the old map, ordered by key with `lt` so that the result does not
+depend on the trie's shape. `stateOnly` when a key was removed. An extension using it must export in an order
+that does not depend on insertion order (fold order inside a hash collision is insertion order).
+-/
+def ofPHashMap [BEq κ] [Hashable κ] (lt : κ → κ → Bool) (entry : κ → ν → α)
+    (m₀ m₁ : PersistentHashMap κ ν) : StateDelta α :=
+  let (changed, removed) := PersistentHashMap.sharedDiff m₀ m₁
+  if removed.isEmpty then .entries ((changed.qsort (lt ·.1 ·.1)).map fun (k, v) => entry k v) else .stateOnly
+
+end StateDelta
+
+/--
 An environment extension with support for storing/retrieving entries from a .olean file.
  - α is the type of the entries that are stored in .olean files.
  - β is the type of values used to update the state.
@@ -1683,6 +1737,21 @@ structure PersistentEnvExtension (α : Type) (β : Type) (σ : Type) where
   command's recorded entries. `none` when the extension has no such conversion. -/
   ofOLeanEntry?   : Option (σ → α → ImportM β)
   /--
+  Computes what one top-level command did to the state, from the states before and after it (each read in the
+  mode the `.olean` export reads it). The result must be either entries whose replay through `ofOLeanEntry?` and
+  `addEntryFn` turns the first state into the second, or `stateOnly`. `none` when the extension has no such
+  function: any change of its state then makes the command unreplayable.
+
+  The registration helpers set it: entry logs (`registerSimplePersistentEnvExtension`, parametric attributes,
+  scoped extensions) take the cells added in front of the old log, map states (`NameMap`, `NameSet`, `PHashMap`)
+  take the bindings not shared with the old map and report any removal as `stateOnly`. A log-based delta does not
+  see a write outside `addEntry` made in the same command as a logged entry: to the state beside a simple
+  extension's log, to a parametric attribute's map beside a new key, or to a scoped extension through its
+  underlying persistent extension (`ScopedEnvExtension.modifyState` is seen). A `PHashMap` delta lists bindings in
+  key order, so the extension's exporter must not depend on the map's fold order.
+  -/
+  stateDelta?     : Option (σ → σ → StateDelta α)
+  /--
   Function to transform state into data that should be imported into other modules. Returns entries
   for all three olean levels at once so that expensive computations can be shared. When using the
   module system without `import all`, `OLeanLevel.exported` is imported, else `OLeanLevel.private`.
@@ -1706,6 +1775,7 @@ instance {α β σ} [Inhabited σ] : Inhabited (PersistentEnvExtension α β σ)
      addImportedFn := fun _ => default,
      addEntryFn := fun s _ => s,
      ofOLeanEntry? := none,
+     stateDelta? := none,
      exportEntriesFn := fun _ _ => .uniform #[],
      statsFn := fun _ => Format.nil
   }
@@ -1766,6 +1836,8 @@ structure PersistentEnvExtensionDescrCore (α β σ : Type) where
   /-- See `PersistentEnvExtension.ofOLeanEntry?`. Commands that add entries to an extension without it cannot
   be replayed from their recorded entries. -/
   ofOLeanEntry?     : Option (σ → α → ImportM β) := none
+  /-- See `PersistentEnvExtension.stateDelta?`. -/
+  stateDelta?       : Option (σ → σ → StateDelta α) := none
   exportEntriesFnEx : Environment → σ → OLeanEntries (Array α)
   statsFn           : σ → Format := fun _ => Format.nil
   asyncMode         : EnvExtension.AsyncMode := .mainOnly
@@ -1809,6 +1881,7 @@ unsafe def registerPersistentEnvExtensionUnsafe {α β σ : Type} [Inhabited σ]
     addImportedFn   := descr.addImportedFn,
     addEntryFn      := descr.addEntryFn,
     ofOLeanEntry?   := descr.ofOLeanEntry?,
+    stateDelta?     := descr.stateDelta?,
     exportEntriesFn := descr.exportEntriesFnEx,
     statsFn         := descr.statsFn
   }
@@ -2938,7 +3011,7 @@ structural recursion to ensure that parent definitions get the correct height ev
 builtin_initialize defHeightOverrideExt : EnvExtension (NameMap UInt32) ← do
   let ext ← registerEnvExtension (pure {}) (asyncMode := .local)
   registerCommandCacheExtension `Lean.defHeightOverrideExt ext
-    (fun before after => after.toArray.filter fun (n, _) => !before.contains n)
+    (fun before after => (NameMap.sharedDiff before after).1)
     (fun state (n, h) => state.insert n h)
 
 /-- Register a height override for a definition so that `getMaxHeight` uses it. -/
