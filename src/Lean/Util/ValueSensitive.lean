@@ -13,11 +13,13 @@ import Lean.ProjFns
 public section
 namespace Lean.ModuleUsage.ValueSensitive
 
-private def taintedHead (names : NameSet) (tainted : List Bool) (e : Expr) : Bool :=
+/-- The names of `names` that `e`'s head stands for: the constant itself, or what a let-bound variable's value
+stood for (`tainted`, indexed by de Bruijn index). -/
+private def headNames (names : NameSet) (tainted : List NameSet) (e : Expr) : NameSet :=
   match e.consumeMData.getAppFn with
-  | .const n _ => names.contains n
-  | .bvar i => tainted.getD i false
-  | _ => false
+  | .const n _ => if names.contains n then ({} : NameSet).insert n else {}
+  | .bvar i => tainted.getD i {}
+  | _ => {}
 
 private def eliminatorRisk (env : Environment) (f : Name) : Option Bool :=
   if f matches .str _ "rec" then
@@ -33,46 +35,65 @@ private def eliminatorRisk (env : Environment) (f : Name) : Option Bool :=
   else
     none
 
-private def riskyEliminatorUse (env : Environment) (names : NameSet) (tainted : List Bool)
-    (fn : Expr) (args : Array Expr) : Bool :=
+private def argsHeadNames (names : NameSet) (tainted : List NameSet) (args : Array Expr) : NameSet :=
+  args.foldl (fun s a => s ∪ headNames names tainted a) {}
+
+/-- The names of `names` that an application of `fn` to `args` can inspect the value of: arguments of a
+projection, the major premise of a recursor without K, any argument of a matcher or other eliminator. -/
+private def riskyEliminatorUses (env : Environment) (names : NameSet) (tainted : List NameSet)
+    (fn : Expr) (args : Array Expr) : NameSet :=
   match fn with
   | .const f _ =>
     if env.isProjectionFn f then
-      args.any (taintedHead names tainted ·)
+      argsHeadNames names tainted args
     else
       match eliminatorRisk env f with
-      | none | some false => false
+      | none | some false => {}
       | some true =>
         if f matches .str _ "rec" then
           match env.find? f with
           | some (.recInfo r) =>
-            if h : r.getMajorIdx < args.size then taintedHead names tainted args[r.getMajorIdx]
-            else false
-          | _ => args.any (taintedHead names tainted ·)
+            if h : r.getMajorIdx < args.size then headNames names tainted args[r.getMajorIdx] else {}
+          | _ => argsHeadNames names tainted args
         else
-          args.any (taintedHead names tainted ·)
-  | _ => false
+          argsHeadNames names tainted args
+  | _ => {}
 
-partial def unsafeInAux (env : Environment) (names : NameSet) (tainted : List Bool) (e : Expr) : Bool :=
-  match e with
-  | .proj _ _ b => taintedHead names tainted b || unsafeInAux env names tainted b
-  | .letE _ t v b _ =>
-    let vTainted := taintedHead names tainted v || unsafeInAux env names tainted v
-    unsafeInAux env names tainted t || unsafeInAux env names tainted v ||
-      unsafeInAux env names (vTainted :: tainted) b
-  | .app .. =>
-    let fn := e.getAppFn
-    let args := e.getAppArgs
-    args.any (unsafeInAux env names tainted ·) || unsafeInAux env names tainted fn ||
-      riskyEliminatorUse env names tainted fn args
-  | .lam _ t b _ | .forallE _ t b _ =>
-    unsafeInAux env names tainted t || unsafeInAux env names (false :: tainted) b
-  | .mdata _ b => unsafeInAux env names tainted b
-  | _ => false
+/-- The names of `names` that `e` uses in a position that can inspect their value. The result for a subterm whose
+loose bound variables all stand for no name does not depend on the context, so it is cached: the walk visits each
+such subterm of the term's DAG once. -/
+private partial def unsafeUses (env : Environment) (names : NameSet) (tainted : List NameSet) (e : Expr) :
+    StateM (Std.HashMap Expr NameSet) NameSet := do
+  let cacheable := (tainted.take e.looseBVarRange).all (·.isEmpty)
+  if cacheable then
+    if let some r := (← get)[e]? then return r
+  let r ← match e with
+    | .proj _ _ b => do pure (headNames names tainted b ∪ (← unsafeUses env names tainted b))
+    | .letE _ t v b _ => do
+      let vUses ← unsafeUses env names tainted v
+      let vTainted := headNames names tainted v ∪ vUses
+      pure ((← unsafeUses env names tainted t) ∪ vUses ∪ (← unsafeUses env names (vTainted :: tainted) b))
+    | .app .. => do
+      let fn := e.getAppFn
+      let args := e.getAppArgs
+      let mut s := riskyEliminatorUses env names tainted fn args ∪ (← unsafeUses env names tainted fn)
+      for a in args do
+        s := s ∪ (← unsafeUses env names tainted a)
+      pure s
+    | .lam _ t b _ | .forallE _ t b _ => do
+      pure ((← unsafeUses env names tainted t) ∪ (← unsafeUses env names ({} :: tainted) b))
+    | .mdata _ b => unsafeUses env names tainted b
+    | _ => pure {}
+  if cacheable then modify (·.insert e r)
+  return r
 
-/-- Whether a constant uses one of `names` in a position that can inspect its value. -/
-def constUnsafelyUsesValue (env : Environment) (names : NameSet) (c : ConstantInfo) : Bool :=
-  unsafeInAux env names [] c.type ||
-    (c.value? (allowOpaque := true)).any (unsafeInAux env names [] ·)
+/-- The names of `names` that a constant uses in a position that can inspect their value. -/
+def unsafelyUsedValues (env : Environment) (names : NameSet) (c : ConstantInfo) : NameSet :=
+  if names.isEmpty then {} else
+  Id.run <| StateT.run' (s := {}) do
+    let ty ← unsafeUses env names [] c.type
+    match c.value? (allowOpaque := true) with
+    | some v => return ty ∪ (← unsafeUses env names [] v)
+    | none => return ty
 
 end Lean.ModuleUsage.ValueSensitive
