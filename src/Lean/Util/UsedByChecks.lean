@@ -17,10 +17,12 @@ builtin_initialize usageRecordingRef : IO.Ref Bool ← IO.mkRef false
 environment that is then discarded (`example`, `#eval`, `#guard`), and the names `recordUsedName` adds. -/
 builtin_initialize usedByChecksRef : IO.Ref NameSet ← IO.mkRef {}
 /--
-Adds `n` to `usedByChecksRef` when recording is on: names that reach the current module's compiled code without
-occurring in any of its terms, namely a specialization reused from another module's cache and the replacement of
-a `@[csimp]` theorem.
+Adds `n` to `usedByChecksRef` when recording is on: names that reach the current module's compiled code or
+elaboration without occurring in any of its terms, namely a specialization reused from another module's cache,
+the replacement of a `@[csimp]` theorem, and every declaration the IR interpreter resolves (called from
+`src/library/ir_interpreter.cpp`, possibly on several threads).
 -/
+@[export lean_usage_record_used]
 def recordUsedName (n : Name) : BaseIO Unit := do
   if (← usageRecordingRef.get) then usedByChecksRef.modify (·.insert n)
 /-- The constants of a declaration's type and value, with that type and value. -/

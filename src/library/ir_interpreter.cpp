@@ -197,6 +197,13 @@ option_ref<decl> find_ir_decl_boxed(elab_environment const & env, name const & n
     return option_ref<decl>(lean_ir_find_env_decl_boxed(env.to_obj_arg(), n.to_obj_arg()));
 }
 
+// `BaseIO Unit`: the compiled function takes no world token and returns a boxed unit.
+extern "C" object * lean_usage_record_used(obj_arg n);
+/** \brief Record `n` as used by the module being elaborated, for its usage data (`Lean.recordUsedName`). */
+static void record_used(name const & n) {
+    lean_dec(lean_usage_record_used(n.to_obj_arg()));
+}
+
 extern "C" double lean_float_of_nat(lean_obj_arg a);
 extern "C" float lean_float32_of_nat(lean_obj_arg a);
 
@@ -838,6 +845,9 @@ private:
         if (e != m_symbol_cache.end()) {
             return e->second;
         }
+        // Every declaration the interpreter runs (and, through its digest, everything that one calls) counts as
+        // used by the module being elaborated.
+        record_used(fn);
         std::shared_lock<std::shared_mutex> lock(*g_native_symbol_cache_mutex);
         auto ne = g_native_symbol_cache->find(fn);
         if (ne != g_native_symbol_cache->end()) {
