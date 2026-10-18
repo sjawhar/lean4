@@ -15,7 +15,8 @@ namespace Lean.ModuleUsage.ValueSensitive
 
 /-- The binders in scope during the walk: how many (`depth`), and the `let`-bound ones whose value stood for names of
 `names` (`tainted`, by binder level counted from the outside; `top?`, the innermost one's level). `id` identifies
-the scope for the cache of subterms whose result depends on it. -/
+the scope by its depth and what each binder's variable stands for (`Scope.enter`), for the cache of subterms whose
+result depends on it. -/
 private structure Scope where
   depth : Nat := 0
   tainted : Std.TreeMap Nat NameSet := {}
@@ -37,11 +38,18 @@ private structure State where
   independent : Std.HashMap Expr NameSet := {}
   /-- Results of the other subterms, by scope. -/
   dependent : Std.HashMap (Nat × Expr) NameSet := {}
+  /-- The ids `Scope.enter` gave, by the enclosing scope's id and the sorted names the new binder's variable stands
+  for. -/
+  children : Std.HashMap (Nat × List Name) Nat := {}
   nextId : Nat := 1
 
-/-- The scope inside one more binder, whose variable stands for `s`. -/
+/-- The scope inside one more binder, whose variable stands for `s`. Entering one scope with the same `s` gives the
+same `id`, so that siblings share their subterms' results; building the key takes time linear in `s`. -/
 private def Scope.enter (sc : Scope) (s : NameSet) : StateM State Scope := do
-  let id ← modifyGet fun st => (st.nextId, { st with nextId := st.nextId + 1 })
+  let key := (sc.id, s.toList)
+  let id ← modifyGet fun st => match st.children[key]? with
+    | some id => (id, st)
+    | none => (st.nextId, { st with children := st.children.insert key st.nextId, nextId := st.nextId + 1 })
   if s.isEmpty then return { sc with depth := sc.depth + 1, id }
   return { depth := sc.depth + 1, tainted := sc.tainted.insert sc.depth s, top? := some sc.depth, id }
 
@@ -97,8 +105,9 @@ private def riskyEliminatorUses (env : Environment) (names : NameSet) (sc : Scop
   | _ => {}
 
 /-- The names of `names` that `e` uses in a position that can inspect their value. Each subterm of the term's DAG
-is walked once per scope it is reached in whose names it depends on, and once overall when it depends on none
-(`Scope.independent`); each node costs time independent of the binder depth. -/
+is walked once per distinct scope (`Scope.id`) it is reached in when its result depends on the scope, and once
+overall when it does not (`Scope.independent`). Besides uniting results, each node costs O(log t) for `t` tainted
+binders in scope (the `Std.TreeMap` lookup of a variable, and the insert on entering a tainted `let`). -/
 private partial def unsafeUses (env : Environment) (names : NameSet) (sc : Scope) (e : Expr) :
     StateM State NameSet := do
   let independent := sc.independent e

@@ -1,16 +1,17 @@
 import Lean
 /-! Recording a module's usage costs in proportion to its terms as DAGs, whatever their binder depth. The module
 has proofs nested `d` binders deep (a `let` chain whose values stand for a theorem, as `have` chains in proof-mode
-proofs do, and a `fun` chain) around a body of `d` distinct nodes that refer to the middle binder, and a proof that
-refers to a `let`-bound theorem from a subterm shared 2^k times as a tree. From `(d, k) = (1000, 10)` to
-`(4000, 16)` the heartbeats of the recording (`ModuleUsage.localDigests`, `computeStmt`, `commandRecords`) grow at
-most 6 times, and stay within 12 times what elaborating the declarations costs (building the terms and `addDecl`).
-A walk doing work proportional to the binders in scope at each node grows 16 times; one that revisits shared
-subterms under a `let` grows 64 times. -/
+proofs do, and a `fun` chain) around a body of `d` distinct nodes that refer to the middle binder, and two proofs
+that refer to a `let`-bound theorem from a subterm shared 2^k times as a tree: under no binder, and under two
+sibling binders of different types at each level (`⟨fun (x : True) => T, fun (y : Nat) => T⟩`). From
+`(d, k) = (1000, 10)` to `(4000, 16)` the heartbeats of the recording (`ModuleUsage.localDigests`, `computeStmt`,
+`commandRecords`) grow at most 6 times, and stay within 12 times what elaborating the declarations costs (building
+the terms and `addDecl`). A walk doing work proportional to the binders in scope at each node grows 16 times; one
+that revisits shared subterms under a `let`, or that keys them by a fresh scope per binder, grows 64 times. -/
 open Lean
 
-/-- A module adding, through `addDecl`, `letChain`, `funChain` and `sharedUnderLet`, and `elabCost`, the
-heartbeats building and adding them took. -/
+/-- A module adding, through `addDecl`, `letChain`, `funChain`, `sharedUnderLet` and `sharedUnderBinders`, and
+`elabCost`, the heartbeats building and adding them took. -/
 def moduleOf (d k : Nat) : String :=
   "import Lean\nopen Lean\ntheorem leaf : True := trivial\n" ++
   "run_cmd Elab.Command.liftCoreM do\n" ++
@@ -40,6 +41,18 @@ def moduleOf (d k : Nat) : String :=
   "    w := mkApp3 (mkConst ``And.left) t t (mkApp4 (mkConst ``And.intro) t t w w)\n" ++
   "  addDecl (.thmDecl { name := `sharedUnderLet, levelParams := [], type := t, " ++
   "value := mkLet `h t (mkConst ``leaf) w })\n" ++
+  -- `let h := leaf; ⟨fun (x : True) => T, fun (y : Nat) => T⟩` nested `k` times, the two `T` one object,
+  -- innermost `T := h`
+  "  let n := mkConst ``Nat\n" ++
+  s!"  let mut p := mkBVar {k}\n" ++
+  "  let mut pTy := t\n" ++
+  s!"  for _ in [:{k}] do\n" ++
+  "    let l := mkForall `x .default t pTy\n" ++
+  "    let r := mkForall `y .default n pTy\n" ++
+  "    p := mkApp4 (mkConst ``And.intro) l r (mkLambda `x .default t p) (mkLambda `y .default n p)\n" ++
+  "    pTy := mkApp2 (mkConst ``And) l r\n" ++
+  "  addDecl (.thmDecl { name := `sharedUnderBinders, levelParams := [], type := pTy, " ++
+  "value := mkLet `h t (mkConst ``leaf) p })\n" ++
   "  let cost := (← IO.getNumHeartbeats) - start\n" ++
   "  addDecl (.defnDecl { name := `elabCost, levelParams := [], type := mkConst ``Nat, " ++
   "value := mkRawNatLit cost, hints := .abbrev, safety := .safe })\n"
