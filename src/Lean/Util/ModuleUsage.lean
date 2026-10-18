@@ -390,6 +390,14 @@ def closureDigest (env : Environment) (own : Array (Name × Digest)) (compilerCo
       Enc.digest
   return e.digest (tableDigest env none digestOf compilerCode) |>.finish
 
+/-- Whether the current module holds an IR declaration the compiler did not produce: more entries under a name
+than `fromCompiler` (`compilerIRRef`) counts. Such a declaration can disagree with the LCNF body that inlining and
+specialization use, so a specialization of a caller need not compute what a call to it does. -/
+def irOutsideCompiler (env : Environment) (fromCompiler : NameMap Nat) : Bool :=
+  let counts : NameMap Nat := (IR.getDecls env).foldl (init := {}) fun m d =>
+    m.insert d.name ((m.find? d.name).getD 0 + 1)
+  counts.foldl (init := false) fun b n k => b || k > (fromCompiler.find? n).getD 0
+
 /-- The imported modules whose `.olean` carries digests (`State.hasEntries`), sorted. -/
 def digestedModules (env : Environment) : Array Name :=
   let s := state env

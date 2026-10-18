@@ -231,7 +231,7 @@ partial def run (declNames : Array Name) (baseOpts : Options) : CompilerM Unit :
       -- or consider running clear? unclear
       profileitM Exception "compilation (IR)" (← getOptions) do
         let irDecls ← IR.toIR decls
-        discard <| IR.compile irDecls
+        for d in ← IR.compile irDecls do recordCompilerIR d.name
 where
   runPassManagerPart (inPhase outPhase : Purity) (profilerName : String)
       (passes : Array Pass) (decls : Array (Decl inPhase)) (isCheckEnabled : Bool) :

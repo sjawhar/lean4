@@ -8,6 +8,7 @@ module
 prelude
 public import Lean.Compiler.IR.CompilerM
 public import Lean.Compiler.IR.ToIRType
+import Lean.Util.UsedByChecks
 
 public section
 
@@ -51,8 +52,9 @@ def bindJoinPoint (fvarId : FVarId) : M JoinPointId := do
 def bindErased (fvarId : FVarId) : M Unit := do
   modify fun s => { s with vars := s.vars.insertIfNew fvarId .erased }
 
-def addDecl (d : Decl) : M Unit :=
+def addDecl (d : Decl) : M Unit := do
   Lean.modifyEnv fun env => declMapExt.addEntry env d
+  recordCompilerIR d.name
 
 def lowerLitValue (v : LCNF.LitValue) : LitVal × IRType :=
   match v with

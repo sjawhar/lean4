@@ -39,8 +39,16 @@ builtin_initialize specCacheExt : SimplePersistentEnvExtension CacheEntry Cache 
       (!·.contains ·.key) addEntry
   }
 
-public def cacheSpec (key : Expr) (declName : Name) : CoreM Unit :=
+/-- The specializer's own cache write: `declName` specializes the call `key` describes. Not exported. -/
+def cacheSpecCore (key : Expr) (declName : Name) : CoreM Unit :=
   modifyEnv fun env => specCacheExt.addEntry env { key, declName }
+
+/-- Maps the specialization key `key` to `declName`. Outside the specializer, nothing ties `declName` to the
+call `key` describes, so a module's specialization reused from this entry need not compute what the module's own
+would: the module counts as running code inside the compiler (`recordCompilerCode`). -/
+public def cacheSpec (key : Expr) (declName : Name) : CoreM Unit := do
+  recordCompilerCode
+  cacheSpecCore key declName
 
 public def findSpecCache? (key : Expr) : CoreM (Option Name) :=
   return specCacheExt.getState (← getEnv) |>.find? key
@@ -435,7 +443,7 @@ mutual
               return (param.type matches .forallE ..) && !(← isArrowClass? param.type).isSome
             else
               return false
-      cacheSpec key specDecl.name
+      cacheSpecCore key specDecl.name
       specDecl.saveBase
       let specDecl ← specDecl.etaExpand
       specDecl.saveBase

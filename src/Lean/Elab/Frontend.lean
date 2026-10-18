@@ -392,7 +392,7 @@ def runFrontend
   let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
   if let some oleanFileName := oleanFileName? then
     let recorded ← declConstsRef.get
-    let compilerCode ← compilerCodeRef.get
+    let compilerCode := (← compilerCodeRef.get) || ModuleUsage.irOutsideCompiler env (← compilerIRRef.get)
     let usage? := usageFileName?.map fun usageFileName =>
       let nodes := ModuleUsage.ownNodes env (ModuleUsage.ownConsts env recorded)
       (usageFileName, nodes, ModuleUsage.localDigests env nodes)

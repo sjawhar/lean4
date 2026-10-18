@@ -25,13 +25,22 @@ the replacement of a `@[csimp]` theorem, and every declaration the IR interprete
 @[export lean_usage_record_used]
 def recordUsedName (n : Name) : BaseIO Unit := do
   if (← usageRecordingRef.get) then usedByChecksRef.modify (·.insert n)
-/-- Whether a compile in this process, while recording is on, ran with passes or constant folders beyond the
-built-in ones (`Lean.Compiler.LCNF.main`): code that runs inside the compiler and can change what a
-specialization computes. -/
+/-- Whether, while recording is on, this process did something that can make a specialization computed here, or
+found in its specialization cache, differ from another module's under the same key: a compile ran with passes
+or constant folders beyond the built-in ones (`Lean.Compiler.LCNF.main`), or a specialization-cache entry was
+added outside the specializer (`Lean.Compiler.LCNF.Specialize.cacheSpec`). IR declarations registered outside the
+compiler count too; `runFrontend` finds those by comparing the module's IR with `compilerIRRef`. -/
 builtin_initialize compilerCodeRef : IO.Ref Bool ← IO.mkRef false
 /-- Sets `compilerCodeRef` when recording is on. -/
 def recordCompilerCode : BaseIO Unit := do
   if (← usageRecordingRef.get) then compilerCodeRef.set true
+/-- Per name, how many IR declarations the compiler produced in this process while recording is on
+(`Lean.Compiler.LCNF.main`, `Lean.IR.ToIR`). An IR declaration of the module beyond these was registered outside
+the compiler, and nothing ties it to the LCNF body that inlining and specialization use instead. -/
+builtin_initialize compilerIRRef : IO.Ref (NameMap Nat) ← IO.mkRef {}
+/-- Counts one compiler-produced IR declaration named `n` when recording is on. -/
+def recordCompilerIR (n : Name) : BaseIO Unit := do
+  if (← usageRecordingRef.get) then compilerIRRef.modify fun m => m.insert n ((m.find? n).getD 0 + 1)
 /-- The constants of a declaration's type and value, with that type and value. -/
 structure DeclConsts where
   type : Expr
