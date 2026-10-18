@@ -430,7 +430,21 @@ public def getArtifact (cache : Cache) (descr : ArtifactDescr) : EIO String Arti
 @[inline] public def outputsFile (cache : Cache) (scope : String) (inputHash : Hash) : FilePath  :=
   cache.outputsDir / scope / s!"{inputHash}.json"
 
-/-- Cache the outputs corresponding to the given input for the package.  -/
+/-- The data of the input-to-output mapping stored in `file`, if any can be read. -/
+def readOutputsData? (file : FilePath) : BaseIO (Option Json) := do
+  let .ok contents ← (IO.FS.readFile file).toBaseIO | return none
+  match Json.parse contents >>= fromJson? with
+  | .ok (out : CacheOutput) => return some out.data
+  | .error _ => return none
+
+/--
+Cache the outputs corresponding to the given input for the package.
+
+Module outputs that a kept-module check accepted (marked with the key `kf`, see
+`ModuleOutputDescrs.keptFrom?`) follow the supersede rule: they never replace an existing mapping
+(except an archive-only mapping of the same archive, which they describe in full), and outputs
+compiled from source always replace accepted ones, whatever `overwrite` says.
+-/
 def writeOutputsCore
   (cache : Cache) (scope : String) (inputHash : Hash) (out : Json)
   (service? : Option CacheServiceName) (remoteScope? : Option CacheServiceScope)
@@ -438,9 +452,16 @@ def writeOutputsCore
 : IO Unit := do
   let file := cache.outputsFile scope inputHash
   createParentDirs file
-  let out := {service?, scope? := remoteScope?, data := out : CacheOutput}
-  let contents := (toJson out).pretty
-  if overwrite then
+  let isKept (data : Json) := (data.getObjVal? "kf").isOk
+  let contents := (toJson {service?, scope? := remoteScope?, data := out : CacheOutput}).pretty
+  if isKept out then
+    match (← readOutputsData? file) with
+    | some (.str archive) =>
+      if let .ok (.str a) := out.getObjVal? "l" then
+        if a == archive then IO.FS.writeFile file contents
+    | some _ => pure ()
+    | none => writeFileIfNew file contents
+  else if overwrite || (← readOutputsData? file).any isKept then
     IO.FS.writeFile file contents
   else
     writeFileIfNew file contents

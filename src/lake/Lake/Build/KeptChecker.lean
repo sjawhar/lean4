@@ -7,9 +7,9 @@ module
 prelude
 public import Lake.Build.Trace
 public import Std.Sync.Mutex
+public import Std.Sync.Channel
 public import Std.Data.HashMap.Basic
 public import Init.System.Promise
-import Lake.Util.Log
 import Init.Data.String.TakeDrop
 
 /-!
@@ -18,9 +18,9 @@ import Init.Data.String.TakeDrop
 A kept-module checker is an external process that decides whether a module's existing `.olean`
 still holds against the module's current imports, so that Lake can record it as up to date
 without compiling the module. Lake starts it on the first request of a build (the command in
-`LAKE_KEPT_CHECKER`, with `LEAN_SYSROOT` set to the toolchain's sysroot), writes one JSON request per
-line to its standard input, and reads one JSON reply per line from its standard output, matched to
-requests by `id`. Requests may be answered in any order.
+`LAKE_KEPT_CHECKER`, with `LEAN_SYSROOT` set to the toolchain's sysroot, in a process group of its
+own), writes one JSON request per line to its standard input, and reads one JSON reply per line from
+its standard output, matched to requests by `id`. Requests may be answered in any order.
 
 Request: `{"v": 1, "id": N, "module": "<name>", "olean": "<absolute path>", "src": "<absolute path>",
 "setup": <setup>}`, where `src` is the module's source file and `<setup>` is the module's `ModuleSetup`
@@ -31,8 +31,11 @@ Reply: `{"id": N, "ok": true, "oleanHash": "<hash of the .olean bytes read>"}` o
 `{"id": N, "ok": false, "reason": "<text>"}`.
 
 A checker that exits, writes a malformed reply, or sends no reply for the configured timeout while
-requests are outstanding is killed, and every request it holds is a reject. The next request starts
-a new checker, up to `maxSpawns` per build; after that every request is a reject.
+requests are outstanding is killed with its process group, and every request it holds is a reject.
+The next request starts a new checker, up to `maxSpawns` per build; after that every request is a
+reject. Requests are written by one task per checker, outside the client's lock, so a checker that
+stops reading cannot block the jobs that ask it, nor the watchdog that kills it; a request that
+cannot be written is a reject.
 -/
 
 open Lean
@@ -47,20 +50,27 @@ public inductive KeptVerdict
   | rejected (reason : String)
   deriving Inhabited
 
-/-- The checker process, without its standard input (held in `KeptChecker.State.stdin?`). -/
+/-- The checker process. Its standard input is written only by its writer task. -/
 public abbrev KeptChecker.Proc :=
-  IO.Process.Child {stdin := .null, stdout := .piped, stderr := .inherit}
+  IO.Process.Child {stdin := .piped, stdout := .piped, stderr := .inherit}
+
+/-- A running checker: its process, the queue of its writer task, and its number (see `spawns`). -/
+public structure KeptChecker.Running where
+  proc : KeptChecker.Proc
+  outbox : Std.CloseableChannel (Nat × String)
+  gen : Nat
 
 public structure KeptChecker.State where
-  /-- The running checker, its standard input, and its number (see `spawns`). -/
-  proc? : Option (KeptChecker.Proc × IO.FS.Handle × Nat) := none
-  /-- How many checkers this build has started. -/
+  running? : Option KeptChecker.Running := none
+  /-- How many checkers this build has started (or tried to). -/
   spawns : Nat := 0
   nextId : Nat := 0
   /-- The requests the running checker has not answered. -/
   pending : Std.HashMap Nat (IO.Promise KeptVerdict) := {}
   /-- When the running checker last replied, or got a request while it had none outstanding. -/
   lastProgress : Nat := 0
+  /-- Why the last checker stopped or could not start. -/
+  lastFailure : String := ""
   /-- Whether the watchdog (`KeptChecker.watch`) runs. -/
   watching : Bool := false
   closed : Bool := false
@@ -84,13 +94,27 @@ public def new (cmd : String) (sysroot : System.FilePath) (timeoutMs : Nat) : Ba
 
 /-- Rejects every outstanding request of checker number `gen`, if it is still the running one. -/
 def died (self : KeptChecker) (gen : Nat) (reason : String) : BaseIO Unit := do
-  let pending : Std.HashMap Nat (IO.Promise KeptVerdict) ← self.state.atomically do
+  let stopped? ← self.state.atomically do
     let s ← get
-    let some (_, _, n) := s.proc? | return {}
-    unless n == gen do return {}
-    set {s with proc? := none, pending := {}}
-    return s.pending
+    let some r := s.running? | return none
+    unless r.gen == gen do return none
+    set {s with running? := none, pending := {}, lastFailure := reason}
+    return some (r, s.pending)
+  let some (r, pending) := stopped? | return
+  discard <| r.outbox.close.toBaseIO
   for (_, promise) in pending do
+    promise.resolve (.rejected reason)
+
+/-- Rejects request `id` of checker number `gen`, if it is still outstanding. -/
+def reject (self : KeptChecker) (gen id : Nat) (reason : String) : BaseIO Unit := do
+  let promise? ← self.state.atomically do
+    let s ← get
+    let some r := s.running? | return none
+    unless r.gen == gen do return none
+    let promise? := s.pending.get? id
+    set {s with pending := s.pending.erase id}
+    return promise?
+  if let some promise := promise? then
     promise.resolve (.rejected reason)
 
 def parseReply (line : String) : Except String (Nat × KeptVerdict) := do
@@ -122,6 +146,17 @@ partial def readReplies (self : KeptChecker) (proc : Proc) (gen : Nat) : IO Unit
     proc.kill
     discard <| proc.wait
 
+/--
+Writes the requests queued for checker number `gen` to its standard input, until its queue is
+closed. A request that cannot be written is rejected.
+-/
+partial def writeRequests (self : KeptChecker) (stdin : IO.FS.Handle)
+    (outbox : Std.CloseableChannel (Nat × String)) (gen : Nat) : IO Unit := do
+  let some (id, line) ← IO.wait (← outbox.recv) | return
+  if let .error e ← (do stdin.putStrLn line; stdin.flush).toBaseIO then
+    self.reject gen id s!"could not write to the checker (number {gen}): {e}"
+  writeRequests self stdin outbox gen
+
 /-- Kills a checker that has sent no reply for `timeoutMs` while requests were outstanding. -/
 partial def watch (self : KeptChecker) : IO Unit := do
   IO.sleep 250
@@ -129,26 +164,34 @@ partial def watch (self : KeptChecker) : IO Unit := do
   let stalled? ← self.state.atomically do
     let s ← get
     if s.closed then return none
-    let some (proc, _, gen) := s.proc? | return some none
+    let some r := s.running? | return some none
     if !s.pending.isEmpty && now - s.lastProgress > self.timeoutMs then
-      return some (some (proc, gen))
+      return some (some r)
     return some none
   match stalled? with
   | none => return
   | some none => watch self
-  | some (some (proc, gen)) =>
-    self.died gen s!"the checker sent no reply for {self.timeoutMs / 1000} s and was killed"
-    try proc.kill catch _ => pure ()
+  | some (some r) =>
+    self.died r.gen s!"the checker sent no reply for {self.timeoutMs / 1000} s and was killed"
+    try r.proc.kill catch _ => pure ()
     watch self
 
-def spawn (self : KeptChecker) : IO (Proc × IO.FS.Handle) := do
-  let child ← IO.Process.spawn {
+/-- Starts checker number `gen` with its reader and writer tasks. -/
+def start (self : KeptChecker) (gen : Nat) : IO Running := do
+  -- `Child.takeStdin` is not used: the child it returns has lost `setsid`, so its `kill` would
+  -- reach the checker only
+  let proc ← IO.Process.spawn {
     cmd := self.cmd
     env := #[("LEAN_SYSROOT", some self.sysroot.toString)]
     stdin := .piped, stdout := .piped, stderr := .inherit
+    -- a process group of its own, so that a kill also reaches the checker's own children, which
+    -- would otherwise hold its pipes open
+    setsid := true
   }
-  let (stdin, proc) ← child.takeStdin
-  return (proc, stdin)
+  let outbox : Std.CloseableChannel (Nat × String) ← Std.CloseableChannel.new
+  discard <| IO.asTask (prio := .dedicated) (self.readReplies proc gen)
+  discard <| IO.asTask (prio := .dedicated) (self.writeRequests proc.stdin outbox gen)
+  return {proc, outbox, gen}
 
 /--
 Asks the checker whether `olean`, the existing `.olean` of `module` (compiled from `src`), holds
@@ -157,46 +200,46 @@ against the imports described by `setup`. Blocks until the checker answers or is
 public def check (self : KeptChecker) (module : Name) (olean src : System.FilePath) (setup : Json)
 : IO KeptVerdict := do
   let promise ← IO.Promise.new
-  let failed? ← self.state.atomically do
+  let registered : Except String (Nat × Running) ← self.state.atomically do
     let mut s ← get
-    if s.proc?.isNone then
+    if s.running?.isNone then
       if s.spawns ≥ maxSpawns then
-        return some s!"the checker exited {maxSpawns} times in this build"
-      match (← (self.spawn).toBaseIO) with
-      | .ok (proc, stdin) =>
-        let gen := s.spawns
+        return .error s!"no checker left in this build: {maxSpawns} were started, and the last \
+          one stopped: {s.lastFailure}"
+      let gen := s.spawns
+      match (← (self.start gen).toBaseIO) with
+      | .ok r =>
         unless s.watching do
           discard <| IO.asTask (prio := .dedicated) self.watch
-        s := {s with proc? := some (proc, stdin, gen), spawns := gen + 1, watching := true}
-        set s
-        discard <| IO.asTask (prio := .dedicated) (self.readReplies proc gen)
+        s := {s with running? := some r, spawns := gen + 1, watching := true}
       | .error e =>
-        set {s with spawns := s.spawns + 1}
-        return some s!"could not start the checker '{self.cmd}': {e}"
-    let some (_, stdin, gen) := s.proc? | return some "the checker is not running"
+        let reason := s!"could not start the checker '{self.cmd}': {e}"
+        set {s with spawns := gen + 1, lastFailure := reason}
+        return .error reason
+    let some r := s.running? | return .error "the checker is not running"
     let id := s.nextId
+    let lastProgress ← if s.pending.isEmpty then IO.monoMsNow else pure s.lastProgress
+    set {s with nextId := id + 1, pending := s.pending.insert id promise, lastProgress}
+    return .ok (id, r)
+  match registered with
+  | .error reason => return .rejected reason
+  | .ok (id, r) =>
     let request := Json.mkObj [
       ("v", toJson (1 : Nat)), ("id", toJson id), ("module", toJson module.toString),
       ("olean", toJson olean.toString), ("src", toJson src.toString), ("setup", setup)
     ]
-    let lastProgress ← if s.pending.isEmpty then IO.monoMsNow else pure s.lastProgress
-    set {s with nextId := id + 1, pending := s.pending.insert id promise, lastProgress}
-    match (← (do stdin.putStrLn request.compress; stdin.flush).toBaseIO) with
-    | .ok _ => return none
-    | .error e =>
-      modify fun s => {s with pending := s.pending.erase id}
-      return some s!"could not write to the checker (number {gen}): {e}"
-  if let some reason := failed? then
-    return .rejected reason
-  return (← IO.wait promise.result?).getD (.rejected "the checker's reply was lost")
+    unless (← r.outbox.trySend (id, request.compress)) do
+      self.reject r.gen id s!"the checker (number {r.gen}) stopped before the request was sent"
+    return (← IO.wait promise.result?).getD (.rejected "the checker's reply was lost")
 
 /-- Stops the checker at the end of a build. -/
 public def close (self : KeptChecker) : IO Unit := do
-  let proc? ← self.state.atomically do
+  let running? ← self.state.atomically do
     let s ← get
-    set {s with closed := true, proc? := none}
-    return s.proc?
-  if let some (proc, _, _) := proc? then
-    try proc.kill catch _ => pure ()
+    set {s with closed := true, running? := none}
+    return s.running?
+  if let some r := running? then
+    discard <| r.outbox.close.toBaseIO
+    try r.proc.kill catch _ => pure ()
 
 end KeptChecker
