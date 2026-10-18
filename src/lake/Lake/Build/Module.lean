@@ -958,7 +958,9 @@ against the hash recorded for it (see `recacheArtifact?`): its descriptor in `de
 trace's record of the module's outputs, or, for the module's `.ltar` (which a build trace does not
 describe), the `.hash` written when it was packed. Returns `none` if any of them does not match or
 has no recorded hash, after checking (and caching or quarantining) all. A `.ltar` without a
-recorded hash is removed instead (it is packed again when needed).
+recorded hash is removed instead (it is packed again when needed). The usage-cutoff sidecars, which
+no trace describes, are cached as they are, as `cacheOutputArtifacts` does: the `.usekey` binds them
+to the `.olean`, and Lake checks that binding wherever it reads them.
 -/
 def Module.recacheOutputArtifacts?
   (mod : Module) (isModule useLocalFile postponesCompile : Bool) (descrs : ModuleOutputDescrs)
@@ -978,6 +980,8 @@ def Module.recacheOutputArtifacts?
     | none =>
       removeFileIfExists mod.ltarFile
       return some none
+  let usage? ← cacheIfExists mod.usageFile "usage"
+  let usekey? ← cacheIfExists mod.usekeyFile "usekey"
   let arts? : Option ModuleOutputArtifacts := do
     return {
       isModule
@@ -990,6 +994,7 @@ def Module.recacheOutputArtifacts?
       c? := ← c?
       bc? := ← bc?
       ltar? := ← ltar?
+      usage?, usekey?
     }
   return arts?
 where
@@ -1002,6 +1007,11 @@ where
       | none => return none
     else
       return some none
+  cacheIfExists file ext : JobM (Option Artifact) := do
+    if (← file.pathExists) then
+      return some (← cacheArtifact file ext (useLocalFile := useLocalFile))
+    else
+      return none
 
 /--
 Some module build artifacts must be located in the build directory (e.g., ILeans).
