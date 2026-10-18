@@ -48,8 +48,12 @@ public def findSpecCache? (key : Expr) : CoreM (Option Name) := do
   recordSpecLookup key
   return specCacheExt.getState (← getEnv) |>.find? key
 
-/-- The specialization-cache entries module `i?` added (the current module's if `none`), oldest first. -/
-public def specCacheEntries (env : Environment) (i? : Option ModuleIdx) : Array (Expr × Name) :=
+/-- The specialization-cache entries module `i?` added (the current module's if `none`), oldest first, so that the
+last entry for a key is the one the cache keeps. Private (this file's default), so that a module's code cannot read
+the cache without `findSpecCache?` recording the lookup; the usage data (`Lean.ModuleUsage`) reads it through the
+export. -/
+@[export lean_spec_cache_entries]
+def specCacheEntries (env : Environment) (i? : Option ModuleIdx) : Array (Expr × Name) :=
   match i? with
   | some i => (specCacheExt.getModuleEntries env i).map fun e => (e.key, e.declName)
   | none => (specCacheExt.getEntries env).toArray.reverse.map fun e => (e.key, e.declName)

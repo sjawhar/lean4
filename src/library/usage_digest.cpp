@@ -26,9 +26,11 @@ Released under Apache 2.0 license as described in the file LICENSE.
 
 /* Meaning digests for usage cutoff (`Lean.ModuleUsage`): the first 128 bits of a SHA-256. An expression's
 digest is a Merkle hash: each node hashes a tag for its kind, its own fields and its children's digests, with
-every variable-length field length-prefixed, so equal digests mean structurally equal terms (`mdata` aside)
+every variable-length field length-prefixed, so equal digests mean structurally equal terms, `mdata` included,
 unless SHA-256 collides. */
 namespace lean {
+/* `Lean.ModuleUsage.mdataBytes`: an `mdata` payload's encoding, equal for two payloads exactly when they are `==`. */
+extern "C" object * lean_usage_mdata_bytes(obj_arg m);
 namespace {
 constexpr size_t digest_size = 16;
 struct digest { unsigned char b[digest_size]; };
@@ -118,7 +120,7 @@ enum : unsigned char {
     tag_name = 1, tag_name_str, tag_name_num,
     tag_level_zero = 10, tag_level_succ, tag_level_max, tag_level_imax, tag_level_param, tag_level_mvar,
     tag_bvar = 20, tag_fvar, tag_mvar, tag_sort, tag_const, tag_app, tag_lam, tag_pi, tag_let, tag_nat_lit,
-    tag_str_lit, tag_proj, tag_exprs = 40
+    tag_str_lit, tag_proj, tag_mdata, tag_mdata_data, tag_exprs = 40
 };
 
 /* `Lean.ModuleUsage.BinderMode`: what of a binder counts besides its domain. */
@@ -126,7 +128,7 @@ enum class binder_mode : unsigned char { none = 0, infos = 1, names_infos = 2 };
 
 class digester {
     binder_mode           m_mode;
-    ptr_digest_map        m_exprs, m_names, m_levels;
+    ptr_digest_map        m_exprs, m_names, m_levels, m_mdata;
     std::vector<object *> m_todo;
     std::vector<object *> m_parts;
 
@@ -165,6 +167,16 @@ class digester {
 
     digest child(expr const & e) { return *m_exprs.find(e.raw()); }
 
+    digest mdata_digest(kvmap const & m) {
+        if (digest const * d = m_mdata.find(m.raw())) return *d;
+        object * bytes = lean_usage_mdata_bytes(m.to_obj_arg());
+        digest r = hasher(tag_mdata_data)
+            .str(reinterpret_cast<char const *>(lean_sarray_cptr(bytes)), lean_sarray_size(bytes)).finish();
+        lean_dec(bytes);
+        m_mdata.insert(m.raw(), r);
+        return r;
+    }
+
     /* `e`'s digest, given its children's in `m_exprs`. */
     digest node_digest(expr const & e) {
         switch (e.kind()) {
@@ -198,7 +210,8 @@ class digester {
             if (v.kind() == literal_kind::Nat) return hasher(tag_nat_lit).nat_val(v.get_nat()).finish();
             return hasher(tag_str_lit).str(v.get_string().data(), v.get_string().num_bytes()).finish();
         }
-        case expr_kind::MData: return child(mdata_expr(e));
+        case expr_kind::MData:
+            return hasher(tag_mdata).dig(mdata_digest(mdata_data(e))).dig(child(mdata_expr(e))).finish();
         case expr_kind::Proj:
             return hasher(tag_proj).dig(name_digest(proj_sname(e))).nat_val(proj_idx(e))
                 .dig(child(proj_expr(e))).finish();

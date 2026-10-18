@@ -1321,11 +1321,11 @@ structure UsageSidecar where
   own : NameMap ModuleUsage.Digest
   used : Array (Name × Array (Name × ModuleUsage.Digest))
   extra : Array Name
-  /-- The specialization-cache keys the module created, each with its specialization's name
-  (`Lean.ModuleUsage.ownSpecKeys`). -/
+  /-- The specialization-cache keys the module created, each with the specialization of its last entry for the
+  key (`Lean.ModuleUsage.specKeysOf`). -/
   specKeys : Array (ModuleUsage.Digest × Name)
   /-- For each key the module looked up in the specialization cache, the digest of its providers in the closure
-  (`Lean.ModuleUsage.specLookups`). -/
+  (`Lean.ModuleUsage.specProviders`). -/
   specLookups : Array (ModuleUsage.Digest × ModuleUsage.Digest)
 
 /-- A module's `.usekey` sidecar: what Lake saw of the module's build when Lean wrote its `.usage`. -/
@@ -1538,25 +1538,23 @@ def importUsage? (hashes : ContentHashes) (importArts : NameMap ImportArtifacts)
 
 /--
 Whether every key the module looked up in the specialization cache (`UsageSidecar.specLookups`) has the same
-providers in its closure as when Lean compiled it: the closure's non-module workspace modules that created the
-key, each with the specialization it maps the key to (`Lean.ModuleUsage.specProvidersDigest`). Each closure
-module's keys come from its `.usage` once `importUsage?` has bound it to the module's current `.olean`, in this
-check's `hashes`: another workspace's build can rebuild a shared dependency between two checks, so no binding is
-reused across checks. An import that starts providing a key the module missed, or stops providing one it hit,
-changes which specialization a fresh compile uses, so the module rebuilds. A module-system module's keys are pinned
-by `modsysHash`, a toolchain module's by the Lean githash.
+providers in its closure as when Lean compiled it: the closure's non-module workspace modules that map the key, each
+with the specialization it maps the key to, digested by the function Lean used (`Lean.ModuleUsage.specProviders`).
+Each closure module's keys come from its `.usage` once `importUsage?` has bound it to the module's current `.olean`,
+in this check's `hashes`: another workspace's build can rebuild a shared dependency between two checks, so no
+binding is reused across checks. An import that starts providing a key the module missed, stops providing one it
+hit, or maps it elsewhere changes which specialization a fresh compile uses, so the module rebuilds. A module-system
+module's keys are pinned by `modsysHash`, a toolchain module's by the Lean githash.
 -/
 def UsageSidecar.specProvidersUnchanged (usage : UsageSidecar) (hashes : ContentHashes)
     (importArts : NameMap ImportArtifacts) : JobM Bool := do
   if usage.specLookups.isEmpty then return true
-  let keys : Std.HashSet ModuleUsage.Digest := usage.specLookups.foldl (·.insert ·.1) {}
-  let mut providers : Std.HashMap ModuleUsage.Digest (Array (Name × Name)) := {}
+  let mut modules : Array (Name × Array (ModuleUsage.Digest × Name)) := #[]
   for (m, arts) in importArts do
     if arts.oleanServer?.isSome then continue
     let some (_, imp) ← importUsage? hashes importArts m | return false
-    for (k, n) in imp.specKeys do
-      if keys.contains k then providers := providers.alter k fun o => some ((o.getD #[]).push (m, n))
-  return usage.specLookups.all fun (k, p) => ModuleUsage.specProvidersDigest (providers.getD k #[]) == p
+    modules := modules.push (m, imp.specKeys)
+  return ModuleUsage.specProviders (usage.specLookups.map (·.1)) modules == usage.specLookups
 
 /--
 A digest of the recorded `closure` digest of each direct workspace import, with its name, or `none`

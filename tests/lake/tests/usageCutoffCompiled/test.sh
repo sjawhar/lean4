@@ -1801,6 +1801,57 @@ perkey_provider_s0() { d2_files ''; }
 perkey_provider_s1() { d2_folder_s1; }
 perkey_provider_c_check() { grep -qE 'Built T\.M( |$)' ../perkey_provider.1.log; }
 
+# Two entries of one provider, or two spellings of one key, decide which specialization a fresh `M` reuses; a
+# kept `M` must match the fresh build. `Y` provides entries for the key `M` looks up (`myMap k`): two for the same
+# key, whose order swaps in state 1 (`r3_order`: the last one wins), or one that is `mdata`-wrapped
+# (`r3_mdata_rev`: the entry is a different key from `M`'s, so state 1 stops `M` hitting it).
+r3_key='(mkApp (mkConst ``T.myMap) (mkConst ``T.k))'
+# `T.NAME (xs : List Nat) := xs.map (· + N)`
+r3_ev() { printf '@[noinline] def %s (xs : List Nat) : List Nat := xs.map (· + %s)\n' "$1" "$2"; }
+# `cacheSpec KEY T.NAME`
+r3_cs() { printf 'run_meta Lean.Compiler.LCNF.Specialize.cacheSpec %s ``T.%s\n' "$1" "$2"; }
+# `Y`: `$1` inside `namespace T`, `$2` at top level
+r3_y() {
+  { printf 'import Lean\nimport T.B\nopen Lean\nnamespace T\ndef y0 : Nat := 0\n'
+    printf '%s\n' "$1"
+    printf 'end T\n'
+    printf '%s\n' "$2"; } > T/Y.lean
+}
+r3_ab() { r3_ev evA 100; r3_ev evB 200; }
+r3_nl=$'\n'
+r3_order_s0() { cs_files; r3_y "$(r3_ab)" "$(r3_cs "$r3_key" evA)$r3_nl$(r3_cs "$r3_key" evB)"; }
+r3_order_s1() { r3_y "$(r3_ab)" "$(r3_cs "$r3_key" evB)$r3_nl$(r3_cs "$r3_key" evA)"; }
+r3_mdata_rev_s0() { cs_files; r3_y "$(r3_ev evil 100)" "$(r3_cs "$r3_key" evil)"; }
+r3_mdata_rev_s1() { r3_y "$(r3_ev evil 100)" "$(r3_cs "(mkMData {} $r3_key)" evil)"; }
+
+# Specialization keys that differ only in `mdata`, with no abuse of the public API: a borrowed-annotated function
+# type is `mdata` in an LCNF type, so the defeq aliases `F1` and `F2` give such keys. `Y` specializes `app1` at
+# `F2` (`@& Nat → Nat`) and `M` at `F1` (`Nat → Nat`), so `M` specializes itself. In state 1 `Y` specializes at
+# `F1`, so a fresh `M` reuses `Y`'s specialization, and a kept `M` must match it.
+r3_nat_s0() {
+  lakefile_app; mkdir_t
+  printf 'namespace T\n@[noinline] def k (n : Nat) : Nat := n + 1\nabbrev F1 := Nat → Nat\nabbrev F2 := (@& Nat) → Nat\n' > T/B.lean
+  printf '@[specialize, noinline] def app1 {α : Type} (f : α → Nat) (a : α) : Nat := f a + 1\nend T\n' >> T/B.lean
+  printf 'import T.B\nnamespace T\ndef y : Nat := app1 (α := F2) (fun g => g 1) k\nend T\n' > T/Y.lean
+  printf 'import T.B\nimport T.Y\nnamespace T\ndef m : Nat := app1 (α := F1) (fun g => g 1) k\nend T\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println (T.m + T.y)\n' > Main.lean
+}
+r3_nat_s1() { printf 'import T.B\nnamespace T\ndef y : Nat := app1 (α := F1) (fun g => g 1) k\nend T\n' > T/Y.lean; }
+
+# As `r3_nat`, made observable: the key is `app3 (fun g => g 1) k` with `F1` or `F2` as the type of `g`, and `Z`
+# (imported by `M` only) registers a folder that rewrites `k _` to 42 inside the specialized body, so `M`'s own
+# specialization computes 44 where `Y`'s computes 8.
+r3_natg_s0() {
+  lakefile_app; mkdir_t
+  printf 'namespace T\n@[noinline] def k (n : Nat) : Nat := n + 1\nabbrev F1 := Nat → Nat\nabbrev F2 := (@& Nat) → Nat\n' > T/B.lean
+  printf '@[specialize, noinline] def app3 (h : F1 → Nat) (f : Nat → Nat) (n : Nat) : Nat := f n + h (fun x => x + 1)\nend T\n' >> T/B.lean
+  printf 'import T.B\nnamespace T\ndef y : Nat := app3 (fun (g : F2) => g 1) k 5\nend T\n' > T/Y.lean
+  printf 'import T.B\nimport T.Z\nimport T.Y\nnamespace T\ndef m : Nat := app3 (fun (g : F1) => g 1) k 5\nend T\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println (T.m)\n' > Main.lean
+  printf 'import Lean\nimport T.B\nopen Lean.Compiler.LCNF.Simp.ConstantFold\ndef myFolder : Folder := fun args => do\n  let #[_] := args | return none\n  return some (.lit (.nat 42))\nrun_meta registerFolder ``T.k ``myFolder\n' > T/Z.lean
+}
+r3_natg_s1() { printf 'import T.B\nnamespace T\ndef y : Nat := app3 (fun (g : F1) => g 1) k 5\nend T\n' > T/Y.lean; }
+
 all_cases="spec_transitive spec_link spec_type spec_precomp csimp_transitive csimp_late specialize_attr
   cov_projfn cov_projfn_rev cov_mlike cov_sparse cov_auxrec cov_sibmatch cov_sibmatch_rev cov_ctlmatch
   cov_sibinst cov_sibclass cov_sibmeta cov_ckind_rev cov_recarg_rev
@@ -1819,7 +1870,7 @@ all_cases="spec_transitive spec_link spec_type spec_precomp csimp_transitive csi
   decl_map enum_repr noinline_attr aux_local struct_repr
   outparam_pos folder_removal r4_simproc r4_parser r4_tactic r4_elab r4_delab r4_eval
   binder_fun binder_jp binder_param owner_macro owner_boxed owner_move binder_info_param binder_info_type
-  pre_extern pre_summary ng ng_ctrl shadow shadow2 perkey_unrelated_spec perkey_provider"
+  pre_summary ng ng_ctrl shadow shadow2 perkey_unrelated_spec perkey_provider r3_order r3_mdata_rev r3_nat r3_natg"
 failed=()
 # `CASES` runs a subset; `NAME:cache` runs a case with the artifact cache (see `run_case`).
 for c in ${CASES:-$all_cases}; do

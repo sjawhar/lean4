@@ -51,13 +51,13 @@ def usedNames : BaseIO NameSet :=
 /--
 Records a lookup of `key` in the specialization cache when recording is on: whether an imported module provides
 the key, and which one, decides whether the module's compile reuses another module's specialization or makes its
-own, so the module's usage data records the key (`ModuleUsage.writeUsage`, `specLookups`).
+own, so the module's usage data records the key (`ModuleUsage.writeUsage`).
 -/
 def recordSpecLookup (key : Expr) : BaseIO Unit := do
   if (← usageRecordingRef.get) then specLookupsRef.modify (·.push key)
 
-/-- The specialization-cache keys looked up so far. -/
-def specLookups : BaseIO (Array Expr) :=
+/-- The specialization-cache keys looked up so far (`recordSpecLookup`). -/
+def lookedUpSpecKeys : BaseIO (Array Expr) :=
   specLookupsRef.get
 
 /-- See `recordCompilerCode`. -/

@@ -467,40 +467,59 @@ def digestedModules (env : Environment) : Array Name :=
   env.header.moduleNames.zipIdx.filterMap (fun (m, i) => if s.hasEntries i then some m else none)
     |>.qsort Name.quickLt
 
-/-- A specialization-cache key's identity in the usage data: a digest of the key without binder names or binder
-infos, as coarse as the cache's key equality or coarser, so that keys the cache tells apart may share an
-identity; that only causes extra rebuilds. -/
+set_option compiler.ignoreBorrowAnnotation true in
+/-- `Compiler.LCNF.Specialize.specCacheEntries`, private to its module so that only the usage data reads the cache
+without recording a lookup. -/
+@[extern "lean_spec_cache_entries"]
+private opaque specCacheEntries (env : Environment) (i? : Option ModuleIdx) : Array (Expr × Name)
+
+/-- A specialization-cache key's identity in the usage data: a digest of exactly what the cache's key equality,
+`Expr.eqv`, compares (`BinderMode.none`, `mdata` included). It must be neither coarser nor finer: two keys the
+cache tells apart sharing an identity let one key's providers stand for the other's, so that a lookup turning from
+a miss into a hit goes unseen, and one key with two identities hides a provider. -/
 def specKeyDigest (key : Expr) : Digest := exprDigest .none key
 
-/-- A digest of a key's providers: the modules that created the key, each with the specialization it maps the key
-to, sorted by module and then name (`Name.quickLt`). Lake computes it from the providers' `specKeys`. -/
-def specProvidersDigest (providers : Array (Name × Name)) : Digest :=
-  let ps := providers.qsort fun a b => Name.quickLt a.1 b.1 || (a.1 == b.1 && Name.quickLt a.2 b.2)
-  (ps.foldl (fun e (m, n) => e.name m |>.name n) (({} : Enc).nat ps.size)).finish
+/-- One module's specialization-cache entries (oldest first) as its `specKeys`: each key's identity with the
+specialization of its last entry, the one the cache keeps (`Specialize.addEntry` replaces), sorted by identity. -/
+def specKeysOf (entries : Array (Expr × Name)) : Array (Digest × Name) :=
+  let last : Std.HashMap Digest Name := entries.foldl (fun m (k, n) => m.insert (specKeyDigest k) n) {}
+  last.toArray.qsort (·.1.hex < ·.1.hex)
 
-/-- The specialization-cache keys the current module created (its own cache entries), each with the
-specialization's name, in order: what importers' `specLookups` are checked against. -/
-def ownSpecKeys (env : Environment) : Array (Digest × Name) :=
-  (Compiler.LCNF.Specialize.specCacheEntries env none).map fun (k, n) => (specKeyDigest k, n)
+/-- For each key identity in `keys`, a digest of its providers: the modules in `modules`, given with their
+`specKeys` (`specKeysOf`), that map the key, each with the specialization it maps the key to, listed by module
+name. The provider that wins is the last one in import order, which `closureDigest` pins, so an unchanged digest
+resolves the key to the same specialization. Lean computes these when it writes a module's `.usage`
+(`specLookups`) and Lake recomputes them from the closure's `.usage` files (`UsageSidecar.specProvidersUnchanged`),
+so both sides group providers alike. -/
+def specProviders (keys : Array Digest) (modules : Array (Name × Array (Digest × Name))) :
+    Array (Digest × Digest) := Id.run do
+  if keys.isEmpty then return #[]
+  let wanted : Std.HashSet Digest := keys.foldl (·.insert ·) {}
+  let mut providers : Std.HashMap Digest (Array (Name × Name)) := {}
+  for (m, ks) in modules do
+    for (k, n) in ks do
+      if wanted.contains k then providers := providers.alter k fun o => some ((o.getD #[]).push (m, n))
+  return keys.map fun k =>
+    let ps := (providers.getD k #[]).qsort (Name.quickLt ·.1 ·.1)
+    (k, (ps.foldl (fun e (m, n) => e.name m |>.name n) (({} : Enc).nat ps.size)).finish)
+
+/-- The specialization-cache keys the current module created (its own cache entries, `specKeysOf`): what
+importers' `specLookups` are checked against. -/
+private def ownSpecKeys (env : Environment) : Array (Digest × Name) :=
+  specKeysOf (specCacheEntries env none)
 
 /-- For each key the current module looked up in the specialization cache (`lookups`), deduplicated and sorted,
-the digest of its providers among the imported non-`module` files with digests (`specProvidersDigest`). The cache
-resolves a key to its last provider in import order, so a provider set that is unchanged, with the closure's import
-order unchanged (which `closureDigest` pins), resolves every lookup to the same specialization; Lake rebuilds the
-module when one of these digests changed. Providers in modules without digests (the toolchain) are pinned by the
-Lean githash, those in `module` files by Lake's `modsysHash`. -/
-def specLookups (env : Environment) (lookups : Array Expr) : Array (Digest × Digest) := Id.run do
+its providers among the imported non-`module` files with digests (`specProviders`); Lake rebuilds the module when
+one of these changes. Providers in modules without digests (the toolchain) are pinned by the Lean githash, those in
+`module` files by Lake's `modsysHash`. -/
+private def specLookups (env : Environment) (lookups : Array Expr) : Array (Digest × Digest) :=
+  let keys := (lookups.foldl (·.insert <| specKeyDigest ·) ({} : Std.HashSet Digest)).toArray.qsort (·.hex < ·.hex)
+  if keys.isEmpty then #[] else
   let s := state env
-  let keys : Std.HashSet Digest := lookups.foldl (·.insert <| specKeyDigest ·) {}
-  if keys.isEmpty then return #[]
-  let mut providers : Std.HashMap Digest (Array (Name × Name)) := {}
-  for (m, i) in env.header.moduleNames.zipIdx do
-    unless s.hasEntries i && !(env.header.moduleData[i]?.any (·.isModule)) do continue
-    for (k, n) in Compiler.LCNF.Specialize.specCacheEntries env (some i) do
-      let d := specKeyDigest k
-      if keys.contains d then providers := providers.alter d fun o => some ((o.getD #[]).push (m, n))
-  let sorted := keys.toArray.qsort (·.hex < ·.hex)
-  return sorted.map fun d => (d, specProvidersDigest (providers.getD d #[]))
+  specProviders keys <| env.header.moduleNames.zipIdx.filterMap fun (m, i) =>
+    if s.hasEntries i && !(env.header.moduleData[i]?.any (·.isModule)) then
+      some (m, specKeysOf (specCacheEntries env (some i)))
+    else none
 
 /-- The format version of the `.usage` sidecar and of Lake's `.usekey`; Lake reads a sidecar of any other
 version as absent. -/

@@ -87,15 +87,43 @@ end Enc
 
 /-- What of a binder, besides its domain, an expression digest counts. -/
 inductive BinderMode where
-  /-- Nothing: what the kernel sees. -/
+  /-- Nothing: exactly what `Expr.eqv` compares. -/
   | none
   /-- Binder infos (the compiler reads `instImplicit`), not names. -/
   | infos
   /-- Names and infos: types whose binders steer elaboration downstream. -/
   | namesInfos
 
+/-- `s` encoded so that two syntax trees encode alike exactly when `Syntax.structEq` holds: source information
+is left out, and an identifier's raw text is the bytes `Substring.Raw.beq` compares. -/
+private partial def syntaxEnc (e : Enc) : Syntax → Enc
+  | .missing => e.u8 0
+  | .node _ k args => args.foldl syntaxEnc (e.u8 1 |>.name k |>.nat args.size)
+  | .atom _ v => e.u8 2 |>.str v
+  | .ident _ raw v pre =>
+    pre.foldl (init := e.u8 3 |>.str raw.repair.toString |>.name v |>.nat pre.length) fun e p => match p with
+      | .namespace ns => e.u8 0 |>.name ns
+      | .decl n fs => fs.foldl Enc.str (e.u8 1 |>.name n |>.nat fs.length)
+
+/-- An `mdata` payload encoded so that two payloads encode alike exactly when they are `==` (`DataValue`'s derived
+`BEq`, which compares syntax with `Syntax.structEq`), as `Expr.eqv` compares them. The expression digester hashes
+it for every `mdata` node. -/
+@[export lean_usage_mdata_bytes]
+private def mdataBytes (m : KVMap) : ByteArray :=
+  (m.entries.foldl (init := ({} : Enc).nat m.entries.length) fun e (k, v) => valueEnc (e.name k) v).buf
+where
+  valueEnc (e : Enc) : DataValue → Enc
+    | .ofString s => e.u8 0 |>.str s
+    | .ofBool b => e.u8 1 |>.bool b
+    | .ofName n => e.u8 2 |>.name n
+    | .ofNat n => e.u8 3 |>.nat n
+    | .ofInt (.ofNat n) => e.u8 4 |>.nat n
+    | .ofInt (.negSucc n) => e.u8 5 |>.nat n
+    | .ofSyntax s => syntaxEnc (e.u8 6) s
+
 /-- A Merkle SHA-256 digest of `e`'s structure (`src/library/usage_digest.cpp`), linear in its distinct
-subterms. Ignores `mdata`. -/
+subterms. It includes every `mdata` node's payload (`mdataBytes`): the compiler reads `[borrowed]` annotations in
+types, and `Expr.eqv`, which the specialization cache compares keys with, compares `mdata`. -/
 @[extern "lean_usage_expr_digest"]
 opaque exprDigest (mode : BinderMode) (e : @& Expr) : Digest
 

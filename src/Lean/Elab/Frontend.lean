@@ -402,7 +402,7 @@ def runFrontend
       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
     if let some (usageFileName, nodes, own) := usage? then
       let used := ModuleUsage.usedFromInfoTrees trees (← usedNames)
-      ModuleUsage.writeUsage env nodes own used (← specLookups) (incrLoaded := incrLoadFileName?.isSome)
+      ModuleUsage.writeUsage env nodes own used (← lookedUpSpecKeys) (incrLoaded := incrLoadFileName?.isSome)
         usageFileName
 
   if let some ileanFileName := ileanFileName? then
