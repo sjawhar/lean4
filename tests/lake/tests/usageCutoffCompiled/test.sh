@@ -579,6 +579,55 @@ f3_runtime_cpass_s1() {
     'def y : List Nat := myMap k [0]'
 }
 
+# A specialization-cache entry written through the public `cacheSpec`, not by the specializer: `Y`, which `M`
+# uses nothing of, maps the key of `M`'s own specialization of `myMap k` to `evil`, which adds 100
+# (`f1_cachespec`). With the entry there from state 0, `M` hits it, so the hit is recorded and an edit to `evil`
+# rebuilds `M` (`f1_cachespec_hit`).
+cs_files() {
+  lakefile_app; mkdir_t
+  printf 'namespace T\n@[noinline] def k (n : Nat) : Nat := n + 1\n' > T/B.lean
+  printf '@[specialize] def myMap (f : Nat → Nat) : List Nat → List Nat\n  | [] => []\n' >> T/B.lean
+  printf '  | x :: xs => f x :: myMap f xs\nend T\n' >> T/B.lean
+  printf 'import T.B\nimport T.Y\nnamespace T\ndef h : List Nat := myMap k [1, 2, 3]\nend T\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println T.h\n' > Main.lean
+}
+cs_y() {
+  printf 'import Lean\nimport T.B\nopen Lean\nnamespace T\ndef y0 : Nat := 0\n' > T/Y.lean
+  printf '@[noinline] def evil (xs : List Nat) : List Nat := xs.map (· + %s)\nend T\n%s' "$1" "$2" >> T/Y.lean
+}
+cs_entry='run_meta Lean.Compiler.LCNF.Specialize.cacheSpec (mkApp (mkConst ``T.myMap) (mkConst ``T.k)) ``T.evil'
+f1_cachespec_s0() { cs_files; cs_y 100 ''; }
+f1_cachespec_s1() { cs_y 100 "$cs_entry"$'\n'; }
+f1_cachespec_hit_s0() { cs_files; cs_y 100 "$cs_entry"$'\n'; }
+f1_cachespec_hit_s1() { cs_y 200 "$cs_entry"$'\n'; }
+
+# `A.f` keeps its LCNF body `g n + 1` but registers IR that adds 50. `Y`'s specialization of `run k` inlines
+# `f`'s body; `M`, where a local attribute stops specializing `f`, calls `f`'s IR. Once `Y` adds the same key, a
+# fresh `M` reuses `Y`'s specialization, so the two must not count as interchangeable.
+premise_ir_s0() {
+  lakefile_app; mkdir_t
+  cat > T/A.lean <<'EOF'
+import Lean
+namespace T
+@[specialize, noinline] def f (g : Nat → Nat) (n : Nat) : Nat := g n + 1
+end T
+open Lean IR in
+run_cmd Lean.Elab.Command.liftCoreM <| IR.addDecl <| (.fdecl `T.f
+  #[{ x := ⟨1⟩, borrow := false, ty := .object }, { x := ⟨2⟩, borrow := false, ty := .object }] .object
+  (.vdecl ⟨3⟩ .object (.ap ⟨1⟩ #[.var ⟨2⟩])
+    (.vdecl ⟨4⟩ .object (.lit (.num 50))
+      (.vdecl ⟨5⟩ .object (.fap ``Nat.add #[.var ⟨3⟩, .var ⟨4⟩]) (.ret (.var ⟨5⟩)))))
+  { maxJp := 0, maxVar := 5 })
+EOF
+  printf 'import T.A\nnamespace T\n@[noinline] def k (n : Nat) : Nat := n + 1\n' > T/B.lean
+  printf '@[specialize, noinline] def run (g : Nat → Nat) (n : Nat) : Nat := f g n\nend T\n' >> T/B.lean
+  printf 'import T.B\nimport T.Y\nnamespace T\nset_option allowUnsafeReducibility true\n' > T/M.lean
+  printf 'attribute [local instance_reducible] f\ndef h : Nat := run k 1\nend T\n' >> T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println T.h\n' > Main.lean
+  printf 'import T.B\nnamespace T\ndef y0 : Nat := 0\nend T\n' > T/Y.lean
+}
+premise_ir_s1() { printf 'import T.B\nnamespace T\ndef y0 : Nat := 0\ndef y : Nat := run k 7\nend T\n' > T/Y.lean; }
+
 # Binder names of an inlined body become C variable names in the importer's C file.
 binder_inline_s0() {
   lakefile_app; mkdir_t
@@ -1035,6 +1084,7 @@ all_cases="spec_transitive spec_link spec_type spec_precomp csimp_transitive csi
   local_inst_own erase_inst_own scoped_inst local_red_own2 local_red_own3 scoped_red_own
   table_order folder_order red_order
   d2_tolerated_lean d2_tolerated_reader f3_own_folder f3_own_cpass f3_runtime_folder f3_runtime_cpass
+  f1_cachespec f1_cachespec_hit premise_ir
   ir_eval macro_eval init_eval
   inl_small inl_inline inl_instance spec_nested spec_derived spec_local spec_renumber
   implemented_by csimp extern export noncomputable partial_body unsafe_body boxed_version structure_eta
