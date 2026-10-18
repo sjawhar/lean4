@@ -169,7 +169,9 @@ def classification : List (Name × UsageClass × String) := [
     entry is in the module's cross-module table digest with the installer's digest, and installers apply in \
     import order (closure digests hash the closure in import order). State written without an entry is not \
     exported, so it changes only the writing module's own compile, whose results are in its compiled entries \
-    and, for specializations, in the providers importers check."),
+    and, for specializations, in the providers importers check. An installed pass runs inside the compiler and \
+    can read any environment state, so a module compiled with any pass beyond the built-in ones has every \
+    imported module with digests as an extra use (`recordCompilerCode`)."),
   (Lean.mkPrivateNameCore `Lean.ExtraModUses `Lean.extraModUses, .recording,
     "Infrastructure for `shake`'s extra-import-dependency recording (src/Lean/ExtraModUses.lean:14-16); \
     written/read by `recordExtraModUseCore`/`recordExtraModUseFromDecl` (src/Lean/ExtraModUses.lean:96-99,123-130) \
@@ -201,7 +203,9 @@ def classification : List (Name × UsageClass × String) := [
     each exported entry is in the module's cross-module table digest with the folder's digest, and \
     applied in import order (closure digests hash the closure in import order). State written without an \
     entry is not exported, so it changes only the writing module's own compile, whose results are in its \
-    compiled entries and, for specializations, in the providers importers check."),
+    compiled entries and, for specializations, in the providers importers check. A folder runs inside the \
+    compiler and can read any environment state, so a module compiled with any folder beyond the built-in ones \
+    has every imported module with digests as an extra use (`recordCompilerCode`)."),
   (`Lean.Compiler.LCNF.monoExt, .R1, "Own-declaration LCNF mono-phase code; written only by the defining module (design R1 list)."),
   (Lean.mkPrivateNameCore `Lean.AuxRecursor `Lean.sparseCasesOnExt, .R1,
     "`markSparseCasesOn` (src/Lean/AuxRecursor.lean:57-58) is public; the elaborator calls it in \

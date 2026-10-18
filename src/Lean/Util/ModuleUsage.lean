@@ -508,13 +508,19 @@ def usageVersion : Nat := 9
 
 /-- `own` is `localDigests env nodes`; `used` holds the imported names recorded while elaborating
 (`moduleUsed`'s `extra`); `lookups` the specialization-cache keys looked up (`specLookups`). The extra module uses
-are the environment's and `extraModUsesByChecks` (those of commands whose environment was discarded). `noskip`
-is set when the run reused commands from an `--incr-load` snapshot, since reused commands never call `addDecl`
-in this process and `used` may miss constants they used. -/
+are the environment's and `extraModUsesByChecks` (those of commands whose environment was discarded); if a
+compile ran passes or constant folders beyond the built-in ones (`compilerCodeSeen`), whose code can read any
+environment state, every imported module with digests is one. `noskip` is set when the run reused commands from an
+`--incr-load` snapshot, since reused commands never call `addDecl` in this process and `used` may miss constants
+they used. -/
 def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Digest)) (used : NameSet)
     (lookups : Array Expr) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
   let s := state env
   let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecks)
+  let allExtra ← if (← compilerCodeSeen) then
+      pure <| env.header.moduleNames.zipIdx.foldl (init := allExtra) fun u (m, i) =>
+        if s.hasEntries i then u.insert { module := m, isExported := false, isMeta := false } else u
+    else pure allExtra
   let extraMods := allExtra.toArray.filter (fun u => (env.getModuleIdx? u.module).any s.hasEntries)
     |>.qsort fun a b => let k (u : ExtraModUse) := 2 * u.isExported.toNat + u.isMeta.toNat
       Name.quickLt a.module b.module || (a.module == b.module && k a < k b)

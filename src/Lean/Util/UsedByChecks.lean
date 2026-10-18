@@ -60,6 +60,22 @@ def recordSpecLookup (key : Expr) : BaseIO Unit := do
 def specLookups : BaseIO (Array Expr) :=
   specLookupsRef.get
 
+/-- See `recordCompilerCode`. -/
+private builtin_initialize compilerCodeRef : IO.Ref Bool ← IO.mkRef false
+
+/--
+Records that a compile in this process ran with passes or constant folders beyond the built-in ones
+(`Lean.Compiler.LCNF.PassManager.run`). Such code runs inside the compiler and can read any environment state, which
+no used name records, so the module's usage data then makes every imported module with digests an extra use
+(`ModuleUsage.writeUsage`). Never cleared.
+-/
+def recordCompilerCode : BaseIO Unit :=
+  compilerCodeRef.set true
+
+/-- Whether `recordCompilerCode` ran in this process. -/
+def compilerCodeSeen : BaseIO Bool :=
+  compilerCodeRef.get
+
 /-- The constants of a declaration's type and value, with that type and value. -/
 structure DeclConsts where
   type : Expr

@@ -582,6 +582,34 @@ f3_runtime_cpass_s1() {
     'def y : List Nat := myMap k [0]'
 }
 
+# Compiler code that reads imported environment state no used name records: `Z`'s folder folds `k 5` to 42 only
+# if `T.flagOn` exists (`fold_env`), and `Z`'s pass fails the compile then (`cpass_env`). `F`, which `M` imports
+# but uses nothing of, gains `T.flagOn` in state 1.
+env_files() {
+  lakefile_app; mkdir_t
+  printf 'namespace T\n@[noinline] def k (n : Nat) : Nat := n + 1\nend T\n' > T/B.lean
+  printf 'import Lean\nimport T.B\n%s\n' "$1" > T/Z.lean
+  printf 'namespace T\ndef f0 : Nat := 0\nend T\n' > T/F.lean
+  printf 'import T.Z\nimport T.F\nnamespace T\n@[noinline] def h (u : Unit) : Nat := k 5\nend T\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println (T.h ())\n' > Main.lean
+}
+env_flag() { printf 'namespace T\ndef f0 : Nat := 0\ndef flagOn : Nat := 0\nend T\n' > T/F.lean; }
+fold_env_s0() {
+  env_files 'open Lean Lean.Compiler.LCNF.Simp.ConstantFold
+def envFolder : Folder := fun args => do
+  let #[_] := args | return none
+  if (← getEnv).contains `T.flagOn then return some (.lit (.nat 42)) else return none
+run_meta registerFolder ``T.k ``envFolder'
+}
+fold_env_s1() { env_flag; }
+cpass_env_s0() {
+  env_files 'open Lean Lean.Compiler.LCNF
+@[cpass] def envInstaller : PassInstaller :=
+  PassInstaller.installAtEnd .base (Pass.mkPerDeclaration `envPass .base fun d => do
+    if (← getEnv).contains `T.flagOn then throwError "flagOn is set" else pure d)'
+}
+cpass_env_s1() { env_flag; }
+
 # A specialization-cache entry written through the public `cacheSpec`, not by the specializer: `Y`, which `M`
 # uses nothing of, maps the key of `M`'s own specialization of `myMap k` to `evil`, which adds 100
 # (`f1_cachespec`). With the entry there from state 0, `M` hits it, so the hit is recorded and an edit to `evil`
@@ -1780,7 +1808,7 @@ all_cases="spec_transitive spec_link spec_type spec_precomp csimp_transitive csi
   class_same class_cross nospec_type folder_cross reducible_cross binder_inline d2_folder d2_tolerated d2_cpass
   local_inst_own erase_inst_own scoped_inst local_red_own2 local_red_own3 scoped_red_own
   table_order folder_order red_order
-  d2_tolerated_lean d2_tolerated_reader f3_own_folder f3_own_cpass f3_runtime_folder f3_runtime_cpass
+  d2_tolerated_lean d2_tolerated_reader f3_own_folder f3_own_cpass f3_runtime_folder f3_runtime_cpass fold_env cpass_env
   f1_cachespec f1_cachespec_hit premise_ir ir_count ir_count_nd lcnf_override d2_down_rebuilt
   collide_boxed_trans irdup_first irdup_after negfail_scoped abi_mix abi_void abi_enum abi_monotype
   wh_ctrl wh_summary wh_extern wh_implby wh_sig tl_pre_extern tl2_pre_extern tl3_race_a tl3_race_b tl3_race_sig

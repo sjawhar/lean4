@@ -13,6 +13,8 @@ import Lean.Compiler.LCNF.ToImpureType
 import Lean.Compiler.LCNF.Check
 import Lean.Meta.Match.MatcherInfo
 import Lean.Compiler.LCNF.SplitSCC
+import Lean.Compiler.LCNF.Simp.ConstantFold
+import Lean.Util.UsedByChecks
 public import Lean.Compiler.IR.Basic
 public import Lean.Compiler.LCNF.CompilerM
 
@@ -122,6 +124,18 @@ def resumeCompilation (declName : Name) (baseOpts : Options) : CoreM Unit := do
   Core.prependError m!"Failed to compile `{declName}`" do
     (← compileDeclsRef.get) decls.declNames baseOpts
 
+/-- Whether `manager` and `folders` are the built-in pass manager and constant folders, unchanged by any
+installer or folder from any module, whether added by an extension entry or written into the extension state
+directly. Both extension states start as these objects and change only by copying (`runImportedDecls`,
+`SMap.insert`), so pointer identity decides. -/
+private unsafe def isBuiltinCompilerUnsafe (manager : PassManager)
+    (folders : SMap Name Simp.ConstantFold.Folder) : Bool :=
+  ptrAddrUnsafe manager == ptrAddrUnsafe builtinPassManager &&
+    ptrAddrUnsafe folders.map₁ == ptrAddrUnsafe Simp.ConstantFold.builtinFolders.map₁ && folders.map₂.isEmpty
+
+@[implemented_by isBuiltinCompilerUnsafe]
+private opaque isBuiltinCompiler (manager : PassManager) (folders : SMap Name Simp.ConstantFold.Folder) : Bool
+
 namespace PassManager
 
 partial def run (declNames : Array Name) (baseOpts : Options) : CompilerM Unit := withAtLeastMaxRecDepth 8192 do
@@ -195,6 +209,9 @@ partial def run (declNames : Array Name) (baseOpts : Options) : CompilerM Unit :
 
   let decls := markRecDecls decls
   let manager ← getPassManager
+  -- Passes and folders beyond the built-in ones run code inside the compiler that can read any environment
+  -- state; the module's usage data then depends on every import (`recordCompilerCode`).
+  unless isBuiltinCompiler manager (← Simp.ConstantFold.getFolders) do recordCompilerCode
   let isCheckEnabled := compiler.check.get (← getOptions)
   let decls ← runPassManagerPart .pure .pure "compilation (LCNF base)" manager.basePasses decls isCheckEnabled
   let decls ← runPassManagerPart .pure .pure "compilation (LCNF mono)" manager.monoPasses decls isCheckEnabled
