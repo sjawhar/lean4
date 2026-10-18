@@ -61,33 +61,48 @@ private def excludedExtension (n : Name) : Bool :=
 
 /-- Records one command's payload: for every persistent extension whose state changed, its typed state delta
 (`PersistentEnvExtension.stateDelta?`); the scoped local entries it added; and its cache deltas. States are read
-in the mode `computeExtEntries` exports them. Takes time proportional to what the command changed, apart from
-the per-extension state reads. -/
+in the mode `computeExtEntries` exports them (`EnvExtension.AsyncMode.forExport`). A change is `stateOnly` when
+the delta says so, when the extension has no delta, when a delta that reads an entry log meets a direct write
+(`PersistentEnvExtensionState.directWrites`), or when a scoped extension's local entries are not the ones the
+payload replays (`ScopedEnvExtension.localEntriesAccountedFor`). Takes time proportional to what the command
+changed, apart from the per-extension state reads. -/
 def recordCommandDelta (before after : Environment) (idx : Nat) : IO Environment := do
-  let scopedNames := (← scopedEnvExtensionsRef.get).foldl (fun s ext => s.insert ext.ext.name) ({} : NameSet)
+  let scopedByName : Std.HashMap Name
+      (ScopedEnvExtension EnvExtensionEntry EnvExtensionEntry EnvExtensionState) :=
+    (← scopedEnvExtensionsRef.get).foldl (fun m ext => m.insert ext.ext.name ext) {}
+  let dStart := scopeDepth before
+  let beforeLocals := localEntriesExt.getState (asyncMode := .local) before |>.size
+  let afterLocals := localEntriesExt.getState (asyncMode := .local) after
+  let locals := afterLocals.extract beforeLocals afterLocals.size
   let mut entries := #[]
   let mut unreplayable := #[]
   let mut stateOnly := #[]
   for ext in ← persistentEnvExtensionsRef.get do
     if excludedExtension ext.name then continue
-    let mode := match ext.toEnvExtension.asyncMode with
-      | .async _ => .sync
-      | mode => mode
-    let s₀ := ext.getState before (asyncMode := mode)
-    let s₁ := ext.getState after (asyncMode := mode)
-    if SharedDiff.sameObject s₀ s₁ then continue
+    let mode := ext.toEnvExtension.asyncMode.forExport
+    let ps₀ := ext.toEnvExtension.getState before (asyncMode := mode)
+    let ps₁ := ext.toEnvExtension.getState after (asyncMode := mode)
+    if SharedDiff.sameObject ps₀.state ps₁.state then continue
+    let scopedExt? := scopedByName[ext.name]?
+    let delta? : Option (StateDelta EnvExtensionEntry) := ext.stateDelta?.map (· ps₀.state ps₁.state)
+    let delta : Option (StateDelta EnvExtensionEntry) :=
+      if !ext.stateDeltaSeesDirectWrites && ps₀.directWrites != ps₁.directWrites then some .stateOnly
+      else match delta?, scopedExt? with
+        | some (.entries es), some scopedExt =>
+          let installed := locals.foldl (init := 0) fun n (depth, name, _) =>
+            if name == ext.name && depth ≤ dStart then n + 1 else n
+          if scopedExt.localEntriesAccountedForIn before after installed then some (.entries es)
+          else some .stateOnly
+        | delta, _ => delta
     let mut changed := true
-    match (ext.stateDelta?.map (· s₀ s₁) : Option (StateDelta EnvExtensionEntry)) with
+    match delta with
     | some (.entries es) =>
       if es.isEmpty then changed := false else entries := entries.push (ext.name, es)
     | some .stateOnly | none => stateOnly := stateOnly.push ext.name
-    if changed && !(scopedNames.contains ext.name || ext.ofOLeanEntry?.isSome) then
+    if changed && !(scopedExt?.isSome || ext.ofOLeanEntry?.isSome) then
       unreplayable := unreplayable.push ext.name
-  if scopeDepth before != scopeDepth after then
+  if dStart != scopeDepth after then
     stateOnly := stateOnly.push `Lean.scopeDepthExt
-  let beforeLocals := localEntriesExt.getState (asyncMode := .local) before |>.size
-  let afterLocals := localEntriesExt.getState (asyncMode := .local) after
-  let locals := afterLocals.extract beforeLocals afterLocals.size
   let caches := (← commandCacheExtensionsRef.get).filterMap fun ext =>
     let delta := ext.delta before after
     if delta.isEmpty then none else some (ext.name, delta)
@@ -146,9 +161,7 @@ def replayCommandEntries (env : Environment) (ce : CommandEntries) (dStart : Nat
       let ext := pExts[i]!
       let some ofOLeanEntry := ext.ofOLeanEntry? |
         throw <| IO.userError s!"unreplayable extension {name}"
-      let mode := match ext.toEnvExtension.asyncMode with
-        | .async _ => .sync
-        | mode => mode
+      let mode := ext.toEnvExtension.asyncMode.forExport
       for entry in entries do
         let b ← ofOLeanEntry (ext.getState env (asyncMode := mode)) entry |>.run { env, opts }
         env := ext.addEntry env b (asyncMode := mode)
