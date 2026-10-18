@@ -450,9 +450,11 @@ def finalizeBuild
 Runs `act` holding an exclusive `flock` on the workspace's `.lake/build.lock`, so that two Lake
 processes never build the same workspace at once (they would delete, rewrite, and cache each
 other's outputs mid-build). The lock is released when `act` finishes, or by the OS when the
-process dies. On Unix-like systems, the processes spawned while it is held inherit it, so if Lake
-is killed, the lock is held until they exit too: the compiler of a killed Lake cannot write into
-the workspace while another Lake builds it. (Windows releases the lock with the process.)
+process dies. On Unix-like systems, the processes spawned while it is held inherit it (`spawnProc`,
+which registers it as `buildLockHandle`), so if Lake is killed, the lock is held until they exit
+too: the compiler of a killed Lake cannot write into the workspace while another Lake builds it.
+The kept-module checker, which runs in a session of its own, does not inherit it. (Windows releases
+the lock with the process.)
 Setting `LAKE_NO_BUILD_LOCK=1` disables it.
 -/
 public def Workspace.withBuildLock (ws : Workspace) (act : IO α) : IO α := do
@@ -471,7 +473,10 @@ public def Workspace.withBuildLock (ws : Workspace) (act : IO α) : IO α := do
       (lock: {lockFile})"
     h.lock
   h.setInheritable true
-  try act finally h.unlock
+  buildLockHandle.set (some h)
+  try act finally
+    buildLockHandle.set none
+    h.unlock
 
 /--
 Run a build function in the Workspace's context using the provided configuration.
@@ -508,12 +513,12 @@ Returns whether a build is needed to validate `build`. Does not report on the at
 
 This is equivalent to checking whether `lake build --no-build` exits with code 0: it reads the same
 kept-module settings (`mkKeptCheck`), so a module `LAKE_KEPT_EXCLUDE` lists needs a build when its
-outputs were kept, and invalid settings, which fail that build, make this `false`.
+outputs were kept. Invalid settings, which fail that build, throw their error.
 -/
 public def Workspace.checkNoBuild
   (ws : Workspace) (build : FetchM (Job α))
-: BaseIO Bool := do
-  let .ok kept ← (mkKeptCheck ws).toBaseIO | return false
+: IO Bool := do
+  let kept ← mkKeptCheck ws
   let jobs ← mkJobQueue
   let cfg := {noBuild := true}
   let mctx ← mkMonitorContext cfg jobs

@@ -906,8 +906,18 @@ inductive ModuleOutputs
 
 instance : Coe ModuleOutputArtifacts ModuleOutputs := ⟨.arts⟩
 
+/--
+Resolves a module's cached outputs: the archive alone (a string, or `{"l": <archive>, "kf": <hash>}`
+for kept outputs, as `lake build -o` records them), or the outputs' descriptions.
+-/
 def resolveModuleOutputs (out : CacheOutput) : JobM ModuleOutputs := do
-  if let .str descr := out.data then
+  let archive? := match out.data with
+    | .str descr => some descr
+    | data => if (data.getObjVal? "o").isOk then none else
+      match data.getObjVal? "l" with
+      | .ok (.str descr) => some descr
+      | _ => none
+  if let some descr := archive? then
     match ArtifactDescr.ofFilePath? descr with
     | .ok descr =>
       return .ltar (← resolveArtifact descr out.service? out.scope?) none none
@@ -1450,12 +1460,22 @@ def Module.recBuildElabArts (mod : Module) : FetchM (Job ModuleOutputArtifacts) 
 where
   fetchFromCache? presetup savedTrace restoreAll : JobM ModuleFetchState := do
     let inputHash := (← getTrace).hash
+    -- A module excluded from kept checks takes no kept outputs from the cache, and under `--no-build`
+    -- it unpacks no archive to find out what it holds: it just needs a build, and no file changes
+    if (← isKeptExcluded) then
+      if let some out ← cachedOutputs? inputHash then
+        if (out.getObjVal? "kf").isOk || ((← getNoBuild) && !(out.getObjVal? "o").isOk) then
+          return .incomplete savedTrace none
     let some ltarOrArts ← getArtifacts? inputHash savedTrace mod.pkg
       | return .incomplete savedTrace none
     match (ltarOrArts : ModuleOutputs) with
     | .ltar ltar usage? usekey? =>
       updateAction .unpack
+      -- The archive's outputs, and its trace, replace the module's: the `.hash` files of the old
+      -- outputs go too, or they would describe the new ones (`fetchFileHash` trusts them)
       mod.clearOutputArtifacts
+      mod.clearOutputHashes
+      removeFileIfExists mod.traceFile
       mod.unpackLtar ltar.path inputHash
       -- The archive ships no sidecars, so the entry's go to the build directory, from which the entry
       -- below is rewritten.
@@ -1464,8 +1484,11 @@ where
       -- Note: This branch implies that only the ltar output is (validly) cached.
       -- Thus, we use only the new trace unpacked from the ltar to resolve further artifacts.
       let savedTrace ← readTraceFile mod.traceFile
+      -- (an archive whose mapping does not say it holds kept outputs, as an `-o` file of the
+      -- previous Lake recorded them)
       if (← isKeptExcluded) && savedTrace.keptFrom?.isSome then
         mod.clearOutputArtifacts
+        mod.clearOutputHashes
         removeFileIfExists mod.traceFile
         return .incomplete .missing none
       let arts? ← getArtifactsUsingTrace? inputHash savedTrace mod.pkg
@@ -1487,8 +1510,6 @@ where
         let ltar ← if restoreAll then restoreArtifact mod.ltarFile ltar else pure ltar
         return .incomplete savedTrace (some ltar)
     | .arts arts =>
-      if (← isKeptExcluded) && arts.keptFrom?.isSome then
-        return .incomplete savedTrace none
       unless (← savedTrace.replayCachedIfUpToDate inputHash) do
         mod.clearOutputArtifacts
         -- The sidecars stay out of the trace, which `.ltar` archives include: a `.usekey` records
@@ -1509,7 +1530,11 @@ where
     let depTrace ← getTrace
     have : GetMTime Module := ⟨(·.getMTime presetup.isModule presetup.postponeCompile)⟩
     have : CheckExists Module := ⟨(·.checkExists presetup.isModule presetup.postponeCompile)⟩
-    let savedTrace ← reviewKept (← readTraceFile mod.traceFile)
+    let (savedTrace, setAside) ← reviewKept (← readTraceFile mod.traceFile)
+    -- Under `--no-build` (and `lake shake`), a set-aside module keeps its files and only reports
+    -- that it needs a build: neither `--old`'s modification-time check nor the cache restores it.
+    if setAside && (← getNoBuild) then
+      return ← mod.buildLean presetup
     if (← mod.pkg.isArtifactCacheWritable) then
       let restore ← mod.pkg.restoreAllArtifacts
       match (← fetchFromCache? presetup savedTrace restore) with
@@ -1551,7 +1576,6 @@ where
             if arts.keptFrom?.isSome then arts else {arts with ltar? := arts.ltar? <|> ltar?}
           -- The supersede rule (`Cache.writeOutputsCore`): accepted outputs never replace a mapping.
           (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs
-            (overwrite := arts.keptFrom?.isNone)
           return arts
         else
           let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
@@ -1590,23 +1614,24 @@ where
   again: when the module is excluded from kept checks, or when the cache maps the same input to
   anything but accepted outputs, in any of the forms Lake writes or installs: outputs compiled from
   source, which replace the kept ones, or an archive (the `-o` and `lake cache add`/`get` form),
-  whose own trace then decides the module's lineage when it is unpacked.
+  whose own trace then decides the module's lineage when it is unpacked. Returns whether it set the
+  trace aside; a `--no-build` build changes no file, and the module just needs a build.
   -/
-  reviewKept (savedTrace : SavedTrace) : JobM SavedTrace := do
-    unless savedTrace.keptFrom?.isSome do return savedTrace
+  reviewKept (savedTrace : SavedTrace) : JobM (SavedTrace × Bool) := do
+    unless savedTrace.keptFrom?.isSome do return (savedTrace, false)
     if (← isKeptExcluded) then return ← setAside
-    let .ok data := savedTrace | return savedTrace
+    let .ok data := savedTrace | return (savedTrace, false)
     unless data.depHash == (← getTrace).hash && (← mod.pkg.isArtifactCacheReadable) do
-      return savedTrace
-    let some out ← cachedOutputs? data.depHash | return savedTrace
-    if (out.getObjVal? "kf").isOk then return savedTrace
+      return (savedTrace, false)
+    let some out ← cachedOutputs? data.depHash | return (savedTrace, false)
+    if (out.getObjVal? "kf").isOk then return (savedTrace, false)
     setAside
-  setAside : JobM SavedTrace := do
-    -- a `--no-build` build changes no file: the module just needs a build
+  setAside : JobM (SavedTrace × Bool) := do
     unless (← getNoBuild) do
       mod.clearOutputArtifacts
+      mod.clearOutputHashes
       removeFileIfExists mod.traceFile
-    return .missing
+    return (.missing, true)
   cachedOutputs? (inputHash : Hash) : JobM (Option Json) := do
     try
       return (← (← getLakeCache).readOutputs? mod.pkg.cacheScope inputHash).map (·.data)
@@ -1817,16 +1842,23 @@ where
           arts.olean.trace |>.mix oleanServer.trace |>.mix oleanPrivate.trace
     else
       return allArtsTrace.mix arts.olean.trace
+  /-
+  Records the module's archive in the `-o` outputs file. The entry of a module whose outputs a
+  kept-module check accepted also carries their lineage (`{"l": <archive>, "kf": <hash>}`), so
+  that a cache installing the file applies the supersede rule to it (`Cache.writeOutputsCore`).
+  -/
   trackOutputsIfEnabled arts : JobM ModuleOutputArtifacts := do
     if let some ref ← Internal.getOutputsRef? mod.pkg then
       let inputHash := (← getTrace).hash
-      if let some ltar := arts.ltar? then
-        ref.insert inputHash ltar.descr (mod.platformIndependent.getD false)
-        return arts
-      else
+      let (arts, ltar) ← id do
+        if let some ltar := arts.ltar? then pure (arts, ltar) else
         let ltar ← mod.packLtar arts
-        ref.insert inputHash ltar.descr (mod.platformIndependent.getD false)
-        return {arts with ltar? := some ltar}
+        pure ({arts with ltar? := some ltar}, ltar)
+      let entry := match arts.keptFrom? with
+        | some hash => Json.mkObj [("l", toJson ltar.descr), ("kf", toJson hash)]
+        | none => toJson ltar.descr
+      ref.insert inputHash entry (mod.platformIndependent.getD false)
+      return arts
     return arts
 
 /-- The `ModuleFacetConfig` for the builtin `irArtsFacet`. -/
