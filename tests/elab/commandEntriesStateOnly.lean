@@ -3,16 +3,16 @@ import Lean
 declaration attribute that erases a simp lemma, or one that edits the simp state through the scoped extension's
 underlying persistent extension) records the extension in its payload's `stateOnly`, and `replayCommandEntries`
 refuses that payload instead of replaying it without the erasure. A declaration command with such a change declines
-the module (`noskip`). An erasure inside `attribute [-simp] x in theorem …` is undone by the command's own scope and
-is not recorded. The commands after an erasure see which lemma it erased in their context digest (`ctx`). -/
+the module (`noskip`). An erasure inside `attribute [-simp] x in theorem …` is undone on the main branch by the
+command's own scope, but the theorem's asynchronous branch forked inside that scope and keeps it, and no stack
+operation expresses an erasure, so that command is refused too (`CommandEntries.branchStateOnly`). The commands after
+an erasure see which lemma it erased in their context digest (`ctx`). -/
 open Lean
 
 def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
   let out ← IO.Process.output { cmd := "lean", args, cwd := dir, env := #[("LEAN_PATH", some dir.toString)] }
   unless out.exitCode = 0 do
     throw <| IO.userError s!"lean {args} failed ({out.exitCode}):\n{out.stdout}\n{out.stderr}"
-
-unsafe def commandEntriesOf (e : EnvExtensionEntry) : CommandEntries := unsafeCast e
 
 /-- Elaborates `src` as module `M` in `dir` as `lean -o` does; returns the command observations, the payloads
 written to `M.olean` and `M.usage`. -/
@@ -25,7 +25,7 @@ unsafe def elabM (dir : System.FilePath) (src : String) :
     throw <| IO.userError "elaboration of M failed"
   let obs := (← ModuleUsage.commandObservationsRef.get).qsort (·.i < ·.i)
   let (md, _) ← readModuleData (dir / "M.olean")
-  let payloads := ((md.entries.find? (·.1 == commandEntriesExt.name)).map (·.2)).getD #[] |>.map commandEntriesOf
+  let payloads := CommandEntries.ofModuleData md
   let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
   return (obs, payloads, usage)
 
@@ -41,7 +41,7 @@ unsafe def replayed (obs : Array ModuleUsage.CommandObservation) (payloads : Arr
   let some o := obs.find? (·.i == i) | throw <| IO.userError s!"no observation {i}"
   let some ce := payloads.find? (·.idx == i) | throw <| IO.userError s!"no payload {i}"
   try
-    let env ← replayCommandEntries (← withReplayStateOf o.before.env o.after.env) ce (scopeDepth o.before.env) {}
+    let env ← replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce (scopeDepth o.before.env) {}
     return s!"replayed: {n} unfolds {unfolds env n} (full run: {unfolds o.after.env n})"
   catch e =>
     return s!"refused: {e}"

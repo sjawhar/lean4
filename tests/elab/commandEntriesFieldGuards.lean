@@ -3,10 +3,13 @@ import Lean
 throws when a field is added, removed or misclassified. For `Elab.Command.State` (`ModuleUsage.commandStateFields`)
 each field is changed on its own and must show its class: the payload for `env`, `post` and `ctx` for `replayed`, a
 `stateOnly` marker for `stateOnly`; a `reset` field must be empty when a later command starts although the command
-before it left the field non-empty, and an `unread` field must not change what the next command declares. Every
+before it left the field non-empty (`messages` also because `elabCommandTopLevel` clears them,
+`src/Lean/Elab/Command.lean:853-854`, so only `traceState` and `snapshotTasks` show `doElab`'s reset), and an
+`unread` field must not change what the next command declares. Every
 field of `Elab.Command.Scope` must change `scopesEnc`. Every field of a scoped extension's `ScopedEnvExtension.State`
 and `StateStack` is changed on its own and must give the state delta (`ScopedEnvExtension.stateDelta`,
-`localEntriesAccountedFor`) its documented result. The fields with a case must be exactly the structure's fields. -/
+`localEntriesAccountedFor`) its documented result; `ops`, the log of stack operations, is outside the command-level
+replay contract and gives no entries. The fields with a case must be exactly the structure's fields. -/
 open Lean Elab Command
 
 def expect (cond : Bool) (msg : String) : IO Unit :=
@@ -143,7 +146,7 @@ unsafe def main : IO Unit := do
         let recorded ← recordCommandDelta st.env st'.env 0
         let some ce := (commandEntriesExt.getState recorded).back? | throw <| IO.userError "no payload"
         expect (!ce.entries.isEmpty && markers.isEmpty) s!"{field}: no payload entry"
-        pure s!"payload {ce.entries.map fun (v, n, _) => s!"{n}.{v}"}"
+        pure s!"payload {ce.entries.map fun e => s!"{e.ext}.{e.view}"}"
       | .replayed =>
         expect (postChanged && ctxChanged && markers.isEmpty) s!"{field}: post {postChanged}, ctx {ctxChanged}"
         pure "post and ctx change"
@@ -217,7 +220,9 @@ unsafe def main : IO Unit := do
     (`newEntries, "the old log not a tail", { s₀ with newEntries := [.global `old] },
       { s₀ with newEntries := [.global `e] }, 0, "stateOnly", true),
     -- numbers levels for `generation` only; outside the replay contract
-    (`pushCount, "advanced", s₀, { s₀ with pushCount := 1 }, 0, "entries 0", true)]
+    (`pushCount, "advanced", s₀, { s₀ with pushCount := 1 }, 0, "entries 0", true),
+    -- the log of stack operations is not part of the command-level replay contract
+    (`ops, "a push logged", s₀, { s₀ with ops := [.push] }, 0, "entries 0", true)]
   let stateFields := getStructureFields env ``ScopedEnvExtension.State
   let stackFields := getStructureFields env ``ScopedEnvExtension.StateStack
   let caseFields := (cases.map (·.1)).toList.eraseDups.toArray

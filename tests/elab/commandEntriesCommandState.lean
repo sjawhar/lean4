@@ -10,8 +10,6 @@ show why `ngen` matters). `nextMacroScope` is the same before and after every co
 are reset before every command, so a command does not see an earlier one's. -/
 open Lean
 
-unsafe def commandEntriesOf (e : EnvExtensionEntry) : CommandEntries := unsafeCast e
-
 structure Run where
   obs : Array ModuleUsage.CommandObservation
   payloads : Array CommandEntries
@@ -26,7 +24,7 @@ unsafe def elabM (dir : System.FilePath) (src : String) : IO Run := do
     throw <| IO.userError s!"elaboration failed:\n{src}"
   let obs := (← ModuleUsage.commandObservationsRef.get).qsort (·.i < ·.i)
   let (md, _) ← readModuleData (dir / "M.olean")
-  let payloads := ((md.entries.find? (·.1 == commandEntriesExt.name)).map (·.2)).getD #[] |>.map commandEntriesOf
+  let payloads := CommandEntries.ofModuleData md
   let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
   let records := (usage.getObjValAs? (Array Json) "commands").toOption.getD #[]
   return { obs, payloads, usage, records }
@@ -44,7 +42,7 @@ unsafe def report (dir : System.FilePath) (label src : String) : IO Run := do
     let kind := (r.records[o.i]?.bind fun c => (c.getObjValAs? String "kind").toOption).getD "?"
     let markers := ce.stateOnly.filter stateMarkers.contains
     let replay ← try
-        discard <| replayCommandEntries (← withReplayStateOf o.before.env o.after.env) ce (scopeDepth o.before.env) {}
+        discard <| replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce (scopeDepth o.before.env) {}
         pure "replayed"
       catch _ => pure "refused"
     IO.println s!"{o.i} {kind}: command-state markers {markers}, {replay}"

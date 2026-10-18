@@ -16,8 +16,6 @@ def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
   unless out.exitCode = 0 do
     throw <| IO.userError s!"lean {args} failed ({out.exitCode}):\n{out.stdout}\n{out.stderr}"
 
-unsafe def commandEntriesOf (e : EnvExtensionEntry) : CommandEntries := unsafeCast e
-
 unsafe def compactBytes (dir : System.FilePath) (a : α) : IO ByteArray := do
   let path := dir / "cmp.bin"
   let _ ← CompactedRegion.save path `compare a #[] none
@@ -122,13 +120,13 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
     throw <| IO.userError "elaboration of M failed"
   let obs := (← ModuleUsage.commandObservationsRef.get).qsort (·.i < ·.i)
   let (md, _) ← readModuleData (dir / "M.olean")
-  let payloads := ((md.entries.find? (·.1 == commandEntriesExt.name)).map (·.2)).getD #[] |>.map commandEntriesOf
+  let payloads := CommandEntries.ofModuleData md
   let pExts := (← persistentEnvExtensionsRef.get).filter (!excludedExtension ·.name)
   for o in obs do
     let some ce := payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"
-    let shown := ce.entries.filterMap fun (v, n, _) => if watched.contains n then some s!"{n}.{v}" else none
+    let shown := ce.entries.filterMap fun e => if watched.contains e.ext then some s!"{e.ext}.{e.view}" else none
     -- as when a kept command is replayed: its constants are present, every extension is in its before-state
-    let base ← withReplayStateOf o.before.env o.after.env
+    let base ← CommandEntries.Testing.rollbackTo o.before.env o.after.env
     let replayed? : Option Environment ← try
         pure (some (← replayCommandEntries base ce (scopeDepth o.before.env) {}))
       catch _ => pure none

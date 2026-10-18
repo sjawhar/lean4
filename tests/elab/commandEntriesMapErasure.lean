@@ -10,8 +10,6 @@ def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
   unless out.exitCode = 0 do
     throw <| IO.userError s!"lean {args} failed ({out.exitCode}):\n{out.stdout}\n{out.stderr}"
 
-unsafe def commandEntriesOf (e : EnvExtensionEntry) : CommandEntries := unsafeCast e
-
 def xSource : String := "import Lean\nopen Lean\n\
   initialize mapExt : MapDeclarationExtension Nat ← mkMapDeclarationExtension\n\
   initialize registerBuiltinAttribute { name := `map_add, descr := \"test\", \
@@ -54,7 +52,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
     throw <| IO.userError "elaboration of M failed"
   let obs := (← ModuleUsage.commandObservationsRef.get).qsort (·.i < ·.i)
   let (md, _) ← readModuleData (dir / "M.olean")
-  let payloads := ((md.entries.find? (·.1 == commandEntriesExt.name)).map (·.2)).getD #[] |>.map commandEntriesOf
+  let payloads := CommandEntries.ofModuleData md
   let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
   IO.println s!"noskip {(usage.getObjValAs? Bool "noskip").toOption}, \
     reason {(usage.getObjValAs? String "noskipReason").toOption}"
@@ -62,6 +60,6 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   for o in obs do
     let some ce := payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"
     IO.println s!"{o.i}: stateOnly {ce.stateOnly.filter watched.contains}, \
-      entries {ce.entries.filterMap fun (v, n, _) => if watched.contains n then some s!"{n}.{v}" else none}"
+      entries {ce.entries.filterMap fun e => if watched.contains e.ext then some s!"{e.ext}.{e.view}" else none}"
 
 #eval main

@@ -8,8 +8,6 @@ rules and instances the test also elaborates the rest of the module on top of th
 would be, and prints what a later command sees. -/
 open Lean
 
-unsafe def commandEntriesOf (e : EnvExtensionEntry) : CommandEntries := unsafeCast e
-
 structure Run where
   src : String
   obs : Array ModuleUsage.CommandObservation
@@ -24,7 +22,7 @@ unsafe def elabM (dir : System.FilePath) (src : String) : IO Run := do
     throw <| IO.userError s!"elaboration failed:\n{src}"
   let obs := (← ModuleUsage.commandObservationsRef.get).qsort (·.i < ·.i)
   let (md, _) ← readModuleData (dir / "M.olean")
-  let payloads := ((md.entries.find? (·.1 == commandEntriesExt.name)).map (·.2)).getD #[] |>.map commandEntriesOf
+  let payloads := CommandEntries.ofModuleData md
   let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
   return { src, obs, payloads, usage }
 
@@ -50,10 +48,10 @@ unsafe def check (dir : System.FilePath) (label : String) (ext : Name) (src : St
   let kind := (((r.usage.getObjValAs? (Array Json) "commands").toOption.getD #[])[i]?.bind
     fun c => (c.getObjValAs? String "kind").toOption).getD "?"
   IO.println s!"{label}: command {i} {kind}, {ext} in stateOnly {ce.stateOnly.contains ext}, entries \
-    {ce.entries.any (·.2.1 == ext)}, locals {ce.locals.any (·.2.1 == ext)}, \
+    {ce.entries.any (·.ext == ext)}, locals {ce.locals.any (·.2.1 == ext)}, \
     noskip {(r.usage.getObjValAs? Bool "noskip").toOption}"
   let replayed? ← try
-      pure (some (← replayCommandEntries (← withReplayStateOf o.before.env o.after.env) ce
+      pure (some (← replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce
         (scopeDepth o.before.env) {}))
     catch _ => pure none
   match replayed?, probe? with

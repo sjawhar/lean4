@@ -630,7 +630,8 @@ inductive CommandStateField where
   /-- Restored for a kept command from its record's `post` (`CommandPost.ofStates`), and covered by later commands'
   `ctx` (`ctxDigest`). -/
   | replayed
-  /-- Reset before every command (`Language/Lean.lean`, `doElab`), so no command reads an earlier one's. -/
+  /-- Reset before every command (`Language/Lean.lean`, `doElab`; `messages` also by `elabCommandTopLevel`), so no
+  command reads an earlier one's. -/
   | reset
   /-- Read by no later command's elaboration; the reason is at `commandStateFields`. -/
   | unread

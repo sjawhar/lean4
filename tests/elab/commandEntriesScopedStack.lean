@@ -8,8 +8,6 @@ replay does not install. Stack changes a declaration makes and undoes (`open …
 dotted names, `classical`) and a top-level local entry stay replayable, and replay reproduces them. -/
 open Lean
 
-unsafe def commandEntriesOf (e : EnvExtensionEntry) : CommandEntries := unsafeCast e
-
 /-- What a later command sees of the simp extension: per stack level, the active namespaces and whether local
 entries are delimited there, and which of `probes` are simp lemmas at the top. -/
 def simpView (env : Environment) (probes : List Name) : String :=
@@ -26,7 +24,7 @@ unsafe def check (dir : System.FilePath) (label src : String) (probes : List Nam
     throw <| IO.userError s!"elaboration of {label} failed"
   let obs := (← ModuleUsage.commandObservationsRef.get).qsort (·.i < ·.i)
   let (md, _) ← readModuleData (dir / "M.olean")
-  let payloads := ((md.entries.find? (·.1 == commandEntriesExt.name)).map (·.2)).getD #[] |>.map commandEntriesOf
+  let payloads := CommandEntries.ofModuleData md
   let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
   let cmds := (usage.getObjValAs? (Array Json) "commands").toOption.getD #[]
   IO.println s!"== {label}: noskip {(usage.getObjValAs? Bool "noskip").toOption}, \
@@ -36,7 +34,7 @@ unsafe def check (dir : System.FilePath) (label src : String) (probes : List Nam
     let kind := (cmds[o.i]?.bind fun c => (c.getObjValAs? String "kind").toOption).getD "?"
     let simpStateOnly := ce.stateOnly.contains Meta.simpExtension.ext.name
     let replay ← try
-        let env ← replayCommandEntries (← withReplayStateOf o.before.env o.after.env) ce (scopeDepth o.before.env) {}
+        let env ← replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce (scopeDepth o.before.env) {}
         let full := simpView o.after.env probes
         let got := simpView env probes
         pure (if full == got then s!"replay matches: {full}" else s!"replay differs: full {full}, replayed {got}")

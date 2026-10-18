@@ -1,4 +1,4 @@
-noskip (some true), reason (some (state-only change to foldLog in declaration command 1))
+noskip (some true), reason (some (state-only change to foldLog in the branch of base.raw in declaration command 1))
 0: stateOnly #[], entries #[]; replay matches: checked=[]/[], main=[]/[]
 1: stateOnly #[foldLog], entries #[]; refused
 2: stateOnly #[], entries #[foldLog.checked]; replay matches: checked=[base.entry, base.raw]/[(base.raw, 99), (base.entry, 1)], main=[]/[]

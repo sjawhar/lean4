@@ -17,9 +17,9 @@ Elab.Command.Scope cases: 13 fields, each covered
 Elab.Command.Scope encoding: 13 fields, each covered
 every Scope field changes scopesEnc
 ScopedEnvExtension.State cases: 6 fields, each covered
-ScopedEnvExtension.StateStack cases: 4 fields, each covered
+ScopedEnvExtension.StateStack cases: 5 fields, each covered
 ScopedEnvExtension.State encoding: 6 fields, each covered
-ScopedEnvExtension.StateStack encoding: 4 fields, each covered
+ScopedEnvExtension.StateStack encoding: 5 fields, each covered
 scoped state, changed alone, without an entry or a local entry: stateOnly, local entries accounted for true
 scoped activeScopes, a namespace activated: stateOnly, local entries accounted for true
 scoped delimitsLocal, changed: stateOnly, local entries accounted for true
@@ -32,3 +32,4 @@ scoped scopedEntries, changed without a scoped entry: stateOnly, local entries a
 scoped newEntries, an entry in front of the old log: entries 1, local entries accounted for true
 scoped newEntries, the old log not a tail: stateOnly, local entries accounted for true
 scoped pushCount, advanced: entries 0, local entries accounted for true
+scoped ops, a push logged: entries 0, local entries accounted for true

@@ -12,8 +12,6 @@ def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
   unless out.exitCode = 0 do
     throw <| IO.userError s!"lean {args} failed ({out.exitCode}):\n{out.stdout}\n{out.stderr}"
 
-unsafe def commandEntriesOf (e : EnvExtensionEntry) : CommandEntries := unsafeCast e
-
 def xSource : String := "import Lean\nopen Lean\n\
   initialize mainLog : SimplePersistentEnvExtension Name NameSet ← registerSimplePersistentEnvExtension { \
     addEntryFn := fun s n => s.insert n, addImportedFn := fun _ => {} }\n\
@@ -65,19 +63,19 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
     throw <| IO.userError "elaboration of M failed"
   let obs := (← ModuleUsage.commandObservationsRef.get).qsort (·.i < ·.i)
   let (md, _) ← readModuleData (dir / "M.olean")
-  let payloads := ((md.entries.find? (·.1 == commandEntriesExt.name)).map (·.2)).getD #[] |>.map commandEntriesOf
+  let payloads := CommandEntries.ofModuleData md
   let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
   IO.println s!"noskip {(usage.getObjValAs? Bool "noskip").toOption}, \
     reason {(usage.getObjValAs? String "noskipReason").toOption}"
   for o in obs do
     let some ce := payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"
     let replay ← try
-        let env ← replayCommandEntries (← withReplayStateOf o.before.env o.after.env) ce (scopeDepth o.before.env) {}
+        let env ← replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce (scopeDepth o.before.env) {}
         let full ← view o.after.env
         let got ← view env
         pure (if full == got then "replay matches" else s!"replay differs:\n    full     {full}\n    replayed {got}")
       catch _ => pure "refused"
     IO.println s!"{o.i}: stateOnly {ce.stateOnly.filter names.contains}, \
-      entries {ce.entries.filterMap fun (v, n, _) => if names.contains n then some s!"{n}.{v}" else none}; {replay}"
+      entries {ce.entries.filterMap fun e => if names.contains e.ext then some s!"{e.ext}.{e.view}" else none}; {replay}"
 
 #eval main

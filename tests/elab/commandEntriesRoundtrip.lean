@@ -8,8 +8,6 @@ payload changes state no entry expresses (`namespace`, `end`: the scope stack) a
 for commands elaborated again; the replay takes the full run's state after them. -/
 open Lean
 
-unsafe def commandEntriesOf (e : EnvExtensionEntry) : CommandEntries := unsafeCast e
-
 def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
   let out ← IO.Process.output { cmd := "lean", args, cwd := dir, env := #[("LEAN_PATH", some dir.toString)] }
   unless out.exitCode = 0 do
@@ -46,15 +44,13 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let some first := observations[0]? | throw <| IO.userError "missing first command observation"
   let baseEnv := first.before.env
   let (md, region) ← readModuleData (dir / "M.olean")
-  let some raw := (md.entries.find? (·.1 == commandEntriesExt.name)).map (·.2) |
-    throw <| IO.userError "missing commandEntriesExt payload"
-  let entries := raw.map commandEntriesOf
+  let entries := CommandEntries.ofModuleData md
   -- the view `computeExtEntries` exports each extension from: checked for `.sync` and `.async _`, else main
   let exportView : Std.HashMap Name EnvExtension.View := (← persistentEnvExtensionsRef.get).foldl
     (fun m ext => m.insert ext.name
       (if ext.toEnvExtension.asyncMode.forExport matches .sync then .checked else .main)) {}
   let exported (entry : CommandEntries) : Array Name :=
-    entry.entries.filterMap fun (v, n, _) => if exportView[n]? == some v then some n else none
+    entry.entries.filterMap fun e => if exportView[e.ext]? == some e.view then some e.ext else none
   let names : Array Name := entries.flatMap exported
   let locals : Array (Nat × Name × EnvExtensionEntry) := entries.flatMap fun entry => entry.locals
   IO.println s!"commands: {entries.size}"
@@ -83,7 +79,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
       {if scopedStateOnly then " and scoped extensions" else ""}"
   let afterOf : Std.HashMap Nat Environment :=
     observations.foldl (fun m obs => m.insert obs.i obs.after.env) {}
-  let mut replayed ← withReplayStateOf baseEnv expectedEnv
+  let mut replayed ← CommandEntries.Testing.rollbackTo baseEnv expectedEnv
   replayed := replayed.setMainModule `M
   let mut elaborated := #[]
   for entry in entries do
@@ -96,7 +92,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
       unless refused do
         throw <| IO.userError s!"payload {entry.idx} with state-only changes was replayed"
       let some after := afterOf[entry.idx]? | throw <| IO.userError s!"no observation {entry.idx}"
-      replayed ← withReplayStateOf after replayed
+      replayed ← CommandEntries.Testing.rollbackTo after replayed
       elaborated := elaborated.push entry.idx
   IO.println s!"elaborated again: {elaborated}"
   let some myExt := (← persistentEnvExtensionsRef.get).find? (·.name == `myExt) |
