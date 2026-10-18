@@ -392,6 +392,21 @@ instance : FromJson DeclNGenRecord := ⟨fun j => return {
   idx := ← j.getObjValAs? Nat "idx"
   parentIdxs := ← j.getObjValAs? (List Nat) "parentIdxs" }⟩
 
+/-- A `NameGenerator` state, as a record with `BEq`. -/
+structure NGenRecord where
+  namePrefix : Name
+  idx : Nat
+  deriving Inhabited, BEq
+
+def NGenRecord.ofNameGenerator (g : NameGenerator) : NGenRecord := { namePrefix := g.namePrefix, idx := g.idx }
+
+def NGenRecord.toNameGenerator (r : NGenRecord) : NameGenerator := { namePrefix := r.namePrefix, idx := r.idx }
+
+instance : ToJson NGenRecord := ⟨fun r => Json.mkObj [("prefix", nameToJson r.namePrefix), ("idx", r.idx)]⟩
+instance : FromJson NGenRecord := ⟨fun j => return {
+  namePrefix := ← nameOfJson? (← j.getObjVal? "prefix")
+  idx := ← j.getObjValAs? Nat "idx" }⟩
+
 /-- The `Command.State` counters a kept command must restore (`commandStateFields`, `.replayed`). -/
 structure CommandPost where
   auxDeclNGen : DeclNGenRecord
@@ -404,12 +419,10 @@ structure CommandPost where
   maxRecDepth : Nat
   /-- The fresh-identifier generator after the command. Its identifiers reach the environment: a command elaborator
   can name a declaration with `mkFreshId`, and proof-mode tactics store generated names in theorem values. -/
-  ngen : NameGenerator
-  deriving Inhabited
-
-instance : BEq CommandPost where
-  beq a b := a.auxDeclNGen == b.auxDeclNGen && a.quotCtxts == b.quotCtxts && a.localEntries == b.localEntries &&
-    a.maxRecDepth == b.maxRecDepth && a.ngen.namePrefix == b.ngen.namePrefix && a.ngen.idx == b.ngen.idx
+  ngen : NGenRecord
+  /-- The fresh-identifier generator before the command, which the command's `ctx` digests (`ctxDigest`). -/
+  ngenBefore : NGenRecord
+  deriving Inhabited, BEq
 
 /-- What a command leaves in the `commandStateFields` it replays, for its record's `post`. -/
 def CommandPost.ofStates (before after : Elab.Command.State) : CommandPost :=
@@ -418,27 +431,29 @@ def CommandPost.ofStates (before after : Elab.Command.State) : CommandPost :=
     quotCtxts := (NameSet.sharedDiff before.usedQuotCtxts after.usedQuotCtxts).1 |>.qsort Name.quickLt
     localEntries := localEntryCount after.env
     maxRecDepth := after.maxRecDepth
-    ngen := after.ngen }
+    ngen := .ofNameGenerator after.ngen
+    ngenBefore := .ofNameGenerator before.ngen }
 
-/-- The generator a kept command leaves: `post.ngen`, or `current` when it is already ahead under the same prefix (an
-earlier command elaborated again used more identifiers than in the recorded run), so that no identifier is generated
-twice. -/
-def CommandPost.restoreNgen (post : CommandPost) (current : NameGenerator) : NameGenerator :=
-  if post.ngen.namePrefix == current.namePrefix then { current with idx := max current.idx post.ngen.idx }
-  else post.ngen
+/-- The generator a kept command leaves: exactly `post.ngen`. `current`, the generator the command is kept from, must
+be `post.ngenBefore`: the command's `ctx` digests the generator before it, so a kept command always starts from the
+recorded one, and any other `current` is an error naming both. -/
+def CommandPost.restoreNgen (post : CommandPost) (current : NameGenerator) : Except String NameGenerator := do
+  let b := post.ngenBefore
+  unless NGenRecord.ofNameGenerator current == b do
+    throw s!"the name generator before the kept command is (prefix {current.namePrefix}, idx {current.idx}), \
+      not the one recorded before it (prefix {b.namePrefix}, idx {b.idx})"
+  return post.ngen.toNameGenerator
 
 instance : ToJson CommandPost := ⟨fun p => Json.mkObj [("auxDeclNGen", toJson p.auxDeclNGen),
   ("quotCtxts", .arr (p.quotCtxts.map nameToJson)), ("localEntries", p.localEntries),
-  ("maxRecDepth", p.maxRecDepth),
-  ("ngen", Json.mkObj [("namePrefix", nameToJson p.ngen.namePrefix), ("idx", p.ngen.idx)])]⟩
-instance : FromJson CommandPost := ⟨fun j => do
-  let g ← j.getObjVal? "ngen"
-  return {
-    auxDeclNGen := ← j.getObjValAs? DeclNGenRecord "auxDeclNGen"
-    quotCtxts := (← j.getObjValAs? (Array JName) "quotCtxts").map (·.name)
-    localEntries := ← j.getObjValAs? Nat "localEntries"
-    maxRecDepth := ← j.getObjValAs? Nat "maxRecDepth"
-    ngen := { namePrefix := (← g.getObjValAs? JName "namePrefix").name, idx := ← g.getObjValAs? Nat "idx" } }⟩
+  ("maxRecDepth", p.maxRecDepth), ("ngen", toJson p.ngen), ("ngenBefore", toJson p.ngenBefore)]⟩
+instance : FromJson CommandPost := ⟨fun j => return {
+  auxDeclNGen := ← j.getObjValAs? DeclNGenRecord "auxDeclNGen"
+  quotCtxts := (← j.getObjValAs? (Array JName) "quotCtxts").map (·.name)
+  localEntries := ← j.getObjValAs? Nat "localEntries"
+  maxRecDepth := ← j.getObjValAs? Nat "maxRecDepth"
+  ngen := ← j.getObjValAs? NGenRecord "ngen"
+  ngenBefore := ← j.getObjValAs? NGenRecord "ngenBefore" }⟩
 
 /-- A summary of the non-persistent cache entries a command added. Keys that hold `Expr`s are digests here; the
 `.olean` payload carries the objects. -/

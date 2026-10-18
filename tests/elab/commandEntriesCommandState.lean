@@ -12,18 +12,6 @@ open Lean
 
 unsafe def commandEntriesOf (e : EnvExtensionEntry) : CommandEntries := unsafeCast e
 
-/-- `target` with the state of every extension a command payload replays taken from `source`. -/
-def withReplayStateOf (source target : Environment) : IO Environment := do
-  let mut target := target
-  for ext in ← persistentEnvExtensionsRef.get do
-    let mode := ext.toEnvExtension.asyncMode.forExport
-    target := ext.toEnvExtension.setState target (ext.toEnvExtension.getState source (asyncMode := mode))
-      (asyncMode := mode)
-  for ext in ← commandCacheExtensionsRef.get do
-    target := ext.copyState source target
-  return localEntriesExt.setState target (localEntriesExt.getState source (asyncMode := .local))
-    (asyncMode := .local)
-
 structure Run where
   obs : Array ModuleUsage.CommandObservation
   payloads : Array CommandEntries
@@ -95,7 +83,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
       maxRecDepth before {o.before.maxRecDepth} after {o.after.maxRecDepth}, \
       post {postField kept o.i "maxRecDepth" |>.map (·.compress)}, \
       post ngen idx is the generator's after the command \
-      {(postField kept o.i "ngen").bind (fun j => (j.getObjValAs? Nat "idx").toOption) == some o.after.ngen.idx}"
+      {((postField kept o.i "ngen").bind fun j => (fromJson? (α := ModuleUsage.NGenRecord) j).toOption).map (·.idx) == some o.after.ngen.idx}"
   let some o := kept.obs.back? | throw <| IO.userError "no observation"
   let st := o.before
   let d (s : Elab.Command.State) := ModuleUsage.ctxDigest s {} default
