@@ -2,7 +2,8 @@ import Lean
 /-! Differential test: `ValueSensitive.unsafelyUsedValues` (one pass per constant, for all its statement-only
 references at once) agrees with a per-reference walk (`Old.constUnsafelyUsesValue env {r} c`, the implementation
 it replaced, with a step budget) on handcrafted constants that put theorems in value-inspecting positions through
-let-bound variables, binders and eliminators, and on every (constant, statement-only reference) pair of the
+let-bound variables, binders and eliminators, on constants 300 binders deep and one projecting a let-bound theorem
+from a subterm shared 2^12 times, and on every (constant, statement-only reference) pair of the
 constants of `Init.Prelude`; and asking for one reference alone gives the same answer as asking for all. A pair
 whose per-reference walk exceeds the budget (exponential on shared terms) is counted, not compared. -/
 open Lean Lean.ModuleUsage
@@ -103,6 +104,33 @@ def useRec : Nat := @Acc.rec Nat (· < ·) (fun _ _ => Nat) (fun _ _ _ => 0) 0 (
 def useNone : True ∧ True := thA
 def useLetUnused : True := let x := thA; trivial
 
+/-! Deep-binder constants, added through `addDecl`: a chain of 300 `let`s, each bound to the one before and the
+first to `thA`, whose body projects the first (`deepLetProj`) or returns it (`deepLetPlain`); 300 lambdas around
+`let h := thA; ⟨h.1, x₁⟩` (`deepFunLet`); and `let h := thA` around `h.1` shared 2^12 times as a tree
+(`deepShared`). -/
+run_cmd Elab.Command.liftCoreM do
+  let d := 300
+  let t := mkConst ``True
+  let tt := mkApp2 (mkConst ``And) t t
+  let chain (body : Expr) : Expr := Id.run do
+    let mut v := body
+    for i in [:d] do
+      v := mkLet `h tt (if i + 1 == d then mkConst ``thA else mkBVar 0) v
+    return v
+  let left (h : Expr) := mkApp3 (mkConst ``And.left) t t h
+  addDecl (.thmDecl { name := `deepLetProj, levelParams := [], type := t, value := chain (left (mkBVar (d - 1))) })
+  addDecl (.thmDecl { name := `deepLetPlain, levelParams := [], type := tt, value := chain (mkBVar (d - 1)) })
+  let mut f := mkLet `h tt (mkConst ``thA) (mkApp4 (mkConst ``And.intro) t t (left (mkBVar 0)) (mkBVar d))
+  let mut ty := tt
+  for _ in [:d] do
+    f := mkLambda `x .default t f
+    ty := mkForall `x .default t ty
+  addDecl (.thmDecl { name := `deepFunLet, levelParams := [], type := ty, value := f })
+  let mut w := left (mkBVar 0)
+  for _ in [:12] do
+    w := left (mkApp4 (mkConst ``And.intro) t t w w)
+  addDecl (.thmDecl { name := `deepShared, levelParams := [], type := t, value := mkLet `h tt (mkConst ``thA) w })
+
 def budget : Nat := 200000
 
 def oldResult (env : Environment) (r : Name) (c : ConstantInfo) : Option Bool :=
@@ -113,7 +141,7 @@ def oldResult (env : Environment) (r : Name) (c : ConstantInfo) : Option Bool :=
 #eval show Elab.Command.CommandElabM Unit from do
   let env ← getEnv
   for n in [``useProj, ``useLet, ``useLetShadow, ``useNested, ``useMatch, ``useCases, ``useRec, ``useNone,
-      ``useLetUnused] do
+      ``useLetUnused, `deepLetProj, `deepLetPlain, `deepFunLet, `deepShared] do
     let some c := env.find? n | throwError "missing {n}"
     let s := stmtOnlyRefs env c
     let new := ValueSensitive.unsafelyUsedValues env s c
