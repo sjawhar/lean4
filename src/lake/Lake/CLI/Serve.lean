@@ -15,6 +15,7 @@ import Lake.Load.Package
 import Lake.Load.Lean.Elab
 import Lake.Load.Workspace
 import Lake.Util.IO
+import Lake.Util.Proc
 
 open Lean
 open System (FilePath)
@@ -96,7 +97,7 @@ public def serve (config : LoadConfig) (args : Array String) : IO UInt32 := do
     else
       IO.eprintln "warning: package configuration has errors, falling back to plain `lean --server`"
       pure (config.lakeEnv.baseVars.push (invalidConfigEnvVar, log.toString), #[])
-  (← IO.Process.spawn {
+  (← spawnProc {
     cmd := config.lakeEnv.lean.lean.toString
     args := #["--server"] ++ moreServerArgs ++ args
     env := extraEnv
