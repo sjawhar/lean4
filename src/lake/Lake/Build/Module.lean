@@ -1241,8 +1241,8 @@ Keeps the module's outputs for a build that does not compile it, if each is stil
 (`descrs?`): with `cacheWith? = some useLocalFile`, saves them to the cache, checking each while saving
 (`recacheOutputArtifacts?`); otherwise checks their bytes (`outputsMatchDescrs`). Returns `none` if the trace
 records no outputs or any output differs, so that the caller builds. Every path that keeps outputs it then vouches
-for under a new input hash, or caches, goes through here: an up-to-date replay that caches its outputs, and a usage
-skip (`Module.skipOrBuild`).
+for under a new input hash, or caches, goes through here: an up-to-date replay that caches its outputs, a usage
+skip (`Module.skipOrBuild`), and a kept-module check's accept (`acceptKept`).
 -/
 def Module.keepOutputs? (mod : Module) (isModule postponesCompile : Bool) (descrs? : Option ModuleOutputDescrs)
     (cacheWith? : Option Bool) : JobM (Option ModuleOutputArtifacts) := do
@@ -1252,6 +1252,7 @@ def Module.keepOutputs? (mod : Module) (isModule postponesCompile : Bool) (descr
   | none =>
     unless (← mod.outputsMatchDescrs isModule postponesCompile descrs) do return none
     return some (← mod.computeArtifacts isModule postponesCompile)
+
 /-- The `keptFrom?` recorded with a saved trace's module outputs. -/
 def SavedTrace.keptFrom? (self : SavedTrace) : Option Hash :=
   self.moduleOutputDescrs?.bind (·.keptFrom?)
@@ -1813,18 +1814,20 @@ Skips compiling a module whose trace is stale if usage cutoff applies to it
 the saved trace describes (`Module.keepOutputs?`): replays its saved log and rewrites its trace with `depTrace`,
 which vouches for those outputs under the new input hash. Otherwise, builds it with `compile`, passing the verdict
 and the module setup the check computed, if the cutoff applies. With `cacheWith? = some useLocalFile`, the outputs
-it returns are in the cache: kept ones were checked while saving them (`recacheOutputArtifacts?`), built ones are
-saved after the build.
+it returns are in the cache: kept ones were checked while saving them (`recacheOutputArtifacts?`), as were outputs
+`compile` reports it kept and cached (a kept-module check's accept), and built ones are saved after the build.
 -/
 def Module.skipOrBuild (mod : Module) (presetup : ModulePreSetup) (savedTrace : SavedTrace)
     (depTrace : BuildTrace) (cacheWith? : Option Bool := none)
-    (compile : Option (UsageVerdict × ModuleSetup) → JobM ModuleOutputArtifacts :=
-      fun d? => mod.buildLean presetup (d?.map (·.2))) :
+    (compile : Option (UsageVerdict × ModuleSetup) → JobM (ModuleOutputArtifacts × Bool) :=
+      fun d? => return (← mod.buildLean presetup (d?.map (·.2)), false)) :
     JobM ModuleOutputArtifacts := do
   let build (decided? : Option (UsageVerdict × ModuleSetup)) : JobM ModuleOutputArtifacts := do
-    let arts ← compile decided?
+    let (arts, cached) ← compile decided?
     match cacheWith? with
-    | some useLocalFile => mod.cacheOutputArtifacts presetup.isModule useLocalFile presetup.postponeCompile
+    | some useLocalFile =>
+      if cached then return arts
+      mod.cacheOutputArtifacts presetup.isModule useLocalFile presetup.postponeCompile
     | none => return arts
   let .ok data := savedTrace | build none
   unless (← mod.usageCutoffApplies presetup) do return ← build none
@@ -1977,7 +1980,7 @@ where
               discard <| mod.buildLean presetup
         else
           cached? := some (← mod.skipOrBuild presetup savedTrace depTrace (cacheWith? := some restore)
-            (compile := checkOrBuild presetup savedTrace))
+            (compile := checkOrBuild presetup savedTrace (some restore)))
         if status.isCacheable then
           let arts ← id do
             if let some arts := cached? then return arts
@@ -2020,9 +2023,9 @@ where
               let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
               mod.withSavedKeptFrom {arts with ltar? := arts.ltar? <|> ltar?}
             else
-              mod.skipOrBuild presetup savedTrace depTrace (compile := checkOrBuild presetup savedTrace)
+              mod.skipOrBuild presetup savedTrace depTrace (compile := checkOrBuild presetup savedTrace none)
         else
-          mod.skipOrBuild presetup savedTrace depTrace (compile := checkOrBuild presetup savedTrace)
+          mod.skipOrBuild presetup savedTrace depTrace (compile := checkOrBuild presetup savedTrace none)
   isKeptExcluded : JobM Bool :=
     return (← getBuildContext).keptExclude.contains mod.name
   /-
@@ -2059,34 +2062,40 @@ where
   Compiles the module (with its `ModuleSetup`, if the caller computed it), unless its existing
   outputs are a kept candidate (`keptCandidate?`) and the kept-module checker accepts them for the
   module's current imports. `Module.skipOrBuild` calls it for a module the usage cutoff does not skip,
-  with the module's verdict when the cutoff applies.
+  with the module's verdict when the cutoff applies. With `cacheWith?`, accepted outputs are saved to
+  the cache as a skip saves its outputs (`Module.keepOutputs?`). Returns the outputs and whether
+  they were kept and cached.
   -/
-  checkOrBuild (presetup : ModulePreSetup) (savedTrace : SavedTrace)
+  checkOrBuild (presetup : ModulePreSetup) (savedTrace : SavedTrace) (cacheWith? : Option Bool)
     (decided? : Option (UsageVerdict × ModuleSetup))
-  : JobM ModuleOutputArtifacts := do
+  : JobM (ModuleOutputArtifacts × Bool) := do
     if let some checker := (← getBuildContext).keptChecker? then
       if let some (data, descrs, setup) ← keptCandidate? presetup savedTrace decided? then
         let cwd ← IO.currentDir
         let abs (f : FilePath) := if f.isAbsolute then f else cwd / f
         match (← checker.check mod.name (abs mod.oleanFile) (abs presetup.srcFile) (toJson setup)) with
         | .accepted hash =>
-          if hash == descrs.olean.hash then
-            return ← acceptKept presetup setup data descrs
-          logInfo s!"kept-module check: the checker read an .olean with hash {hash}, \
-            not {descrs.olean.hash} as recorded in the module's trace; compiling"
+          if hash != descrs.olean.hash then
+            logInfo s!"kept-module check: the checker read an .olean with hash {hash}, \
+              not {descrs.olean.hash} as recorded in the module's trace; compiling"
+          else if let some arts ← acceptKept presetup setup data descrs cacheWith? then
+            return (arts, cacheWith?.isSome)
+          else
+            logInfo "kept-module check: the module's outputs changed while the checker checked them; \
+              compiling"
         | .rejected reason =>
           logInfo s!"kept-module check: {reason}; compiling"
-    mod.buildLean presetup (decided?.map (·.2))
+    return (← mod.buildLean presetup (decided?.map (·.2)), false)
   /-
   The saved trace, its output descriptions and the module's setup if the module's existing outputs
   may be kept for its current input: they were produced from the same local inputs
   (`ModulePreSetup.localTrace`), so only the module's imports differ, the files are the ones the
-  trace describes, and the usage cutoff's verdict is `recheck`. That verdict is the rule for kept
-  modules: when the machinery the module used while elaborating is unchanged, re-checking its proofs
-  is enough; when it changed, or the records cannot tell, the module compiles. Without the cutoff's
-  verdict there is no candidate. A `module` file, a module linked into a shared library
-  (`precompileModules`), and a module excluded from kept checks are never candidates, nor is any
-  module of a `--no-build` build.
+  trace describes (`Module.outputsMatchDescrs`, as for a skip), and the usage cutoff's verdict is
+  `recheck`. That verdict is the rule for kept modules: when the machinery the module used while
+  elaborating is unchanged, re-checking its proofs is enough; when it changed, or the records cannot
+  tell, the module compiles. Without the cutoff's verdict there is no candidate. A `module` file, a
+  module linked into a shared library (`precompileModules`), and a module excluded from kept checks
+  are never candidates, nor is any module of a `--no-build` build.
   -/
   keptCandidate? (presetup : ModulePreSetup) (savedTrace : SavedTrace)
     (decided? : Option (UsageVerdict × ModuleSetup))
@@ -2096,53 +2105,51 @@ where
     let .ok data := savedTrace | return none
     let some descrs := savedTrace.moduleOutputDescrs? | return none
     unless data.localHash? == some presetup.localTrace.hash do return none
-    -- The `.hash` files are not trusted here: an output can change without them.
-    unless (← hashIs mod.oleanFile descrs.olean) && (← hashIs mod.ileanFile descrs.ilean) do
-      return none
-    if let some c := descrs.c? then
-      unless (← hashIs mod.cFile c) do return none
-    if let some bc := descrs.bc? then
-      unless (← hashIs mod.bcFile bc) do return none
+    unless (← mod.outputsMatchDescrs presetup.isModule presetup.postponeCompile descrs) do return none
     match decided? with
     | some (.recheck, setup) => return some (data, descrs, setup)
     | some (.compile reason, _) =>
       logInfo s!"kept-module check: not asked: {reason}; compiling"
       return none
     | _ => return none
-  hashIs (file : FilePath) (descr : ArtifactDescr) : BaseIO Bool := do
-    match (← (computeFileHash file).toBaseIO) with
-    | .ok hash => return hash == descr.hash
-    | .error _ => return false
   /-
   Records the module's existing outputs, which the kept-module checker accepted, as the outputs of
-  its current input. Their `.hash` files are rewritten from the hashes `keptCandidate?` computed.
-  The module's `.ltar` was packed with the previous trace, so it is removed. Its usage key is marked
-  kept (`UsekeySidecar.kept`): the `.usage` describes its constants as Lean compiled them, and a
-  constant they mention may mean something new now, so its importers must not trust its digests
-  (`importUsage?`). A key that cannot be read is removed instead.
+  its current input, if they still are what the trace describes: they go through the skip path's
+  check (`Module.keepOutputs?`, which with `cacheWith?` also saves them to the cache), as the
+  checker may have taken minutes. Returns `none` if they are not (the caller compiles). Their
+  `.hash` files are rewritten from the trace's descriptions. The module's `.ltar` was packed with
+  the previous trace, so it is removed. Its usage key is marked kept (`UsekeySidecar.kept`) before
+  the outputs are saved: the `.usage` describes its constants as Lean compiled them, and a constant
+  they mention may mean something new now, so its importers, here or after a restore from the cache,
+  must not trust its digests (`importUsage?`). A key that cannot be read is removed instead.
   -/
   acceptKept (presetup : ModulePreSetup) (setup : ModuleSetup) (data : BuildMetadata)
-    (descrs : ModuleOutputDescrs)
-  : JobM ModuleOutputArtifacts := do
-    buildAction (← getTrace) mod.traceFile (action := .check) (localHash? := some presetup.localTrace.hash) do
-      data.log.replay
-      writeFileHash mod.oleanFile descrs.olean.hash
-      writeFileHash mod.ileanFile descrs.ilean.hash
-      if let some c := descrs.c? then writeFileHash mod.cFile c.hash
-      if let some bc := descrs.bc? then writeFileHash mod.bcFile bc.hash
-      removeFileIfExists mod.ltarFile
-      clearFileHash mod.ltarFile
-      createParentDirs mod.setupFile
-      IO.FS.writeFile mod.setupFile (toJson setup).pretty
-      let key? ← (IO.FS.readFile mod.usekeyFile).toBaseIO
-      -- under an artifact cache the key is a read-only link: it is replaced, never written through
-      removeFileIfExists mod.usekeyFile
-      clearFileHash mod.usekeyFile
-      if let .ok contents := key? then
-        if let .ok key@(.obj _) := Json.parse contents then
-          IO.FS.writeFile mod.usekeyFile (key.setObjVal! "kept" true).compress
-      let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
-      return {arts with keptFrom? := descrs.keptFrom? <|> some data.depHash}
+    (descrs : ModuleOutputDescrs) (cacheWith? : Option Bool)
+  : JobM (Option ModuleOutputArtifacts) := do
+    writeFileHash mod.oleanFile descrs.olean.hash
+    writeFileHash mod.ileanFile descrs.ilean.hash
+    if let some c := descrs.c? then writeFileHash mod.cFile c.hash
+    if let some bc := descrs.bc? then writeFileHash mod.bcFile bc.hash
+    removeFileIfExists mod.ltarFile
+    clearFileHash mod.ltarFile
+    let key? ← (IO.FS.readFile mod.usekeyFile).toBaseIO
+    -- under an artifact cache the key is a read-only link: it is replaced, never written through
+    removeFileIfExists mod.usekeyFile
+    clearFileHash mod.usekeyFile
+    if let .ok contents := key? then
+      if let .ok key@(.obj _) := Json.parse contents then
+        IO.FS.writeFile mod.usekeyFile (key.setObjVal! "kept" true).compress
+    match (← mod.keepOutputs? presetup.isModule presetup.postponeCompile (some descrs) cacheWith?) with
+    | none =>
+      mod.clearOutputHashes
+      return none
+    | some arts =>
+      some <$> buildAction (← getTrace) mod.traceFile (action := .check)
+          (localHash? := some presetup.localTrace.hash) do
+        data.log.replay
+        createParentDirs mod.setupFile
+        IO.FS.writeFile mod.setupFile (toJson setup).pretty
+        return {arts with keptFrom? := descrs.keptFrom? <|> some data.depHash}
   -- Unpacks the module's own `.ltar` (stamped with `inputHash`) into the build directory and
   -- returns whether it did. The archive carries its own trace, which vouches only for the archive,
   -- so it must still have the hash recorded when it was packed; if it does not, or none is
