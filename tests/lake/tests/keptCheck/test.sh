@@ -76,7 +76,7 @@ seta t1s 2
 SYSROOT=$("$LAKE" -d t1s env printenv LEAN_SYSROOT)
 test_exp -n "$SYSROOT"
 export STUB_LOG="$PWD/t1s.log"
-env -u LEAN_SYSROOT PATH=/usr/bin:/bin LAKE_KEPT_CHECKER="$STUB" "$LAKE" -d t1s build P > t1s.out 2>&1
+env -u LEAN_SYSROOT PATH=/usr/bin:/bin LAKE_KEPT_CHECKER="$STUB" "$(command -v "$LAKE")" -d t1s build P > t1s.out 2>&1
 test_cmd grep -q 'Checked P.B' t1s.out
 test_exp "$(sort -u t1s.log.sysroot)" = "$SYSROOT"
 
@@ -197,6 +197,196 @@ test_cmd cat t15.out
 test_exp "$(cat t15.rc)" = 0
 test_out 'Built P.B' -d t15 build P
 
+# Every input of a module except its imports is part of its local inputs (`localHash`): when one
+# changes, no module is a candidate. The library's `needs` (an input file `P.B` reads with
+# `include_str`): the module compiles (here red, as a fresh build is) and the checker is not asked.
+# (`extraDepTargets` enter the same trace, but this Lake does not make a module stale when one of
+# them changes, so they give no candidate to test.)
+mkn() { # mkn DIR LIB_CONFIG -- package `p` with input file `foo` (data/foo.txt = one), `P.B` reading it
+  mkdir -p "$1/P" "$1/data"
+  printf 'name = "p"\n\n[[input_file]]\nname = "foo"\npath = "data/foo.txt"\ntext = true\n\n[[lean_lib]]\nname = "P"\n%s\n' \
+    "$2" > "$1/lakefile.toml"
+  printf 'def A.w : Nat := 0\n' > "$1/P/A.lean"
+  printf 'import P.A\ndef B.s : String := include_str "../data/foo.txt"\ntheorem B.ok : B.s = "one" := rfl\n' > "$1/P/B.lean"
+  printf 'import P.B\n' > "$1/P.lean"
+  printf 'one' > "$1/data/foo.txt"
+}
+mkn t18 'needs = ["foo"]'
+test_run -d t18 build P
+printf 'two' > t18/data/foo.txt
+export STUB_LOG="$PWD/t18.log"
+LAKE_KEPT_CHECKER="$STUB" test_status_out 1 'Building P.B' -d t18 build P
+test_exp ! -e t18.log
+# ... the module's `dynlibs` and `plugins` (the shared library of library `Q`, which changes; it is
+# built first, so that the modules only load it)
+for kind in dynlibs plugins; do
+  mkp "t19$kind" "$kind = [\"Q:shared\"]"$'\n\n[[lean_lib]]\nname = "Q"\n'
+  printf 'def Q.q : Nat := 1\n' > "t19$kind/Q.lean"
+  test_run -d "t19$kind" build Q:shared
+  test_run -d "t19$kind" build P
+  rm -f "t19$kind/Q.lean"; printf 'def Q.q : Nat := 2\n' > "t19$kind/Q.lean"
+  test_run -d "t19$kind" build Q:shared
+  export STUB_LOG="$PWD/t19$kind.log"
+  LAKE_KEPT_CHECKER="$STUB" test_out 'Built P.B' -d "t19$kind" build P
+  test_exp ! -e "t19$kind.log"
+done
+# ... the module's `moreLeanArgs`
+mkp t20 $'moreLeanArgs = ["-DmaxRecDepth=700"]\n'
+test_run -d t20 build P
+seta t20 2
+sed_i 's/-DmaxRecDepth=700/-DmaxRecDepth=701/' t20/lakefile.toml
+export STUB_LOG="$PWD/t20.log"
+LAKE_KEPT_CHECKER="$STUB" test_out 'Built P.B' -d t20 build P
+test_exp ! -e t20.log
+# ... the package
+mkp t21
+test_run -d t21 build P
+seta t21 2
+sed_i 's/^name = "p"$/name = "q"/' t21/lakefile.toml
+export STUB_LOG="$PWD/t21.log"
+LAKE_KEPT_CHECKER="$STUB" test_out 'Built P.B' -d t21 build P
+test_exp ! -e t21.log
+# ... and the toolchain (as Lake identifies it: `LEAN_GITHASH`). The platform is the last part; it
+# cannot change on one machine.
+mkp t22
+test_run -d t22 build P
+seta t22 2
+export STUB_LOG="$PWD/t22.log"
+LEAN_GITHASH=0000000000000000000000000000000000000000 LAKE_KEPT_CHECKER="$STUB" test_out 'Built P.B' -d t22 build P
+test_exp ! -e t22.log
+
+# A `module` file is never a candidate
+mkp t23
+printf 'module\npublic def A.w : Nat := 0\n' > t23/P/A.lean
+printf 'module\npublic import P.A\npublic theorem B.ok : A.w = A.w := rfl\n' > t23/P/B.lean
+printf 'module\npublic import P.B\n' > t23/P.lean
+test_run -d t23 build P
+# (a new public declaration of `P.A`: a `module`'s importers see only its interface)
+rm -f t23/P/A.lean
+printf 'module\npublic def A.w : Nat := 0\npublic def A.x : Nat := 2\n' > t23/P/A.lean
+export STUB_LOG="$PWD/t23.log"
+LAKE_KEPT_CHECKER="$STUB" test_out 'Built P.B' -d t23 build P
+test_exp ! -e t23.log
+
+# Lake hashes every output it would keep: an `.ilean` or `.c` changed after its build, or an output
+# that is missing, makes the module no candidate
+for broken in 'printf x >> t24/$OUT/B.ilean' 'printf x >> t24/.lake/build/ir/P/B.c' 'rm t24/$OUT/B.ilean'; do
+  rm -rf t24 t24.log; mkp t24
+  test_run -d t24 build P
+  seta t24 2
+  eval "$broken"
+  export STUB_LOG="$PWD/t24.log"
+  LAKE_KEPT_CHECKER="$STUB" test_out 'Built P.B' -d t24 build P
+  test_cmd_fails grep -qx P.B t24.log
+done
+
+# An accepted module replays its saved log (here a `sorry` warning), on the accept and after it
+mkp t25
+printf 'import P.A\ntheorem B.ok : A.w = 0 := rfl\ndef B.u : Nat := A.w\ntheorem B.s : True := sorry\n' > t25/P/B.lean
+test_run -d t25 build P
+seta t25 2
+export STUB_LOG="$PWD/t25.log"
+LAKE_KEPT_CHECKER="$STUB" test_out 'Checked P.B' -d t25 build P
+match_text 'declaration uses `sorry`' produced.out
+test_out 'declaration uses `sorry`' -d t25 build P
+
+# An accept removes the module's `.ltar` (packed for the old trace) and rewrites its `.setup.json`
+mkp t26
+test_run -d t26 build P +P.B:ltar
+test_exp -f t26/.lake/build/ir/P/B.ltar
+test_cmd touch t26.mark
+sleep 1
+seta t26 2
+export STUB_LOG="$PWD/t26.log"
+LAKE_KEPT_CHECKER="$STUB" test_out 'Checked P.B' -d t26 build P
+test_exp ! -e t26/.lake/build/ir/P/B.ltar
+test_exp t26/.lake/build/ir/P/B.setup.json -nt t26.mark
+
+# Without `LAKE_KEPT_CHECKER`, a stale module is compiled as it always was, and nothing is marked kept
+mkp t27
+test_run -d t27 build P
+seta t27 2
+test_out 'Built P.B' -d t27 build P
+no_match_text 'Checked' produced.out
+test_cmd_fails grep -rq '"kf"' "t27/$OUT"
+
+# A checker that answers with malformed lines is killed each time: every candidate is compiled
+mkp t28
+test_run -d t28 build P
+seta t28 2
+export STUB_LOG="$PWD/t28.log"
+LAKE_KEPT_CHECKER="$STUB" STUB_MODE=garbage test_out 'Built P.B' -d t28 build P
+no_match_text 'Checked' produced.out
+match_text 'malformed reply' produced.out
+test_exp "$(spawns t28.log)" -le 4
+
+# A checker that cannot be started rejects every candidate, saying why
+mkp t29
+test_run -d t29 build P
+seta t29 2
+LAKE_KEPT_CHECKER="$PWD/no-such-checker" test_out 'Built P.B' -d t29 build P
+match_text 'could not start the checker' produced.out
+no_match_text 'exited 4 times' produced.out
+
+# Replies to ids that were never asked, and repeated replies, are ignored
+mkp t30
+test_run -d t30 build P
+seta t30 2
+export STUB_LOG="$PWD/t30.log"
+LAKE_KEPT_CHECKER="$STUB" STUB_MODE=bogus-id test_out 'Checked P.B' -d t30 build P
+match_text 'Checked P.C' produced.out
+
+# `LAKE_KEPT_CHECKER_TIMEOUT` must be at least one second
+mkp t31
+LAKE_KEPT_CHECKER="$STUB" LAKE_KEPT_CHECKER_TIMEOUT=0 test_err 'at least 1 second' -d t31 build P
+
+# A checker that stops reading while Lake writes requests larger than a pipe's buffer (here setups of
+# over 64 KiB) is still killed after `LAKE_KEPT_CHECKER_TIMEOUT`: writes never block the watchdog
+mkp t32
+pad=$(head -c 70000 /dev/zero | tr '\0' x)
+sed_i "s/^maxHeartbeats = 300000\$/maxHeartbeats = 300000\nweak.keptCheckPad = \"$pad\"/" t32/lakefile.toml
+test_run -d t32 build P
+seta t32 2
+export STUB_LOG="$PWD/t32.log"
+start=$(date +%s)
+LAKE_KEPT_CHECKER="$STUB" LAKE_KEPT_CHECKER_TIMEOUT=3 STUB_MODE=hang-once \
+  test_cmd_out 'Checked P.C' timeout 100 "$LAKE" -d t32 build P
+test_exp $(( $(date +%s) - start )) -lt 60
+test_cmd test "$(head -1 t32.log.json | wc -c)" -gt 65536
+test_exp "$(spawns t32.log)" = 2
+
+# A killed checker's own children are killed with it (they would hold its pipes open and keep Lake
+# from finishing until they exit)
+mkp t33
+test_run -d t33 build P
+seta t33 2
+export STUB_LOG="$PWD/t33.log"
+start=$(date +%s)
+LAKE_KEPT_CHECKER="$STUB" LAKE_KEPT_CHECKER_TIMEOUT=3 STUB_MODE=fork-hang-once test_out 'Checked P.C' -d t33 build P
+test_exp $(( $(date +%s) - start )) -lt 40
+
+# `LAKE_KEPT_EXCLUDE` applies to every build mode: with `--old`, an excluded kept module is
+# compiled (its kept outputs are removed with its trace) ...
+mkp t34
+test_run -d t34 build P
+seta t34 2
+export STUB_LOG="$PWD/t34.log"
+LAKE_KEPT_CHECKER="$STUB" test_out 'Checked P.B' -d t34 build P
+printf 'P.B\n' > exclude34
+LAKE_KEPT_EXCLUDE="$PWD/exclude34" test_out 'Built P.B' -d t34 build P --old
+test_cmd_fails grep -q '"kf"' "t34/$OUT/B.trace"
+# ... a `--no-build` build needs a build for it (and changes no file) ...
+mkp t35
+test_run -d t35 build P
+seta t35 2
+export STUB_LOG="$PWD/t35.log"
+LAKE_KEPT_CHECKER="$STUB" test_out 'Checked P.B' -d t35 build P
+LAKE_KEPT_EXCLUDE="$PWD/exclude34" test_status 3 -d t35 build P --no-build
+test_cmd grep -q '"kf"' "t35/$OUT/B.trace"
+# ... and so does `lake shake`'s check that the oleans are current
+sed_i 's/^name = "p"$/name = "p"\ndefaultTargets = ["P"]/' t35/lakefile.toml
+LAKE_KEPT_EXCLUDE="$PWD/exclude34" test_err 'out of date oleans' -d t35 shake
+
 # With the artifact cache
 export LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true
 
@@ -254,6 +444,12 @@ seta t12b 2
 test_out 'Unpacked P.B' -d t12b build P.B
 test_cmd grep -q '"kf"' "t12b/$OUT/B.trace"
 test_cmd grep -q '"kf"' "$(mapping t12b B)"
+# An excluded module is not restored from a kept archive either: it is compiled
+test_cmd rm -f "$LAKE_CACHE_DIR/artifacts/$(cat "t12/$OUT/B.olean.hash").olean"
+mkp t12c
+seta t12c 2
+LAKE_KEPT_EXCLUDE="$PWD/exclude7" test_out 'Built P.B' -d t12c build P.B
+test_cmd_fails grep -q '"kf"' "t12c/$OUT/B.trace"
 
 # A module restored from the cache is a candidate the next time its imports change
 export LAKE_CACHE_DIR="$PWD/cache17"
@@ -264,3 +460,70 @@ test_not_out 'Built P.B' -d t17 build P
 seta t17 2
 export STUB_LOG="$PWD/t17.log"
 LAKE_KEPT_CHECKER="$STUB" test_out 'Checked P.B' -d t17 build P
+
+# The supersede rule, in every form Lake writes or installs a mapping: accepted outputs never
+# replace a mapping, and compiled outputs always replace accepted ones. In each case `y` accepts
+# `P.B` and `x` compiles the same input of `P.B` without a checker.
+# A compile that lands while the check is outstanding keeps its mapping, and `y` then takes it
+export LAKE_CACHE_DIR="$PWD/cache36"
+mkp t36y
+test_run -d t36y build P
+seta t36y 2
+mkp t36x
+seta t36x 2
+export STUB_LOG="$PWD/t36.log" STUB_GO="$PWD/t36.go"
+( if LAKE_KEPT_CHECKER="$STUB" STUB_MODE=wait-go "$LAKE" -d t36y build P > t36y.out 2>&1
+  then echo 0; else echo $?; fi > t36y.rc ) &
+for _ in $(seq 300); do grep -qx P.B t36.log 2>/dev/null && break; sleep 0.1; done
+test_cmd grep -qx P.B t36.log
+test_out 'Built P.B' -d t36x build P
+test_cmd touch "$STUB_GO"
+wait
+test_cmd cat t36y.out
+test_exp "$(cat t36y.rc)" = 0
+test_cmd grep -q 'Checked P.B' t36y.out
+test_exp "$(dephash "t36x/$OUT/B.trace")" = "$(dephash "t36y/$OUT/B.trace")"
+test_cmd_fails grep -q '"kf"' "$(mapping t36y B)"
+test_run -d t36y build P
+test_cmd_fails grep -q '"kf"' "t36y/$OUT/B.trace"
+# A tree whose own compiled outputs for the input are current publishes them over accepted ones
+# (`x` compiled them with another cache, whose artifacts this one then gets)
+export LAKE_CACHE_DIR="$PWD/cache37"
+mkp t37y
+test_run -d t37y build P
+seta t37y 2
+export STUB_LOG="$PWD/t37.log"
+LAKE_KEPT_CHECKER="$STUB" test_out 'Checked P.B' -d t37y build P
+test_cmd grep -q '"kf"' "$(mapping t37y B)"
+mkp t37x
+seta t37x 2
+LAKE_CACHE_DIR="$PWD/cache37x" test_out 'Built P.B' -d t37x build P
+test_cmd cp -n "$PWD"/cache37x/artifacts/* "$LAKE_CACHE_DIR/artifacts/"
+test_run -d t37x build P
+test_cmd_fails grep -q '"kf"' "$(mapping t37y B)"
+test_run -d t37y build P
+test_cmd_fails grep -q '"kf"' "t37y/$OUT/B.trace"
+# An archive-only mapping (the `-o` form) installed by `lake cache add`, or by `lake cache get`
+# with the scope it came from: `y` sets its kept outputs aside and unpacks the archive
+for install in add get; do
+  export LAKE_CACHE_DIR="$PWD/cache38$install"
+  mkp "t38$install"
+  test_run -d "t38$install" build P
+  seta "t38$install" 2
+  export STUB_LOG="$PWD/t38$install.log"
+  LAKE_KEPT_CHECKER="$STUB" test_out 'Checked P.B' -d "t38$install" build P
+  mkp "t38${install}x"
+  seta "t38${install}x" 2
+  LAKE_CACHE_DIR="$PWD/cache38${install}x" test_run -d "t38${install}x" build P -o "$PWD/o38$install.jsonl"
+  for a in "t38${install}x"/.lake/build/ir/*.ltar "t38${install}x"/.lake/build/ir/P/*.ltar; do
+    test_cmd cp "$a" "$LAKE_CACHE_DIR/artifacts/$(cat "$a.hash").ltar"
+  done
+  if [ $install = add ]; then
+    test_run -d "t38${install}x" cache add "$PWD/o38$install.jsonl"
+  else
+    test_run -d "t38${install}x" cache get "$PWD/o38$install.jsonl" --scope=p
+  fi
+  test_cmd grep -q '\.ltar"' "$(mapping "t38$install" B)"
+  test_run -d "t38$install" build P
+  test_cmd_fails grep -q '"kf"' "t38$install/$OUT/B.trace"
+done
