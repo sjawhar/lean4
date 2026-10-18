@@ -13,7 +13,8 @@ cd work
 # `.olean`, `.ilean` and `.ir` files the cutoff kept must also be byte for byte those of a clean build of
 # state 1 with the cutoff on, made in the same directory. The one difference the cutoff accepts is a
 # specialization a module created itself where a fresh build would reuse another module's, of the same
-# function at the same arguments, which also reaches a replayed importer that inlined the module's saved body:
+# function at the same arguments, which also reaches an importer, replayed or rebuilt, that inlined the module's
+# saved body:
 # a case that makes one names the C files it allows to differ
 # (`CASE_c_exempt`; those modules' other outputs are exempt too, and `CASE_olean_exempt` adds the modules
 # importing them) and checks them itself (`CASE_c_check`, run in the cutoff tree). A case writes its state-0
@@ -522,6 +523,17 @@ d2_down_c_check() {
   grep -q 'myMap___at___00T_g_spec__0' .lake/build/ir/T/M.c && grep -q 'myMap___at___00T_g_spec__0' .lake/build/ir/Main.c
 }
 
+# The same reaches an importer that is rebuilt while the tolerated `M` is kept: `Main`'s source changes in
+# state 1, and it inlines the kept `M`'s saved body, which calls `M`'s own specialization, where a fresh `Main`
+# calls `Y`'s.
+d2_down_rebuilt_s0() { d2_down_s0; }
+d2_down_rebuilt_s1() {
+  d2_down_s1
+  printf 'import T.M\ndef unused : Nat := 1\ndef main : IO Unit := IO.println (T.g [1, 2, 3])\n' > Main.lean
+}
+d2_down_rebuilt_c_exempt() { echo T/M.c Main.c; }
+d2_down_rebuilt_c_check() { d2_down_c_check; }
+
 # Code inside the compiler from other sources than an imported module's entries: `M` registers a folder
 # itself (`f3_own_folder`) or declares a `@[cpass]` itself (`f3_own_cpass`), or `Y`, imported but unused,
 # installs a folder (`f3_runtime_folder`) or a pass (`f3_runtime_cpass`) by writing the extension state
@@ -652,6 +664,169 @@ EOF
   printf 'import T.B\nnamespace T\ndef y0 : Nat := 0\nend T\n' > T/Y.lean
 }
 premise_ir_s1() { printf 'import T.B\nnamespace T\ndef y0 : Nat := 0\ndef y : Nat := run k 7\nend T\n' > T/Y.lean; }
+
+# `premise_ir`'s `A` also compiles `T.f` once more in a discarded environment, so the compiler's IR for `T.f`
+# exists in the process although the module's IR for it does not come from the compiler. `CheckEval` runs `T.h`
+# in the interpreter, which reads IR; `ir_count_nd` proves `T.h = 52` by `native_decide` although `T.h`'s kernel
+# value is 3, so a kept `M` must not turn the build's failure into a success.
+ir_count_s0() {
+  premise_ir_s0
+  printf 'open Lean in\nrun_meta withoutModifyingEnv (Lean.compileDecls #[``T.f])\n' >> T/A.lean
+  printf 'import T.M\n#eval T.h\n' > CheckEval.lean
+}
+ir_count_s1() { premise_ir_s1; }
+ir_count_nd_s0() {
+  ir_count_s0
+  printf 'import T.M\ntheorem bad : T.h = 52 := by native_decide\n#print axioms bad\n' > CheckBad.lean
+}
+ir_count_nd_s1() { ir_count_s1; }
+
+# LCNF written outside the compiler: `Y`, which `M` uses nothing of, specializes the key of `M`'s own
+# specialization (`y := app k 7`) and then saves another declaration's LCNF under its specialization's name
+# through the public `Decl.saveBase`/`Decl.saveMono`. A fresh `M` reuses `Y`'s entry and inlines that body.
+lo_files() {
+  lakefile_app; mkdir_t
+  printf 'namespace T\n@[noinline] def k (n : Nat) : Nat := n + 1\n' > T/B.lean
+  printf '@[specialize, noinline] def app (f : Nat → Nat) (n : Nat) : Nat := f n + 1\nend T\n' >> T/B.lean
+  printf 'import T.B\nimport T.Y\nnamespace T\ndef h : Nat := app k 1\nend T\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println T.h\n' > Main.lean
+}
+lo_y() { printf 'import Lean\nimport T.B\nnamespace T\ndef y0 : Nat := 0\n%s\nend T\n%s\n' "$1" "$2" > T/Y.lean; }
+lo_override='open Lean Compiler LCNF in
+run_meta do
+  let env ← getEnv
+  let specName := `T.app._at_.T.y.spec_0
+  let some _ := getDeclCore? env baseExt specName | throwError "no base declaration {specName}"
+  let some b := getDeclCore? env baseExt ``T.evil | throwError "no base declaration for evil"
+  Decl.saveBase { b with name := specName }
+  if let some m := getDeclCore? env monoExt ``T.evil then
+    Decl.saveMono { m with name := specName }'
+lcnf_override_s0() { lo_files; lo_y '' ''; }
+lcnf_override_s1() { lo_y $'def y : Nat := app k 7\ndef evil (n : Nat) : Nat := n + 100' "$lo_override"; }
+
+# A type's module computes and persists its representation (trivial-structure info, constructor layout, IR type,
+# mono types) with `Meta` at default transparency, so a `local` reducibility attribute in that module changes it
+# with no exported attribute or kernel term changing. `abi_mix`: `S`'s field `p : Pred` is irrelevant while `Pred`
+# unfolds to a type former, so `S` is a trivial structure around `n` (trivial-structure info, constructor layout);
+# `M` reads `S` in the kept layout while `Main`, rebuilt because `mkS` changes, builds it in the new one.
+# `abi_void`: the same for the impure trivial-structure info, with a field whose type unfolds to `Void`.
+# `abi_enum` guards the IR type of `E`: it is computed through `toLCNFType`, which unfolds at `.all`
+# transparency, so the local attribute leaves it, and `Y`'s code, unchanged. `abi_monotype`: `Y` overwrites the
+# mono type of its own constructor through the public `monoTypeExt.insert`.
+abi_files() {
+  lakefile_app; mkdir_t
+  printf 'def Pred : Type := Nat → Prop\ninstance : Inhabited Pred := ⟨fun _ => True⟩\n' > T/A.lean
+  printf 'def V : Type := Void Unit\ninstance : Inhabited V := ⟨Void.mk ()⟩\n' >> T/A.lean
+  printf 'import T.Y\n@[noinline] def f (s : S) : Nat := s.n + 1\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println (f (mkS 5))\n' > Main.lean
+}
+abi_y() {
+  printf 'import T.A\nsection\n%s\nstructure S where\n  p : %s\n  n : Nat\nend\n' "$1" "$2" > T/Y.lean
+  printf '@[noinline] def mkS (n : Nat) : S := ⟨default, n⟩\n' >> T/Y.lean
+}
+abi_mix_s0() { abi_files; abi_y '' Pred; }
+abi_mix_s1() { abi_y 'attribute [local irreducible] Pred' Pred; }
+abi_void_s0() { abi_files; abi_y '' V; }
+abi_void_s1() { abi_y 'attribute [local irreducible] V' V; }
+abi_enum_y() {
+  printf 'import T.A\nsection\n%s\ninductive E where\n  | a (p : Pred)\n  | b\nend\n' "$1" > T/Y.lean
+  printf '@[noinline] def mkE : Nat → E\n  | 0 => .a default\n  | _ => .b\n' >> T/Y.lean
+}
+abi_enum_s0() {
+  abi_files; abi_enum_y ''
+  printf 'import T.Y\n@[noinline] def f (e : E) : Nat := match e with\n  | .a _ => 1\n  | .b => 2\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println (f (mkE 0) + 10 * f (mkE 1))\n' > Main.lean
+}
+abi_enum_s1() { abi_enum_y 'attribute [local irreducible] Pred'; }
+abi_monotype_s0() {
+  lakefile_app; mkdir_t
+  printf 'import Lean\nnamespace T\nstructure P where\n  a : Nat\n  b : Nat\nend T\n' > T/Y.lean
+  printf 'import T.Y\nnamespace T\n@[noinline] def f (n : Nat) : Nat := (P.mk n 5).b + (P.mk n 5).a\nend T\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println (T.f 2)\n' > Main.lean
+}
+abi_monotype_s1() {
+  cat >> T/Y.lean <<'EOF'
+open Lean Compiler LCNF in
+run_meta do
+  let some _ := monoTypeExt.find? (← getEnv) ``T.P.mk | throwError "no mono type for P.mk"
+  modifyEnv fun env => monoTypeExt.insert env ``T.P.mk
+    (mkArrow (mkConst ``Nat) (mkArrow (mkConst ``Nat) (mkConst ``UInt8))) (allowOverwrite := true)
+EOF
+}
+
+# Writes, through public functions and outside the compiler, to the compiled entries of `Y`'s own
+# specialization of a key `M` also specializes: its dead-branch summary (`wh_summary`), an `@[extern]`
+# (`wh_extern`) or `implemented_by` (`wh_implby`) attribute on it, its impure signature (`wh_sig`). A fresh `M`
+# reuses `Y`'s specialization; the kept one must not. `wh_ctrl` writes nothing: the tolerated difference only.
+wh_b() {
+  cat > T/B.lean <<'EOF'
+namespace T
+@[noinline] def k (n : Nat) : Nat := n + 1
+@[noinline] def k2 (n : Nat) : Bool := n == 99
+@[specialize] def iter (f : Nat → Nat) : Nat → Nat
+  | 0 => 0
+  | n+1 => f (iter f n)
+@[specialize] def anyP (f : Nat → Bool) : List Nat → Bool
+  | [] => false
+  | x :: xs => f x || anyP f xs
+end T
+EOF
+}
+wh_y() { printf 'import Lean\nimport T.B\nnamespace T\ndef y0 : Nat := 0\n%s\nend T\n%s\n' "$1" "$2" > T/Y.lean; }
+wh_files() {
+  lakefile_app; mkdir_t; wh_b; wh_y '' ''
+  cat > T/M.lean <<'EOF'
+import T.B
+import T.Y
+namespace T
+def h : Nat := iter k 3
+def hs : String := match anyP k2 [1,2,3] with | true => "T" | false => "F"
+end T
+EOF
+  printf 'import T.M\ndef main : IO Unit := do\n  IO.println T.h\n  IO.println T.hs\n' > Main.lean
+}
+wh_decls=$'def y : Nat := iter k 7\ndef yb : Bool := anyP k2 [7]\ndef evilI (n : Nat) : Nat := n + 100'
+wh_ctrl_s0() { wh_files; }
+wh_ctrl_s1() { wh_y "$wh_decls" ''; }
+wh_ctrl_c_exempt() { echo T/M.c; }
+wh_ctrl_olean_exempt() { echo Main; }
+wh_summary_s0() { wh_files; }
+wh_summary_s1() {
+  wh_y "$wh_decls" 'open Lean Compiler LCNF UnreachableBranches in
+run_meta do
+  let spec := `T.anyP._at_.T.yb.spec_0
+  let some _ := getDeclCore? (← getEnv) monoExt spec | throwError "no mono declaration {spec}"
+  modifyEnv fun env => addFunctionSummary env spec (.ctor ``Bool.true #[])'
+}
+wh_extern_s0() { wh_files; }
+wh_extern_s1() {
+  wh_y "$wh_decls" 'open Lean Compiler LCNF in
+run_meta do
+  let spec := `T.iter._at_.T.y.spec_0
+  let some _ := getDeclCore? (← getEnv) monoExt spec | throwError "no mono declaration {spec}"
+  match externAttr.setParam (← getEnv) spec { entries := [.standard `all "lean_nat_succ"] } with
+  | .ok env => setEnv env
+  | .error e => throwError e'
+}
+wh_implby_s0() { wh_files; }
+wh_implby_s1() {
+  wh_y "$wh_decls" 'open Lean Compiler LCNF in
+run_meta do
+  let spec := `T.iter._at_.T.y.spec_0
+  let some _ := getDeclCore? (← getEnv) monoExt spec | throwError "no mono declaration {spec}"
+  match setImplementedBy (← getEnv) spec ``T.evilI with
+  | .ok env => setEnv env
+  | .error e => throwError e'
+}
+wh_sig_s0() { wh_files; }
+wh_sig_s1() {
+  wh_y "$wh_decls" 'open Lean Compiler LCNF in
+run_meta do
+  let env ← getEnv
+  let spec := `T.iter._at_.T.y.spec_0
+  let some sig := getSigCore? env impureSigExt spec | throwError "no impure signature {spec}"
+  modifyEnv fun env => impureSigExt.addEntry env { sig with type := ImpureType.uint8 }'
+}
 
 # Binder names of an inlined body become C variable names in the importer's C file.
 binder_inline_s0() {
@@ -1124,6 +1299,33 @@ collide_first_s1() { collide_b; }
 collide_after_s0() { collide_files A B; }
 collide_after_s1() { collide_b; }
 
+# The same with a `_boxed` name, reached through an intermediate module: `C` imports `X`, which imports `B`
+# before `A`; `C` passes `foo` (unboxed parameters) as a closure, so its code names `foo._boxed`, and `B` gains
+# a kernel constant of that name.
+cb_files() {
+  printf 'name = "test"\ndefaultTargets = ["T"]\n[[lean_lib]]\nname = "T"\n' > lakefile.toml
+  mkdir_t
+  printf '@[noinline] def foo (n : UInt64) : UInt64 := n + 1\n' > T/A.lean
+  printf 'def unrelated : Nat := 0\n' > T/B.lean
+  printf 'import T.B\nimport T.A\n' > T/X.lean
+  printf 'import T.X\n@[noinline] def apply (g : UInt64 → UInt64) (x : UInt64) : UInt64 := g x\n' > T/C.lean
+  printf 'def useFoo (x : UInt64) : UInt64 := apply foo x\n' >> T/C.lean
+  printf 'import T.C\n' > T.lean
+}
+collide_boxed_trans_s0() { cb_files; }
+collide_boxed_trans_s1() {
+  printf 'def unrelated : Nat := 0\n@[noinline] def foo._boxed (n : Nat) : Nat := n + 7\n' > T/B.lean
+}
+
+# A control for the comparison of failing builds: `scoped_inst` with a module `N` that fails in state 1, so the
+# build fails while `M` and `W` are kept; the outputs both builds produced must still agree.
+negfail_scoped_s0() {
+  scoped_inst_s0
+  printf 'def nok : Nat := 1\n' > T/N.lean
+  printf 'import T.W\nimport T.N\ndef main : IO Unit := IO.println w\n' > Main.lean
+}
+negfail_scoped_s1() { scoped_inst_s1; printf 'def nok : Nat := "x"\n' > T/N.lean; }
+
 # A module's code must not be able to clear, forge or bypass what the build records about it. Each case runs
 # the attempt (`hard_try`) inside the module that would profit from it; the state it targets is private, so the
 # attempt is rejected, logs `attempt rejected: …` and leaves the module compiling as it would without it
@@ -1218,7 +1420,9 @@ all_cases="spec_transitive spec_link spec_type spec_precomp csimp_transitive csi
   local_inst_own erase_inst_own scoped_inst local_red_own2 local_red_own3 scoped_red_own
   table_order folder_order red_order
   d2_tolerated_lean d2_tolerated_reader f3_own_folder f3_own_cpass f3_runtime_folder f3_runtime_cpass
-  f1_cachespec f1_cachespec_hit premise_ir
+  f1_cachespec f1_cachespec_hit premise_ir ir_count ir_count_nd lcnf_override d2_down_rebuilt
+  collide_boxed_trans negfail_scoped abi_mix abi_void abi_enum abi_monotype
+  wh_ctrl wh_summary wh_extern wh_implby wh_sig
   ir_eval macro_eval init_eval
   inl_small inl_inline inl_instance spec_nested spec_derived spec_local spec_renumber
   implemented_by csimp extern export noncomputable partial_body unsafe_body boxed_version structure_eta
