@@ -3,9 +3,9 @@
 2: ok #[Lean.Compiler.LCNF.baseExt, logExt]
 3: ok #[Lean.Compiler.LCNF.baseExt, scopeExt]
 4: ok #[Lean.Compiler.LCNF.baseExt, scopeExt]
-5: refused #[_private.Lean.Namespace.0.Lean.namespacesExt]: command 5 changed #[Lean.scopeDepthExt] without entries; it must be elaborated again
+5: refused #[_private.Lean.Namespace.0.Lean.namespacesExt]: stateOnly #[Lean.scopeDepthExt, Lean.Elab.Command.scopes] and scoped extensions: true
 6: ok #[Lean.Compiler.LCNF.baseExt, scopeExt]
-7: refused #[]: command 7 changed #[scopeExt, Lean.scopeDepthExt] without entries; it must be elaborated again
+7: refused #[]: stateOnly #[Lean.scopeDepthExt, Lean.Elab.Command.scopes] and scoped extensions: true
 8: ok #[Lean.Compiler.LCNF.baseExt, mapExt]
 9: ok #[_private.Lean.Namespace.0.Lean.namespacesExt, Lean.Compiler.LCNF.baseExt]
 10: ok #[Lean.Compiler.nospecializeAttr, Lean.Compiler.LCNF.baseExt]
@@ -19,4 +19,10 @@
 18: ok #[Lean.Compiler.inlineAttrs]
 19: ok #[Lean.Compiler.LCNF.baseExt, Lean.Compiler.LCNF.passManagerExt]
 20: ok #[asyncExt]
-21: ok #[]
+21: ok #[Lean.Compiler.LCNF.baseExt]
+22: ok #[Lean.Compiler.implementedByAttr]
+23: ok #[_private.Lean.Namespace.0.Lean.namespacesExt, Lean.Compiler.LCNF.baseExt, Lean.Meta.Simp.simprocDeclExt]
+24: ok #[Lean.Compiler.LCNF.baseExt, Lean.Meta.Tactic.Cbv.cbvSimprocDeclExt]
+25: ok #[Lean.Compiler.LCNF.baseExt]
+26: ok #[Lean.Compiler.LCNF.Simp.ConstantFold.folderExt]
+27: ok #[]

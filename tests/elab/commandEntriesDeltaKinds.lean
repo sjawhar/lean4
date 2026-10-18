@@ -3,11 +3,12 @@ import Lean
 every kind of extension state the recorder handles: an entry log whose exporter sorts and deduplicates (the
 duplicate entry of a later command is replayed too), a scoped extension whose exporter drops some entries (the
 dropped entries are replayed too), a declaration map entry inserted before its declaration exists (replayed
-with the inserting command), tag attributes, parametric attributes, enum and reducibility overwrites, hash-map
-states (compiled declarations, structures), namespaces, a pass installer, and an extension written from an
-asynchronous proof. The check compares each extension's private export under the after-environment and, for the
-test's own extensions, the states themselves (log and set, scoped stack, map bindings). Payloads of `namespace`
-and `end` are refused: they change the scope stack, which no entry expresses. -/
+with the inserting command), tag attributes, parametric attributes (`export`, `implemented_by`), enum and
+reducibility overwrites, hash-map states (compiled declarations, structures, `simproc` and `cbv_simproc`
+declarations), namespaces, a pass installer, a constant folder, and an extension written from an asynchronous
+proof. The check compares each extension's private export under the after-environment and, for the test's own
+extensions, the states themselves (log and set, scoped stack, map bindings). Payloads of `namespace` and `end`
+are refused: they change the scope stack, which no entry expresses. -/
 open Lean
 
 def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
@@ -30,11 +31,6 @@ def excludedExtension (n : Name) : Bool :=
 
 abbrev PExt := PersistentEnvExtension EnvExtensionEntry EnvExtensionEntry EnvExtensionState
 
-def modeOf (ext : PExt) : EnvExtension.AsyncMode :=
-  match ext.toEnvExtension.asyncMode with
-  | .async _ => .sync
-  | m => m
-
 unsafe def sameObjects (a b : Array EnvExtensionEntry) : Bool :=
   a.size == b.size && (a.zip b).all fun (x, y) => ptrAddrUnsafe x == ptrAddrUnsafe y
 
@@ -42,7 +38,7 @@ unsafe def sameObjects (a b : Array EnvExtensionEntry) : Bool :=
 built: the log and the set of `logExt`, the scoped stack's log and states of `scopeExt`, the bindings of
 `mapExt`, the log and array of `asyncExt`. `none` for every other extension. -/
 unsafe def fingerprint (dir : System.FilePath) (ext : PExt) (env : Environment) : IO (Option ByteArray) := do
-  let s := ext.getState (asyncMode := modeOf ext) env
+  let s := ext.getState (asyncMode := ext.toEnvExtension.asyncMode.forExport) env
   match ext.name with
   | `logExt =>
     let (log, set) : List Name × NameSet := unsafeCast s
@@ -66,8 +62,9 @@ registered command caches, the local-entry log) taken from `source`. -/
 def withReplayStateOf (source target : Environment) : IO Environment := do
   let mut target := target
   for ext in ← persistentEnvExtensionsRef.get do
-    target := ext.toEnvExtension.setState target (ext.toEnvExtension.getState source (asyncMode := modeOf ext))
-      (asyncMode := modeOf ext)
+    let mode := ext.toEnvExtension.asyncMode.forExport
+    target := ext.toEnvExtension.setState target (ext.toEnvExtension.getState source (asyncMode := mode))
+      (asyncMode := mode)
   for ext in ← commandCacheExtensionsRef.get do
     target := ext.copyState source target
   return localEntriesExt.setState target (localEntriesExt.getState source (asyncMode := .local))
@@ -77,7 +74,9 @@ def withReplayStateOf (source target : Environment) : IO Environment := do
 def watched : List Name := [`logExt, `scopeExt, `mapExt, `asyncExt, `Lean.Compiler.nospecializeAttr,
   `Lean.matchPatternAttr, .num `_private.Lean.Structure 0 ++ `Lean.structureExt, `Lean.Compiler.LCNF.baseExt,
   .num `_private.Lean.Namespace 0 ++ `Lean.namespacesExt, `Lean.exportAttr, `reducibilityCore,
-  `Lean.Compiler.inlineAttrs, `Lean.Compiler.LCNF.passManagerExt]
+  `Lean.Compiler.inlineAttrs, `Lean.Compiler.LCNF.passManagerExt, `Lean.Compiler.implementedByAttr,
+  `Lean.Meta.Simp.simprocDeclExt, `Lean.Meta.Tactic.Cbv.cbvSimprocDeclExt,
+  `Lean.Compiler.LCNF.Simp.ConstantFold.folderExt]
 
 unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   IO.FS.writeFile (dir / "X.lean") "import Lean\nopen Lean\n\
@@ -121,10 +120,17 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
     def g (n : Nat) : Nat := n\n\
     attribute [inline] g\n\
     @[cpass] meta def inst : Lean.Compiler.LCNF.PassInstaller := { phase := .base, install := pure }\n\
-    theorem at1 : True := by\n  run_tac Lean.modifyEnv (asyncExt.addEntry (asyncDecl := `at1) · 11)\n  exact trivial\n"
+    theorem at1 : True := by\n  run_tac Lean.modifyEnv (asyncExt.addEntry (asyncDecl := `at1) · 11)\n  exact trivial\n\
+    def ibImpl (n : Nat) : Nat := n\n\
+    @[implemented_by ibImpl] def ib (n : Nat) : Nat := n\n\
+    open Lean Meta in simproc keepSucc (Nat.succ _) := fun _ => return .continue\n\
+    open Lean Meta Sym.Simp in cbv_simproc keepAdd (Nat.add _ _) := fun _ => return .rfl\n\
+    def myFolder : Lean.Compiler.LCNF.Simp.ConstantFold.Folder := fun _ => return none\n\
+    run_cmd Lean.Elab.Command.liftCoreM <| \
+      Lean.Compiler.LCNF.Simp.ConstantFold.registerFolder ``Nat.pred ``myFolder\n"
   IO.FS.writeFile (dir / "M.lean") src
   enableInitializersExecution
-  let some _ ← Elab.runFrontend src {} (dir / "M.lean").toString `M
+  let some _ ← Elab.runFrontend src {} "M.lean" `M
       (oleanFileName? := some (dir / "M.olean")) |
     throw <| IO.userError "elaboration of M failed"
   let obs := (← ModuleUsage.commandObservationsRef.get).qsort (·.i < ·.i)
@@ -136,16 +142,20 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
     let shown := ce.entries.filterMap fun (n, _) => if watched.contains n then some n else none
     -- as when a kept command is replayed: its constants are present, every extension is in its before-state
     let base ← withReplayStateOf o.before.env o.after.env
-    let replayed? : Except String Environment ← try
-        pure (.ok (← replayCommandEntries base ce (scopeDepth o.before.env) {}))
-      catch e => pure (.error (toString e))
+    let replayed? : Option Environment ← try
+        pure (some (← replayCommandEntries base ce (scopeDepth o.before.env) {}))
+      catch _ => pure none
     match replayed? with
-    | .error e => IO.println s!"{o.i}: refused {shown}: {e}"
-    | .ok replayed =>
+    | none =>
+      let scopedExts := (← scopedEnvExtensionsRef.get).map (·.ext.name)
+      IO.println s!"{o.i}: refused {shown}: stateOnly {ce.stateOnly.filter (!scopedExts.contains ·)} and \
+        scoped extensions: {ce.stateOnly.any scopedExts.contains}"
+    | some replayed =>
       let mut mismatches := #[]
       for ext in pExts do
-        let want := (ext.exportEntriesFn o.after.env (ext.getState (asyncMode := modeOf ext) o.after.env)).private
-        let got := (ext.exportEntriesFn o.after.env (ext.getState (asyncMode := modeOf ext) replayed)).private
+        let mode := ext.toEnvExtension.asyncMode.forExport
+        let want := (ext.exportEntriesFn o.after.env (ext.getState (asyncMode := mode) o.after.env)).private
+        let got := (ext.exportEntriesFn o.after.env (ext.getState (asyncMode := mode) replayed)).private
         let exportSame ← if sameObjects want got then pure true else
           pure ((← compactBytes dir want) == (← compactBytes dir got))
         let stateSame := (← fingerprint dir ext o.after.env) == (← fingerprint dir ext replayed)

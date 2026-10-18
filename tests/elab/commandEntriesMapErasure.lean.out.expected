@@ -1,0 +1,10 @@
+noskip (some true), reason (some (state-only change to mapExt in declaration command 1))
+0: stateOnly #[], entries #[mapExt]
+1: stateOnly #[mapExt], entries #[]
+2: stateOnly #[], entries #[tagAttr]
+3: stateOnly #[tagAttr], entries #[]
+4: stateOnly #[], entries #[_private.Lean.Namespace.0.Lean.namespacesExt, Lean.Meta.Simp.simprocDeclExt]
+5: stateOnly #[Lean.Meta.Simp.simprocDeclExt], entries #[]
+6: stateOnly #[], entries #[_private.Lean.Namespace.0.Lean.namespacesExt]
+7: stateOnly #[_private.Lean.Namespace.0.Lean.namespacesExt], entries #[]
+8: stateOnly #[], entries #[]
