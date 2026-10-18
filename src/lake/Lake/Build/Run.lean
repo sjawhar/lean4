@@ -344,8 +344,8 @@ def monitorJob (ctx : MonitorContext) (job : Job α) : BaseIO (BuildResult α) :
 /--
 The kept-module check settings from the environment: the checker command `LAKE_KEPT_CHECKER`, with
 `LAKE_KEPT_CHECKER_TIMEOUT` (seconds without a reply, while requests are outstanding, before the
-checker is killed; default 900), and `LAKE_KEPT_EXCLUDE`, a file of module names, one per line.
-The checker runs with the workspace toolchain's sysroot as `LEAN_SYSROOT`.
+checker is killed; positive, default 900), and `LAKE_KEPT_EXCLUDE`, a file of module names, one per
+line. The checker runs with the workspace toolchain's sysroot as `LEAN_SYSROOT`.
 -/
 def mkKeptCheck (ws : Workspace) : IO (Option KeptChecker × Lean.NameSet) := do
   let checker? ← do
@@ -355,6 +355,8 @@ def mkKeptCheck (ws : Workspace) : IO (Option KeptChecker × Lean.NameSet) := do
       let some s := (← IO.getEnv "LAKE_KEPT_CHECKER_TIMEOUT") | pure 900
       let some n := s.toNat?
         | throw <| IO.userError s!"LAKE_KEPT_CHECKER_TIMEOUT: expected seconds, got '{s}'"
+      if n == 0 then
+        throw <| IO.userError "LAKE_KEPT_CHECKER_TIMEOUT: must be at least 1 second, got '0'"
       pure n
     some <$> KeptChecker.new cmd ws.lakeEnv.lean.sysroot (timeout * 1000)
   let mut exclude : Lean.NameSet := {}
@@ -498,17 +500,21 @@ def monitorBuild (mctx : MonitorContext) (job : Job (Job α)) : BaseIO (BuildRes
 /--
 Returns whether a build is needed to validate `build`. Does not report on the attempted build.
 
-This is equivalent to checking whether `lake build --no-build` exits with code 0.
+This is equivalent to checking whether `lake build --no-build` exits with code 0: it reads the same
+kept-module settings (`mkKeptCheck`), so a module `LAKE_KEPT_EXCLUDE` lists needs a build when its
+outputs were kept, and invalid settings, which fail that build, make this `false`.
 -/
 public def Workspace.checkNoBuild
   (ws : Workspace) (build : FetchM (Job α))
 : BaseIO Bool := do
+  let .ok kept ← (mkKeptCheck ws).toBaseIO | return false
   let jobs ← mkJobQueue
   let cfg := {noBuild := true}
   let mctx ← mkMonitorContext cfg jobs
-  let bctx ← mkBuildContext ws cfg jobs
+  let bctx ← mkBuildContext ws cfg jobs (kept := kept)
   let job ← startBuild bctx build
   let result ← monitorBuild mctx job
+  if let some checker := bctx.keptChecker? then discard <| checker.close.toBaseIO
   return result.isOk -- `isOk` means no failures, and thus no `--no-build` failures
 
 /-- Run a build function in the Workspace's context and await the result. -/
