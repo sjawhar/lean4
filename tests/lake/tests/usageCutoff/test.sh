@@ -19,7 +19,7 @@ test_cmd_out '[["Test","A"],[[["a"],"' cat .lake/build/lib/lean/Test/B.usage
 # `lean -o` records usage only when asked (`--usage`)
 "$LAKE" env lean Test/A.lean -o Test/Direct.olean
 test_exp ! -e Test/Direct.usage
-# `example` (C) reaches `used` through `usedByChecksRef`, `#print axioms` (D) through its `TermInfo`.
+# `example` (C) reaches `used` through the recorded used names, `#print axioms` (D) through its `TermInfo`.
 test_cmd_out '[["Test","A"],[[["a"],"' cat .lake/build/lib/lean/Test/C.usage
 test_cmd_out '[["Test","A"],[[["ta"],"' cat .lake/build/lib/lean/Test/D.usage
 # Names are component arrays: a macro-scoped name keeps its components instead of an unparsable string.

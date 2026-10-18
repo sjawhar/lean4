@@ -136,6 +136,22 @@ private unsafe def isBuiltinCompilerUnsafe (manager : PassManager)
 @[implemented_by isBuiltinCompilerUnsafe]
 private opaque isBuiltinCompiler (manager : PassManager) (folders : SMap Name Simp.ConstantFold.Folder) : Bool
 
+/-- Per name, how many IR declarations the compiler produced in this process while usage recording is on: the
+entries the IR step of `PassManager.run` added to the environment. Private, so only that step adds to it. -/
+private builtin_initialize compilerIRRef : IO.Ref (NameMap Nat) ← IO.mkRef {}
+
+/-- The IR declarations the compiler produced in this process, counted per name. An IR declaration of a module
+beyond these was registered outside the compiler (`ModuleUsage.irOutsideCompiler`). -/
+def compilerIRCounts : BaseIO (NameMap Nat) :=
+  compilerIRRef.get
+
+/-- Counts the IR entries `env` has beyond `before`, an earlier state of the same environment's IR list. -/
+private def recordCompilerIR (before : List IR.Decl) (env : Environment) : BaseIO Unit := do
+  unless (← usageRecordingEnabled) do return
+  let after := IR.getDecls env
+  let added := after.take (after.length - before.length)
+  compilerIRRef.modify fun m => added.foldl (init := m) fun m d => m.insert d.name ((m.find? d.name).getD 0 + 1)
+
 namespace PassManager
 
 partial def run (declNames : Array Name) (baseOpts : Options) : CompilerM Unit := withAtLeastMaxRecDepth 8192 do
@@ -230,8 +246,10 @@ partial def run (declNames : Array Name) (baseOpts : Options) : CompilerM Unit :
       -- TODO consider doing this in one go afterwards in a separate mapM and running clearPure to save memory
       -- or consider running clear? unclear
       profileitM Exception "compilation (IR)" (← getOptions) do
+        let before := IR.getDecls (← getEnv)
         let irDecls ← IR.toIR decls
-        for d in ← IR.compile irDecls do recordCompilerIR d.name
+        discard <| IR.compile irDecls
+        recordCompilerIR before (← getEnv)
 where
   runPassManagerPart (inPhase outPhase : Purity) (profilerName : String)
       (passes : Array Pass) (decls : Array (Decl inPhase)) (isCheckEnabled : Bool) :

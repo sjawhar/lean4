@@ -233,27 +233,6 @@ where
         return
       catch _ => pure ()
 
-/-- `(name, type, value?)` of each constant `decl` adds as given: those of axioms, definitions, theorems and
-opaques. `none` for inductive and quotient declarations. -/
-private def declConstVals : Declaration → Option (Array (Name × Expr × Option Expr))
-  | .axiomDecl v => some #[(v.name, v.type, none)]
-  | .defnDecl v => some #[(v.name, v.type, some v.value)]
-  | .thmDecl v => some #[(v.name, v.type, some v.value)]
-  | .opaqueDecl v => some #[(v.name, v.type, some v.value)]
-  | .mutualDefnDecl vs => some (vs.toArray.map fun v => (v.name, v.type, some v.value))
-  | _ => none
-
-/-- Adds the constants of `decl` to `usedByChecksRef` and, per constant it adds as given, to `declConstsRef`. -/
-private def recordDeclConsts (decl : Declaration) : IO Unit := do
-  let some vals := declConstVals decl | do
-    let used := decl.foldExprM (m := Id) (fun s e => e.foldConsts s fun c s => s.insert c) ({} : NameSet)
-    usedByChecksRef.modify fun acc => used.foldl (·.insert ·) acc
-  let recs := vals.map fun (n, type, value?) =>
-    let s := type.foldConsts ({} : NameSet) fun c s => s.insert c
-    (n, ({ type, value?, consts := value?.elim s fun v => v.foldConsts s fun c s => s.insert c } : DeclConsts))
-  usedByChecksRef.modify fun acc => recs.foldl (fun acc (_, r) => r.consts.foldl (·.insert ·) acc) acc
-  declConstsRef.modify fun m => recs.foldl (fun m (n, r) => m.insert n r) m
-
 /--
 Adds the given declaration to the environment's private scope, deriving a suitable presentation in
 the public scope if under the module system and if the declaration is not private. If `forceExpose`
@@ -261,7 +240,7 @@ is true, exposes the declaration body, i.e. preserves the full representation in
 independently of `Environment.isExporting` and even for theorems.
 -/
 def addDecl (decl : Declaration) (forceExpose := false) : CoreM Unit := do
-  if (← usageRecordingRef.get) then recordDeclConsts decl
+  recordDeclConsts decl
   addDeclCore decl forceExpose
   discard <| decl.getTopLevelNames.mapM snapshotEnvLinterOptions
 

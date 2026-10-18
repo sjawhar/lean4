@@ -89,9 +89,14 @@ public def copyExtraModUses (src dest : Environment) : Environment := Id.run do
       env := extraModUses.addEntry env entry
   env
 
-/-- Every extra module use recorded in this process, including those of commands whose environment is then
-discarded (`example`, `#check`, `#eval`, `#synth`, `#reduce`), which `getLocalExtraModUses` loses. -/
-public builtin_initialize extraModUsesByChecksRef : IO.Ref (Std.HashSet ExtraModUse) ← IO.mkRef {}
+/-- Every extra module use recorded in this process while usage recording is on, including those of commands
+whose environment is then discarded (`example`, `#check`, `#eval`, `#synth`, `#reduce`), which
+`getLocalExtraModUses` loses. Private: it only grows, through `recordExtraModUseCore`. -/
+builtin_initialize extraModUsesByChecksRef : IO.Ref (Std.HashSet ExtraModUse) ← IO.mkRef {}
+
+/-- The extra module uses `extraModUsesByChecksRef` holds. -/
+public def extraModUsesByChecks : BaseIO (Std.HashSet ExtraModUse) :=
+  extraModUsesByChecksRef.get
 
 def recordExtraModUseCore [MonadLiftT IO m] (mod : Name) (isMeta : Bool) (hint : Name := .anonymous) :
     m Unit := do
@@ -100,7 +105,7 @@ def recordExtraModUseCore [MonadLiftT IO m] (mod : Name) (isMeta : Bool) (hint :
     trace[extraModUses] "recording {if entry.isExported then "public" else "private"} \
       {if isMeta then "meta" else "regular"} extra mod use {mod}\
       {if hint.isAnonymous then m!"" else m!" of {hint}"}"
-    if (← (usageRecordingRef.get : IO Bool)) then
+    if (← (usageRecordingEnabled : IO Bool)) then
       (extraModUsesByChecksRef.modify (·.insert entry) : IO Unit)
     modifyEnv (extraModUses.addEntry · entry)
 

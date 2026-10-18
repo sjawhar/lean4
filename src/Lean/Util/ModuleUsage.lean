@@ -57,7 +57,7 @@ def localHash (c : ConstantInfo) : Digest :=
 
 /-- The constants `c`'s kernel meaning depends on: those in its type and value, its inductive's block and
 constructors, its recursor rules' right-hand sides, and its `implemented_by` target. The constants of its type
-and value are `recorded`'s if it holds an equal type and value under `c`'s name (`declConstsRef`). -/
+and value are `recorded`'s if it holds an equal type and value under `c`'s name (`recordedDeclConsts`). -/
 def refs (env : Environment) (c : ConstantInfo) (recorded : NameMap DeclConsts := {}) : Array Name :=
   let s : NameSet := match c, recorded.find? c.name with
     | .axiomInfo _, some r | .defnInfo _, some r | .thmInfo _, some r | .opaqueInfo _, some r =>
@@ -116,7 +116,7 @@ structure State where
   /-- Per imported module: empty if its `.olean` carries no digests (written without `lean --usage`, or by a
   toolchain without this extension); otherwise a marker entry at index 0, then the module's digests sorted by
   name. The marker's own name is never looked up, so no user constant can collide with it; its digest is
-  `compilerCodeMark` if the module's compiles ran code inside the compiler (`compilerCodeRef`), else zero. -/
+  `compilerCodeMark` if the module's compiles ran code inside the compiler (`compilerCodeSeen`), else zero. -/
   importedModuleEntries : Array (Array (Name × Digest)) := #[]
   /-- The current module's digests, if `setLocalDigests` stored them for the `.olean` write. -/
   localDigests? : Option (Array (Name × Digest)) := none
@@ -154,7 +154,8 @@ def State.ownerOf (s : State) (env : Environment) (x : Name) : Name :=
   | some i => if s.hasEntries i then ModuleUsage.ownerOf (fun c => (s.findAt? i c).isSome) x else x
   | none => x
 
-builtin_initialize ext : PersistentEnvExtension (Name × Digest) (Name × Digest) State ←
+/-- Private, so that a module's code cannot rewrite the digests or compiler-code bits it sees for its imports. -/
+private builtin_initialize ext : PersistentEnvExtension (Name × Digest) (Name × Digest) State ←
   registerPersistentEnvExtension {
     mkInitial := pure {}
     addImportedFn := fun es => pure { importedModuleEntries := es }
@@ -240,7 +241,7 @@ def localDigests (env : Environment) (nodes := ownNodes env (ownConsts env)) : A
   compute env (state env) nodes
 
 /-- Stores `own` (`localDigests env`) and whether the module's compiles ran code inside the compiler
-(`compilerCodeRef`) for the extension to export. Without it, the `.olean` carries no digests. -/
+(`compilerCodeSeen`) for the extension to export. Without it, the `.olean` carries no digests. -/
 def setLocalDigests (env : Environment) (own : Array (Name × Digest)) (compilerCode : Bool) : Environment :=
   ext.modifyState (asyncMode := .mainOnly) env
     ({ · with localDigests? := some own, localCompilerCode := compilerCode })
@@ -391,8 +392,8 @@ def closureDigest (env : Environment) (own : Array (Name × Digest)) (compilerCo
   return e.digest (tableDigest env none digestOf compilerCode) |>.finish
 
 /-- Whether the current module holds an IR declaration the compiler did not produce: more entries under a name
-than `fromCompiler` (`compilerIRRef`) counts. Such a declaration can disagree with the LCNF body that inlining and
-specialization use, so a specialization of a caller need not compute what a call to it does. -/
+than `fromCompiler` (`Compiler.LCNF.compilerIRCounts`) counts. Such a declaration can disagree with the LCNF body
+that inlining and specialization use, so a specialization of a caller need not compute what a call to it does. -/
 def irOutsideCompiler (env : Environment) (fromCompiler : NameMap Nat) : Bool :=
   let counts : NameMap Nat := (IR.getDecls env).foldl (init := {}) fun m d =>
     m.insert d.name ((m.find? d.name).getD 0 + 1)
@@ -410,7 +411,7 @@ def usageVersion : Nat := 7
 
 /-- `own` is `localDigests env nodes`; `used` holds the imported names recorded while elaborating
 (`moduleUsed`'s `extra`); `compilerCode` says whether the module's compiles ran code inside the compiler
-(`compilerCodeRef`). The extra module uses are the environment's and `extraModUsesByChecksRef`'s (those of
+(`compilerCodeSeen`). The extra module uses are the environment's and `extraModUsesByChecks` (those of
 commands whose environment was discarded). If the module's compiles or those of any imported module with
 digests ran code inside the compiler, every imported module with digests is an extra use: a specialization
 reused from another module's cache then need not compute what the module's own one does. `noskip` is set when
@@ -419,7 +420,7 @@ process and `used` may miss constants they used. -/
 def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Digest)) (used : NameSet)
     (compilerCode : Bool) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
   let s := state env
-  let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecksRef.get)
+  let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecks)
   let digested := env.header.moduleNames.zipIdx.filter fun (_, i) => s.hasEntries i
   let allExtra := if compilerCode || digested.any (s.compilerCodeAt ·.2) then
       digested.foldl (fun u (m, _) => u.insert { module := m, isExported := false, isMeta := false }) allExtra

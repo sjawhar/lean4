@@ -5,48 +5,99 @@ Released under Apache 2.0 license as described in the file LICENSE.
 module
 prelude
 public import Lean.Data.NameMap.Basic
-public import Lean.Expr
+public import Lean.Declaration
 public import Init.System.IO
+import Lean.Util.FoldConsts
 public section
 namespace Lean
-/-- Whether this process records `usedByChecksRef` and `extraModUsesByChecksRef`: set by `runFrontend` when it
-will write an `.olean` and its `.usage` (`--usage`), which read them. Off in the language server, which writes
-neither. -/
-builtin_initialize usageRecordingRef : IO.Ref Bool ← IO.mkRef false
+
+/-!
+Process state the usage data reads (`runFrontend`, `ModuleUsage.writeUsage`). The references are private, and the
+public functions only switch recording on, add to what is recorded, or read it, so code that a module runs while
+it is elaborated cannot clear or switch off what its usage data will say.
+-/
+
+/-- Whether this process records usage: switched on by `runFrontend` when it will write an `.olean` and its
+`.usage` (`--usage`), never off. Off in the language server, which writes neither. -/
+private builtin_initialize usageRecordingRef : IO.Ref Bool ← IO.mkRef false
 /-- Constants of every declaration given to `addDecl` in this process, including those elaborated in an
 environment that is then discarded (`example`, `#eval`, `#guard`), and the names `recordUsedName` adds. -/
-builtin_initialize usedByChecksRef : IO.Ref NameSet ← IO.mkRef {}
+private builtin_initialize usedByChecksRef : IO.Ref NameSet ← IO.mkRef {}
+/-- See `recordCompilerCode`. -/
+private builtin_initialize compilerCodeRef : IO.Ref Bool ← IO.mkRef false
+
+/-- Switches usage recording on for the rest of the process. -/
+def enableUsageRecording : BaseIO Unit :=
+  usageRecordingRef.set true
+
+/-- Whether usage recording is on. -/
+def usageRecordingEnabled : BaseIO Bool :=
+  usageRecordingRef.get
+
 /--
-Adds `n` to `usedByChecksRef` when recording is on: names that reach the current module's compiled code or
-elaboration without occurring in any of its terms, namely a specialization reused from another module's cache,
-the replacement of a `@[csimp]` theorem, and every declaration the IR interpreter resolves (called from
+Records `n` as used when recording is on: names that reach the current module's compiled code or elaboration
+without occurring in any of its terms, namely a specialization reused from another module's cache, the
+replacement of a `@[csimp]` theorem, and every declaration the IR interpreter resolves (called from
 `src/library/ir_interpreter.cpp`, possibly on several threads).
 -/
 @[export lean_usage_record_used]
 def recordUsedName (n : Name) : BaseIO Unit := do
   if (← usageRecordingRef.get) then usedByChecksRef.modify (·.insert n)
-/-- Whether, while recording is on, this process did something that can make a specialization computed here, or
-found in its specialization cache, differ from another module's under the same key: a compile ran with passes
-or constant folders beyond the built-in ones (`Lean.Compiler.LCNF.main`), or a specialization-cache entry was
-added outside the specializer (`Lean.Compiler.LCNF.Specialize.cacheSpec`). IR declarations registered outside the
-compiler count too; `runFrontend` finds those by comparing the module's IR with `compilerIRRef`. -/
-builtin_initialize compilerCodeRef : IO.Ref Bool ← IO.mkRef false
-/-- Sets `compilerCodeRef` when recording is on. -/
-def recordCompilerCode : BaseIO Unit := do
-  if (← usageRecordingRef.get) then compilerCodeRef.set true
-/-- Per name, how many IR declarations the compiler produced in this process while recording is on
-(`Lean.Compiler.LCNF.main`, `Lean.IR.ToIR`). An IR declaration of the module beyond these was registered outside
-the compiler, and nothing ties it to the LCNF body that inlining and specialization use instead. -/
-builtin_initialize compilerIRRef : IO.Ref (NameMap Nat) ← IO.mkRef {}
-/-- Counts one compiler-produced IR declaration named `n` when recording is on. -/
-def recordCompilerIR (n : Name) : BaseIO Unit := do
-  if (← usageRecordingRef.get) then compilerIRRef.modify fun m => m.insert n ((m.find? n).getD 0 + 1)
+
+/-- The names recorded as used so far. -/
+def usedNames : BaseIO NameSet :=
+  usedByChecksRef.get
+
+/--
+Records that this process did something that can make a specialization computed here, or found in its
+specialization cache, differ from another module's under the same key: a compile ran with passes or constant
+folders beyond the built-in ones (`Lean.Compiler.LCNF.main`), or a specialization-cache entry was added outside the
+specializer (`Lean.Compiler.LCNF.Specialize.cacheSpec`). IR declarations registered outside the compiler count too;
+`runFrontend` finds those by comparing the module's IR with what the compiler produced. A set bit costs only
+rebuilds, so it is set whether or not recording is on.
+-/
+def recordCompilerCode : BaseIO Unit :=
+  compilerCodeRef.set true
+
+/-- Whether `recordCompilerCode` ran in this process. -/
+def compilerCodeSeen : BaseIO Bool :=
+  compilerCodeRef.get
+
 /-- The constants of a declaration's type and value, with that type and value. -/
 structure DeclConsts where
   type : Expr
   value? : Option Expr
   consts : NameSet
+
 /-- Per name, the `DeclConsts` of the last axiom, definition, theorem or opaque given to `addDecl` under that
 name, so that `ModuleUsage.refs` does not walk a kept constant's type and value again. -/
-builtin_initialize declConstsRef : IO.Ref (NameMap DeclConsts) ← IO.mkRef {}
+private builtin_initialize declConstsRef : IO.Ref (NameMap DeclConsts) ← IO.mkRef {}
+
+/-- `(name, type, value?)` of each constant `decl` adds as given: those of axioms, definitions, theorems and
+opaques. `none` for inductive and quotient declarations. -/
+private def declConstVals : Declaration → Option (Array (Name × Expr × Option Expr))
+  | .axiomDecl v => some #[(v.name, v.type, none)]
+  | .defnDecl v => some #[(v.name, v.type, some v.value)]
+  | .thmDecl v => some #[(v.name, v.type, some v.value)]
+  | .opaqueDecl v => some #[(v.name, v.type, some v.value)]
+  | .mutualDefnDecl vs => some (vs.toArray.map fun v => (v.name, v.type, some v.value))
+  | _ => none
+
+/-- When recording is on, records the constants of `decl` as used and, per constant it adds as given, its
+`DeclConsts`, computed here from `decl` itself. -/
+def recordDeclConsts (decl : Declaration) : BaseIO Unit := do
+  unless (← usageRecordingRef.get) do return
+  let some vals := declConstVals decl | do
+    let used := decl.foldExprM (m := Id) (fun s e => e.foldConsts s fun c s => s.insert c) ({} : NameSet)
+    usedByChecksRef.modify fun acc => used.foldl (·.insert ·) acc
+  let recs := vals.map fun (n, type, value?) =>
+    let s := type.foldConsts ({} : NameSet) fun c s => s.insert c
+    (n, ({ type, value?, consts := value?.elim s fun v => v.foldConsts s fun c s => s.insert c } : DeclConsts))
+  usedByChecksRef.modify fun acc => recs.foldl (fun acc (_, r) => r.consts.foldl (·.insert ·) acc) acc
+  declConstsRef.modify fun m => recs.foldl (fun m (n, r) => m.insert n r) m
+
+/-- The `DeclConsts` recorded so far. -/
+def recordedDeclConsts : BaseIO (NameMap DeclConsts) :=
+  declConstsRef.get
+
 end Lean

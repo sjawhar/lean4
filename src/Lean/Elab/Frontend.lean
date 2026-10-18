@@ -16,6 +16,7 @@ import Lean.Linter.PersistentLintLog
 import Lean.Util.ProfilerServer
 import Lean.Util.ModuleUsage
 import Lean.Util.UsedByChecks
+import Lean.Compiler.LCNF.Main
 
 public section
 
@@ -287,7 +288,7 @@ def runFrontend
     (usageFileName? : Option System.FilePath := none)
     : IO (Option Environment) := do
   let startTime := (← IO.monoNanosNow).toFloat / 1000000000
-  if oleanFileName?.isSome && usageFileName?.isSome then usageRecordingRef.set true
+  if oleanFileName?.isSome && usageFileName?.isSome then enableUsageRecording
   let inputCtx := Parser.mkInputContext input fileName
   -- default `cmdlineSnapshots` to true (not done as default value for API back-compat reasons)
   -- except when full-snapshotting so that enough information for resumption is available
@@ -391,8 +392,9 @@ def runFrontend
 
   let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
   if let some oleanFileName := oleanFileName? then
-    let recorded ← declConstsRef.get
-    let compilerCode := (← compilerCodeRef.get) || ModuleUsage.irOutsideCompiler env (← compilerIRRef.get)
+    let recorded ← recordedDeclConsts
+    let compilerCode :=
+      (← compilerCodeSeen) || ModuleUsage.irOutsideCompiler env (← Compiler.LCNF.compilerIRCounts)
     let usage? := usageFileName?.map fun usageFileName =>
       let nodes := ModuleUsage.ownNodes env (ModuleUsage.ownConsts env recorded)
       (usageFileName, nodes, ModuleUsage.localDigests env nodes)
@@ -402,7 +404,7 @@ def runFrontend
       let env := usage?.elim env fun (_, _, own) => ModuleUsage.setLocalDigests env own compilerCode
       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
     if let some (usageFileName, nodes, own) := usage? then
-      let used := ModuleUsage.usedFromInfoTrees trees (← usedByChecksRef.get)
+      let used := ModuleUsage.usedFromInfoTrees trees (← usedNames)
       ModuleUsage.writeUsage env nodes own used compilerCode (incrLoaded := incrLoadFileName?.isSome)
         usageFileName
 
