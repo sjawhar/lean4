@@ -330,9 +330,13 @@ opaque usedFromInfoTrees (trees : Array Elab.InfoTree) (init : NameSet) : NameSe
 /-! Cross-module compiler tables: entries a module adds for declarations of other modules, which change how
 every importer compiles without changing any digest of those declarations. -/
 
-/-- Whether `n` is defined in module `i` (`none`: the current module). -/
+/-- Whether module `i` (`none`: the current module) defines `n`. For the current module, `n` must be one of its
+constants: a name no import defines but the module does not know either (a sibling module's declaration, say)
+is not its own, so an entry for it stays in `tableDigest`. -/
 private def definedIn (env : Environment) (i? : Option ModuleIdx) (n : Name) : Bool :=
-  env.getModuleIdxFor? n == i?
+  match i? with
+  | some _ => env.getModuleIdxFor? n == i?
+  | none => env.getModuleIdxFor? n == none && (env.setExporting false).contains n (skipRealize := false)
 
 /-- Module `i?`'s entries of an extension: `imported i` for an imported module, `loc` (the current module's,
 newest first) reversed for `none`. -/
@@ -363,12 +367,29 @@ private def compilerShapedConsts (env : Environment) (i? : Option ModuleIdx) : A
   | none => (env.checked.get.constants.foldStage2 (fun acc n _ => if compilerShapedName n then acc.push n else acc)
       #[]).qsort Name.quickLt
 
+/-- Module `i?`'s claimed compiler-only names (IR declarations without a kernel constant, which importers resolve
+to the module through `getModuleIdxFor?`) that a compile of the module would not generate: names without a
+compiler-generated shape that are public or private under another module's prefix. Such a name can collide with
+a declaration of an importer, whose fresh build then fails; the module's own realized auxiliary constants (match
+splitters) carry its own private prefix and are left out. -/
+private def claimedForeignNames (env : Environment) (i? : Option ModuleIdx) : Array Name :=
+  let (mod, names) := match i? with
+    | some i => (env.header.moduleNames[i.toNat]!, env.header.moduleData[i.toNat]?.elim #[] (·.extraConstNames))
+    | none =>
+      let priv := env.setExporting false
+      (env.mainModule, (IR.getDecls env).toArray.filterMap fun (d : IR.Decl) =>
+        if priv.contains d.name then none else some d.name)
+  let ownPrefix := privatePrefix? (mkPrivateNameCore mod `x)
+  let foreign := names.filter fun n => !compilerShapedName n && privatePrefix? n != ownPrefix
+  (foreign.qsort Name.quickLt).eraseReps
+
 /-- A digest of one module's entries in the cross-module compiler tables: `@[csimp]` replacements, instances
 and classes declared for another module's declaration, reducibility set for another module's declaration,
 unification hints, `@[cpass]` installers and constant folders, each hint, installer and folder with its
 declaration's digest (`digestOf`), matcher info and IR meta marks written for another module's declaration; its
-kernel constants with compiler-generated names (`compilerShapedConsts`); and whether the module's compiles ran
-code inside the compiler (`compilerCode`). `i? = none` is the current module. -/
+kernel constants with compiler-generated names (`compilerShapedConsts`); its claimed compiler-only names that a
+compile would not generate (`claimedForeignNames`); and whether the module's compiles ran code inside the compiler
+(`compilerCode`). `i? = none` is the current module. -/
 def tableDigest (env : Environment) (i? : Option ModuleIdx) (digestOf : Name → Option Digest)
     (compilerCode : Bool) : Digest := Id.run do
   let csimp := pickEntries i? (Compiler.CSimp.ext.ext.getModuleEntries env ·)
@@ -425,7 +446,18 @@ def tableDigest (env : Environment) (i? : Option ModuleIdx) (digestOf : Name →
   let shaped := compilerShapedConsts env i?
   e := e.nat shaped.size
   for n in shaped do e := e.name n
+  let claimed := claimedForeignNames env i?
+  e := e.nat claimed.size
+  for n in claimed do e := e.name n
   return e.finish
+
+/-- The registered names of the environment extensions whose entries for other modules' names `tableDigest`
+reads. The census test checks that every extension it classifies as a cross-module table is listed here. -/
+def digestedCrossTables : List Name := [
+  `Lean.Compiler.CSimp.ext, `Lean.Meta.instanceExtension, `reducibilityExtra, `Lean.classExtension,
+  `Lean.Compiler.LCNF.passManagerExt, `Lean.Compiler.LCNF.Simp.ConstantFold.folderExt,
+  `Lean.Meta.unificationHintExtension, `Lean.Meta.Match.Extension.extension,
+  mkPrivateNameCore `Lean.Compiler.MetaAttr `Lean.declMetaExt]
 
 /-- A digest of the module's import closure: its modules in import order (`env.header.moduleNames`, the order
 in which every compiler table applies their entries, so that the last import wins where entries conflict), and

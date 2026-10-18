@@ -27,6 +27,8 @@ public import Lean.Compiler.LCNF.ToImpureType
 public import Lean.Structure
 public import Lean.AuxRecursor
 public import Lean.Meta.Match.MatcherInfo
+import Lean.ProjFns
+import Lean.OriginalConstKind
 public section
 
 /-!
@@ -347,19 +349,30 @@ def noConfusionEnc (e : Enc) : NoConfusionInfo → Enc
   | .regular arity lhs rhs => e.u8 0 |>.nat arity |>.nat lhs |>.nat rhs
   | .perCtor arity fields => e.u8 1 |>.nat arity |>.nat fields
 
+def constantKindEnc (e : Enc) : ConstantKind → Enc
+  | .defn => e.u8 0 | .thm => e.u8 1 | .axiom => e.u8 2 | .opaque => e.u8 3
+  | .quot => e.u8 4 | .induct => e.u8 5 | .ctor => e.u8 6 | .recursor => e.u8 7
+
+/-- The argument a structurally recursive declaration recurses on (`EqnInfo.recArgPos`); implemented in
+`Lean.Elab.PreDefinition.Structural.Eqns`, which this module cannot import. -/
+@[extern "lean_get_structural_rec_arg_pos_of_env"]
+opaque getStructuralRecArgPosOfEnv? (env : Environment) (declName : Name) : Option Nat
+
 /-- The attributes and elaborator data of `x` that its users' compiled code depends on, as importers read them:
 how they call it (`implemented_by`, `@[extern]`, `@[export]`, `noncomputable`, the init function of a global),
 whether and how they inline, unfold or specialize it (inline kind, `@[never_extract]`, `@[match_pattern]`, which
 whnf reads when unfolding at matchers, reducibility, instance entries, `@[specialize]` arguments), for a type how
 arguments of that type are specialized (class status with out-params, `@[nospecialize]`, `@[weak_specialize]`),
-its meta mark, and the data the elaborator keeps for it and the compiler's paths read: structure info, matcher info,
-`noConfusion` info. Instance and reducibility
-attributes can be local, scoped or erased, so the module's end state can differ from what importers see: those are
-read from what the module exports, the instance entries the module exports for `x` and `x`'s entry in the
-reducibility core extension (local and scoped reducibility live in `reducibilityExtraExt`, whose exported entries
-`tableDigest` covers). The other attributes reject every kind but global, cannot be erased, and are set only in the
-declaration's module; matcher info and IR meta marks written for other modules' declarations are in `tableDigest`.
-(`@[tagged_return]` changes only the declaration's own impure signature and IR, which `entriesEnc` covers.) -/
+its meta mark, and every table the elaborator keeps for it that the compiler's paths read: structure info,
+matcher info, the matcher-like tag, `noConfusion` info, the auxiliary-recursor and sparse-`casesOn` tags (which
+make toLCNF turn a call into `cases`), projection-function info (which makes it inline the body), auxiliary
+parent-projection info, the structural recursion argument and the original constant kind. Every one of these
+has a public writer, so none is a function of the kernel data alone. Instance and reducibility attributes can be
+local, scoped or erased, so the module's end state can differ from what importers see: those are read from what
+the module exports, the instance entries the module exports for `x` and `x`'s entry in the reducibility core
+extension (local and scoped reducibility live in `reducibilityExtraExt`, whose exported entries `tableDigest`
+covers). Entries a module writes for a name it does not define are in `tableDigest`. (`@[tagged_return]` changes
+only the declaration's own impure signature and IR, which `entriesEnc` covers.) -/
 def attrsEnc (env : Environment) (lc : LocalCompiled) (x : Name) (s : CEnc) : CEnc :=
   let insts := lc.insts.getD x #[]
   let red := (reducibilityCoreExt.getState (asyncDecl := x) env).find? x |>.getD .semireducible
@@ -379,7 +392,18 @@ def attrsEnc (env : Environment) (lc : LocalCompiled) (x : Name) (s : CEnc) : CE
     |>.bool (isMarkedMeta env x)
     |>.opt (getStructureInfo? env x) structureInfoEnc
     |>.opt (Meta.Match.Extension.getMatcherInfo? env x) matcherInfoEnc
-    |>.opt (noConfusionExt.find? env x) fun s i => { s with e := noConfusionEnc s.e i }
+    |>.opt (noConfusionExt.find? env x) (fun s i => { s with e := noConfusionEnc s.e i })
+    |>.bool (Meta.isMatcherLikeCore env x)
+    |>.bool (auxRecExt.isTagged env x)
+    |>.bool (isSparseCasesOn env x)
+    |>.opt (env.getProjectionFnInfo? x) (fun s i =>
+      let ⟨ctorName, numParams, idx, fromClass⟩ := i
+      s.decl ctorName |>.nat numParams |>.nat idx |>.bool fromClass)
+    |>.opt (env.getAuxParentProjectionInfo? x) (fun s i =>
+      let ⟨numParams, fromClass⟩ := i
+      s.nat numParams |>.bool fromClass)
+    |>.opt (getStructuralRecArgPosOfEnv? env x) CEnc.nat
+    |>.opt (getOriginalConstKind? env x) (fun s k => { s with e := constantKindEnc s.e k })
 
 def trivialEnc (e : Enc) (i : LCNF.TrivialStructureInfo) : Enc :=
   let ⟨ctorName, numParams, fieldIdx⟩ := i
@@ -449,5 +473,29 @@ def compiledDigest (env : Environment) (lc : LocalCompiled) (x : Name) : Compile
 /-- `CompiledDigest.entries` of a name without compiled entries. -/
 def noEntries (env : Environment) : Digest :=
   (entriesEnc env {} .anonymous { e := {} }).e.finish
+
+/-- The registered names of the environment extensions whose entries for a name `attrsEnc`, `entriesEnc` and
+`CompiledDigest.irMeta` read, and the module's package, which every node digest carries. The census test checks
+that every extension it classifies as own-declaration data is listed here. -/
+def digestedOwnTables : List Name := [
+  `Lean.Compiler.implementedByAttr, `Lean.externAttr, `Lean.noncomputableExt, `Lean.exportAttr,
+  `Lean.regularInitAttr, `Lean.builtinInitAttr, `Lean.Compiler.inlineAttrs, `Lean.neverExtractAttr,
+  `Lean.matchPatternAttr, `reducibilityCore, `Lean.Meta.instanceExtension, `Lean.Compiler.specializeAttr,
+  `Lean.classExtension, `Lean.Compiler.nospecializeAttr, `Lean.Compiler.weakSpecializeAttr,
+  mkPrivateNameCore `Lean.Compiler.MetaAttr `Lean.metaExt,
+  mkPrivateNameCore `Lean.Compiler.MetaAttr `Lean.declMetaExt,
+  mkPrivateNameCore `Lean.Structure `Lean.structureExt, `Lean.Meta.Match.Extension.extension,
+  `Lean.noConfusionExt, `Lean.Meta.matcherLikeExt, `Lean.auxRecExt,
+  mkPrivateNameCore `Lean.AuxRecursor `Lean.sparseCasesOnExt, `Lean.projectionFnInfoExt,
+  `Lean.auxParentProjInfoExt, `Lean.Elab.Structural.eqnInfoExt,
+  mkPrivateNameCore `Lean.OriginalConstKind `Lean.privateConstKindsExt,
+  `Lean.Compiler.LCNF.baseExt, `Lean.Compiler.LCNF.monoExt, `Lean.Compiler.LCNF.impureSigExt, `Lean.IR.declMapExt,
+  `Lean.Compiler.LCNF.specExtension, `Lean.Compiler.LCNF.UnreachableBranches.functionSummariesExt,
+  mkPrivateNameCore `Lean.Compiler.LCNF.MonoTypes `Lean.Compiler.LCNF.trivialStructureInfoExt,
+  mkPrivateNameCore `Lean.Compiler.LCNF.ToImpureType `Lean.Compiler.LCNF.impureTrivialStructureInfoExt,
+  mkPrivateNameCore `Lean.Compiler.LCNF.ToImpureType `Lean.Compiler.LCNF.impureTypeExt,
+  `Lean.Compiler.LCNF.monoTypeExt,
+  mkPrivateNameCore `Lean.Compiler.LCNF.ToImpureType `Lean.Compiler.LCNF.ctorLayoutExt,
+  mkPrivateNameCore `Lean.Compiler.ModPkgExt `Lean.modPkgExt]
 
 end Lean.ModuleUsage
