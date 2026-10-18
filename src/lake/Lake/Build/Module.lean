@@ -1239,8 +1239,9 @@ structure UsageImport where
 def UsageSidecar.toImport (u : UsageSidecar) : UsageImport :=
   { moduleDigest := u.moduleDigest, closure := u.closure, own := u.own }
 
-/-- Reads only the fields an importer checks; a sidecar that fails `UsageSidecar` here is rejected by its own
-module's check (`readOwnUsage`), which runs before any importer reads it. -/
+/-- Reads only the fields an importer checks (`importUsage?`). The fields it skips are not importer inputs; a
+sidecar that `UsageSidecar` would reject fails its own module's check, and the importer still binds the sidecar to
+the `.olean` through the `.usekey`. -/
 instance : FromJson UsageImport where
   fromJson? j := do
     let own ← j.getObjValAs? (Array (SidecarName × ModuleUsage.Digest)) "own"

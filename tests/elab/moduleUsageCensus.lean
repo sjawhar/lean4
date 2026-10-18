@@ -33,8 +33,9 @@ extension may have one. The row says whether the table can change what a special
 under a given key (`body`: covered by the compiler-code bit a module records at each compile, which
 turns off the tolerance of specialization reuse), only which keys exist and what the compiler
 decides to inline or specialize (`keysOrDecisions`), the cache itself (`cache`), or only whether a
-definitional-equality query succeeds (`defeqOutcome`), and whether a later entry overwrites an earlier
-one, so that import order matters (closure digests hash the closure in import order).
+definitional-equality query succeeds (`defeqOutcome`), and whether import order matters (a later entry
+overwrites an earlier one, installers apply in order, or the first matching hint wins; closure digests hash the
+closure in import order).
 
 Every `tableNotes` row and `Lean.IR.declMapExt` also need a row in `writerNotes`: how writes from outside the
 compiler are handled (`bitSetting`: they set the module's compiler-code bit; `keysOrDecisionsOnly`: they cannot
@@ -208,11 +209,12 @@ def classification : List (Name × UsageClass × String) := [
     importers only through that declaration's own impure signature and IR, which R1 covers \
     (the digest does not read the attribute itself)."),
   (`Lean.Meta.Match.Extension.extension, .kernelDerived,
-    "`Match.addMatcherInfo` (src/Lean/Meta/Match/MatcherInfo.lean:138-151) has a single call site, \
+    "`Match.addMatcherInfo` (src/Lean/Meta/Match/MatcherInfo.lean:138-151) has two call sites, \
     src/Lean/Meta/Match/Match.lean:1126, run right after `addDecl` of the very matcher \
-    (src/Lean/Meta/Match/Match.lean:1117) whose `MatcherInfo` it records; only the defining module \
-    can write it, and the recorded discriminant/arity info follows from the match-compiler's own \
-    analysis of the matcher it just emitted."),
+    (src/Lean/Meta/Match/Match.lean:1117) whose `MatcherInfo` it records, and \
+    src/Lean/Meta/Constructions/CasesOnSameCtor.lean:225, for the declaration that function just \
+    built; only the defining module writes it, and the recorded discriminant/arity info follows from \
+    that declaration's own construction."),
   (`Lean.matchPatternAttr, .R1,
     "`TagAttribute` on the tagged declaration itself (src/Lean/Meta/Match/MatchPatternAttr.lean:34-36); \
     read by `canUnfoldAtMatcher` (src/Lean/Meta/GetUnfoldableConst.lean:42) inside `whnfMatcher`, so \
@@ -249,7 +251,7 @@ inductive SpecEffect where
   | body | keysOrDecisions | cache | defeqOutcome
 deriving BEq
 
-/-- `extension name → (effect on reused specializations, a later entry overwrites an earlier one, reason)`. -/
+/-- `extension name → (effect on reused specializations, import order matters, reason)`. -/
 def tableNotes : List (Name × SpecEffect × Bool × String) := [
   (`Lean.Compiler.LCNF.passManagerExt, .body, true,
     "An installer's passes run on every declaration, specializations included, after their keys are \
@@ -312,7 +314,8 @@ def writerNotes : List (Name × Writers × String × String) := [
     through the private `cacheSpecCore` (src/Lean/Compiler/LCNF/Specialize.lean:42-51)."),
   (`Lean.IR.declMapExt, .bitSetting, "premise_ir",
     "IR the compiler did not produce (the public `IR.addDecl`, or a direct `addEntry`) shows as more IR \
-    entries under a name than the compiler counted (`compilerIRRef`, `ModuleUsage.irOutsideCompiler`)."),
+    entries under a name than the compiler's IR step added (`Compiler.LCNF.compilerIRCounts`, counted in a \
+    private reference; `ModuleUsage.irOutsideCompiler`)."),
   (`Lean.Compiler.CSimp.ext, .keysOrDecisionsOnly, "csimp_late",
     "A replacement applies to the compiling module's own terms in toLCNF, before keys are formed."),
   (`Lean.Meta.instanceExtension, .keysOrDecisionsOnly, "local_inst_own",
