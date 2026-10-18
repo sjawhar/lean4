@@ -120,7 +120,8 @@ def getOtherDeclMonoType (declName : Name) : CoreM Expr := do
   if (← getEnv).find? declName matches some (.inductInfo _) | some (.ctorInfo _) then
     throwError "`{declName}` was not compiled; `compileDecls` must run on inductive types first"
   let type ← toMonoType (← getOtherDeclBaseType declName [])
-  -- avoid `addEntry` for local-only caching
+  -- `modifyState` logs no entry. The state is exported for every name the environment contains, but importers look
+  -- a name up only in its defining module's entries, so a type cached here for an imported name stays local.
   modifyEnv (monoTypeExt.modifyState · (monoTypeExt.addEntryFn · (declName, type)))
   return type
 
