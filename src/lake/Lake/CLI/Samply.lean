@@ -10,6 +10,7 @@ public import Init.System.IO
 import Lean.Data.Json
 import Lean.Compiler.NameDemangling
 import Lake.Util.IO
+import Lake.Util.Proc
 import Lake.Util.Url
 import Init.Data.String.Extra
 import Init.Data.String.Search
@@ -30,7 +31,7 @@ open Lean (Json toJson)
 
 /-- Check that a command is available on PATH. -/
 def requireCmd (cmd : String) (installHint : String) : IO Unit := do
-  let result ← IO.Process.output { cmd := "sh", args := #["-c", s!"command -v {cmd}"] }
+  let result ← outputProc { cmd := "sh", args := #["-c", s!"command -v {cmd}"] }
   if result.exitCode != 0 then
     throw <| IO.userError s!"'{cmd}' not found. {installHint}"
 
@@ -162,7 +163,7 @@ public def run (binary : String) (passthrough : Array String)
     let out := outputPath.getD (if raw then "profile-raw.json.gz" else "profile-demangled.json.gz")
     let (samplyArgs, progArgs) := splitOnDash passthrough
     IO.eprintln "Recording profile..."
-    let recorder ← IO.Process.spawn {
+    let recorder ← spawnProc {
       cmd := "samply", env
       args := #["record", "--save-only", "-o", rawProfile] ++ samplyArgs
               ++ #["--", binary] ++ progArgs
@@ -180,7 +181,7 @@ public def run (binary : String) (passthrough : Array String)
     let samplyLog := (tmpDir / "samply.log").toString
     IO.FS.writeFile samplyLog ""
     -- `exec` ensures cleanup kills samply itself, rather than just its shell.
-    let samplyProc ← IO.Process.spawn {
+    let samplyProc ← spawnProc {
       cmd := "sh"
       args := #["-c",
         s!"exec samply load --no-open -P {port} {shellQuote rawProfile} \
@@ -193,10 +194,10 @@ public def run (binary : String) (passthrough : Array String)
       let token ← waitForServer samplyLog samplyProc port
       let serverUrl := s!"http://127.0.0.1:{port}/{token}"
       IO.eprintln "Symbolicating and demangling..."
-      let rawJson ← IO.Process.run { cmd := "gzip", args := #["-dc", rawProfile] }
+      let rawJson ← runProc { cmd := "gzip", args := #["-dc", rawProfile] }
       let profile ← IO.ofExcept <| Json.parse rawJson
       let (symbReq, funcMaps) ← buildSymbolicationRequest profile
-      let symbResp ← IO.Process.run {
+      let symbResp ← runProc {
         cmd := "curl"
         args := #["--fail", "-sS", "--noproxy", "*", s!"{serverUrl}/symbolicate/v5",
                   "-H", "Content-Type: application/json", "--data-binary", "@-"]
@@ -204,7 +205,7 @@ public def run (binary : String) (passthrough : Array String)
       let result ← applySymbols profile (← IO.ofExcept <| Json.parse symbResp) funcMaps
       let tmpJson := tmpDir / "demangled.json"
       IO.FS.writeFile tmpJson result.compress
-      discard <| IO.Process.run { cmd := "gzip", args := #[tmpJson.toString] }
+      discard <| runProc { cmd := "gzip", args := #[tmpJson.toString] }
       -- Samply opens the file afresh for each request, so its existing server can serve the result.
       IO.FS.rename (tmpDir / "demangled.json.gz") rawProfile
       copyFile rawProfile out
