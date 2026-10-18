@@ -1195,6 +1195,46 @@ def SavedTrace.moduleOutputDescrs? (self : SavedTrace) : Option ModuleOutputDesc
   let some outputs := data.outputs? | none
   (ModuleOutputDescrs.fromJson? outputs).toOption
 
+/--
+Whether every output the saved trace describes (`descrs`) is in the build directory with the bytes recorded for
+it, hashed as the cache hashes a module output (`Hash.ofByteArray` of the file's bytes; module outputs are never
+cached as text). The outputs are those `recacheOutputArtifacts?` checks.
+-/
+def Module.outputsMatchDescrs (mod : Module) (isModule postponesCompile : Bool) (descrs : ModuleOutputDescrs) :
+    JobM Bool := do
+  let required : Array (Bool × FilePath × Option ArtifactDescr) := #[
+    (true, mod.oleanFile, some descrs.olean),
+    (isModule, mod.oleanServerFile, descrs.oleanServer?),
+    (isModule, mod.oleanPrivateFile, descrs.oleanPrivate?),
+    (isModule && !postponesCompile, mod.irSigFile, descrs.irSig?),
+    (isModule && !postponesCompile, mod.irFile, descrs.ir?),
+    (true, mod.ileanFile, some descrs.ilean),
+    (!(isModule && postponesCompile), mod.cFile, descrs.c?),
+    (Lean.Internal.hasLLVMBackend (), mod.bcFile, descrs.bc?)]
+  for (c, file, descr?) in required do
+    unless c do continue
+    let some descr := descr? | return false
+    let .ok bytes ← (IO.FS.readBinFile file).toBaseIO | return false
+    unless Hash.ofByteArray bytes == descr.hash do return false
+  return true
+
+/--
+Keeps the module's outputs for a build that does not compile it, if each is still what the saved trace describes
+(`descrs?`): with `cacheWith? = some useLocalFile`, saves them to the cache, checking each while saving
+(`recacheOutputArtifacts?`); otherwise checks their bytes (`outputsMatchDescrs`). Returns `none` if the trace
+records no outputs or any output differs, so that the caller builds. Every path that keeps outputs it then vouches
+for under a new input hash, or caches, goes through here: an up-to-date replay that caches its outputs, and a usage
+skip (`Module.skipOrBuild`).
+-/
+def Module.keepOutputs? (mod : Module) (isModule postponesCompile : Bool) (descrs? : Option ModuleOutputDescrs)
+    (cacheWith? : Option Bool) : JobM (Option ModuleOutputArtifacts) := do
+  let some descrs := descrs? | return none
+  match cacheWith? with
+  | some useLocalFile => mod.recacheOutputArtifacts? isModule useLocalFile postponesCompile descrs
+  | none =>
+    unless (← mod.outputsMatchDescrs isModule postponesCompile descrs) do return none
+    return some (← mod.computeArtifacts isModule postponesCompile)
+
 def Module.packLtar
   (self : Module) (arts : ModuleOutputArtifacts)
 : JobM Artifact := do
@@ -1662,25 +1702,29 @@ def Module.usageCutoffApplies (mod : Module) (presetup : ModulePreSetup) : JobM 
 
 /--
 Skips compiling a module whose trace is stale if usage cutoff applies to it
-(`Module.usageCutoffApplies`) and nothing it used changed meaning (`Module.usageUpToDate`):
-replays its saved log and rewrites its trace with `depTrace`. Otherwise, builds it, reusing the
-module setup the check computed.
+(`Module.usageCutoffApplies`), nothing it used changed meaning (`Module.usageUpToDate`), and its outputs are
+still what the saved trace describes (`Module.keepOutputs?`, which with `cacheWith?` also saves them to the cache):
+replays its saved log and rewrites its trace with `depTrace`, which vouches for those outputs under the new input
+hash. Otherwise, builds it, reusing the module setup the check computed. Returns the outputs and whether they were
+kept and cached.
 -/
 def Module.skipOrBuild (mod : Module) (presetup : ModulePreSetup) (savedTrace : SavedTrace)
-    (depTrace : BuildTrace) : JobM ModuleOutputArtifacts := do
-  let .ok data := savedTrace | mod.buildLean presetup
+    (depTrace : BuildTrace) (cacheWith? : Option Bool := none) : JobM (ModuleOutputArtifacts × Bool) := do
+  let .ok data := savedTrace | return (← mod.buildLean presetup, false)
   unless (← mod.usageCutoffApplies presetup) do
-    return ← mod.buildLean presetup
+    return (← mod.buildLean presetup, false)
   let setup ← mkModuleSetup mod presetup
   unless (← mod.usageUpToDate presetup setup.importArts) do
-    return ← mod.buildLean presetup setup
+    return (← mod.buildLean presetup setup, false)
+  let some arts ← mod.keepOutputs? presetup.isModule presetup.postponeCompile savedTrace.moduleOutputDescrs?
+      cacheWith? | return (← mod.buildLean presetup setup, false)
   mod.checkSourceUnchanged presetup
   updateAction .replay
   data.log.replay
   unless (← getNoBuild) do
     writeBuildTrace mod.traceFile depTrace (data.outputs?.getD .null) data.log
     removeFileIfExists (mod.traceFile.addExtension "nobuild")
-  mod.computeArtifacts presetup.isModule presetup.postponeCompile
+  return (arts, cacheWith?.isSome)
 
 def  adjustMTime (arts : ModuleOutputArtifacts) (traceFile : FilePath) : JobM ModuleOutputArtifacts := do
   match (← getMTime traceFile |>.toBaseIO) with
@@ -1788,16 +1832,19 @@ where
                 discard <| mod.buildLean presetup
             else
               discard <| mod.buildLean presetup
-        else
-          discard <| mod.skipOrBuild presetup savedTrace depTrace
+        let mut skipped? : Option ModuleOutputArtifacts := none
+        if !status.isUpToDate then
+          -- A kept module's outputs are cached here, each checked while saving.
+          let (arts, cached) ← mod.skipOrBuild presetup savedTrace depTrace
+            (cacheWith? := if status.isCacheable then some restore else none)
+          if cached then skipped? := some arts
         if status.isCacheable then
           let arts ← id do
+            if let some arts := skipped? then return arts
             if replayed then
-              -- with no outputs recorded in the trace there is nothing to check them against
-              if let some descrs := savedTrace.moduleOutputDescrs? then
-                if let some arts ← mod.recacheOutputArtifacts?
-                    presetup.isModule restore presetup.postponeCompile descrs then
-                  return arts
+              if let some arts ← mod.keepOutputs? presetup.isModule presetup.postponeCompile
+                  savedTrace.moduleOutputDescrs? (cacheWith? := some restore) then
+                return arts
               discard <| mod.buildLean presetup
             mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile
           let arts := {arts with ltar? := arts.ltar? <|> ltar?}
@@ -1827,9 +1874,9 @@ where
               let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
               return {arts with ltar? := arts.ltar? <|> ltar?}
             else
-              mod.skipOrBuild presetup savedTrace depTrace
+              (·.1) <$> mod.skipOrBuild presetup savedTrace depTrace
         else
-          mod.skipOrBuild presetup savedTrace depTrace
+          (·.1) <$> mod.skipOrBuild presetup savedTrace depTrace
   -- Unpacks the module's own `.ltar` (stamped with `inputHash`) into the build directory and
   -- returns whether it did. The archive carries its own trace, which vouches only for the archive,
   -- so it must still have the hash recorded when it was packed; if it does not, or none is

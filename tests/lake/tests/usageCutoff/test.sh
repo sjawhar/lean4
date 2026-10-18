@@ -457,6 +457,19 @@ printf 'def a := 1\ntheorem ta : a = 1 := sorry\ndef unrelated := 4\n' > Test/A.
 mv -f B.tmp .lake/build/lib/lean/Test/B.olean
 rm .lake/build/lib/lean/Test/B.olean.hash
 test_out "Built Test.B" build Test.B
+# as is the rest of what its trace describes: B.ilean or B.c replaced behind Lake's back builds B again, and
+# no cache entry takes the replaced bytes
+u=4
+for f in lib/lean/Test/B.ilean ir/Test/B.c; do
+  u=$((u + 1))
+  printf 'def a := 1\ntheorem ta : a = 1 := sorry\ndef unrelated := %s\n' $u > Test/A.lean
+  cp .lake/build/$f good.tmp
+  { cat good.tmp; printf '\n/* replaced */\n'; } > B.tmp
+  mv -f B.tmp .lake/build/$f
+  test_out "Built Test.B" build -v Test.B
+  test_cmd cmp good.tmp .lake/build/$f
+  test_cmd_fails grep -rqF -- '/* replaced */' "$LAKE_CACHE_DIR/artifacts"
+done
 # a module-system file in the closure still forces the rebuild (N's proof becomes false)
 printf 'module\npublic def d : Nat := 1\n' > Test/U.lean
 printf 'module\npublic import Test.U\npublic def c : Nat := d\n' > Test/K.lean
