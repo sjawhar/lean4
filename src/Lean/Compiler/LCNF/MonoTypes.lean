@@ -9,7 +9,6 @@ prelude
 public import Lean.Compiler.LCNF.Util
 public import Lean.Compiler.LCNF.BaseTypes
 public import Lean.Compiler.LCNF.Irrelevant
-import Lean.Util.UsedByChecks
 
 public section
 
@@ -121,8 +120,7 @@ def getOtherDeclMonoType (declName : Name) : CoreM Expr := do
   if (← getEnv).find? declName matches some (.inductInfo _) | some (.ctorInfo _) then
     throwError "`{declName}` was not compiled; `compileDecls` must run on inductive types first"
   let type ← toMonoType (← getOtherDeclBaseType declName [])
-  -- cached in the extension's state, which is exported for this module's own declarations
-  logCompiledName declName
+  -- avoid `addEntry` for local-only caching
   modifyEnv (monoTypeExt.modifyState · (monoTypeExt.addEntryFn · (declName, type)))
   return type
 

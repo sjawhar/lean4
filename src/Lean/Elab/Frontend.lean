@@ -16,7 +16,6 @@ import Lean.Linter.PersistentLintLog
 import Lean.Util.ProfilerServer
 import Lean.Util.ModuleUsage
 import Lean.Util.UsedByChecks
-import Lean.Compiler.LCNF.Main
 
 public section
 
@@ -393,20 +392,17 @@ def runFrontend
   let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
   if let some oleanFileName := oleanFileName? then
     let recorded ← recordedDeclConsts
-    let usage? ← usageFileName?.mapM fun usageFileName => do
-      let consts := ModuleUsage.ownConsts env recorded
-      let cds := ModuleUsage.compiledDigests env consts
-      let nodes := ModuleUsage.ownNodes env consts cds
-      let compilerCode := (← compilerCodeSeen) || (← Compiler.LCNF.compiledOutsideCompiler env cds)
-      return (usageFileName, nodes, ModuleUsage.localDigests env nodes, compilerCode)
+    let usage? := usageFileName?.map fun usageFileName =>
+      let nodes := ModuleUsage.ownNodes env (ModuleUsage.ownConsts env recorded)
+      (usageFileName, nodes, ModuleUsage.localDigests env nodes)
     profileitIO ".olean serialization" finalOpts do
       let commandLints := collectCommandLints snaps none #[]
       let env ← Linter.recordLints inputCtx.fileMap env commandLints
-      let env := usage?.elim env fun (_, _, own, compilerCode) => ModuleUsage.setLocalDigests env own compilerCode
+      let env := usage?.elim env fun (_, _, own) => ModuleUsage.setLocalDigests env own
       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
-    if let some (usageFileName, nodes, own, compilerCode) := usage? then
+    if let some (usageFileName, nodes, own) := usage? then
       let used := ModuleUsage.usedFromInfoTrees trees (← usedNames)
-      ModuleUsage.writeUsage env nodes own used compilerCode (incrLoaded := incrLoadFileName?.isSome)
+      ModuleUsage.writeUsage env nodes own used (← specLookups) (incrLoaded := incrLoadFileName?.isSome)
         usageFileName
 
   if let some ileanFileName := ileanFileName? then

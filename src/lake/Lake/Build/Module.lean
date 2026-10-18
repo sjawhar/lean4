@@ -1180,6 +1180,12 @@ structure UsageSidecar where
   own : NameMap ModuleUsage.Digest
   used : Array (Name × Array (Name × ModuleUsage.Digest))
   extra : Array Name
+  /-- The specialization-cache keys the module created, each with its specialization's name
+  (`Lean.ModuleUsage.ownSpecKeys`). -/
+  specKeys : Array (ModuleUsage.Digest × Name)
+  /-- For each key the module looked up in the specialization cache, the digest of its providers in the closure
+  (`Lean.ModuleUsage.specLookups`). -/
+  specLookups : Array (ModuleUsage.Digest × ModuleUsage.Digest)
 
 /-- A module's `.usekey` sidecar: what Lake saw of the module's build when Lean wrote its `.usage`. -/
 structure UsekeySidecar where
@@ -1217,6 +1223,7 @@ instance : FromJson UsageSidecar where
     let own ← j.getObjValAs? (Array (SidecarName × ModuleUsage.Digest)) "own"
     let used ← j.getObjValAs? (Array (SidecarName × Array (SidecarName × ModuleUsage.Digest))) "used"
     let extra ← j.getObjValAs? (Array (SidecarName × Bool)) "extra"
+    let specKeys ← j.getObjValAs? (Array (ModuleUsage.Digest × SidecarName)) "specKeys"
     return {
       noskip := ← j.getObjValAs? Bool "noskip"
       moduleDigest := ← j.getObjValAs? ModuleUsage.Digest "moduleDigest"
@@ -1225,6 +1232,8 @@ instance : FromJson UsageSidecar where
       own := own.foldl (init := {}) fun m (n, d) => m.insert n.name d
       used := used.map fun (m, cs) => (m.name, cs.map fun (c, d) => (c.name, d))
       extra := extra.map (·.1.name)
+      specKeys := specKeys.map fun (d, n) => (d, n.name)
+      specLookups := ← j.getObjValAs? (Array (ModuleUsage.Digest × ModuleUsage.Digest)) "specLookups"
     }
 
 /-- The parts of an imported module's `.usage` that its importers' checks read (`importUsage?`), which
@@ -1233,11 +1242,12 @@ structure UsageImport where
   moduleDigest : ModuleUsage.Digest
   closure : ModuleUsage.Digest
   own : NameMap ModuleUsage.Digest
+  specKeys : Array (ModuleUsage.Digest × Name)
   deriving TypeName
 
 /-- The `UsageImport` view of a module's own `.usage`. -/
 def UsageSidecar.toImport (u : UsageSidecar) : UsageImport :=
-  { moduleDigest := u.moduleDigest, closure := u.closure, own := u.own }
+  { moduleDigest := u.moduleDigest, closure := u.closure, own := u.own, specKeys := u.specKeys }
 
 /-- Reads only the fields an importer checks (`importUsage?`). The fields it skips are not importer inputs; a
 sidecar that `UsageSidecar` would reject fails its own module's check, and the importer still binds the sidecar to
@@ -1245,10 +1255,12 @@ the `.olean` through the `.usekey`. -/
 instance : FromJson UsageImport where
   fromJson? j := do
     let own ← j.getObjValAs? (Array (SidecarName × ModuleUsage.Digest)) "own"
+    let specKeys ← j.getObjValAs? (Array (ModuleUsage.Digest × SidecarName)) "specKeys"
     return {
       moduleDigest := ← j.getObjValAs? ModuleUsage.Digest "moduleDigest"
       closure := ← j.getObjValAs? ModuleUsage.Digest "closure"
       own := own.foldl (init := {}) fun m (n, d) => m.insert n.name d
+      specKeys := specKeys.map fun (d, n) => (d, n.name)
     }
 
 instance : FromJson UsekeySidecar where
@@ -1383,6 +1395,54 @@ def importUsage? (hashes : ContentHashes) (importArts : NameMap ImportArtifacts)
     unless key.olean == (← contentHash hashes olean) do return none
   return some (olean, usage)
 
+/-- The specialization-cache keys a closure module created, as `closureSpecKeys?` caches them for one build. -/
+structure ClosureSpecKeys where
+  keys? : Option (Array (ModuleUsage.Digest × Name))
+  deriving TypeName
+
+/--
+The specialization-cache keys importee `m` created (`UsageImport.specKeys`), from its `.usage` once `importUsage?`
+has bound it to the importee's current `.olean`, or `none` if `importUsage?` accepts no `.usage`. Bound once per
+build and kept in the build's sidecar cache: a check consults only the closure of the module it checks, whose jobs
+all finished before it, and no job rewrites another module's `.olean`; so the binding a first check made holds for
+every later check in the build, which spares each check hashing its whole closure.
+-/
+def closureSpecKeys? (importArts : NameMap ImportArtifacts) (m : Name) :
+    JobM (Option (Array (ModuleUsage.Digest × Name))) := do
+  let some arts := importArts.find? m | return none
+  let some olean := arts.olean? | return none
+  let cacheKey := olean.withExtension "speckeys"
+  let cached ← (← getBuildContext).sidecarCache.atomically do
+    return (← getThe (Std.HashMap FilePath (ModuleUsage.Digest × Dynamic))).get? cacheKey
+  if let some (_, entry) := cached then
+    let some entry := entry.get? ClosureSpecKeys | error s!"{cacheKey}: cached entry has the wrong type"
+    return entry.keys?
+  let keys? := (← importUsage? (← IO.mkRef {}) importArts m).map (·.2.specKeys)
+  (← getBuildContext).sidecarCache.atomically do
+    modifyThe (Std.HashMap FilePath (ModuleUsage.Digest × Dynamic))
+      (·.insert cacheKey (default, Dynamic.mk (ClosureSpecKeys.mk keys?)))
+  return keys?
+
+/--
+Whether every key the module looked up in the specialization cache (`UsageSidecar.specLookups`) has the same
+providers in its closure as when Lean compiled it: the closure's non-module workspace modules that created the
+key, each with the specialization it maps the key to (`closureSpecKeys?`, `Lean.ModuleUsage.specProvidersDigest`).
+An import that starts providing a key the module missed, or stops providing one it hit, changes which
+specialization a fresh compile uses, so the module rebuilds. A module-system module's keys are pinned by
+`modsysHash`, a toolchain module's by the Lean githash.
+-/
+def UsageSidecar.specProvidersUnchanged (usage : UsageSidecar) (importArts : NameMap ImportArtifacts) :
+    JobM Bool := do
+  if usage.specLookups.isEmpty then return true
+  let keys : Std.HashSet ModuleUsage.Digest := usage.specLookups.foldl (·.insert ·.1) {}
+  let mut providers : Std.HashMap ModuleUsage.Digest (Array (Name × Name)) := {}
+  for (m, arts) in importArts do
+    if arts.oleanServer?.isSome then continue
+    let some specKeys ← closureSpecKeys? importArts m | return false
+    for (k, n) in specKeys do
+      if keys.contains k then providers := providers.alter k fun o => some ((o.getD #[]).push (m, n))
+  return usage.specLookups.all fun (k, p) => ModuleUsage.specProvidersDigest (providers.getD k #[]) == p
+
 /--
 A digest of the recorded `closure` digest of each direct workspace import, with its name, or `none`
 if `importUsage?` accepts no `.usage` for one. A module's closure is its direct imports plus their
@@ -1484,8 +1544,9 @@ Whether nothing the module used changed meaning since Lean wrote its `.usage`: i
 its closure (`importArts`, `UsageSidecar.coversClosure`), its `.olean` and local inputs are
 unchanged, no module-system module in its closure changed (`modsysHash`), its closure is unchanged
 (`closureHash`), every constant it used from a workspace module has the same digest in that
-module's current `.usage` (one its key binds to its current `.olean`, `importUsage?`), and every
-workspace `extra` module has the same `.olean` hash and `moduleDigest`. Every `.olean` hash is of
+module's current `.usage` (one its key binds to its current `.olean`, `importUsage?`), every
+workspace `extra` module has the same `.olean` hash and `moduleDigest`, and every specialization-cache key it
+looked up has the same providers (`UsageSidecar.specProvidersUnchanged`). Every `.olean` hash is of
 the file's bytes (`contentHash`), never read from a `.hash` file.
 -/
 def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
@@ -1510,7 +1571,7 @@ def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
     let some (olean, imp) ← importUsage? hashes importArts m | return false
     unless (← contentHash hashes olean) == oleanHash do return false
     unless imp.moduleDigest == digest do return false
-  return true
+  usage.specProvidersUnchanged importArts
 
 /--
 Whether usage cutoff applies to the module: cutoff is enabled, the module is neither a

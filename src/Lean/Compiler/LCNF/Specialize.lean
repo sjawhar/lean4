@@ -39,19 +39,20 @@ builtin_initialize specCacheExt : SimplePersistentEnvExtension CacheEntry Cache 
       (!·.contains ·.key) addEntry
   }
 
-/-- The specializer's own cache write: `declName` specializes the call `key` describes. Not exported. -/
-def cacheSpecCore (key : Expr) (declName : Name) : CoreM Unit :=
+public def cacheSpec (key : Expr) (declName : Name) : CoreM Unit :=
   modifyEnv fun env => specCacheExt.addEntry env { key, declName }
 
-/-- Maps the specialization key `key` to `declName`. Outside the specializer, nothing ties `declName` to the
-call `key` describes, so a module's specialization reused from this entry need not compute what the module's own
-would: the module counts as running code inside the compiler (`recordCompilerCode`). -/
-public def cacheSpec (key : Expr) (declName : Name) : CoreM Unit := do
-  recordCompilerCode
-  cacheSpecCore key declName
-
-public def findSpecCache? (key : Expr) : CoreM (Option Name) :=
+/-- Looks `key` up in the specialization cache. Records the lookup for the module's usage data
+(`recordSpecLookup`): which modules in the closure provide the key decides which code the compile uses. -/
+public def findSpecCache? (key : Expr) : CoreM (Option Name) := do
+  recordSpecLookup key
   return specCacheExt.getState (← getEnv) |>.find? key
+
+/-- The specialization-cache entries module `i?` added (the current module's if `none`), oldest first. -/
+public def specCacheEntries (env : Environment) (i? : Option ModuleIdx) : Array (Expr × Name) :=
+  match i? with
+  | some i => (specCacheExt.getModuleEntries env i).map fun e => (e.key, e.declName)
+  | none => (specCacheExt.getEntries env).toArray.reverse.map fun e => (e.key, e.declName)
 
 structure Context where
   /--
@@ -443,7 +444,7 @@ mutual
               return (param.type matches .forallE ..) && !(← isArrowClass? param.type).isSome
             else
               return false
-      cacheSpecCore key specDecl.name
+      cacheSpec key specDecl.name
       specDecl.saveBase
       let specDecl ← specDecl.etaExpand
       specDecl.saveBase

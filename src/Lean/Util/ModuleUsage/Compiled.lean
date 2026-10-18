@@ -454,8 +454,7 @@ def entriesEnc (env : Environment) (lc : LocalCompiled) (x : Name) (s : CEnc) : 
   (s.opt (LCNF.findCtorLayout? env x) ctorLayoutEnc).flushTys
 
 /-- The compiled interface of a name, digested in two parts, with the declaration names it mentions and whether
-its IR is exported for interpretation (`isDeclMeta`, which the module's end-of-file closure computation may set
-after the name was compiled). -/
+its IR is exported for interpretation (`isDeclMeta`). -/
 structure CompiledDigest where
   /-- `attrsEnc`: how callers compile calls to the name. -/
   attrs : Digest
@@ -469,10 +468,6 @@ def compiledDigest (env : Environment) (lc : LocalCompiled) (x : Name) : Compile
   let a := attrsEnc env lc x { e := {} } |>.flushTys
   let c := entriesEnc env lc x { e := {}, ms := a.ms }
   { attrs := a.e.finish, entries := c.e.finish, irMeta := isDeclMeta env x, mentions := c.ms }
-
-/-- `CompiledDigest.entries` of a name without compiled entries. -/
-def noEntries (env : Environment) : Digest :=
-  (entriesEnc env {} .anonymous { e := {} }).e.finish
 
 /-- The registered names of the environment extensions whose entries for a name `attrsEnc`, `entriesEnc` and
 `CompiledDigest.irMeta` read, and the module's package, which every node digest carries. The census test checks

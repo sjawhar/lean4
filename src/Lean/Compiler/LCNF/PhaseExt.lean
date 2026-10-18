@@ -8,7 +8,6 @@ module
 prelude
 public import Lean.Compiler.LCNF.PassManager
 public import Lean.Compiler.LCNF.PublicDeclsExt
-import Lean.Util.UsedByChecks
 
 public section
 
@@ -178,16 +177,13 @@ def saveImpureDeclCore (env : Environment) (decl : Decl .impure) : Environment :
   let env := impureExt.modifyState env (fun s => s.insert decl.name decl)
   impureSigExt.addEntry env decl.toSignature
 
-def Decl.saveBase (decl : Decl .pure) : CoreM Unit := do
-  logCompiledName decl.name
+def Decl.saveBase (decl : Decl .pure) : CoreM Unit :=
   modifyEnv (saveBaseDeclCore · decl)
 
-def Decl.saveMono (decl : Decl .pure) : CoreM Unit := do
-  logCompiledName decl.name
+def Decl.saveMono (decl : Decl .pure) : CoreM Unit :=
   modifyEnv (saveMonoDeclCore · decl)
 
-def Decl.saveImpure (decl : Decl .impure) : CoreM Unit := do
-  logCompiledName decl.name
+def Decl.saveImpure (decl : Decl .impure) : CoreM Unit :=
   modifyEnv (saveImpureDeclCore · decl)
 
 def Decl.save (decl : Decl pu) : CompilerM Unit := do

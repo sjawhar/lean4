@@ -23,8 +23,8 @@ private builtin_initialize usageRecordingRef : IO.Ref Bool ← IO.mkRef false
 /-- Constants of every declaration given to `addDecl` in this process, including those elaborated in an
 environment that is then discarded (`example`, `#eval`, `#guard`), and the names `recordUsedName` adds. -/
 private builtin_initialize usedByChecksRef : IO.Ref NameSet ← IO.mkRef {}
-/-- See `recordCompilerCode`. -/
-private builtin_initialize compilerCodeRef : IO.Ref Bool ← IO.mkRef false
+/-- The keys looked up in the specialization cache while recording is on (`recordSpecLookup`). -/
+private builtin_initialize specLookupsRef : IO.Ref (Array Expr) ← IO.mkRef #[]
 
 /-- Switches usage recording on for the rest of the process. -/
 def enableUsageRecording : BaseIO Unit :=
@@ -49,39 +49,16 @@ def usedNames : BaseIO NameSet :=
   usedByChecksRef.get
 
 /--
-Records that this process did something that can make a specialization computed here, or found in its
-specialization cache, differ from another module's under the same key: a compile ran with passes or constant
-folders beyond the built-in ones (`Lean.Compiler.LCNF.main`), or a specialization-cache entry was added outside the
-specializer (`Lean.Compiler.LCNF.Specialize.cacheSpec`). IR declarations registered outside the compiler count too;
-`runFrontend` finds those by comparing the module's IR with what the compiler produced. A set bit costs only
-rebuilds, so it is set whether or not recording is on.
+Records a lookup of `key` in the specialization cache when recording is on: whether an imported module provides
+the key, and which one, decides whether the module's compile reuses another module's specialization or makes its
+own, so the module's usage data records the key (`ModuleUsage.writeUsage`, `specLookups`).
 -/
-def recordCompilerCode : BaseIO Unit :=
-  compilerCodeRef.set true
+def recordSpecLookup (key : Expr) : BaseIO Unit := do
+  if (← usageRecordingRef.get) then specLookupsRef.modify (·.push key)
 
-/-- Whether `recordCompilerCode` ran in this process. -/
-def compilerCodeSeen : BaseIO Bool :=
-  compilerCodeRef.get
-
-/-- The names whose compiled entries the compiler wrote while usage recording is on, each with the writing
-thread, in order: the `Decl.save*` functions and the mono-type cache log here. `PassManager.run` reads the part
-its own thread wrote while it ran, to learn which names its run produced; entries written anywhere else are never
-read, so writing to the log vouches for nothing. -/
-private builtin_initialize compiledNameLogRef : IO.Ref (Array (UInt64 × Name)) ← IO.mkRef #[]
-
-/-- Logs that the compiler wrote compiled entries for `n` on this thread, when usage recording is on. -/
-def logCompiledName (n : Name) : BaseIO Unit := do
-  if (← usageRecordingRef.get) then
-    let tid ← IO.getTID
-    compiledNameLogRef.modify (·.push (tid, n))
-
-/-- The current length of the compiled-name log. -/
-def compiledNameLogSize : BaseIO Nat :=
-  return (← compiledNameLogRef.get).size
-
-/-- The names thread `tid` logged from position `start` of the compiled-name log on. -/
-def compiledNamesSince (start : Nat) (tid : UInt64) : BaseIO (Array Name) :=
-  return ((← compiledNameLogRef.get).extract start).filterMap fun (t, n) => if t == tid then some n else none
+/-- The specialization-cache keys looked up so far. -/
+def specLookups : BaseIO (Array Expr) :=
+  specLookupsRef.get
 
 /-- The constants of a declaration's type and value, with that type and value. -/
 structure DeclConsts where
