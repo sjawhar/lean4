@@ -778,7 +778,8 @@ def commandRecords (env : Environment) (own : Array (Name × Digest))
     fun m (i, n) => m.alter i fun ns => some ((ns.getD #[]).push n)
   let extrasByIdx : Std.HashMap Nat (Array ExtraModUse) := extras.toArray.foldl (init := {})
     fun m (i, u) => m.alter i fun us => some ((us.getD #[]).push u)
-  let mut entriesEnc : Enc := {}
+  -- a hash chain over the payloads so far: extending it costs the same at every command
+  let mut entries : Digest := ({} : Enc).finish
   let mut quotSet : NameSet := {}
   let mut quotDigest : NameSetDigest := {}
   let mut out := #[]
@@ -868,7 +869,7 @@ def commandRecords (env : Environment) (own : Array (Name × Digest))
     let sparseCasesOn := sparseCasesOn.qsort fun a b => Name.quickLt a.2 b.2
     let structRes := structureResolutionCacheDelta obs.before.env obs.after.env
       |>.qsort fun a b => Name.quickLt a.1 b.1
-    let ctx := ctxDigest obs.before quotDigest entriesEnc.finish
+    let ctx := ctxDigest obs.before quotDigest entries
     out := out.push {
       i := obs.i, key, text, ctx
       isDecl := !decls.isEmpty
@@ -880,10 +881,10 @@ def commandRecords (env : Environment) (own : Array (Name × Digest))
     if let some payload := payloadByIdx[obs.i]? then
       let path := dir / s!"command-{obs.i}"
       let _ ← unsafe CompactedRegion.save path `commandEntries payload #[] none
-      entriesEnc := entriesEnc.digest (Digest.ofBytes (← IO.FS.readBinFile path))
+      entries := (({} : Enc).digest entries |>.digest (Digest.ofBytes (← IO.FS.readBinFile path))).finish
       -- a change no entry expresses (an erasure) is determined by the command's text and context
       unless payload.stateOnly.isEmpty do
-        entriesEnc := entriesEnc.digest text |>.digest ctx
+        entries := (({} : Enc).digest entries |>.digest text |>.digest ctx).finish
   return out
 
 /-- A digest of the module's import closure: its sorted module names. -/
