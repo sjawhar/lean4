@@ -7,6 +7,7 @@ module
 
 prelude
 public import Lean.ScopedEnvExtension
+import all Lean.Environment  -- for `PersistentEnvExtension.addEntryChecked`
 
 public section
 namespace Lean
@@ -29,8 +30,11 @@ private opaque scopedEntryOfEntry (entry : EnvExtensionEntry) :
 structure CommandEntries where
   idx : Nat
   /-- Per persistent extension, the entries whose replay onto the command's before-state yields its after-state
-  (`PersistentEnvExtension.stateDelta?`), oldest first. -/
+  (`PersistentEnvExtension.stateDelta?`), oldest first, in the view `computeExtEntries` exports. -/
   entries : Array (Name × Array EnvExtensionEntry)
+  /-- For the extensions read in the checked view (`.sync`, `.async _`), the same for their main-branch view, which a
+  write in `.local` mode reaches alone and an asynchronous branch's write does not reach. -/
+  baseEntries : Array (Name × Array EnvExtensionEntry) := #[]
   locals : Array (Nat × Name × EnvExtensionEntry)
   caches : CommandCaches := {}
   /-- Persistent extensions this command changed that have no conversion from their `.olean` entries back to
@@ -61,11 +65,13 @@ private def excludedExtension (n : Name) : Bool :=
 
 /-- Records one command's payload: for every persistent extension whose state changed, its typed state delta
 (`PersistentEnvExtension.stateDelta?`); the scoped local entries it added; and its cache deltas. States are read
-in the mode `computeExtEntries` exports them (`EnvExtension.AsyncMode.forExport`). A change is `stateOnly` when
-the delta says so, when the extension has no delta, when a delta that reads an entry log meets a direct write
-(`PersistentEnvExtensionState.directWrites`), or when a scoped extension's local entries are not the ones the
-payload replays (`ScopedEnvExtension.localEntriesAccountedFor`). Takes time proportional to what the command
-changed, apart from the per-extension state reads. -/
+in the mode `computeExtEntries` exports them (`EnvExtension.AsyncMode.forExport`), and, for an extension read in the
+checked view, also in its main-branch view (`baseEntries`). A change is `stateOnly` when a delta says so or the
+extension has no delta; when the command made a write the delta may not see (`EnvExtension.unaccountedWrites`, in
+each view); when a scoped extension's local entries are not the ones the payload replays
+(`ScopedEnvExtension.localEntriesAccountedFor`); or when a scoped extension got both entries and installed local
+entries, which replay applies entries first and so possibly in another order. Takes time proportional to what the
+command changed, apart from the per-extension state reads. -/
 def recordCommandDelta (before after : Environment) (idx : Nat) : IO Environment := do
   let scopedByName : Std.HashMap Name
       (ScopedEnvExtension EnvExtensionEntry EnvExtensionEntry EnvExtensionState) :=
@@ -75,30 +81,51 @@ def recordCommandDelta (before after : Environment) (idx : Nat) : IO Environment
   let afterLocals := localEntriesExt.getState (asyncMode := .local) after
   let locals := afterLocals.extract beforeLocals afterLocals.size
   let mut entries := #[]
+  let mut baseEntries := #[]
   let mut unreplayable := #[]
   let mut stateOnly := #[]
   for ext in ← persistentEnvExtensionsRef.get do
     if excludedExtension ext.name then continue
     let mode := ext.toEnvExtension.asyncMode.forExport
-    let ps₀ := ext.toEnvExtension.getState before (asyncMode := mode)
-    let ps₁ := ext.toEnvExtension.getState after (asyncMode := mode)
-    if SharedDiff.sameObject ps₀.state ps₁.state then continue
+    let twoViews := mode matches .sync
+    let unaccounted (mode : EnvExtension.AsyncMode) :=
+      ext.toEnvExtension.unaccountedWrites before mode != ext.toEnvExtension.unaccountedWrites after mode
+    let unaccounted := unaccounted mode || (twoViews && unaccounted .local)
+    let state (env : Environment) (mode : EnvExtension.AsyncMode) :=
+      (ext.toEnvExtension.getState env (asyncMode := mode)).state
+    let s₀ := state before mode
+    let s₁ := state after mode
+    let b₀ := if twoViews then state before .local else s₀
+    let b₁ := if twoViews then state after .local else s₁
+    let baseChanged := twoViews && !SharedDiff.sameObject b₀ b₁
+    if SharedDiff.sameObject s₀ s₁ && !baseChanged && !unaccounted then continue
     let scopedExt? := scopedByName[ext.name]?
-    let delta? : Option (StateDelta EnvExtensionEntry) := ext.stateDelta?.map (· ps₀.state ps₁.state)
+    let delta? : Option (StateDelta EnvExtensionEntry) :=
+      if SharedDiff.sameObject s₀ s₁ then some (.entries #[]) else ext.stateDelta?.map (· s₀ s₁)
     let delta : Option (StateDelta EnvExtensionEntry) :=
-      if !ext.stateDeltaSeesDirectWrites && ps₀.directWrites != ps₁.directWrites then some .stateOnly
+      if unaccounted then some .stateOnly
       else match delta?, scopedExt? with
         | some (.entries es), some scopedExt =>
           let installed := locals.foldl (init := 0) fun n (depth, name, _) =>
             if name == ext.name && depth ≤ dStart then n + 1 else n
-          if scopedExt.localEntriesAccountedForIn before after installed then some (.entries es)
+          if installed > 0 && !es.isEmpty then some .stateOnly
+          else if scopedExt.localEntriesAccountedForIn before after installed then some (.entries es)
           else some .stateOnly
         | delta, _ => delta
-    let mut changed := true
-    match delta with
-    | some (.entries es) =>
-      if es.isEmpty then changed := false else entries := entries.push (ext.name, es)
-    | some .stateOnly | none => stateOnly := stateOnly.push ext.name
+    let baseDelta : Option (StateDelta EnvExtensionEntry) :=
+      if baseChanged then ext.stateDelta?.map (· b₀ b₁) else some (.entries #[])
+    let mut changed := false
+    match delta, baseDelta with
+    | some (.entries es), some (.entries bs) =>
+      unless es.isEmpty do
+        entries := entries.push (ext.name, es)
+        changed := true
+      unless bs.isEmpty do
+        baseEntries := baseEntries.push (ext.name, bs)
+        changed := true
+    | _, _ =>
+      stateOnly := stateOnly.push ext.name
+      changed := true
     if changed && !(scopedExt?.isSome || ext.ofOLeanEntry?.isSome) then
       unreplayable := unreplayable.push ext.name
   if dStart != scopeDepth after then
@@ -107,7 +134,7 @@ def recordCommandDelta (before after : Environment) (idx : Nat) : IO Environment
     let delta := ext.delta before after
     if delta.isEmpty then none else some (ext.name, delta)
   return commandEntriesExt.addEntry after
-    { idx, entries, locals, caches := { deltas := caches }, unreplayable, stateOnly }
+    { idx, entries, baseEntries, locals, caches := { deltas := caches }, unreplayable, stateOnly }
 
 /-- Replaces the current module's command payload with `entries` before writing its `.olean`. -/
 def setCommandEntries (env : Environment) (entries : Array CommandEntries) : Environment :=
@@ -127,7 +154,8 @@ def commandEntriesNoskipReason? (entries : Array CommandEntries) (isDecl : Nat �
 private def isIR (n : Name) : Bool := n == `Lean.IR.declMapExt
 private def isLCNF (n : Name) : Bool := (`Lean.Compiler.LCNF).isPrefixOf n
 
-/-- Replays a command payload into `env`. Entries reached only inside a deeper transient scope remain in the
+/-- Replays a command payload into `env`. An extension read in the checked view gets `entries` in that view and
+`baseEntries` in its main-branch view. Entries reached only inside a deeper transient scope remain in the
 local-entry log but are not installed in the current scoped state. Throws on a payload with `stateOnly`
 changes. -/
 def replayCommandEntries (env : Environment) (ce : CommandEntries) (dStart : Nat) (opts : Options) :
@@ -141,10 +169,10 @@ def replayCommandEntries (env : Environment) (ce : CommandEntries) (dStart : Nat
   let scopedByName : Std.HashMap Name
       (ScopedEnvExtension EnvExtensionEntry EnvExtensionEntry EnvExtensionState) :=
     scopedExts.foldl (fun m ext => m.insert ext.ext.name ext) {}
-  let ordered := ce.entries.filter (isIR ·.1) ++ ce.entries.filter (isLCNF ·.1) ++
-    ce.entries.filter (fun e => !isIR e.1 && !isLCNF e.1)
+  let order (es : Array (Name × Array EnvExtensionEntry)) :=
+    es.filter (isIR ·.1) ++ es.filter (isLCNF ·.1) ++ es.filter (fun e => !isIR e.1 && !isLCNF e.1)
   let mut env := env
-  for (name, entries) in ordered do
+  for (name, entries) in order ce.entries do
     if let some scopedExt := scopedByName[name]? then
       for entry in entries do
         let entry := scopedEntryOfEntry entry
@@ -164,7 +192,15 @@ def replayCommandEntries (env : Environment) (ce : CommandEntries) (dStart : Nat
       let mode := ext.toEnvExtension.asyncMode.forExport
       for entry in entries do
         let b ← ofOLeanEntry (ext.getState env (asyncMode := mode)) entry |>.run { env, opts }
-        env := ext.addEntry env b (asyncMode := mode)
+        env := if mode matches .sync then ext.addEntryChecked env b else ext.addEntry env b (asyncMode := mode)
+  for (name, entries) in order ce.baseEntries do
+    let some i := byName[name]? | throw <| IO.userError s!"unknown environment extension {name}"
+    let ext := pExts[i]!
+    let some ofOLeanEntry := ext.ofOLeanEntry? |
+      throw <| IO.userError s!"unreplayable extension {name}"
+    for entry in entries do
+      let b ← ofOLeanEntry (ext.getState env (asyncMode := .local)) entry |>.run { env, opts }
+      env := ext.addEntry env b (asyncMode := .local)
   for (depth, name, entry) in ce.locals do
     if depth ≤ dStart then
       let some ext := scopedByName[name]? |

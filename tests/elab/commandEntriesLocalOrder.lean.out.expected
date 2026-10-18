@@ -1,0 +1,8 @@
+macro rules: command 3 decl, Lean.Elab.macroAttribute in stateOnly true, entries false, locals true, noskip (some true)
+  replay refused
+instances: command 3 decl, Lean.Meta.instanceExtension in stateOnly true, entries false, locals true, noskip (some true)
+  replay refused
+simp lemmas: command 4 decl, Lean.Meta.simpExtension in stateOnly true, entries false, locals true, noskip (some true)
+  replay refused
+notations: command 2 decl, Lean.Parser.parserExtension in stateOnly true, entries false, locals true, noskip (some true)
+  replay refused

@@ -84,7 +84,7 @@ Given a name, find all the stored correct, existing identifiers that mention tha
 -/
 public def getSuggestions [Monad m] [MonadEnv m] (incorrectName : Name) : m NameSet := do
   let env ← getEnv
-  let { state, importedEntries, .. } := identifierSuggestionsImpl.2.toEnvExtension.getState env
+  let { state, importedEntries } := identifierSuggestionsImpl.2.toEnvExtension.getState env
   let localEntries := state.find? incorrectName |>.getD {}
   return importedEntries.foldl (init := localEntries) fun results moduleEntry =>
     match moduleEntry.binSearch (incorrectName, default) (fun a b => Name.quickLt a.1 b.1) with
@@ -97,7 +97,7 @@ for that identifier.
 -/
 public def getStoredSuggestions [Monad m] [MonadEnv m] (trueName : Name) : m NameSet := do
   let env ← getEnv
-  let { state, importedEntries, .. } := identifierSuggestionsImpl.1.toEnvExtension.getState env
+  let { state, importedEntries } := identifierSuggestionsImpl.1.toEnvExtension.getState env
   let localEntries := state.find? trueName |>.getD {}
   return importedEntries.foldl (init := localEntries) fun results moduleEntry =>
     match moduleEntry.binSearch (trueName, default) (fun a b => Name.quickLt a.1 b.1) with

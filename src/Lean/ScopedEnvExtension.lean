@@ -7,6 +7,7 @@ module
 
 prelude
 public import Lean.Attributes
+import all Lean.Environment  -- for `EnvExtension.modifyStateAccounted`
 
 public section
 
@@ -118,8 +119,9 @@ must account for the replayed local entries (`localEntriesAccountedFor`). -/
 def stateFields : Array Name := #[`state, `activeScopes, `delimitsLocal, `modCount, `localCount, `generation]
 
 /-- The fields of `StateStack`, each encoded by `stateDelta`: `stateStack` level by level (`stateFields`) and with
-the same length; `scopedEntries` changes only with a new scoped entry; `newEntries` gives the entries;
-`pushCount` only numbers pushed levels, and a push that is not popped again changes the stack length. -/
+the same length; `scopedEntries` changes only with a new scoped entry; `newEntries` gives the entries.
+`pushCount` is outside the replay contract by design: it only numbers pushed levels (`State.generation`), which
+elaboration never reads, and a push that is not popped again changes the stack length. -/
 def stackFields : Array Name := #[`stateStack, `scopedEntries, `newEntries, `pushCount]
 
 private def sameShape (l₀ l₁ : State σ) : Bool :=
@@ -220,11 +222,11 @@ unsafe def registerScopedEnvExtensionUnsafe (descr : Descr α β σ) : IO (Scope
 @[implemented_by registerScopedEnvExtensionUnsafe]
 opaque registerScopedEnvExtension (descr : Descr α β σ) : IO (ScopedEnvExtension α β σ)
 
-/-- Writes the stack without counting the write in `PersistentEnvExtensionState.directWrites`: `stateDelta` encodes
-the writes of the operations below itself (`stateFields`, `stackFields`). -/
+/-- Writes the stack as a sanctioned writer (`EnvExtension.modifyStateAccounted`): `stateDelta` encodes the writes of
+the operations below itself (`stateFields`, `stackFields`). -/
 private def modifyStack (ext : ScopedEnvExtension α β σ) (env : Environment)
     (f : StateStack α β σ → StateStack α β σ) (asyncMode := EnvExtension.AsyncMode.local) : Environment :=
-  ext.ext.toEnvExtension.modifyState (asyncMode := asyncMode) env fun ps => { ps with state := f ps.state }
+  ext.ext.toEnvExtension.modifyStateAccounted (asyncMode := asyncMode) env fun ps => { ps with state := f ps.state }
 
 def ScopedEnvExtension.pushScope (ext : ScopedEnvExtension α β σ) (env : Environment) : Environment :=
   modifyStack ext env fun s =>
@@ -326,7 +328,7 @@ def ScopedEnvExtension.activateScoped (ext : ScopedEnvExtension α β σ) (env :
 /-- Replaces the top state. Writes outside `addEntry`, `addScopedEntry` and `addLocalEntry` must go through this
 function (or `activateScoped`), which counts them in `State.modCount`, so that a command making one is recorded
 as `stateOnly` rather than replayed from its entries. A write through the underlying persistent extension
-(`ext.ext.modifyState`) is counted in `PersistentEnvExtensionState.directWrites` instead. -/
+(`ext.ext.modifyState`) is counted in `EnvExtension.unaccountedWrites` instead. -/
 def ScopedEnvExtension.modifyState (ext : ScopedEnvExtension α β σ) (env : Environment) (f : σ → σ) : Environment :=
   modifyStack ext env (asyncMode := ext.ext.toEnvExtension.asyncMode) fun s =>
     match s.stateStack with
