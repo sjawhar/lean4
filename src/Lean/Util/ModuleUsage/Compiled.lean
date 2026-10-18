@@ -366,13 +366,12 @@ arguments of that type are specialized (class status with out-params, `@[nospeci
 its meta mark, and every table the elaborator keeps for it that the compiler's paths read: structure info,
 matcher info, the matcher-like tag, `noConfusion` info, the auxiliary-recursor and sparse-`casesOn` tags (which
 make toLCNF turn a call into `cases`), projection-function info (which makes it inline the body), auxiliary
-parent-projection info, the structural recursion argument and the original constant kind. Every one of these
-has a public writer, so none is a function of the kernel data alone. Instance and reducibility attributes can be
-local, scoped or erased, so the module's end state can differ from what importers see: those are read from what
-the module exports, the instance entries the module exports for `x` and `x`'s entry in the reducibility core
-extension (local and scoped reducibility live in `reducibilityExtraExt`, whose exported entries `tableDigest`
-covers). Entries a module writes for a name it does not define are in `tableDigest`. (`@[tagged_return]` changes
-only the declaration's own impure signature and IR, which `entriesEnc` covers.) -/
+parent-projection info, the structural recursion argument and the original constant kind. Instance and reducibility
+attributes can be local, scoped or erased, so the module's end state can differ from what importers see: those are
+read from what the module exports, the instance entries the module exports for `x` and `x`'s entry in the
+reducibility core extension (local and scoped reducibility live in `reducibilityExtraExt`, whose exported entries
+`tableDigest` covers). Entries a module writes for a name it does not define are in `tableDigest`.
+(`@[tagged_return]` changes only the declaration's own impure signature and IR, which `entriesEnc` covers.) -/
 def attrsEnc (env : Environment) (lc : LocalCompiled) (x : Name) (s : CEnc) : CEnc :=
   let insts := lc.insts.getD x #[]
   let red := (reducibilityCoreExt.getState (asyncDecl := x) env).find? x |>.getD .semireducible
@@ -453,25 +452,16 @@ def entriesEnc (env : Environment) (lc : LocalCompiled) (x : Name) (s : CEnc) : 
   let s := s.opt (LCNF.monoTypeExt.find? env x) CEnc.ty
   (s.opt (LCNF.findCtorLayout? env x) ctorLayoutEnc).flushTys
 
-/-- The compiled interface of a name, digested in two parts, with the declaration names it mentions and whether
-its IR is exported for interpretation (`isDeclMeta`). -/
-structure CompiledDigest where
-  /-- `attrsEnc`: how callers compile calls to the name. -/
-  attrs : Digest
-  /-- `entriesEnc`: the name's compiled entries. -/
-  entries : Digest
-  irMeta : Bool
-  mentions : NameSet
-  deriving Inhabited
+/-- The compiled interface of `x`: how callers compile calls to it (`attrsEnc`), its compiled entries
+(`entriesEnc`) and whether its IR is exported for interpretation (`isDeclMeta`), with the declaration names they
+mention. -/
+def compiledEnc (env : Environment) (lc : LocalCompiled) (x : Name) (s : CEnc) : CEnc :=
+  let s := entriesEnc env lc x (attrsEnc env lc x s |>.flushTys)
+  { s with e := s.e.bool (isDeclMeta env x) }
 
-def compiledDigest (env : Environment) (lc : LocalCompiled) (x : Name) : CompiledDigest :=
-  let a := attrsEnc env lc x { e := {} } |>.flushTys
-  let c := entriesEnc env lc x { e := {}, ms := a.ms }
-  { attrs := a.e.finish, entries := c.e.finish, irMeta := isDeclMeta env x, mentions := c.ms }
-
-/-- The registered names of the environment extensions whose entries for a name `attrsEnc`, `entriesEnc` and
-`CompiledDigest.irMeta` read, and the module's package, which every node digest carries. The census test checks
-that every extension it classifies as own-declaration data is listed here. -/
+/-- The registered names of the environment extensions whose entries for a name `compiledEnc` reads, and the
+module's package, which every node digest carries. The census test checks that every extension it classifies as
+own-declaration data is listed here. -/
 def digestedOwnTables : List Name := [
   `Lean.Compiler.implementedByAttr, `Lean.externAttr, `Lean.noncomputableExt, `Lean.exportAttr,
   `Lean.regularInitAttr, `Lean.builtinInitAttr, `Lean.Compiler.inlineAttrs, `Lean.neverExtractAttr,
