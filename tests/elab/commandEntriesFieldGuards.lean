@@ -2,11 +2,11 @@ import Lean
 /-! Every field of the states a declaration command can change behaves as the recorder classifies it, and the test
 throws when a field is added, removed or misclassified. For `Elab.Command.State` (`ModuleUsage.commandStateFields`)
 each field is changed on its own and must show its class: the payload for `env`, `post` and `ctx` for `replayed`, a
-`stateOnly` marker for `stateOnly`; a `reset` field must be empty when the next command starts, and an `unread` field
-must not change what the next command declares. Every field of `Elab.Command.Scope` must change `scopesEnc`. Every
-field of a scoped extension's `ScopedEnvExtension.State` and `StateStack` is changed on its own and must give the
-state delta (`ScopedEnvExtension.stateDelta`, `localEntriesAccountedFor`) its documented result. The fields with a
-case must be exactly the structure's fields. -/
+`stateOnly` marker for `stateOnly`; a `reset` field must be empty when a later command starts although the command
+before it left the field non-empty, and an `unread` field must not change what the next command declares. Every
+field of `Elab.Command.Scope` must change `scopesEnc`. Every field of a scoped extension's `ScopedEnvExtension.State`
+and `StateStack` is changed on its own and must give the state delta (`ScopedEnvExtension.stateDelta`,
+`localEntriesAccountedFor`) its documented result. The fields with a case must be exactly the structure's fields. -/
 open Lean Elab Command
 
 def expect (cond : Bool) (msg : String) : IO Unit :=
@@ -28,18 +28,32 @@ def deltaStr : StateDelta α → String
   | .stateOnly => "stateOnly"
 
 /-- A module that reports, as string constants, what a command sees of the fields reset before every command: once
-as the first command, once after commands that log a message, a trace and start snapshot tasks. -/
+as the first command, once directly after `leave_state`, which leaves a message, a trace and a snapshot task in its
+state. `trace.profiler.output` keeps the trace from being turned into a message when the command ends, as when
+profiling, so the command leaves it in its state. -/
 def resetModule : String := "import Lean\nopen Lean Elab Command\n\
   syntax \"report \" ident : command\n\
   elab_rules : command | `(report $n) => do\n\
   \x20 let s := s!\"messages={(← get).messages.toList.length} traceState={(← get).traceState.traces.size} \
     snapshotTasks={(← get).snapshotTasks.size}\"\n\
   \x20 elabCommand (← `(def $n : String := $(Syntax.mkStrLit s)))\n\
+  elab \"leave_state\" : command => do\n\
+  \x20 logWarning \"a warning\"\n\
+  \x20 addTrace `debug m!\"a trace\"\n\
+  \x20 modify fun s => { s with \
+    snapshotTasks := s.snapshotTasks.push { stx? := none, task := .pure default, cancelTk? := none } }\n\
   report resetFirst\n\
-  run_cmd logWarning \"a warning\"\n\
-  set_option trace.debug true in run_cmd trace[debug] \"a trace\"\n\
-  theorem t : True := trivial\n\
+  set_option trace.profiler.output \"unused\"\n\
+  leave_state\n\
   report resetAfter\n"
+
+/-- How much of `field`, a field reset before every command, `st` holds, counted as `resetModule`'s `report` counts
+it. -/
+def resetSize (st : Command.State) : Name → Option Nat
+  | `messages => some st.messages.toList.length
+  | `traceState => some st.traceState.traces.size
+  | `snapshotTasks => some st.snapshotTasks.size
+  | _ => none
 
 /-- The observations of elaborating `src` as module `M`. -/
 unsafe def observe (src : String) : IO (Array ModuleUsage.CommandObservation) := do
@@ -105,14 +119,18 @@ unsafe def main : IO Unit := do
       snapshotTasks := st.snapshotTasks.push ({ stx? := none, task := .pure default, cancelTk? := none }) }),
     (`prevLinterStates, fun st => { st with prevLinterStates := some (.pure #[]) })]
   coverage "Elab.Command.State cases" (getStructureFields env ``Command.State) (changed.map (·.1))
-  let (resetFirst, resetAfter) ← do
+  let (resetFirst, resetAfter, resetLeft) ← do
     let resetObs ← observe resetModule
-    let some last := resetObs.back? | throw <| IO.userError "no observation"
+    let adds (n : Name) (o : ModuleUsage.CommandObservation) := !o.before.env.contains n && o.after.env.contains n
+    let some reportObs := resetObs.find? (adds `resetAfter) |
+      throw <| IO.userError "no observation of `report resetAfter`"
+    let some prev := resetObs.find? (·.i + 1 == reportObs.i) |
+      throw <| IO.userError "no command before `report resetAfter`"
     let str (n : Name) : String :=
-      match (((last.after.env.find? n).bind (·.value?)).map (·.consumeMData) : Option Expr) with
+      match (((reportObs.after.env.find? n).bind (·.value?)).map (·.consumeMData) : Option Expr) with
       | some (.lit (.strVal s)) => s
       | _ => "?"
-    pure (str `resetFirst, str `resetAfter)
+    pure (str `resetFirst, str `resetAfter, prev.after)
   for (field, change) in changed do
     let some cls := classOf field | throw <| IO.userError s!"{field} unclassified"
     let st' := change st
@@ -125,7 +143,7 @@ unsafe def main : IO Unit := do
         let recorded ← recordCommandDelta st.env st'.env 0
         let some ce := (commandEntriesExt.getState recorded).back? | throw <| IO.userError "no payload"
         expect (!ce.entries.isEmpty && markers.isEmpty) s!"{field}: no payload entry"
-        pure s!"payload {ce.entries.map (·.1)}"
+        pure s!"payload {ce.entries.map fun (v, n, _) => s!"{n}.{v}"}"
       | .replayed =>
         expect (postChanged && ctxChanged && markers.isEmpty) s!"{field}: post {postChanged}, ctx {ctxChanged}"
         pure "post and ctx change"
@@ -136,7 +154,11 @@ unsafe def main : IO Unit := do
         let seen (s : String) := (s.splitOn " ").find? (·.startsWith s!"{field}=")
         expect ((seen resetFirst).isSome && seen resetFirst == seen resetAfter && markers.isEmpty && !ctxChanged)
           s!"{field}: the first command sees {resetFirst}, a later one {resetAfter}"
-        pure s!"a later command sees what the first does ({(seen resetAfter).getD "?"})"
+        let left := resetSize resetLeft field
+        expect (left.any (· != 0))
+          s!"{field}: the command before the later one leaves {left}, so no reset is exercised"
+        pure s!"a later command sees what the first does ({(seen resetAfter).getD "?"}) although the command before \
+          it leaves the field non-empty"
       | .unread =>
         let mut same := true
         for o in probes do

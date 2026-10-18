@@ -217,16 +217,25 @@ unsafe def registerScopedEnvExtensionUnsafe (descr : Descr α β σ) : IO (Scope
   }
   let ext := { descr := descr, ext := ext : ScopedEnvExtension α β σ }
   scopedEnvExtensionsRef.modify fun exts => exts.push (unsafeCast ext)
+  EnvExtension.setIdentity ext.ext.toEnvExtension.idx (·.map ({ · with scopedDescr := ptrAddrUnsafe ext.descr }))
   return ext
 
 @[implemented_by registerScopedEnvExtensionUnsafe]
 opaque registerScopedEnvExtension (descr : Descr α β σ) : IO (ScopedEnvExtension α β σ)
 
-/-- Writes the stack as a sanctioned writer (`EnvExtension.modifyStateAccounted`): `stateDelta` encodes the writes of
-the operations below itself (`stateFields`, `stackFields`). -/
+private unsafe def descrIdentityImpl (ext : ScopedEnvExtension α β σ) : EnvExtensionIdentity :=
+  PersistentEnvExtension.identityImpl ext.ext (ptrAddrUnsafe ext.descr)
+
+/-- The identity a write through `ext`'s stack presents: its persistent extension's, with its descriptor. -/
+@[implemented_by descrIdentityImpl]
+private opaque descrIdentity (ext : ScopedEnvExtension α β σ) : EnvExtensionIdentity
+
+/-- Writes the stack as a sanctioned writer (`EnvExtension.modifyStateAccounted`, presenting the registered
+descriptor): `stateDelta` encodes the writes of the operations below itself (`stateFields`, `stackFields`). -/
 private def modifyStack (ext : ScopedEnvExtension α β σ) (env : Environment)
     (f : StateStack α β σ → StateStack α β σ) (asyncMode := EnvExtension.AsyncMode.local) : Environment :=
-  ext.ext.toEnvExtension.modifyStateAccounted (asyncMode := asyncMode) env fun ps => { ps with state := f ps.state }
+  ext.ext.toEnvExtension.modifyStateAccounted (asyncMode := asyncMode) env (descrIdentity ext)
+    fun ps => { ps with state := f ps.state }
 
 def ScopedEnvExtension.pushScope (ext : ScopedEnvExtension α β σ) (env : Environment) : Environment :=
   modifyStack ext env fun s =>

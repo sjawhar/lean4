@@ -62,6 +62,6 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   for o in obs do
     let some ce := payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"
     IO.println s!"{o.i}: stateOnly {ce.stateOnly.filter watched.contains}, \
-      entries {ce.entries.filterMap fun (n, _) => if watched.contains n then some n else none}"
+      entries {ce.entries.filterMap fun (v, n, _) => if watched.contains n then some s!"{n}.{v}" else none}"
 
 #eval main

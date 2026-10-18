@@ -10,19 +10,6 @@ open Lean
 
 unsafe def commandEntriesOf (e : EnvExtensionEntry) : CommandEntries := unsafeCast e
 
-/-- `target` with the state of every extension a command payload replays taken from `source`: a kept command is
-replayed with its constants present and every extension in its before-state. -/
-def withReplayStateOf (source target : Environment) : IO Environment := do
-  let mut target := target
-  for ext in ← persistentEnvExtensionsRef.get do
-    let mode := ext.toEnvExtension.asyncMode.forExport
-    target := ext.toEnvExtension.setState target (ext.toEnvExtension.getState source (asyncMode := mode))
-      (asyncMode := mode)
-  for ext in ← commandCacheExtensionsRef.get do
-    target := ext.copyState source target
-  return localEntriesExt.setState target (localEntriesExt.getState source (asyncMode := .local))
-    (asyncMode := .local)
-
 /-- What a later command sees of the simp extension: per stack level, the active namespaces and whether local
 entries are delimited there, and which of `probes` are simp lemmas at the top. -/
 def simpView (env : Environment) (probes : List Name) : String :=

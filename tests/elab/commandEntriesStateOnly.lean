@@ -14,20 +14,6 @@ def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
 
 unsafe def commandEntriesOf (e : EnvExtensionEntry) : CommandEntries := unsafeCast e
 
-/-- `target` with the state of every extension a command payload replays (persistent and scoped extensions,
-registered command caches, the local-entry log) taken from `source`: a kept command is replayed with its
-constants present and every extension in its before-state. -/
-def withReplayStateOf (source target : Environment) : IO Environment := do
-  let mut target := target
-  for ext in ← persistentEnvExtensionsRef.get do
-    let mode := ext.toEnvExtension.asyncMode.forExport
-    target := ext.toEnvExtension.setState target (ext.toEnvExtension.getState source (asyncMode := mode))
-      (asyncMode := mode)
-  for ext in ← commandCacheExtensionsRef.get do
-    target := ext.copyState source target
-  return localEntriesExt.setState target (localEntriesExt.getState source (asyncMode := .local))
-    (asyncMode := .local)
-
 /-- Elaborates `src` as module `M` in `dir` as `lean -o` does; returns the command observations, the payloads
 written to `M.olean` and `M.usage`. -/
 unsafe def elabM (dir : System.FilePath) (src : String) :

@@ -14,18 +14,6 @@ def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
 
 unsafe def commandEntriesOf (e : EnvExtensionEntry) : CommandEntries := unsafeCast e
 
-/-- `target` with the state of every extension a command payload replays taken from `source`. -/
-def withReplayStateOf (source target : Environment) : IO Environment := do
-  let mut target := target
-  for ext in ← persistentEnvExtensionsRef.get do
-    let mode := ext.toEnvExtension.asyncMode.forExport
-    target := ext.toEnvExtension.setState target (ext.toEnvExtension.getState source (asyncMode := mode))
-      (asyncMode := mode)
-  for ext in ← commandCacheExtensionsRef.get do
-    target := ext.copyState source target
-  return localEntriesExt.setState target (localEntriesExt.getState source (asyncMode := .local))
-    (asyncMode := .local)
-
 def xSource : String := "import Lean\nopen Lean\n\
   initialize logExt : SimplePersistentEnvExtension Name NameSet ← registerSimplePersistentEnvExtension { \
     addEntryFn := fun s n => s.insert n, addImportedFn := fun _ => {} }\n\
@@ -100,6 +88,6 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
           else s!"replay differs: full {view o.after.env}, replayed {view env}")
       catch _ => pure "refused"
     IO.println s!"{o.i}: stateOnly {ce.stateOnly.filter watched.contains}, \
-      entries {ce.entries.filterMap fun (n, _) => if watched.contains n then some n else none}; {replay}"
+      entries {ce.entries.filterMap fun (v, n, _) => if watched.contains n then some s!"{n}.{v}" else none}; {replay}"
 
 #eval main

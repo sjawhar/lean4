@@ -17,21 +17,6 @@ def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
 
 unsafe def commandEntriesOf (e : EnvExtensionEntry) : CommandEntries := unsafeCast e
 
-/-- `target` with the state of every extension a command payload replays taken from `source`, in both views. -/
-def withReplayStateOf (source target : Environment) : IO Environment := do
-  let mut target := target
-  for ext in ← persistentEnvExtensionsRef.get do
-    let mode := ext.toEnvExtension.asyncMode.forExport
-    target := ext.toEnvExtension.setState target (ext.toEnvExtension.getState source (asyncMode := mode))
-      (asyncMode := mode)
-    if mode matches .sync then
-      target := ext.toEnvExtension.setState target (ext.toEnvExtension.getState source (asyncMode := .local))
-        (asyncMode := .local)
-  for ext in ← commandCacheExtensionsRef.get do
-    target := ext.copyState source target
-  return localEntriesExt.setState target (localEntriesExt.getState source (asyncMode := .local))
-    (asyncMode := .local)
-
 def xSource : String := "import Lean\nopen Lean\n\
   initialize mainLog : SimplePersistentEnvExtension Name NameSet ← registerSimplePersistentEnvExtension { \
     addEntryFn := fun s n => s.insert n, addImportedFn := fun _ => {} }\n\
@@ -85,15 +70,14 @@ def mSource : String := "import X\n\
   @[main_add] def d9 : Nat := 0\n\
   theorem t10 : True := by\n  run_tac Lean.modifyEnv (branchLog.addEntry (asyncDecl := `t10) · `t10)\n  exact trivial\n"
 
-/-- Every state of the test's own extensions a later command can read: the checked and main-branch views. -/
+/-- Every state of the test's own extensions a later command can read: the checked and the main-branch view of each,
+whatever its registered mode (a write in another mode reaches the other view). -/
 unsafe def view (exts : List (PersistentEnvExtension EnvExtensionEntry EnvExtensionEntry EnvExtensionState))
     (env : Environment) : String := Id.run do
   let mut parts := #[]
   for ext in exts do
-    let modes := if ext.toEnvExtension.asyncMode matches .mainOnly then [EnvExtension.AsyncMode.mainOnly]
-      else [.sync, .local]
-    for mode in modes do
-      let s := ext.getState (asyncMode := mode) env
+    for v in [EnvExtension.View.checked, .main] do
+      let s := (ext.toEnvExtension.getStateIn env v).state
       let shown : String :=
         if ext.name == `myParamExt then
           let (keys, m) : List Name × NameMap Nat := unsafeCast s
@@ -104,7 +88,7 @@ unsafe def view (exts : List (PersistentEnvExtension EnvExtensionEntry EnvExtens
         else
           let (log, set) : List Name × NameSet := unsafeCast s
           s!"{log}/{set.toList}"
-      parts := parts.push s!"{ext.name}.{if mode matches .sync then "checked" else "main"}={shown}"
+      parts := parts.push s!"{ext.name}.{v}={shown}"
   return ", ".intercalate parts.toList
 
 unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
@@ -132,7 +116,6 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
         pure (if full == got then "replay matches" else s!"replay differs:\n    full     {full}\n    replayed {got}")
       catch _ => pure "refused"
     IO.println s!"{o.i}: stateOnly {ce.stateOnly.filter names.contains}, \
-      entries {ce.entries.filterMap fun (n, _) => if names.contains n then some n else none}, \
-      main-branch entries {ce.baseEntries.filterMap fun (n, _) => if names.contains n then some n else none}; {replay}"
+      entries {ce.entries.filterMap fun (v, n, _) => if names.contains n then some s!"{n}.{v}" else none}; {replay}"
 
 #eval main

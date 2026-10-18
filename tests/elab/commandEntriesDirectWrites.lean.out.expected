@@ -4,6 +4,6 @@ noskip (some true), reason (some (state-only change to logExt in declaration com
 2: stateOnly #[logExt], entries #[]; refused
 3: stateOnly #[myParamExt], entries #[]; refused
 4: stateOnly #[scopeExt], entries #[]; refused
-5: stateOnly #[], entries #[Lean.Meta.Simp.simprocDeclExt]; replay matches [modifySide, setSide, onlySide, paramSide, scopeSide]
+5: stateOnly #[], entries #[Lean.Meta.Simp.simprocDeclExt.main]; replay matches [modifySide, setSide, onlySide, paramSide, scopeSide]
 6: stateOnly #[], entries #[]; replay matches [modifySide, setSide, onlySide, paramSide, scopeSide]
 7: stateOnly #[], entries #[]; replay matches [modifySide, setSide, onlySide, paramSide, scopeSide]

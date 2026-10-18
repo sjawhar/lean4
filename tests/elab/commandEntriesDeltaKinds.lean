@@ -57,19 +57,6 @@ unsafe def fingerprint (dir : System.FilePath) (ext : PExt) (env : Environment) 
     some <$> compactBytes dir (log, arr)
   | _ => return none
 
-/-- `target` with the state of every extension a command payload replays (persistent and scoped extensions,
-registered command caches, the local-entry log) taken from `source`. -/
-def withReplayStateOf (source target : Environment) : IO Environment := do
-  let mut target := target
-  for ext in ← persistentEnvExtensionsRef.get do
-    let mode := ext.toEnvExtension.asyncMode.forExport
-    target := ext.toEnvExtension.setState target (ext.toEnvExtension.getState source (asyncMode := mode))
-      (asyncMode := mode)
-  for ext in ← commandCacheExtensionsRef.get do
-    target := ext.copyState source target
-  return localEntriesExt.setState target (localEntriesExt.getState source (asyncMode := .local))
-    (asyncMode := .local)
-
 /-- Extensions whose payload membership the output reports, to show each kind was exercised. -/
 def watched : List Name := [`logExt, `scopeExt, `mapExt, `asyncExt, `Lean.Compiler.nospecializeAttr,
   `Lean.matchPatternAttr, .num `_private.Lean.Structure 0 ++ `Lean.structureExt, `Lean.Compiler.LCNF.baseExt,
@@ -139,7 +126,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let pExts := (← persistentEnvExtensionsRef.get).filter (!excludedExtension ·.name)
   for o in obs do
     let some ce := payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"
-    let shown := ce.entries.filterMap fun (n, _) => if watched.contains n then some n else none
+    let shown := ce.entries.filterMap fun (v, n, _) => if watched.contains n then some s!"{n}.{v}" else none
     -- as when a kept command is replayed: its constants are present, every extension is in its before-state
     let base ← withReplayStateOf o.before.env o.after.env
     let replayed? : Option Environment ← try

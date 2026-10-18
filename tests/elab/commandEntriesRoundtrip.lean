@@ -2,7 +2,8 @@ import Lean
 /-! Per-command `.olean` payloads include all persistent extension additions and scoped local entries,
 including dynamically registered extensions and parser/macro state, and replaying them reproduces every
 extension's export, also for an extension whose `.olean` entries differ from its state entries
-(`@[cpass]`: `passManagerExt` exports installer names and rebuilds the pass manager from them). Commands whose
+(`@[cpass]`: `passManagerExt` exports installer names and rebuilds the pass manager from them). The extensions
+listed per payload are those with entries in the view the export reads (`AsyncMode.forExport`). Commands whose
 payload changes state no entry expresses (`namespace`, `end`: the scope stack) are refused by replay and stand
 for commands elaborated again; the replay takes the full run's state after them. -/
 open Lean
@@ -31,19 +32,6 @@ def sameParse (expected actual : Environment) (input : String) : Bool :=
   | .error a, .error b => a == b
   | _, _ => false
 
-/-- `target` with the state of every extension a command payload replays (persistent and scoped extensions,
-registered command caches, the local-entry log) taken from `source`. -/
-def withReplayStateOf (source target : Environment) : IO Environment := do
-  let mut target := target
-  for ext in ← persistentEnvExtensionsRef.get do
-    let mode := ext.toEnvExtension.asyncMode.forExport
-    target := ext.toEnvExtension.setState target (ext.toEnvExtension.getState source (asyncMode := mode))
-      (asyncMode := mode)
-  for ext in ← commandCacheExtensionsRef.get do
-    target := ext.copyState source target
-  return localEntriesExt.setState target (localEntriesExt.getState source (asyncMode := .local))
-    (asyncMode := .local)
-
 unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   IO.FS.writeFile (dir / "X.lean") "import Lean\nopen Lean\ndef v := 5\nregister_simp_attr my_set\ninitialize myExt : SimplePersistentEnvExtension Name (Array Name) ← registerSimplePersistentEnvExtension { addEntryFn := Array.push, addImportedFn := fun as => as.foldl (· ++ ·) #[] }\ninitialize registerBuiltinAttribute { name := `my_tag, descr := \"test\", add := fun decl _ _ => modifyEnv (myExt.addEntry · decl) }\n"
   IO.FS.writeFile (dir / "M.lean") "import X\n\n@[cpass] meta def testPassInstaller : Lean.Compiler.LCNF.PassInstaller := { phase := .base, install := pure }\n\ntheorem a : True := trivial\n\ndef h : Nat → Nat | 0 => 1 | n + 1 => n\n\n@[simp] theorem s : v = 5 := rfl\nattribute [local simp] s\n@[local simp] theorem ls : 2 = 2 := rfl\nattribute [local simp] s in theorem tin : 3 = 3 := by simp\nnamespace Foo\nend Foo\nattribute [local simp] a in open Foo in @[local simp] theorem t2 : True := trivial\nnamespace A.B\ntheorem tn : True := trivial\nend A.B\n\ntheorem d : 2 + 2 = 4 := by decide +kernel\ndef e1 : Fin 5 := ⟨3, by decide +kernel⟩\ninstance : Inhabited Nat := ⟨v⟩\n\n/-- A reducible definition with a docstring. -/\n@[reducible] def r : Nat := v + 1\n\nstructure P where\n  x : Nat\n  y : Nat\n\ninductive T where\n  | leaf\n  | node (l : T) (n : Nat) (r : T)\n\ndef T.size : T → Nat\n  | .leaf => 0\n  | .node l _ r => l.size + 1 + r.size\n\ndef k : Nat → Nat | 0 => 2 | n + 1 => n + 3\ndef e2 : Fin 5 := ⟨3, by decide +kernel⟩\ntheorem d2 : 2 + 2 = 4 := by decide +kernel\n\nnoncomputable def cl : Decidable (∀ n : Nat, n = n) := by classical exact inferInstance\nnamespace Prot\nprotected def p := 1\nend Prot\n@[my_set] theorem ms : 5 = 5 := rfl\n@[my_tag] def myTagged := 1\nsyntax \"⊕⊕\" term : term\nmacro_rules | `(⊕⊕ $x) => `($x + 1)\nnotation \"⊗⊗\" => Nat.add\n"
@@ -61,7 +49,13 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let some raw := (md.entries.find? (·.1 == commandEntriesExt.name)).map (·.2) |
     throw <| IO.userError "missing commandEntriesExt payload"
   let entries := raw.map commandEntriesOf
-  let names : Array Name := entries.flatMap fun entry => entry.entries.map fun p => p.1
+  -- the view `computeExtEntries` exports each extension from: checked for `.sync` and `.async _`, else main
+  let exportView : Std.HashMap Name EnvExtension.View := (← persistentEnvExtensionsRef.get).foldl
+    (fun m ext => m.insert ext.name
+      (if ext.toEnvExtension.asyncMode.forExport matches .sync then .checked else .main)) {}
+  let exported (entry : CommandEntries) : Array Name :=
+    entry.entries.filterMap fun (v, n, _) => if exportView[n]? == some v then some n else none
+  let names : Array Name := entries.flatMap exported
   let locals : Array (Nat × Name × EnvExtensionEntry) := entries.flatMap fun entry => entry.locals
   IO.println s!"commands: {entries.size}"
   IO.println s!"payload extensions: {names.size}"
@@ -83,7 +77,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let scopedExts := (← scopedEnvExtensionsRef.get).map (·.ext.name)
   for entry in entries do
     let scopedStateOnly := entry.stateOnly.any scopedExts.contains
-    IO.println s!"{entry.idx} extensions={entry.entries.map (·.1)} \
+    IO.println s!"{entry.idx} extensions={exported entry} \
       locals={entry.locals.map fun (depth, name, _) => (depth, name)} \
       caches={entry.caches.deltas.map (·.1)} stateOnly={entry.stateOnly.filter (!scopedExts.contains ·)}\
       {if scopedStateOnly then " and scoped extensions" else ""}"

@@ -1,9 +1,8 @@
 Elab.Command.State classification: 12 fields, each covered
 Elab.Command.State cases: 12 fields, each covered
-M.lean:8:0: warning: a warning
-[debug] a trace
-env (Lean.ModuleUsage.CommandStateField.env): payload #[Lean.aliasExtension]
-messages (Lean.ModuleUsage.CommandStateField.reset): a later command sees what the first does (messages=0)
+M.lean:13:0: warning: a warning
+env (Lean.ModuleUsage.CommandStateField.env): payload #[Lean.aliasExtension.main]
+messages (Lean.ModuleUsage.CommandStateField.reset): a later command sees what the first does (messages=0) although the command before it leaves the field non-empty
 scopes (Lean.ModuleUsage.CommandStateField.stateOnly): marker Lean.Elab.Command.scopes
 usedQuotCtxts (Lean.ModuleUsage.CommandStateField.replayed): post and ctx change
 nextMacroScope (Lean.ModuleUsage.CommandStateField.stateOnly): marker Lean.Elab.Command.nextMacroScope
@@ -11,8 +10,8 @@ maxRecDepth (Lean.ModuleUsage.CommandStateField.replayed): post and ctx change
 ngen (Lean.ModuleUsage.CommandStateField.replayed): post and ctx change
 auxDeclNGen (Lean.ModuleUsage.CommandStateField.replayed): post and ctx change
 infoState (Lean.ModuleUsage.CommandStateField.stateOnly): marker Lean.Elab.Command.infoState
-traceState (Lean.ModuleUsage.CommandStateField.reset): a later command sees what the first does (traceState=0)
-snapshotTasks (Lean.ModuleUsage.CommandStateField.reset): a later command sees what the first does (snapshotTasks=0)
+traceState (Lean.ModuleUsage.CommandStateField.reset): a later command sees what the first does (traceState=0) although the command before it leaves the field non-empty
+snapshotTasks (Lean.ModuleUsage.CommandStateField.reset): a later command sees what the first does (snapshotTasks=0) although the command before it leaves the field non-empty
 prevLinterStates (Lean.ModuleUsage.CommandStateField.unread): later commands declare the same
 Elab.Command.Scope cases: 13 fields, each covered
 Elab.Command.Scope encoding: 13 fields, each covered

@@ -13,22 +13,9 @@ def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
 
 unsafe def commandEntriesOf (e : EnvExtensionEntry) : CommandEntries := unsafeCast e
 
-/-- `target` with the state of every extension a command payload replays (persistent and scoped extensions,
-registered command caches, the local-entry log) taken from `source`: a kept command is replayed with its
-constants present and every extension in its before-state. -/
-def withReplayStateOf (source target : Environment) : IO Environment := do
-  let mut target := target
-  for ext in ← persistentEnvExtensionsRef.get do
-    let mode := ext.toEnvExtension.asyncMode.forExport
-    target := ext.toEnvExtension.setState target (ext.toEnvExtension.getState source (asyncMode := mode))
-      (asyncMode := mode)
-  for ext in ← commandCacheExtensionsRef.get do
-    target := ext.copyState source target
-  return localEntriesExt.setState target (localEntriesExt.getState source (asyncMode := .local))
-    (asyncMode := .local)
-
+/-- `preExt`'s entries in `ce`'s main-branch view, the view its `.mainOnly` writes reach. -/
 unsafe def preEntries (ce : CommandEntries) : Array (Name × Nat) :=
-  ((ce.entries.find? (·.1 == `preExt)).map (·.2) |>.getD #[]).map unsafeCast
+  ((ce.entries.find? fun (v, n, _) => v == .main && n == `preExt).map (·.2.2) |>.getD #[]).map unsafeCast
 
 unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   IO.FS.writeFile (dir / "X.lean") "import Lean\nopen Lean\n\

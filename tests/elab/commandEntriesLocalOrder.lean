@@ -10,18 +10,6 @@ open Lean
 
 unsafe def commandEntriesOf (e : EnvExtensionEntry) : CommandEntries := unsafeCast e
 
-/-- `target` with the state of every extension a command payload replays taken from `source`. -/
-def withReplayStateOf (source target : Environment) : IO Environment := do
-  let mut target := target
-  for ext in ← persistentEnvExtensionsRef.get do
-    let mode := ext.toEnvExtension.asyncMode.forExport
-    target := ext.toEnvExtension.setState target (ext.toEnvExtension.getState source (asyncMode := mode))
-      (asyncMode := mode)
-  for ext in ← commandCacheExtensionsRef.get do
-    target := ext.copyState source target
-  return localEntriesExt.setState target (localEntriesExt.getState source (asyncMode := .local))
-    (asyncMode := .local)
-
 structure Run where
   src : String
   obs : Array ModuleUsage.CommandObservation
@@ -62,7 +50,7 @@ unsafe def check (dir : System.FilePath) (label : String) (ext : Name) (src : St
   let kind := (((r.usage.getObjValAs? (Array Json) "commands").toOption.getD #[])[i]?.bind
     fun c => (c.getObjValAs? String "kind").toOption).getD "?"
   IO.println s!"{label}: command {i} {kind}, {ext} in stateOnly {ce.stateOnly.contains ext}, entries \
-    {ce.entries.any (·.1 == ext)}, locals {ce.locals.any (·.2.1 == ext)}, \
+    {ce.entries.any (·.2.1 == ext)}, locals {ce.locals.any (·.2.1 == ext)}, \
     noskip {(r.usage.getObjValAs? Bool "noskip").toOption}"
   let replayed? ← try
       pure (some (← replayCommandEntries (← withReplayStateOf o.before.env o.after.env) ce

@@ -188,6 +188,21 @@ The index of a module name in the array equals the `ModuleIdx` for the same modu
 def EnvironmentHeader.moduleNames (header : EnvironmentHeader) : Array Name :=
   header.modules.map (·.module)
 
+/--
+What an accounted write to a persistent extension's state presents (`EnvExtension.modifyStateAccounted`): the
+record's name, its `addEntryFn` by address, its `stateDeltaSeesDirectWrites`, and, for a write through a scoped
+extension, the scoped descriptor by address. The environment holds the registered identity per extension index
+(`Kernel.Environment.extIdentities`); a write whose record does not match the one registered at its index is
+counted as unaccounted.
+-/
+structure EnvExtensionIdentity where
+  name : Name
+  addEntryFn : USize
+  seesDirectWrites : Bool
+  /-- The scoped descriptor's address; `0` for a write through the persistent extension, which does not check it. -/
+  scopedDescr : USize := 0
+  deriving Inhabited
+
 namespace Kernel
 
 structure Diagnostics where
@@ -265,13 +280,26 @@ structure Environment where
   sanctioned writer accounted for (`EnvExtension.unaccountedWrites`). Grown on demand.
   -/
   private unaccountedWrites : Array Nat := #[]
+  /--
+  Per environment extension index, the registered persistent extension's identity, copied from the registry when the
+  environment is created or its extension array grows. Read by accounted writes only.
+  -/
+  private extIdentities : Array (Option EnvExtensionIdentity) := #[]
 deriving Nonempty
 
-/-- Counts a write to extension `idx`'s state that no sanctioned writer accounted for. -/
-private def Environment.countUnaccountedWrite (env : Environment) (idx : Nat) : Environment :=
+/-- Whether `id` is the identity registered at extension index `idx`. -/
+private def Environment.identityMatches (env : Environment) (idx : Nat) (id : EnvExtensionIdentity) : Bool :=
+  match env.extIdentities[idx]? with
+  | some (some reg) =>
+    reg.name == id.name && reg.addEntryFn == id.addEntryFn && reg.seesDirectWrites == id.seesDirectWrites &&
+      (id.scopedDescr == 0 || id.scopedDescr == reg.scopedDescr)
+  | _ => false
+
+/-- Counts `n` writes to extension `idx`'s state that no sanctioned writer accounted for. -/
+private def Environment.countUnaccountedWrite (env : Environment) (idx : Nat) (n : Nat := 1) : Environment :=
   let ws := env.unaccountedWrites
   let ws := if idx < ws.size then ws else ws ++ Array.replicate (idx + 1 - ws.size) 0
-  { env with unaccountedWrites := ws.modify idx (· + 1) }
+  { env with unaccountedWrites := ws.modify idx (· + n) }
 
 /-- Exceptions that can be raised by the kernel when type checking new declarations. -/
 inductive Exception where
@@ -451,6 +479,8 @@ private structure AsyncConst where
   checking, synchronous decl addition) that can eagerly guarantee they will not report any state.
   -/
   exts?       : Option (Task (Array EnvExtensionState))
+  /-- The branch's `Kernel.Environment.unaccountedWrites` beside `exts?`, for the per-command recorder. -/
+  branchWrites? : Option (Task (Array Nat)) := none
   /--
   `Task AsyncConsts` except for problematic recursion. The set of nested constants created while
   elaborating this constant.
@@ -968,6 +998,7 @@ private structure ConstPromiseVal where
   privateConstInfo     : ConstantInfo
   exportedConstInfo    : ConstantInfo
   exts                 : Array EnvExtensionState
+  branchWrites         : Array Nat
   nestedConsts         : VisibilityMap AsyncConsts
 deriving Nonempty
 
@@ -1055,6 +1086,9 @@ def addConstAsync (env : Environment) (constName : Name) (kind : ConstantKind)
       | some v => v.exts
       -- any value should work here, `base` does not block
       | none   => env.base.private.extensions)
+    branchWrites? := guard reportExts *> some (constPromise.result?.map (sync := true) fun
+      | some v => v.branchWrites
+      | none   => env.base.private.unaccountedWrites)
     aconstsImpl := constPromise.result?.map (sync := true) fun
       | some v => .mk v.nestedConsts.private
       | none   => .mk (α := AsyncConsts) default
@@ -1133,6 +1167,7 @@ def AddConstAsyncResult.commitConst (res : AddConstAsyncResult) (env : Environme
     privateConstInfo := info
     exportedConstInfo := (exportedInfo? <|> (env.setExporting true).find? res.constName).getD info
     exts := env.base.private.extensions
+    branchWrites := env.base.private.unaccountedWrites
     nestedConsts := env.asyncConstsMap
   }
 
@@ -1328,6 +1363,16 @@ def EnvExtension.AsyncMode.forExport : EnvExtension.AsyncMode → EnvExtension.A
   | .async _ => .sync
   | mode => mode
 
+/-- One of an environment's two copies of the extension states: `checked`, the kernel environment every branch
+commits to, which `.sync` and `.async _` reads see; and `main`, the current branch's own copy (`Environment.base`),
+which `.local` and `.mainOnly` reads see. A write reaches one or both, by the mode it is called with. -/
+inductive EnvExtension.View where
+  | checked
+  | main
+  deriving Inhabited, BEq, Repr
+
+instance : ToString EnvExtension.View := ⟨fun | .checked => "checked" | .main => "main"⟩
+
 abbrev ReplayFn (σ : Type) :=
   (oldState : σ) → (newState : σ) → (newConsts : List Name) → σ → σ
 
@@ -1353,6 +1398,15 @@ namespace EnvExtension
 private builtin_initialize envExtensionsRef : IO.Ref (Array (EnvExtension EnvExtensionState)) ← IO.mkRef #[]
 /-- The index allocated to an environment extension. -/
 def index (ext : EnvExtension σ) : Nat := ext.idx
+
+/-- The identity of the persistent extension registered at each index (`registerPersistentEnvExtension`, completed
+by `registerScopedEnvExtension`), copied into every environment created afterwards. -/
+private builtin_initialize identitiesRef : IO.Ref (Array (Option EnvExtensionIdentity)) ← IO.mkRef #[]
+
+private def setIdentity (idx : Nat) (f : Option EnvExtensionIdentity → Option EnvExtensionIdentity) : IO Unit :=
+  identitiesRef.modify fun ids =>
+    let ids := if idx < ids.size then ids else ids ++ Array.replicate (idx + 1 - ids.size) none
+    ids.modify idx f
 
 /--
   User-defined environment extensions are declared using the `initialize` command.
@@ -1422,23 +1476,46 @@ def asyncMayModify (ext : EnvExtension σ) (env : Environment) (asyncDecl : Name
       (ctx.mayContain asyncDecl && (env.findAsyncConst? asyncDecl).any (·.exts?.isNone))
     | _ => true
 
-/-- `modifyState`, with the write counted in `Kernel.Environment.unaccountedWrites` (in every view it writes)
-unless `accounted`. -/
-private def modifyStateCore {σ : Type} (ext : EnvExtension σ) (env : Environment) (f : σ → σ)
-    (asyncMode : AsyncMode) (asyncDecl : Name) (accounted : Bool) : Environment := Id.run do
-  -- for panics
-  let _ : Inhabited Environment := ⟨env⟩
+/-- How a write to an extension's state is counted in `Kernel.Environment.unaccountedWrites`: an `unaccounted` write
+always (`modifyState`); an `accounted` write (`modifyStateAccounted`) only when the identity it presents is not the
+one registered at the extension's index. -/
+private inductive WriteKind where
+  | unaccounted
+  | accounted (id : EnvExtensionIdentity)
+
+/-- The views a write reaches. -/
+private inductive WriteViews where
+  | main
+  | checked
+  | both
+
+/-- Applies `f` to `ext`'s state in `views`, counting the write in each view it reaches as `kind` says. -/
+private def writeViews {σ : Type} (ext : EnvExtension σ) (env : Environment) (views : WriteViews)
+    (kind : WriteKind) (f : σ → σ) : Environment :=
+  let counted := match kind with
+    | .unaccounted => true
+    | .accounted id => !env.base.private.identityMatches ext.idx id
   -- safety: `ext`'s constructor is private, so we can assume the entry at `ext.idx` is of type `σ`
   let write (kenv : Kernel.Environment) : Kernel.Environment :=
     let kenv := { kenv with extensions := unsafe ext.modifyStateImpl kenv.extensions f }
-    if accounted then kenv else kenv.countUnaccountedWrite ext.idx
+    if counted then kenv.countUnaccountedWrite ext.idx else kenv
+  match views with
+  | .main => { env with base.private := write env.base.private }
+  | .checked => { env with checked := env.checked.map (sync := true) write }
+  | .both => env.modifyCheckedAsync write
+
+/-- A write in mode `asyncMode`: `.mainOnly` and `.local` reach the main-branch view, the others both views. -/
+private def modifyStateCore {σ : Type} (ext : EnvExtension σ) (env : Environment) (f : σ → σ)
+    (asyncMode : AsyncMode) (asyncDecl : Name) (kind : WriteKind) : Environment := Id.run do
+  -- for panics
+  let _ : Inhabited Environment := ⟨env⟩
   match asyncMode with
   | .mainOnly =>
     if let some asyncCtx := env.asyncCtx? then
       return panic! s!"environment extension is marked as `mainOnly` but used in {asyncCtx.descr}"
-    return { env with base.private := write env.base.private }
+    return writeViews ext env .main kind f
   | .local =>
-    return { env with base.private := write env.base.private }
+    return writeViews ext env .main kind f
   | _ =>
     if asyncMode matches .async _ then
       if asyncDecl.isAnonymous then
@@ -1452,7 +1529,7 @@ private def modifyStateCore {σ : Type} (ext : EnvExtension σ) (env : Environme
       if let some (n :: _) := env.asyncCtx?.map (·.realizingStack) then
         return panic! s!"environment extension must set `replay?` field to be \
           used in realization context '{n}'"
-    env.modifyCheckedAsync write
+    writeViews ext env .both kind f
 
 /--
 Applies the given function to the extension state. See `AsyncMode` for details on how modifications
@@ -1461,19 +1538,20 @@ from different environment branches are reconciled.
 Note that in modes `sync` and `async`, `f` will be called twice, on the local and on the `checked`
 state.
 
-The write is counted in `unaccountedWrites`: a persistent extension's state is written by `PersistentEnvExtension`'s
-own functions, and a command that writes it here records no entry the recorder can replay.
+The write is counted in `unaccountedWrites`, in each view it reaches: a persistent extension's state is written by
+`PersistentEnvExtension`'s own functions, and a command that writes it here records no entry the recorder can replay.
 -/
 def modifyState {σ : Type} (ext : EnvExtension σ) (env : Environment) (f : σ → σ)
     (asyncMode := ext.asyncMode) (asyncDecl : Name := .anonymous) : Environment :=
-  modifyStateCore ext env f asyncMode asyncDecl (accounted := false)
+  modifyStateCore ext env f asyncMode asyncDecl .unaccounted
 
 /-- `modifyState` for the sanctioned writers of a persistent extension's state (`PersistentEnvExtension.addEntry`,
-`setState`/`modifyState` when the extension's state delta sees them, the scoped-extension operations), whose effect
-the extension's `stateDelta?` sees: not counted in `unaccountedWrites`. -/
-private def modifyStateAccounted {σ : Type} (ext : EnvExtension σ) (env : Environment) (f : σ → σ)
-    (asyncMode := ext.asyncMode) (asyncDecl : Name := .anonymous) : Environment :=
-  modifyStateCore ext env f asyncMode asyncDecl (accounted := true)
+`setState`/`modifyState` when the extension's state delta sees them, the scoped-extension operations). Not counted
+in `unaccountedWrites` when `id` is the identity registered at `ext`'s index; a write through a record the caller
+built differently (another `addEntryFn`, flag, scoped descriptor or index) is counted. -/
+private def modifyStateAccounted {σ : Type} (ext : EnvExtension σ) (env : Environment) (id : EnvExtensionIdentity)
+    (f : σ → σ) (asyncMode := ext.asyncMode) (asyncDecl : Name := .anonymous) : Environment :=
+  modifyStateCore ext env f asyncMode asyncDecl (.accounted id)
 
 /--
 Sets the extension state to the given value. See `AsyncMode` for details on how modifications from
@@ -1482,12 +1560,24 @@ different environment branches are reconciled.
 def setState {σ : Type} (ext : EnvExtension σ) (env : Environment) (s : σ) (asyncMode := ext.asyncMode) : Environment :=
   inline <| modifyState (asyncMode := asyncMode) ext env fun _ => s
 
-/-- The writes to `ext`'s state that no sanctioned writer accounted for (`modifyState`), in the view `asyncMode`
-reads: the checked view for `.sync`, the main-branch view for `.local` and `.mainOnly`. The per-command recorder
-compares it across a command. -/
-def unaccountedWrites {σ : Type} (ext : EnvExtension σ) (env : Environment) (asyncMode : AsyncMode) : Nat :=
-  let kenv := if asyncMode matches .sync then env.checked.get else env.base.private
-  kenv.unaccountedWrites[ext.idx]?.getD 0
+private def viewEnv (env : Environment) : View → Kernel.Environment
+  | .checked => env.checked.get
+  | .main => env.base.private
+
+/-- The writes to `ext`'s state in `view` that were counted as unaccounted (`modifyState`, or an accounted write
+through a record other than the registered one). The per-command recorder compares it across a command. -/
+def unaccountedWrites {σ : Type} (ext : EnvExtension σ) (env : Environment) (view : View) : Nat :=
+  (viewEnv env view).unaccountedWrites[ext.idx]?.getD 0
+
+-- `unsafe` fails to infer `Nonempty` here
+private unsafe def getStateInUnsafe {σ : Type} [Inhabited σ] (ext : EnvExtension σ) (env : Environment)
+    (view : View) : σ :=
+  -- safety: `ext`'s constructor is private, so we can assume the entry at `ext.idx` is of type `σ`
+  ext.getStateImpl (viewEnv env view).extensions
+
+/-- `ext`'s state in `view`. -/
+@[implemented_by getStateInUnsafe]
+opaque getStateIn {σ : Type} [Inhabited σ] (ext : EnvExtension σ) (env : Environment) (view : View) : σ
 
 -- `unsafe` fails to infer `Nonempty` here
 private unsafe def getStateUnsafe {σ : Type} [Inhabited σ] (ext : EnvExtension σ)
@@ -1617,6 +1707,8 @@ opaque registerCommandCacheExtension [Inhabited σ] (name : Name) (ext : EnvExte
 
 private def mkInitialExtensionStates : IO (Array EnvExtensionState) := EnvExtension.mkInitialExtStates
 
+private def registeredIdentities : IO (Array (Option EnvExtensionIdentity)) := EnvExtension.identitiesRef.get
+
 def mkEmptyEnvironment (trustLevel : UInt32 := 0) : IO Environment := do
   let initializing ← IO.initializing
   if initializing then throw (IO.userError "environment objects cannot be created during initialization")
@@ -1629,6 +1721,7 @@ def mkEmptyEnvironment (trustLevel : UInt32 := 0) : IO Environment := do
       header          := { trustLevel }
       extensions      := exts
       irBaseExts      := exts
+      extIdentities   := ← registeredIdentities
     }
     importRealizationCtx? := none
   }
@@ -1787,8 +1880,10 @@ structure PersistentEnvExtension (α : Type) (β : Type) (σ : Type) where
   scoped extensions) take the cells added in front of the old log, map states (`NameMap`, `NameSet`, `PHashMap`)
   take the bindings not shared with the old map and report any removal as `stateOnly`. A `PHashMap` delta lists
   bindings in key order, so the extension's exporter must not depend on the map's fold order. A write the delta may
-  not see (`setState`/`modifyState` of a log-based delta, a write through `toEnvExtension`) is counted in
-  `EnvExtension.unaccountedWrites`, and a command that makes one is recorded as `stateOnly`.
+  not see (`setState`/`modifyState` of a log-based delta, a write through `toEnvExtension`, a write through a record
+  other than the registered one) is counted in `EnvExtension.unaccountedWrites`, in each view it reaches, and a
+  command that makes one is recorded as `stateOnly`. The recorder reads both views of every extension, whatever
+  mode each write was called with.
   -/
   stateDelta?     : Option (σ → σ → StateDelta α)
   /--
@@ -1850,20 +1945,27 @@ def getModuleIREntries {α β σ : Type} [Inhabited σ] (ext : PersistentEnvExte
   -- safety: as in `getStateUnsafe`
   unsafe (ext.toEnvExtension.getStateImpl env.base.private.irBaseExts).importedEntries[m]!
 
+private unsafe def identityImpl {α β σ : Type} (ext : PersistentEnvExtension α β σ) (scopedDescr : USize := 0) :
+    EnvExtensionIdentity :=
+  { name := ext.name, addEntryFn := ptrAddrUnsafe ext.addEntryFn, seesDirectWrites := ext.stateDeltaSeesDirectWrites,
+    scopedDescr }
+
+/-- The identity an accounted write through `ext` presents (`EnvExtension.modifyStateAccounted`); `scopedDescr` is
+the scoped descriptor's address for a write through a scoped extension, else `0`. -/
+@[implemented_by identityImpl]
+private opaque identity {α β σ : Type} (ext : PersistentEnvExtension α β σ) (scopedDescr : USize := 0) :
+  EnvExtensionIdentity
+
 def addEntry {α β σ : Type} (ext : PersistentEnvExtension α β σ) (env : Environment) (b : β)
     (asyncMode := ext.toEnvExtension.asyncMode) (asyncDecl : Name := .anonymous) : Environment :=
-  ext.toEnvExtension.modifyStateAccounted (asyncMode := asyncMode) (asyncDecl := asyncDecl) env fun s =>
-    let state := ext.addEntryFn s.state b
-    { s with state := state }
+  ext.toEnvExtension.modifyStateAccounted (asyncMode := asyncMode) (asyncDecl := asyncDecl) env ext.identity
+    fun s => { s with state := ext.addEntryFn s.state b }
 
-/-- `addEntry` into the checked view only, for replaying a recorded checked-view delta of an extension read in that
-view (`.sync`, `.async _`): its main-branch view is replayed from its own recorded delta (`addEntry` with
-`asyncMode := .local`). -/
-private def addEntryChecked {α β σ : Type} (ext : PersistentEnvExtension α β σ) (env : Environment) (b : β) :
-    Environment :=
-  { env with checked := env.checked.map (sync := true) fun kenv =>
-    { kenv with extensions := unsafe ext.toEnvExtension.modifyStateImpl kenv.extensions fun s =>
-      { s with state := ext.addEntryFn s.state b } } }
+/-- `addEntry` into `view` alone, for replaying an entry recorded in that view. -/
+private def addEntryIn {α β σ : Type} (ext : PersistentEnvExtension α β σ) (env : Environment)
+    (view : EnvExtension.View) (b : β) : Environment :=
+  ext.toEnvExtension.writeViews env (match view with | .checked => .checked | .main => .main)
+    (.accounted ext.identity) fun s => { s with state := ext.addEntryFn s.state b }
 
 /-- Get the current state of the given extension in the given environment. -/
 def getState {α β σ : Type} [Inhabited σ] (ext : PersistentEnvExtension α β σ) (env : Environment)
@@ -1877,7 +1979,7 @@ def modifyState {α β σ : Type} (ext : PersistentEnvExtension α β σ) (env :
     (asyncMode := ext.toEnvExtension.asyncMode) (asyncDecl : Name := Name.anonymous) : Environment :=
   let g := fun (ps : PersistentEnvExtensionState α σ) => { ps with state := f ps.state }
   if ext.stateDeltaSeesDirectWrites then
-    ext.toEnvExtension.modifyStateAccounted (asyncMode := asyncMode) (asyncDecl := asyncDecl) env g
+    ext.toEnvExtension.modifyStateAccounted (asyncMode := asyncMode) (asyncDecl := asyncDecl) env ext.identity g
   else
     ext.toEnvExtension.modifyState (asyncMode := asyncMode) (asyncDecl := asyncDecl) env g
 
@@ -1952,6 +2054,7 @@ unsafe def registerPersistentEnvExtensionUnsafe {α β σ : Type} [Inhabited σ]
     statsFn         := descr.statsFn
   }
   persistentEnvExtensionsRef.modify fun pExts => pExts.push (unsafeCast pExt)
+  EnvExtension.setIdentity ext.idx fun _ => some (PersistentEnvExtension.identityImpl pExt 0)
   return pExt
 
 @[implemented_by registerPersistentEnvExtensionUnsafe]
@@ -2161,7 +2264,8 @@ private opaque runInitAttrs (env : Environment) (opts : Options) : IO Unit
 
 private def ensureExtensionsArraySize (env : Environment) : IO Environment := do
   let exts ← EnvExtension.ensureExtensionsArraySize env.base.private.extensions
-  return env.modifyCheckedAsync ({ · with extensions := exts })
+  let ids ← registeredIdentities
+  return env.modifyCheckedAsync ({ · with extensions := exts, extIdentities := ids })
 
 private partial def finalizePersistentExtensions (env : Environment) (mods : Array ModuleData) (opts : Options) : IO Environment := do
   loop 0 env
@@ -2556,6 +2660,7 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
     quotInit        := !imports.isEmpty -- We assume `Init.Prelude` initializes quotient module
     extensions      := exts
     irBaseExts      := exts
+    extIdentities   := ← registeredIdentities
     header     := {
       trustLevel, imports, moduleData, isModule
       modules      := modules.map (·.toEffectiveImport)
@@ -2781,6 +2886,10 @@ where
               (ext.getStateImpl oldEnv.extensions)
               (ext.getStateImpl newEnv.extensions)
               (consts.map (·.constInfo.name))) }
+        -- the realization's unaccounted writes to the state `replay` copies count in `kenv` too
+        let written := newEnv.unaccountedWrites[ext.idx]?.getD 0 - oldEnv.unaccountedWrites[ext.idx]?.getD 0
+        if written > 0 then
+          kenv := kenv.countUnaccountedWrite ext.idx written
     for c in consts do
       if skipExisting && (kenv.find? c.constInfo.name).isSome then
         continue
@@ -2916,14 +3025,16 @@ def realizeConst (env : Environment) (forConst : Name) (constName : Name)
     let newPrivateConsts := newPrivateConsts.map fun c =>
       let c := { c with isRealized := true }
       if c.exts?.isNone then
-        { c with exts? := some <| .pure realizeEnv'.base.private.extensions }
+        { c with exts? := some <| .pure realizeEnv'.base.private.extensions
+                 branchWrites? := some <| .pure realizeEnv'.base.private.unaccountedWrites }
       else c
     let numNewPublicConsts := realizeEnv'.asyncConstsMap.public.size - realizeEnv.asyncConstsMap.public.size
     let newPublicConsts := realizeEnv'.asyncConstsMap.public.revList.take numNewPublicConsts |>.reverse
     let newPublicConsts := newPublicConsts.map fun c =>
       let c := { c with isRealized := true }
       if c.exts?.isNone then
-        { c with exts? := some <| .pure realizeEnv'.base.private.extensions }
+        { c with exts? := some <| .pure realizeEnv'.base.private.extensions
+                 branchWrites? := some <| .pure realizeEnv'.base.private.unaccountedWrites }
       else c
     let exts ← EnvExtension.envExtensionsRef.get
     -- NOTE: We must ensure that `realizeEnv.localRealizationCtxMap` is not reachable via `res`
