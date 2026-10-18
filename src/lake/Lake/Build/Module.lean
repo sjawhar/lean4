@@ -1367,6 +1367,13 @@ structure UsekeySidecar where
   /-- For each workspace `extra` module of the `.usage`: the `contentHash` of its `.olean` and its
   `moduleDigest`. -/
   extra : NameMap (ModuleUsage.Digest × ModuleUsage.Digest)
+  /--
+  Set when a kept-module check accepted the module's `.olean` for imports other than those Lean
+  compiled it against (`acceptKept`): the `.usage`'s own digests describe the module's constants as
+  they were then, and a constant they mention may have changed meaning since. The module's own
+  check still reads the key; its importers do not (`importUsage?`).
+  -/
+  kept : Bool := false
   deriving TypeName
 
 /--
@@ -1450,6 +1457,7 @@ instance : FromJson UsekeySidecar where
       modsys := ← j.getObjValAs? ModuleUsage.Digest "modsys"
       closure := ← j.getObjValAs? ModuleUsage.Digest "closure"
       extra := ← nameDigestPairs (← j.getObjVal? "extra")
+      kept := (j.getObjValAs? Bool "kept").toOption.getD false
     }
 
 /-- Parses the bytes of a usage-cutoff sidecar: `none` if it has another format version than
@@ -1521,7 +1529,7 @@ def readOwnUsage (path : FilePath) (expected? : Option ModuleUsage.Digest := non
     error s!"{path}: read failed: {e}"
 
 /--
-The hashes of the files one usage-cutoff check (`Module.usageUpToDate`, `Module.writeUsekey`) has
+The hashes of the files one usage-cutoff check (`Module.usageVerdict`, `Module.writeUsekey`) has
 read, so that it reads each file once, and every `importUsage?` binding of the check is to the same bytes. A check
 never reuses another's: another workspace's build can rebuild a shared dependency between two checks, and nothing
 about a file short of its bytes shows that they did not change since (e.g., a write through a shared mapping can
@@ -1565,7 +1573,8 @@ module-system file, its `.usekey` is read first, and the `.usage` must be the on
 replace the three files while they are read; reading the key first makes every mixture of old and new files fail
 one of the two comparisons, so the check sees one state of the module or none. An `.olean` rewritten behind Lake's
 back (e.g., by `lean -o` of other contents, which leaves the old sidecars and `.hash`) is not checked against the
-old `.usage` either. A module-system file's bytes are pinned by `modsysHash` instead.
+old `.usage` either. A module-system file's bytes are pinned by `modsysHash` instead. Nor is a `.usage` whose module
+a kept-module check kept (`UsekeySidecar.kept`): its digests may be stale, so an importer that used it is not skipped.
 -/
 def importUsage? (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) (m : Name) :
     JobM (Option (FilePath × UsageImport)) := do
@@ -1575,6 +1584,7 @@ def importUsage? (hashes : ContentHashes) (importArts : NameMap ImportArtifacts)
   if arts.oleanServer?.isSome then
     return (olean, ·) <$> (← readUsageSidecar UsageImport usageFile)
   let some key ← readUsageSidecar UsekeySidecar (olean.withExtension "usekey") | return none
+  if key.kept then return none
   let some usage ← readUsageSidecar UsageImport usageFile (expected? := key.usage) | return none
   unless key.olean == (← contentHash hashes olean) do return none
   return some (olean, usage)
@@ -1716,39 +1726,67 @@ def Module.buildLean
   if let some modsysBefore := modsysBefore? then mod.writeUsekey presetup setup.importArts modsysBefore
   return arts
 
+/-- What a stale module's usage records say about it (`Module.usageVerdict`). -/
+inductive UsageVerdict
+  /-- Nothing the module used changed meaning: its compile is skipped. -/
+  | upToDate
+  /--
+  The machinery the module used while elaborating is unchanged, but a constant it used changed
+  meaning, or its closure's compiler tables, import order or specialization providers changed:
+  its proofs may be re-checked instead of compiled (`keptCandidate?`).
+  -/
+  | recheck
+  /-- A module whose machinery it used changed, or its records cannot say: it compiles. -/
+  | compile (reason : String)
+
 /--
-Whether nothing the module used changed meaning since Lean wrote its `.usage`: its `.usekey` (read first) was written
-from its current `.usage` (`UsekeySidecar.usage`) and `.olean`, its `.usage` covers its closure (`importArts`,
-`UsageSidecar.coversClosure`), its local inputs are unchanged, no module-system module in its closure changed
-(`modsysHash`), its closure is unchanged (`closureHash`), every constant it used from a workspace module has the
-same digest in that module's current `.usage` (one its key binds to its current `.olean`, `importUsage?`), every
-workspace `extra` module has the same `.olean` hash and `moduleDigest`, and every specialization-cache key it looked
-up has the same providers (`UsageSidecar.specProvidersUnchanged`). Every `.olean` hash is of the file's bytes
-(`contentHash`), never read from a `.hash` file.
+Decides a stale module from its usage records. `upToDate` if nothing the module used changed meaning since Lean
+wrote its `.usage`: its `.usekey` (read first) was written from its current `.usage` (`UsekeySidecar.usage`) and
+`.olean`, its `.usage` covers its closure (`importArts`, `UsageSidecar.coversClosure`), its local inputs are
+unchanged, no module-system module in its closure changed (`modsysHash`), its closure is unchanged (`closureHash`),
+every constant it used from a workspace module has the same digest in that module's current `.usage` (one its key
+binds to its current `.olean`, `importUsage?`), every workspace `extra` module has the same `.olean` hash and
+`moduleDigest`, and every specialization-cache key it looked up has the same providers
+(`UsageSidecar.specProvidersUnchanged`). Every `.olean` hash is of the file's bytes (`contentHash`), never read from
+a `.hash` file.
+
+Otherwise the rule for kept modules applies: when the machinery the module used while
+elaborating changed (an `extra` module: its tactics, macros, elaborators, simp lemmas or instances),
+it compiles, and so it does when its records cannot show that machinery unchanged; when only the
+meaning of constants it used changed, or only its closure, it is `recheck`.
 -/
-def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
-    (importArts : NameMap ImportArtifacts) : JobM Bool := do
-  let some key ← readUsageSidecar UsekeySidecar mod.usekeyFile | return false
-  let some (usage, _) ← readOwnUsage mod.usageFile (expected? := key.usage) | return false
-  if usage.noskip || key.localHash != presetup.localTrace.hash || !usage.coversClosure importArts then
-    return false
+def Module.usageVerdict (mod : Module) (presetup : ModulePreSetup)
+    (importArts : NameMap ImportArtifacts) : JobM UsageVerdict := do
+  let some key ← readUsageSidecar UsekeySidecar mod.usekeyFile
+    | return .compile "it has no usage key"
+  let some (usage, _) ← readOwnUsage mod.usageFile (expected? := key.usage)
+    | return .compile "its usage record is missing or is not the one its key was written from"
+  if usage.noskip then return .compile "its usage record may be incomplete"
+  if key.localHash != presetup.localTrace.hash then return .compile "its local inputs changed"
+  unless usage.coversClosure importArts do
+    return .compile "a module of its closure had no usage digests when it was compiled"
   let hashes ← IO.mkRef {}
-  unless (← contentHash hashes mod.oleanFile) == key.olean do return false
-  unless (← modsysHash hashes importArts) == key.modsys do return false
-  unless (← closureHash hashes presetup importArts) == some key.closure do return false
+  unless (← contentHash hashes mod.oleanFile) == key.olean do
+    return .compile "its usage record describes another .olean"
+  unless (← modsysHash hashes importArts) == key.modsys do
+    return .compile "a module-system file of its closure changed"
+  for m in usage.extra do
+    if (← findModule? m).isNone then continue
+    let some (oleanHash, digest) := key.extra.find? m
+      | return .compile s!"its usage key does not record {m}, whose machinery it used"
+    let some (olean, imp) ← importUsage? hashes importArts m
+      | return .compile s!"{m}, whose machinery it used, has no current usage record"
+    unless (← contentHash hashes olean) == oleanHash && imp.moduleDigest == digest do
+      return .compile s!"{m}, whose machinery it used, changed"
   -- A module outside the workspace is a toolchain module, pinned by the Lean githash in `localTrace`.
   for (m, consts) in usage.used do
     if (← findModule? m).isNone then continue
-    let some (_, imp) ← importUsage? hashes importArts m | return false
+    let some (_, imp) ← importUsage? hashes importArts m | return .recheck
     for (c, d) in consts do
-      unless imp.own.find? c == some d do return false
-  for m in usage.extra do
-    if (← findModule? m).isNone then continue
-    let some (oleanHash, digest) := key.extra.find? m | return false
-    let some (olean, imp) ← importUsage? hashes importArts m | return false
-    unless (← contentHash hashes olean) == oleanHash do return false
-    unless imp.moduleDigest == digest do return false
-  usage.specProvidersUnchanged hashes importArts
+      unless imp.own.find? c == some d do return .recheck
+  unless (← closureHash hashes presetup importArts) == some key.closure do return .recheck
+  unless (← usage.specProvidersUnchanged hashes importArts) do return .recheck
+  return .upToDate
 
 /--
 Whether usage cutoff applies to the module: cutoff is enabled, the module is neither a
@@ -1761,28 +1799,31 @@ def Module.usageCutoffApplies (mod : Module) (presetup : ModulePreSetup) : JobM 
 
 /--
 Skips compiling a module whose trace is stale if usage cutoff applies to it
-(`Module.usageCutoffApplies`), nothing it used changed meaning (`Module.usageUpToDate`), and its outputs are
-still what the saved trace describes (`Module.keepOutputs?`): replays its saved log and rewrites its trace with
-`depTrace`, which vouches for those outputs under the new input hash. Otherwise, builds it with `compile`, passing the
-module setup the check computed, if it computed one. With `cacheWith? = some useLocalFile`, the outputs it returns
-are in the cache: kept ones were checked while saving them (`recacheOutputArtifacts?`), built ones are saved after
-the build.
+(`Module.usageCutoffApplies`), its verdict (`Module.usageVerdict`) is `upToDate`, and its outputs are still what
+the saved trace describes (`Module.keepOutputs?`): replays its saved log and rewrites its trace with `depTrace`,
+which vouches for those outputs under the new input hash. Otherwise, builds it with `compile`, passing the verdict
+and the module setup the check computed, if the cutoff applies. With `cacheWith? = some useLocalFile`, the outputs
+it returns are in the cache: kept ones were checked while saving them (`recacheOutputArtifacts?`), built ones are
+saved after the build.
 -/
 def Module.skipOrBuild (mod : Module) (presetup : ModulePreSetup) (savedTrace : SavedTrace)
     (depTrace : BuildTrace) (cacheWith? : Option Bool := none)
-    (compile : Option ModuleSetup → JobM ModuleOutputArtifacts := (mod.buildLean presetup ·)) :
+    (compile : Option (UsageVerdict × ModuleSetup) → JobM ModuleOutputArtifacts :=
+      fun d? => mod.buildLean presetup (d?.map (·.2))) :
     JobM ModuleOutputArtifacts := do
-  let build (setup? : Option ModuleSetup) : JobM ModuleOutputArtifacts := do
-    let arts ← compile setup?
+  let build (decided? : Option (UsageVerdict × ModuleSetup)) : JobM ModuleOutputArtifacts := do
+    let arts ← compile decided?
     match cacheWith? with
     | some useLocalFile => mod.cacheOutputArtifacts presetup.isModule useLocalFile presetup.postponeCompile
     | none => return arts
   let .ok data := savedTrace | build none
   unless (← mod.usageCutoffApplies presetup) do return ← build none
   let setup ← mkModuleSetup mod presetup
-  unless (← mod.usageUpToDate presetup setup.importArts) do return ← build setup
+  let verdict ← mod.usageVerdict presetup setup.importArts
+  unless verdict matches .upToDate do return ← build (some (verdict, setup))
   let some arts ← mod.keepOutputs? presetup.isModule presetup.postponeCompile savedTrace.moduleOutputDescrs?
-      cacheWith? | build setup
+      cacheWith?
+    | build (some (.compile "its outputs are not what its trace describes", setup))
   mod.checkSourceUnchanged presetup
   updateAction .replay
   data.log.replay
@@ -1992,13 +2033,14 @@ where
   /-
   Compiles the module (with its `ModuleSetup`, if the caller computed it), unless its existing
   outputs are a kept candidate (`keptCandidate?`) and the kept-module checker accepts them for the
-  module's current imports. `Module.skipOrBuild` calls it for a module the usage cutoff does not skip.
+  module's current imports. `Module.skipOrBuild` calls it for a module the usage cutoff does not skip,
+  with the module's verdict when the cutoff applies.
   -/
-  checkOrBuild (presetup : ModulePreSetup) (savedTrace : SavedTrace) (setup? : Option ModuleSetup)
+  checkOrBuild (presetup : ModulePreSetup) (savedTrace : SavedTrace)
+    (decided? : Option (UsageVerdict × ModuleSetup))
   : JobM ModuleOutputArtifacts := do
     if let some checker := (← getBuildContext).keptChecker? then
-      if let some (data, descrs) ← keptCandidate? presetup savedTrace then
-        let setup ← setup?.getDM (mkModuleSetup mod presetup)
+      if let some (data, descrs, setup) ← keptCandidate? presetup savedTrace decided? then
         let cwd ← IO.currentDir
         let abs (f : FilePath) := if f.isAbsolute then f else cwd / f
         match (← checker.check mod.name (abs mod.oleanFile) (abs presetup.srcFile) (toJson setup)) with
@@ -2009,16 +2051,21 @@ where
             not {descrs.olean.hash} as recorded in the module's trace; compiling"
         | .rejected reason =>
           logInfo s!"kept-module check: {reason}; compiling"
-    mod.buildLean presetup setup?
+    mod.buildLean presetup (decided?.map (·.2))
   /-
-  The saved trace and its output descriptions if the module's existing outputs may be kept for
-  its current input: they were produced from the same local inputs (`ModulePreSetup.localTrace`),
-  so only the module's imports differ, and the files are the ones the trace describes. A
-  `module` file, a module linked into a shared library (`precompileModules`), and a module
-  excluded from kept checks are never candidates, nor is any module of a `--no-build` build.
+  The saved trace, its output descriptions and the module's setup if the module's existing outputs
+  may be kept for its current input: they were produced from the same local inputs
+  (`ModulePreSetup.localTrace`), so only the module's imports differ, the files are the ones the
+  trace describes, and the usage cutoff's verdict is `recheck`. That verdict is the rule for kept
+  modules: when the machinery the module used while elaborating is unchanged, re-checking its proofs
+  is enough; when it changed, or the records cannot tell, the module compiles. Without the cutoff's
+  verdict there is no candidate. A `module` file, a module linked into a shared library
+  (`precompileModules`), and a module excluded from kept checks are never candidates, nor is any
+  module of a `--no-build` build.
   -/
   keptCandidate? (presetup : ModulePreSetup) (savedTrace : SavedTrace)
-  : JobM (Option (BuildMetadata × ModuleOutputDescrs)) := do
+    (decided? : Option (UsageVerdict × ModuleSetup))
+  : JobM (Option (BuildMetadata × ModuleOutputDescrs × ModuleSetup)) := do
     if (← getNoBuild) || presetup.isModule || mod.shouldPrecompile || (← isKeptExcluded) then
       return none
     let .ok data := savedTrace | return none
@@ -2031,7 +2078,12 @@ where
       unless (← hashIs mod.cFile c) do return none
     if let some bc := descrs.bc? then
       unless (← hashIs mod.bcFile bc) do return none
-    return some (data, descrs)
+    match decided? with
+    | some (.recheck, setup) => return some (data, descrs, setup)
+    | some (.compile reason, _) =>
+      logInfo s!"kept-module check: not asked: {reason}; compiling"
+      return none
+    | _ => return none
   hashIs (file : FilePath) (descr : ArtifactDescr) : BaseIO Bool := do
     match (← (computeFileHash file).toBaseIO) with
     | .ok hash => return hash == descr.hash
@@ -2039,7 +2091,10 @@ where
   /-
   Records the module's existing outputs, which the kept-module checker accepted, as the outputs of
   its current input. Their `.hash` files are rewritten from the hashes `keptCandidate?` computed.
-  The module's `.ltar` was packed with the previous trace, so it is removed.
+  The module's `.ltar` was packed with the previous trace, so it is removed. Its usage key is marked
+  kept (`UsekeySidecar.kept`): the `.usage` describes its constants as Lean compiled them, and a
+  constant they mention may mean something new now, so its importers must not trust its digests
+  (`importUsage?`). A key that cannot be read is removed instead.
   -/
   acceptKept (presetup : ModulePreSetup) (setup : ModuleSetup) (data : BuildMetadata)
     (descrs : ModuleOutputDescrs)
@@ -2054,6 +2109,13 @@ where
       clearFileHash mod.ltarFile
       createParentDirs mod.setupFile
       IO.FS.writeFile mod.setupFile (toJson setup).pretty
+      let key? ← (IO.FS.readFile mod.usekeyFile).toBaseIO
+      -- under an artifact cache the key is a read-only link: it is replaced, never written through
+      removeFileIfExists mod.usekeyFile
+      clearFileHash mod.usekeyFile
+      if let .ok contents := key? then
+        if let .ok key@(.obj _) := Json.parse contents then
+          IO.FS.writeFile mod.usekeyFile (key.setObjVal! "kept" true).compress
       let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
       return {arts with keptFrom? := descrs.keptFrom? <|> some data.depHash}
   -- Unpacks the module's own `.ltar` (stamped with `inputHash`) into the build directory and

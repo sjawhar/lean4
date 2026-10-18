@@ -345,12 +345,17 @@ def monitorJob (ctx : MonitorContext) (job : Job α) : BaseIO (BuildResult α) :
 The kept-module check settings from the environment: the checker command `LAKE_KEPT_CHECKER`, with
 `LAKE_KEPT_CHECKER_TIMEOUT` (seconds without a reply, while requests are outstanding, before the
 checker is killed; positive, default 900), and `LAKE_KEPT_EXCLUDE`, a file of module names, one per
-line. The checker runs with the workspace toolchain's sysroot as `LEAN_SYSROOT`.
+line. The checker runs with the workspace toolchain's sysroot as `LEAN_SYSROOT`. It needs the usage
+cutoff (`LAKE_USAGE_CUTOFF`), whose records say which modules may be re-checked instead of compiled
+(`Module.usageVerdict`).
 -/
 def mkKeptCheck (ws : Workspace) : IO (Option KeptChecker × Lean.NameSet) := do
   let checker? ← do
     let some cmd := (← IO.getEnv "LAKE_KEPT_CHECKER") | pure none
     if cmd.isEmpty then pure none else
+    unless ws.lakeEnv.usageCutoff do
+      throw <| IO.userError "LAKE_KEPT_CHECKER needs the usage cutoff, whose records say which \
+        modules may be re-checked instead of compiled, but LAKE_USAGE_CUTOFF turns it off"
     let timeout ← do
       let some s := (← IO.getEnv "LAKE_KEPT_CHECKER_TIMEOUT") | pure 900
       let some n := s.toNat?
