@@ -16,11 +16,11 @@ the Lean functions the C++ IR interpreter (`src/library/ir_interpreter.cpp`) cal
 unless every reachable extension is classified into one of the coverage classes the usage-cutoff
 machinery relies on: `R1` (own-declaration entries, covered by the declaration's own digest), `R5`
 (entries one module writes about another's declarations, covered by the writer's closure digest),
-`specCache` (a cache keyed by expression, checked per key by the keys the module looked up), `viaOwnEntries` (read only while
-compiling the declaration it belongs to, so its effect shows in that declaration's own digested entries),
-`moduleLocal` (never
-exported to `.olean` in a way another module's compile can observe), or `recording` (written by
-usage/extra-module-use bookkeeping, never read to generate code). An extension absent from the
+`specCache` (a cache keyed by expression, checked per key by the keys the module looked up),
+`viaOwnEntries` (read only while compiling the declaration it belongs to, so its effect shows in that
+declaration's own digested entries), `moduleLocal` (never exported to `.olean` in a way another
+module's compile can observe), or `recording` (written by usage/extra-module-use bookkeeping, never
+read to generate code). An extension absent from the
 table defaults to `notRead` ("unreachable from the compiler entry points"), correct only when the
 BFS does not find it reachable; a reachable extension defaulting to (or explicitly classified)
 `notRead`, or explicitly marked `uncovered` (fits no class), fails the test. The table may not name
@@ -46,12 +46,13 @@ looked-up key in its closure change; only keys and specialization names are comp
 folder tables (`R5`), entries are in `tableDigest` with the installer's or folder's digest, and state written
 without an entry is not exported, so it changes only the writing module's own compile.
 
-The classes are tied to the digest code: every table classified `R1` or `R1R5` must be listed in
-`ModuleUsage.digestedOwnTables` (what `attrsEnc`, `entriesEnc` and `CompiledDigest.irMeta` read for an own name,
-and the package), every `R5` or `R1R5` table in `ModuleUsage.digestedCrossTables` (what `tableDigest` reads for
-other modules' names), and both lists may name only registered extensions. `viaOwnEntries` is the one class for a
-table the digest code does not read itself: its effect reaches importers only through the declaration's own
-digested entries.
+The classification is compared with two hand-written lists, not with what the digest code reads: every table
+classified `R1` or `R1R5` must be listed in `ModuleUsage.digestedOwnTables` (src/Lean/Util/ModuleUsage/Compiled.lean),
+every `R5` or `R1R5` table in `ModuleUsage.digestedCrossTables` (src/Lean/Util/ModuleUsage.lean), and both lists
+may name only registered extensions. This test does not check that `attrsEnc`, `entriesEnc`,
+`isDeclMeta` or `tableDigest` read a listed table; the harness's `cov_*` cases catch a read
+dropped from them. `viaOwnEntries` is the one class for a table the digest code does not read itself: its
+effect reaches importers only through the declaration's own digested entries.
 -/
 open Lean
 
@@ -96,10 +97,10 @@ present and non-`notRead`/`uncovered`; everything else defaults to `notRead`. -/
 def classification : List (Name × UsageClass × String) := [
   (`Lean.Compiler.LCNF.monoTypeExt, .R1,
     "Mono-phase type of a declaration, written for inductives and constructors by `compileInductives` \
-    inside a compiler run (src/Lean/Compiler/LCNF/MonoTypes.lean:103-106) and, for other names, on a cache \
-    miss in the mono phase (:117-125). Not a function of the kernel data alone: `toMonoType` \
-    (:61-97) converts the base type (`toLCNFType`: `whnfD`, `whnf` at `.all` transparency, the exposure \
-    scope, src/Lean/Compiler/LCNF/Types.lean:132-160) and reads the trivial-structure caches. Encoded \
+    (src/Lean/Compiler/LCNF/MonoTypes.lean:103-106) and, for other names, on a cache miss in the mono \
+    phase (:117-125). Not a function of the kernel data alone: `toMonoType` \
+    (:56-93) converts the base type (`toLCNFType`: `whnfD`, `whnf` at `.all` transparency, the exposure \
+    scope, src/Lean/Compiler/LCNF/Types.lean:130-168) and reads the trivial-structure caches. Encoded \
     per own name by `entriesEnc` (`monoTypeExt.find?`)."),
   (`Lean.Meta.instanceExtension, .R1R5,
     "Entries record a decl as a class instance; covered by R1 for its own declarations and R5 for \
@@ -108,13 +109,13 @@ def classification : List (Name × UsageClass × String) := [
     "`markMatcherLike` (src/Lean/Meta/Match/MatcherInfo.lean:192-193) is public; the elaborator calls it \
     in src/Lean/Meta/Constructions/CasesOnSameCtor.lean:105 for the `.het` auxiliary it just built. \
     `attrsEnc` encodes the tag of each own declaration (`Meta.isMatcherLikeCore`)."),
-  (`Lean.noncomputableExt, .R1, "Own-declaration marker; written only by the defining module (design R1 list)."),
+  (`Lean.noncomputableExt, .R1, "Own-declaration marker, in `attrsEnc`. The only writer is `TagDeclarationExtension.tag`, directly or through `addNoncomputable` (src/Lean/Compiler/NoncomputableAttr.lean:19-20); it asserts the declaration is not imported (src/Lean/EnvExtension.lean:120) and a failed assertion returns the unchanged environment. `isTagged` of an imported name reads only its own module's entries (design R1 list)."),
   (`reducibilityExtra, .R5, "Entries another module may add for an imported decl's reducibility (design R5 list)."),
-  (`Lean.Compiler.LCNF.baseExt, .R1, "Own-declaration LCNF base-phase code; written only by the defining module (design R1 list)."),
-  (`Lean.builtinInitAttr, .R1, "Own-declaration marker; written only by the defining module (design R1 list)."),
-  (`Lean.Compiler.LCNF.specExtension, .R1, "Own-declaration spec entries; written only by the defining module (design R1 list)."),
-  (`Lean.Compiler.inlineAttrs, .R1, "Own-declaration marker; written only by the defining module (design R1 list)."),
-  (`Lean.neverExtractAttr, .R1, "Own-declaration marker; written only by the defining module (design R1 list)."),
+  (`Lean.Compiler.LCNF.baseExt, .R1, "Own-declaration LCNF base-phase code, read by `entriesEnc` whoever wrote it. An entry written for another module's name is not read: importers resolve a name's code through its defining module (design R1 list)."),
+  (`Lean.builtinInitAttr, .R1, "Own-declaration marker, in `attrsEnc`. The `builtin_init` handler rejects imported declarations (src/Lean/Attributes.lean:295-296), as does `ParametricAttribute.setParam` (:329-330), which `setBuiltinInitAttr` (src/Lean/Compiler/InitAttr.lean:146-147) and `declareBuiltin` (:149-157, a fresh name) call. `getParam?` of an imported name reads only its own module's entries (:313-318) (design R1 list)."),
+  (`Lean.Compiler.LCNF.specExtension, .R1, "Own-declaration spec entries, read by `entriesEnc` whoever wrote them. An entry written for another module's name is not read: importers resolve a name's entries through its defining module (design R1 list)."),
+  (`Lean.Compiler.inlineAttrs, .R1, "Own-declaration marker, in `attrsEnc`. The five inline attributes' handler rejects imported declarations (src/Lean/Attributes.lean:381-382), as does `EnumAttributes.setValue` (:403-404), which `Compiler.setInlineAttribute` (src/Lean/Compiler/InlineAttrs.lean:80-81) calls. `getValue` of an imported name reads only its own module's entries (:394-398) (design R1 list)."),
+  (`Lean.neverExtractAttr, .R1, "Own-declaration marker, in `attrsEnc`. The attribute handler rejects imported declarations (src/Lean/Attributes.lean:210-211), as does `TagAttribute.setTag` (:225-226). `hasTag` of an imported name reads only its own module's entries (:232-233) (design R1 list)."),
   (`Lean.auxRecExt, .R1,
     "`markAuxRecursor` (src/Lean/AuxRecursor.lean:29-30) is public; the elaborator calls it right after \
     the `addDecl`/`addAndCompile` of the aux recursor each generator builds (e.g. \
@@ -125,34 +126,34 @@ def classification : List (Name × UsageClass × String) := [
     "`addProjectionFnInfo` (src/Lean/ProjFns.lean:33-34) is public; the elaborator calls it in \
     `mkProjections` (src/Lean/Meta/Structure.lean:117) for the projection it is synthesizing. `attrsEnc` \
     encodes the entry of each own declaration (`getProjectionFnInfo?`)."),
-  (`Lean.Compiler.specializeAttr, .R1, "Own-declaration marker; written only by the defining module (design R1 list)."),
+  (`Lean.Compiler.specializeAttr, .R1, "Own-declaration marker, in `attrsEnc`. The `specialize` handler rejects imported declarations (src/Lean/Attributes.lean:295-296), as does `ParametricAttribute.setParam` (:329-330); it has no other writer. `getParam?` of an imported name reads only its own module's entries (:313-318) (design R1 list)."),
   (Lean.mkPrivateNameCore `Lean.Compiler.ModPkgExt `Lean.modPkgExt, .R1,
     "The module's package, included in every digest of the module (design R1 list)."),
   (Lean.mkPrivateNameCore `Lean.Compiler.LCNF.ToImpureType `Lean.Compiler.LCNF.impureTrivialStructureInfoExt, .R1,
     "Whether an inductive's impure representation is a trivial structure, written by `compileInductives` \
-    inside a compiler run (src/Lean/Compiler/LCNF/ToImpureType.lean:38-40,54-55,346). Not a function of \
-    the kernel data alone: the predicate `impureIrrelevantType` (:44-50) runs `whnfD`, `isProp` and \
+    (src/Lean/Compiler/LCNF/ToImpureType.lean:38-40,54-55,346). Not a function of \
+    the kernel data alone: the predicate `impureIrrelevantType` (:47-51) runs `whnfD`, `isProp` and \
     `isTypeFormerType`, and the constructor fields are read at default transparency \
     (src/Lean/Compiler/LCNF/Irrelevant.lean:21-72). Encoded per own inductive by `entriesEnc` \
     (`findTrivialImpureStructureInfo?`)."),
-  (`Lean.Compiler.weakSpecializeAttr, .R1, "Own-declaration marker; written only by the defining module (design R1 list)."),
-  (`Lean.Compiler.LCNF.UnreachableBranches.functionSummariesExt, .R1, "Own-declaration summaries; written only by the defining module (design R1 list)."),
-  (`Lean.exportAttr, .R1, "Own-declaration marker; written only by the defining module (design R1 list)."),
+  (`Lean.Compiler.weakSpecializeAttr, .R1, "Own-declaration marker, in `attrsEnc`. The attribute handler rejects imported declarations (src/Lean/Attributes.lean:210-211), as does `TagAttribute.setTag` (:225-226). `hasTag` of an imported name reads only its own module's entries (:232-233) (design R1 list)."),
+  (`Lean.Compiler.LCNF.UnreachableBranches.functionSummariesExt, .R1, "Own-declaration summaries, read by `entriesEnc` whoever wrote them. An entry written for another module's name is not read: importers resolve a name's summary through its defining module (design R1 list)."),
+  (`Lean.exportAttr, .R1, "Own-declaration marker, in `attrsEnc`. The `export` handler rejects imported declarations (src/Lean/Attributes.lean:295-296), as does `ParametricAttribute.setParam` (:329-330); it has no other writer. `getParam?` of an imported name reads only its own module's entries (:313-318) (design R1 list)."),
   (`Lean.IR.declMapExt, .R1,
     "Own-declaration IR code, read by `entriesEnc` for each own name, whoever wrote it. Importers resolve a \
     name's IR through its defining module (`findExtEntry?` by module index), so an entry written for another \
     module's name is not read, except a name the module claims (`extraConstNames`) that has no \
     compiler-generated shape, which `tableDigest` holds (`claimedForeignNames`)."),
   (Lean.mkPrivateNameCore `Lean.Compiler.LCNF.ToImpureType `Lean.Compiler.LCNF.impureTypeExt, .R1,
-    "IR type of an inductive, written by `setImpureType` from `compileInductives` inside a compiler run \
+    "IR type of an inductive, written by `setImpureType` from `compileInductives` \
     (src/Lean/Compiler/LCNF/ToImpureType.lean:121-124,349). Not a function of the kernel data alone: \
     `computeImpureType` (:97-118) walks the constructor field types with `forallTelescope` and converts \
     them through `toLCNFType`/`toMonoType`, which use `whnfD`, `whnf` at `.all` transparency and the \
-    exposure scope (src/Lean/Compiler/LCNF/Types.lean:132-160). Encoded per own inductive by `entriesEnc` \
+    exposure scope (src/Lean/Compiler/LCNF/Types.lean:130-168). Encoded per own inductive by `entriesEnc` \
     (`findImpureType?`)."),
   (`Lean.indirectModUseExt, .recording,
     "Infrastructure for `shake`'s extra-import-dependency recording (src/Lean/ExtraModUses.lean:14-16); \
-    only consulted by `recordExtraModUseFromDecl` (src/Lean/ExtraModUses.lean:129) to propagate a \
+    only consulted by `recordExtraModUseFromDecl` (src/Lean/ExtraModUses.lean:134) to propagate a \
     further bookkeeping entry, never to decide what code is generated."),
   (Lean.mkPrivateNameCore `Lean.Structure `Lean.structureExt, .R1,
     "`registerStructure` (src/Lean/Structure.lean:111-122) and `setStructureParents` (:128-131) are called \
@@ -174,7 +175,7 @@ def classification : List (Name × UsageClass × String) := [
     imported module with digests as an extra use (`recordCompilerCode`)."),
   (Lean.mkPrivateNameCore `Lean.ExtraModUses `Lean.extraModUses, .recording,
     "Infrastructure for `shake`'s extra-import-dependency recording (src/Lean/ExtraModUses.lean:14-16); \
-    written/read by `recordExtraModUseCore`/`recordExtraModUseFromDecl` (src/Lean/ExtraModUses.lean:96-99,123-130) \
+    written/read by `recordExtraModUseCore`/`recordExtraModUseFromDecl` (src/Lean/ExtraModUses.lean:101-110,128-135) \
     purely to track additional imports `shake` should require, never to decide generated code."),
   (`Lean.Compiler.LCNF.postponedCompileDeclsExt, .moduleLocal,
     "`addImportedFn := fun _ => {}` (src/Lean/Compiler/LCNF/Main.lean:103) discards any imported \
@@ -184,15 +185,15 @@ def classification : List (Name × UsageClass × String) := [
     module in a separate process (src/LeanIR.lean:151), never a downstream module's ordinary \
     compile. The entries never cross the ordinary import graph the usage-cutoff machinery covers."),
   (Lean.mkPrivateNameCore `Lean.Compiler.LCNF.ToImpureType `Lean.Compiler.LCNF.ctorLayoutExt, .R1,
-    "Runtime layout of a constructor, written by `compileInductives` inside a compiler run \
+    "Runtime layout of a constructor, written by `compileInductives` \
     (src/Lean/Compiler/LCNF/ToImpureType.lean:227-231,354). Not a function of the kernel data alone: \
     `fillCache` runs `forallTelescopeReducing` on the constructor type (:237) and converts each field \
     type through the base, mono and impure type caches, at default transparency. Encoded per own \
     constructor by `entriesEnc` (`findCtorLayout?`)."),
-  (Lean.mkPrivateNameCore `Lean.Compiler.MetaAttr `Lean.metaExt, .R1, "Own-declaration `meta` mark; written only by the defining module (design R1 list)."),
-  (`Lean.regularInitAttr, .R1, "Own-declaration marker; written only by the defining module (design R1 list)."),
+  (Lean.mkPrivateNameCore `Lean.Compiler.MetaAttr `Lean.metaExt, .R1, "Own-declaration `meta` mark, in `attrsEnc`. The only writer is `markMeta` (src/Lean/Compiler/MetaAttr.lean:22-23, called at src/Lean/AddDecl.lean:252 and src/Lean/Elab/MutualDef.lean:1080,1215), which goes through `TagDeclarationExtension.tag`; it asserts the declaration is not imported (src/Lean/EnvExtension.lean:120) and a failed assertion returns the unchanged environment (design R1 list)."),
+  (`Lean.regularInitAttr, .R1, "Own-declaration marker, in `attrsEnc`. The `init` handler rejects imported declarations (src/Lean/Attributes.lean:295-296), as does `ParametricAttribute.setParam` (:329-330); it has no other writer. `getParam?` of an imported name reads only its own module's entries (:313-318) (design R1 list)."),
   (Lean.mkPrivateNameCore `Lean.Compiler.LCNF.MonoTypes `Lean.Compiler.LCNF.trivialStructureInfoExt, .R1,
-    "Trivial-structure info of an inductive, written by `compileInductives` inside a compiler run \
+    "Trivial-structure info of an inductive, written by `compileInductives` \
     (src/Lean/Compiler/LCNF/MonoTypes.lean:20-23, ToImpureType.lean:345). Not a function of the kernel \
     data alone: the computation reads the constructor fields at default transparency \
     (`Meta.forallTelescopeReducing`, `isProp`, `isTypeFormerType`: src/Lean/Compiler/LCNF/Irrelevant.lean:21-72), \
@@ -206,7 +207,7 @@ def classification : List (Name × UsageClass × String) := [
     compiled entries and, for specializations, in the providers importers check. A folder runs inside the \
     compiler and can read any environment state, so a module compiled with any folder beyond the built-in ones \
     has every imported module with digests as an extra use (`recordCompilerCode`)."),
-  (`Lean.Compiler.LCNF.monoExt, .R1, "Own-declaration LCNF mono-phase code; written only by the defining module (design R1 list)."),
+  (`Lean.Compiler.LCNF.monoExt, .R1, "Own-declaration LCNF mono-phase code, read by `entriesEnc` whoever wrote it. An entry written for another module's name is not read: importers resolve a name's code through its defining module (design R1 list)."),
   (Lean.mkPrivateNameCore `Lean.AuxRecursor `Lean.sparseCasesOnExt, .R1,
     "`markSparseCasesOn` (src/Lean/AuxRecursor.lean:57-58) is public; the elaborator calls it in \
     src/Lean/Meta/Constructions/CtorElim.lean:206 and src/Lean/Meta/Constructions/SparseCasesOn.lean:149 \
@@ -215,7 +216,7 @@ def classification : List (Name × UsageClass × String) := [
   (Lean.mkPrivateNameCore `Lean.Compiler.MetaAttr `Lean.declMetaExt, .R1R5,
     "`setDeclMeta` (src/Lean/Compiler/MetaAttr.lean:65-69) is public with no ownership check, and \
     `IR.inferMeta` also marks the `meta` closure of an own declaration (src/Lean/Compiler/IR/Meta.lean:32-49); \
-    `isDeclMeta` (:48-62) decides which IR bodies a module exports for interpretation \
+    `isDeclMeta` (src/Lean/Compiler/MetaAttr.lean:48-62) decides which IR bodies a module exports for interpretation \
     (src/Lean/Compiler/IR/CompilerM.lean:94-108,233). `isDeclMeta` of an own declaration is in \
     `attrsEnc` (R1), an entry for another module's declaration is in the cross-module table digest (R5)."),
   (Lean.mkPrivateNameCore `Lean.Compiler.LCNF.Specialize `Lean.Compiler.LCNF.Specialize.specCacheExt, .specCache,
@@ -235,12 +236,12 @@ def classification : List (Name × UsageClass × String) := [
     "`recordOriginalConstKind` (src/Lean/AddDecl.lean:108-110) is public and `addDeclCore` (:112,159-161) \
     writes the kind of the declaration it adds when the exported constant differs. `attrsEnc` encodes \
     the kind of each own declaration (`getOriginalConstKind?`)."),
-  (`Lean.Compiler.implementedByAttr, .R1, "Own-declaration marker; written only by the defining module (design R1 list)."),
-  (`Lean.externAttr, .R1, "Own-declaration marker; written only by the defining module (design R1 list)."),
-  (`reducibilityCore, .R1, "Own-declaration reducibility; written only by the defining module (design R1 list)."),
+  (`Lean.Compiler.implementedByAttr, .R1, "Own-declaration marker, in `attrsEnc`. The `implemented_by` handler rejects imported declarations (src/Lean/Attributes.lean:295-296), as does `ParametricAttribute.setParam` (:329-330), which `Compiler.setImplementedBy` (src/Lean/Compiler/ImplementedByAttr.lean:70-71) and its monadic wrapper (:75-79) call. `getParam?` of an imported name reads only its own module's entries (:313-318) (design R1 list)."),
+  (`Lean.externAttr, .R1, "Own-declaration marker, in `attrsEnc`. The `extern` handler rejects imported declarations (src/Lean/Attributes.lean:295-296), as does `ParametricAttribute.setParam` (:329-330); it has no other writer. `getParam?` of an imported name reads only its own module's entries (:313-318) (design R1 list)."),
+  (`reducibilityCore, .R1, "Own-declaration reducibility, in `attrsEnc`. The only writer, `setReducibilityStatusCore` (src/Lean/ReducibilityAttrs.lean:93-104), sends a global status for an imported name to `reducibilityExtra` (:95-98); `setReducibilityStatus` (:266-267) and the attribute handler (:190) go through it. `getReducibilityStatusCore` reads only the imported name's own module entries from this table (:86-90) (design R1 list)."),
   (`Lean.Compiler.CSimp.ext, .R5, "`@[csimp]` entries another module may add for an imported decl (design R5 list)."),
-  (`Lean.Compiler.nospecializeAttr, .R1, "Own-declaration marker; written only by the defining module (design R1 list)."),
-  (`Lean.Compiler.LCNF.impureSigExt, .R1, "Own-declaration impure signature; written only by the defining module (design R1 list)."),
+  (`Lean.Compiler.nospecializeAttr, .R1, "Own-declaration marker, in `attrsEnc`. The attribute handler rejects imported declarations (src/Lean/Attributes.lean:210-211), as does `TagAttribute.setTag` (:225-226). `hasTag` of an imported name reads only its own module's entries (:232-233) (design R1 list)."),
+  (`Lean.Compiler.LCNF.impureSigExt, .R1, "Own-declaration impure signature, read by `entriesEnc` whoever wrote it. An entry written for another module's name is not read: importers resolve a name's signature through its defining module (design R1 list)."),
   (Lean.mkPrivateNameCore `Lean.Compiler.LCNF.ToImpure `Lean.Compiler.LCNF.taggedReturnAttr, .viaOwnEntries,
     "Module-private, read only at src/Lean/Compiler/LCNF/ToImpure.lean:347 for the declaration \
     being lowered (written at src/Lean/Compiler/LCNF/ToImpure.lean:23); its effect reaches \
@@ -284,7 +285,7 @@ def classification : List (Name × UsageClass × String) := [
 
 /-- How a write to a table is handled when it happens outside the compiler or outside the declaring module.
 `ownDeclDigest`: the table's entry for the module's own declaration is read by `attrsEnc` or `entriesEnc` and so
-is in that declaration's digest, whoever wrote it and whether or not inside a compiler run (an attribute only
+is in that declaration's digest, whoever wrote it (an attribute only
 read while lowering the declaration itself reaches importers through the digested entries that lowering
 produces); importers resolve the entries of an imported name through its defining module, so an entry written
 for another module's name is dropped by the writer or never read. `moduleDigest`: a value of the module itself,
@@ -327,7 +328,7 @@ def writers : List (Name × List (Name × Mechanism × String)) := [
     (`Lean.Compiler.LCNF.setOtherDeclMonoType, .ownDeclDigest,
       "Called only by `compileInductives` (src/Lean/Compiler/LCNF/ToImpureType.lean:348,353); any entry of an own name is in `entriesEnc`, whoever wrote it."),
     (`Lean.Compiler.LCNF.getOtherDeclMonoType, .ownDeclDigest,
-      "Caches a non-inductive name's mono type on a miss with a direct `modifyState` (src/Lean/Compiler/LCNF/MonoTypes.lean:117-128); the state is exported for the module's own declarations, where `entriesEnc` reads it.")]),
+      "Caches a non-inductive name's mono type on a miss with a direct `modifyState` (src/Lean/Compiler/LCNF/MonoTypes.lean:117-125); the state is exported for the module's own declarations, where `entriesEnc` reads it.")]),
   (`Lean.Meta.instanceExtension, [
     (`Lean.Meta.addInstance, .tableDigest,
       "No imported-declaration check (src/Lean/Meta/Instances.lean:284-305): an entry for another module's declaration is in the cross-module table digest, one for its own is in `attrsEnc`."),
@@ -348,10 +349,10 @@ def writers : List (Name × List (Name × Mechanism × String)) := [
       "The five reducibility attributes (src/Lean/ReducibilityAttrs.lean:186-259); `validate` rejects a global status on an imported name unless `allowUnsafeReducibility` is set (:146-147).")]),
   (`Lean.Compiler.LCNF.baseExt, [
     (`Lean.Compiler.LCNF.saveBaseDeclCore, .ownDeclDigest,
-      "Writes the entry (src/Lean/Compiler/LCNF/PhaseExt.lean:171-172); a base declaration of an own name is in `entriesEnc`, whoever wrote it. An entry for another module's name is not read by importers, which resolve a name's declaration through its defining module."),
+      "Writes the entry (src/Lean/Compiler/LCNF/PhaseExt.lean:170-171); a base declaration of an own name is in `entriesEnc`, whoever wrote it. An entry for another module's name is not read by importers, which resolve a name's declaration through its defining module."),
     (`Lean.Compiler.LCNF.Decl.saveBase, .ownDeclDigest,
-      "Saves a declaration under its name (src/Lean/Compiler/LCNF/PhaseExt.lean:182-184); called by passes."),
-    (`Lean.Compiler.LCNF.Decl.save, .ownDeclDigest, "Dispatches on the phase to the three `save*` functions (src/Lean/Compiler/LCNF/PhaseExt.lean:211-218).")]),
+      "Saves a declaration under its name (src/Lean/Compiler/LCNF/PhaseExt.lean:180-181); called by passes."),
+    (`Lean.Compiler.LCNF.Decl.save, .ownDeclDigest, "Dispatches on the phase to the three `save*` functions (src/Lean/Compiler/LCNF/PhaseExt.lean:189-196).")]),
   (`Lean.builtinInitAttr, [
     (`Lean.setBuiltinInitAttr, .ownDeclDigest,
       "`setParam` on the attribute, which rejects imported declarations (src/Lean/Attributes.lean:329-330) (src/Lean/Compiler/InitAttr.lean:146-147)."),
@@ -360,9 +361,9 @@ def writers : List (Name × List (Name × Mechanism × String)) := [
     (`Lean.registerInitAttrUnsafe, .ownDeclDigest, parametricAttrReason)]),
   (`Lean.Compiler.LCNF.specExtension, [
     (`Lean.Compiler.LCNF.saveSpecEntries, .ownDeclDigest,
-      "Called by the specialize pass (src/Lean/Compiler/LCNF/Specialize.lean:562-563); a spec entry of an own name is in `entriesEnc`, whoever wrote it."),
+      "Called by the specialize pass (src/Lean/Compiler/LCNF/Specialize.lean:564); a spec entry of an own name is in `entriesEnc`, whoever wrote it."),
     (`Lean.Compiler.LCNF.Specialize.loop, .ownDeclDigest,
-      "Writes `alreadySpecialized` entries in the same pass (src/Lean/Compiler/LCNF/Specialize.lean:536-543).")]),
+      "Writes `alreadySpecialized` entries in the same pass (src/Lean/Compiler/LCNF/Specialize.lean:540-544).")]),
   (`Lean.Compiler.inlineAttrs, [
     (`Lean.Compiler.setInlineAttribute, .ownDeclDigest,
       "`setValue`, which rejects imported declarations (src/Lean/Attributes.lean:403-404) (src/Lean/Compiler/InlineAttrs.lean:80-81)."),
@@ -385,7 +386,7 @@ def writers : List (Name × List (Name × Mechanism × String)) := [
     (`Lean.registerParametricAttribute, .ownDeclDigest, parametricAttrReason)]),
   (`Lean.modPkgExt, [
     (`Lean.Environment.setModulePackage, .moduleDigest,
-      "Called by the header processing (src/Lean/Elab/Import.lean:166); the package is in every node digest of the module (src/Lean/Util/ModuleUsage.lean:215,219).")]),
+      "Called by the header processing (src/Lean/Elab/Import.lean:166); the package is in every node digest of the module (src/Lean/Util/ModuleUsage.lean:208,215).")]),
   (`Lean.Compiler.LCNF.impureTrivialStructureInfoExt, [
     (`Lean.Compiler.LCNF.setHasTrivialImpureStructure?, .ownDeclDigest,
       "Sole caller `compileInductives` (src/Lean/Compiler/LCNF/ToImpureType.lean:346); any entry of an own inductive is in `entriesEnc`, whoever wrote it."),
@@ -398,16 +399,16 @@ def writers : List (Name × List (Name × Mechanism × String)) := [
     (`Lean.Compiler.LCNF.UnreachableBranches.addFunctionSummary, .ownDeclDigest,
       "Public (src/Lean/Compiler/LCNF/ElimDeadBranches.lean:304-305); a summary of an own name is in `entriesEnc`, whoever wrote it."),
     (`Lean.Compiler.LCNF.Decl.elimDeadBranches, .ownDeclDigest,
-      "The pass's own write (src/Lean/Compiler/LCNF/ElimDeadBranches.lean:670-676).")]),
+      "The pass's own write (src/Lean/Compiler/LCNF/ElimDeadBranches.lean:671-673).")]),
   (`Lean.exportAttr, [
     (`Lean.ParametricAttribute.setParam, .ownDeclDigest, parametricAttrReason),
     (`Lean.registerParametricAttribute, .ownDeclDigest, parametricAttrReason)]),
   (`Lean.IR.declMapExt, [
     (`Lean.IR.addDecl, .ownDeclDigest,
-      "Public (src/Lean/Compiler/IR/CompilerM.lean:198-201); an IR declaration of an own name is in `entriesEnc`, whoever added it. A declaration added for another module's name is not read by importers, which resolve a name's IR through its defining module (`findExtEntry?` by module index), except a name the module claims (`extraConstNames`) that has no compiler-generated shape: `tableDigest` holds those (`claimedForeignNames`)."),
-    (`Lean.IR.addDecls, .ownDeclDigest, "Called by `IR.compile` (src/Lean/Compiler/IR.lean:35), which `runCore` calls."),
+      "Public (src/Lean/Compiler/IR/CompilerM.lean:197-198); an IR declaration of an own name is in `entriesEnc`, whoever added it. A declaration added for another module's name is not read by importers, which resolve a name's IR through its defining module (`findExtEntry?` by module index), except a name the module claims (`extraConstNames`) that has no compiler-generated shape: `tableDigest` holds those (`claimedForeignNames`)."),
+    (`Lean.IR.addDecls, .ownDeclDigest, "Called by `IR.compile` (src/Lean/Compiler/IR.lean:35), which `PassManager.run` calls."),
     (`Lean.IR.ToIR.addDecl, .ownDeclDigest,
-      "Adds the dummy declaration of an extern (src/Lean/Compiler/IR/ToIR.lean:55-57,202); covered like `IR.addDecl`.")]),
+      "Adds the dummy declaration of an extern (src/Lean/Compiler/IR/ToIR.lean:54-55,202); covered like `IR.addDecl`.")]),
   (`Lean.Compiler.LCNF.impureTypeExt, [
     (`Lean.Compiler.LCNF.setImpureType, .ownDeclDigest,
       "Sole caller `compileInductives` (src/Lean/Compiler/LCNF/ToImpureType.lean:349); any entry of an own inductive is in `entriesEnc`, whoever wrote it.")]),
@@ -436,9 +437,9 @@ def writers : List (Name × List (Name × Mechanism × String)) := [
     (`Lean.Compiler.LCNF.Simp.ConstantFold.registerFolder, .tableDigest,
       "Public, any declaration (src/Lean/Compiler/LCNF/Simp/ConstantFold.lean:837-839): the entry is exported and the module's cross-module table digest holds it with the folder's digest. State written without an entry (`modifyState`) is not exported, so it changes only the writing module's own compile, whose results are in its compiled entries.")]),
   (`Lean.Compiler.LCNF.monoExt, [
-    (`Lean.Compiler.LCNF.saveMonoDeclCore, .ownDeclDigest, "As `saveBaseDeclCore` (src/Lean/Compiler/LCNF/PhaseExt.lean:174-175)."),
-    (`Lean.Compiler.LCNF.Decl.saveMono, .ownDeclDigest, "As `Decl.saveBase` (src/Lean/Compiler/LCNF/PhaseExt.lean:203-205)."),
-    (`Lean.Compiler.LCNF.Decl.save, .ownDeclDigest, "Dispatches on the phase to the three `save*` functions (src/Lean/Compiler/LCNF/PhaseExt.lean:211-218).")]),
+    (`Lean.Compiler.LCNF.saveMonoDeclCore, .ownDeclDigest, "As `saveBaseDeclCore` (src/Lean/Compiler/LCNF/PhaseExt.lean:173-174)."),
+    (`Lean.Compiler.LCNF.Decl.saveMono, .ownDeclDigest, "As `Decl.saveBase` (src/Lean/Compiler/LCNF/PhaseExt.lean:183-184)."),
+    (`Lean.Compiler.LCNF.Decl.save, .ownDeclDigest, "Dispatches on the phase to the three `save*` functions (src/Lean/Compiler/LCNF/PhaseExt.lean:189-196).")]),
   (`Lean.sparseCasesOnExt, [
     (`Lean.markSparseCasesOn, .ownDeclDigest,
       "Public (src/Lean/AuxRecursor.lean:57-58); called in src/Lean/Meta/Constructions/CtorElim.lean:206 and SparseCasesOn.lean:149. The tag of an own declaration is in `attrsEnc` (`isSparseCasesOn`)."),
@@ -477,9 +478,9 @@ def writers : List (Name × List (Name × Mechanism × String)) := [
     (`Lean.registerTagAttribute, .ownDeclDigest, tagAttrReason)]),
   (`Lean.Compiler.LCNF.impureSigExt, [
     (`Lean.Compiler.LCNF.saveImpureDeclCore, .ownDeclDigest,
-      "As `saveBaseDeclCore` (src/Lean/Compiler/LCNF/PhaseExt.lean:177-179). The standalone `leanir` tool also adds the signatures of externs (src/LeanIR.lean:120); it re-adds what this module's own run already exported and writes no usage file."),
-    (`Lean.Compiler.LCNF.Decl.saveImpure, .ownDeclDigest, "As `Decl.saveBase` (src/Lean/Compiler/LCNF/PhaseExt.lean:207-209)."),
-    (`Lean.Compiler.LCNF.Decl.save, .ownDeclDigest, "Dispatches on the phase to the three `save*` functions (src/Lean/Compiler/LCNF/PhaseExt.lean:211-218).")]),
+      "As `saveBaseDeclCore` (src/Lean/Compiler/LCNF/PhaseExt.lean:176-178). The standalone `leanir` tool also adds the signatures of externs (src/LeanIR.lean:120); it re-adds what this module's own run already exported and writes no usage file."),
+    (`Lean.Compiler.LCNF.Decl.saveImpure, .ownDeclDigest, "As `Decl.saveBase` (src/Lean/Compiler/LCNF/PhaseExt.lean:186-187)."),
+    (`Lean.Compiler.LCNF.Decl.save, .ownDeclDigest, "Dispatches on the phase to the three `save*` functions (src/Lean/Compiler/LCNF/PhaseExt.lean:189-196).")]),
   (`Lean.Compiler.LCNF.taggedReturnAttr, [
     (`Lean.TagAttribute.setTag, .ownDeclDigest,
       "The attribute is read only while lowering the tagged declaration itself (src/Lean/Compiler/LCNF/ToImpure.lean:347), so it changes only that declaration's impure signature and IR, which `entriesEnc` encodes. `setTag` rejects declarations of imported modules (src/Lean/Attributes.lean:225-226)."),
@@ -587,8 +588,8 @@ def writers : List (Name × List (Name × Mechanism × String)) := [
   for e in exts do
     unless env.contains (holderOf e.name) do
       errors := errors.push s!"registered extension `{e.name}` has no holder constant: `{holderOf e.name}` is not in the environment (add an entry to `aliases`)"
-  -- Classes tied to the digest code: own-declaration classes must be read by `attrsEnc`/`entriesEnc`, cross-module
-  -- classes by `tableDigest`, and both lists may name only registered extensions.
+  -- The classification is compared with the hand-written digest lists: `R1`/`R1R5` tables must be in
+  -- `digestedOwnTables`, `R5`/`R1R5` tables in `digestedCrossTables`, and both lists may name only registered extensions.
   for n in ModuleUsage.digestedOwnTables ++ ModuleUsage.digestedCrossTables do
     unless registered.contains n do
       errors := errors.push s!"the digest code lists `{n}`, which is not a registered persistent environment extension"

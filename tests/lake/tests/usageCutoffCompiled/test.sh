@@ -11,7 +11,7 @@ cd work
 # what the executable `app` prints, what `lake env lean` prints for each `Check*.lean`, and the C file of
 # every module, which for a module the cutoff skipped must be what compiling its sources now produces. The
 # `.olean`, `.ilean` and `.ir` files the cutoff kept must also be byte for byte those of a clean build of
-# state 1 with the cutoff on, made in the same directory. There is no tolerated difference. A module that
+# state 1 with the cutoff on, made in the same directory. A module that
 # specialized a function itself where a fresh build would reuse another module's specialization of the same
 # function at the same arguments is built again (`perkey_provider`), and one whose imports gain a
 # specialization it never looked up is replayed (`perkey_unrelated_spec`). A case may also check the build
@@ -431,7 +431,7 @@ red_order_s1() { order_x Z2 Z1; }
 
 # A specialization-cache miss that becomes a hit. `M` specializes `myMap k` itself; then `Y`, which `M` imports
 # but uses nothing of, starts specializing the same call, so a fresh `M` reuses `Y`'s specialization instead.
-# `M` is built again whether or not code runs inside the compiler (`d2_tolerated`). With a constant folder for `k`
+# `M` is built again (`perkey_provider`). With a constant folder for `k`
 # registered in `Z` (`d2_folder`), which `Y` does not import and which is not meaning-preserving (it returns 42),
 # the two specializations compute different things as well.
 d2_files() {
@@ -457,32 +457,20 @@ run_meta registerFolder ``T.k ``myFolder
 EOF
 }
 d2_folder_s1() { d2_y $'def y : List Nat := myMap k [0]\n'; }
-d2_tolerated_s0() { d2_files ''; }
-d2_tolerated_s1() { d2_folder_s1; }
-# The same with a compiler pass (a no-op) registered in `Z`: code that runs inside the compiler is not known to
-# preserve meaning, so `M` must compile again and match the fresh build byte for byte.
-d2_cpass_s0() {
-  d2_files $'import T.Z\n'
-  cat > T/Z.lean <<'EOF'
-import Lean
-import T.B
-open Lean.Compiler.LCNF
-@[cpass] def myInstaller : PassInstaller :=
-  PassInstaller.installAtEnd .base (Pass.mkPerDeclaration `myNoop .base fun d => pure d)
-EOF
-}
-d2_cpass_s1() { d2_folder_s1; }
 
-# Toolchain modules alone leave the compiler's passes and folders built-in: `M` importing `Lean`, and also a
-# module that only reads the folder table, is built again as in `d2_tolerated`.
-d2_tolerated_lean_s0() { d2_files $'import Lean\n'; }
-d2_tolerated_lean_s1() { d2_folder_s1; }
-d2_tolerated_reader_s0() {
+# The compiler's passes and folders stay the built-in ones when `M` imports `Lean` (`flag_off_lean`) or a module
+# that only reads the folder table (`flag_off_reader`). State 1 adds a definition to the imported `Y` that `M`
+# does not use and that provides no key `M` looked up, so `M` is replayed.
+flag_off_lean_s0() { d2_files $'import Lean\n'; }
+flag_off_lean_s1() { d2_y $'def yUnused : Nat := 1\n'; }
+flag_off_lean_c_check() { grep -qE 'Replayed T\.M( |$)' ../flag_off_lean.1.log; }
+flag_off_reader_s0() {
   d2_files $'import Lean\nimport T.R\n'
   printf 'import Lean\nopen Lean Lean.Compiler.LCNF.Simp.ConstantFold\nrun_meta do\n  let _ ← getFolders\n  pure ()\n' \
     > T/R.lean
 }
-d2_tolerated_reader_s1() { d2_folder_s1; }
+flag_off_reader_s1() { d2_y $'def yUnused : Nat := 1\n'; }
+flag_off_reader_c_check() { grep -qE 'Replayed T\.M( |$)' ../flag_off_reader.1.log; }
 
 # `Main` inlines `M.g`, whose body calls the specialization `M` creates: `M` is built again, so `Main` is too and
 # calls `Y`'s, as a fresh build does.
@@ -500,7 +488,7 @@ d2_down_rebuilt_s1() {
   printf 'import T.M\ndef unused : Nat := 1\ndef main : IO Unit := IO.println (T.g [1, 2, 3])\n' > Main.lean
 }
 
-# Code inside the compiler from other sources than an imported module's entries: `M` registers a folder
+# Compiler passes and folders from other sources than an imported module's entries: `M` registers a folder
 # itself (`f3_own_folder`) or declares a `@[cpass]` itself (`f3_own_cpass`), or `Y`, imported but unused,
 # installs a folder (`f3_runtime_folder`) or a pass (`f3_runtime_cpass`) by writing the extension state
 # directly, with no entry, before it specializes the same call. Each time a fresh `M` differs from the kept
@@ -634,7 +622,7 @@ f1_cachespec_hit_s1() { cs_y 200 "$cs_entry"$'\n'; }
 
 # `A.f` keeps its LCNF body `g n + 1` but registers IR that adds 50. `Y`'s specialization of `run k` inlines
 # `f`'s body; `M`, where a local attribute stops specializing `f`, calls `f`'s IR. Once `Y` adds the same key, a
-# fresh `M` reuses `Y`'s specialization, so the two must not count as interchangeable.
+# fresh `M` reuses `Y`'s specialization, which inlines `f`'s LCNF body, so a kept `M` must match that.
 premise_ir_s0() {
   lakefile_app; mkdir_t
   cat > T/A.lean <<'EOF'
@@ -659,9 +647,8 @@ EOF
 }
 premise_ir_s1() { printf 'import T.B\nnamespace T\ndef y0 : Nat := 0\ndef y : Nat := run k 7\nend T\n' > T/Y.lean; }
 
-# `premise_ir`'s `A` also compiles `T.f` once more in a discarded environment, so the compiler's IR for `T.f`
-# exists in the process although the module's IR for it does not come from the compiler. `CheckEval` runs `T.h`
-# in the interpreter, which reads IR; `ir_count_nd` proves `T.h = 52` by `native_decide` although `T.h`'s kernel
+# `premise_ir`'s `A` also compiles `T.f` once more in a discarded environment. `CheckEval` runs `T.h` in the
+# interpreter, which reads IR; `ir_count_nd` proves `T.h = 52` by `native_decide` although `T.h`'s kernel
 # value is 3, so a kept `M` must not turn the build's failure into a success.
 ir_count_s0() {
   premise_ir_s0
@@ -820,13 +807,13 @@ run_meta do
   modifyEnv fun env => impureSigExt.addEntry env { sig with type := ImpureType.uint8 }'
 }
 
-# Outside writes that land in the compile that produces `Y`'s specialization, so that the compiler appears to
-# have written them: an `@[extern]` attribute set on the specialization's name before it exists
+# Outside writes to the entries of `Y`'s specialization, which a fresh `M` reads when it reuses it: an
+# `@[extern]` attribute set on the specialization's name before it exists
 # (`tl_pre_extern`, `tl2_pre_extern` with the key `lcnf_override` uses), and a second thread writing through the
 # compile's `Core.State` reference while it runs: the dead-branch summary (`tl3_race_a`: the compile runs on a
 # spawned task and the writer on the command's thread; `tl3_race_b`: the other way round) or the impure
-# signature (`tl3_race_sig`) of the specialization once its IR exists. A fresh `M` reuses `Y`'s specialization
-# and so reads the written value, which `M` must therefore be built against.
+# signature (`tl3_race_sig`) of the specialization once its IR exists. A kept `M` must match a fresh `M`, which
+# reuses `Y`'s specialization and so reads the written value.
 tl_y() { cat > T/Y.lean; }
 tl_pre_extern_s0() { wh_files; }
 tl_pre_extern_s1() {
@@ -1708,37 +1695,27 @@ cov_recarg_rev_s1() {
 }
 ## Outside writes before the compile, compiler-only names that shadow constants, and the keys a module looked up.
 
-# Attributes and entries written before the compile that produces `Y`'s specialization of `iter k` (or of
-# `anyP k2`), which the compile does not overwrite: an `@[extern]` attribute (`pre_extern`) and a dead-branch
-# summary (`pre_summary`) on the specialization's name. A fresh `M` reuses `Y`'s specialization and reads them.
+# A dead-branch summary written before the compile that produces `Y`'s specialization of `anyP k2`, which the
+# compile does not overwrite (`pre_summary`; `tl_pre_extern` does the same with an `@[extern]` attribute). A
+# fresh `M` reuses `Y`'s specialization and reads it.
 pre_y() {
   cat > T/Y.lean <<EOF
 import Lean
 import T.B
 namespace T
 def y0 : Nat := 0
-def evilI (n : Nat) : Nat := n + 100
 end T
 $1
 namespace T
 def y : Nat := iter k 7
 def yb : Bool := anyP k2 [7]
 end T
-$2
 EOF
 }
-pre_set_extern='open Lean Compiler LCNF in
-run_meta do
-  let spec := `T.iter._at_.T.y.spec_0
-  match externAttr.setParam (← getEnv) spec { entries := [.standard `all "lean_nat_succ"] } with
-  | .ok env => setEnv env
-  | .error e => throwError e'
 pre_set_summary='open Lean Compiler LCNF UnreachableBranches in
 run_meta modifyEnv fun env => addFunctionSummary env `T.anyP._at_.T.yb.spec_0 (.ctor ``Bool.true #[])'
-pre_extern_s0() { wh_files; }
-pre_extern_s1() { pre_y "$pre_set_extern" ''; }
 pre_summary_s0() { wh_files; }
-pre_summary_s1() { pre_y "$pre_set_summary" ''; }
+pre_summary_s1() { pre_y "$pre_set_summary"; }
 
 # `@[never_extract]` is read live, by common-subexpression elimination, so a specialization `Y` compiled before
 # `attribute [never_extract] g` (one call of `g`, one tick) differs from one `M` compiles itself with the final
@@ -1878,7 +1855,7 @@ all_cases="spec_transitive spec_link spec_type spec_precomp csimp_transitive csi
   class_same class_cross nospec_type folder_cross reducible_cross binder_inline d2_folder
   local_inst_own erase_inst_own scoped_inst local_red_own2 local_red_own3 scoped_red_own
   table_order folder_order red_order
-  d2_tolerated_lean d2_tolerated_reader f3_own_folder f3_own_cpass f3_runtime_folder f3_runtime_cpass fold_env cpass_env
+  flag_off_lean flag_off_reader f3_own_folder f3_own_cpass f3_runtime_folder f3_runtime_cpass fold_env cpass_env
   f1_cachespec f1_cachespec_hit premise_ir ir_count ir_count_nd lcnf_override d2_down_rebuilt
   collide_boxed_trans irdup_first irdup_after negfail_scoped abi_mix abi_void abi_enum abi_monotype
   wh_ctrl wh_summary wh_extern wh_implby wh_sig tl_pre_extern tl2_pre_extern tl3_race_a tl3_race_b tl3_race_sig
