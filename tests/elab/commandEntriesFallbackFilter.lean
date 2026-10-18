@@ -13,20 +13,15 @@ def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
 
 unsafe def commandEntriesOf (e : EnvExtensionEntry) : CommandEntries := unsafeCast e
 
-def modeOf (ext : PersistentEnvExtension EnvExtensionEntry EnvExtensionEntry EnvExtensionState) :
-    EnvExtension.AsyncMode :=
-  match ext.toEnvExtension.asyncMode with
-  | .async _ => .sync
-  | m => m
-
 /-- `target` with the state of every extension a command payload replays (persistent and scoped extensions,
 registered command caches, the local-entry log) taken from `source`: a kept command is replayed with its
 constants present and every extension in its before-state. -/
 def withReplayStateOf (source target : Environment) : IO Environment := do
   let mut target := target
   for ext in ← persistentEnvExtensionsRef.get do
-    target := ext.toEnvExtension.setState target (ext.toEnvExtension.getState source (asyncMode := modeOf ext))
-      (asyncMode := modeOf ext)
+    let mode := ext.toEnvExtension.asyncMode.forExport
+    target := ext.toEnvExtension.setState target (ext.toEnvExtension.getState source (asyncMode := mode))
+      (asyncMode := mode)
   for ext in ← commandCacheExtensionsRef.get do
     target := ext.copyState source target
   return localEntriesExt.setState target (localEntriesExt.getState source (asyncMode := .local))

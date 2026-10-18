@@ -36,9 +36,7 @@ registered command caches, the local-entry log) taken from `source`. -/
 def withReplayStateOf (source target : Environment) : IO Environment := do
   let mut target := target
   for ext in ← persistentEnvExtensionsRef.get do
-    let mode := match ext.toEnvExtension.asyncMode with
-      | .async _ => .sync
-      | mode => mode
+    let mode := ext.toEnvExtension.asyncMode.forExport
     target := ext.toEnvExtension.setState target (ext.toEnvExtension.getState source (asyncMode := mode))
       (asyncMode := mode)
   for ext in ← commandCacheExtensionsRef.get do
@@ -82,10 +80,13 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   IO.println s!"cache payloads: {!cacheNames.isEmpty}"
   let registeredCaches := (← commandCacheExtensionsRef.get).map (·.name)
   IO.println s!"cache names resolve: {cacheNames.all registeredCaches.contains}"
+  let scopedExts := (← scopedEnvExtensionsRef.get).map (·.ext.name)
   for entry in entries do
+    let scopedStateOnly := entry.stateOnly.any scopedExts.contains
     IO.println s!"{entry.idx} extensions={entry.entries.map (·.1)} \
       locals={entry.locals.map fun (depth, name, _) => (depth, name)} \
-      caches={entry.caches.deltas.map (·.1)} stateOnly={entry.stateOnly}"
+      caches={entry.caches.deltas.map (·.1)} stateOnly={entry.stateOnly.filter (!scopedExts.contains ·)}\
+      {if scopedStateOnly then " and scoped extensions" else ""}"
   let afterOf : Std.HashMap Nat Environment :=
     observations.foldl (fun m obs => m.insert obs.i obs.after.env) {}
   let mut replayed ← withReplayStateOf baseEnv expectedEnv
