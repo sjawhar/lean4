@@ -1,31 +1,35 @@
-Elab.Command.State: 12 fields, unclassified #[], not a field #[]
-Elab.Command.Scope: 13 fields, unclassified #[], not a field #[]
-ScopedEnvExtension.State: 6 fields, unclassified #[], not a field #[]
-ScopedEnvExtension.StateStack: 4 fields, unclassified #[], not a field #[]
-env (some (Lean.ModuleUsage.CommandStateField.env)) changed: markers #[]
-messages (some (Lean.ModuleUsage.CommandStateField.irrelevant)) changed: markers #[]
-scopes (some (Lean.ModuleUsage.CommandStateField.stateOnly)) changed: markers #[Lean.Elab.Command.scopes]
-scopes (some (Lean.ModuleUsage.CommandStateField.stateOnly)) changed: markers #[]
-usedQuotCtxts (some (Lean.ModuleUsage.CommandStateField.replayed)) changed: markers #[]
-nextMacroScope (some (Lean.ModuleUsage.CommandStateField.stateOnly)) changed: markers #[Lean.Elab.Command.nextMacroScope]
-maxRecDepth (some (Lean.ModuleUsage.CommandStateField.replayed)) changed: markers #[]
-ngen (some (Lean.ModuleUsage.CommandStateField.irrelevant)) changed: markers #[]
-auxDeclNGen (some (Lean.ModuleUsage.CommandStateField.replayed)) changed: markers #[]
-infoState (some (Lean.ModuleUsage.CommandStateField.stateOnly)) changed: markers #[Lean.Elab.Command.infoState]
-infoState (some (Lean.ModuleUsage.CommandStateField.stateOnly)) changed: markers #[]
-traceState (some (Lean.ModuleUsage.CommandStateField.irrelevant)) changed: markers #[]
-snapshotTasks (some (Lean.ModuleUsage.CommandStateField.irrelevant)) changed: markers #[]
-prevLinterStates (some (Lean.ModuleUsage.CommandStateField.irrelevant)) changed: markers #[]
-scoped nothing: entries 0, local entries accounted for: true
-scoped state alone, without an entry or a local entry: stateOnly, local entries accounted for: true
-scoped activeScopes: stateOnly, local entries accounted for: true
-scoped delimitsLocal: stateOnly, local entries accounted for: true
-scoped modCount: stateOnly, local entries accounted for: true
-scoped generation: stateOnly, local entries accounted for: true
-scoped localCount without a recorded local entry: entries 0, local entries accounted for: false
-scoped localCount with a recorded local entry: entries 0, local entries accounted for: true
-scoped stack length: stateOnly, local entries accounted for: false
-scoped scopedEntries: stateOnly, local entries accounted for: true
-scoped newEntries, new prefix: entries 1, local entries accounted for: true
-scoped newEntries, not a tail: stateOnly, local entries accounted for: true
-scoped pushCount: entries 0, local entries accounted for: true
+Elab.Command.State classification: 12 fields, each covered
+Elab.Command.State cases: 12 fields, each covered
+M.lean:8:0: warning: a warning
+[debug] a trace
+env (Lean.ModuleUsage.CommandStateField.env): payload #[Lean.aliasExtension]
+messages (Lean.ModuleUsage.CommandStateField.reset): a later command sees what the first does (messages=0)
+scopes (Lean.ModuleUsage.CommandStateField.stateOnly): marker Lean.Elab.Command.scopes
+usedQuotCtxts (Lean.ModuleUsage.CommandStateField.replayed): post and ctx change
+nextMacroScope (Lean.ModuleUsage.CommandStateField.stateOnly): marker Lean.Elab.Command.nextMacroScope
+maxRecDepth (Lean.ModuleUsage.CommandStateField.replayed): post and ctx change
+ngen (Lean.ModuleUsage.CommandStateField.replayed): post and ctx change
+auxDeclNGen (Lean.ModuleUsage.CommandStateField.replayed): post and ctx change
+infoState (Lean.ModuleUsage.CommandStateField.stateOnly): marker Lean.Elab.Command.infoState
+traceState (Lean.ModuleUsage.CommandStateField.reset): a later command sees what the first does (traceState=0)
+snapshotTasks (Lean.ModuleUsage.CommandStateField.reset): a later command sees what the first does (snapshotTasks=0)
+prevLinterStates (Lean.ModuleUsage.CommandStateField.unread): later commands declare the same
+Elab.Command.Scope cases: 13 fields, each covered
+Elab.Command.Scope encoding: 13 fields, each covered
+every Scope field changes scopesEnc
+ScopedEnvExtension.State cases: 6 fields, each covered
+ScopedEnvExtension.StateStack cases: 4 fields, each covered
+ScopedEnvExtension.State encoding: 6 fields, each covered
+ScopedEnvExtension.StateStack encoding: 4 fields, each covered
+scoped state, changed alone, without an entry or a local entry: stateOnly, local entries accounted for true
+scoped activeScopes, a namespace activated: stateOnly, local entries accounted for true
+scoped delimitsLocal, changed: stateOnly, local entries accounted for true
+scoped modCount, a write without an entry: stateOnly, local entries accounted for true
+scoped generation, a level replaced: stateOnly, local entries accounted for true
+scoped localCount, a local entry the payload replays: entries 0, local entries accounted for true
+scoped localCount, a local entry the payload does not replay: entries 0, local entries accounted for false
+scoped stateStack, a level pushed: stateOnly, local entries accounted for false
+scoped scopedEntries, changed without a scoped entry: stateOnly, local entries accounted for true
+scoped newEntries, an entry in front of the old log: entries 1, local entries accounted for true
+scoped newEntries, the old log not a tail: stateOnly, local entries accounted for true
+scoped pushCount, advanced: entries 0, local entries accounted for true

@@ -4,11 +4,10 @@ the recorder treats each (`ModuleUsage.commandStateFields`). A change to the com
 `variable`, a `universe`, made by a macro next to a `def`) is recorded as `Lean.Elab.Command.scopes` in the
 payload's `stateOnly`: the payload is refused and the module is declined (`noskip`); a scope the command restores
 (`set_option … in`, `open … in`, dotted names) is not. `maxRecDepth`, which `set_option maxRecDepth … in` leaves
-changed after the command, is replayed: the record's `post` holds it and the next command's context digest
-includes it. `nextMacroScope` is the same before and after every command. The name generator `ngen` is not
-replayed and not in the context digest: elaborating a command from a generator advanced by a million gives the same
-declaration. `messages` and `traceState` are reset before every command, so a command does not see an earlier
-one's. -/
+changed after the command, and the name generator `ngen` are replayed: the record's `post` holds them after the
+command and the next command's context digest includes them (`commandEntriesNgenRestore`, `commandEntriesNgenDiff`
+show why `ngen` matters). `nextMacroScope` is the same before and after every command. `messages` and `traceState`
+are reset before every command, so a command does not see an earlier one's. -/
 open Lean
 
 unsafe def commandEntriesOf (e : EnvExtensionEntry) : CommandEntries := unsafeCast e
@@ -94,21 +93,14 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   for o in kept.obs do
     IO.println s!"{o.i}: nextMacroScope unchanged {o.before.nextMacroScope == o.after.nextMacroScope}, \
       maxRecDepth before {o.before.maxRecDepth} after {o.after.maxRecDepth}, \
-      post {postField kept o.i "maxRecDepth" |>.map (·.compress)}"
+      post {postField kept o.i "maxRecDepth" |>.map (·.compress)}, \
+      post ngen idx is the generator's after the command \
+      {(postField kept o.i "ngen").bind (fun j => (j.getObjValAs? Nat "idx").toOption) == some o.after.ngen.idx}"
   let some o := kept.obs.back? | throw <| IO.userError "no observation"
   let st := o.before
   let d (s : Elab.Command.State) := ModuleUsage.ctxDigest s {} default
   IO.println s!"ctx depends on maxRecDepth: {d st != d { st with maxRecDepth := st.maxRecDepth + 1 }}, \
     on ngen: {d st != d { st with ngen := st.ngen.mkChild.2 }}"
-  -- the last command elaborated again from its before-state with the name generator advanced
-  let src ← IO.FS.readFile (dir / "kept" / "M.lean")
-  let ctx : Elab.Command.Context := { fileName := "M.lean", fileMap := src.toFileMap, snap? := none, cancelTk? := none }
-  let advanced := { st with ngen := { st.ngen with idx := st.ngen.idx + 1000000 } }
-  let (_, again) ← ((Elab.Command.elabCommandTopLevel o.stx).run ctx |>.run advanced).toIO
-    fun e => IO.userError s!"re-elaboration failed"
-  let value (env : Environment) := (env.find? `m2).bind (·.value? (allowOpaque := true))
-  IO.println s!"m2 with the generator advanced by 1000000: same value {value again.env == value o.after.env}, \
-    value present {(value o.after.env).isSome}"
   -- a command does not see the messages or traces of the command before it (the frontend prints the info)
   discard <| report (dir / "perCommand") "messages and traces are per command" (header ++
     "run_cmd logWarning \"a warning\"\n\

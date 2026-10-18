@@ -402,16 +402,43 @@ structure CommandPost where
   /-- `maxRecDepth` after the command: `set_option maxRecDepth n in` leaves it set (`elabSetOption` caches it in
   the state, and the `in` macro's `end` restores only the scope). -/
   maxRecDepth : Nat
-  deriving Inhabited, BEq
+  /-- The fresh-identifier generator after the command. Its identifiers reach the environment: a command elaborator
+  can name a declaration with `mkFreshId`, and proof-mode tactics store generated names in theorem values. -/
+  ngen : NameGenerator
+  deriving Inhabited
+
+instance : BEq CommandPost where
+  beq a b := a.auxDeclNGen == b.auxDeclNGen && a.quotCtxts == b.quotCtxts && a.localEntries == b.localEntries &&
+    a.maxRecDepth == b.maxRecDepth && a.ngen.namePrefix == b.ngen.namePrefix && a.ngen.idx == b.ngen.idx
+
+/-- What a command leaves in the `commandStateFields` it replays, for its record's `post`. -/
+def CommandPost.ofStates (before after : Elab.Command.State) : CommandPost :=
+  let g := after.auxDeclNGen.toRecord
+  { auxDeclNGen := { namePrefix := g.namePrefix, idx := g.idx, parentIdxs := g.parentIdxs }
+    quotCtxts := (NameSet.sharedDiff before.usedQuotCtxts after.usedQuotCtxts).1 |>.qsort Name.quickLt
+    localEntries := localEntryCount after.env
+    maxRecDepth := after.maxRecDepth
+    ngen := after.ngen }
+
+/-- The generator a kept command leaves: `post.ngen`, or `current` when it is already ahead under the same prefix (an
+earlier command elaborated again used more identifiers than in the recorded run), so that no identifier is generated
+twice. -/
+def CommandPost.restoreNgen (post : CommandPost) (current : NameGenerator) : NameGenerator :=
+  if post.ngen.namePrefix == current.namePrefix then { current with idx := max current.idx post.ngen.idx }
+  else post.ngen
 
 instance : ToJson CommandPost := ⟨fun p => Json.mkObj [("auxDeclNGen", toJson p.auxDeclNGen),
   ("quotCtxts", .arr (p.quotCtxts.map nameToJson)), ("localEntries", p.localEntries),
-  ("maxRecDepth", p.maxRecDepth)]⟩
-instance : FromJson CommandPost := ⟨fun j => return {
-  auxDeclNGen := ← j.getObjValAs? DeclNGenRecord "auxDeclNGen"
-  quotCtxts := (← j.getObjValAs? (Array JName) "quotCtxts").map (·.name)
-  localEntries := ← j.getObjValAs? Nat "localEntries"
-  maxRecDepth := ← j.getObjValAs? Nat "maxRecDepth" }⟩
+  ("maxRecDepth", p.maxRecDepth),
+  ("ngen", Json.mkObj [("namePrefix", nameToJson p.ngen.namePrefix), ("idx", p.ngen.idx)])]⟩
+instance : FromJson CommandPost := ⟨fun j => do
+  let g ← j.getObjVal? "ngen"
+  return {
+    auxDeclNGen := ← j.getObjValAs? DeclNGenRecord "auxDeclNGen"
+    quotCtxts := (← j.getObjValAs? (Array JName) "quotCtxts").map (·.name)
+    localEntries := ← j.getObjValAs? Nat "localEntries"
+    maxRecDepth := ← j.getObjValAs? Nat "maxRecDepth"
+    ngen := { namePrefix := (← g.getObjValAs? JName "namePrefix").name, idx := ← g.getObjValAs? Nat "idx" } }⟩
 
 /-- A summary of the non-persistent cache entries a command added. Keys that hold `Expr`s are digests here; the
 `.olean` payload carries the objects. -/
@@ -585,10 +612,13 @@ extension payload. -/
 inductive CommandStateField where
   /-- Carried by the command's extension payload (`recordCommandDelta`). -/
   | env
-  /-- Restored for a kept command from its record's `post`, and covered by later commands' `ctx`. -/
+  /-- Restored for a kept command from its record's `post` (`CommandPost.ofStates`), and covered by later commands'
+  `ctx` (`ctxDigest`). -/
   | replayed
-  /-- Not read by later commands, or reset before them; the reason is at `commandStateFields`. -/
-  | irrelevant
+  /-- Reset before every command (`Language/Lean.lean`, `doElab`), so no command reads an earlier one's. -/
+  | reset
+  /-- Read by no later command's elaboration; the reason is at `commandStateFields`. -/
+  | unread
   /-- A change makes the command's payload `stateOnly` (`commandStateChanges`). -/
   | stateOnly
   deriving Repr, BEq
@@ -596,23 +626,19 @@ inductive CommandStateField where
 /--
 Every field of `Elab.Command.State`, classified:
 - `env`: the extension payload.
-- `messages`, `traceState`, `snapshotTasks`: reset before every command (`Language/Lean.lean`, `doElab`), reported
-  per command.
+- `messages`, `traceState`, `snapshotTasks`: reset before every command, reported per command.
 - `scopes`: `stateOnly` when `scopesEnc` differs; a kept command's scopes are not recorded.
-- `usedQuotCtxts`, `auxDeclNGen`, `maxRecDepth`: `post`.
+- `usedQuotCtxts`, `auxDeclNGen`, `maxRecDepth`, `ngen`: `post` and `ctx`. `ngen` reaches the environment (see
+  `CommandPost.ngen`), so a command elaborated from another generator can declare other names or values.
 - `nextMacroScope`: `withInitQuotContext` restores it after every top-level command with source; `stateOnly`
   otherwise.
-- `ngen`: the fresh-identifier generator. Its identifiers do not reach the environment (the kernel rejects
-  metavariables; free variables are abstracted), so later commands need only fresh identifiers, which keeping the
-  current generator provides: it only advances.
 - `infoState`: reset by `elabCommandTopLevel` except `enabled`, which is `stateOnly` when it differs.
 - `prevLinterStates`: read only by stateful linters, which run under `withoutModifyingEnv` and only log messages.
 -/
 def commandStateFields : Array (Name × CommandStateField) := #[
-  (`env, .env), (`messages, .irrelevant), (`scopes, .stateOnly), (`usedQuotCtxts, .replayed),
-  (`nextMacroScope, .stateOnly), (`maxRecDepth, .replayed), (`ngen, .irrelevant), (`auxDeclNGen, .replayed),
-  (`infoState, .stateOnly), (`traceState, .irrelevant), (`snapshotTasks, .irrelevant),
-  (`prevLinterStates, .irrelevant)]
+  (`env, .env), (`messages, .reset), (`scopes, .stateOnly), (`usedQuotCtxts, .replayed),
+  (`nextMacroScope, .stateOnly), (`maxRecDepth, .replayed), (`ngen, .replayed), (`auxDeclNGen, .replayed),
+  (`infoState, .stateOnly), (`traceState, .reset), (`snapshotTasks, .reset), (`prevLinterStates, .unread)]
 
 /-- The `stateOnly` markers (`Lean.Elab.Command.<field>`) of the `commandStateFields` a command changed. -/
 def commandStateChanges (before after : Elab.Command.State) : Array Name := Id.run do
@@ -632,6 +658,7 @@ def ctxDigest (st : Elab.Command.State) (quotCtxts : NameSetDigest) (entries : D
   let g := st.auxDeclNGen.toRecord
   scopesEnc {} st.scopes |>.nat st.nextMacroScope |>.nat st.maxRecDepth |>.name g.namePrefix |>.nat g.idx
     |>.nat g.parentIdxs.length |> g.parentIdxs.foldl Enc.nat
+    |>.name st.ngen.namePrefix |>.nat st.ngen.idx
     |>.nat quotCtxts.size |>.u64 quotCtxts.hi |>.u64 quotCtxts.lo
     |>.digest entries |>.finish
 
@@ -825,9 +852,6 @@ def commandRecords (env : Environment) (own : Array (Name × Digest))
       if (env.getModuleIdx? u.module).any fs.hasEntries then some (u.module, u.isMeta)
       else none).qsort fun a b => Name.quickLt a.1 b.1 ||
         (a.1 == b.1 && a.2.toNat < b.2.toNat)
-    let g := obs.after.auxDeclNGen.toRecord
-    let quotCtxts := (NameSet.sharedDiff obs.before.usedQuotCtxts obs.after.usedQuotCtxts).1
-      |>.qsort Name.quickLt
     let matcher := Meta.Match.matcherCacheDelta obs.before.env obs.after.env
     let matcher := matcher.map fun (value, compile, isPrivate, n) =>
       (matcherKeyDigest value compile isPrivate, n)
@@ -850,12 +874,7 @@ def commandRecords (env : Environment) (own : Array (Name × Digest))
       isDecl := !decls.isEmpty
       isInit := kind == ``Lean.Parser.Command.«initialize»
       decls, aux, usesStmt, usesFull, extra
-      post := {
-        auxDeclNGen := { namePrefix := g.namePrefix, idx := g.idx, parentIdxs := g.parentIdxs }
-        quotCtxts
-        localEntries := localEntryCount obs.after.env
-        maxRecDepth := obs.after.maxRecDepth
-      }
+      post := CommandPost.ofStates obs.before obs.after
       caches := { matcher, auxLemma, eqnsInv, sparseCasesOn, structRes }
     }
     if let some payload := payloadByIdx[obs.i]? then

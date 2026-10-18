@@ -28,15 +28,14 @@
 4 decl: command-state markers #[], replayed
 5 decl: command-state markers #[], replayed
 6 other: command-state markers #[], replayed
-0: nextMacroScope unchanged true, maxRecDepth before 512 after 512, post (some 512)
-1: nextMacroScope unchanged true, maxRecDepth before 512 after 512, post (some 512)
-2: nextMacroScope unchanged true, maxRecDepth before 512 after 512, post (some 512)
-3: nextMacroScope unchanged true, maxRecDepth before 512 after 512, post (some 512)
-4: nextMacroScope unchanged true, maxRecDepth before 512 after 777, post (some 777)
-5: nextMacroScope unchanged true, maxRecDepth before 777 after 777, post (some 777)
-6: nextMacroScope unchanged true, maxRecDepth before 777 after 777, post (some 777)
-ctx depends on maxRecDepth: true, on ngen: false
-m2 with the generator advanced by 1000000: same value true, value present true
+0: nextMacroScope unchanged true, maxRecDepth before 512 after 512, post (some 512), post ngen idx is the generator's after the command true
+1: nextMacroScope unchanged true, maxRecDepth before 512 after 512, post (some 512), post ngen idx is the generator's after the command true
+2: nextMacroScope unchanged true, maxRecDepth before 512 after 512, post (some 512), post ngen idx is the generator's after the command true
+3: nextMacroScope unchanged true, maxRecDepth before 512 after 512, post (some 512), post ngen idx is the generator's after the command true
+4: nextMacroScope unchanged true, maxRecDepth before 512 after 777, post (some 777), post ngen idx is the generator's after the command true
+5: nextMacroScope unchanged true, maxRecDepth before 777 after 777, post (some 777), post ngen idx is the generator's after the command true
+6: nextMacroScope unchanged true, maxRecDepth before 777 after 777, post (some 777), post ngen idx is the generator's after the command true
+ctx depends on maxRecDepth: true, on ngen: true
 M.lean:3:0: warning: a warning
 [debug] a trace
 messages 0, traces 0

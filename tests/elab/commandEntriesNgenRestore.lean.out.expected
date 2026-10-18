@@ -1,0 +1,3 @@
+full run: [generated3, pm, generated7]; command 1 stateOnly #[]
+generator as before command 1: restored idx true, constants [generated3, pm, generated7], pm value as in the full run true, errors []
+generator already ahead of post.ngen: restored idx true, constants [generated3, generated107, pm], pm value as in the full run false, errors []
