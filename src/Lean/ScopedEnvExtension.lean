@@ -27,6 +27,9 @@ structure State (σ : Type) where
   modCount     : Nat := 0
   /-- Local entries applied to `state` (`ScopedEnvExtension.addLocalEntry`). -/
   localCount   : Nat := 0
+  /-- The push that created this level (`StateStack.pushCount` then), so that a level popped and pushed again is
+  told apart from the one it replaces. -/
+  generation   : Nat := 0
 
 structure ScopedEntries (β : Type) where
   map : SMap Name (PArray β) := {}
@@ -35,6 +38,8 @@ structure StateStack (α : Type) (β : Type) (σ : Type) where
   stateStack    : List (State σ) := {}
   scopedEntries : ScopedEntries β := {}
   newEntries    : List (Entry α) := []
+  /-- Scope pushes so far (`ScopedEnvExtension.pushScope`), numbering the levels' `State.generation`. -/
+  pushCount     : Nat := 0
   deriving Inhabited
 
 structure Descr (α : Type) (β : Type) (σ : Type) where
@@ -79,24 +84,15 @@ def addImportedFn (descr : Descr α β σ) (as : Array (Array (Entry α))) : Imp
   return { stateStack := [ { state := s } ], scopedEntries := scopedEntries }
 
 def addEntryFn (descr : Descr α β σ) (s : StateStack α β σ) (e : Entry β) : StateStack α β σ :=
-  match s with
-  | { stateStack := stateStack, scopedEntries := scopedEntries, newEntries := newEntries } =>
-    match e with
-    | Entry.global b => {
-        scopedEntries := scopedEntries
-        newEntries    := (Entry.global (descr.toOLeanEntry b)) :: newEntries
-        stateStack    := stateStack.map fun s => { s with state := descr.addEntry s.state b }
-      }
-    | Entry.«scoped» ns b =>
-      {
-        scopedEntries := scopedEntries.insert ns b
-        newEntries    := (Entry.«scoped» ns (descr.toOLeanEntry b)) :: newEntries
-        stateStack    := stateStack.map fun s =>
-          if s.activeScopes.contains ns then
-            { s with state := descr.addEntry s.state b }
-          else
-            s
-      }
+  match e with
+  | Entry.global b => { s with
+      newEntries := (Entry.global (descr.toOLeanEntry b)) :: s.newEntries
+      stateStack := s.stateStack.map fun l => { l with state := descr.addEntry l.state b } }
+  | Entry.«scoped» ns b => { s with
+      scopedEntries := s.scopedEntries.insert ns b
+      newEntries    := (Entry.«scoped» ns (descr.toOLeanEntry b)) :: s.newEntries
+      stateStack    := s.stateStack.map fun l =>
+        if l.activeScopes.contains ns then { l with state := descr.addEntry l.state b } else l }
 
 def exportEntriesFn (descr : Descr α β σ) (env : Environment) (s : StateStack α β σ) : OLeanEntries (Array (Entry α)) := Id.run do
   let mut exported : Array (Entry α) := #[]
@@ -116,24 +112,58 @@ def exportEntriesFn (descr : Descr α β σ) (env : Environment) (s : StateStack
       if let some e := r.private  then priv     := priv.push     (.scoped ns e)
   return { exported, server, «private» := priv }
 
+/-- The fields of `State`, each encoded by `stateDelta`: `state` is changed by the replayed entries and local
+entries; `activeScopes`, `delimitsLocal`, `modCount` and `generation` must be equal, level by level; `localCount`
+must account for the replayed local entries (`localEntriesAccountedFor`). -/
+def stateFields : Array Name := #[`state, `activeScopes, `delimitsLocal, `modCount, `localCount, `generation]
+
+/-- The fields of `StateStack`, each encoded by `stateDelta`: `stateStack` level by level (`stateFields`) and with
+the same length; `scopedEntries` changes only with a new scoped entry; `newEntries` gives the entries;
+`pushCount` only numbers pushed levels, and a push that is not popped again changes the stack length. -/
+def stackFields : Array Name := #[`stateStack, `scopedEntries, `newEntries, `pushCount]
+
+private def sameShape (l₀ l₁ : State σ) : Bool :=
+  l₀.delimitsLocal == l₁.delimitsLocal && l₀.modCount == l₁.modCount && l₀.generation == l₁.generation &&
+    (SharedDiff.sameObject l₀.activeScopes l₁.activeScopes ||
+      let (added, removed) := NameSet.sharedDiff l₀.activeScopes l₁.activeScopes
+      added.isEmpty && removed.isEmpty)
+
 /--
 The state delta of a scoped extension (`PersistentEnvExtension.stateDelta?`): the global and scoped entries in
-front of the old log, oldest first. `stateOnly` when the top state's `modCount` changed, when the old log is not
-a tail of the new one, or when the top state changed with no new entry and no local entry applied to it (a
-write through the underlying persistent extension).
+front of the old log, oldest first. `stateOnly` when any field the entries do not express changed (`stateFields`,
+`stackFields`): the stack length, a level's `activeScopes`, `delimitsLocal`, `modCount` or `generation`, the
+scoped entries without a new scoped entry; when the old log is not a tail of the new one; or when the top state
+changed with neither a new entry nor a local entry. The local entries themselves are checked by
+`localEntriesAccountedFor`.
 -/
 def stateDelta (s₀ s₁ : StateStack α β σ) : StateDelta (Entry α) :=
-  match s₀.stateStack, s₁.stateStack with
-  | top₀ :: _, top₁ :: _ =>
-    if top₀.modCount != top₁.modCount then .stateOnly else
-    match List.newPrefix? s₁.newEntries s₀.newEntries with
-    | some [] =>
-      if SharedDiff.sameObject top₀.state top₁.state || top₀.localCount != top₁.localCount then
-        .entries #[]
-      else .stateOnly
-    | some new => .entries new.toArray.reverse
+  if s₀.stateStack.length != s₁.stateStack.length ||
+      !(s₀.stateStack.zip s₁.stateStack).all fun (l₀, l₁) => sameShape l₀ l₁ then
+    .stateOnly
+  else match List.newPrefix? s₁.newEntries s₀.newEntries with
     | none => .stateOnly
-  | _, _ => .stateOnly
+    | some new =>
+      if !new.any (· matches .scoped ..) && !SharedDiff.sameObject s₀.scopedEntries s₁.scopedEntries then
+        .stateOnly
+      else if !new.isEmpty then
+        .entries new.toArray.reverse
+      else match s₀.stateStack, s₁.stateStack with
+        | top₀ :: _, top₁ :: _ =>
+          if SharedDiff.sameObject top₀.state top₁.state || top₀.localCount != top₁.localCount then .entries #[]
+          else .stateOnly
+        | _, _ => .entries #[]
+
+/-- Whether replaying `n` local entries (`ScopedEnvExtension.addLocalEntry`, which counts each on the levels it
+reaches) onto `s₀` gives `s₁`'s local-entry counts, level by level: every local entry the command applied is one the
+payload replays. Meaningful once `stateDelta s₀ s₁` accepted the stacks. -/
+def localEntriesAccountedFor (s₀ s₁ : StateStack α β σ) (n : Nat) : Bool :=
+  go s₀.stateStack s₁.stateStack true
+where
+  go : List (State σ) → List (State σ) → Bool → Bool
+    | l₀ :: r₀, l₁ :: r₁, reached =>
+      l₁.localCount == l₀.localCount + (if reached then n else 0) && go r₀ r₁ (reached && !l₁.delimitsLocal)
+    | [], [], _ => true
+    | _, _, _ => false
 
 end ScopedEnvExtension
 
@@ -190,14 +220,23 @@ unsafe def registerScopedEnvExtensionUnsafe (descr : Descr α β σ) : IO (Scope
 @[implemented_by registerScopedEnvExtensionUnsafe]
 opaque registerScopedEnvExtension (descr : Descr α β σ) : IO (ScopedEnvExtension α β σ)
 
+/-- Writes the stack without counting the write in `PersistentEnvExtensionState.directWrites`: `stateDelta` encodes
+the writes of the operations below itself (`stateFields`, `stackFields`). -/
+private def modifyStack (ext : ScopedEnvExtension α β σ) (env : Environment)
+    (f : StateStack α β σ → StateStack α β σ) (asyncMode := EnvExtension.AsyncMode.local) : Environment :=
+  ext.ext.toEnvExtension.modifyState (asyncMode := asyncMode) env fun ps => { ps with state := f ps.state }
+
 def ScopedEnvExtension.pushScope (ext : ScopedEnvExtension α β σ) (env : Environment) : Environment :=
-  ext.ext.modifyState (asyncMode := .local) env fun s =>
+  modifyStack ext env fun s =>
     match s.stateStack with
     | [] => s
-    | state :: stack => { s with stateStack := { state with delimitsLocal := true } :: state :: stack }
+    | state :: stack =>
+      { s with
+        stateStack := { state with delimitsLocal := true, generation := s.pushCount + 1 } :: state :: stack
+        pushCount := s.pushCount + 1 }
 
 def ScopedEnvExtension.popScope (ext : ScopedEnvExtension α β σ) (env : Environment) : Environment :=
-  ext.ext.modifyState (asyncMode := .local) env fun s =>
+  modifyStack ext env fun s =>
     match s.stateStack with
     | _      :: state₂ :: stack => { s with stateStack := state₂ :: stack }
     | _ => s
@@ -207,7 +246,7 @@ to turn off delimiting of local entries across multiple implicit scope levels
 (e.g. those introduced by compound `namespace A.B.C` expansions).
 -/
 def ScopedEnvExtension.setDelimitsLocal (ext : ScopedEnvExtension α β σ) (env : Environment) (depth : Nat) : Environment :=
-  ext.ext.modifyState (asyncMode := .local) env fun s =>
+  modifyStack ext env fun s =>
     {s with stateStack := go depth s.stateStack}
 where
   go : Nat → List (State σ) → List (State σ)
@@ -240,7 +279,7 @@ def ScopedEnvExtension.addLocalEntry (ext : ScopedEnvExtension α β σ) (env : 
   let depth := reachedDepth states (states.length - 1)
   let env := localEntriesExt.modifyState (asyncMode := .local) env
     (·.push (depth, ext.ext.name, eraseEnvExtensionEntry (ext.descr.toOLeanEntry b)))
-  ext.ext.modifyState (asyncMode := .local) env fun s =>
+  modifyStack ext env fun s =>
     {s with stateStack := stateStackModify ext s.stateStack b}
 
 def ScopedEnvExtension.addCore (env : Environment) (ext : ScopedEnvExtension α β σ) (b : β) (kind : AttributeKind) (namespaceName : Name) : Environment :=
@@ -259,8 +298,13 @@ def ScopedEnvExtension.getState [Inhabited σ] (ext : ScopedEnvExtension α β �
   | top :: _ => top.state
   | _        => unreachable!
 
+/-- `ScopedEnvExtension.localEntriesAccountedFor` on the extension's stacks in two environments. -/
+def ScopedEnvExtension.localEntriesAccountedForIn (ext : ScopedEnvExtension α β σ) (env₀ env₁ : Environment)
+    (n : Nat) : Bool :=
+  localEntriesAccountedFor (ext.ext.getState (asyncMode := .local) env₀) (ext.ext.getState (asyncMode := .local) env₁) n
+
 def ScopedEnvExtension.activateScoped (ext : ScopedEnvExtension α β σ) (env : Environment) (namespaceName : Name) : Environment :=
-  ext.ext.modifyState (asyncMode := .local) env fun s =>
+  modifyStack ext env fun s =>
     match s.stateStack with
     | top :: stack =>
       if top.activeScopes.contains namespaceName then
@@ -275,16 +319,16 @@ def ScopedEnvExtension.activateScoped (ext : ScopedEnvExtension α β σ) (env :
             let mut state := top.state
             for b in bs do
               state := ext.descr.addEntry state b
-            { state, activeScopes, modCount := top.modCount + 1, localCount := top.localCount }
+            { top with state, activeScopes, delimitsLocal := true, modCount := top.modCount + 1 }
         { s with stateStack := top :: stack }
     | _ => s
 
 /-- Replaces the top state. Writes outside `addEntry`, `addScopedEntry` and `addLocalEntry` must go through this
 function (or `activateScoped`), which counts them in `State.modCount`, so that a command making one is recorded
 as `stateOnly` rather than replayed from its entries. A write through the underlying persistent extension
-(`ext.ext.modifyState`) is detected only in a command that adds no entry and no local entry to `ext`. -/
+(`ext.ext.modifyState`) is counted in `PersistentEnvExtensionState.directWrites` instead. -/
 def ScopedEnvExtension.modifyState (ext : ScopedEnvExtension α β σ) (env : Environment) (f : σ → σ) : Environment :=
-  ext.ext.modifyState env fun s =>
+  modifyStack ext env (asyncMode := ext.ext.toEnvExtension.asyncMode) fun s =>
     match s.stateStack with
     | top :: stack =>
       { s with stateStack := { top with state := f top.state, modCount := top.modCount + 1 } :: stack }
