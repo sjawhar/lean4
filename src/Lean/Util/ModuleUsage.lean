@@ -22,6 +22,9 @@ import Lean.Meta.Instances
 import Lean.Class
 import Lean.Meta.UnificationHint
 import Lean.Elab.InfoTree.Util
+import Init.Data.String.TakeDrop
+import Init.Data.String.Search
+import Init.Data.String.Iterate
 public section
 
 /-!
@@ -324,11 +327,33 @@ private def pickEntries {α : Type} (i? : Option ModuleIdx) (imported : ModuleId
   | some i => imported i
   | none => loc.reverse.toArray
 
+/-- Whether `n` has the shape of a declaration name the compiler generates: `f._redArg`, `f._boxed`,
+`f._boxed_const_N`, `f._closed_N`, `f._lam_N`, `f._elam_N`, `g._at_.o.spec_N` (macro scopes aside). -/
+def compilerShapedName (n : Name) : Bool :=
+  match if n.hasMacroScopes then (extractMacroScopes n).name else n with
+  | .str p s =>
+    let idx (pre : String) := (s.dropPrefix? pre).any fun r =>
+      let r := r.toString
+      !r.isEmpty && r.all Char.isDigit
+    s == "_redArg" || s == "_boxed" || idx "_boxed_const_" || idx "_closed_" || idx "_lam_" || idx "_elam_" ||
+      (idx "spec_" && p.components.contains `_at_)
+  | _ => false
+
+/-- Module `i?`'s kernel constants whose names have a compiler-generated shape. A compiler-only name belongs to
+the first module in import order that lists it (`Environment.lean`, `finalizeImport`), so such a constant can take
+the name over from another module's compiler-only declaration. -/
+private def compilerShapedConsts (env : Environment) (i? : Option ModuleIdx) : Array Name :=
+  match i? with
+  | some i => (env.header.moduleData[i.toNat]?.elim #[] (·.constNames)).filter compilerShapedName
+  | none => (env.checked.get.constants.foldStage2 (fun acc n _ => if compilerShapedName n then acc.push n else acc)
+      #[]).qsort Name.quickLt
+
 /-- A digest of one module's entries in the cross-module compiler tables: `@[csimp]` replacements, instances
 and classes declared for another module's declaration, reducibility set for another module's declaration,
 unification hints, `@[cpass]` installers and constant folders, each hint, installer and folder with its
-declaration's digest (`digestOf`), together with whether the module's compiles ran code inside the compiler
-(`compilerCode`). `i? = none` is the current module. -/
+declaration's digest (`digestOf`); its kernel constants with compiler-generated names (`compilerShapedConsts`);
+and whether the module's compiles ran code inside the compiler (`compilerCode`). `i? = none` is the current
+module. -/
 def tableDigest (env : Environment) (i? : Option ModuleIdx) (digestOf : Name → Option Digest)
     (compilerCode : Bool) : Digest := Id.run do
   let csimp := pickEntries i? (Compiler.CSimp.ext.ext.getModuleEntries env ·)
@@ -372,6 +397,9 @@ def tableDigest (env : Environment) (i? : Option ModuleIdx) (digestOf : Name →
   e := e.nat hints.size
   for x in hints do
     e := scopedEnc (fun e (h : Meta.UnificationHintEntry) => withDigest e h.val) e x
+  let shaped := compilerShapedConsts env i?
+  e := e.nat shaped.size
+  for n in shaped do e := e.name n
   return e.finish
 
 /-- A digest of the module's import closure: its modules in import order (`env.header.moduleNames`, the order
