@@ -22,6 +22,11 @@ public import Lean.ReducibilityAttrs
 public import Lean.Meta.Instances
 import Lean.Class
 import Lean.Meta.Match.MatchPatternAttr
+public import Lean.Compiler.LCNF.MonoTypes
+public import Lean.Compiler.LCNF.ToImpureType
+public import Lean.Structure
+public import Lean.AuxRecursor
+public import Lean.Meta.Match.MatcherInfo
 public section
 
 /-!
@@ -296,7 +301,7 @@ def scopedEnc {α : Type} (f : Enc → α → Enc) (e : Enc) : ScopedEnvExtensio
 def instanceEntryEnc (e : Enc) (a : Meta.InstanceEntry) : Enc :=
   e.opt a.globalName? Enc.name |>.nat a.priority |> (attrKindEnc · a.attrKind)
 
-/-- The current module's data that `compiledEnc` reads besides the per-name extension states. -/
+/-- The current module's data that `attrsEnc` and `entriesEnc` read besides the per-name extension states. -/
 structure LocalCompiled where
   /-- IR declarations, by name. -/
   ir : Std.HashMap Name (Array IR.Decl) := {}
@@ -312,17 +317,49 @@ def LocalCompiled.ofEnv (env : Environment) : LocalCompiled :=
         | some n => m.alter n fun o => some ((o.getD #[]).push e)
         | none => m }
 
-/-- The attributes of `x` that its users' compiled code depends on, as importers read them: how they call it
-(`implemented_by`, `@[extern]`, `@[export]`, `noncomputable`, the init function of a global), whether and how
-they inline, unfold or specialize it (inline kind, `@[never_extract]`, `@[match_pattern]`, which whnf reads when
-unfolding at matchers, reducibility, instance entries, `@[specialize]` arguments), and, for a type, how arguments
-of that type are specialized (class status with out-params, `@[nospecialize]`, `@[weak_specialize]`), plus its
-meta mark. Instance and reducibility attributes can be local, scoped or erased, so the module's end state can
-differ from what importers see: those are read from what the module exports, the instance entries the module
-exports for `x` and `x`'s entry in the reducibility core extension (local and scoped reducibility live in
-`reducibilityExtraExt`, whose exported entries `tableDigest` covers). The other attributes reject every kind but
-global, cannot be erased, and are set only in the declaration's module. (`@[tagged_return]` changes only the
-declaration's own impure signature and IR, which `compiledEnc` covers.) -/
+def binderInfoEnc (e : Enc) : BinderInfo → Enc
+  | .default => e.u8 0 | .implicit => e.u8 1 | .strictImplicit => e.u8 2 | .instImplicit => e.u8 3
+
+def structureInfoEnc (s : CEnc) (i : StructureInfo) : CEnc :=
+  let ⟨structName, fieldNames, fieldInfo, parentInfo⟩ := i
+  let s := s.name structName |>.names fieldNames.toList
+  let s := fieldInfo.foldl (init := s.nat fieldInfo.size) fun s f =>
+    let ⟨fieldName, projFn, subobject?, binderInfo, autoParam?⟩ := f
+    let s := s.name fieldName |>.decl projFn |>.opt subobject? CEnc.decl
+    { s with e := binderInfoEnc s.e binderInfo }.opt autoParam? CEnc.ty
+  parentInfo.foldl (init := s.nat parentInfo.size) fun s p =>
+    let ⟨structName, subobject, projFn⟩ := p
+    s.decl structName |>.bool subobject |>.decl projFn
+
+def matcherInfoEnc (s : CEnc) (i : Meta.MatcherInfo) : CEnc :=
+  let ⟨numParams, numDiscrs, altInfos, uElimPos?, discrInfos, overlaps⟩ := i
+  let s := altInfos.foldl (init := s.nat numParams |>.nat numDiscrs |>.nat altInfos.size) fun s a =>
+    let ⟨numFields, numOverlaps, hasUnitThunk⟩ := a
+    s.nat numFields |>.nat numOverlaps |>.bool hasUnitThunk
+  let s := discrInfos.foldl (init := s.opt uElimPos? CEnc.nat |>.nat discrInfos.size) fun s d =>
+    let ⟨hName?⟩ := d
+    s.opt hName? CEnc.name
+  let ⟨map⟩ := overlaps
+  let os := map.toArray.qsort (·.1 < ·.1)
+  os.foldl (init := s.nat os.size) fun s (k, v) => s.nat k |>.nats v.toArray
+
+def noConfusionEnc (e : Enc) : NoConfusionInfo → Enc
+  | .regular arity lhs rhs => e.u8 0 |>.nat arity |>.nat lhs |>.nat rhs
+  | .perCtor arity fields => e.u8 1 |>.nat arity |>.nat fields
+
+/-- The attributes and elaborator data of `x` that its users' compiled code depends on, as importers read them:
+how they call it (`implemented_by`, `@[extern]`, `@[export]`, `noncomputable`, the init function of a global),
+whether and how they inline, unfold or specialize it (inline kind, `@[never_extract]`, `@[match_pattern]`, which
+whnf reads when unfolding at matchers, reducibility, instance entries, `@[specialize]` arguments), for a type how
+arguments of that type are specialized (class status with out-params, `@[nospecialize]`, `@[weak_specialize]`),
+its meta mark, and the data the elaborator keeps for it and the compiler's paths read: structure info, matcher info,
+`noConfusion` info. Instance and reducibility
+attributes can be local, scoped or erased, so the module's end state can differ from what importers see: those are
+read from what the module exports, the instance entries the module exports for `x` and `x`'s entry in the
+reducibility core extension (local and scoped reducibility live in `reducibilityExtraExt`, whose exported entries
+`tableDigest` covers). The other attributes reject every kind but global, cannot be erased, and are set only in the
+declaration's module; matcher info and IR meta marks written for other modules' declarations are in `tableDigest`.
+(`@[tagged_return]` changes only the declaration's own impure signature and IR, which `entriesEnc` covers.) -/
 def attrsEnc (env : Environment) (lc : LocalCompiled) (x : Name) (s : CEnc) : CEnc :=
   let insts := lc.insts.getD x #[]
   let red := (reducibilityCoreExt.getState (asyncDecl := x) env).find? x |>.getD .semireducible
@@ -340,6 +377,29 @@ def attrsEnc (env : Environment) (lc : LocalCompiled) (x : Name) (s : CEnc) : CE
     |>.bool (hasNospecializeAttribute env x)
     |>.bool (hasWeakSpecializeAttribute env x)
     |>.bool (isMarkedMeta env x)
+    |>.opt (getStructureInfo? env x) structureInfoEnc
+    |>.opt (Meta.Match.Extension.getMatcherInfo? env x) matcherInfoEnc
+    |>.opt (noConfusionExt.find? env x) fun s i => { s with e := noConfusionEnc s.e i }
+
+def trivialEnc (e : Enc) (i : LCNF.TrivialStructureInfo) : Enc :=
+  let ⟨ctorName, numParams, fieldIdx⟩ := i
+  e.name ctorName |>.nat numParams |>.nat fieldIdx
+
+def ctorInfoEnc (e : Enc) (i : LCNF.CtorInfo) : Enc :=
+  let ⟨name, cidx, size, usize, ssize⟩ := i
+  e.name name |>.nat cidx |>.nat size |>.nat usize |>.nat ssize
+
+def ctorFieldEnc (s : CEnc) : LCNF.CtorFieldInfo → CEnc
+  | .erased => s.u8 0
+  | .object i type => (s.u8 1 |>.nat i).ty type
+  | .usize i => s.u8 2 |>.nat i
+  | .scalar sz offset type => (s.u8 3 |>.nat sz |>.nat offset).ty type
+  | .void => s.u8 4
+  | .spilled depth i type => (s.u8 5 |>.nat depth |>.nat i).ty type
+
+def ctorLayoutEnc (s : CEnc) (l : LCNF.CtorLayout) : CEnc :=
+  let ⟨ctorInfo, fieldInfo⟩ := l
+  fieldInfo.foldl ctorFieldEnc ({ s with e := ctorInfoEnc s.e ctorInfo }.nat fieldInfo.size)
 
 /-- The names of the current module with compiled entries. -/
 def compiledNames (env : Environment) (lc : LocalCompiled) : NameSet :=
@@ -350,16 +410,44 @@ def compiledNames (env : Environment) (lc : LocalCompiled) : NameSet :=
   let s := (LCNF.specExtension.getState env).specInfo.foldl (fun s n _ => s.insert n) s
   (LCNF.UnreachableBranches.functionSummariesExt.getState env).foldl (fun s n _ => s.insert n) s
 
-/-- The compiled interface of the current module's name `x`: its attributes, and its LCNF base and mono
-declarations, impure signature, IR declarations, specialization info and dead-branch summary. -/
-def compiledEnc (env : Environment) (lc : LocalCompiled) (x : Name) (s : CEnc) : CEnc :=
-  let s := attrsEnc env lc x s
+/-- The current module's compiled entries for `x`, which importers inline, specialize or call: its LCNF base
+and mono declarations, impure signature, IR declarations, specialization info and dead-branch summary, and, for
+an inductive type or constructor, the representation caches its module computed and persisted (trivial-structure
+info, impure trivial-structure info, IR type, mono type, constructor layout). The caches are computed with `Meta`
+at default transparency, so the module's local reducibility can change them. -/
+def entriesEnc (env : Environment) (lc : LocalCompiled) (x : Name) (s : CEnc) : CEnc :=
   let s := s.opt ((LCNF.baseExt.getState env).find? x) LCNFEnc.decl
   let s := s.opt ((LCNF.monoExt.getState env).find? x) LCNFEnc.decl
   let s := s.opt ((LCNF.impureSigExt.getState env).find? x) LCNFEnc.signature
   let ds := lc.ir.getD x #[]
   let s := ds.foldl IREnc.decl (s.nat ds.size)
   let s := s.opt ((LCNF.specExtension.getState env).specInfo.find? x) specEntryEnc
-  s.opt ((LCNF.UnreachableBranches.functionSummariesExt.getState env).find? x) summaryEnc
+  let s := s.opt ((LCNF.UnreachableBranches.functionSummariesExt.getState env).find? x) summaryEnc
+  let s := s.opt (LCNF.findTrivialStructureInfo? env x) fun s i => { s with e := s.e.opt i trivialEnc }
+  let s := s.opt (LCNF.findTrivialImpureStructureInfo? env x) fun s i => { s with e := s.e.opt i trivialEnc }
+  let s := s.opt (LCNF.findImpureType? env x) CEnc.ty
+  let s := s.opt (LCNF.monoTypeExt.find? env x) CEnc.ty
+  (s.opt (LCNF.findCtorLayout? env x) ctorLayoutEnc).flushTys
+
+/-- The compiled interface of a name, digested in two parts, with the declaration names it mentions and whether
+its IR is exported for interpretation (`isDeclMeta`, which the module's end-of-file closure computation may set
+after the name was compiled). -/
+structure CompiledDigest where
+  /-- `attrsEnc`: how callers compile calls to the name. -/
+  attrs : Digest
+  /-- `entriesEnc`: the name's compiled entries. -/
+  entries : Digest
+  irMeta : Bool
+  mentions : NameSet
+  deriving Inhabited
+
+def compiledDigest (env : Environment) (lc : LocalCompiled) (x : Name) : CompiledDigest :=
+  let a := attrsEnc env lc x { e := {} } |>.flushTys
+  let c := entriesEnc env lc x { e := {}, ms := a.ms }
+  { attrs := a.e.finish, entries := c.e.finish, irMeta := isDeclMeta env x, mentions := c.ms }
+
+/-- `CompiledDigest.entries` of a name without compiled entries. -/
+def noEntries (env : Environment) : Digest :=
+  (entriesEnc env {} .anonymous { e := {} }).e.finish
 
 end Lean.ModuleUsage

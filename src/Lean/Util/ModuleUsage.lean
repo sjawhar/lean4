@@ -21,6 +21,7 @@ import Lean.ReducibilityAttrs
 import Lean.Meta.Instances
 import Lean.Class
 import Lean.Meta.UnificationHint
+import Lean.Compiler.MetaAttr
 import Lean.Elab.InfoTree.Util
 import Init.Data.String.TakeDrop
 import Init.Data.String.Search
@@ -32,7 +33,7 @@ Usage data for Lake's usage cutoff: meaning digests of a module's declarations (
 when Lean runs with `--usage`), and the `.usage` sidecar recording, per imported module, the digests of
 the declarations the module used, from which Lake decides whether the module must be compiled again.
 
-A digest covers a declaration's kernel data and its compiled interface (`compiledEnc`), Merkle-closed over the
+A digest covers a declaration's kernel data and its compiled interface (`compiledDigest`), Merkle-closed over the
 declarations both refer to. Compiler-only names (`f._redArg`, `g._at_.h.spec_0`, ...) fold into an owner, a
 kernel constant of the same module (`ownerOf`), whose digest covers them.
 -/
@@ -191,33 +192,47 @@ structure Node where
   refs : Array Name
   deriving Inhabited
 
-/-- The current module's nodes. -/
-def ownNodes (env : Environment) (consts : Array (Name × ConstantInfo × Array Name)) : Array Node := Id.run do
-  let s := state env
+/-- The compiled digest of each of the current module's kernel constants (`consts`) and of each name with
+compiled entries. -/
+def compiledDigests (env : Environment) (consts : Array (Name × ConstantInfo × Array Name)) :
+    Std.HashMap Name CompiledDigest :=
   let lc := LocalCompiled.ofEnv env
+  let names := consts.foldl (·.insert ·.1) (compiledNames env lc)
+  names.toArray.foldl (init := {}) fun m n => m.insert n (compiledDigest env lc n)
+
+/-- The current module's nodes, from its kernel constants (`consts`) and their compiled digests (`cds`, which
+`compiledDigests` computes). -/
+def ownNodes (env : Environment) (consts : Array (Name × ConstantInfo × Array Name))
+    (cds : Std.HashMap Name CompiledDigest := compiledDigests env consts) : Array Node := Id.run do
+  let s := state env
   let kernel : Std.HashMap Name (ConstantInfo × Array Name) :=
     consts.foldl (fun m (n, ci, rs) => m.insert n (ci, rs)) {}
   let mut folded : Std.HashMap Name (Array Name) := {}
-  for x in (compiledNames env lc).toArray do
+  for (x, _) in cds do
     unless kernel.contains x do
       folded := folded.alter (ownerOf kernel.contains x) fun o => some ((o.getD #[]).push x)
   let localOwner (x : Name) : Name :=
     if kernel.contains x || folded.contains x then x else ownerOf kernel.contains x
   let pkg := env.getModulePackage?
   let names := consts.map (·.1) ++ (folded.toArray.filterMap fun (n, _) => if kernel.contains n then none else some n)
+  let compiled (e : Enc) (x : Name) : Enc × NameSet :=
+    let cd := cds.getD x default
+    (e.digest cd.attrs |>.digest cd.entries |>.bool cd.irMeta, cd.mentions)
   return names.map fun n => Id.run do
     let k? := kernel[n]?
-    let mut c : CEnc := { e := ({} : Enc).opt pkg Enc.str |>.opt k? fun e (ci, _) => e.digest (localHash ci) }
-    c := compiledEnc env lc n c
+    let (e, ms) := compiled (({} : Enc).opt pkg Enc.str |>.opt k? fun e (ci, _) => e.digest (localHash ci)) n
+    let mut e := e
+    let mut mentions := (k?.elim #[] (·.2)).foldl (·.insert ·) ms
     let fs := (folded.getD n #[]).filter (· != n) |>.qsort Name.quickLt
-    c := c.nat fs.size
+    e := e.nat fs.size
     for x in fs do
-      c := compiledEnc env lc x (c.name x)
-    let mentions := (k?.elim #[] (·.2)).foldl (·.insert ·) c.ms
+      let (e', ms') := compiled (e.name x) x
+      e := e'
+      mentions := ms'.foldl (·.insert ·) mentions
     let rs : NameSet := mentions.foldl (init := {}) fun rs m =>
       let o := if (env.getModuleIdxFor? m).isSome then s.ownerOf env m else localOwner m
       if o == n then rs else rs.insert o
-    { name := n, localDigest := c.e.finish, refs := rs.toArray.qsort Name.quickLt }
+    { name := n, localDigest := e.finish, refs := rs.toArray.qsort Name.quickLt }
 
 /-- Digests of the current module's nodes: SCCs in dependency order; each SCC's digest hashes its members'
 names and local digests with the name and digest of every node outside it that they refer to (tagged absent if
@@ -351,9 +366,9 @@ private def compilerShapedConsts (env : Environment) (i? : Option ModuleIdx) : A
 /-- A digest of one module's entries in the cross-module compiler tables: `@[csimp]` replacements, instances
 and classes declared for another module's declaration, reducibility set for another module's declaration,
 unification hints, `@[cpass]` installers and constant folders, each hint, installer and folder with its
-declaration's digest (`digestOf`); its kernel constants with compiler-generated names (`compilerShapedConsts`);
-and whether the module's compiles ran code inside the compiler (`compilerCode`). `i? = none` is the current
-module. -/
+declaration's digest (`digestOf`), matcher info and IR meta marks written for another module's declaration; its
+kernel constants with compiler-generated names (`compilerShapedConsts`); and whether the module's compiles ran
+code inside the compiler (`compilerCode`). `i? = none` is the current module. -/
 def tableDigest (env : Environment) (i? : Option ModuleIdx) (digestOf : Name → Option Digest)
     (compilerCode : Bool) : Digest := Id.run do
   let csimp := pickEntries i? (Compiler.CSimp.ext.ext.getModuleEntries env ·)
@@ -372,6 +387,10 @@ def tableDigest (env : Environment) (i? : Option ModuleIdx) (digestOf : Name →
     ((Compiler.LCNF.Simp.ConstantFold.folderExt.getState env).1.map (·.toFolderOleanEntry))
   let hints := pickEntries i? (Meta.unificationHintExtension.ext.getModuleEntries env ·)
     (Meta.unificationHintExtension.ext.getState env).newEntries
+  let matchers := pickEntries i? (Meta.Match.Extension.extension.getModuleEntries env ·)
+    (Meta.Match.Extension.extension.getEntries env)
+  let matchers := matchers.filter (!definedIn env i? ·.name)
+  let metas := (declMetaEntries env i?).filter (!definedIn env i? ·)
   let withDigest (e : Enc) (n : Name) := e.name n |>.opt (digestOf n) Enc.digest
   let mut e : Enc := ({} : Enc).bool compilerCode |>.nat csimp.size
   for x in csimp do
@@ -397,6 +416,12 @@ def tableDigest (env : Environment) (i? : Option ModuleIdx) (digestOf : Name →
   e := e.nat hints.size
   for x in hints do
     e := scopedEnc (fun e (h : Meta.UnificationHintEntry) => withDigest e h.val) e x
+  e := e.nat matchers.size
+  for m in matchers do
+    let ⟨name, info⟩ := m
+    e := (matcherInfoEnc { e := e.name name } info).e
+  e := e.nat metas.size
+  for n in metas do e := e.name n
   let shaped := compilerShapedConsts env i?
   e := e.nat shaped.size
   for n in shaped do e := e.name n
@@ -419,14 +444,6 @@ def closureDigest (env : Environment) (own : Array (Name × Digest)) (compilerCo
       Enc.digest
   return e.digest (tableDigest env none digestOf compilerCode) |>.finish
 
-/-- Whether the current module holds an IR declaration the compiler did not produce: more entries under a name
-than `fromCompiler` (`Compiler.LCNF.compilerIRCounts`) counts. Such a declaration can disagree with the LCNF body
-that inlining and specialization use, so a specialization of a caller need not compute what a call to it does. -/
-def irOutsideCompiler (env : Environment) (fromCompiler : NameMap Nat) : Bool :=
-  let counts : NameMap Nat := (IR.getDecls env).foldl (init := {}) fun m d =>
-    m.insert d.name ((m.find? d.name).getD 0 + 1)
-  counts.foldl (init := false) fun b n k => b || k > (fromCompiler.find? n).getD 0
-
 /-- The imported modules whose `.olean` carries digests (`State.hasEntries`), sorted. -/
 def digestedModules (env : Environment) : Array Name :=
   let s := state env
@@ -435,7 +452,7 @@ def digestedModules (env : Environment) : Array Name :=
 
 /-- The format version of the `.usage` sidecar and of Lake's `.usekey`; Lake reads a sidecar of any other
 version as absent. -/
-def usageVersion : Nat := 7
+def usageVersion : Nat := 8
 
 /-- `own` is `localDigests env nodes`; `used` holds the imported names recorded while elaborating
 (`moduleUsed`'s `extra`); `compilerCode` says whether the module's compiles ran code inside the compiler

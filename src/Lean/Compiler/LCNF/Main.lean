@@ -17,6 +17,7 @@ import Lean.Compiler.LCNF.Simp.ConstantFold
 import Lean.Util.UsedByChecks
 public import Lean.Compiler.IR.Basic
 public import Lean.Compiler.LCNF.CompilerM
+public import Lean.Util.ModuleUsage.Compiled
 
 public section
 namespace Lean.Compiler.LCNF
@@ -136,25 +137,95 @@ private unsafe def isBuiltinCompilerUnsafe (manager : PassManager)
 @[implemented_by isBuiltinCompilerUnsafe]
 private opaque isBuiltinCompiler (manager : PassManager) (folders : SMap Name Simp.ConstantFold.Folder) : Bool
 
-/-- Per name, how many IR declarations the compiler produced in this process while usage recording is on: the
-entries the IR step of `PassManager.run` added to the environment. Private, so only that step adds to it. -/
-private builtin_initialize compilerIRRef : IO.Ref (NameMap Nat) ← IO.mkRef {}
+/-- An outermost `PassManager.run` in progress on one thread, while usage recording is on: where it started in the
+compiled-name log, the kernel constants it and the runs nested in it compile (as their environments hold them),
+and the IR declarations their IR steps added (newest first). -/
+private structure ActiveRun where
+  start : Nat
+  inputs : Array ConstantInfo
+  ir : List IR.Decl := []
 
-/-- The IR declarations the compiler produced in this process, counted per name. An IR declaration of a module
-beyond these was registered outside the compiler (`ModuleUsage.irOutsideCompiler`). -/
-def compilerIRCounts : BaseIO (NameMap Nat) :=
-  compilerIRRef.get
+/-- Per thread inside `PassManager.run`, its outermost run. A run executes on the thread that started it until it
+returns: the runtime runs a task to completion on one worker, and waiting on another task blocks the waiting
+thread. -/
+private builtin_initialize activeRunsRef : IO.Ref (Std.HashMap UInt64 ActiveRun) ← IO.mkRef {}
 
-/-- Counts the IR entries `env` has beyond `before`, an earlier state of the same environment's IR list. -/
-private def recordCompilerIR (before : List IR.Decl) (env : Environment) : BaseIO Unit := do
+/-- The kernel constants of every outermost run of this process, including those of environments that were then
+discarded. -/
+private builtin_initialize runInputsRef : IO.Ref (Array (Array ConstantInfo)) ← IO.mkRef #[]
+
+/-- Per name a run produced, the compiled digest of the name at the run's end, with the run (an index into
+`runInputsRef`). Private, so only `PassManager.run` adds to it. -/
+private builtin_initialize producedRef : IO.Ref (Std.HashMap Name (Array (ModuleUsage.CompiledDigest × Nat))) ←
+  IO.mkRef {}
+
+/-- Notes the IR entries `env` has beyond `before`, an earlier state of the same environment's IR list, under the
+thread's outermost run. -/
+private def noteIR (before : List IR.Decl) (env : Environment) : BaseIO Unit := do
   unless (← usageRecordingEnabled) do return
+  let tid ← IO.getTID
   let after := IR.getDecls env
   let added := after.take (after.length - before.length)
-  compilerIRRef.modify fun m => added.foldl (init := m) fun m d => m.insert d.name ((m.find? d.name).getD 0 + 1)
+  activeRunsRef.modify fun m => m.modify tid fun r => { r with ir := added ++ r.ir }
+
+/-- Enters a run on thread `tid`; returns whether it is the thread's outermost run. -/
+private def enterRun (tid : UInt64) (inputs : Array ConstantInfo) : BaseIO Bool := do
+  if (← activeRunsRef.get).contains tid then
+    activeRunsRef.modify fun m => m.modify tid fun r => { r with inputs := r.inputs ++ inputs }
+    return false
+  let start ← compiledNameLogSize
+  activeRunsRef.modify (·.insert tid { start, inputs })
+  return true
+
+/-- Leaves the outermost run on thread `tid` and records the compiled digest, in `env`, of each name it produced:
+the names its thread logged compiled entries for, the names of its IR declarations, its kernel constants and their
+constructors (whose representation caches the run computes). -/
+private def exitRun (tid : UInt64) (env : Environment) : BaseIO Unit := do
+  let some r := (← activeRunsRef.get)[tid]? | return
+  activeRunsRef.modify (·.erase tid)
+  let saved ← compiledNamesSince r.start tid
+  let names : NameSet := saved.foldl (·.insert ·) {}
+  let names := r.ir.foldl (fun s d => s.insert d.name) names
+  let names := r.inputs.foldl (init := names) fun s ci => match ci with
+    | .inductInfo v => v.ctors.foldl (·.insert ·) (s.insert ci.name)
+    | _ => s.insert ci.name
+  let lc : ModuleUsage.LocalCompiled :=
+    { ir := r.ir.foldl (init := {}) fun m d => m.alter d.name fun o => some ((o.getD #[]).push d) }
+  let run ← runInputsRef.modifyGet fun rs => (rs.size, rs.push r.inputs)
+  let digests := names.toArray.map fun n => (n, ModuleUsage.compiledDigest env lc n)
+  producedRef.modify fun m => digests.foldl (init := m) fun m (n, cd) =>
+    m.alter n fun o => some ((o.getD #[]).push (cd, run))
+
+/-- Whether the current module holds compiled entries that the compiler did not produce from the module's own
+constants. `cds` is the compiled digest of each of the module's names (`ModuleUsage.compiledDigests`). Every name
+with compiled entries must have been produced by a run (`PassManager.run`) whose kernel constants equal `env`'s
+under the same names, with the same entries at the run's end and, for a name that is not a kernel constant, the
+same attributes; a kernel constant's attributes may change after its compile, and its digest covers them anyway.
+So entries written outside the compiler (`IR.addDecl`, `Decl.saveBase` outside a run, `addFunctionSummary`, a
+direct extension entry), attributes set on a compiler-generated name, and entries produced from a constant of
+another environment (a discarded one, say) are caught: any of them can make importers' inlining and
+specialization disagree with what the entries' own module compiled. -/
+def compiledOutsideCompiler (env : Environment) (cds : Std.HashMap Name ModuleUsage.CompiledDigest) :
+    BaseIO Bool := do
+  let produced ← producedRef.get
+  -- A run is invalid if the final environment holds one of its kernel constants with another type or value. A
+  -- constant it does not hold (a match splitter realized while elaborating a proof, whose compiled entries
+  -- reach the module without the constant) cannot disagree with it. Private constants count, so look in the
+  -- private scope, through realizations.
+  let priv := env.setExporting false
+  let same (ci : ConstantInfo) : Bool := match priv.find? ci.name with
+    | none => true
+    | some ci' => ci'.type == ci.type && ci'.value? (allowOpaque := true) == ci.value? (allowOpaque := true)
+  let valid := (← runInputsRef.get).map (·.all same)
+  let empty := ModuleUsage.noEntries env
+  return cds.fold (init := false) fun out n cd => out || (cd.entries != empty &&
+    let kernel := priv.contains n (skipRealize := false)
+    !(produced[n]?.any (·.any fun (r, run) =>
+      valid[run]! && r.entries == cd.entries && (kernel || r.attrs == cd.attrs))))
 
 namespace PassManager
 
-partial def run (declNames : Array Name) (baseOpts : Options) : CompilerM Unit := withAtLeastMaxRecDepth 8192 do
+partial def runCore (declNames : Array Name) (baseOpts : Options) : CompilerM Unit := withAtLeastMaxRecDepth 8192 do
   /-
   Note: we need to increase the recursion depth because we currently do to save phase1
   declarations in .olean files. Then, we have to recursively compile all dependencies,
@@ -249,7 +320,7 @@ partial def run (declNames : Array Name) (baseOpts : Options) : CompilerM Unit :
         let before := IR.getDecls (← getEnv)
         let irDecls ← IR.toIR decls
         discard <| IR.compile irDecls
-        recordCompilerIR before (← getEnv)
+        noteIR before (← getEnv)
 where
   runPassManagerPart (inPhase outPhase : Purity) (profilerName : String)
       (passes : Array Pass) (decls : Array (Decl inPhase)) (isCheckEnabled : Bool) :
@@ -266,6 +337,14 @@ where
         withPhase pass.phaseOut <| checkpoint pass.name state.snd (isCheckEnabled || pass.shouldAlwaysRunCheck)
       let decls := state.fst.withAssertPurity outPhase fun h => h ▸ state.snd
       return decls
+
+/-- Runs the compiler on `declNames`, recording for the usage data which entries the run produced. -/
+def run (declNames : Array Name) (baseOpts : Options) : CompilerM Unit := do
+  unless (← usageRecordingEnabled) do return (← runCore declNames baseOpts)
+  let tid ← IO.getTID
+  let outer ← enterRun tid (declNames.filterMap ((← getEnv).setExporting false).find?)
+  try runCore declNames baseOpts
+  finally if outer then exitRun tid (← getEnv)
 
 end PassManager
 

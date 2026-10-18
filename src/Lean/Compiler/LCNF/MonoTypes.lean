@@ -9,6 +9,7 @@ prelude
 public import Lean.Compiler.LCNF.Util
 public import Lean.Compiler.LCNF.BaseTypes
 public import Lean.Compiler.LCNF.Irrelevant
+import Lean.Util.UsedByChecks
 
 public section
 
@@ -32,6 +33,10 @@ Requires `compileDecls` to have been run for inductive `declName`.
 -/
 def hasTrivialStructure? (declName : Name) : CoreM (Option TrivialStructureInfo) :=
   Irrelevant.hasTrivialStructure? trivialStructureInfoExt declName
+
+/-- The trivial-structure info persisted for `declName`, if the cache holds an entry for it. -/
+def findTrivialStructureInfo? (env : Environment) (declName : Name) : Option (Option TrivialStructureInfo) :=
+  trivialStructureInfoExt.find? env declName
 
 def getParamTypes (type : Expr) : Array Expr :=
   go type #[]
@@ -116,7 +121,8 @@ def getOtherDeclMonoType (declName : Name) : CoreM Expr := do
   if (← getEnv).find? declName matches some (.inductInfo _) | some (.ctorInfo _) then
     throwError "`{declName}` was not compiled; `compileDecls` must run on inductive types first"
   let type ← toMonoType (← getOtherDeclBaseType declName [])
-  -- avoid `addEntry` for local-only caching
+  -- cached in the extension's state, which is exported for this module's own declarations
+  logCompiledName declName
   modifyEnv (monoTypeExt.modifyState · (monoTypeExt.addEntryFn · (declName, type)))
   return type
 
