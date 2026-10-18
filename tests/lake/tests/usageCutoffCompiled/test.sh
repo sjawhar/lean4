@@ -1438,6 +1438,32 @@ collide_boxed_trans_s1() {
   printf 'def unrelated : Nat := 0\n@[noinline] def foo._boxed (n : Nat) : Nat := n + 7\n' > T/B.lean
 }
 
+# An IR-only compiler-shaped name a module registers for a declaration it does not define: `Z` adds an
+# `@[extern]` IR declaration `foo._redArg` for `A`'s `foo`. Importers resolve the name to the first module in
+# import order that claims it, so with `Z` imported before `A` (`irdup_first`) `C`'s code reaches `Z`'s
+# declaration; with `A` first (`irdup_after`, control) it keeps reaching `A`'s.
+irdup_files() {
+  lakefile_app; mkdir_t
+  printf '@[noinline] def foo (n _h : Nat) : Nat := n + 5\n' > T/A.lean
+  printf 'import Lean\ndef zdummy : Nat := 1\n' > T/Z.lean
+  printf 'import T.%s\nimport T.%s\n@[noinline] def useFoo (n : Nat) : Nat := foo n 0\n' "$1" "$2" > T/C.lean
+  printf 'import T.C\ndef main : IO Unit := IO.println (useFoo 1)\n' > Main.lean
+}
+irdup_z() {
+  cat > T/Z.lean <<'EOF'
+import Lean
+def zdummy : Nat := 1
+open Lean IR in
+run_cmd Lean.Elab.Command.liftCoreM <| IR.addDecl <| (.extern `foo._redArg
+  #[{ x := ⟨1⟩, borrow := false, ty := .object }] .object
+  { entries := [.standard `all "lean_nat_succ"] })
+EOF
+}
+irdup_first_s0() { irdup_files Z A; }
+irdup_first_s1() { irdup_z; }
+irdup_after_s0() { irdup_files A Z; }
+irdup_after_s1() { irdup_z; }
+
 # A control for the comparison of failing builds: `scoped_inst` with a module `N` that fails in state 1, so the
 # build fails while `M` and `W` are kept; the outputs both builds produced must still agree.
 negfail_scoped_s0() {
@@ -1756,7 +1782,7 @@ all_cases="spec_transitive spec_link spec_type spec_precomp csimp_transitive csi
   table_order folder_order red_order
   d2_tolerated_lean d2_tolerated_reader f3_own_folder f3_own_cpass f3_runtime_folder f3_runtime_cpass
   f1_cachespec f1_cachespec_hit premise_ir ir_count ir_count_nd lcnf_override d2_down_rebuilt
-  collide_boxed_trans negfail_scoped abi_mix abi_void abi_enum abi_monotype
+  collide_boxed_trans irdup_first irdup_after negfail_scoped abi_mix abi_void abi_enum abi_monotype
   wh_ctrl wh_summary wh_extern wh_implby wh_sig tl_pre_extern tl2_pre_extern tl3_race_a tl3_race_b tl3_race_sig
   ir_eval macro_eval init_eval
   inl_small inl_inline inl_instance spec_nested spec_derived spec_local spec_renumber

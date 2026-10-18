@@ -78,15 +78,19 @@ def refs (env : Environment) (c : ConstantInfo) (recorded : NameMap DeclConsts :
   s.toArray.qsort Name.quickLt
 
 /-- For a specialization prefix `g._at_.o` (a specialization of `g` that `o` created), `o`: the components after
-the first `_at_`. A specialization created inside another specialization is `g._at_.g'._at_.o.spec_M`, whose
-creator `g'._at_.o.spec_M` is itself a specialization name that strips to `o`. Folding does not depend on the
-result being the creator: writer and reader strip the same way, and an owner's digest covers whatever folds into
-it. -/
+the first `_at_`, joined as they are (`Name.append` would treat a `_hyg` component as macro scopes, which `o`
+can contain in the middle). A specialization created inside another specialization is `g._at_.g'._at_.o.spec_M`,
+whose creator `g'._at_.o.spec_M` is itself a specialization name that strips to `o`. Folding does not depend on
+the result being the creator: writer and reader strip the same way, and an owner's digest covers whatever folds
+into it. -/
 def atOwner? (p : Name) : Option Name :=
   let cs := p.components
   match cs.findIdx? (· == `_at_) with
   | some j =>
-    let o := (cs.drop (j + 1)).foldl Name.append .anonymous
+    let o := (cs.drop (j + 1)).foldl (init := Name.anonymous) fun acc c => match c with
+      | .str _ s => .str acc s
+      | .num _ n => .num acc n
+      | .anonymous => acc
     if o.isAnonymous then none else some o
   | none => none
 
@@ -316,13 +320,12 @@ opaque usedFromInfoTrees (trees : Array Elab.InfoTree) (init : NameSet) : NameSe
 /-! Cross-module compiler tables: entries a module adds for declarations of other modules, which change how
 every importer compiles without changing any digest of those declarations. -/
 
-/-- Whether module `i` (`none`: the current module) defines `n`. For the current module, `n` must be one of its
-constants: a name no import defines but the module does not know either (a sibling module's declaration, say)
-is not its own, so an entry for it stays in `tableDigest`. -/
-private def definedIn (env : Environment) (i? : Option ModuleIdx) (n : Name) : Bool :=
-  match i? with
-  | some _ => env.getModuleIdxFor? n == i?
-  | none => env.getModuleIdxFor? n == none && (env.setExporting false).contains n (skipRealize := false)
+/-- Whether module `i` (`none`: the current module) defines `n` as a kernel constant; `priv` is the environment
+in its private scope (`setExporting false`). `getModuleIdxFor?` alone also maps a module's claimed compiler-only
+names, and maps nothing for a name no import defines; neither is a declaration of the module, so an entry for it
+stays in `tableDigest`, and a claimed name it owns no prefix of is listed (`claimedForeignNames`). -/
+private def definedIn (priv : Environment) (i? : Option ModuleIdx) (n : Name) : Bool :=
+  priv.getModuleIdxFor? n == i? && priv.contains n (skipRealize := false)
 
 /-- Module `i?`'s entries of an extension: `imported i` for an imported module, `loc` (the current module's,
 newest first) reversed for `none`. -/
@@ -354,39 +357,37 @@ private def compilerShapedConsts (env : Environment) (i? : Option ModuleIdx) : A
       #[]).qsort Name.quickLt
 
 /-- Module `i?`'s claimed compiler-only names (IR declarations without a kernel constant, which importers resolve
-to the module through `getModuleIdxFor?`) that a compile of the module would not generate: names without a
-compiler-generated shape that are public or private under another module's prefix. Such a name can collide with
-a declaration of an importer, whose fresh build then fails; the module's own realized auxiliary constants (match
-splitters) carry its own private prefix and are left out. -/
-private def claimedForeignNames (env : Environment) (i? : Option ModuleIdx) : Array Name :=
-  let (mod, names) := match i? with
-    | some i => (env.header.moduleNames[i.toNat]!, env.header.moduleData[i.toNat]?.elim #[] (·.extraConstNames))
-    | none =>
-      let priv := env.setExporting false
-      (env.mainModule, (IR.getDecls env).toArray.filterMap fun (d : IR.Decl) =>
-        if priv.contains d.name then none else some d.name)
-  let ownPrefix := privatePrefix? (mkPrivateNameCore mod `x)
-  let foreign := names.filter fun n => !compilerShapedName n && privatePrefix? n != ownPrefix
+to the first module in import order that claims them, `findExtEntry?`) whose owner the module does not define:
+stripping the name as `ownerOf` does reaches none of the module's kernel constants. A name the module's own
+compile generates folds into a constant the module defines, whose digest covers its entries; any other claimed
+name, compiler-shaped or not, can take a call to that name over from another module, so it is listed. -/
+private def claimedForeignNames (priv : Environment) (i? : Option ModuleIdx) : Array Name :=
+  let names := match i? with
+    | some i => priv.header.moduleData[i.toNat]?.elim #[] (·.extraConstNames)
+    | none => (IR.getDecls priv).toArray.filterMap fun (d : IR.Decl) =>
+        if priv.contains d.name (skipRealize := false) then none else some d.name
+  let foreign := names.filter fun n => !definedIn priv i? (ownerOf (definedIn priv i?) n)
   (foreign.qsort Name.quickLt).eraseReps
 
 /-- A digest of one module's entries in the cross-module compiler tables: `@[csimp]` replacements, instances
 and classes declared for another module's declaration, reducibility set for another module's declaration,
 unification hints, `@[cpass]` installers and constant folders, each hint, installer and folder with its
 declaration's digest (`digestOf`), matcher info and IR meta marks written for another module's declaration; its
-kernel constants with compiler-generated names (`compilerShapedConsts`) and its claimed compiler-only names that a
-compile would not generate (`claimedForeignNames`). `i? = none` is the current module. -/
+kernel constants with compiler-generated names (`compilerShapedConsts`) and its claimed compiler-only names whose
+owner it does not define (`claimedForeignNames`). `i? = none` is the current module. -/
 def tableDigest (env : Environment) (i? : Option ModuleIdx) (digestOf : Name → Option Digest) : Digest :=
   Id.run do
+  let priv := env.setExporting false
   let csimp := pickEntries i? (Compiler.CSimp.ext.ext.getModuleEntries env ·)
     (Compiler.CSimp.ext.ext.getState env).newEntries
   let insts := pickEntries i? (Meta.instanceExtension.ext.getModuleEntries env ·)
     (Meta.instanceExtension.ext.getState env).newEntries
   let insts := insts.filter fun e => match e with
-    | .global a | .scoped _ a => a.globalName?.any (!definedIn env i? ·)
+    | .global a | .scoped _ a => a.globalName?.any (!definedIn priv i? ·)
   let reds := pickEntries i? (reducibilityExtraExt.ext.getModuleEntries env ·)
     (reducibilityExtraExt.ext.getState env).newEntries
   let classes := pickEntries i? (classExtension.getModuleEntries env ·) (classExtension.getEntries env)
-  let classes := classes.filter (!definedIn env i? ·.name)
+  let classes := classes.filter (!definedIn priv i? ·.name)
   let passes := pickEntries i? (Compiler.LCNF.passManagerExt.getModuleEntries env ·)
     (Compiler.LCNF.passManagerExt.getState env).1
   let folders := pickEntries i? (Compiler.LCNF.Simp.ConstantFold.folderExt.getModuleEntries env ·)
@@ -395,8 +396,8 @@ def tableDigest (env : Environment) (i? : Option ModuleIdx) (digestOf : Name →
     (Meta.unificationHintExtension.ext.getState env).newEntries
   let matchers := pickEntries i? (Meta.Match.Extension.extension.getModuleEntries env ·)
     (Meta.Match.Extension.extension.getEntries env)
-  let matchers := matchers.filter (!definedIn env i? ·.name)
-  let metas := (declMetaEntries env i?).filter (!definedIn env i? ·)
+  let matchers := matchers.filter (!definedIn priv i? ·.name)
+  let metas := (declMetaEntries env i?).filter (!definedIn priv i? ·)
   let withDigest (e : Enc) (n : Name) := e.name n |>.opt (digestOf n) Enc.digest
   let mut e : Enc := ({} : Enc).nat csimp.size
   for x in csimp do
@@ -431,7 +432,7 @@ def tableDigest (env : Environment) (i? : Option ModuleIdx) (digestOf : Name →
   let shaped := compilerShapedConsts env i?
   e := e.nat shaped.size
   for n in shaped do e := e.name n
-  let claimed := claimedForeignNames env i?
+  let claimed := claimedForeignNames priv i?
   e := e.nat claimed.size
   for n in claimed do e := e.name n
   return e.finish
