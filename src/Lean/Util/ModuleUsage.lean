@@ -369,12 +369,24 @@ private def claimedForeignNames (priv : Environment) (i? : Option ModuleIdx) : A
   let foreign := names.filter fun n => !definedIn priv i? (ownerOf (definedIn priv i?) n)
   (foreign.qsort Name.quickLt).eraseReps
 
+/-- A discrimination-tree key, encoded so that two keys encode alike exactly when they are `==`, as the tree
+compares them when it matches. -/
+def discrKeyEnc (e : Enc) : Meta.DiscrTree.Key → Enc
+  | .star => e.u8 0
+  | .other => e.u8 1
+  | .lit (.natVal n) => e.u8 2 |>.nat n
+  | .lit (.strVal s) => e.u8 3 |>.str s
+  | .fvar f n => e.u8 4 |>.name f.name |>.nat n
+  | .const c n => e.u8 5 |>.name c |>.nat n
+  | .arrow => e.u8 6
+  | .proj s i n => e.u8 7 |>.name s |>.nat i |>.nat n
+
 /-- A digest of one module's entries in the cross-module compiler tables: `@[csimp]` replacements, instances
 and classes declared for another module's declaration, reducibility set for another module's declaration,
-unification hints, `@[cpass]` installers and constant folders, each hint, installer and folder with its
-declaration's digest (`digestOf`), matcher info and IR meta marks written for another module's declaration; its
-kernel constants with compiler-generated names (`compilerShapedConsts`) and its claimed compiler-only names whose
-owner it does not define (`claimedForeignNames`). `i? = none` is the current module. -/
+unification hints, `@[cpass]` installers and constant folders, each hint (with its discrimination-tree keys),
+installer and folder with its declaration's digest (`digestOf`), matcher info and IR meta marks written for another
+module's declaration; its kernel constants with compiler-generated names (`compilerShapedConsts`) and its claimed
+compiler-only names whose owner it does not define (`claimedForeignNames`). `i? = none` is the current module. -/
 def tableDigest (env : Environment) (i? : Option ModuleIdx) (digestOf : Name → Option Digest) : Digest :=
   Id.run do
   let priv := env.setExporting false
@@ -422,7 +434,8 @@ def tableDigest (env : Environment) (i? : Option ModuleIdx) (digestOf : Name →
     e := withDigest (e.name declName) folderDeclName
   e := e.nat hints.size
   for x in hints do
-    e := scopedEnc (fun e (h : Meta.UnificationHintEntry) => withDigest e h.val) e x
+    e := scopedEnc (fun e (h : Meta.UnificationHintEntry) =>
+      withDigest (h.keys.foldl discrKeyEnc (e.nat h.keys.size)) h.val) e x
   e := e.nat matchers.size
   for m in matchers do
     let ⟨name, info⟩ := m

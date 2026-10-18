@@ -264,8 +264,9 @@ def classification : List (Name × UsageClass × String) := [
   (`Lean.Meta.unificationHintExtension, .R5,
     "Any module may add a hint for declarations it did not define \
     (`addUnificationHint`, src/Lean/Meta/UnificationHint.lean:77-89); the writer's exported entries \
-    are part of the cross-module table digest, and `tryUnificationHints` reads the whole table \
-    (:104-119)."),
+    are part of the cross-module table digest, each with its discrimination-tree keys, which the writer \
+    computes in its own environment and `tryUnificationHints` matches on when it reads the whole table \
+    (:108-119)."),
   (`Lean.auxParentProjInfoExt, .R1,
     "`addAuxParentProjectionInfo` (src/Lean/ProjFns.lean:77-78) is public; the elaborator calls it in \
     `mkCoercionToCopiedParent` (src/Lean/Elab/Structure.lean:1440) for the parent projection of the \
