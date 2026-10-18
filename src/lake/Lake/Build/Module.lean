@@ -1496,51 +1496,25 @@ def importUsage? (hashes : ContentHashes) (importArts : NameMap ImportArtifacts)
     unless key.olean == (← contentHash hashes olean) do return none
   return some (olean, usage)
 
-/-- The specialization-cache keys a closure module created, as `closureSpecKeys?` caches them for one build. -/
-structure ClosureSpecKeys where
-  keys? : Option (Array (ModuleUsage.Digest × Name))
-  deriving TypeName
-
-/--
-The specialization-cache keys importee `m` created (`UsageImport.specKeys`), from its `.usage` once `importUsage?`
-has bound it to the importee's current `.olean`, or `none` if `importUsage?` accepts no `.usage`. Bound once per
-build and kept in the build's sidecar cache: a check consults only the closure of the module it checks, whose jobs
-all finished before it, and no job rewrites another module's `.olean`; so the binding a first check made holds for
-every later check in the build, which spares each check hashing its whole closure.
--/
-def closureSpecKeys? (importArts : NameMap ImportArtifacts) (m : Name) :
-    JobM (Option (Array (ModuleUsage.Digest × Name))) := do
-  let some arts := importArts.find? m | return none
-  let some olean := arts.olean? | return none
-  let cacheKey := olean.withExtension "speckeys"
-  let cached ← (← getBuildContext).sidecarCache.atomically do
-    return (← getThe (Std.HashMap FilePath (ModuleUsage.Digest × Dynamic))).get? cacheKey
-  if let some (_, entry) := cached then
-    let some entry := entry.get? ClosureSpecKeys | error s!"{cacheKey}: cached entry has the wrong type"
-    return entry.keys?
-  let keys? := (← importUsage? (← IO.mkRef {}) importArts m).map (·.2.specKeys)
-  (← getBuildContext).sidecarCache.atomically do
-    modifyThe (Std.HashMap FilePath (ModuleUsage.Digest × Dynamic))
-      (·.insert cacheKey (default, Dynamic.mk (ClosureSpecKeys.mk keys?)))
-  return keys?
-
 /--
 Whether every key the module looked up in the specialization cache (`UsageSidecar.specLookups`) has the same
 providers in its closure as when Lean compiled it: the closure's non-module workspace modules that created the
-key, each with the specialization it maps the key to (`closureSpecKeys?`, `Lean.ModuleUsage.specProvidersDigest`).
-An import that starts providing a key the module missed, or stops providing one it hit, changes which
-specialization a fresh compile uses, so the module rebuilds. A module-system module's keys are pinned by
-`modsysHash`, a toolchain module's by the Lean githash.
+key, each with the specialization it maps the key to (`Lean.ModuleUsage.specProvidersDigest`). Each closure
+module's keys come from its `.usage` once `importUsage?` has bound it to the module's current `.olean`, in this
+check's `hashes`: another workspace's build can rebuild a shared dependency between two checks, so no binding is
+reused across checks. An import that starts providing a key the module missed, or stops providing one it hit,
+changes which specialization a fresh compile uses, so the module rebuilds. A module-system module's keys are pinned
+by `modsysHash`, a toolchain module's by the Lean githash.
 -/
-def UsageSidecar.specProvidersUnchanged (usage : UsageSidecar) (importArts : NameMap ImportArtifacts) :
-    JobM Bool := do
+def UsageSidecar.specProvidersUnchanged (usage : UsageSidecar) (hashes : ContentHashes)
+    (importArts : NameMap ImportArtifacts) : JobM Bool := do
   if usage.specLookups.isEmpty then return true
   let keys : Std.HashSet ModuleUsage.Digest := usage.specLookups.foldl (·.insert ·.1) {}
   let mut providers : Std.HashMap ModuleUsage.Digest (Array (Name × Name)) := {}
   for (m, arts) in importArts do
     if arts.oleanServer?.isSome then continue
-    let some specKeys ← closureSpecKeys? importArts m | return false
-    for (k, n) in specKeys do
+    let some (_, imp) ← importUsage? hashes importArts m | return false
+    for (k, n) in imp.specKeys do
       if keys.contains k then providers := providers.alter k fun o => some ((o.getD #[]).push (m, n))
   return usage.specLookups.all fun (k, p) => ModuleUsage.specProvidersDigest (providers.getD k #[]) == p
 
@@ -1675,7 +1649,7 @@ def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
     let some (olean, imp) ← importUsage? hashes importArts m | return false
     unless (← contentHash hashes olean) == oleanHash do return false
     unless imp.moduleDigest == digest do return false
-  usage.specProvidersUnchanged importArts
+  usage.specProvidersUnchanged hashes importArts
 
 /--
 Whether usage cutoff applies to the module: cutoff is enabled, the module is neither a

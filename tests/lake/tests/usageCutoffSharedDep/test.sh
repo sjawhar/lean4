@@ -19,12 +19,13 @@ for ws in a b; do
 done
 printf '[[lean_lib]]\nname = "T"\n' >> a/lakefile.toml
 printf 'import T.Slow\nimport D\ntheorem kept : sharedValue = 1 := rfl\n' > a/T/M.lean
+printf 'import T.E\nimport D\ndef xs : Nat := 5\n' > a/T/X.lean
 
-# `T.E` reads `D.usage` when it writes its `.usekey`. `T.Slow` imports `T.E` and holds the build
-# until the test creates `release`; `M` is built after it.
+# `T.E` reads `D.usage` when it writes its `.usekey`. `T.Slow` imports `T.X`, which imports `T.E`,
+# and holds the build until the test creates `release`; `M` is built after it.
 write_a() {
   printf 'import D\ndef early : Nat := sharedValue + %s\n' $1 > a/T/E.lean
-  printf '%s\n' 'import T.E' '#eval do' \
+  printf '%s\n' 'import T.X' '#eval do' \
     "  IO.FS.writeFile \"$PWD/ready\" \"\"" \
     '  for _ in [:600] do' \
     "    if ← System.FilePath.pathExists \"$PWD/release\" then return" \
@@ -73,3 +74,18 @@ test_exp $rc != 0
 no_match_text "Replayed T.M" race.log
 match_text "T/M.lean" race.log
 test_exp ! -f a/.lake/build/lib/lean/T/M.olean
+
+# `T.X`, checked before `D` is rewritten, looks up the specialization key of `myMap k2` in `D`. `D` then
+# gains a specialization of `myMap k`, the key `M` looked up: `M`'s check reads the rewritten `D.usage`,
+# so `M` is compiled against the new `D` rather than replayed with its own specialization.
+spec_d='@[noinline] def k (n : Nat) : Nat := n + 1\n@[noinline] def k2 (n : Nat) : Nat := n + 2\n@[specialize] def myMap (f : Nat → Nat) : List Nat → List Nat\n  | [] => []\n  | x :: xs => f x :: myMap f xs\ndef sharedValue : Nat := 1\n'
+printf "$spec_d" > dep/D.lean
+printf 'import T.E\nimport D\ndef xs : List Nat := myMap k2 [5]\n' > a/T/X.lean
+printf 'import T.Slow\nimport D\ndef h : List Nat := myMap k [1, 2, 3]\n' > a/T/M.lean
+touch release
+(cd a && test_run build T.M)
+(cd b && test_run build D)
+race "${spec_d}def y : List Nat := myMap k [0]\n"
+test_exp $rc = 0
+no_match_text "Replayed T.M" race.log
+match_text "Built T.M" race.log
