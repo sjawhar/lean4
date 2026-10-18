@@ -125,8 +125,9 @@ public structure BuildContext extends BuildConfig, Context where
   fileDigests : Std.Mutex (Std.HashMap FilePath (Lean.ModuleUsage.FileStamp × Lean.ModuleUsage.Digest))
   /--
   The kept-module checker (`LAKE_KEPT_CHECKER`): a module whose own source and options did not
-  change since its outputs were built, but whose imports did, keeps those outputs if it accepts
-  them. If `none`, every such module is compiled.
+  change since its outputs were built, but whose imports did, keeps those outputs if the usage
+  cutoff's records show the machinery it used unchanged and the checker accepts them. If `none`,
+  every such module is compiled.
   -/
   keptChecker? : Option KeptChecker := none
   /--
