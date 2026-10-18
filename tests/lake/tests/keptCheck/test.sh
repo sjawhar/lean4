@@ -306,6 +306,17 @@ for broken in 'printf x >> t24/$OUT/B.ilean' 'printf x >> t24/.lake/build/ir/P/B
   test_cmd_fails grep -qx P.B t24.log
 done
 
+# An accept goes through the same check of the module's outputs as a usage skip
+# (`Module.keepOutputs?`): an output that changed while the checker checked the module (here its
+# `.ilean`) makes it compile
+mkp t54
+test_run -d t54 build P
+seta t54 2
+export STUB_LOG="$PWD/t54.log"
+LAKE_KEPT_CHECKER="$STUB" STUB_MODE=alter-ilean test_out 'Built P.B' -d t54 build P
+match_text 'changed while the checker checked them' produced.out
+test_cmd grep -qx P.B t54.log
+
 # An accepted module replays its saved log (here a `sorry` warning), on the accept and after it
 mkp t25
 printf 'import P.A\ntheorem B.ok : A.w = 0 := rfl\ndef B.u : Nat := A.w\ntheorem B.s : True := sorry\n' > t25/P/B.lean
