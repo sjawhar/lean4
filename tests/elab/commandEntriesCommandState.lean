@@ -1,0 +1,118 @@
+import Lean
+/-! The parts of `Elab.Command.State` other than the environment that a declaration command can change, and how
+the recorder treats each (`ModuleUsage.commandStateFields`). A change to the command scope (`scopes`: an option, a
+`variable`, a `universe`, made by a macro next to a `def`) is recorded as `Lean.Elab.Command.scopes` in the
+payload's `stateOnly`: the payload is refused and the module is declined (`noskip`); a scope the command restores
+(`set_option … in`, `open … in`, dotted names) is not. `maxRecDepth`, which `set_option maxRecDepth … in` leaves
+changed after the command, is replayed: the record's `post` holds it and the next command's context digest
+includes it. `nextMacroScope` is the same before and after every command. The name generator `ngen` is not
+replayed and not in the context digest: elaborating a command from a generator advanced by a million gives the same
+declaration. `messages` and `traceState` are reset before every command, so a command does not see an earlier
+one's. -/
+open Lean
+
+unsafe def commandEntriesOf (e : EnvExtensionEntry) : CommandEntries := unsafeCast e
+
+/-- `target` with the state of every extension a command payload replays taken from `source`. -/
+def withReplayStateOf (source target : Environment) : IO Environment := do
+  let mut target := target
+  for ext in ← persistentEnvExtensionsRef.get do
+    let mode := ext.toEnvExtension.asyncMode.forExport
+    target := ext.toEnvExtension.setState target (ext.toEnvExtension.getState source (asyncMode := mode))
+      (asyncMode := mode)
+  for ext in ← commandCacheExtensionsRef.get do
+    target := ext.copyState source target
+  return localEntriesExt.setState target (localEntriesExt.getState source (asyncMode := .local))
+    (asyncMode := .local)
+
+structure Run where
+  obs : Array ModuleUsage.CommandObservation
+  payloads : Array CommandEntries
+  usage : Json
+  records : Array Json
+
+unsafe def elabM (dir : System.FilePath) (src : String) : IO Run := do
+  IO.FS.createDirAll dir
+  IO.FS.writeFile (dir / "M.lean") src
+  enableInitializersExecution
+  let some _ ← Elab.runFrontend src {} "M.lean" `M (oleanFileName? := some (dir / "M.olean")) |
+    throw <| IO.userError s!"elaboration failed:\n{src}"
+  let obs := (← ModuleUsage.commandObservationsRef.get).qsort (·.i < ·.i)
+  let (md, _) ← readModuleData (dir / "M.olean")
+  let payloads := ((md.entries.find? (·.1 == commandEntriesExt.name)).map (·.2)).getD #[] |>.map commandEntriesOf
+  let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
+  let records := (usage.getObjValAs? (Array Json) "commands").toOption.getD #[]
+  return { obs, payloads, usage, records }
+
+def stateMarkers : List Name :=
+  [`Lean.Elab.Command.scopes, `Lean.Elab.Command.nextMacroScope, `Lean.Elab.Command.infoState]
+
+/-- Per command: its kind, the command-state markers in its payload's `stateOnly`, and whether replay accepts it. -/
+unsafe def report (dir : System.FilePath) (label src : String) : IO Run := do
+  let r ← elabM dir src
+  IO.println s!"== {label}: noskip {(r.usage.getObjValAs? Bool "noskip").toOption}, \
+    reason {(r.usage.getObjValAs? String "noskipReason").toOption}"
+  for o in r.obs do
+    let some ce := r.payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"
+    let kind := (r.records[o.i]?.bind fun c => (c.getObjValAs? String "kind").toOption).getD "?"
+    let markers := ce.stateOnly.filter stateMarkers.contains
+    let replay ← try
+        discard <| replayCommandEntries (← withReplayStateOf o.before.env o.after.env) ce (scopeDepth o.before.env) {}
+        pure "replayed"
+      catch _ => pure "refused"
+    IO.println s!"{o.i} {kind}: command-state markers {markers}, {replay}"
+  return r
+
+def postField (r : Run) (i : Nat) (field : String) : Option Json :=
+  r.records[i]?.bind fun c => (c.getObjVal? "post").toOption.bind fun p => (p.getObjVal? field).toOption
+
+unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
+  initSearchPath (← getBuildDir)
+  let header := "import Lean\nopen Lean Elab Command\n"
+  discard <| report (dir / "option") "a macro sets an option next to a def" (header ++
+    "set_option autoImplicit false\n\
+    syntax \"opt_def \" ident : command\n\
+    macro_rules | `(opt_def $n) => return mkNullNode #[← `(set_option autoImplicit true), ← `(def $n : Nat := 1)]\n\
+    opt_def x\n\
+    def g (y : α) : α := y\n")
+  discard <| report (dir / "variable") "a macro adds a variable next to a def" (header ++
+    "syntax \"var_def \" ident : command\n\
+    macro_rules | `(var_def $n) => return mkNullNode #[← `(variable ($(mkIdent `k) : Nat)), ← `(def $n : Nat := 1)]\n\
+    var_def x\n\
+    def h : Nat := k\n")
+  discard <| report (dir / "universe") "a macro declares a universe next to a def" (header ++
+    "syntax \"univ_def \" ident : command\n\
+    macro_rules | `(univ_def $n) => return mkNullNode #[← `(universe $(mkIdent `w)), ← `(def $n : Nat := 1)]\n\
+    univ_def x\n\
+    def idw (α : Sort w) (a : α) : α := a\n")
+  let kept ← report (dir / "kept") "scopes the command restores" (header ++
+    "set_option maxHeartbeats 1000 in def a : Nat := 0\n\
+    open Nat in def b : Nat := succ 0\n\
+    theorem A.B.c : True := trivial\n\
+    set_option maxRecDepth 777 in theorem m1 : True := trivial\n\
+    theorem m2 (n : Nat) : n + 0 = n ∧ True := by simp\n")
+  for o in kept.obs do
+    IO.println s!"{o.i}: nextMacroScope unchanged {o.before.nextMacroScope == o.after.nextMacroScope}, \
+      maxRecDepth before {o.before.maxRecDepth} after {o.after.maxRecDepth}, \
+      post {postField kept o.i "maxRecDepth" |>.map (·.compress)}"
+  let some o := kept.obs.back? | throw <| IO.userError "no observation"
+  let st := o.before
+  let d (s : Elab.Command.State) := ModuleUsage.ctxDigest s {} default
+  IO.println s!"ctx depends on maxRecDepth: {d st != d { st with maxRecDepth := st.maxRecDepth + 1 }}, \
+    on ngen: {d st != d { st with ngen := st.ngen.mkChild.2 }}"
+  -- the last command elaborated again from its before-state with the name generator advanced
+  let src ← IO.FS.readFile (dir / "kept" / "M.lean")
+  let ctx : Elab.Command.Context := { fileName := "M.lean", fileMap := src.toFileMap, snap? := none, cancelTk? := none }
+  let advanced := { st with ngen := { st.ngen with idx := st.ngen.idx + 1000000 } }
+  let (_, again) ← ((Elab.Command.elabCommandTopLevel o.stx).run ctx |>.run advanced).toIO
+    fun e => IO.userError s!"re-elaboration failed"
+  let value (env : Environment) := (env.find? `m2).bind (·.value? (allowOpaque := true))
+  IO.println s!"m2 with the generator advanced by 1000000: same value {value again.env == value o.after.env}, \
+    value present {(value o.after.env).isSome}"
+  -- a command does not see the messages or traces of the command before it (the frontend prints the info)
+  discard <| report (dir / "perCommand") "messages and traces are per command" (header ++
+    "run_cmd logWarning \"a warning\"\n\
+    set_option trace.debug true in run_cmd trace[debug] \"a trace\"\n\
+    run_cmd logInfo m!\"messages {(← get).messages.toList.length}, traces {(← get).traceState.traces.size}\"\n")
+
+#eval main

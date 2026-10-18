@@ -1,0 +1,31 @@
+Elab.Command.State: 12 fields, unclassified #[], not a field #[]
+Elab.Command.Scope: 13 fields, unclassified #[], not a field #[]
+ScopedEnvExtension.State: 6 fields, unclassified #[], not a field #[]
+ScopedEnvExtension.StateStack: 4 fields, unclassified #[], not a field #[]
+env (some (Lean.ModuleUsage.CommandStateField.env)) changed: markers #[]
+messages (some (Lean.ModuleUsage.CommandStateField.irrelevant)) changed: markers #[]
+scopes (some (Lean.ModuleUsage.CommandStateField.stateOnly)) changed: markers #[Lean.Elab.Command.scopes]
+scopes (some (Lean.ModuleUsage.CommandStateField.stateOnly)) changed: markers #[]
+usedQuotCtxts (some (Lean.ModuleUsage.CommandStateField.replayed)) changed: markers #[]
+nextMacroScope (some (Lean.ModuleUsage.CommandStateField.stateOnly)) changed: markers #[Lean.Elab.Command.nextMacroScope]
+maxRecDepth (some (Lean.ModuleUsage.CommandStateField.replayed)) changed: markers #[]
+ngen (some (Lean.ModuleUsage.CommandStateField.irrelevant)) changed: markers #[]
+auxDeclNGen (some (Lean.ModuleUsage.CommandStateField.replayed)) changed: markers #[]
+infoState (some (Lean.ModuleUsage.CommandStateField.stateOnly)) changed: markers #[Lean.Elab.Command.infoState]
+infoState (some (Lean.ModuleUsage.CommandStateField.stateOnly)) changed: markers #[]
+traceState (some (Lean.ModuleUsage.CommandStateField.irrelevant)) changed: markers #[]
+snapshotTasks (some (Lean.ModuleUsage.CommandStateField.irrelevant)) changed: markers #[]
+prevLinterStates (some (Lean.ModuleUsage.CommandStateField.irrelevant)) changed: markers #[]
+scoped nothing: entries 0, local entries accounted for: true
+scoped state alone, without an entry or a local entry: stateOnly, local entries accounted for: true
+scoped activeScopes: stateOnly, local entries accounted for: true
+scoped delimitsLocal: stateOnly, local entries accounted for: true
+scoped modCount: stateOnly, local entries accounted for: true
+scoped generation: stateOnly, local entries accounted for: true
+scoped localCount without a recorded local entry: entries 0, local entries accounted for: false
+scoped localCount with a recorded local entry: entries 0, local entries accounted for: true
+scoped stack length: stateOnly, local entries accounted for: false
+scoped scopedEntries: stateOnly, local entries accounted for: true
+scoped newEntries, new prefix: entries 1, local entries accounted for: true
+scoped newEntries, not a tail: stateOnly, local entries accounted for: true
+scoped pushCount: entries 0, local entries accounted for: true
