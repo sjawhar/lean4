@@ -1505,22 +1505,25 @@ negfail_scoped_s1() { scoped_inst_s1; printf 'def nok : Nat := "x"\n' > T/N.lean
 # the attempt (`hard_try`) inside the module that would profit from it; the state it targets is private, so the
 # attempt is rejected, logs `attempt rejected: …` and leaves the module compiling as it would without it
 # (`hard_rejected`, in each case's `_c_check`). `hard_recording` clears the flag that switches usage recording
-# on; `hard_usedbychecks` clears the names recorded as used while `B` evaluates `A`'s function;
+# on, `hard_speclookups` the specialization-cache keys recorded as looked up, and `hard_moduleext` the digests
+# recorded for `M`'s imports: `Y` then starts providing the key `M` looked up, so `M` must build again.
+# `hard_compilercode` clears the flag that records that a compile ran passes or folders beyond the built-in
+# ones (`fold_env`'s folder reads state that `F` changes), so `M` must build again and print 42.
+# `hard_usedbychecks` clears the names recorded as used while `B` evaluates `A`'s function;
 # `hard_declconsts` empties the constants recorded for `M`'s declarations; `hard_extramod` clears the module
 # uses recorded for a macro that a discarded command expands.
 hard_try() {
   printf 'open Lean Elab Command in\nrun_cmd do\n  let stx ← match Parser.runParserCategory (← getEnv) `command "%s" with\n    | .ok stx => pure stx\n    | .error e => throwError e\n  let saved := (← get).messages\n  elabCommand stx\n  let errs := (← get).messages.toList.filter (·.severity == .error)\n  modify fun s => { s with messages := saved }\n  if let some e := errs.head? then logInfo m!"attempt rejected: {← e.data.toString}"\n' "$1"
 }
 hard_rejected() { grep -q 'attempt rejected' "../$1.1.log"; }
-hard_folder='run_meta modifyEnv fun env => folderExt.modifyState env fun (es, m) => (es, m.insert ``T.k myFolder)'
 hard_m() {
   printf 'import T.B\nimport T.Y\n%snamespace T\ndef h : List Nat := myMap k [1, 2, 3]\nend T\n%s' "${1:-}" "${2:-}" > T/M.lean
 }
 hard_recording_s0() { f3_files; f3_y "$(hard_try 'run_meta Lean.usageRecordingRef.set false')" ''; hard_m; }
 hard_recording_s1() {
-  f3_y "$(hard_try 'run_meta Lean.usageRecordingRef.set false')"$'\n'"$hard_folder" 'def y : List Nat := myMap k [0]'
+  f3_y "$(hard_try 'run_meta Lean.usageRecordingRef.set false')" 'def y : List Nat := myMap k [0]'
 }
-hard_recording_c_check() { hard_rejected hard_recording; }
+hard_recording_c_check() { hard_rejected hard_recording && grep -qE 'Built T\.M( |$)' ../hard_recording.1.log; }
 
 hard_usedbychecks_a() { printf 'def hardval : Nat := %s\n' "$1" > T/A.lean; }
 hard_usedbychecks_s0() {
@@ -1577,6 +1580,21 @@ hard_extramod_s0() {
 }
 hard_extramod_s1() { hard_extramod_a 20; }
 hard_extramod_c_check() { hard_rejected hard_extramod; }
+
+hard_moduleext_try="$(hard_try 'run_meta modifyEnv fun env => Lean.ModuleUsage.ext.modifyState (asyncMode := .mainOnly) env fun s => { s with importedModuleEntries := #[] }')"
+hard_moduleext_s0() { f3_files; f3_y '' ''; hard_m $'import Lean\n' "$hard_moduleext_try"; }
+hard_moduleext_s1() { f3_y '' 'def y : List Nat := myMap k [0]'; }
+hard_moduleext_c_check() { hard_rejected hard_moduleext && grep -qE 'Built T\.M( |$)' ../hard_moduleext.1.log; }
+
+hard_speclookups_s0() {
+  f3_files; f3_y '' ''; hard_m $'import Lean\n' "$(hard_try 'run_meta Lean.specLookupsRef.set #[]')"
+}
+hard_speclookups_s1() { f3_y '' 'def y : List Nat := myMap k [0]'; }
+hard_speclookups_c_check() { hard_rejected hard_speclookups && grep -qE 'Built T\.M( |$)' ../hard_speclookups.1.log; }
+
+hard_compilercode_s0() { fold_env_s0; hard_try 'run_meta Lean.compilerCodeRef.set false' >> T/M.lean; }
+hard_compilercode_s1() { env_flag; }
+hard_compilercode_c_check() { hard_rejected hard_compilercode; }
 
 ## Tables a module writes through public functions.
 
@@ -1855,8 +1873,9 @@ r3_natg_s1() { printf 'import T.B\nnamespace T\ndef y : Nat := app3 (fun (g : F1
 all_cases="spec_transitive spec_link spec_type spec_precomp csimp_transitive csimp_late specialize_attr
   cov_projfn cov_projfn_rev cov_mlike cov_sparse cov_auxrec cov_sibmatch cov_sibmatch_rev cov_ctlmatch
   cov_sibinst cov_sibclass cov_sibmeta cov_ckind_rev cov_recarg_rev
-  collide_first collide_after hard_recording hard_usedbychecks hard_declconsts hard_extramod d2_down
-  class_same class_cross nospec_type folder_cross reducible_cross binder_inline d2_folder d2_tolerated d2_cpass
+  collide_first collide_after hard_recording hard_moduleext hard_speclookups hard_compilercode hard_usedbychecks hard_declconsts
+  hard_extramod d2_down
+  class_same class_cross nospec_type folder_cross reducible_cross binder_inline d2_folder
   local_inst_own erase_inst_own scoped_inst local_red_own2 local_red_own3 scoped_red_own
   table_order folder_order red_order
   d2_tolerated_lean d2_tolerated_reader f3_own_folder f3_own_cpass f3_runtime_folder f3_runtime_cpass fold_env cpass_env
