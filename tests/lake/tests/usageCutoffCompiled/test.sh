@@ -1847,6 +1847,34 @@ r3_natg_s0() {
 }
 r3_natg_s1() { printf 'import T.B\nnamespace T\ndef y : Nat := app3 (fun (g : F1) => g 1) k 5\nend T\n' > T/Y.lean; }
 
+# A `@&` annotation the compiler reads from a declaration that has no compiled code of its own, so that only the
+# declaration's type or value changes in state 1: the compiler eta-expands a projection (`borrow_proj`) or a
+# constructor passed unapplied (`borrow_ctor`) with the binder types of its kernel type, and unfolds a type alias
+# (`borrow_alias`); the parameter it builds is borrowed exactly when the annotation is there. `M` is unchanged.
+borrow_files() {
+  lakefile_app; mkdir_t
+  printf '%s\n' "$1" > T/B.lean
+  printf 'import T.B\n%s\n' "$2" > T/M.lean
+  printf 'import T.M\n%s\n' "$3" > Main.lean
+}
+borrow_proj_s0() {
+  borrow_files $'structure Hs where\n  f : List Nat → List Nat' \
+    $'def g (h : Hs) : List Nat → List Nat := h.f\ndef h0 : Hs := ⟨List.reverse⟩' \
+    'def main : IO Unit := IO.println (g h0 [1, 2, 3])'
+}
+borrow_proj_s1() { printf '%s\n' $'structure Hs where\n  f : (@& List Nat) → List Nat' > T/B.lean; }
+borrow_ctor_s0() {
+  borrow_files $'structure W where\n  x : List Nat\n  y : Nat' \
+    'def k (xs : List (List Nat)) (ys : List Nat) : List W := @List.zipWith (List Nat) Nat W W.mk xs ys' \
+    'def main : IO Unit := IO.println (k [[1], [2, 3]] [4, 5]).length'
+}
+borrow_ctor_s1() { printf '%s\n' $'structure W where\n  x : @& List Nat\n  y : Nat' > T/B.lean; }
+borrow_alias_s0() {
+  borrow_files 'def Fn : Type := List Nat → List Nat' 'def g : Fn := fun (l : List Nat) => l.reverse' \
+    'def main : IO Unit := IO.println (g [1, 2, 3])'
+}
+borrow_alias_s1() { printf '%s\n' 'def Fn : Type := (@& List Nat) → List Nat' > T/B.lean; }
+
 all_cases="spec_transitive spec_link spec_type spec_precomp csimp_transitive csimp_late specialize_attr
   cov_projfn cov_projfn_rev cov_mlike cov_sparse cov_auxrec cov_sibmatch cov_sibmatch_rev cov_ctlmatch
   cov_sibinst cov_sibclass cov_sibmeta cov_ckind_rev cov_recarg_rev
@@ -1866,7 +1894,8 @@ all_cases="spec_transitive spec_link spec_type spec_precomp csimp_transitive csi
   decl_map enum_repr noinline_attr aux_local struct_repr
   outparam_pos folder_removal r4_simproc r4_parser r4_tactic r4_elab r4_delab r4_eval
   binder_fun binder_jp binder_param owner_macro owner_boxed owner_move binder_info_param binder_info_type
-  pre_summary ng ng_ctrl shadow shadow2 perkey_unrelated_spec perkey_provider r3_order r3_mdata_rev r3_nat r3_natg"
+  pre_summary ng ng_ctrl shadow shadow2 perkey_unrelated_spec perkey_provider r3_order r3_mdata_rev r3_nat r3_natg
+  borrow_proj borrow_ctor borrow_alias"
 failed=()
 # `CASES` runs a subset; `NAME:cache` runs a case with the artifact cache (see `run_case`).
 for c in ${CASES:-$all_cases}; do
