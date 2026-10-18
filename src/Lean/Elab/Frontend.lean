@@ -400,7 +400,8 @@ def runFrontend
       for obs in observations.qsort (·.i < ·.i) do
         let recorded ← recordCommandDelta obs.before.env obs.after.env obs.i
         if let some entry := (commandEntriesExt.getState recorded).back? then
-          entries := entries.push entry
+          entries := entries.push { entry with
+            stateOnly := entry.stateOnly ++ ModuleUsage.commandStateChanges obs.before obs.after }
     let env := setCommandEntries env entries
     let commands ← ModuleUsage.commandRecords env own stmt entries
     profileitIO ".olean serialization" finalOpts do
