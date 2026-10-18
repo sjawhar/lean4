@@ -3,22 +3,20 @@ source ../common.sh
 
 ./clean.sh
 
-# A module whose source and options are unchanged but whose imports changed is a kept candidate:
-# with `LAKE_KEPT_CHECKER` set, Lake asks that checker (here `stub.sh`) whether the module's existing
-# `.olean` holds against its current imports, and on a yes records the module as up to date
-# without compiling it. `LAKE_KEPT_EXCLUDE` makes Lake decide the modules it lists as if nothing
-# had been kept for them.
+# A module whose source and options are unchanged but whose imports changed is a kept candidate
+# when the usage cutoff (on by default) does not skip it and its records show the machinery it used
+# while elaborating unchanged (`Module.usageVerdict`): with `LAKE_KEPT_CHECKER` set, Lake asks that
+# checker (here `stub.sh`) whether the module's existing `.olean` holds against its current
+# imports, and on a yes records the module as up to date without compiling it. `LAKE_KEPT_EXCLUDE`
+# makes Lake decide the modules it lists as if nothing had been kept for them.
 
 STUB="$PWD/stub.sh"
 mkdir -p work && cd work
 export LAKE_ARTIFACT_CACHE=false
-# Without the usage cutoff: with it on, the cutoff skips a module whose imports changed only in what
-# it never used before any kept-module check is asked
-export LAKE_USAGE_CUTOFF=false
-unset LAKE_KEPT_CHECKER LAKE_KEPT_EXCLUDE LAKE_KEPT_CHECKER_TIMEOUT STUB_MODE STUB_VERDICTS
+unset LAKE_KEPT_CHECKER LAKE_KEPT_EXCLUDE LAKE_KEPT_CHECKER_TIMEOUT STUB_MODE STUB_VERDICTS LAKE_USAGE_CUTOFF
 
 OUT=.lake/build/lib/lean/P
-# mkp DIR [LIB_CONFIG] -- package `p`: `P.A` defines `A.v` (see `seta`) and `A.w := 0`; `P.B`
+# mkp DIR [LIB_CONFIG] -- package `p`: `P.A` defines `A.v` and `A.w`, which `seta` changes; `P.B`
 # imports `P.A` and uses only `A.w`; `P.C` imports `P.B`; `P.D`, `P.E` and `P.F` import `P.A`
 mkp() {
   mkdir -p "$1/P"
@@ -30,8 +28,9 @@ mkp() {
   for m in D E F; do printf 'import P.A\ntheorem %s.ok : A.w = 0 := rfl\n' "$m" > "$1/P/$m.lean"; done
   seta "$1" 1
 }
-# seta DIR V -- replace `P/A.lean` (a new file, as a checkout writes it) with `A.v := V`
-seta() { rm -f "$1/P/A.lean"; printf 'def A.v : Nat := %s\ndef A.w : Nat := 0\n' "$2" > "$1/P/A.lean"; }
+# seta DIR V -- replace `P/A.lean` (a new file, as a checkout writes it) with `A.v := V` and
+# `A.w := V - V`: `A.w` changes meaning but stays `0`, so its users re-check, and their proofs hold
+seta() { rm -f "$1/P/A.lean"; printf 'def A.v : Nat := %s\ndef A.w : Nat := %s - %s\n' "$2" "$2" "$2" > "$1/P/A.lean"; }
 # dephash TRACE -- the input hash recorded in a trace file
 dephash() { grep -oE '"depHash": *"[0-9a-f]{16}"' "$1" | grep -oE '[0-9a-f]{16}'; }
 # mapping DIR MOD -- the cache's input-to-output mapping for `P.MOD`'s current input in tree DIR
@@ -386,6 +385,41 @@ test_cmd grep -q '"kf"' "t35/$OUT/B.trace"
 # ... and so does `lake shake`'s check that the oleans are current
 sed_i 's/^name = "p"$/name = "p"\ndefaultTargets = ["P"]/' t35/lakefile.toml
 LAKE_KEPT_EXCLUDE="$PWD/exclude34" test_err 'out of date oleans' -d t35 shake
+
+# The rule for kept modules on top of the usage cutoff (`Module.usageVerdict`). `P.B` also uses the
+# tactic macro of `P.M` (machinery its elaboration used, which its usage record lists as `extra`)
+mkp t40
+printf 'macro "triv!" : tactic => `(tactic| trivial)\n' > t40/P/M.lean
+printf 'import P.A\nimport P.M\ntheorem B.ok : A.w = 0 := rfl\ndef B.u : Nat := A.w\ntheorem B.t : True := by triv!\n' \
+  > t40/P/B.lean
+test_run -d t40 build P
+test_cmd_out '[["P","M"],' cat "t40/$OUT/B.usage"
+export STUB_LOG="$PWD/t40.log"
+# The machinery `P.B` used changed: it compiles, and the checker is not asked
+rm -f t40/P/M.lean; printf 'macro "triv!" : tactic => `(tactic| exact True.intro)\n' > t40/P/M.lean
+LAKE_KEPT_CHECKER="$STUB" test_out 'Built P.B' -d t40 build P
+match_text 'not asked: P.M, whose machinery it used, changed' produced.out
+test_cmd_fails grep -qx P.B t40.log
+# Nothing `P.B` used changed meaning: the cutoff skips it before any check (`-v` shows replays)
+rm -f t40/P/A.lean; printf 'def A.v : Nat := 7\ndef A.w : Nat := 1 - 1\n' > t40/P/A.lean
+LAKE_KEPT_CHECKER="$STUB" test_out 'Replayed P.B' -d t40 build -v P
+test_cmd_fails grep -qx P.B t40.log
+# A constant `P.B` used changed meaning, and its machinery did not: the checker re-checks it
+seta t40 2
+LAKE_KEPT_CHECKER="$STUB" test_out 'Checked P.B' -d t40 build P
+test_cmd grep -qx P.B t40.log
+test_cmd grep -q '"kept":true' "t40/$OUT/B.usekey"
+# ... and `P.C`, which uses `B.u`, is not skipped on `P.B`'s old digests: after the accept they may
+# be stale (here `B.u` now unfolds to another term), so it is re-checked too
+no_match_text 'Replayed P.C' produced.out
+test_cmd grep -qx P.C t40.log
+# ... while `P.B`'s own next check still reads its marked key (bound to its `.usage` and `.olean`): a
+# further meaning change re-checks it again, rather than compiling it for want of a key
+seta t40 3
+LAKE_KEPT_CHECKER="$STUB" test_out 'Checked P.B' -d t40 build P
+no_match_text 'not asked' produced.out
+# A checker without the usage cutoff is refused: its records decide which modules may be re-checked
+LAKE_USAGE_CUTOFF=false LAKE_KEPT_CHECKER="$STUB" test_err 'needs the usage cutoff' -d t40 build P
 
 # With the artifact cache
 export LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true
