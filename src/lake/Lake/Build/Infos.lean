@@ -86,6 +86,8 @@ public structure ModulePreSetup where
   irSigTrace : BuildTrace
   localTrace : BuildTrace
   srcMTime : MTime
+  /-- The hash of the source's contents as Lake read them (see `Module.recFetchInput`). -/
+  srcHash : Hash
   srcFile : FilePath
   isModule : Bool
   directImports : Array ModuleImport

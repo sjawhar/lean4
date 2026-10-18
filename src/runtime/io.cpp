@@ -490,6 +490,16 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_unlock(b_obj_arg h) {
     }
 }
 
+/* Handle.setInheritable : (@& Handle) → (inheritable : Bool) → IO Unit */
+extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_set_inheritable(b_obj_arg h, uint8_t x) {
+    HANDLE wh = win_handle(io_get_handle(h));
+    if (SetHandleInformation(wh, HANDLE_FLAG_INHERIT, x ? HANDLE_FLAG_INHERIT : 0)) {
+        return io_result_mk_ok(box(0));
+    } else {
+        return io_result_mk_error((sstream() << GetLastError()).str());
+    }
+}
+
 #else
 
 /* Handle.lock : (@& Handle) → (exclusive : Bool) → IO Unit */
@@ -524,6 +534,16 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_unlock(b_obj_arg h) {
     } else {
         return io_result_mk_error(decode_io_error(errno, nullptr));
     }
+}
+
+/* Handle.setInheritable : (@& Handle) → (inheritable : Bool) → IO Unit */
+extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_set_inheritable(b_obj_arg h, uint8_t x) {
+    int fd = fileno(io_get_handle(h));
+    int flags = fcntl(fd, F_GETFD);
+    if (flags == -1 || fcntl(fd, F_SETFD, x ? (flags & ~FD_CLOEXEC) : (flags | FD_CLOEXEC)) == -1) {
+        return io_result_mk_error(decode_io_error(errno, nullptr));
+    }
+    return io_result_mk_ok(box(0));
 }
 
 #endif
@@ -1176,6 +1196,27 @@ extern "C" LEAN_EXPORT obj_res lean_io_symlink_metadata(b_obj_arg filename) {
         return mdata;
     }
 #endif
+}
+
+/* System.FilePath.isSameFile : (@& FilePath) → (@& FilePath) → IO Bool */
+extern "C" LEAN_EXPORT obj_res lean_io_is_same_file(b_obj_arg p1, b_obj_arg p2) {
+    uv_stat_t st[2];
+    b_obj_arg ps[2] = {p1, p2};
+    for (int i = 0; i < 2; i++) {
+        const char* fname = string_cstr(ps[i]);
+        if (strlen(fname) != lean_string_size(ps[i]) - 1) {
+            return mk_embedded_nul_error(ps[i]);
+        }
+        uv_fs_t req;
+        int ret = uv_fs_stat(NULL, &req, fname, NULL);
+        if (ret < 0) {
+            uv_fs_req_cleanup(&req);
+            return io_result_mk_error(decode_uv_error(ret, ps[i]));
+        }
+        st[i] = req.statbuf;
+        uv_fs_req_cleanup(&req);
+    }
+    return io_result_mk_ok(box(st[0].st_dev == st[1].st_dev && st[0].st_ino == st[1].st_ino));
 }
 
 extern "C" LEAN_EXPORT obj_res lean_io_create_dir(b_obj_arg p) {
