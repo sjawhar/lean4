@@ -50,10 +50,10 @@ inductive AddedConst where
 
 namespace AddedConst
 
-/-- Every constant the record re-adds. -/
+/-- Every constant the record re-adds, once each. -/
 partial def names : AddedConst → Array Name
   | .plain n => #[n]
-  | .async n _ _ nested => nested.foldl (· ++ ·.names) #[n]
+  | .async n _ _ nested => nested.foldl (fun ns a => ns ++ (a.names.filter (· != n))) #[n]
   | .realization _ _ consts _ => consts
 
 end AddedConst
