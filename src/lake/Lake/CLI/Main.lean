@@ -21,6 +21,7 @@ import Lake.Load.Workspace
 import Lake.Load.Toml
 import Lake.Util.IO
 import Lake.Util.Git
+import Lake.Util.Proc
 import Lake.Util.MainM
 import Lake.Util.Cli
 import Lake.CLI.Init
@@ -1280,7 +1281,7 @@ protected def env : CliM PUnit := do
     else
       pure config.lakeEnv.vars
   if let some cmd ← takeArg? then
-    let child ← IO.Process.spawn {cmd, args := (← takeArgs).toArray, env}
+    let child ← spawnProc {cmd, args := (← takeArgs).toArray, env}
     exit <| ← child.wait
   else
     env.forM fun (var, val?) =>
