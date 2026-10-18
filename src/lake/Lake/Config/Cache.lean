@@ -208,7 +208,11 @@ def insertCore
   (platformIndependent := false)
 : CacheMap := cache.insertCore inputHash (toJson val) platformIndependent
 
-/-- Extract each output from their structured data into a flat array of artifact descriptions. -/
+/--
+Extract each output from their structured data into a flat array of artifact descriptions. The `kf`
+entry of module outputs (the input hash a kept module's outputs were compiled for) is metadata, not
+an artifact.
+-/
 public partial def collectOutputDescrs (map : CacheMap) : LogIO (Array ArtifactDescr) := do
   throwIfLogs <| map.foldM (init := #[]) fun as _ e => go as e.out
 where go as o := do
@@ -231,7 +235,7 @@ where go as o := do
       logError s!"unsupported output: {e}"
       return as
   | .arr os => os.foldlM (init := as) go
-  | .obj os => os.foldlM (init := as) fun as _ o => go as o
+  | .obj os => os.foldlM (init := as) fun as k o => if k == "kf" then pure as else go as o
 
 end CacheMap
 
@@ -442,8 +446,8 @@ Cache the outputs corresponding to the given input for the package.
 
 Module outputs that a kept-module check accepted (marked with the key `kf`, see
 `ModuleOutputDescrs.keptFrom?`) follow the supersede rule: they never replace an existing mapping
-(except an archive-only mapping of the same archive, which they describe in full), and outputs
-compiled from source always replace accepted ones, whatever `overwrite` says.
+(the file is created exclusively), and outputs compiled from source always replace accepted ones,
+whatever `overwrite` says.
 -/
 def writeOutputsCore
   (cache : Cache) (scope : String) (inputHash : Hash) (out : Json)
@@ -455,12 +459,7 @@ def writeOutputsCore
   let isKept (data : Json) := (data.getObjVal? "kf").isOk
   let contents := (toJson {service?, scope? := remoteScope?, data := out : CacheOutput}).pretty
   if isKept out then
-    match (← readOutputsData? file) with
-    | some (.str archive) =>
-      if let .ok (.str a) := out.getObjVal? "l" then
-        if a == archive then IO.FS.writeFile file contents
-    | some _ => pure ()
-    | none => writeFileIfNew file contents
+    writeFileIfNew file contents
   else if overwrite || (← readOutputsData? file).any isKept then
     IO.FS.writeFile file contents
   else
@@ -902,7 +901,7 @@ def transferArtifacts
         "--aws-sigv4", "aws:amz:auto:s3", "--user", cfg.key,
         "-s", "-w", "%{stderr}%{json}\n", "--config", path.toString
       ]
-  let child ← IO.Process.spawn {
+  let child ← spawnProc {
     cmd := ← Internal.getCurl, args
     stdout := .piped, stderr := .piped
   }
@@ -987,7 +986,7 @@ where
       stdout := .piped, stderr := .piped
     }
     logVerbose (mkCmdLog spawnArgs)
-    let {stdout, stderr, exitCode} ← IO.Process.output spawnArgs
+    let {stdout, stderr, exitCode} ← outputProc spawnArgs
     match Json.parse stdout >>= fromJson? with
     | .ok (resp :  ReservoirResp (Array String)) =>
       match resp with
