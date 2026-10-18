@@ -127,36 +127,38 @@ rm .lake/build/lib/lean/Test/B.olean.hash
 test_out "Built Test.B" build Test.B
 # `lean -o` without `--usage` rewrites an .olean without digests and keeps its old sidecars (and, without
 # `--rehash`, its old `.hash`): a module compiled against it records nothing it uses from it, so it gets no
-# key and compiles again (and fails) once that import changes
+# key and compiles again (and fails) once that import changes. With the artifact cache on, Lake restores the
+# rewritten .olean from the cache entry its trace names before the importer compiles, so the importer sees
+# digests: this block and the next two run with the cache off
 printf 'def ow := 1\n' > Test/OW.lean
-test_run build Test.OW
+LAKE_ARTIFACT_CACHE=false test_run build Test.OW
 "$LAKE" env lean Test/OW.lean -o .lake/build/lib/lean/Test/OW.olean
 printf 'import Test.OW\ntheorem om : ow = 1 := rfl\n' > Test/OM.lean
-test_run build Test.OM
+LAKE_ARTIFACT_CACHE=false test_run build Test.OM
 test_exp ! -f .lake/build/lib/lean/Test/OM.usekey
 printf 'def ow := 2\n' > Test/OW.lean
-test_err "error: Test/OM.lean" build -v Test.OM
+LAKE_ARTIFACT_CACHE=false test_err "error: Test/OM.lean" build -v Test.OM
 no_match_text "Replayed Test.OM" produced.out
 # the same with `--rehash`
 printf 'def rw1 := 1\n' > Test/RW.lean
-test_run build Test.RW
+LAKE_ARTIFACT_CACHE=false test_run build Test.RW
 "$LAKE" env lean Test/RW.lean -o .lake/build/lib/lean/Test/RW.olean
 printf 'import Test.RW\ntheorem rm : rw1 = 1 := rfl\n' > Test/RM.lean
-test_run --rehash build Test.RM
+LAKE_ARTIFACT_CACHE=false test_run --rehash build Test.RM
 test_exp ! -f .lake/build/lib/lean/Test/RM.usekey
 printf 'def rw1 := 2\n' > Test/RW.lean
-test_err "error: Test/RM.lean" --rehash build -v Test.RM
+LAKE_ARTIFACT_CACHE=false test_err "error: Test/RM.lean" --rehash build -v Test.RM
 no_match_text "Replayed Test.RM" produced.out
 # the same through an intermediate import, compiled while OT still had digests
 printf 'def ot := 1\n' > Test/OT.lean
 printf 'import Test.OT\ndef oi := 0\n' > Test/OI.lean
-test_run build Test.OI
+LAKE_ARTIFACT_CACHE=false test_run build Test.OI
 "$LAKE" env lean Test/OT.lean -o .lake/build/lib/lean/Test/OT.olean
 printf 'import Test.OI\ntheorem oj : ot = 1 := rfl\n' > Test/OJ.lean
-test_run build Test.OJ
+LAKE_ARTIFACT_CACHE=false test_run build Test.OJ
 test_exp ! -f .lake/build/lib/lean/Test/OJ.usekey
 printf 'def ot := 2\n' > Test/OT.lean
-test_err "error: Test/OJ.lean" build -v Test.OJ
+LAKE_ARTIFACT_CACHE=false test_err "error: Test/OJ.lean" build -v Test.OJ
 no_match_text "Replayed Test.OJ" produced.out
 # an import's .olean compiled from other contents behind Lake's back, with its source and sidecars as
 # they were: under `--rehash` its importer, compiled against the old .olean, is checked against the new
@@ -173,37 +175,39 @@ LAKE_ARTIFACT_CACHE=false test_err "error: Test/VM.lean" --rehash build -v Test.
 no_match_text "Replayed Test.VM" produced.out
 # without `--rehash`, such an .olean keeps its old `.hash`, which the check never reads: it hashes the
 # bytes. HM's trace goes stale through an unrelated edit to HX, so a build without the cutoff compiles HM
-# again against the real HA.olean (and fails); with the cutoff HM must do the same, not replay
+# again against the real HA.olean (and fails); with the cutoff HM must do the same, not replay. With the
+# artifact cache on, Lake restores the rewritten .olean from its cache entry, so a build without the cutoff
+# does not compile against it either: this block and the next two run with the cache off
 printf 'def ha := 1\n' > Test/HA.lean
 printf 'def hx := 0\n' > Test/HX.lean
 printf 'import Test.HA\nimport Test.HX\ntheorem hm : ha = 1 := rfl\n' > Test/HM.lean
-test_run build Test.HM
+LAKE_ARTIFACT_CACHE=false test_run build Test.HM
 printf 'def ha := 2\n' > Test/HA.lean
 "$LAKE" env lean Test/HA.lean -o .lake/build/lib/lean/Test/HA.olean
 printf 'def ha := 1\n' > Test/HA.lean
 printf 'def hx := 0\ndef hx2 := 0\n' > Test/HX.lean
-test_err "error: Test/HM.lean" build -v Test.HM
+LAKE_ARTIFACT_CACHE=false test_err "error: Test/HM.lean" build -v Test.HM
 no_match_text "Replayed Test.HM" produced.out
 # the same for the module's own .olean: GM compiles again instead of keeping the rewritten one
 printf 'def gx := 0\n' > Test/GX.lean
 printf 'import Test.GX\ndef gm := 1\n' > Test/GM.lean
-test_run build Test.GM
+LAKE_ARTIFACT_CACHE=false test_run build Test.GM
 printf 'import Test.GX\ndef gm := 2\n' > Test/GM.lean
 "$LAKE" env lean Test/GM.lean -o .lake/build/lib/lean/Test/GM.olean
 printf 'import Test.GX\ndef gm := 1\n' > Test/GM.lean
 printf 'def gx := 0\ndef gx2 := 0\n' > Test/GX.lean
-lake_out build -v Test.GM
+LAKE_ARTIFACT_CACHE=false lake_out build -v Test.GM
 match_text "Built Test.GM" produced.out
 # and for a module-system import, whose bytes the check compares instead of digests (`modsysHash`)
 printf 'module\npublic def du : Nat := 1\n' > Test/UH.lean
 printf 'def ux := 0\n' > Test/UX.lean
 printf 'import Test.UH\nimport Test.UX\ntheorem un : du = 1 := rfl\n' > Test/UN.lean
-test_run build Test.UN
+LAKE_ARTIFACT_CACHE=false test_run build Test.UN
 printf 'module\npublic def du : Nat := 2\n' > Test/UH.lean
 "$LAKE" env lean Test/UH.lean -o .lake/build/lib/lean/Test/UH.olean
 printf 'module\npublic def du : Nat := 1\n' > Test/UH.lean
 printf 'def ux := 0\ndef ux2 := 0\n' > Test/UX.lean
-test_err "error: Test/UN.lean" build -v Test.UN
+LAKE_ARTIFACT_CACHE=false test_err "error: Test/UN.lean" build -v Test.UN
 no_match_text "Replayed Test.UN" produced.out
 # a failed rebuild leaves no sidecars behind
 printf 'import Test.A\ndef b : Bool := a\n' > Test/B.lean
