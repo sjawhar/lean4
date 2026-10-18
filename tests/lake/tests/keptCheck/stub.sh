@@ -18,6 +18,8 @@
 # - `wait-go`: before answering for `P.B`, wait (at most 30 s) until the file `$STUB_GO` exists
 # - `chatter-once`: on the first request of all runs, stop reading and answer an id that was never
 #   asked once a second (for at most two minutes, so that a stub no Lake kills ends by itself)
+# - `alter-ilean`: before answering for `P.B`, append a byte to its `.ilean`, as if the build
+#   directory changed while the check ran
 set -u
 echo spawn >> "$STUB_LOG.spawns"
 echo "$$" >> "$STUB_LOG.pids"
@@ -45,6 +47,7 @@ while IFS= read -r line; do
       if [ "$mod" = P.B ]; then
         for _ in $(seq 300); do [ -e "$STUB_GO" ] && break; sleep 0.1; done
       fi;;
+    alter-ilean) if [ "$mod" = P.B ]; then printf x >> "${olean%.olean}.ilean"; fi;;
   esac
   if [ -n "${STUB_VERDICTS:-}" ] && grep -qx "$mod fail" "$STUB_VERDICTS"; then
     reply=$(printf '{"id":%s,"ok":false,"reason":"the stub rejects %s"}' "$id" "$mod")
