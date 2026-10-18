@@ -1540,8 +1540,13 @@ where
                 return arts
               discard <| mod.buildLean presetup
             mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile
-          let arts ← mod.withSavedKeptFrom {arts with ltar? := arts.ltar? <|> ltar?}
+          let arts ← mod.withSavedKeptFrom arts
+          -- An archive from the cache describes the mapping's outputs, which accepted ones are not.
+          let arts :=
+            if arts.keptFrom?.isSome then arts else {arts with ltar? := arts.ltar? <|> ltar?}
+          -- The supersede rule (`Cache.writeOutputsCore`): accepted outputs never replace a mapping.
           (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs
+            (overwrite := arts.keptFrom?.isNone)
           return arts
         else
           let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
@@ -1575,23 +1580,31 @@ where
   isKeptExcluded : JobM Bool :=
     return (← getBuildContext).keptExclude.contains mod.name
   /-
-  A saved trace of outputs that a kept-module check accepted is set aside, so that the module is
-  decided again, when the module is excluded from kept checks, or when the cache maps the same
-  input to outputs compiled from source (which then replace the kept ones).
+  A saved trace of outputs that a kept-module check accepted is set aside, together with those
+  outputs (so that no mode of the build replays them, `--old` included), and the module is decided
+  again: when the module is excluded from kept checks, or when the cache maps the same input to
+  anything but accepted outputs, in any of the forms Lake writes or installs: outputs compiled from
+  source, which replace the kept ones, or an archive (the `-o` and `lake cache add`/`get` form),
+  whose own trace then decides the module's lineage when it is unpacked.
   -/
   reviewKept (savedTrace : SavedTrace) : JobM SavedTrace := do
     unless savedTrace.keptFrom?.isSome do return savedTrace
-    if (← isKeptExcluded) then return .missing
+    if (← isKeptExcluded) then return ← setAside
     let .ok data := savedTrace | return savedTrace
     unless data.depHash == (← getTrace).hash && (← mod.pkg.isArtifactCacheReadable) do
       return savedTrace
-    let some cached ← cachedDescrs? data.depHash | return savedTrace
-    return if cached.keptFrom?.isNone then .missing else savedTrace
-  cachedDescrs? (inputHash : Hash) : JobM (Option ModuleOutputDescrs) := do
+    let some out ← cachedOutputs? data.depHash | return savedTrace
+    if (out.getObjVal? "kf").isOk then return savedTrace
+    setAside
+  setAside : JobM SavedTrace := do
+    -- a `--no-build` build changes no file: the module just needs a build
+    unless (← getNoBuild) do
+      mod.clearOutputArtifacts
+      removeFileIfExists mod.traceFile
+    return .missing
+  cachedOutputs? (inputHash : Hash) : JobM (Option Json) := do
     try
-      let some out ← (← getLakeCache).readOutputs? mod.pkg.cacheScope inputHash | return none
-      let descrs? : Except String ModuleOutputDescrs := fromJson? out.data
-      return descrs?.toOption
+      return (← (← getLakeCache).readOutputs? mod.pkg.cacheScope inputHash).map (·.data)
     catch e =>
       dropLogFrom e
       return none
