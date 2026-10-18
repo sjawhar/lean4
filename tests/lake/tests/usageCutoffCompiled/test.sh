@@ -13,7 +13,8 @@ cd work
 # `.olean`, `.ilean` and `.ir` files the cutoff kept must also be byte for byte those of a clean build of
 # state 1 with the cutoff on, made in the same directory. The one difference the cutoff accepts is a
 # specialization a module created itself where a fresh build would reuse another module's, of the same
-# function at the same arguments: a case that makes one names the C files it allows to differ
+# function at the same arguments, which also reaches a replayed importer that inlined the module's saved body:
+# a case that makes one names the C files it allows to differ
 # (`CASE_c_exempt`; those modules' other outputs are exempt too, and `CASE_olean_exempt` adds the modules
 # importing them) and checks them itself (`CASE_c_check`, run in the cutoff tree). A case writes its state-0
 # files with `CASE_s0` and the files state 1 changes with `CASE_s1`, both in the package directory.
@@ -69,7 +70,7 @@ run_case() {
   rc=0
   (cd "$cut" && env "${env[@]}" "$LAKE" build -v > ../$n.1.log 2>&1) || rc=$?
   (cd "$cut" && observe $rc ../$n.1.log) > cut/$n.obs
-  local cutrc=$rc
+  local cutrc=$rc rcs=0
   if [ "$mode" = cache ]; then
     rc=0
     (cd "$cut" && env "${env[@]}" "$LAKE" build -v > ../$n.2.log 2>&1) || rc=$?
@@ -77,7 +78,7 @@ run_case() {
     (cd "$cut" && observe $rc ../$n.2.log) > cut/$n.obs2
     mkdir -p "cut/$n.shared"
     (cd "cut/$n.shared" && "${c}_s0" && "${c}_s1")
-    local rcs=0
+    rcs=0
     (cd "cut/$n.shared" && env "${env[@]}" "$LAKE" build -v > ../$n.shared.log 2>&1) || rcs=$?
     (cd "cut/$n.shared" && observe $rcs ../$n.shared.log) > cut/$n.shared.obs
   fi
@@ -107,40 +108,50 @@ run_case() {
     ok=0
     echo "FAILURE: $n: ${c}_c_check failed in $cut"
   fi
-  # The cutoff's promise is that what it keeps is what a clean build produces. The clean build has the cutoff
-  # on (a build without it writes `.olean` files without digests) and is made at the cutoff tree's path, which a
-  # module that logs a message embeds in its `.olean`. A module whose C file the case exempts is exempt here
-  # too, as are the modules `CASE_olean_exempt` lists (those importing it, whose `.olean` embeds its digests).
-  local kept="$cut.kept" k skip e oexempt=$exempt
+  # The cutoff's promise is that what it keeps is what a clean build produces. For the cutoff tree, and in cache
+  # mode for the tree restored from the shared cache, the clean build has the cutoff on (a build without it
+  # writes `.olean` files without digests) and is made at the same path, which a module that logs a message
+  # embeds in its `.olean`. A module whose C file the case exempts is exempt here too, as are the modules
+  # `CASE_olean_exempt` lists (those importing it, whose `.olean` embeds its digests). When a build fails, the
+  # outputs both builds produced are compared.
+  local kept k skip e oexempt=$exempt trc name
   if declare -F "${c}_olean_exempt" > /dev/null; then oexempt="$oexempt $("${c}_olean_exempt")"; fi
-  rm -rf "$kept"
-  cp -a "$cut/.lake/build" "$kept"
-  rm -rf "$cut/.lake/build"
-  rc=0
-  (cd "$cut" && "$LAKE" build -v > ../$n.clean.log 2>&1) || rc=$?
-  if [ $cutrc = 0 ] && [ $rc != 0 ]; then
-    ok=0
-    echo "FAILURE: $n: the clean cutoff-on build of state 1 (cut/$n.clean.log) fails"
-  elif [ $cutrc != 0 ] && [ $rc = 0 ]; then
-    ok=0
-    echo "FAILURE: $n: the cutoff build of state 1 fails but the clean cutoff-on build (cut/$n.clean.log) succeeds"
-  fi
-  # A failing build leaves no outputs to compare.
-  for f in $( [ $cutrc = 0 ] && (build_outputs "$cut/.lake/build"; build_outputs "$kept") | LC_ALL=C sort -u); do
-    k=${f#./}; k=${k%%.*}
-    skip=0
-    for e in $oexempt; do
-      case "$k" in *"/${e%.c}") skip=1;; esac
-    done
-    if [ $skip = 1 ]; then continue; fi
-    if [ ! -e "$kept/$f" ] || [ ! -e "$cut/.lake/build/$f" ]; then
+  for t in "$cut" ${mode:+"cut/$n.shared"}; do
+    kept="$t.kept"
+    name=${t##*/}
+    trc=$cutrc
+    if [ "$t" != "$cut" ]; then trc=$rcs; fi
+    rm -rf "$kept"
+    cp -a "$t/.lake/build" "$kept"
+    rm -rf "$t/.lake/build"
+    rc=0
+    (cd "$t" && "$LAKE" build -v > ../$name.clean.log 2>&1) || rc=$?
+    if [ $trc = 0 ] && [ $rc != 0 ]; then
       ok=0
-      echo "FAILURE: $n: ${f#./} exists in only one of the cutoff build and the clean cutoff-on build"
-    elif ! cmp -s "$cut/.lake/build/$f" "$kept/$f"; then
+      echo "FAILURE: $n: the clean cutoff-on build of state 1 (cut/$name.clean.log) fails"
+    elif [ $trc != 0 ] && [ $rc = 0 ]; then
       ok=0
-      echo "FAILURE: $n: ${f#./} kept by the cutoff differs from the clean cutoff-on build's:"
-      cmp "$cut/.lake/build/$f" "$kept/$f" || true
+      echo "FAILURE: $n: the build of $t fails but the clean cutoff-on build (cut/$name.clean.log) succeeds"
     fi
+    for f in $( (build_outputs "$t/.lake/build"; build_outputs "$kept") | LC_ALL=C sort -u); do
+      k=${f#./}; k=${k%%.*}
+      skip=0
+      for e in $oexempt; do
+        case "$k" in *"/${e%.c}") skip=1;; esac
+      done
+      if [ $skip = 1 ]; then continue; fi
+      if [ ! -e "$kept/$f" ] || [ ! -e "$t/.lake/build/$f" ]; then
+        if [ $trc = 0 ] && [ $rc = 0 ]; then
+          ok=0
+          echo "FAILURE: $n: ${f#./} exists in only one of the build of $t and the clean cutoff-on build"
+        fi
+      elif ! cmp -s "$t/.lake/build/$f" "$kept/$f"; then
+        ok=0
+        echo "FAILURE: $n: ${f#./} of $t differs from the clean cutoff-on build's:"
+        cmp "$t/.lake/build/$f" "$kept/$f" || true
+      fi
+    done
+    rm -rf "$kept"
   done
   if [ $ok = 0 ]; then
     echo "-- the cutoff build of state 1 (cut/$n.1.log):"
@@ -496,6 +507,20 @@ d2_tolerated_reader_s1() { d2_folder_s1; }
 d2_tolerated_reader_c_exempt() { d2_tolerated_c_exempt; }
 d2_tolerated_reader_olean_exempt() { d2_tolerated_olean_exempt; }
 d2_tolerated_reader_c_check() { d2_tolerated_c_check; }
+
+# The tolerated difference also reaches a replayed importer that inlined the tolerated module's saved body:
+# `Main` inlines `M.g`, whose body calls the specialization `M` created, so the kept `Main` calls it too where
+# a fresh `Main` calls `Y`'s. Both exist in the kept tree, and what the executable prints is unchanged.
+d2_down_s0() {
+  d2_files ''
+  printf 'import T.B\nimport T.Y\nnamespace T\ndef g (xs : List Nat) : List Nat := myMap k xs\nend T\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println (T.g [1, 2, 3])\n' > Main.lean
+}
+d2_down_s1() { d2_folder_s1; }
+d2_down_c_exempt() { echo T/M.c Main.c; }
+d2_down_c_check() {
+  grep -q 'myMap___at___00T_g_spec__0' .lake/build/ir/T/M.c && grep -q 'myMap___at___00T_g_spec__0' .lake/build/ir/Main.c
+}
 
 # Code inside the compiler from other sources than an imported module's entries: `M` registers a folder
 # itself (`f3_own_folder`) or declares a `@[cpass]` itself (`f3_own_cpass`), or `Y`, imported but unused,
@@ -1079,7 +1104,116 @@ binder_info_type_s0() {
 }
 binder_info_type_s1() { printf 'set_option checkBinderAnnotations false\nstructure Foo where\n  x : Nat\n@[noinline] def g (f : [Foo] → Nat) (n : Nat) : Nat := @f ⟨1⟩ + n\n' > T/A.lean; }
 
+## Compiler-generated names, and state that a module's code must not reach.
+
+# `A.foo`'s `_redArg` is a compiler-only name that `A` owns. `B` gains a kernel constant of the same name, and
+# `C`, which imports `B` before `A`, resolves the name to `B`'s constant in a fresh build (`collide_first`) but
+# to `A`'s when `A` comes first (`collide_after`). A module that introduces such a constant changes what its
+# importers compile, so `C` must be compiled again.
+collide_files() {
+  printf 'name = "test"\ndefaultTargets = ["T"]\n[[lean_lib]]\nname = "T"\n' > lakefile.toml
+  mkdir_t
+  printf 'def foo (n : Nat) (_h : Nat) : Nat := n + 1\n' > T/A.lean
+  printf 'def unrelated : Nat := 0\n' > T/B.lean
+  printf 'import T.%s\nimport T.%s\ndef useFoo (n : Nat) : Nat × Nat := (foo n 0, n)\n' "$1" "$2" > T/C.lean
+  printf 'import T.C\n' > T.lean
+}
+collide_b() { printf 'def unrelated : Nat := 0\n@[noinline] def foo._redArg (_n : Nat) : UInt32 := 7\n' > T/B.lean; }
+collide_first_s0() { collide_files B A; }
+collide_first_s1() { collide_b; }
+collide_after_s0() { collide_files A B; }
+collide_after_s1() { collide_b; }
+
+# A module's code must not be able to clear, forge or bypass what the build records about it. Each case runs
+# the attempt (`hard_try`) inside the module that would profit from it; the state it targets is private, so the
+# attempt is rejected, logs `attempt rejected: …` and leaves the module compiling as it would without it
+# (`hard_rejected`, in each case's `_c_check`). `hard_recording` and `hard_compilercode` clear the flags
+# that decide whether the compiler ran code of its own (`f3_runtime_folder` otherwise); `hard_usedbychecks`
+# clears the names recorded as used while `B` evaluates `A`'s function; `hard_declconsts` empties the
+# constants recorded for `M`'s declarations; `hard_extramod` clears the module uses recorded for a macro that a
+# discarded command expands; `hard_moduleext` clears the digests and compiler-code bits `M` has for its
+# imports.
+hard_try() {
+  printf 'open Lean Elab Command in\nrun_cmd do\n  let stx ← match Parser.runParserCategory (← getEnv) `command "%s" with\n    | .ok stx => pure stx\n    | .error e => throwError e\n  let saved := (← get).messages\n  elabCommand stx\n  let errs := (← get).messages.toList.filter (·.severity == .error)\n  modify fun s => { s with messages := saved }\n  if let some e := errs.head? then logInfo m!"attempt rejected: {← e.data.toString}"\n' "$1"
+}
+hard_rejected() { grep -q 'attempt rejected' "../$1.1.log"; }
+hard_folder='run_meta modifyEnv fun env => folderExt.modifyState env fun (es, m) => (es, m.insert ``T.k myFolder)'
+hard_m() {
+  printf 'import T.B\nimport T.Y\n%snamespace T\ndef h : List Nat := myMap k [1, 2, 3]\nend T\n%s' "${1:-}" "${2:-}" > T/M.lean
+}
+hard_recording_s0() { f3_files; f3_y "$(hard_try 'run_meta Lean.usageRecordingRef.set false')" ''; hard_m; }
+hard_recording_s1() {
+  f3_y "$(hard_try 'run_meta Lean.usageRecordingRef.set false')"$'\n'"$hard_folder" 'def y : List Nat := myMap k [0]'
+}
+hard_recording_c_check() { hard_rejected hard_recording; }
+hard_compilercode_s0() { f3_files; f3_y '' "$(hard_try 'run_meta Lean.compilerCodeRef.set false')"; hard_m; }
+hard_compilercode_s1() {
+  f3_y "$hard_folder" $'def y : List Nat := myMap k [0]\n'"$(hard_try 'run_meta Lean.compilerCodeRef.set false')"
+}
+hard_compilercode_c_check() { hard_rejected hard_compilercode; }
+hard_moduleext_try="$(hard_try 'run_meta modifyEnv fun env => Lean.ModuleUsage.ext.modifyState (asyncMode := .mainOnly) env fun s => { s with importedModuleEntries := #[] }')"
+hard_moduleext_s0() { f3_files; f3_y '' ''; hard_m $'import Lean\n' "$hard_moduleext_try"; }
+hard_moduleext_s1() { f3_y "$hard_folder" 'def y : List Nat := myMap k [0]'; }
+hard_moduleext_c_check() { hard_rejected hard_moduleext; }
+
+hard_usedbychecks_a() { printf 'def hardval : Nat := %s\n' "$1" > T/A.lean; }
+hard_usedbychecks_s0() {
+  lakefile_app; mkdir_t
+  hard_usedbychecks_a 10
+  {
+    cat <<'EOF'
+import T.A
+import Lean
+open Lean Meta
+run_meta do
+  let n ← evalConst Nat `hardval (checkMeta := false)
+  let d := .defnDecl {
+    name := `b
+    levelParams := []
+    type := mkConst ``Nat
+    value := mkNatLit n
+    hints := .abbrev
+    safety := .safe
+  }
+  addDecl d
+  compileDecl d
+EOF
+    hard_try 'run_meta Lean.usedByChecksRef.set {}'
+  } > T/B.lean
+  printf 'import T.B\n@[noinline] def m : Nat := b\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println m\n' > Main.lean
+}
+hard_usedbychecks_s1() { hard_usedbychecks_a 20; }
+hard_usedbychecks_c_check() { hard_rejected hard_usedbychecks; }
+
+hard_declconsts_a() { printf '@[inline] def hx : Nat := %s\n' "$1" > T/A.lean; }
+hard_declconsts_s0() {
+  lakefile_app; mkdir_t
+  hard_declconsts_a 10
+  {
+    printf 'import T.A\nimport Lean\n@[noinline] def m : Nat := hx + 1\n'
+    hard_try 'run_meta Lean.declConstsRef.modify fun r => r.map fun _ d => { d with consts := {} }'
+  } > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println m\n' > Main.lean
+}
+hard_declconsts_s1() { hard_declconsts_a 20; }
+hard_declconsts_c_check() { hard_rejected hard_declconsts; }
+
+hard_extramod_a() { printf 'macro "hardmac" : term => `(%s)\n' "$1" > T/A.lean; }
+hard_extramod_s0() {
+  lakefile_app; mkdir_t
+  hard_extramod_a 10
+  {
+    printf 'import T.A\nimport Lean\n#eval (hardmac : Nat)\n'
+    hard_try 'run_meta Lean.extraModUsesByChecksRef.set {}'
+  } > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := pure ()\n' > Main.lean
+}
+hard_extramod_s1() { hard_extramod_a 20; }
+hard_extramod_c_check() { hard_rejected hard_extramod; }
 all_cases="spec_transitive spec_link spec_type spec_precomp csimp_transitive csimp_late specialize_attr
+  collide_first collide_after hard_recording hard_compilercode hard_usedbychecks hard_declconsts hard_extramod
+  hard_moduleext d2_down
   class_same class_cross nospec_type folder_cross reducible_cross binder_inline d2_folder d2_tolerated d2_cpass
   local_inst_own erase_inst_own scoped_inst local_red_own2 local_red_own3 scoped_red_own
   table_order folder_order red_order
