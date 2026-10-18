@@ -35,6 +35,11 @@ turns off the tolerance of specialization reuse), only which keys exist and what
 decides to inline or specialize (`keysOrDecisions`), the cache itself (`cache`), or only whether a
 definitional-equality query succeeds (`defeqOutcome`), and whether a later entry overwrites an earlier
 one, so that import order matters (closure digests hash the closure in import order).
+
+Every `tableNotes` row and `Lean.IR.declMapExt` also need a row in `writerNotes`: how writes from outside the
+compiler are handled (`bitSetting`: they set the module's compiler-code bit; `keysOrDecisionsOnly`: they cannot
+change what a specialization under a given key computes), with the case that exercises it. A table that can
+change a specialization's body, or the cache itself, must be `bitSetting`.
 -/
 open Lean
 
@@ -281,6 +286,48 @@ def tableNotes : List (Name × SpecEffect × Bool × String) := [
     in discrimination-tree match order and the first success wins (:116-118), so import order matters.")
 ]
 
+/-- How writes from outside the compiler are handled, for a table that can reach a specialization another module
+reuses. `bitSetting`: every such write sets the module's compiler-code bit, which turns off the tolerance of
+specialization reuse for the module and its importers (by the state check at each compile batch, or at the
+writer). `keysOrDecisionsOnly`: writes change only which keys exist, what the compiler decides to inline or
+specialize, or whether a defeq query succeeds, never what a specialization under a given key computes. -/
+inductive Writers where
+  | bitSetting | keysOrDecisionsOnly
+deriving BEq
+
+/-- `extension name → (handling of writes from outside the compiler, the usageCutoffCompiled case that exercises
+it, reason)`. Every `tableNotes` row needs one, and so does `Lean.IR.declMapExt`, whose IR can disagree with the
+LCNF body that inlining and specialization use. A table whose `SpecEffect` is `body` or `cache` must be
+`bitSetting`. -/
+def writerNotes : List (Name × Writers × String × String) := [
+  (`Lean.Compiler.LCNF.passManagerExt, .bitSetting, "f3_runtime_cpass",
+    "`@[cpass]`, `addPass` and a direct `modifyState` all change the pass manager, which each compile batch \
+    compares with `builtinPassManager` by pointer (src/Lean/Compiler/LCNF/Main.lean, `isBuiltinCompiler`)."),
+  (`Lean.Compiler.LCNF.Simp.ConstantFold.folderExt, .bitSetting, "f3_runtime_folder",
+    "`registerFolder` and a direct `modifyState` change the folder map, which each compile batch compares \
+    with `builtinFolders` by pointer (src/Lean/Compiler/LCNF/Main.lean, `isBuiltinCompiler`)."),
+  (Lean.mkPrivateNameCore `Lean.Compiler.LCNF.Specialize `Lean.Compiler.LCNF.Specialize.specCacheExt, .bitSetting,
+    "f1_cachespec",
+    "The extension is private; its one public writer, `cacheSpec`, sets the bit, and the specializer writes \
+    through the private `cacheSpecCore` (src/Lean/Compiler/LCNF/Specialize.lean:42-51)."),
+  (`Lean.IR.declMapExt, .bitSetting, "premise_ir",
+    "IR the compiler did not produce (the public `IR.addDecl`, or a direct `addEntry`) shows as more IR \
+    entries under a name than the compiler counted (`compilerIRRef`, `ModuleUsage.irOutsideCompiler`)."),
+  (`Lean.Compiler.CSimp.ext, .keysOrDecisionsOnly, "csimp_late",
+    "A replacement applies to the compiling module's own terms in toLCNF, before keys are formed."),
+  (`Lean.Meta.instanceExtension, .keysOrDecisionsOnly, "local_inst_own",
+    "Instance status decides base-phase inlining only; given the `declMapExt` row, the code a decision \
+    chooses between computes the same."),
+  (`reducibilityExtra, .keysOrDecisionsOnly, "red_order",
+    "Reducibility decides whether to specialize or lambda-lift only; given the `declMapExt` row, the code a \
+    decision chooses between computes the same."),
+  (`Lean.classExtension, .keysOrDecisionsOnly, "class_cross",
+    "Class status decides which parameters are specialized only."),
+  (`Lean.Meta.unificationHintExtension, .keysOrDecisionsOnly, "",
+    "A hint can only make a `Meta.isDefEq` query succeed; the compiler's terms carry no metavariables, and no \
+    case exercises it.")
+]
+
 #eval show CoreM Unit from do
   let env ← getEnv
   -- Roots: the LCNF/IR code-generation entry points, plus the Lean functions
@@ -360,5 +407,18 @@ def tableNotes : List (Name × SpecEffect × Bool × String) := [
   for e in exts do
     unless env.contains (holderOf e.name) do
       errors := errors.push s!"registered extension `{e.name}` has no holder constant: `{holderOf e.name}` is not in the environment (add an entry to `aliases`)"
+  -- Writer handling: every `tableNotes` row and `declMapExt` need a `writerNotes` row, and a table that can
+  -- change a specialization's body or is the cache itself must be `bitSetting`.
+  for (n, eff, _, _) in tableNotes do
+    match writerNotes.find? (·.1 == n) with
+    | none => errors := errors.push s!"`{n}` has a `tableNotes` row but no `writerNotes` row"
+    | some (_, w, _, _) =>
+      if (eff == .body || eff == .cache) && w != .bitSetting then
+        errors := errors.push s!"`{n}` can change a reused specialization's body but its writers are not `bitSetting`"
+  for (n, _, _, _) in writerNotes do
+    unless n == ``Lean.IR.declMapExt || tableNotes.any (·.1 == n) do
+      errors := errors.push s!"`writerNotes` names `{n}`, which has no `tableNotes` row"
+  unless writerNotes.any (·.1 == ``Lean.IR.declMapExt) do
+    errors := errors.push "`Lean.IR.declMapExt` has no `writerNotes` row"
   unless errors.isEmpty do
     throwError "moduleUsageCensus found {errors.size} issue(s) (of {registered.size} registered, {reachedExts.size} reachable extensions):\n{"\n".intercalate errors.toList}"
