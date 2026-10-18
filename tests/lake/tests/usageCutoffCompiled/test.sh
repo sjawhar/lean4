@@ -11,14 +11,12 @@ cd work
 # what the executable `app` prints, what `lake env lean` prints for each `Check*.lean`, and the C file of
 # every module, which for a module the cutoff skipped must be what compiling its sources now produces. The
 # `.olean`, `.ilean` and `.ir` files the cutoff kept must also be byte for byte those of a clean build of
-# state 1 with the cutoff on, made in the same directory. The one difference the cutoff accepts is a
-# specialization a module created itself where a fresh build would reuse another module's, of the same
-# function at the same arguments, which also reaches an importer, replayed or rebuilt, that inlined the module's
-# saved body:
-# a case that makes one names the C files it allows to differ
-# (`CASE_c_exempt`; those modules' other outputs are exempt too, and `CASE_olean_exempt` adds the modules
-# importing them) and checks them itself (`CASE_c_check`, run in the cutoff tree). A case writes its state-0
-# files with `CASE_s0` and the files state 1 changes with `CASE_s1`, both in the package directory.
+# state 1 with the cutoff on, made in the same directory. There is no tolerated difference. A module that
+# specialized a function itself where a fresh build would reuse another module's specialization of the same
+# function at the same arguments is built again (`perkey_provider`), and one whose imports gain a
+# specialization it never looked up is replayed (`perkey_unrelated_spec`). A case may also check the build
+# itself with `CASE_c_check`, run in the cutoff tree. A case writes its state-0 files with `CASE_s0` and the
+# files state 1 changes with `CASE_s1`, both in the package directory.
 
 # Store the Lake cache in the test directory, never the system cache
 export LAKE_CACHE_DIR=
@@ -93,11 +91,8 @@ run_case() {
       echo "FAILURE: $n: $o (cutoff on) differs from a fresh build (fresh/$n.obs, above as ---)"
     fi
   done
-  local exempt=""
-  if declare -F "${c}_c_exempt" > /dev/null; then exempt=$("${c}_c_exempt"); fi
   for t in "$cut" ${mode:+"cut/$n.shared"}; do
     for f in $(cd "$fresh/.lake/build/ir" && find . -name '*.c' | LC_ALL=C sort); do
-      case " $exempt " in *" ${f#./} "*) continue;; esac
       if ! cmp -s "$fresh/.lake/build/ir/$f" "$t/.lake/build/ir/$f"; then
         ok=0
         echo "FAILURE: $n: $t/.lake/build/ir/${f#./} differs from the fresh build's:"
@@ -112,11 +107,8 @@ run_case() {
   # The cutoff's promise is that what it keeps is what a clean build produces. For the cutoff tree, and in cache
   # mode for the tree restored from the shared cache, the clean build has the cutoff on (a build without it
   # writes `.olean` files without digests) and is made at the same path, which a module that logs a message
-  # embeds in its `.olean`. A module whose C file the case exempts is exempt here too, as are the modules
-  # `CASE_olean_exempt` lists (those importing it, whose `.olean` embeds its digests). When a build fails, the
-  # outputs both builds produced are compared.
-  local kept k skip e oexempt=$exempt trc name
-  if declare -F "${c}_olean_exempt" > /dev/null; then oexempt="$oexempt $("${c}_olean_exempt")"; fi
+  # embeds in its `.olean`. When a build fails, the outputs both builds produced are compared.
+  local kept trc name
   for t in "$cut" ${mode:+"cut/$n.shared"}; do
     kept="$t.kept"
     name=${t##*/}
@@ -135,12 +127,6 @@ run_case() {
       echo "FAILURE: $n: the build of $t fails but the clean cutoff-on build (cut/$name.clean.log) succeeds"
     fi
     for f in $( (build_outputs "$t/.lake/build"; build_outputs "$kept") | LC_ALL=C sort -u); do
-      k=${f#./}; k=${k%%.*}
-      skip=0
-      for e in $oexempt; do
-        case "$k" in *"/${e%.c}") skip=1;; esac
-      done
-      if [ $skip = 1 ]; then continue; fi
       if [ ! -e "$kept/$f" ] || [ ! -e "$t/.lake/build/$f" ]; then
         if [ $trc = 0 ] && [ $rc = 0 ]; then
           ok=0
@@ -445,9 +431,9 @@ red_order_s1() { order_x Z2 Z1; }
 
 # A specialization-cache miss that becomes a hit. `M` specializes `myMap k` itself; then `Y`, which `M` imports
 # but uses nothing of, starts specializing the same call, so a fresh `M` reuses `Y`'s specialization instead.
-# Without code running inside the compiler both compute the same function (`d2_tolerated`): `M` may keep its
-# own, and only its C file differs. With a constant folder for `k` registered in `Z` (`d2_folder`), which is
-# not meaning-preserving (it returns 42) and which `Y` does not import, they differ, and `M` must compile again.
+# `M` is built again whether or not code runs inside the compiler (`d2_tolerated`). With a constant folder for `k`
+# registered in `Z` (`d2_folder`), which `Y` does not import and which is not meaning-preserving (it returns 42),
+# the two specializations compute different things as well.
 d2_files() {
   lakefile_app; mkdir_t
   printf 'namespace T\n@[noinline] def k (n : Nat) : Nat := n + 1\n' > T/B.lean
@@ -473,11 +459,6 @@ EOF
 d2_folder_s1() { d2_y $'def y : List Nat := myMap k [0]\n'; }
 d2_tolerated_s0() { d2_files ''; }
 d2_tolerated_s1() { d2_folder_s1; }
-d2_tolerated_c_exempt() { echo T/M.c; }
-# `Main` imports `M`, so its `.olean` embeds the digests of the `M` that differs.
-d2_tolerated_olean_exempt() { echo Main; }
-# The kept `M` still calls the specialization it created.
-d2_tolerated_c_check() { grep -q 'myMap___at___00T_h_spec__0' .lake/build/ir/T/M.c; }
 # The same with a compiler pass (a no-op) registered in `Z`: code that runs inside the compiler is not known to
 # preserve meaning, so `M` must compile again and match the fresh build byte for byte.
 d2_cpass_s0() {
@@ -493,46 +474,31 @@ EOF
 d2_cpass_s1() { d2_folder_s1; }
 
 # Toolchain modules alone leave the compiler's passes and folders built-in: `M` importing `Lean`, and also a
-# module that only reads the folder table, keeps the tolerance of `d2_tolerated`.
+# module that only reads the folder table, is built again as in `d2_tolerated`.
 d2_tolerated_lean_s0() { d2_files $'import Lean\n'; }
 d2_tolerated_lean_s1() { d2_folder_s1; }
-d2_tolerated_lean_c_exempt() { d2_tolerated_c_exempt; }
-d2_tolerated_lean_olean_exempt() { d2_tolerated_olean_exempt; }
-d2_tolerated_lean_c_check() { d2_tolerated_c_check; }
 d2_tolerated_reader_s0() {
   d2_files $'import Lean\nimport T.R\n'
   printf 'import Lean\nopen Lean Lean.Compiler.LCNF.Simp.ConstantFold\nrun_meta do\n  let _ ← getFolders\n  pure ()\n' \
     > T/R.lean
 }
 d2_tolerated_reader_s1() { d2_folder_s1; }
-d2_tolerated_reader_c_exempt() { d2_tolerated_c_exempt; }
-d2_tolerated_reader_olean_exempt() { d2_tolerated_olean_exempt; }
-d2_tolerated_reader_c_check() { d2_tolerated_c_check; }
 
-# The tolerated difference also reaches a replayed importer that inlined the tolerated module's saved body:
-# `Main` inlines `M.g`, whose body calls the specialization `M` created, so the kept `Main` calls it too where
-# a fresh `Main` calls `Y`'s. Both exist in the kept tree, and what the executable prints is unchanged.
+# `Main` inlines `M.g`, whose body calls the specialization `M` creates: `M` is built again, so `Main` is too and
+# calls `Y`'s, as a fresh build does.
 d2_down_s0() {
   d2_files ''
   printf 'import T.B\nimport T.Y\nnamespace T\ndef g (xs : List Nat) : List Nat := myMap k xs\nend T\n' > T/M.lean
   printf 'import T.M\ndef main : IO Unit := IO.println (T.g [1, 2, 3])\n' > Main.lean
 }
 d2_down_s1() { d2_folder_s1; }
-d2_down_c_exempt() { echo T/M.c Main.c; }
-d2_down_c_check() {
-  grep -q 'myMap___at___00T_g_spec__0' .lake/build/ir/T/M.c && grep -q 'myMap___at___00T_g_spec__0' .lake/build/ir/Main.c
-}
 
-# The same reaches an importer that is rebuilt while the tolerated `M` is kept: `Main`'s source changes in
-# state 1, and it inlines the kept `M`'s saved body, which calls `M`'s own specialization, where a fresh `Main`
-# calls `Y`'s.
+# The same when `Main`'s source also changes in state 1.
 d2_down_rebuilt_s0() { d2_down_s0; }
 d2_down_rebuilt_s1() {
   d2_down_s1
   printf 'import T.M\ndef unused : Nat := 1\ndef main : IO Unit := IO.println (T.g [1, 2, 3])\n' > Main.lean
 }
-d2_down_rebuilt_c_exempt() { echo T/M.c Main.c; }
-d2_down_rebuilt_c_check() { d2_down_c_check; }
 
 # Code inside the compiler from other sources than an imported module's entries: `M` registers a folder
 # itself (`f3_own_folder`) or declares a `@[cpass]` itself (`f3_own_cpass`), or `Y`, imported but unused,
@@ -757,7 +723,7 @@ EOF
 # Writes, through public functions and outside the compiler, to the compiled entries of `Y`'s own
 # specialization of a key `M` also specializes: its dead-branch summary (`wh_summary`), an `@[extern]`
 # (`wh_extern`) or `implemented_by` (`wh_implby`) attribute on it, its impure signature (`wh_sig`). A fresh `M`
-# reuses `Y`'s specialization; the kept one must not. `wh_ctrl` writes nothing: the tolerated difference only.
+# reuses `Y`'s specialization; the kept one must not. `wh_ctrl` writes nothing.
 wh_b() {
   cat > T/B.lean <<'EOF'
 namespace T
@@ -788,8 +754,6 @@ EOF
 wh_decls=$'def y : Nat := iter k 7\ndef yb : Bool := anyP k2 [7]\ndef evilI (n : Nat) : Nat := n + 100'
 wh_ctrl_s0() { wh_files; }
 wh_ctrl_s1() { wh_y "$wh_decls" ''; }
-wh_ctrl_c_exempt() { echo T/M.c; }
-wh_ctrl_olean_exempt() { echo Main; }
 wh_summary_s0() { wh_files; }
 wh_summary_s1() {
   wh_y "$wh_decls" 'open Lean Compiler LCNF UnreachableBranches in
@@ -826,6 +790,163 @@ run_meta do
   let spec := `T.iter._at_.T.y.spec_0
   let some sig := getSigCore? env impureSigExt spec | throwError "no impure signature {spec}"
   modifyEnv fun env => impureSigExt.addEntry env { sig with type := ImpureType.uint8 }'
+}
+
+# Outside writes that land in the compile that produces `Y`'s specialization, so that the compiler appears to
+# have written them: an `@[extern]` attribute set on the specialization's name before it exists
+# (`tl_pre_extern`, `tl2_pre_extern` with the key `lcnf_override` uses), and a second thread writing through the
+# compile's `Core.State` reference while it runs: the dead-branch summary (`tl3_race_a`: the compile runs on a
+# spawned task and the writer on the command's thread; `tl3_race_b`: the other way round) or the impure
+# signature (`tl3_race_sig`) of the specialization once its IR exists. A fresh `M` reuses `Y`'s specialization
+# and so reads the written value, which `M` must therefore be built against.
+tl_y() { cat > T/Y.lean; }
+tl_pre_extern_s0() { wh_files; }
+tl_pre_extern_s1() {
+  tl_y <<'EOF'
+import Lean
+import T.B
+namespace T
+def y0 : Nat := 0
+end T
+open Lean Compiler LCNF in
+run_meta do
+  let spec := `T.iter._at_.T.y.spec_0
+  match externAttr.setParam (← getEnv) spec { entries := [.standard `all "lean_nat_succ"] } with
+  | .ok env => setEnv env
+  | .error e => throwError e
+namespace T
+def y : Nat := iter k 7
+def yb : Bool := anyP k2 [7]
+end T
+EOF
+}
+tl2_pre_extern_s0() { lo_files; lo_y '' ''; }
+tl2_pre_extern_s1() {
+  tl_y <<'EOF'
+import Lean
+import T.B
+namespace T
+def y0 : Nat := 0
+end T
+open Lean Compiler LCNF in
+run_meta do
+  let spec := `T.app._at_.T.y.spec_0
+  match externAttr.setParam (← getEnv) spec { entries := [.standard `all "lean_nat_succ"] } with
+  | .ok env => setEnv env
+  | .error e => throwError e
+namespace T
+def y : Nat := app k 7
+end T
+EOF
+}
+tl_race_head='import Lean
+import T.B
+namespace T
+def y0 : Nat := 0
+end T
+open Lean Meta Compiler LCNF
+
+def getSR : CoreM (IO.Ref Core.State) := fun _ sr => pure sr
+
+def addYb : MetaM Unit := do
+  let lst ← mkListLit (mkConst ``Nat) [mkNatLit 7]
+  addDecl <| .defnDecl {
+    name := `T.yb
+    levelParams := []
+    type := mkConst ``Bool
+    value := mkApp2 (mkConst `T.anyP) (mkConst `T.k2) lst
+    hints := .abbrev
+    safety := .safe
+  }
+'
+tl_race_tail='  match UnreachableBranches.getFunctionSummary? (← getEnv) spec with
+  | some (.ctor ``Bool.true #[]) => logInfo "final summary: written"
+  | some _ => logInfo "final summary: compiler'"'"'s"
+  | none => logInfo "final summary: none"
+'
+tl3_race_a_s0() { wh_files; }
+tl3_race_a_s1() {
+  { printf '%s' "$tl_race_head"
+    cat <<'EOF'
+set_option Elab.async false in
+run_meta do
+  let spec := `T.anyP._at_.T.yb.spec_0
+  addYb
+  let ctx ← readThe Core.Context
+  let sr ← getSR
+  let t ← BaseIO.asTask (prio := .dedicated) (((Lean.compileDecls #[`T.yb] : CoreM Unit) ctx sr).toBaseIO)
+  let mut done := false
+  while !done do
+    if (getSigCore? (← getEnv) impureSigExt spec).isSome then
+      modifyEnv fun env => UnreachableBranches.addFunctionSummary env spec (.ctor ``Bool.true #[])
+      done := true
+    else if (← IO.hasFinished t) then
+      done := true
+  match (← IO.wait t) with
+  | .ok _ => pure ()
+  | .error e => throwError m!"compile failed: {← e.toMessageData.toString}"
+EOF
+    printf '%s' "$tl_race_tail"
+  } | tl_y
+}
+tl3_race_b_s0() { wh_files; }
+tl3_race_b_s1() {
+  { printf '%s' "$tl_race_head"
+    cat <<'EOF'
+set_option Elab.async false in
+run_meta do
+  let spec := `T.anyP._at_.T.yb.spec_0
+  addYb
+  let ctx ← readThe Core.Context
+  let sr ← getSR
+  let stop ← IO.mkRef false
+  let tamper : CoreM Unit := do
+    while !(← stop.get) do
+      if (getSigCore? (← getEnv) impureSigExt spec).isSome then
+        modifyEnv fun env => UnreachableBranches.addFunctionSummary env spec (.ctor ``Bool.true #[])
+        return
+  let t ← BaseIO.asTask (prio := .dedicated) ((tamper ctx sr).toBaseIO)
+  Lean.compileDecls #[`T.yb]
+  stop.set true
+  discard <| IO.wait t
+EOF
+    printf '%s' "$tl_race_tail"
+  } | tl_y
+}
+tl3_race_sig_s0() { wh_files; }
+tl3_race_sig_s1() {
+  { printf '%s' "$tl_race_head"
+    cat <<'EOF'
+set_option Elab.async false in
+run_meta do
+  let spec := `T.iter._at_.T.y.spec_0
+  let env0 ← getEnv
+  addDecl <| .defnDecl {
+    name := `T.y
+    levelParams := []
+    type := mkConst ``Nat
+    value := mkApp2 (mkConst `T.iter) (mkConst `T.k) (mkNatLit 7)
+    hints := .abbrev
+    safety := .safe
+  }
+  let ctx ← readThe Core.Context
+  let sr ← getSR
+  let stop ← IO.mkRef false
+  let tamper : CoreM Unit := do
+    while !(← stop.get) do
+      if (IR.findEnvDecl (← getEnv) spec).isSome then
+        if let some sig := getSigCore? (← getEnv) impureSigExt spec then
+          modifyEnv fun env => impureSigExt.addEntry env { sig with type := ImpureType.uint8 }
+          return
+  let t ← BaseIO.asTask (prio := .dedicated) ((tamper ctx sr).toBaseIO)
+  Lean.compileDecls #[`T.y]
+  stop.set true
+  discard <| IO.wait t
+  match getSigCore? (← getEnv) impureSigExt spec with
+  | some s => logInfo (if s.type == ImpureType.uint8 then "final signature: written" else "final signature: compiler's")
+  | none => logInfo "final signature: none"
+EOF
+  } | tl_y
 }
 
 # Binder names of an inlined body become C variable names in the importer's C file.
@@ -1329,12 +1450,10 @@ negfail_scoped_s1() { scoped_inst_s1; printf 'def nok : Nat := "x"\n' > T/N.lean
 # A module's code must not be able to clear, forge or bypass what the build records about it. Each case runs
 # the attempt (`hard_try`) inside the module that would profit from it; the state it targets is private, so the
 # attempt is rejected, logs `attempt rejected: …` and leaves the module compiling as it would without it
-# (`hard_rejected`, in each case's `_c_check`). `hard_recording` and `hard_compilercode` clear the flags
-# that decide whether the compiler ran code of its own (`f3_runtime_folder` otherwise); `hard_usedbychecks`
-# clears the names recorded as used while `B` evaluates `A`'s function; `hard_declconsts` empties the
-# constants recorded for `M`'s declarations; `hard_extramod` clears the module uses recorded for a macro that a
-# discarded command expands; `hard_moduleext` clears the digests and compiler-code bits `M` has for its
-# imports.
+# (`hard_rejected`, in each case's `_c_check`). `hard_recording` clears the flag that switches usage recording
+# on; `hard_usedbychecks` clears the names recorded as used while `B` evaluates `A`'s function;
+# `hard_declconsts` empties the constants recorded for `M`'s declarations; `hard_extramod` clears the module
+# uses recorded for a macro that a discarded command expands.
 hard_try() {
   printf 'open Lean Elab Command in\nrun_cmd do\n  let stx ← match Parser.runParserCategory (← getEnv) `command "%s" with\n    | .ok stx => pure stx\n    | .error e => throwError e\n  let saved := (← get).messages\n  elabCommand stx\n  let errs := (← get).messages.toList.filter (·.severity == .error)\n  modify fun s => { s with messages := saved }\n  if let some e := errs.head? then logInfo m!"attempt rejected: {← e.data.toString}"\n' "$1"
 }
@@ -1348,15 +1467,6 @@ hard_recording_s1() {
   f3_y "$(hard_try 'run_meta Lean.usageRecordingRef.set false')"$'\n'"$hard_folder" 'def y : List Nat := myMap k [0]'
 }
 hard_recording_c_check() { hard_rejected hard_recording; }
-hard_compilercode_s0() { f3_files; f3_y '' "$(hard_try 'run_meta Lean.compilerCodeRef.set false')"; hard_m; }
-hard_compilercode_s1() {
-  f3_y "$hard_folder" $'def y : List Nat := myMap k [0]\n'"$(hard_try 'run_meta Lean.compilerCodeRef.set false')"
-}
-hard_compilercode_c_check() { hard_rejected hard_compilercode; }
-hard_moduleext_try="$(hard_try 'run_meta modifyEnv fun env => Lean.ModuleUsage.ext.modifyState (asyncMode := .mainOnly) env fun s => { s with importedModuleEntries := #[] }')"
-hard_moduleext_s0() { f3_files; f3_y '' ''; hard_m $'import Lean\n' "$hard_moduleext_try"; }
-hard_moduleext_s1() { f3_y "$hard_folder" 'def y : List Nat := myMap k [0]'; }
-hard_moduleext_c_check() { hard_rejected hard_moduleext; }
 
 hard_usedbychecks_a() { printf 'def hardval : Nat := %s\n' "$1" > T/A.lean; }
 hard_usedbychecks_s0() {
@@ -1413,23 +1523,249 @@ hard_extramod_s0() {
 }
 hard_extramod_s1() { hard_extramod_a 20; }
 hard_extramod_c_check() { hard_rejected hard_extramod; }
+
+## Tables a module writes through public functions.
+
+# Tables the compiler reads for an imported declaration, which the declaring module can write for its own
+# declaration with a public function: `Z` defines `myFst` (or a `casesOn`-shaped definition), and tags it
+# in state 0; state 1 removes the tag (`_rev`: adds it). `M` calls it, so its compiled code inlines the body or
+# calls the function (`addProjectionFnInfo`, `Meta.markMatcherLike`), or turns the call into a `cases`
+# (`markSparseCasesOn`, `markAuxRecursor`).
+cov_m() {
+  lakefile_app; mkdir_t
+  printf 'import T.Z\n@[noinline] def g (p : Nat × Nat) : Nat := %s + 1\n' "$1" > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println (g (3, 4))\n' > Main.lean
+}
+cov_z() {
+  printf 'import Lean\nopen Lean\n@[noinline] def myFst (p : Nat × Nat) : Nat := p.1 + 7\n%s\n' "$1" > T/Z.lean
+}
+cov_projfn_tag='run_cmd modifyEnv fun env => addProjectionFnInfo env ``myFst ``Prod.mk 2 0 false'
+cov_projfn_s0() { cov_m 'myFst p'; cov_z "$cov_projfn_tag"; }
+cov_projfn_s1() { cov_z ''; }
+cov_projfn_rev_s0() { cov_m 'myFst p'; cov_z ''; }
+cov_projfn_rev_s1() { cov_z "$cov_projfn_tag"; }
+cov_mlike_s0() { cov_m 'myFst p'; cov_z 'run_cmd modifyEnv fun env => Meta.markMatcherLike env ``myFst'; }
+cov_mlike_s1() { cov_z ''; }
+cov_cases_m() {
+  lakefile_app; mkdir_t
+  printf 'import T.Z\n@[noinline] def g (c : Color) : Nat := %s (motive := fun _ => Nat) c 1 2\n' "$1" > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println (g .green)\n' > Main.lean
+}
+cov_cases_z() {
+  printf 'import Lean\nopen Lean\ninductive Color | red | green\n' > T/Z.lean
+  printf '@[noinline] def myCases {motive : Color → Sort u} (c : Color) (red : motive .red) (green : motive .green) : motive c := Color.casesOn c red green\n' >> T/Z.lean
+  printf '@[noinline] def Color.casesOn_my {motive : Color → Sort u} (c : Color) (red : motive .red) (green : motive .green) : motive c := Color.casesOn c red green\n' >> T/Z.lean
+  printf '%s\n' "$1" >> T/Z.lean
+}
+cov_sparse_s0() { cov_cases_m myCases; cov_cases_z 'run_cmd modifyEnv fun env => markSparseCasesOn env ``myCases'; }
+cov_sparse_s1() { cov_cases_z ''; }
+cov_auxrec_s0() { cov_cases_m Color.casesOn_my; cov_cases_z 'run_cmd modifyEnv fun env => markAuxRecursor env ``Color.casesOn_my'; }
+cov_auxrec_s1() { cov_cases_z ''; }
+
+# An entry a module writes for the declaration of a sibling module that it does not import: `Z` writes it for
+# `W`'s declaration, and `M` imports both. It is in no digest of `W`, and `Z` does not know the name.
+# `cov_sibmatch`: matcher info for `foo.match_7`, which `M` inlines with the entry (`_rev`: the entry appears in
+# state 1; `cov_ctlmatch`: `Z` imports `W`). `cov_sibinst`: an instance entry for `foo`, which the base phase
+# does not inline. `cov_sibclass`: a class entry for `Foo`, which makes `g` specialized for `M`'s argument.
+# `cov_sibmeta`: the IR meta mark of a module's declaration, which no importer reads.
+sib_info='{ numParams := 0, numDiscrs := 1, altInfos := #[], uElimPos? := none, discrInfos := #[{}], overlaps := {} }'
+sib_z() { printf 'import Lean\nopen Lean\n%s\n' "$1" > T/Z.lean; }
+sib_files() {
+  lakefile_app; mkdir_t
+  printf '@[noinline] def foo.match_7 (motive : Nat → Nat) (x : Nat) : Nat := motive x\n' > T/W.lean
+  printf 'import T.W\nimport T.Z\n@[noinline] def g (x : Nat) : Nat := foo.match_7 (fun y => y + 1) x\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println (g 4)\n' > Main.lean
+}
+sib_entry='run_cmd modifyEnv fun env => Meta.Match.Extension.addMatcherInfo env `foo.match_7 '"$sib_info"
+cov_sibmatch_s0() { sib_files; sib_z "$sib_entry"; }
+cov_sibmatch_s1() { sib_z ''; }
+cov_sibmatch_rev_s0() { sib_files; sib_z ''; }
+cov_sibmatch_rev_s1() { sib_z "$sib_entry"; }
+ctl_entry='run_cmd modifyEnv fun env => Meta.Match.Extension.addMatcherInfo env ``foo.match_7 '"$sib_info"
+ctl_z() { printf 'import Lean\nimport T.W\nopen Lean\n%s\n' "$1" > T/Z.lean; }
+cov_ctlmatch_s0() { sib_files; ctl_z "$ctl_entry"; }
+cov_ctlmatch_s1() { ctl_z ''; }
+
+sibinst_entry='run_cmd modifyEnv fun env => Meta.instanceExtension.addEntry env { keys := #[.const ``Inhabited 1, .const ``Nat 0], val := mkConst `foo, priority := 1000, globalName? := some `foo, synthOrder := #[], attrKind := .global }'
+cov_sibinst_s0() {
+  lakefile_app; mkdir_t
+  printf '@[inline, instance_reducible] def foo : Inhabited Nat := ⟨7⟩\n' > T/W.lean
+  printf 'import T.W\nimport T.Z\n@[noinline] def g : Inhabited Nat := foo\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println g.default\n' > Main.lean
+  sib_z "$sibinst_entry"
+}
+cov_sibinst_s1() { sib_z ''; }
+
+cov_sibclass_s0() {
+  lakefile_app; mkdir_t
+  printf 'structure Foo where\n  x : Nat\n' > T/W.lean
+  printf 'import T.W\nimport T.Z\n@[noinline] def g (f : Foo) (n : Nat) : Nat := n + 1\ndef h : Nat := g ⟨5⟩ 3\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println h\n' > Main.lean
+  sib_z 'run_cmd modifyEnv fun env => classExtension.addEntry env { name := `Foo, outParams := #[], outLevelParams := #[] }'
+}
+cov_sibclass_s1() { sib_z ''; }
+
+cov_sibmeta_s0() {
+  lakefile_app; mkdir_t
+  printf 'module\npublic def foo : Nat := 1\n' > T/W.lean
+  printf 'module\npublic import T.W\npublic import T.Z\n@[noinline] public def g : Nat := foo + 1\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println g\n' > Main.lean
+  printf 'module\nimport Lean\nopen Lean\nrun_cmd modifyEnv fun env => setDeclMeta env `foo\n' > T/Z.lean
+}
+cov_sibmeta_s1() { printf 'module\nimport Lean\nopen Lean\n' > T/Z.lean; }
+
+# The original kind of `myFst` recorded as a theorem in state 1: a reference to it is then rejected by the code
+# generator, so a kept `M` would succeed where a fresh one fails.
+cov_ckind_rev_s0() { cov_m 'myFst p'; cov_z ''; }
+cov_ckind_rev_s1() { cov_z 'run_cmd modifyEnv fun env => recordOriginalConstKind env ``myFst .thm'; }
+
+# The structural recursion argument position recorded for `myRec` is overwritten in state 1: `M`'s `rfl` proof of
+# the unfolding equation relies on smart unfolding, which the position steers, so a fresh `M` fails to build
+# where a kept one would not.
+cov_recarg_m() {
+  lakefile_app; mkdir_t
+  printf 'import T.Z\ntheorem t (n : Nat) : myRec (n + 1) = myRec n + 2 := by rfl\ndef g : Nat := myRec 3\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println g\n' > Main.lean
+}
+cov_recarg_z() {
+  printf 'import Lean\nopen Lean Elab Structural\ndef myRec : Nat → Nat\n  | 0 => 0\n  | n + 1 => myRec n + 2\n%s\n' "$1" > T/Z.lean
+}
+cov_recarg_rev_s0() { cov_recarg_m; cov_recarg_z ''; }
+cov_recarg_rev_s1() {
+  cov_recarg_z $'run_cmd modifyEnv fun env =>\n  match eqnInfoExt.find? env ``myRec with\n  | some i => eqnInfoExt.insert (allowOverwrite := true) env ``myRec { i with recArgPos := 5 }\n  | none => env'
+}
+## Outside writes before the compile, compiler-only names that shadow constants, and the keys a module looked up.
+
+# Attributes and entries written before the compile that produces `Y`'s specialization of `iter k` (or of
+# `anyP k2`), which the compile does not overwrite: an `@[extern]` attribute (`pre_extern`) and a dead-branch
+# summary (`pre_summary`) on the specialization's name. A fresh `M` reuses `Y`'s specialization and reads them.
+pre_y() {
+  cat > T/Y.lean <<EOF
+import Lean
+import T.B
+namespace T
+def y0 : Nat := 0
+def evilI (n : Nat) : Nat := n + 100
+end T
+$1
+namespace T
+def y : Nat := iter k 7
+def yb : Bool := anyP k2 [7]
+end T
+$2
+EOF
+}
+pre_set_extern='open Lean Compiler LCNF in
+run_meta do
+  let spec := `T.iter._at_.T.y.spec_0
+  match externAttr.setParam (← getEnv) spec { entries := [.standard `all "lean_nat_succ"] } with
+  | .ok env => setEnv env
+  | .error e => throwError e'
+pre_set_summary='open Lean Compiler LCNF UnreachableBranches in
+run_meta modifyEnv fun env => addFunctionSummary env `T.anyP._at_.T.yb.spec_0 (.ctor ``Bool.true #[])'
+pre_extern_s0() { wh_files; }
+pre_extern_s1() { pre_y "$pre_set_extern" ''; }
+pre_summary_s0() { wh_files; }
+pre_summary_s1() { pre_y "$pre_set_summary" ''; }
+
+# `@[never_extract]` is read live, by common-subexpression elimination, so a specialization `Y` compiled before
+# `attribute [never_extract] g` (one call of `g`, one tick) differs from one `M` compiles itself with the final
+# attribute (two ticks): `ng` sets the attribute after `Y`'s specialization, `ng_ctrl` before it.
+ng_b() {
+  cat > T/B.lean <<'EOF'
+namespace T
+@[specialize] def two (p q : Nat → Nat) (n : Nat) : Nat := p n + q n
+end T
+EOF
+}
+ng_y() { printf 'import T.B\nnamespace T\n@[noinline] def f (n : Nat) : Nat := dbgTrace "tick" fun _ => n + 1\n@[noinline] def g (n : Nat) : Nat := f n\n%s\nend T\n' "$1" > T/Y.lean; }
+ng_files() {
+  lakefile_app; mkdir_t; ng_b; ng_y 'attribute [never_extract] g'
+  cat > T/M.lean <<'EOF'
+import T.B
+import T.Y
+namespace T
+def h : Nat := two g g 3
+end T
+EOF
+  printf 'import T.M\ndef main : IO Unit := IO.println T.h\n' > Main.lean
+}
+ng_s0() { ng_files; }
+ng_s1() { ng_y $'def y : Nat := two g g 5\nattribute [never_extract] g'; }
+ng_ctrl_s0() { ng_files; }
+ng_ctrl_s1() { ng_y $'attribute [never_extract] g\ndef y : Nat := two g g 5'; }
+
+# `Y` compiles an evil `T.f` in a discarded environment, then copies that environment's compiler entries into its
+# real environment, which has no constant `T.f`. The compiler-only name `T.f` then shadows `M`'s own constant
+# `T.f` in `M`'s compiler lookups, which read the owning module's entries first. `shadow2`: `M` defines `T.f`
+# with `addDecl`, so it has no declaration range.
+sh_files() {
+  lakefile_app; mkdir_t
+  printf 'import T.Y\nnamespace T\n@[inline] def f (n : Nat) : Nat := n + 1\n@[noinline] def g (n : Nat) : Nat := f n\nend T\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println (T.g 1)\n' > Main.lean
+}
+sh_y() { printf 'import Lean\nnamespace T\ndef y0 : Nat := 0\nend T\n%s\n' "$1" > T/Y.lean; }
+sh_copy='open Lean Compiler LCNF in
+run_meta do
+  let envB ← withoutModifyingEnv do
+    addDecl <| .defnDecl { name := `T.f, levelParams := [], type := .forallE `n (mkConst ``Nat) (mkConst ``Nat) .default, value := mkLambda `n .default (mkConst ``Nat) (mkApp2 (mkConst ``Nat.add) (.bvar 0) (mkNatLit 100)), hints := .abbrev, safety := .safe }
+    compileDecls #[`T.f]
+    getEnv
+  modifyEnv fun env =>
+    let irNew := (IR.getDecls envB).take ((IR.getDecls envB).length - (IR.getDecls env).length)
+    let env := irNew.reverse.foldl (fun env d => IR.declMapExt.addEntry env d) env
+    let env := baseExt.setState env (baseExt.getState envB)
+    let env := monoExt.setState env (monoExt.getState envB)
+    let env := impureSigExt.setState env (impureSigExt.getState envB)
+    let env := specExtension.setState env (specExtension.getState envB)
+    UnreachableBranches.functionSummariesExt.setState env (UnreachableBranches.functionSummariesExt.getState envB)'
+shadow_s0() { sh_files; sh_y ''; }
+shadow_s1() { sh_y "$sh_copy"; }
+sh2_files() {
+  lakefile_app; mkdir_t
+  cat > T/M.lean <<'EOF'
+import T.Y
+open Lean in
+run_meta do
+  addDecl <| .defnDecl { name := `T.f, levelParams := [], type := .forallE `n (mkConst ``Nat) (mkConst ``Nat) .default, value := mkLambda `n .default (mkConst ``Nat) (mkApp2 (mkConst ``Nat.add) (.bvar 0) (mkNatLit 1)), hints := .abbrev, safety := .safe }
+  compileDecls #[`T.f]
+@[noinline] def g (n : Nat) : Nat := T.f n
+EOF
+  printf 'import T.M\ndef main : IO Unit := IO.println (g 1)\n' > Main.lean
+}
+shadow2_s0() { sh2_files; sh_y ''; }
+shadow2_s1() { sh_y "$sh_copy"; }
+
+# A module is built again only when the providers of a specialization key it looked up change. `Y` gains a
+# specialization of `myMap` at a lambda that `M` never specializes it at (`perkey_unrelated_spec`): `M` is
+# replayed. `Y` gains one at `k`, exactly the key `M` looked up and specialized itself (`perkey_provider`): `M`
+# is built, and, like everything else, matches the fresh build.
+perkey_unrelated_spec_s0() { d2_files ''; }
+perkey_unrelated_spec_s1() { d2_y $'def y : List Nat := myMap (· + 1) [0]\n'; }
+perkey_unrelated_spec_c_check() { grep -qE 'Replayed T\.M( |$)' ../perkey_unrelated_spec.1.log; }
+perkey_provider_s0() { d2_files ''; }
+perkey_provider_s1() { d2_folder_s1; }
+perkey_provider_c_check() { grep -qE 'Built T\.M( |$)' ../perkey_provider.1.log; }
+
 all_cases="spec_transitive spec_link spec_type spec_precomp csimp_transitive csimp_late specialize_attr
-  collide_first collide_after hard_recording hard_compilercode hard_usedbychecks hard_declconsts hard_extramod
-  hard_moduleext d2_down
+  cov_projfn cov_projfn_rev cov_mlike cov_sparse cov_auxrec cov_sibmatch cov_sibmatch_rev cov_ctlmatch
+  cov_sibinst cov_sibclass cov_sibmeta cov_ckind_rev cov_recarg_rev
+  collide_first collide_after hard_recording hard_usedbychecks hard_declconsts hard_extramod d2_down
   class_same class_cross nospec_type folder_cross reducible_cross binder_inline d2_folder d2_tolerated d2_cpass
   local_inst_own erase_inst_own scoped_inst local_red_own2 local_red_own3 scoped_red_own
   table_order folder_order red_order
   d2_tolerated_lean d2_tolerated_reader f3_own_folder f3_own_cpass f3_runtime_folder f3_runtime_cpass
   f1_cachespec f1_cachespec_hit premise_ir ir_count ir_count_nd lcnf_override d2_down_rebuilt
   collide_boxed_trans negfail_scoped abi_mix abi_void abi_enum abi_monotype
-  wh_ctrl wh_summary wh_extern wh_implby wh_sig
+  wh_ctrl wh_summary wh_extern wh_implby wh_sig tl_pre_extern tl2_pre_extern tl3_race_a tl3_race_b tl3_race_sig
   ir_eval macro_eval init_eval
   inl_small inl_inline inl_instance spec_nested spec_derived spec_local spec_renumber
   implemented_by csimp extern export noncomputable partial_body unsafe_body boxed_version structure_eta
   instance_reducible reducible macro_inline_instance inline_instance specialize_args closed_extraction
   decl_map enum_repr noinline_attr aux_local struct_repr
   outparam_pos folder_removal r4_simproc r4_parser r4_tactic r4_elab r4_delab r4_eval
-  binder_fun binder_jp binder_param owner_macro owner_boxed owner_move binder_info_param binder_info_type"
+  binder_fun binder_jp binder_param owner_macro owner_boxed owner_move binder_info_param binder_info_type
+  pre_extern pre_summary ng ng_ctrl shadow shadow2 perkey_unrelated_spec perkey_provider"
 failed=()
 # `CASES` runs a subset; `NAME:cache` runs a case with the artifact cache (see `run_case`).
 for c in ${CASES:-$all_cases}; do
