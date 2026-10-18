@@ -927,10 +927,25 @@ def resolveModuleOutputs (out : CacheOutput) : JobM ModuleOutputs := do
 
 instance : ResolveOutputs ModuleOutputs := ⟨resolveModuleOutputs⟩
 
+/--
+Saves the module's usage-cutoff sidecars (`.usage`, `.usekey`), where they exist, to the local Lake cache as they
+are: no trace describes them, but the `.usekey` binds them to the `.olean`, and Lake checks that binding wherever it
+reads them.
+-/
+def Module.cacheUsageSidecars (mod : Module) (useLocalFile : Bool) : JobM (Option Artifact × Option Artifact) :=
+  return (← cacheIfExists mod.usageFile "usage", ← cacheIfExists mod.usekeyFile "usekey")
+where
+  cacheIfExists file ext : JobM (Option Artifact) := do
+    if (← file.pathExists) then
+      return some (← cacheArtifact file ext (useLocalFile := useLocalFile))
+    else
+      return none
+
 /-- Save module build artifacts to the local Lake cache. -/
 def Module.cacheOutputArtifacts
   (mod : Module)  (isModule : Bool) (useLocalFile : Bool) (postponesCompile : Bool)
 : JobM ModuleOutputArtifacts := do
+  let (usage?, usekey?) ← mod.cacheUsageSidecars useLocalFile
   return {
     isModule
     olean := ← cache mod.oleanFile "olean"
@@ -942,8 +957,7 @@ def Module.cacheOutputArtifacts
     c? := ← cacheIf? (!(isModule && postponesCompile)) mod.cFile "c"
     bc? := ← cacheIf? (Lean.Internal.hasLLVMBackend ()) mod.bcFile "bc"
     ltar? := ← cacheIf? (← mod.ltarFile.pathExists) mod.ltarFile "ltar"
-    usage? := ← cacheIf? (← mod.usageFile.pathExists) mod.usageFile "usage"
-    usekey? := ← cacheIf? (← mod.usekeyFile.pathExists) mod.usekeyFile "usekey"
+    usage?, usekey?
   }
 where
   @[inline] cache file ext := do
@@ -958,9 +972,8 @@ against the hash recorded for it (see `recacheArtifact?`): its descriptor in `de
 trace's record of the module's outputs, or, for the module's `.ltar` (which a build trace does not
 describe), the `.hash` written when it was packed. Returns `none` if any of them does not match or
 has no recorded hash, after checking (and caching or quarantining) all. A `.ltar` without a
-recorded hash is removed instead (it is packed again when needed). The usage-cutoff sidecars, which
-no trace describes, are cached as they are, as `cacheOutputArtifacts` does: the `.usekey` binds them
-to the `.olean`, and Lake checks that binding wherever it reads them.
+recorded hash is removed instead (it is packed again when needed). The usage-cutoff sidecars are
+cached by `cacheUsageSidecars`.
 -/
 def Module.recacheOutputArtifacts?
   (mod : Module) (isModule useLocalFile postponesCompile : Bool) (descrs : ModuleOutputDescrs)
@@ -980,8 +993,7 @@ def Module.recacheOutputArtifacts?
     | none =>
       removeFileIfExists mod.ltarFile
       return some none
-  let usage? ← cacheIfExists mod.usageFile "usage"
-  let usekey? ← cacheIfExists mod.usekeyFile "usekey"
+  let (usage?, usekey?) ← mod.cacheUsageSidecars useLocalFile
   let arts? : Option ModuleOutputArtifacts := do
     return {
       isModule
@@ -1007,11 +1019,6 @@ where
       | none => return none
     else
       return some none
-  cacheIfExists file ext : JobM (Option Artifact) := do
-    if (← file.pathExists) then
-      return some (← cacheArtifact file ext (useLocalFile := useLocalFile))
-    else
-      return none
 
 /--
 Some module build artifacts must be located in the build directory (e.g., ILeans).
