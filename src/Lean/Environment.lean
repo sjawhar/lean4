@@ -1310,6 +1310,13 @@ inductive EnvExtension.AsyncMode where
   | async (branch : AsyncBranch)
   deriving Inhabited
 
+/-- The mode in which an extension's state is read for export to the `.olean` (`computeExtEntries`), and in which
+the per-command recorder reads and replays it: `.async _` as `.sync` (the `checked` state, with every branch
+committed), every other mode as itself. -/
+def EnvExtension.AsyncMode.forExport : EnvExtension.AsyncMode → EnvExtension.AsyncMode
+  | .async _ => .sync
+  | mode => mode
+
 abbrev ReplayFn (σ : Type) :=
   (oldState : σ) → (newState : σ) → (newConsts : List Name) → σ → σ
 
@@ -1551,9 +1558,7 @@ private unsafe def registerCommandCacheExtensionUnsafe [Inhabited σ] (name : Na
     (ext : EnvExtension σ) (delta : σ → σ → Array α) (insert : σ → α → σ) : IO (EnvExtension σ) := do
   if (← commandCacheExtensionsRef.get).any (·.name == name) then
     throw (IO.userError s!"invalid command cache extension, '{name}' has already been used")
-  let mode := match ext.asyncMode with
-    | .async _ => .sync
-    | mode => mode
+  let mode := ext.asyncMode.forExport
   commandCacheExtensionsRef.modify (·.push {
     name
     delta := fun before after =>
@@ -1595,6 +1600,10 @@ def mkEmptyEnvironment (trustLevel : UInt32 := 0) : IO Environment := do
 structure PersistentEnvExtensionState (α : Type) (σ : Type) where
   importedEntries : Array (Array α)  -- entries per imported module
   state : σ
+  /-- Writes to `state` through `PersistentEnvExtension.setState`/`modifyState`, which add no entry. A command's
+  recorded state delta does not trust an entry log when this changed in the command
+  (`PersistentEnvExtension.stateDeltaSeesDirectWrites`). -/
+  directWrites : Nat := 0
 
 structure ImportM.Context where
   env  : Environment
@@ -1744,13 +1753,17 @@ structure PersistentEnvExtension (α : Type) (β : Type) (σ : Type) where
 
   The registration helpers set it: entry logs (`registerSimplePersistentEnvExtension`, parametric attributes,
   scoped extensions) take the cells added in front of the old log, map states (`NameMap`, `NameSet`, `PHashMap`)
-  take the bindings not shared with the old map and report any removal as `stateOnly`. A log-based delta does not
-  see a write outside `addEntry` made in the same command as a logged entry: to the state beside a simple
-  extension's log, to a parametric attribute's map beside a new key, or to a scoped extension through its
-  underlying persistent extension (`ScopedEnvExtension.modifyState` is seen). A `PHashMap` delta lists bindings in
-  key order, so the extension's exporter must not depend on the map's fold order.
+  take the bindings not shared with the old map and report any removal as `stateOnly`. A `PHashMap` delta lists
+  bindings in key order, so the extension's exporter must not depend on the map's fold order. A write that bypasses
+  both `addEntry` and `setState`/`modifyState` (through `toEnvExtension` directly) is not seen by a log-based delta.
   -/
   stateDelta?     : Option (σ → σ → StateDelta α)
+  /--
+  Whether `stateDelta?` sees writes through `setState`/`modifyState` (`PersistentEnvExtensionState.directWrites`):
+  true for deltas that diff the whole state (maps), false for those that read an entry log. When false, a command
+  that writes the state directly is recorded as `stateOnly`.
+  -/
+  stateDeltaSeesDirectWrites : Bool
   /--
   Function to transform state into data that should be imported into other modules. Returns entries
   for all three olean levels at once so that expensive computations can be shared. When using the
@@ -1776,6 +1789,7 @@ instance {α β σ} [Inhabited σ] : Inhabited (PersistentEnvExtension α β σ)
      addEntryFn := fun s _ => s,
      ofOLeanEntry? := none,
      stateDelta? := none,
+     stateDeltaSeesDirectWrites := false,
      exportEntriesFn := fun _ _ => .uniform #[],
      statsFn := fun _ => Format.nil
   }
@@ -1814,14 +1828,17 @@ def getState {α β σ : Type} [Inhabited σ] (ext : PersistentEnvExtension α �
     (asyncMode := ext.toEnvExtension.asyncMode) (asyncDecl : Name := .anonymous) : σ :=
   (ext.toEnvExtension.getState (asyncMode := asyncMode) (asyncDecl := asyncDecl) env).state
 
-/-- Set the current state of the given extension in the given environment. -/
+/-- Set the current state of the given extension in the given environment. The write is counted in
+`PersistentEnvExtensionState.directWrites`. -/
 def setState {α β σ : Type} (ext : PersistentEnvExtension α β σ) (env : Environment) (s : σ) : Environment :=
-  ext.toEnvExtension.modifyState env fun ps => { ps with  state := s }
+  ext.toEnvExtension.modifyState env fun ps => { ps with state := s, directWrites := ps.directWrites + 1 }
 
-/-- Modify the state of the given extension in the given environment by applying the given function. -/
+/-- Modify the state of the given extension in the given environment by applying the given function. The write is
+counted in `PersistentEnvExtensionState.directWrites`. -/
 def modifyState {α β σ : Type} (ext : PersistentEnvExtension α β σ) (env : Environment) (f : σ → σ)
     (asyncMode := ext.toEnvExtension.asyncMode) (asyncDecl : Name := Name.anonymous) : Environment :=
-  ext.toEnvExtension.modifyState (asyncMode := asyncMode) (asyncDecl := asyncDecl) env fun ps => { ps with state := f (ps.state) }
+  ext.toEnvExtension.modifyState (asyncMode := asyncMode) (asyncDecl := asyncDecl) env fun ps =>
+    { ps with state := f ps.state, directWrites := ps.directWrites + 1 }
 
 end PersistentEnvExtension
 
@@ -1838,6 +1855,8 @@ structure PersistentEnvExtensionDescrCore (α β σ : Type) where
   ofOLeanEntry?     : Option (σ → α → ImportM β) := none
   /-- See `PersistentEnvExtension.stateDelta?`. -/
   stateDelta?       : Option (σ → σ → StateDelta α) := none
+  /-- See `PersistentEnvExtension.stateDeltaSeesDirectWrites`. -/
+  stateDeltaSeesDirectWrites : Bool := false
   exportEntriesFnEx : Environment → σ → OLeanEntries (Array α)
   statsFn           : σ → Format := fun _ => Format.nil
   asyncMode         : EnvExtension.AsyncMode := .mainOnly
@@ -1882,6 +1901,7 @@ unsafe def registerPersistentEnvExtensionUnsafe {α β σ : Type} [Inhabited σ]
     addEntryFn      := descr.addEntryFn,
     ofOLeanEntry?   := descr.ofOLeanEntry?,
     stateDelta?     := descr.stateDelta?,
+    stateDeltaSeesDirectWrites := descr.stateDeltaSeesDirectWrites,
     exportEntriesFn := descr.exportEntriesFnEx,
     statsFn         := descr.statsFn
   }
@@ -1966,10 +1986,7 @@ def Environment.computeExtEntries (env : Environment) :
     IO (OLeanEntries (Array (Name × Array EnvExtensionEntry))) := do
   let pExts ← persistentEnvExtensionsRef.get
   let allEntries := pExts.map fun pExt =>
-    let asyncMode := match pExt.toEnvExtension.asyncMode with
-      | .async _ => .sync
-      | m => m
-    let state := pExt.getState (asyncMode := asyncMode) env
+    let state := pExt.getState (asyncMode := pExt.toEnvExtension.asyncMode.forExport) env
     let oe := pExt.exportEntriesFn env state
     (pExt.name, oe)
   let filterNonEmpty (level : OLeanLevel) :=
