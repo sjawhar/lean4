@@ -95,6 +95,7 @@ def mkDeclExt (phase : Phase) (name : Name := by exact decl_name%) :
     addEntryFn := fun s decl => s.insert decl.name decl
     ofOLeanEntry? := some fun _ entry => pure entry
     stateDelta? := some <| StateDelta.ofPHashMap Name.quickLt fun _ decl => decl
+    stateDeltaSeesDirectWrites := true
     exportEntriesFnEx env s := Id.run do
       let all := sortedEntries s declLt
       let exported := all.filterMap fun decl => do
@@ -145,6 +146,7 @@ def mkSigDeclExt (phase : Phase) (name : Name := by exact decl_name%) :
     addEntryFn := fun s sig => s.insert sig.name sig
     ofOLeanEntry? := some fun _ entry => pure entry
     stateDelta? := some <| StateDelta.ofPHashMap Name.quickLt fun _ sig => sig
+    stateDeltaSeesDirectWrites := true
     exportEntriesFnEx env s := Id.run do
       let all := sortedEntries s sigLt
       let exported := all.filterMap fun sig => do

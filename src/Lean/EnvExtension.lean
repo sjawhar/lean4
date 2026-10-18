@@ -148,6 +148,7 @@ def mkMapDeclarationExtension (name : Name := by exact decl_name%)
     addEntryFn      := fun s (n, v) => s.insert n v
     ofOLeanEntry? := some fun _ entry => pure entry
     stateDelta? := some StateDelta.ofNameMap
+    stateDeltaSeesDirectWrites := true
     exportEntriesFnEx env s := exportEntriesFn env s
     asyncMode
     replay?         := some fun _ newState newConsts s =>

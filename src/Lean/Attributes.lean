@@ -188,6 +188,7 @@ def registerTagAttribute (name : Name) (descr : String)
     addEntryFn      := fun (s : NameSet) n => s.insert n
     ofOLeanEntry?  := some fun _ entry => pure entry
     stateDelta?    := some StateDelta.ofNameSet
+    stateDeltaSeesDirectWrites := true
     exportEntriesFnEx := fun env es =>
       let all : Array Name := es.foldl (fun a e => a.push e) #[] |>.qsort Name.quickLt
       -- Do not export info for private defs at exported/server levels
@@ -370,6 +371,7 @@ def registerEnumAttributes (attrDescrs : List (Name × String × α))
     addEntryFn      := fun (s : NameMap α) (p : Name × α) => s.insert p.1 p.2
     ofOLeanEntry?  := some fun _ entry => pure entry
     stateDelta?    := some StateDelta.ofNameMap
+    stateDeltaSeesDirectWrites := true
     exportEntriesFnEx := fun env m =>
       let all : Array (Name × α) := m.foldl (fun a n p => a.push (n, p)) #[] |>.qsort (fun a b => Name.quickLt a.1 b.1)
       -- Do not export info for private defs at exported/server levels

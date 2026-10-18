@@ -50,6 +50,7 @@ private builtin_initialize namespacesExt : PersistentEnvExtension Name Name Stat
           .entries ((added.qsort (Name.quickLt ·.1 ·.1)).map (·.1))
         else .stateOnly
       | none => .stateOnly
+    stateDeltaSeesDirectWrites := true
     exportEntriesFn s :=
       let entries := s.map₂.toArray.map (·.1)
       entries.qsort (·.quickLt)

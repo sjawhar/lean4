@@ -57,6 +57,7 @@ builtin_initialize simprocDeclExt : PersistentEnvExtension SimprocDecl SimprocDe
       if SharedDiff.sameObject s₀.builtin s₁.builtin then
         StateDelta.ofPHashMap Name.quickLt (fun declName keys => { declName, keys }) s₀.newEntries s₁.newEntries
       else .stateOnly
+    stateDeltaSeesDirectWrites := true
     exportEntriesFn := fun s =>
       let result := s.newEntries.foldl (init := #[]) fun result declName keys => result.push { declName, keys }
       result.qsort SimprocDecl.lt

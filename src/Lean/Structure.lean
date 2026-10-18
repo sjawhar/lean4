@@ -91,6 +91,7 @@ private builtin_initialize structureExt : PersistentEnvExtension StructureInfo S
   ofOLeanEntry?   := some fun _ entry => pure entry
   stateDelta?     := some fun (_, s₀) (_, s₁) =>
     StateDelta.ofPHashMap Name.quickLt (fun _ info => info) s₀.map s₁.map
+  stateDeltaSeesDirectWrites := true
   exportEntriesFn := fun (_, s) => s.map.toArray |>.map (·.snd) |>.qsort StructureInfo.lt
 }
 
