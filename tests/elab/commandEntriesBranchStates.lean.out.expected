@@ -1,0 +1,6 @@
+module noskip (some true)
+a: record in the branch (t): full localLog [fromBranch], syncLog [fromBranch], cacheLog [fromBranch], main localLog []; kept reads equal; stateOnly #[]
+b: empty record, main-branch write after the fork (t2): full localLog [], syncLog [], cacheLog [], main localLog [mainSide]; kept reads equal; stateOnly #[]
+c: open Foo in (t3): full localLog [mainSide], syncLog [], cacheLog [], main localLog [mainSide], scopeExt stack [[Foo], []], top [Foo.y]; kept reads equal; stateOnly #[]
+d: local entry in the scope (t4): full localLog [mainSide], syncLog [], cacheLog [], main localLog [mainSide], scopeExt stack [[], []], top [x]; kept reads equal; stateOnly #[]
+e: state write no operation expresses (t5): full localLog [mainSide], syncLog [], cacheLog [], main localLog [mainSide], scopeExt stack [[]], top [modSide]; refused; stateOnly #[scopeExt]

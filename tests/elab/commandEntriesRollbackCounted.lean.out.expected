@@ -1,0 +1,3 @@
+module noskip (some true), reason (some (unreplayable extension Lean.Parser.Term.Doc.recommendedSpellingByNameExt))
+0: stateOnly contains logExt true; refused
+1: stateOnly contains logExt false; replay matches
