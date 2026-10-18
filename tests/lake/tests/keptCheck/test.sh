@@ -3,22 +3,23 @@ source ../common.sh
 
 ./clean.sh
 
-# A module whose source and options are unchanged but whose imports changed is a kept candidate:
-# with `LAKE_KEPT_CHECKER` set, Lake asks that checker (here `stub.sh`) whether the module's existing
-# `.olean` holds against its current imports, and on a yes records the module as up to date
-# without compiling it. `LAKE_KEPT_EXCLUDE` makes Lake decide the modules it lists as if nothing
-# had been kept for them.
+# A module whose source and options are unchanged but whose imports changed is a kept candidate
+# when the usage cutoff does not skip it and its records show the machinery it used while
+# elaborating unchanged (`Module.usageVerdict`): with `LAKE_KEPT_CHECKER` set, Lake asks that
+# checker (here `stub.sh`) whether the module's existing `.olean` holds against its current
+# imports, and on a yes records the module as up to date without compiling it. `LAKE_KEPT_EXCLUDE`
+# makes Lake decide the modules it lists as if nothing had been kept for them.
 
 STUB="$PWD/stub.sh"
 mkdir -p work && cd work
 export LAKE_ARTIFACT_CACHE=false
-# Without the usage cutoff: with it on, the cutoff skips a module whose imports changed only in what
-# it never used before any kept-module check is asked
-export LAKE_USAGE_CUTOFF=false
 unset LAKE_KEPT_CHECKER LAKE_KEPT_EXCLUDE LAKE_KEPT_CHECKER_TIMEOUT STUB_MODE STUB_VERDICTS
+# The checker needs the usage cutoff, which is off by default: every case turns it on, and the
+# refusal cases unset it or turn it off
+export LAKE_USAGE_CUTOFF=1
 
 OUT=.lake/build/lib/lean/P
-# mkp DIR [LIB_CONFIG] -- package `p`: `P.A` defines `A.v` (see `seta`) and `A.w := 0`; `P.B`
+# mkp DIR [LIB_CONFIG] -- package `p`: `P.A` defines `A.v` and `A.w`, which `seta` changes; `P.B`
 # imports `P.A` and uses only `A.w`; `P.C` imports `P.B`; `P.D`, `P.E` and `P.F` import `P.A`
 mkp() {
   mkdir -p "$1/P"
@@ -30,8 +31,9 @@ mkp() {
   for m in D E F; do printf 'import P.A\ntheorem %s.ok : A.w = 0 := rfl\n' "$m" > "$1/P/$m.lean"; done
   seta "$1" 1
 }
-# seta DIR V -- replace `P/A.lean` (a new file, as a checkout writes it) with `A.v := V`
-seta() { rm -f "$1/P/A.lean"; printf 'def A.v : Nat := %s\ndef A.w : Nat := 0\n' "$2" > "$1/P/A.lean"; }
+# seta DIR V -- replace `P/A.lean` (a new file, as a checkout writes it) with `A.v := V` and
+# `A.w := V - V`: `A.w` changes meaning but stays `0`, so its users re-check, and their proofs hold
+seta() { rm -f "$1/P/A.lean"; printf 'def A.v : Nat := %s\ndef A.w : Nat := %s - %s\n' "$2" "$2" "$2" > "$1/P/A.lean"; }
 # dephash TRACE -- the input hash recorded in a trace file
 dephash() { grep -oE '"depHash": *"[0-9a-f]{16}"' "$1" | grep -oE '[0-9a-f]{16}'; }
 # mapping DIR MOD -- the cache's input-to-output mapping for `P.MOD`'s current input in tree DIR
@@ -386,6 +388,212 @@ test_cmd grep -q '"kf"' "t35/$OUT/B.trace"
 # ... and so does `lake shake`'s check that the oleans are current
 sed_i 's/^name = "p"$/name = "p"\ndefaultTargets = ["P"]/' t35/lakefile.toml
 LAKE_KEPT_EXCLUDE="$PWD/exclude34" test_err 'out of date oleans' -d t35 shake
+
+# The rule for kept modules on top of the usage cutoff (`Module.usageVerdict`). `P.B` also uses the
+# tactic macro of `P.M` (machinery its elaboration used, which its usage record lists as `extra`)
+mkp t40
+printf 'macro "triv!" : tactic => `(tactic| trivial)\n' > t40/P/M.lean
+printf 'import P.A\nimport P.M\ntheorem B.ok : A.w = 0 := rfl\ndef B.u : Nat := A.w\ntheorem B.t : True := by triv!\n' \
+  > t40/P/B.lean
+test_run -d t40 build P
+test_cmd_out '[["P","M"],' cat "t40/$OUT/B.usage"
+export STUB_LOG="$PWD/t40.log"
+# The machinery `P.B` used changed: it compiles, and the checker is not asked
+rm -f t40/P/M.lean; printf 'macro "triv!" : tactic => `(tactic| exact True.intro)\n' > t40/P/M.lean
+LAKE_KEPT_CHECKER="$STUB" test_out 'Built P.B' -d t40 build P
+match_text 'not asked: P.M, whose machinery it used, changed' produced.out
+test_cmd_fails grep -qx P.B t40.log
+# Nothing `P.B` used changed meaning: the cutoff skips it before any check (`-v` shows replays)
+rm -f t40/P/A.lean; printf 'def A.v : Nat := 7\ndef A.w : Nat := 1 - 1\n' > t40/P/A.lean
+LAKE_KEPT_CHECKER="$STUB" test_out 'Replayed P.B' -d t40 build -v P
+test_cmd_fails grep -qx P.B t40.log
+# A constant `P.B` used changed meaning, and its machinery did not: the checker re-checks it
+seta t40 2
+LAKE_KEPT_CHECKER="$STUB" test_out 'Checked P.B' -d t40 build P
+test_cmd grep -qx P.B t40.log
+test_cmd grep -q '"kept":true' "t40/$OUT/B.usekey"
+# ... and `P.C`, which uses `B.u`, is not skipped on `P.B`'s old digests: after the accept they may
+# be stale (here `B.u` now unfolds to another term), so it is re-checked too
+no_match_text 'Replayed P.C' produced.out
+test_cmd grep -qx P.C t40.log
+# ... while `P.B`'s own next check still reads its marked key (bound to its `.usage` and `.olean`): a
+# further meaning change re-checks it again, rather than compiling it for want of a key
+seta t40 3
+LAKE_KEPT_CHECKER="$STUB" test_out 'Checked P.B' -d t40 build P
+no_match_text 'not asked' produced.out
+# A module compiled while a module it used is kept gets no usage key (`Module.writeUsekey`): its `.usage` records
+# the kept module's digests, which describe its declarations as Lean compiled them, and a later check would accept
+# them once the kept module compiles again. `P.K` is kept after a meaning change of `A.w` that `P.I` (edited, so
+# compiled) then proves; when `A.w` goes back and `P.K` compiles, `P.I`'s proof no longer holds, and the build must
+# say so, as a fresh build does
+mk59() { # mk59 DIR [MID] -- package `p`: `P.K` defines `K.u := A.w`; `P.I` proves `K.u = 0` and imports `P.K`, or
+  # `P.MID`, which imports `P.K` and uses nothing of it
+  mkdir -p "$1/P"
+  printf 'name = "p"\n\n[[lean_lib]]\nname = "P"\n' > "$1/lakefile.toml"
+  printf 'def A.w : Nat := 0\n' > "$1/P/A.lean"
+  printf 'import P.A\nnoncomputable def K.u : Nat := A.w\n' > "$1/P/K.lean"
+  if [ -n "${2:-}" ]; then printf 'import P.K\ndef %s.j : Nat := 0\n' "$2" > "$1/P/$2.lean"; fi
+  printf 'import P.%s\ntheorem I.t : K.u = 0 := rfl\n' "${2:-K}" > "$1/P/I.lean"
+  printf 'import P.I\n' > "$1/P.lean"
+}
+# t59D DIR [MID] -- round 1: `A.w := 5`, `P.K` is kept, and the edited `P.I` proves `K.u = 5`; round 2: `A.w := 0`
+# and `P.K` is touched
+t59D() {
+  mk59 "$@"
+  test_run -d "$1" build P
+  rm -f "$1/P/A.lean" "$1/P/I.lean"
+  printf 'def A.w : Nat := 5\n' > "$1/P/A.lean"
+  printf 'import P.%s\ntheorem I.t : K.u = 5 := rfl\n' "${2:-K}" > "$1/P/I.lean"
+  export STUB_LOG="$PWD/$1.log"
+  LAKE_KEPT_CHECKER="$STUB" test_out 'Checked P.K' -d "$1" build P
+  match_text 'Built P.I' produced.out
+  test_exp ! -e "$1/$OUT/I.usekey"
+  rm -f "$1/P/A.lean"; printf 'def A.w : Nat := 0\n' > "$1/P/A.lean"
+  printf -- '-- touched\n' >> "$1/P/K.lean"
+  LAKE_KEPT_CHECKER="$STUB" test_err 'Type mismatch' -d "$1" build P
+  match_text 'not asked: it has no usage key' produced.out
+}
+t59D t59
+# ... and so does a module that reaches the kept module through an intermediate, `P.J`, which uses nothing of
+# `P.K`: `P.J` is re-checked and kept, and `P.I` is compiled against both
+t59D t59t J
+test_cmd grep -qx P.J t59t.log
+
+# An importer that uses nothing of a kept module is re-checked, not skipped (`Module.usageVerdict`): the kept
+# module's digests describe its declarations as Lean compiled them, and the compiled code of the importer (here
+# `Y.g`) is the checker's to decide. `P.K` uses `A.w`, which changes meaning
+mkc() { # mkc DIR -- package `p`: `P.K` uses `A.w` (`seta` changes it); `P.Y` imports `P.K`, uses nothing of it
+  # and defines `Y.g`
+  mkdir -p "$1/P"
+  printf 'name = "p"\n\n[[lean_lib]]\nname = "P"\n' > "$1/lakefile.toml"
+  seta "$1" 1
+  printf 'import P.A\ntheorem K.ok : A.w = 0 := rfl\ndef K.f (n : Nat) : Nat := n + A.w\n' > "$1/P/K.lean"
+  printf 'import P.K\ndef Y.g (n : Nat) : Nat := n * 2 + 1\n' > "$1/P/Y.lean"
+  printf 'import P.Y\n' > "$1/P.lean"
+}
+mkc t60
+test_run -d t60 build P
+seta t60 2
+export STUB_LOG="$PWD/t60.log"
+LAKE_KEPT_CHECKER="$STUB" test_out 'Checked P.Y' -d t60 build -v P
+match_text 'Checked P.K' produced.out
+no_match_text 'Replayed P.Y' produced.out
+test_cmd grep -qx P.Y t60.log
+# ... and an importer compiled while a module of its closure is kept gets no usage key, though it uses nothing of
+# that module: the key would bind the kept module's recorded closure, which is the one before the accept
+# (`closureHash`), so the importer compiles the next time it is stale. Here `P.Y` is edited while `P.K` is kept
+mkc t61
+test_run -d t61 build P
+seta t61 2
+rm -f t61/P/Y.lean; printf 'import P.K\ndef Y.g (n : Nat) : Nat := n * 2 + 3\n' > t61/P/Y.lean
+export STUB_LOG="$PWD/t61.log"
+LAKE_KEPT_CHECKER="$STUB" test_out 'Checked P.K' -d t61 build P
+match_text 'Built P.Y' produced.out
+test_exp ! -e "t61/$OUT/Y.usekey"
+seta t61 3
+LAKE_KEPT_CHECKER="$STUB" test_out 'not asked: it has no usage key' -d t61 build P
+match_text 'Built P.Y' produced.out
+
+# A module compiled while a workspace module of its closure is kept gets no usage key even when
+# another workspace rebuilds that kept module normally before this compile ends: `Module.writeUsekey`
+# reads the closure's trust as the compile starts (`untrustedBefore?`), not only when it ends. The
+# `shared` package (lib `Sh`) is a path dependency of `w` (lib `W`); `Sh.K` defines `K.u := A.w` and
+# `W.X` proves `X.t : K.u = V` by `rfl`. In round 1 `w` keeps `Sh.K` (re-checked) and compiles `W.X`
+# against it while, held at a gate after it has loaded `Sh.K`'s `.olean`, the `shared` tree rebuilds
+# `Sh.K` normally and gives it an ordinary key. `W.X` still gets no key, so round 2 (no checker, `A.w`
+# back to `0`) recompiles `W.X` on `Sh.K`'s honest outputs and the false proof fails.
+mkrace() { # mkrace DIR -- `shared` (lib Sh: `A.w := 0`, `K.u := A.w`) required by path by `w` (lib W:
+  # `W.X` imports `Sh.K` and proves `X.t : K.u = 0`)
+  mkdir -p "$1/shared/Sh" "$1/w/W"
+  printf 'name = "shared"\n\n[[lean_lib]]\nname = "Sh"\n' > "$1/shared/lakefile.toml"
+  printf 'import Sh.K\n' > "$1/shared/Sh.lean"
+  printf 'def A.w : Nat := 0\n' > "$1/shared/Sh/A.lean"
+  printf 'import Sh.A\nnoncomputable def K.u : Nat := A.w\n' > "$1/shared/Sh/K.lean"
+  printf 'name = "w"\n\n[[require]]\nname = "shared"\npath = "../shared"\n\n[[lean_lib]]\nname = "W"\n' > "$1/w/lakefile.toml"
+  printf 'import W.X\n' > "$1/w/W.lean"
+  printf 'import Sh.K\ntheorem X.t : K.u = 0 := rfl\n' > "$1/w/W/X.lean"
+}
+XKEY=t62/w/.lake/build/lib/lean/W/X.usekey
+KKEY=t62/shared/.lake/build/lib/lean/Sh/K.usekey
+gate="$PWD/t62/w"
+mkrace t62
+# round 0: every module compiles under the cutoff, so each gets a key
+test_run -d t62/w build W
+test_exp -f "$XKEY"
+# round 1: `A.w` changes meaning, and `W.X` waits at a gate after it has loaded `Sh.K`'s `.olean`
+rm -f t62/shared/Sh/A.lean; printf 'def A.w : Nat := 5\n' > t62/shared/Sh/A.lean
+rm -f t62/w/W/X.lean
+cat > t62/w/W/X.lean <<EOF
+import Sh.K
+#eval show IO Unit from do
+  IO.FS.writeFile "$gate/started" ""
+  for _ in [0:1200] do
+    if (← System.FilePath.pathExists "$gate/go") then return
+    IO.sleep 100
+theorem X.t : K.u = 5 := rfl
+EOF
+export STUB_LOG="$PWD/t62.log"
+( LAKE_KEPT_CHECKER="$STUB" "$LAKE" -d t62/w build W > t62.r1 2>&1; echo $? > t62.r1.rc ) &
+r1pid=$!
+for _ in $(seq 600); do [ -e "$gate/started" ] && break; sleep 0.1; done
+test_exp -e "$gate/started"
+# `Sh.K` is kept right now; the `shared` tree rebuilds it normally, giving it an ordinary key
+test_cmd grep -q '"kept":true' "$KKEY"
+rm -f t62/shared/Sh/K.lean; printf 'import Sh.A\nnoncomputable def K.u : Nat := A.w\n-- edited in round 1\n' > t62/shared/Sh/K.lean
+test_run -d t62/shared build Sh.K
+test_cmd_fails grep -q '"kept":true' "$KKEY"
+touch "$gate/go"
+wait $r1pid
+test_cmd cat t62.r1
+test_exp "$(cat t62.r1.rc)" = 0
+# `W.X` compiled against the kept `Sh.K`, so it has no usage key although `Sh.K` now has an ordinary one
+test_exp ! -e "$XKEY"
+# round 2 (no checker): `A.w` back to `0` and `Sh.K` touched; with no key `W.X` recompiles and its
+# false `X.t : K.u = 5` fails
+rm -f t62/shared/Sh/A.lean; printf 'def A.w : Nat := 0\n' > t62/shared/Sh/A.lean
+rm -f t62/shared/Sh/K.lean; printf 'import Sh.A\nnoncomputable def K.u : Nat := A.w\n-- edited in round 1\n-- edited in round 2\n' > t62/shared/Sh/K.lean
+test_status 1 -d t62/w build W
+# A name `P.C`'s code refers to now resolves to another module: it compiles, and the checker is not
+# asked, though a constant it used changed meaning too. `P.C` calls `foo._redArg`, a kernel constant of
+# `P.K`, and imports `P.A` first, which gains `foo`, whose compile creates the compiler-only name
+# `foo._redArg`: a fresh compile of `P.C` calls `P.A`'s, and re-checking its proofs would not see it
+mkr() { # mkr DIR -- package `p`: `P.C` imports `P.A` and then `P.K`, uses `K.w` and calls `foo._redArg`
+  mkdir -p "$1/P"
+  printf 'name = "p"\n\n[[lean_lib]]\nname = "P"\n' > "$1/lakefile.toml"
+  printf 'def other : Nat := 0\n' > "$1/P/A.lean"
+  printf 'def K.w : Nat := 1 - 1\n@[noinline] def foo._redArg (_n : Nat) : UInt32 := 7\n' > "$1/P/K.lean"
+  printf 'import P.A\nimport P.K\ntheorem C.ok : K.w = 0 := rfl\n@[noinline] def useIt (n : Nat) : UInt32 := foo._redArg n\n' \
+    > "$1/P/C.lean"
+  printf 'import P.C\n' > "$1/P.lean"
+}
+mkr t57
+test_run -d t57 build P
+rm -f t57/P/A.lean t57/P/K.lean
+printf 'def other : Nat := 0\ndef foo (n : Nat) (_h : Nat) : Nat := n + 1\n' > t57/P/A.lean
+printf 'def K.w : Nat := 2 - 2\n@[noinline] def foo._redArg (_n : Nat) : UInt32 := 7\n' > t57/P/K.lean
+export STUB_LOG="$PWD/t57.log"
+LAKE_KEPT_CHECKER="$STUB" test_out 'not asked: a name it looked up, used or referred to may now resolve to another module' \
+  -d t57 build P
+match_text 'Built P.C' produced.out
+test_exp ! -e t57.log
+# ... and so does a module whose import closure changed, gaining no module, though only a constant it
+# used changed meaning: `resolvedUnchanged` cannot tell for a changed closure. `P.X`, which `P.B`
+# imports, now imports `P.A` too
+mkp t58
+printf 'def X.x : Nat := 0\n' > t58/P/X.lean
+printf 'import P.A\nimport P.X\ntheorem B.ok : A.w = 0 := rfl\ndef B.u : Nat := A.w\n' > t58/P/B.lean
+test_run -d t58 build P
+rm -f t58/P/X.lean; printf 'import P.A\ndef X.x : Nat := 0\n' > t58/P/X.lean
+seta t58 2
+export STUB_LOG="$PWD/t58.log"
+LAKE_KEPT_CHECKER="$STUB" test_out 'not asked: its import closure changed' -d t58 build P
+match_text 'Built P.B' produced.out
+test_cmd_fails grep -qx P.B t58.log
+# A checker without the usage cutoff is refused, whether the setting is unset or false: the cutoff's
+# records decide which modules may be re-checked. The refusal names the setting that turns the
+# cutoff on
+(unset LAKE_USAGE_CUTOFF; LAKE_KEPT_CHECKER="$STUB" test_err 'needs the usage cutoff (LAKE_USAGE_CUTOFF=1)' -d t40 build P)
+LAKE_USAGE_CUTOFF=false LAKE_KEPT_CHECKER="$STUB" test_err 'needs the usage cutoff' -d t40 build P
 
 # With the artifact cache
 export LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true
