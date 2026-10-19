@@ -1394,13 +1394,33 @@ def Module.buildLean
   return arts
 
 /--
-Whether usage cutoff applies to the module: cutoff is enabled, the module is neither a
-module-system file nor part of a `precompileModules` library, and its artifacts exist.
+Whether usage cutoff can apply to the module: cutoff is enabled, and the module is neither a module-system file nor
+part of a `precompileModules` library. Such a module's compiles are recorded in the usage index
+(`Module.indexUsage`), and a build that misses the cache by input hash looks them up.
+-/
+def Module.usageIndexApplies (mod : Module) (presetup : ModulePreSetup) : JobM Bool := do
+  if presetup.isModule || mod.shouldPrecompile then return false
+  usageCutoffEnabled
+
+/--
+Whether usage cutoff applies to the module: it can (`Module.usageIndexApplies`), and its artifacts exist.
 -/
 def Module.usageCutoffApplies (mod : Module) (presetup : ModulePreSetup) : JobM Bool := do
-  if presetup.isModule || mod.shouldPrecompile then return false
-  unless (← usageCutoffEnabled) do return false
+  unless (← mod.usageIndexApplies presetup) do return false
   mod.checkArtifactsExist presetup.isModule presetup.postponeCompile
+
+/--
+Records the module's outputs, `arts`, which are in the cache, in the usage index (`Cache.writeUsageIndex`) if a
+lookup can read them: they name a `.usekey`, the build restores artifacts (`restore`), as a lookup requires, and usage
+cutoff can apply to the module. The entry has no archive.
+-/
+def Module.indexUsage (mod : Module) (presetup : ModulePreSetup) (arts : ModuleOutputArtifacts) (restore : Bool) :
+    JobM Unit := do
+  unless restore do return
+  let some usekey := arts.usekey? | return
+  unless (← mod.usageIndexApplies presetup) do return
+  (← getLakeCache).writeUsageIndex mod.pkg.cacheScope presetup.localTrace.hash usekey.hash
+    (toJson {arts.descrs with ltar? := none})
 
 /--
 Skips compiling a module whose trace is stale if usage cutoff applies to it
@@ -1517,6 +1537,7 @@ where
           -- Note: Cache service metadata is not preserved on an output update because it would
           -- result in downloading module outputs that are not available on the remote.
           (← getLakeCache).writeOutputs mod.pkg.cacheScope inputHash arts.descrs (overwrite := true)
+          mod.indexUsage presetup arts restoreAll
           return .complete arts
         else
           return .complete arts
@@ -1590,6 +1611,7 @@ where
             if arts.keptFrom?.isSome then arts else {arts with ltar? := arts.ltar? <|> ltar?}
           -- The supersede rule (`Cache.writeOutputsCore`): accepted outputs never replace a mapping.
           (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs
+          mod.indexUsage presetup arts restore
           return arts
         else
           let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
