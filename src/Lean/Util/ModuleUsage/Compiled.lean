@@ -48,8 +48,6 @@ structure CEnc where
   tys : Array Expr := #[]
   ms : NameSet := {}
 
-instance : Inhabited CEnc := ⟨{ e := {} }⟩
-
 namespace CEnc
 @[inline] def u8 (s : CEnc) (v : UInt8) : CEnc := { s with e := s.e.u8 v }
 @[inline] def u64 (s : CEnc) (v : UInt64) : CEnc := { s with e := s.e.u64 v }
