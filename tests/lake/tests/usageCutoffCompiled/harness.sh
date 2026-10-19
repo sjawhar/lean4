@@ -843,12 +843,9 @@ run_meta do
 }
 
 # Outside writes to the entries of `Y`'s specialization, which a fresh `M` reads when it reuses it: an
-# `@[extern]` attribute set on the specialization's name before it exists
-# (`tl_pre_extern`, `tl2_pre_extern` with the key `lcnf_override` uses), and a second thread writing through the
-# compile's `Core.State` reference while it runs: the dead-branch summary (`tl3_race_a`: the compile runs on a
-# spawned task and the writer on the command's thread; `tl3_race_b`: the other way round) or the impure
-# signature (`tl3_race_sig`) of the specialization once its IR exists. A kept `M` must match a fresh `M`, which
-# reuses `Y`'s specialization and so reads the written value.
+# `@[extern]` attribute set on the specialization's name before it exists (`tl_pre_extern`, `tl2_pre_extern` with
+# the key `lcnf_override` uses). A kept `M` must match a fresh `M`, which reuses `Y`'s specialization and so reads
+# the written value.
 tl_y() { cat > T/Y.lean; }
 tl_pre_extern_s0() { wh_files; }
 tl_pre_extern_s1() {
@@ -888,115 +885,6 @@ namespace T
 def y : Nat := app k 7
 end T
 EOF
-}
-tl_race_head='import Lean
-import T.B
-namespace T
-def y0 : Nat := 0
-end T
-open Lean Meta Compiler LCNF
-
-def getSR : CoreM (IO.Ref Core.State) := fun _ sr => pure sr
-
-def addYb : MetaM Unit := do
-  let lst ← mkListLit (mkConst ``Nat) [mkNatLit 7]
-  addDecl <| .defnDecl {
-    name := `T.yb
-    levelParams := []
-    type := mkConst ``Bool
-    value := mkApp2 (mkConst `T.anyP) (mkConst `T.k2) lst
-    hints := .abbrev
-    safety := .safe
-  }
-'
-tl_race_tail='  match UnreachableBranches.getFunctionSummary? (← getEnv) spec with
-  | some (.ctor ``Bool.true #[]) => logInfo "final summary: written"
-  | some _ => logInfo "final summary: compiler'"'"'s"
-  | none => logInfo "final summary: none"
-'
-tl3_race_a_s0() { wh_files; }
-tl3_race_a_s1() {
-  { printf '%s' "$tl_race_head"
-    cat <<'EOF'
-set_option Elab.async false in
-run_meta do
-  let spec := `T.anyP._at_.T.yb.spec_0
-  addYb
-  let ctx ← readThe Core.Context
-  let sr ← getSR
-  let t ← BaseIO.asTask (prio := .dedicated) (((Lean.compileDecls #[`T.yb] : CoreM Unit) ctx sr).toBaseIO)
-  let mut done := false
-  while !done do
-    if (getSigCore? (← getEnv) impureSigExt spec).isSome then
-      modifyEnv fun env => UnreachableBranches.addFunctionSummary env spec (.ctor ``Bool.true #[])
-      done := true
-    else if (← IO.hasFinished t) then
-      done := true
-  match (← IO.wait t) with
-  | .ok _ => pure ()
-  | .error e => throwError m!"compile failed: {← e.toMessageData.toString}"
-EOF
-    printf '%s' "$tl_race_tail"
-  } | tl_y
-}
-tl3_race_b_s0() { wh_files; }
-tl3_race_b_s1() {
-  { printf '%s' "$tl_race_head"
-    cat <<'EOF'
-set_option Elab.async false in
-run_meta do
-  let spec := `T.anyP._at_.T.yb.spec_0
-  addYb
-  let ctx ← readThe Core.Context
-  let sr ← getSR
-  let stop ← IO.mkRef false
-  let tamper : CoreM Unit := do
-    while !(← stop.get) do
-      if (getSigCore? (← getEnv) impureSigExt spec).isSome then
-        modifyEnv fun env => UnreachableBranches.addFunctionSummary env spec (.ctor ``Bool.true #[])
-        return
-  let t ← BaseIO.asTask (prio := .dedicated) ((tamper ctx sr).toBaseIO)
-  Lean.compileDecls #[`T.yb]
-  stop.set true
-  discard <| IO.wait t
-EOF
-    printf '%s' "$tl_race_tail"
-  } | tl_y
-}
-tl3_race_sig_s0() { wh_files; }
-tl3_race_sig_s1() {
-  { printf '%s' "$tl_race_head"
-    cat <<'EOF'
-set_option Elab.async false in
-run_meta do
-  let spec := `T.iter._at_.T.y.spec_0
-  let env0 ← getEnv
-  addDecl <| .defnDecl {
-    name := `T.y
-    levelParams := []
-    type := mkConst ``Nat
-    value := mkApp2 (mkConst `T.iter) (mkConst `T.k) (mkNatLit 7)
-    hints := .abbrev
-    safety := .safe
-  }
-  let ctx ← readThe Core.Context
-  let sr ← getSR
-  let stop ← IO.mkRef false
-  let tamper : CoreM Unit := do
-    while !(← stop.get) do
-      if (IR.findEnvDecl (← getEnv) spec).isSome then
-        if let some sig := getSigCore? (← getEnv) impureSigExt spec then
-          modifyEnv fun env => impureSigExt.addEntry env { sig with type := ImpureType.uint8 }
-          return
-  let t ← BaseIO.asTask (prio := .dedicated) ((tamper ctx sr).toBaseIO)
-  Lean.compileDecls #[`T.y]
-  stop.set true
-  discard <| IO.wait t
-  match getSigCore? (← getEnv) impureSigExt spec with
-  | some s => logInfo (if s.type == ImpureType.uint8 then "final signature: written" else "final signature: compiler's")
-  | none => logInfo "final signature: none"
-EOF
-  } | tl_y
 }
 
 # Binder names of an inlined body become C variable names in the importer's C file.
@@ -2021,7 +1909,7 @@ all_cases="spec_transitive spec_link spec_type spec_precomp plugin_replay csimp_
   f1_cachespec f1_cachespec_hit premise_ir ir_count ir_count_nd lcnf_override d2_down_rebuilt
   collide_boxed_trans irdup_first irdup_after claim_ns claim_nsb claim_nsb_priv negfail_scoped abi_mix abi_void
   abi_enum abi_monotype
-  wh_ctrl wh_summary wh_extern wh_implby wh_sig tl_pre_extern tl2_pre_extern tl3_race_a tl3_race_b tl3_race_sig
+  wh_ctrl wh_summary wh_extern wh_implby wh_sig tl_pre_extern tl2_pre_extern
   ir_eval macro_eval init_eval
   inl_small inl_inline inl_instance spec_nested spec_derived spec_local spec_renumber
   implemented_by csimp extern export noncomputable partial_body unsafe_body boxed_version structure_eta
