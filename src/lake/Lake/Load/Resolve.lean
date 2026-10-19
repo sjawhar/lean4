@@ -9,6 +9,7 @@ prelude
 public import Lake.Config.Workspace
 public import Lake.Load.Manifest
 import Lake.Util.IO
+import Lake.Util.Proc
 import Lake.Util.StoreInsts
 import Lake.Config.Monad
 import Lake.Load.Materialize
@@ -417,7 +418,7 @@ def Workspace.updateToolchain
       | logInfo s!"no Elan detected; you will need to manually restart Lake"
         IO.Process.exit restartCode.toUInt8
     logInfo s!"restarting Lake via Elan"
-    let child ← IO.Process.spawn {
+    let child ← spawnProc {
       cmd := elanInstall.elan.toString
       args := #["run", "--install", tc.toString, "lake"] ++ lakeArgs
       env := ws.lakeEnv.noToolchainVars

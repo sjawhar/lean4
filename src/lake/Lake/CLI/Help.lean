@@ -172,7 +172,25 @@ mappings of each to a file specified by the `-o` option. By default, with `-o`,
 Lake will track the targets of the root package, use `--package` to select a
 different one. These mappings can then be used to upload the build artifacts
 to a remote cache with `lake cache put`. This will only include the artifacts
-from the covered targets. Other targets in the package will not be tracked."
+from the covered targets. Other targets in the package will not be tracked.
+
+BUILD SERVICE:          compile Lean modules on a shared service instead of locally
+  LAKE_REMOTE_EXEC            service endpoint (grpc://host:port or grpcs://host:port); the switch
+  LAKE_REMOTE_EXEC_TOOLCHAIN  sha256:<hex> of the toolchain image (required with the switch)
+  LAKE_REMOTE_EXEC_SYSROOT    Lean sysroot inside the image (default: the local sysroot)
+  LAKE_REMOTE_EXEC_INSTANCE   service instance name (default: lean)
+  LAKE_REMOTE_EXEC_CLIENT     the `lean-remote` executable (default: lean-remote)
+  LAKE_REMOTE_EXEC_SOCKET     daemon socket passed to the bridge
+  LAKE_REMOTE_EXEC_LOG        append one JSON line per module resolved through the service
+  LEAN_REMOTE_CLIENT_LABEL    overrides the client label reported to the service
+
+A service whose toolchain does not run this Lake's Lean fails the build, and a module that needs
+the service fails when the service does not answer. C files and plugins still compile locally, and
+outputs are downloaded as soon as they are built.
+
+The build ends with `lake: remote: <state>; <c> cached (<m> from manifest), <e> executed, <l> local;
+other actions: …`. `executed` counts every action the service ran for this build, compiles that
+failed there included; `<state>` is ok, unreachable, off: <reason>, or idle."
 
 def helpQuery :=
 "Build targets and output results
@@ -582,6 +600,7 @@ USAGE:
 COMMANDS:
   get [<mappings>]      download build outputs into the local Lake cache
   put <mappings>        upload build outputs to a remote cache
+  push                  upload the outputs that builds queued for the remote cache
   add <mappings>        add input-to-output mappings to the Lake cache
   clean                 removes ALL from the local Lake cache
   services              print configured remote cache services
@@ -673,6 +692,12 @@ Files are uploaded using the AWS Signature Version 4 authentication protocol
 via `curl`. Thus, the service should generally be an S3-compatible bucket.
 The authentication key is set via the `LAKE_CACHE_KEY` environment variable.
 
+A service that accepts only OAuth bearer tokens (e.g., a Cloud Storage bucket
+without HMAC keys) is instead named by `LAKE_REMOTE_CACHE`, with a command
+that prints a token in `LAKE_CACHE_TOKEN_CMD` (see `lake cache services`).
+Uploads to it need no key, and they only create objects: an object that is
+already present is left as it is, which is not an error.
+
 Since Lake does not currently use cryptographically secure hashes for
 artifacts and outputs, uploads to the cache are prefixed with a scope to
 avoid clashes. This is controlled by `--scope` or `--repo`. With `--repo`,
@@ -741,7 +766,12 @@ Reads the mappings file located at `outputs.jsonl` within the staging
 directory and writes the mappings to the Lake cache. Then, it copies the
 described artifacts from the staging directory into the cache. Mappings and
 artifacts already in the cache are not overwritten unless `--force-overwrite`
-is specified."
+is specified. An artifact whose bytes do not have the content hash in its file
+name is not copied, and the command fails without writing the mappings. The
+same holds where the cache's file system cannot hard-link a new artifact to its
+name: a new artifact is published only by a hard link, which never leaves part
+of a file under its name or replaces a file. With `--force-overwrite`, an
+artifact is renamed into place instead."
 
 def helpCachePutStaged :=
 "Upload build outputs from a staging directory to a remote service
@@ -765,6 +795,86 @@ code. However, because of this, the package's platform and toolchain settings
 will not be automatically detected for `--repo` and must be specified manually
 via `--platform` and `--toolchain` (if needed). Similarly, the source revision
 the outputs correspond to must be manually specified via `--rev`."
+
+def helpCachePush :=
+"Upload the outputs that builds queued for the shared remote cache
+
+USAGE:
+  lake cache push [--wait] [--follow <file>]
+
+OPTIONS:
+  --wait                          wait for a push that is running, then push
+  --follow <file>                 keep pushing what a build queues while it
+                                  holds the lock on <file> (builds with the
+                                  claim/push mechanism enabled start their
+                                  push this way; physical claims still need
+                                  `LAKE_CLAIM_SLOTS`)
+
+With `LAKE_REMOTE_CACHE_QUEUE` set to true and `LAKE_REMOTE_CACHE` naming an
+`s3` service (see `lake cache services`), a build appends each output that it
+compiled (not one it replayed or restored) to the queue `push.jsonl` in the
+Lake cache directory. It uploads nothing itself. It queues nothing while
+`LEAN_GITHASH` names a Lean other than the one it runs, or while
+`LAKE_USAGE_CUTOFF` is true.
+
+This command empties the queue without loading a workspace. For each entry, it
+hashes the cache artifacts again. An entry whose artifact is gone, or no longer
+matches its hash, is dropped and recorded in `push-dropped.jsonl`, and a
+changed artifact is moved to the cache's `quarantine` directory. A module's
+outputs are packed into one archive. The push copies the bytes it uploads into
+`push-staging` in the cache directory, preparing up to 16 entries at once (one
+per CPU). Each artifact is uploaded under its SHA-256, then, once all of its
+artifacts are present, the entry's input-to-output mapping, each only if the
+object is not present yet. An entry that fails to be packed or uploaded stays
+in the queue.
+
+One push runs at a time. Another one exits at once (with status 0), unless
+`--wait` is set, and the running one also uploads any entry appended while it
+runs. At the end, the push writes its counts to `remote-status-push.json` in the
+cache directory. It exits with status 1 if entries remain in the queue.
+
+A build with the queue on claims no input unless `LAKE_CLAIM_SLOTS` is set
+(and `LAKE_REMOTE_CACHE_CLAIMS` is not false). It names how many of the
+build's compiles must already run before it claims the next input and waits
+for other builds; `0` claims every input. Claims let machines that build the
+same targets at once compile each one once, but they were measured to cost
+wall time on both machines (see `Lake.Build.Claim`), so they are off by
+default; a build that claims nothing still queues its outputs and pushes
+them.
+
+A build that claims creates the object `claim/<scope>/<inputHash>` in the
+remote cache if no build holds it, and rewrites it while it compiles. With a
+worker free it compiles at once, and neither claims nor waits. A build whose
+compiles fill its slots and that finds the claim taken waits for the input's
+mapping instead of compiling, and takes the claim over when the claim says
+that the compile failed, when the claim says that its compile or its upload
+still runs but its holder (the build, or the push that uploads its outputs)
+is a process of this machine that no longer runs and the build has seen the
+claim unchanged for 5 seconds, or when the remote cache has not replaced it
+for `LAKE_CLAIM_TAKEOVER_SECS` seconds (600 by default) or the build has seen
+it unchanged for that long by its own clock.
+Builds that see each other compiling share the inputs out: each gives every
+input it is about to compile to one of the builds whose live claim saying
+`building` it has read, by the input's hash, claims its own and leaves the
+others. It takes an input that its build left unclaimed for
+`LAKE_CLAIM_DEFER_SECS` seconds (15 by default, 0 to leave none), and then
+leaves that build no more inputs until it sees it compiling again. A build
+that has seen no other build compiling claims every input it reaches.
+Each send of a claim request ends within 20 seconds, or fails, as does one
+whose answer is larger than 64 KiB, and claim requests are not retried. A
+request may first run `LAKE_CACHE_TOKEN_CMD` (when no token is held, or it is
+older than 45 minutes), and one that the remote cache refuses for its token
+runs it again and is sent once more. Each run may take 60 seconds, so a claim
+request takes at most two runs and two sends: 160 seconds. After its first
+queued output, a build that claims inputs starts this command itself, once,
+detached, as
+`lake cache push --wait --follow <file>` with a lock file that the build holds
+until it ends: the push uploads each output as the build queues it, tries an
+upload that failed again every 30 seconds while the build runs, ends after the
+build has ended (also when the Lake process goes on, as `lake exe` does), and
+marks each claim done once its mapping is uploaded. Its output goes to
+`push.log` in the cache directory. A claim that cannot be read or written is a
+miss: the build compiles as it would without claims."
 
 def helpCacheClean :=
 "Removes ALL files from the local Lake cache
@@ -798,7 +908,86 @@ The configuration of the system cache could look something like the following:
   artifactEndpoint = \"https://my-s3.com/a0\"
   revisionEndpoint = \"https://my-s3.com/r0\"
 
-If no `cache.defaultService` is configured, Lake will use Reservoir by default."
+If no `cache.defaultService` is configured, Lake will use Reservoir by default.
+
+Requests to an `s3` service that accepts only OAuth bearer tokens (e.g., a
+Cloud Storage bucket without HMAC keys) can carry a token:
+
+  LAKE_REMOTE_CACHE=<name>      the service that receives the token
+  LAKE_CACHE_TOKEN_CMD=<cmd>    a shell command that prints the token
+
+The command must print the bare token (not `Bearer <token>` or a JSON
+document), which may contain only the characters RFC 6750 allows: letters,
+digits, and `-._~+/=`. Lake refuses any other output, without showing it.
+
+Lake runs the command (with `sh -c`) when it first sends such a request, not
+at startup. It reuses the token for up to 45 minutes, and it runs the command
+again and retries the request once if the service refuses the token (HTTP
+401). The command runs in a session of its own, so a Ctrl-C that stops Lake
+does not stop it; a command that has not ended after 60 seconds is stopped,
+with every process it started, and fails. If the command fails, Lake reports
+the same error for 60 seconds without running it again (for 5 minutes if it
+was stopped after 60 seconds).
+
+The token goes only to the host of the service's artifact endpoint, as
+`Authorization: Bearer <token>`, and only through a temporary file that `curl`
+reads: never on a command line. That endpoint must use HTTPS, unless its host
+is a loopback address (`localhost`, `127.x.x.x`, `[::1]`). A request that
+carries the token follows no redirect (a redirect is an error) and ignores
+the user's `.curlrc`. A process Lake starts does not get the token, though
+it inherits both variables from Lake's environment.
+
+A build that uploads to such a service (`LAKE_REMOTE_CACHE_QUEUE`; see
+`lake cache push`) can also claim an input before it compiles it:
+
+  LAKE_CLAIM_SLOTS=<n>             claim an input, and wait for other builds,
+                                   once `n` compiles of this build already run
+                                   (unset by default: no input is claimed,
+                                   since claims were measured to cost wall
+                                   time; 0 claims every input)
+  LAKE_REMOTE_CACHE_CLAIMS=false   claim nothing, whatever `LAKE_CLAIM_SLOTS`
+                                   says, and do not push in the background
+  LAKE_CLAIM_TAKEOVER_SECS=<n>     take a claim over after the remote cache has
+                                   not replaced it, or the build has seen it
+                                   unchanged, for `n` seconds (600 by
+                                   default); the holder rewrites its claims
+                                   every 60 seconds, or every `n/4` seconds if
+                                   that is less
+  LAKE_CLAIM_DEFER_SECS=<n>        claim an input that the build it belongs to
+                                   has left unclaimed for `n` seconds (15 by
+                                   default; 0 claims every input at once, so
+                                   the build that is ahead takes nearly all of
+                                   them)
+  LAKE_PUSH_SHELL=<path>           the shell that starts the background push
+                                   (`/bin/bash` by default); it must close
+                                   every descriptor by number, and where it is
+                                   missing the push runs before the build ends
+
+A mapping that a build read from the remote cache stays in the local cache.
+Once `LAKE_REMOTE_CACHE` no longer names that service, Lake reads none of its
+artifacts from the remote cache: a missing one is compiled again. While it
+names one, a local mapping whose artifacts were pruned does not hide the
+remote cache: Lake reads the remote mapping instead. A downloaded archive
+that does not unpack is a miss: Lake compiles the module and moves the
+archive into the cache's `quarantine` directory.
+
+A read of a mapping or an artifact of the remote cache gives up after 3
+seconds without a connection or without progress, and is tried once more
+after 1 second: such a read of a remote cache that does not answer ends after
+about 7 seconds, and is a miss. After 3 such reads in a row fail once their
+transfers took 3 seconds or more (what a read waits before its transfer, e.g.
+behind other reads, does not count), the build reads no more mappings or
+artifacts of the remote cache and compiles its other targets (claims, if they
+are on, are still requested); `remote-status-read.json` in the cache directory
+says so (`stopped`). An upload of `lake cache push` gives up after 30 seconds
+without progress, or after 60 seconds and one more for each MiB that its
+`curl` run uploads, and one that failed transiently (a timeout, a host that
+could not be resolved, or HTTP 408, 429, 500, 502, 503, 504, 522 or 524) is
+tried again up to 3 times. A push removes the entries it uploaded from the
+queue as it goes, so a push that is stopped keeps its progress. A push you run
+whose first entries reach no service at all stops there and keeps every entry
+queued (`remote-status-push.json` says so); a build's own push tries them again
+every 30 seconds while the build runs."
 
 def helpScriptCli :=
 "Manage Lake scripts
@@ -966,6 +1155,7 @@ public def helpCache : (cmd : String) → String
 | "unstage"             => helpCacheUnstage
 | "put-staged"          => helpCachePutStaged
 | "clean"               => helpCacheClean
+| "push"                => helpCachePush
 | "services"            => helpCacheServices
 | _                     => helpCacheCli
 

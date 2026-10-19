@@ -104,6 +104,26 @@ public abbrev FetchM := FetchT LogIO
 
 export BuildInfo (fetch)
 
+/--
+One snapshot of the build store (a single `ST.Ref.get`). A lookup-only pass over many memoized
+facets reads it instead of the shared cell, since each `get` of a multi-threaded ref is two atomic
+exchanges on that cell.
+-/
+@[inline] public def getBuildStoreSnapshot : FetchM BuildStore :=
+  .ofFn fun _ _ _ store _ log => return .ok (← store.get) log
+
+/-- The job memoized for `info` in the snapshot `s`, if any. -/
+@[inline] public def BuildStore.getInfo?
+  (s : BuildStore) (info : BuildInfo) [t : FamilyOut BuildData info.key α]
+: Option (Job α) :=
+  cast (by rw [t.fam_eq]) (s.get? info.key)
+
+/-- `info.fetch`, served from the snapshot `s` if already memoized there. -/
+@[inline] public def fetchFrom
+  (s : BuildStore) (info : BuildInfo) [FamilyOut BuildData info.key α]
+: FetchM (Job α) := do
+  if let some job := s.getInfo? info then return job else info.fetch
+
 /-- Fetch the result of this facet of a module. -/
 public protected def ModuleFacet.fetch (self : ModuleFacet α) (mod : Module) : FetchM (Job α) :=
   fetch <| mod.facetCore self.name
