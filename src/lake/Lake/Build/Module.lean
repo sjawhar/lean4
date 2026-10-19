@@ -1432,10 +1432,13 @@ Looks in the usage index (`Cache.usageCandidates`) for a compile of the module, 
 downloaded), pre-filtered (`usagePrefilter`), and decided by the cutoff's own check (`Module.usageVerdict`) on its
 cache files, which reads them in `hashes`, the module's decision. A candidate that passes goes to `accept`, with its
 name (the hash of its `.usekey`) and its outputs in the cache; the first one `accept` takes ends the lookup. A
-candidate that cannot be read or resolved, that is a module-system file's (`m`), that names no `.usage` or
-`.usekey`, or, unless `kept`, whose outputs a kept-module check accepted (`ModuleOutputDescrs.keptFrom?`), is skipped.
-A candidate whose check found its `.olean` is not the one its key records has that cache entry checked
-(`checkUsageIndexEntry`).
+candidate whose outputs a kept-module check accepted (`ModuleOutputDescrs.keptFrom?`) is offered only if no compile
+passes: a compile of the same `.olean` passes whenever the kept outputs do, and a kept key makes the module's
+importers distrust its `.usage` (`importUsage?`). A candidate that cannot be read or resolved, that is a
+module-system file's (`m`), that names no `.usage` or `.usekey`, or, unless `kept`, whose outputs were kept, is
+skipped, and so is one whose cached files cannot be read during its check (e.g., another process removed an entry
+after the resolve). A candidate whose check found its `.olean` is not the one its key records has that cache entry
+checked (`checkUsageIndexEntry`).
 
 A lookup that found any candidate logs one verbose line: `usage index: restored <name> (...)` or
 `usage index: no match (...)`, where `(...)` counts the candidates, those whose `.usage` the pre-filter read
@@ -1492,6 +1495,8 @@ def Module.lookupUsageIndex (mod : Module) (presetup : ModulePreSetup) (importAr
   let mut checked := 0
   let mut prefilterNs := 0
   let mut checkNs := 0
+  -- Kept outputs that passed, in the order they passed, offered once no compile has been taken
+  let mut keptPassed : Array (String × ModuleOutputArtifacts) := #[]
   for file in candidates do
     let start ← IO.monoNanosNow
     let (passed?, read) ← prefilter file
@@ -1500,13 +1505,27 @@ def Module.lookupUsageIndex (mod : Module) (presetup : ModulePreSetup) (importAr
     if read then parsed := parsed + 1
     let some (arts, files, keyOlean) := passed? | continue
     checked := checked + 1
-    let verdict ← mod.usageVerdict presetup importArts hashes files
+    let verdict ← id do
+      try
+        mod.usageVerdict presetup importArts hashes files
+      catch e =>
+        let log ← takeLogFrom e
+        logVerbose <| log.entries.foldl (s!"{·}\n- {·.message}")
+          s!"usage index: could not read the cached files of {file.fileStem.getD file.toString}:"
+        return .compile "its cached files could not be read"
     unless verdict matches .upToDate do
       if let some hash := (← hashes.files.get)[arts.olean.path]? then
         if hash != keyOlean then discard <| checkUsageIndexEntry arts.olean
     checkNs := checkNs + ((← IO.monoNanosNow) - filtered)
     unless verdict matches .upToDate do continue
     let name := file.fileStem.getD file.toString
+    if arts.keptFrom?.isSome then
+      keptPassed := keptPassed.push (name, arts)
+      continue
+    if let some result ← accept name arts then
+      logVerbose s!"usage index: restored {name} ({← stats parsed checked prefilterNs checkNs})"
+      return some result
+  for (name, arts) in keptPassed do
     if let some result ← accept name arts then
       logVerbose s!"usage index: restored {name} ({← stats parsed checked prefilterNs checkNs})"
       return some result
@@ -1515,11 +1534,13 @@ def Module.lookupUsageIndex (mod : Module) (presetup : ModulePreSetup) (importAr
 
 /--
 Restores the outputs of a compile of the module that the usage index offers (`Module.lookupUsageIndex`), when its
-build missed the cache by input hash, instead of compiling it: the first candidate that passes the usage cutoff's check
-against the module's current imports (`importArts`, in `hashes`, the module's decision) replaces the module's outputs
-and trace, if every file restored, sidecars included, has the bytes its description records. A file that does not
-has its cache entry checked (`checkUsageIndexEntry`), and the next candidate is taken, as it is when the restore fails
-(e.g., an entry was pruned meanwhile). Outputs a kept-module check accepted keep that lineage
+build missed the cache by input hash, instead of compiling it: a candidate that passes the usage cutoff's check
+against the module's current imports (`importArts`, in `hashes`, the module's decision), the most recent compile
+before any kept outputs, replaces the module's outputs and trace, if every file restored, sidecars included, has the
+bytes its description records. A file that does not has its cache entry checked (`checkUsageIndexEntry`), and the
+next candidate is taken, as it is when the restore fails (e.g., an entry was pruned meanwhile). If its check passed and
+the restore then fails, the module's own outputs are already gone, so the module is compiled even if a kept-module
+check could have accepted them. Outputs a kept-module check accepted keep that lineage
 (`ModuleOutputDescrs.keptFrom?`); a module excluded from kept checks takes none of them. Fails, as a usage skip does,
 if the module's source changed during the build (`Module.checkSourceUnchanged`). Writes the module's trace with
 `depTrace`, as a restore from the cache by input hash does, and returns the outputs, which are in the cache; the
