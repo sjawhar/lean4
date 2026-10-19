@@ -1436,37 +1436,81 @@ candidate that cannot be read or resolved, that is a module-system file's (`m`),
 `.usekey`, or, unless `kept`, whose outputs a kept-module check accepted (`ModuleOutputDescrs.keptFrom?`), is skipped.
 A candidate whose check found its `.olean` is not the one its key records has that cache entry checked
 (`checkUsageIndexEntry`).
+
+A lookup that found any candidate logs one verbose line: `usage index: restored <name> (...)` or
+`usage index: no match (...)`, where `(...)` counts the candidates, those whose `.usage` the pre-filter read
+(`parsed`) and those that reached the check (`fully checked`), with the time the pre-filter took apart from reading
+views, the views this lookup added (`UsageView`) and the time it took to read them, and the importees the checks
+bound (`ContentHashes.imports`) that the module's same-tree check had not, with the time the checks took.
 -/
 def Module.lookupUsageIndex (mod : Module) (presetup : ModulePreSetup) (importArts : NameMap ImportArtifacts)
     (hashes : ContentHashes) (kept : Bool) (accept : String → ModuleOutputArtifacts → JobM (Option α)) :
     JobM (Option α) := do
   let candidates ← (← getLakeCache).usageCandidates mod.pkg.cacheScope presetup.localTrace.hash
+  if candidates.isEmpty then return none
+  -- The views this lookup added, and the nanoseconds it took to read them
+  let views ← IO.mkRef ((0, 0) : Nat × Nat)
+  let boundBefore := (← hashes.imports.get).size
   -- An importee as the module's decision bound it, if it did, else as the build's view of it
   let importee? (m : Name) : JobM (Option (Option ModuleUsage.Digest × UsageImport)) := do
     if let some bound := (← hashes.imports.get).find? m then
       let some (olean, imp) := bound | return none
       if (importArts.find? m).any (·.oleanServer?.isSome) then return some (none, imp)
       return some ((← hashes.files.get)[olean]?, imp)
-    return (← usageView? importArts m).1
-  for file in candidates do
-    let some descrs ← readUsageIndexEntry? file | continue
-    if descrs.isModule || (!kept && descrs.keptFrom?.isSome) then continue
+    let start ← IO.monoNanosNow
+    let (view, read) ← usageView? importArts m
+    if read then
+      let stop ← IO.monoNanosNow
+      views.modify fun (n, ns) => (n + 1, ns + (stop - start))
+    return view
+  -- The candidate's outputs, files and its key's `.olean` hash if it passes the pre-filter, and whether its `.usage`
+  -- was read
+  let prefilter (file : FilePath) :
+      JobM (Option (ModuleOutputArtifacts × UsageFiles × ModuleUsage.Digest) × Bool) := do
+    let some descrs ← readUsageIndexEntry? file | return (none, false)
+    if descrs.isModule || (!kept && descrs.keptFrom?.isSome) then return (none, false)
     let arts? : Option ModuleOutputArtifacts ← id do
       try
         return some (← descrs.resolve none none)
       catch e =>
         dropLogFrom e
         return none
-    let some arts := arts? | continue
-    let (some usage, some usekey) := (arts.usage?, arts.usekey?) | continue
-    let .passed keyOlean ← usagePrefilter presetup importArts hashes importee? usekey.path usage.path | continue
-    let files : UsageFiles := {usekey := usekey.path, usage := usage.path, olean := arts.olean.path}
-    unless (← mod.usageVerdict presetup importArts hashes files) matches .upToDate do
+    let some arts := arts? | return (none, false)
+    let (some usage, some usekey) := (arts.usage?, arts.usekey?) | return (none, false)
+    match (← usagePrefilter presetup importArts hashes importee? usekey.path usage.path) with
+    | .key => return (none, false)
+    | .usage => return (none, true)
+    | .passed keyOlean =>
+      return (some (arts, {usekey := usekey.path, usage := usage.path, olean := arts.olean.path}, keyOlean), true)
+  let stats (parsed checked prefilterNs checkNs : Nat) : JobM String := do
+    let (viewsRead, viewsNs) ← views.get
+    let bound := (← hashes.imports.get).size - boundBefore
+    return s!"{candidates.size} candidates, {parsed} parsed, {checked} fully checked; \
+      prefilter {(prefilterNs - viewsNs) / 1000} µs; {viewsRead} views read in {viewsNs / 1000} µs; \
+      {bound} importees bound in {checkNs / 1000} µs"
+  let mut parsed := 0
+  let mut checked := 0
+  let mut prefilterNs := 0
+  let mut checkNs := 0
+  for file in candidates do
+    let start ← IO.monoNanosNow
+    let (passed?, read) ← prefilter file
+    let filtered ← IO.monoNanosNow
+    prefilterNs := prefilterNs + (filtered - start)
+    if read then parsed := parsed + 1
+    let some (arts, files, keyOlean) := passed? | continue
+    checked := checked + 1
+    let verdict ← mod.usageVerdict presetup importArts hashes files
+    unless verdict matches .upToDate do
       if let some hash := (← hashes.files.get)[arts.olean.path]? then
         if hash != keyOlean then discard <| checkUsageIndexEntry arts.olean
-      continue
-    if let some result ← accept (file.fileStem.getD file.toString) arts then
+    checkNs := checkNs + ((← IO.monoNanosNow) - filtered)
+    unless verdict matches .upToDate do continue
+    let name := file.fileStem.getD file.toString
+    if let some result ← accept name arts then
+      logVerbose s!"usage index: restored {name} ({← stats parsed checked prefilterNs checkNs})"
       return some result
+  logVerbose s!"usage index: no match ({← stats parsed checked prefilterNs checkNs})"
   return none
 
 /--
