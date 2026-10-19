@@ -412,7 +412,11 @@ def runFrontend
     let used := ModuleUsage.usedFromInfoTrees trees (← usedByChecksRef.get)
     let declIdxs := commands.foldl (init := ({} : Std.HashSet Nat)) fun s c =>
       if c.isDecl then s.insert c.i else s
+    -- a frontend the module runs in-process (`Lean.Elab.process` in an `#eval`) records its own commands into the same
+    -- references, from index 0 again
+    let nested := (observations.foldl (fun s o => s.insert o.i) ({} : Std.HashSet Nat)).size != observations.size
     let noskipReason? := if env.header.isModule then some "module-system"
+      else if nested then some "command observations of a nested frontend"
       else commandEntriesNoskipReason? entries declIdxs.contains
     ModuleUsage.writeUsage env consts own stmt used commands
       (incrLoaded := incrLoadFileName?.isSome) (oleanFileName.withExtension "usage")

@@ -14,8 +14,8 @@ namespace Lean
 
 /-- The change of one view of an environment's extension states from one point to a later one: per persistent
 extension the entries its state delta gives (`PersistentEnvExtension.stateDelta?`), per scoped extension the stack
-operations it logged (`ScopedEnvExtension.stackDelta`, each erased), per command cache whose view this is the entries
-it added. A command's change, an asynchronous branch's, a realization's and a realization context's all use it. -/
+operations it logged (`ScopedEnvExtension.stackDelta`, each erased), per command cache the entries it added in this
+view. A command's change, an asynchronous branch's, a realization's and a realization context's all use it. -/
 structure ViewStates where
   entries : Array (Name × Array EnvExtensionEntry) := #[]
   scopedOps : Array (Name × Array EnvExtensionEntry) := #[]
@@ -177,7 +177,6 @@ private def viewStates (regs : Registries) (view : EnvExtension.View) (k₀ k₁
         refused := refused.push ext.name
         unless isScoped || ext.ofOLeanEntry?.isSome do unreplayable := unreplayable.push ext.name
   for cache in regs.caches do
-    if cache.view != view then continue
     let idx := cache.ext.idx
     unless idx < k₀.extensions.size && idx < k₁.extensions.size do continue
     let es := cache.stateDelta (cacheStateIn cache k₀) (cacheStateIn cache k₁)
@@ -232,20 +231,32 @@ private opaque contextEnv (ctx : RealizationContext) : Environment
 
 /--
 `cells`, the constants one constant map gained (oldest first, each with the list after it, which is the map an
-asynchronous constant's branch forked from), as `AddedConst`s: one record per realization, an `async` record with its
-branch's own additions (`cellsSince` its map and the tail after it) for a constant with states of its own, `plain` for
-the rest; `self?` (inside its own branch) as `plain`. A realization whose constants the before-environment already
-holds was made by an earlier command and merged here from the cache: it is dropped, and its constants resolve through
-`allRealizations` as in the full run. Also the (constant, extension) pairs whose state no record expresses.
+asynchronous constant's branch forked from), as `AddedConst`s in order: an `async` record with its branch's own additions
+(`cellsSince` its map and the tail after it) for a constant with states of its own; one record per realization, with
+all the constants `realize` added itself, at the position of the last of them (a realization requested inside another
+one merged its constants into the outer one's between the outer one's own, and runs in its own context, so it never
+depends on them); `plain` for the rest; `self?` (inside its own branch) as `plain`; and `ctxs`, context records each
+with the number of cells before it. A realization whose constants the before-environment already holds was made by an
+earlier command and merged here from the cache: it is dropped, and its constants resolve through `allRealizations` as
+in the full run. Also the (constant, extension) pairs whose state no record expresses.
 -/
 private partial def addedConsts (regs : Registries) (w : Walk) (cells : List (AsyncConst × List AsyncConst))
-    (exportedKind : AsyncConst → Option ConstantKind) (self? : Option Name := none) :
-    Array AddedConst × Array (Name × Name) := Id.run do
+    (exportedKind : AsyncConst → Option ConstantKind) (self? : Option Name := none)
+    (ctxs : List (Nat × AddedConst) := []) : Array AddedConst × Array (Name × Name) := Id.run do
+  -- per realization key, the index of its last constant
+  let mut last : Std.HashMap (Name × Name) Nat := {}
+  for h : k in [:cells.length] do
+    if let some info := cells[k].1.realization? then
+      last := last.insert (info.forConst, info.constName) k
   let mut out : Array AddedConst := #[]
   let mut refused := #[]
-  -- realization key → index in `out`, or `none` for a dropped realization
-  let mut realizations : Std.HashMap (Name × Name) (Option Nat) := {}
-  for (c, tail) in cells do
+  let mut pending := ctxs
+  -- per realization key, its constants so far and how many of them the before-environment holds
+  let mut realized : Std.HashMap (Name × Name) (Array Name × Nat) := {}
+  for (k, (c, tail)) in (List.range cells.length).zip cells do
+    while pending.head?.any (·.1 ≤ k) do
+      out := out.push pending.head!.2
+      pending := pending.tail
     let name := c.constInfo.name
     if self? == some name then
       out := out.push (.plain name)
@@ -253,25 +264,20 @@ private partial def addedConsts (regs : Registries) (w : Walk) (cells : List (As
     match c.realization?, c.kenv? with
     | some info, some kenv =>
       let key := (info.forConst, info.constName)
-      let held := (w.beforeKernel.find? name).isSome
-      match realizations[key]? with
-      | some (some i) =>
-        if held then refused := refused.push (name, `Lean.Environment.realizeConst)
-        out := out.modify i fun
-          | .realization f k consts s => .realization f k (consts.push name) s
-          | a => a
-      | some none =>
-        unless held do refused := refused.push (name, `Lean.Environment.realizeConst)
-      | none =>
-        if held then
-          realizations := realizations.insert key none
-        else if !contextStartedFrom w.after info.forConst info.base then
-          refused := refused.push (name, `Lean.Environment.realizationContext)
-        else
-          let (states, r, u) := viewStates regs .main info.base kenv.get
-          refused := refused ++ (r ++ u).map (name, ·)
-          realizations := realizations.insert key (some out.size)
-          out := out.push (.realization info.forConst info.constName #[name] states)
+      let (names, held) := realized.getD key (#[], 0)
+      let names := names.push name
+      let held := held + if (w.beforeKernel.find? name).isSome then 1 else 0
+      realized := realized.insert key (names, held)
+      unless last[key]? == some k do continue
+      if held == names.size then continue
+      if held > 0 then
+        refused := refused.push (name, `Lean.Environment.realizeConst)
+      else if !contextStartedFrom w.after info.forConst info.base then
+        refused := refused.push (name, `Lean.Environment.realizationContext)
+      else
+        let (states, r, u) := viewStates regs .main info.base kenv.get
+        refused := refused ++ (r ++ u).map (name, ·)
+        out := out.push (.realization info.forConst info.constName names states)
     | none, some kenv =>
       if c.isRealized then
         refused := refused.push (name, `Lean.Environment.realizeConst)
@@ -285,6 +291,7 @@ private partial def addedConsts (regs : Registries) (w : Walk) (cells : List (As
           out := out.push (.async name (exportedKind c) states nested)
         | none => refused := refused.push (name, `Lean.Environment.asyncConsts)
     | _, none => out := out.push (.plain name)
+  for (_, a) in pending do out := out.push a
   return (out, refused)
 
 /-- The realization contexts the command registered on the main branch, in registration order, each as a `context`
@@ -329,25 +336,9 @@ def recordCommandDelta (before after : Environment) (idx : Nat) : IO Environment
   | none => stateOnly := stateOnly.push `Lean.Environment.asyncConsts
   | some cells =>
     let (ctxs, rc) := addedContexts regs before after
-    branchStateOnly := branchStateOnly ++ rc
-    -- interleave: a context goes after the constants its environment held
-    let mut pending := ctxs.toList
-    let mut position := 0
-    for (c, tail) in cells do
-      while pending.head?.any (·.1 ≤ position) do
-        added := added.push pending.head!.2
-        pending := pending.tail
-      let (recs, r) := addedConsts regs w [(c, tail)] exportedKind
-      branchStateOnly := branchStateOnly ++ r
-      -- consecutive constants of one realization form one record
-      for a in recs do
-        match a, added.back? with
-        | .realization f k #[n] _, some (.realization f' k' consts s) =>
-          if f == f' && k == k' then added := added.pop.push (.realization f k (consts.push n) s)
-          else added := added.push a
-        | _, _ => added := added.push a
-      position := position + 1
-    for (_, a) in pending do added := added.push a
+    let (recs, r) := addedConsts regs w cells exportedKind (ctxs := ctxs.toList)
+    added := recs
+    branchStateOnly := branchStateOnly ++ rc ++ r
   for (_, ext) in branchStateOnly do
     unless stateOnly.contains ext do stateOnly := stateOnly.push ext
   return commandEntriesExt.addEntry after
