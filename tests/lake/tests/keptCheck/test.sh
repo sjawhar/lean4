@@ -873,6 +873,42 @@ for install in add get; do
   test_cmd_fails grep -q '"kf"' "t41${install}z/$OUT/B.trace"
 done
 
+# Kept outputs keep their lineage on every path that returns them. After an accept, a change that
+# `P.B` did not use (`A.w` back to its first definition) is a usage-cutoff skip of the kept outputs;
+# with the artifact cache read but not written (Lake's default, `ro`) or off, `-o` still records
+# them as kept, so `lake cache add` of that file leaves another tree's compiled mapping of the same
+# input compiled
+yenv() { # yenv ro|off -- the kept tree's cache settings, in a subshell
+  if [ "$1" = ro ]; then unset LAKE_ARTIFACT_CACHE LAKE_RESTORE_ARTIFACTS; else export LAKE_ARTIFACT_CACHE=false; fi
+  export LAKE_CACHE_DIR="$PWD/cache42y$1"
+}
+# setw1 DIR -- `A.w` as `mkp` defined it (`1 - 1`), and another `A.v`, so that `P.A` changes
+setw1() { rm -f "$1/P/A.lean"; printf 'def A.v : Nat := 9\ndef A.w : Nat := 1 - 1\n' > "$1/P/A.lean"; }
+for cm in ro off; do
+  kt=t42$cm; ct=t42${cm}x
+  mkp $kt
+  (yenv $cm; test_run -d $kt build P)
+  seta $kt 2
+  export STUB_LOG="$PWD/$kt.log"
+  (yenv $cm; LAKE_KEPT_CHECKER="$STUB" test_out 'Checked P.B' -d $kt build P)
+  setw1 $kt
+  (yenv $cm; test_out 'Replayed P.B' -d $kt build -v P -o "$PWD/o42$cm.jsonl")
+  test_cmd grep -q '"kf"' "$kt/$OUT/B.trace"
+  bh=$(dephash "$kt/$OUT/B.trace")
+  test_cmd_out '"kf"' grep -F "\"$bh\"" "o42$cm.jsonl"
+  export LAKE_CACHE_DIR="$PWD/cache42$cm"
+  mkp $ct
+  setw1 $ct
+  test_out 'Built P.B' -d $ct build P
+  test_exp "$(dephash "$ct/$OUT/B.trace")" = "$bh"
+  for a in $kt/.lake/build/ir/*.ltar $kt/.lake/build/ir/P/*.ltar; do
+    if [ -e "$a.hash" ]; then test_cmd cp "$a" "$LAKE_CACHE_DIR/artifacts/$(cat "$a.hash").ltar"; fi
+  done
+  test_run -d $ct cache add "$PWD/o42$cm.jsonl"
+  test_cmd grep -q '"o"' "$(mapping $ct B)"
+  test_cmd_fails grep -q '"kf"' "$(mapping $ct B)"
+done
+
 # When a kept module is set aside for an archive (here `lake cache get` of another tree's `-o` file)
 # and the archive is unpacked, the `.hash` files of the kept outputs go too: with the cache read but
 # not written (`LAKE_ARTIFACT_CACHE` unset), the module's importers see the archive's outputs, which
