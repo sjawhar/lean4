@@ -456,8 +456,7 @@ def entriesEnc (env : Environment) (lc : LocalCompiled) (x : Name) (s : CEnc) : 
 (`entriesEnc`) and whether its IR is exported for interpretation (`isDeclMeta`), with the declaration names they
 mention. -/
 def compiledEnc (env : Environment) (lc : LocalCompiled) (x : Name) (s : CEnc) : CEnc :=
-  let s := entriesEnc env lc x (attrsEnc env lc x s |>.flushTys)
-  { s with e := s.e.bool (isDeclMeta env x) }
+  entriesEnc env lc x (attrsEnc env lc x s |>.flushTys) |>.bool (isDeclMeta env x)
 
 /-- The registered names of the environment extensions whose entries for a name `compiledEnc` reads, and the
 module's package, which every node digest carries. The census test checks that every extension it classifies as

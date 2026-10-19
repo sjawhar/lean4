@@ -38,6 +38,9 @@ private def hex16 (v : UInt64) : String :=
 /-- 32 lowercase hex digits. -/
 def Digest.hex (d : Digest) : String := hex16 d.hi ++ hex16 d.lo
 
+/-- The order of `hex`, without building the strings. -/
+def Digest.lt (a b : Digest) : Bool := a.hi < b.hi || (a.hi == b.hi && a.lo < b.lo)
+
 /-- Parses exactly 32 lowercase hex digits. -/
 def Digest.ofHex? (s : String) : Option Digest := do
   let bs := s.toUTF8

@@ -1204,8 +1204,7 @@ def SavedTrace.moduleOutputDescrs? (self : SavedTrace) : Option ModuleOutputDesc
 
 /--
 Whether every output the saved trace describes (`descrs`) is in the build directory with the bytes recorded for
-it, hashed as the cache hashes a module output (`Hash.ofByteArray` of the file's bytes; module outputs are never
-cached as text). The outputs are those `recacheOutputArtifacts?` checks.
+it, hashed as the cache hashes a module output (`computeBinFileHash`).
 -/
 def Module.outputsMatchDescrs (mod : Module) (isModule postponesCompile : Bool) (descrs : ModuleOutputDescrs) :
     JobM Bool := do
@@ -1221,8 +1220,8 @@ def Module.outputsMatchDescrs (mod : Module) (isModule postponesCompile : Bool) 
   for (c, file, descr?) in required do
     unless c do continue
     let some descr := descr? | return false
-    let .ok bytes ← (IO.FS.readBinFile file).toBaseIO | return false
-    unless Hash.ofByteArray bytes == descr.hash do return false
+    let .ok hash ← (computeBinFileHash file).toBaseIO | return false
+    unless hash == descr.hash do return false
   return true
 
 /--
@@ -1505,9 +1504,10 @@ def readOwnUsage (path : FilePath) (expected? : Option ModuleUsage.Digest := non
 
 /--
 The hashes of the files one usage-cutoff check (`Module.usageUpToDate`, `Module.writeUsekey`) has
-read, so that it reads each file once. A check never reuses another's: nothing about a file short of
-its bytes shows that they did not change since (e.g., a write through a shared mapping can leave its
-status-change time as it was).
+read, so that it reads each file once, and every `importUsage?` binding of the check is to the same bytes. A check
+never reuses another's: another workspace's build can rebuild a shared dependency between two checks, and nothing
+about a file short of its bytes shows that they did not change since (e.g., a write through a shared mapping can
+leave its status-change time as it was).
 -/
 abbrev ContentHashes := IO.Ref (Std.HashMap FilePath ModuleUsage.Digest)
 
@@ -1566,8 +1566,7 @@ Whether every key the module looked up in the specialization cache (`UsageSideca
 providers in its closure as when Lean compiled it: the closure's non-module workspace modules that map the key, each
 with the specialization it maps the key to, digested by the function Lean used (`Lean.ModuleUsage.specProviders`).
 Each closure module's keys come from its `.usage` once `importUsage?` has bound it to the module's current `.olean`,
-in this check's `hashes`: another workspace's build can rebuild a shared dependency between two checks, so no
-binding is reused across checks. An import that starts providing a key the module missed, stops providing one it
+in this check's `hashes`. An import that starts providing a key the module missed, stops providing one it
 hit, or maps it elsewhere changes which specialization a fresh compile uses, so the module rebuilds. A module-system
 module's keys are pinned by `modsysHash`, a toolchain module's by the Lean githash.
 -/
@@ -1742,28 +1741,31 @@ def Module.usageCutoffApplies (mod : Module) (presetup : ModulePreSetup) : JobM 
 /--
 Skips compiling a module whose trace is stale if usage cutoff applies to it
 (`Module.usageCutoffApplies`), nothing it used changed meaning (`Module.usageUpToDate`), and its outputs are
-still what the saved trace describes (`Module.keepOutputs?`, which with `cacheWith?` also saves them to the cache):
-replays its saved log and rewrites its trace with `depTrace`, which vouches for those outputs under the new input
-hash. Otherwise, builds it, reusing the module setup the check computed. Returns the outputs and whether they were
-kept and cached.
+still what the saved trace describes (`Module.keepOutputs?`): replays its saved log and rewrites its trace with
+`depTrace`, which vouches for those outputs under the new input hash. Otherwise, builds it, reusing the module setup
+the check computed. With `cacheWith? = some useLocalFile`, the outputs it returns are in the cache: kept ones were
+checked while saving them (`recacheOutputArtifacts?`), built ones are saved after the build.
 -/
 def Module.skipOrBuild (mod : Module) (presetup : ModulePreSetup) (savedTrace : SavedTrace)
-    (depTrace : BuildTrace) (cacheWith? : Option Bool := none) : JobM (ModuleOutputArtifacts × Bool) := do
-  let .ok data := savedTrace | return (← mod.buildLean presetup, false)
-  unless (← mod.usageCutoffApplies presetup) do
-    return (← mod.buildLean presetup, false)
+    (depTrace : BuildTrace) (cacheWith? : Option Bool := none) : JobM ModuleOutputArtifacts := do
+  let build (setup? : Option ModuleSetup) : JobM ModuleOutputArtifacts := do
+    let arts ← mod.buildLean presetup setup?
+    match cacheWith? with
+    | some useLocalFile => mod.cacheOutputArtifacts presetup.isModule useLocalFile presetup.postponeCompile
+    | none => return arts
+  let .ok data := savedTrace | build none
+  unless (← mod.usageCutoffApplies presetup) do return ← build none
   let setup ← mkModuleSetup mod presetup
-  unless (← mod.usageUpToDate presetup setup.importArts) do
-    return (← mod.buildLean presetup setup, false)
+  unless (← mod.usageUpToDate presetup setup.importArts) do return ← build setup
   let some arts ← mod.keepOutputs? presetup.isModule presetup.postponeCompile savedTrace.moduleOutputDescrs?
-      cacheWith? | return (← mod.buildLean presetup setup, false)
+      cacheWith? | build setup
   mod.checkSourceUnchanged presetup
   updateAction .replay
   data.log.replay
   unless (← getNoBuild) do
     writeBuildTrace mod.traceFile depTrace (data.outputs?.getD .null) data.log
     removeFileIfExists (mod.traceFile.addExtension "nobuild")
-  return (arts, cacheWith?.isSome)
+  return arts
 
 def  adjustMTime (arts : ModuleOutputArtifacts) (traceFile : FilePath) : JobM ModuleOutputArtifacts := do
   match (← getMTime traceFile |>.toBaseIO) with
@@ -1859,6 +1861,8 @@ where
         let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
         -- Whether the build directory holds the outputs the saved trace describes
         let mut replayed := false
+        -- The outputs of a usage skip or build, already in the cache
+        let mut cached? : Option ModuleOutputArtifacts := none
         if status.isUpToDate then
           if (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) then
             replayed := true
@@ -1871,15 +1875,11 @@ where
                 discard <| mod.buildLean presetup
             else
               discard <| mod.buildLean presetup
-        let mut skipped? : Option ModuleOutputArtifacts := none
-        if !status.isUpToDate then
-          -- A kept module's outputs are cached here, each checked while saving.
-          let (arts, cached) ← mod.skipOrBuild presetup savedTrace depTrace
-            (cacheWith? := if status.isCacheable then some restore else none)
-          if cached then skipped? := some arts
+        else
+          cached? := some (← mod.skipOrBuild presetup savedTrace depTrace (cacheWith? := some restore))
         if status.isCacheable then
           let arts ← id do
-            if let some arts := skipped? then return arts
+            if let some arts := cached? then return arts
             if replayed then
               if let some arts ← mod.keepOutputs? presetup.isModule presetup.postponeCompile
                   savedTrace.moduleOutputDescrs? (cacheWith? := some restore) then
@@ -1913,9 +1913,9 @@ where
               let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
               return {arts with ltar? := arts.ltar? <|> ltar?}
             else
-              (·.1) <$> mod.skipOrBuild presetup savedTrace depTrace
+              mod.skipOrBuild presetup savedTrace depTrace
         else
-          (·.1) <$> mod.skipOrBuild presetup savedTrace depTrace
+          mod.skipOrBuild presetup savedTrace depTrace
   -- Unpacks the module's own `.ltar` (stamped with `inputHash`) into the build directory and
   -- returns whether it did. The archive carries its own trace, which vouches only for the archive,
   -- so it must still have the hash recorded when it was packed; if it does not, or none is

@@ -82,19 +82,16 @@ def refs (env : Environment) (c : ConstantInfo) (recorded : NameMap DeclConsts :
   s.toArray.qsort Name.quickLt
 
 /-- For a specialization prefix `g._at_.o` (a specialization of `g` that `o` created), `o`: the components after
-the first `_at_`, joined as they are (`Name.append` would treat a `_hyg` component as macro scopes, which `o`
-can contain in the middle). A specialization created inside another specialization is `g._at_.g'._at_.o.spec_M`,
-whose creator `g'._at_.o.spec_M` is itself a specialization name that strips to `o`. Folding does not depend on
-the result being the creator: writer and reader strip the same way, and an owner's digest covers whatever folds
-into it. -/
+the first `_at_`, joined by `Name.appendCore` (`Name.append` would treat a `_hyg` component as macro scopes, which
+`o` can contain in the middle). A specialization created inside another specialization is
+`g._at_.g'._at_.o.spec_M`, whose creator `g'._at_.o.spec_M` is itself a specialization name that strips to `o`.
+Folding does not depend on the result being the creator: writer and reader strip the same way, and an owner's
+digest covers whatever folds into it. -/
 def atOwner? (p : Name) : Option Name :=
   let cs := p.components
   match cs.findIdx? (· == `_at_) with
   | some j =>
-    let o := (cs.drop (j + 1)).foldl (init := Name.anonymous) fun acc c => match c with
-      | .str _ s => .str acc s
-      | .num _ n => .num acc n
-      | .anonymous => acc
+    let o := (cs.drop (j + 1)).foldl Name.appendCore .anonymous
     if o.isAnonymous then none else some o
   | none => none
 
@@ -323,10 +320,9 @@ opaque usedFromInfoTrees (trees : Array Elab.InfoTree) (init : NameSet) : NameSe
 /-! Cross-module compiler tables: entries a module adds for declarations of other modules, which change how
 every importer compiles without changing any digest of those declarations. -/
 
-/-- Whether module `i` (`none`: the current module) defines `n` as a kernel constant; `priv` is the environment
-in its private scope (`setExporting false`). `getModuleIdxFor?` alone also maps a module's claimed compiler-only
-names, and maps nothing for a name no import defines; neither is a declaration of the module, so an entry for it
-stays in `tableDigest`, and a claimed name the module does not own is listed (`claimedForeignNames`). -/
+/-- Whether module `i?` (`none`: the current module) defines `n` as a kernel constant, realized constants included.
+`priv` is the environment in its private scope (`setExporting false`). `getModuleIdxFor?` alone would also accept a
+module's claimed compiler-only names. -/
 private def definedIn (priv : Environment) (i? : Option ModuleIdx) (n : Name) : Bool :=
   priv.getModuleIdxFor? n == i? && priv.contains n (skipRealize := false)
 
@@ -528,10 +524,10 @@ a miss into a hit goes unseen, and one key with two identities hides a provider.
 def specKeyDigest (key : Expr) : Digest := exprDigest .none .eqv key
 
 /-- One module's specialization-cache entries (oldest first) as its `specKeys`: each key's identity with the
-specialization of its last entry, the one the cache keeps (`Specialize.addEntry` replaces), sorted by identity. -/
+specialization of its last entry, the one the cache keeps (`Specialize.addEntry` replaces), in no particular order. -/
 def specKeysOf (entries : Array (Expr × Name)) : Array (Digest × Name) :=
   let last : Std.HashMap Digest Name := entries.foldl (fun m (k, n) => m.insert (specKeyDigest k) n) {}
-  last.toArray.qsort (·.1.hex < ·.1.hex)
+  last.toArray
 
 /-- For each key identity in `keys`, a digest of its providers: the modules in `modules`, given with their
 `specKeys` (`specKeysOf`), that map the key, each with the specialization it maps the key to, listed by module
@@ -541,7 +537,6 @@ resolves the key to the same specialization. Lean computes these when it writes 
 so both sides group providers alike. -/
 def specProviders (keys : Array Digest) (modules : Array (Name × Array (Digest × Name))) :
     Array (Digest × Digest) := Id.run do
-  if keys.isEmpty then return #[]
   let wanted : Std.HashSet Digest := keys.foldl (·.insert ·) {}
   let mut providers : Std.HashMap Digest (Array (Name × Name)) := {}
   for (m, ks) in modules do
@@ -551,17 +546,17 @@ def specProviders (keys : Array Digest) (modules : Array (Name × Array (Digest 
     let ps := (providers.getD k #[]).qsort (Name.quickLt ·.1 ·.1)
     (k, (ps.foldl (fun e (m, n) => e.name m |>.name n) (({} : Enc).nat ps.size)).finish)
 
-/-- The specialization-cache keys the current module created (its own cache entries, `specKeysOf`): what
+/-- The specialization-cache keys the current module created (its own cache entries, `specKeysOf`), sorted: what
 importers' `specLookups` are checked against. -/
 private def ownSpecKeys (env : Environment) : Array (Digest × Name) :=
-  specKeysOf (specCacheEntries env none)
+  (specKeysOf (specCacheEntries env none)).qsort (·.1.lt ·.1)
 
 /-- For each key the current module looked up in the specialization cache (`lookups`), deduplicated and sorted,
 its providers among the imported non-`module` files with digests (`specProviders`); Lake rebuilds the module when
 one of these changes. Providers in modules without digests (the toolchain) are pinned by the Lean githash, those in
 `module` files by Lake's `modsysHash`. -/
 private def specLookups (env : Environment) (lookups : Array Expr) : Array (Digest × Digest) :=
-  let keys := (lookups.foldl (·.insert <| specKeyDigest ·) ({} : Std.HashSet Digest)).toArray.qsort (·.hex < ·.hex)
+  let keys := (lookups.foldl (·.insert <| specKeyDigest ·) ({} : Std.HashSet Digest)).toArray.qsort Digest.lt
   if keys.isEmpty then #[] else
   let s := state env
   specProviders keys <| env.header.moduleNames.zipIdx.filterMap fun (m, i) =>
@@ -587,10 +582,9 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
     (used : NameSet) (lookups : Array Expr) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
   let s := state env
   let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecks)
-  let allExtra ← if (← compilerCodeSeen) then
-      pure <| env.header.moduleNames.zipIdx.foldl (init := allExtra) fun u (m, i) =>
-        if s.hasEntries i then u.insert { module := m, isExported := false, isMeta := false } else u
-    else pure allExtra
+  let allExtra := if (← compilerCodeSeen) then
+      env.header.moduleNames.foldl (·.insert { module := ·, isExported := false, isMeta := false }) allExtra
+    else allExtra
   let extraMods := allExtra.toArray.filter (fun u => (env.getModuleIdx? u.module).any s.hasEntries)
     |>.qsort fun a b => let k (u : ExtraModUse) := 2 * u.isExported.toNat + u.isMeta.toNat
       Name.quickLt a.module b.module || (a.module == b.module && k a < k b)
