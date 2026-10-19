@@ -44,6 +44,11 @@ public structure Env where
   enableArtifactCache? : Option Bool
   /-- Whether to restore all artifacts from the Lake cache by default (i.e., `LAKE_RESTORE_ARTIFACTS`). -/
   restoreAllArtifacts? : Option Bool
+  /--
+  Whether to skip compiling a module when nothing it used changed meaning (i.e., `LAKE_USAGE_CUTOFF`,
+  off unless set to a true value).
+  -/
+  usageCutoff : Bool
   /-- Whether the system cache has been disabled (`LAKE_CACHE_DIR` is set but empty). -/
   noSystemCache : Bool := false
   /--
@@ -176,6 +181,7 @@ public def compute
     noCache := (noCache <|> (← IO.getEnv "LAKE_NO_CACHE").bind envToBool?).getD false
     enableArtifactCache? := (← IO.getEnv "LAKE_ARTIFACT_CACHE").bind envToBool?
     restoreAllArtifacts? := (← IO.getEnv "LAKE_RESTORE_ARTIFACTS").bind envToBool?
+    usageCutoff := ((← IO.getEnv "LAKE_USAGE_CUTOFF").bind envToBool?).getD false
     lakeConfig? := (← IO.getEnv "LAKE_CONFIG") <|> userHome?.map (· / ".lake" / "config.toml" |>.toString)
     cacheKey? := (← IO.getEnv "LAKE_CACHE_KEY").map (·.trimAscii.copy)
     cacheArtifactEndpoint? := (← IO.getEnv "LAKE_CACHE_ARTIFACT_ENDPOINT").map normalizeUrl
@@ -310,6 +316,7 @@ public def vars (env : Env) : Array (String × Option String)  :=
     ("LAKE_CACHE_DIR", if let some cache := env.lakeCache? then cache.dir.toString else ""),
     ("LAKE_ARTIFACT_CACHE", if let some b := env.enableArtifactCache? then toString b else ""),
     ("LAKE_RESTORE_ARTIFACTS", if let some b := env.restoreAllArtifacts? then toString b else ""),
+    ("LAKE_USAGE_CUTOFF", some (toString env.usageCutoff)),
     ("LEAN_PATH", some env.leanPath.toString),
     ("LEAN_SRC_PATH", some env.leanSrcPath.toString),
     ("LEAN_GITHASH", env.leanGithash),

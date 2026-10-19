@@ -198,6 +198,10 @@ export LAKE_CONFIG="$WORK_DIR/services.toml"
 test_run build Test -o outputs.jsonl
 test_exp -s outputs.jsonl
 
+# Record the uploaded hash of an importee's `.olean`: a `cache get` restore must reproduce its
+# bytes exactly (a leantar that rewrites ByteArray headers on unpack breaks this)
+BASIC_OLEAN_HASH="$(cat .lake/build/lib/lean/Test/Basic.olean.hash)"
+
 # Verify artifacts and outputs are uploaded to the default upload service
 test_run cache put outputs.jsonl --scope=test
 REV="$(git rev-parse HEAD)"
@@ -216,6 +220,9 @@ test_out 'downloaded artifact' cache get --scope=test --service=ok
 test_artifacts "$NUM_ARTS"
 test_exp -d "$CACHE_DIR/revisions/test"
 test_run build Test --no-build
+
+# The restored `Basic.olean` has the uploaded hash, so `Test`'s dependency trace still matches
+test_exp "$(cat .lake/build/lib/lean/Test/Basic.olean.hash)" = "$BASIC_OLEAN_HASH"
 
 # Verify cached outputs and artifacts are not fetched again
 test_not_out 'downloading' cache get --scope=test --service=ok
