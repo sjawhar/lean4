@@ -7,6 +7,22 @@ copy_to_work lakefile.toml
 export LAKE_CACHE_DIR=
 # The cutoff is off by default: every arm that expects it turns it on (or off) explicitly
 export LAKE_USAGE_CUTOFF=1
+# built_or_restored MOD -- the last build (`produced.out`, verbose) did not replay MOD: it compiled MOD, or, when the
+# test runs with a writable artifact cache that restores artifacts (`LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true`,
+# the cache-env run), it restored a compile of MOD that the cache's usage index offered, which passed the usage
+# cutoff's check on the cache's own bytes (`usage index: restored` in MOD's job)
+built_or_restored() {
+  no_match_text "Replayed $1" produced.out
+  awk -v m=" $1" '/^[^ ]+ \[[0-9]+\/[0-9]+\]/ {
+    s = $0; sub(/ \([0-9.]+m?s\)$/, "", s); show = substr(s, length(s) - length(m) + 1) == m }
+    show' produced.out > job.out
+  if [ "${LAKE_ARTIFACT_CACHE:-}" = true ] && [ "${LAKE_RESTORE_ARTIFACTS:-}" = true ] && \
+      grep -qF "usage index: restored" job.out; then
+    match_text "usage index: restored" job.out
+  else
+    match_text "Built $1" produced.out
+  fi
+}
 mkdir -p Test
 printf 'def a := 1\ntheorem ta : a = 1 := sorry\n' > Test/A.lean
 printf 'import Test.A\ndef b := a + 1\n' > Test/B.lean
@@ -38,31 +54,31 @@ printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH 
 test_not_out "warning" build -v Test.HU
 match_text "Replayed Test.HU" produced.out
 # the `.usekey` is read first, and only the `.usage` it was written from is accepted: any other `.usage` (here one
-# that would not even parse) leaves HU stale: built, no warning
+# that would not even parse) leaves HU stale: not replayed (built, or restored from the cache's usage index), no warning
 # (sidecars are removed before being rewritten: under an artifact cache they are read-only links)
 printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 1\n' > Test/H.lean
 rm -f .lake/build/lib/lean/Test/HU.usage
 printf '{"version":13,"noskip":false,"moduleDigest":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","providesDigest":"00000000000000000000000000000000","provides":[[],[]],"indirect":[],"digested":[],"importedClosures":[],"importedDigests":[],"own":[],"used":[[[true],[]]],"resolvedAll":false,"resolved":[],"extra":[],"specKeys":[],"specLookups":[]}' > .lake/build/lib/lean/Test/HU.usage
 test_not_out "warning" build -v Test.HU
-match_text "Built Test.HU" produced.out
-# a name component that is neither a string nor a number is corrupt input: warned, then built
+built_or_restored Test.HU
+# a name component that is neither a string nor a number is corrupt input: warned, then not replayed
 printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 3\n' > Test/H.lean
 rm -f .lake/build/lib/lean/Test/HU.usekey
 printf '{"version":13,"usage":"00000000000000000000000000000000","local":"0000000000000000","olean":"00000000000000000000000000000000","modsys":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","extra":[[[true],"00000000000000000000000000000000","00000000000000000000000000000000"]]}' > .lake/build/lib/lean/Test/HU.usekey
-test_out "expected a name component" build Test.HU
-match_text "Built Test.HU" produced.out
+test_out "expected a name component" build -v Test.HU
+built_or_restored Test.HU
 # so is a sidecar that is not UTF-8
 printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 4\n' > Test/H.lean
 rm -f .lake/build/lib/lean/Test/HU.usekey
 printf '\377' > .lake/build/lib/lean/Test/HU.usekey
-test_out "Test/HU.usekey" build Test.HU
-match_text "Built Test.HU" produced.out
-# a sidecar of another format version (another toolchain wrote it) reads as absent: built, no warning
+test_out "Test/HU.usekey" build -v Test.HU
+built_or_restored Test.HU
+# a sidecar of another format version (another toolchain wrote it) reads as absent: not replayed, no warning
 rm -f .lake/build/lib/lean/Test/HU.usekey
 printf '{"version":3,"local":"0000000000000000","olean":"00000000000000000000000000000000","modsys":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","extra":[]}' > .lake/build/lib/lean/Test/HU.usekey
 printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 2\n' > Test/H.lean
 test_not_out "warning" build -v Test.HU
-match_text "Built Test.HU" produced.out
+built_or_restored Test.HU
 # unrelated addition: A recompiles, nothing below it does
 printf 'def a := 1\ntheorem ta : a = 1 := sorry\ndef unrelated := 2\n' > Test/A.lean
 lake_out build -v Test.B Test.C Test.D
@@ -88,10 +104,11 @@ printf '[leanOptions]\nmaxRecDepth = 1000\n' >> lakefile.toml
 test_out "Built Test.B" build Test.B
 cp lakefile.toml.bak lakefile.toml
 test_run build Test.B
-# missing key: the module builds
+# missing key: the module builds (or is restored from a compile the cache's usage index offers)
 rm .lake/build/lib/lean/Test/B.usekey
 printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 3\n' > Test/A.lean
-test_out "Built Test.B" build Test.B
+lake_out build -v Test.B
+built_or_restored Test.B
 # disabled: Lake asks Lean for no usage data, so B has no sidecars and its `.olean` no digests
 printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 4\n' > Test/A.lean
 LAKE_USAGE_CUTOFF=0 test_out "Built Test.B" build Test.B
@@ -101,9 +118,11 @@ printf '%s\n' 'import Lean' 'import Test.B' 'open Lean Elab Command' '#eval show
   '  logInfo m!"{((← getEnv).getModuleIdx? `Test.B).map (ModuleUsage.state (← getEnv)).hasEntries}"' \
   > Test/Inspect.lean
 test_cmd_out "some (false)" "$LAKE" env lean Test/Inspect.lean
-# the next cutoff-on build compiles B instead of replaying it, and B has digests again
+# the next cutoff-on build compiles B (or restores a cutoff-on compile of it from the cache's usage index) instead of
+# replaying it, and B has digests again
 printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 4\ndef unrelated4 := 0\n' > Test/A.lean
-test_out "Built Test.B" build -v Test.B
+lake_out build -v Test.B
+built_or_restored Test.B
 test_cmd_out "some (true)" "$LAKE" env lean Test/Inspect.lean
 # the cutoff setting is part of the trace: a cutoff-on build compiles again an import last built with the
 # cutoff off, so B is checked against its new digests (here `a` changed, so B builds)
@@ -130,12 +149,14 @@ rm -f .lake/build/lib/lean/Test/B.usekey
 printf '{' > .lake/build/lib/lean/Test/B.usekey
 test_out "Test/B.usekey" build Test.B
 # a key is bound to its module's .olean: an .olean rewritten behind Lake's back (e.g. by another
-# toolchain, which keeps the old sidecars) makes the module build normally
+# toolchain, which keeps the old sidecars) makes the module build normally (or be restored from the cache's usage
+# index, whose check reads the cache's bytes)
 printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 6\n' > Test/A.lean
 { cat .lake/build/lib/lean/Test/B.olean; printf 'x'; } > B.tmp
 mv -f B.tmp .lake/build/lib/lean/Test/B.olean
 rm .lake/build/lib/lean/Test/B.olean.hash
-test_out "Built Test.B" build Test.B
+lake_out build -v Test.B
+built_or_restored Test.B
 # `lean -o` without `--usage` rewrites an .olean without digests and keeps its old sidecars (and, without
 # `--rehash`, its old `.hash`): a module compiled against it records nothing it uses from it, so it gets no
 # key and compiles again (and fails) once that import changes. With the artifact cache on, Lake restores the
