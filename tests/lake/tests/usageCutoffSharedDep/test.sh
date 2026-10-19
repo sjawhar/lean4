@@ -94,7 +94,7 @@ test_exp $rc = 0
 no_match_text "Replayed T.M" race.log
 match_text "Built T.M" race.log
 
-# Waits until the build that `race_in_compile` started holds, or fails.
+# Waits until the build running in the background holds (it creates `ready`), or fails.
 await_ready() {
   for _ in $(seq 600); do
     test -f ready && break
