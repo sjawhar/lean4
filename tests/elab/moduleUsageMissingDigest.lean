@@ -2,9 +2,9 @@ import Lean
 /-! A `.usage` record never drops a used constant silently. A constant of a module that carries no usage
 digests (the stage-1 toolchain's own modules, compiled by stage 0) is left out by name. A declaration that
 only existed in an environment the module discarded — here `base.dep`, realized under `withoutModifyingEnv`
-and then reused from the realization cache by an `example` — stands for the constants it used. Any other
-used constant without a full or statement digest is an error, in the per-command records
-(`usesFull`/`usesStmt`) and in the module-level `used`/`usedAttrs`. -/
+and then reused from the realization cache by an `example` — stands for the constants it used. A constant of
+this module without a digest refuses the per-command records. An imported constant without a full or statement
+digest is an error, in the per-command records (`usesFull`/`usesStmt`) and in the module-level `used`/`usedAttrs`. -/
 open Lean
 
 def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
@@ -70,8 +70,8 @@ example : use_dep% base = 2 := rfl
   let consts := ModuleUsage.ownConsts env
   let own := ModuleUsage.localDigests env consts
   let stmt := ModuleUsage.computeStmt env (ModuleUsage.stmtState env) own consts
-  expectError "local constant without a digest" do
-    discard <| ModuleUsage.commandRecords env (own.filter (·.1 != `m)) stmt #[]
+  let (recs, reason?) ← ModuleUsage.commandRecords env (own.filter (·.1 != `m)) stmt #[]
+  IO.println s!"local constant without a digest: {recs.size} records, refused: {reason?.getD "no"}"
   let noFull := ModuleUsage.ext.modifyState env fun s =>
     { s with importedModuleEntries := dropEntry `xd s.importedModuleEntries }
   expectError "imported constant without a full digest (command)" do

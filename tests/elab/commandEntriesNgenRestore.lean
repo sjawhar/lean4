@@ -63,7 +63,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let some kept := obs.find? (·.i == 1) | throw <| IO.userError "no observation 1"
   let some ce := payloads.find? (·.idx == 1) | throw <| IO.userError "no payload 1"
   let post := (records[1]?.bind fun r => (r.getObjVal? "post").toOption).getD .null
-  IO.println s!"full run: {localNames fullEnv}; command 1 stateOnly {ce.stateOnly}"
+  IO.println s!"full run: {localNames fullEnv}; command 1 refusals {ce.refusals}"
   let replayed ← replayCommandEntries (← CommandEntries.Testing.rollbackTo kept.before.env kept.after.env) ce {}
   let ctx : Command.Context := { fileName := "M.lean", fileMap := mSource.toFileMap, snap? := none, cancelTk? := none }
   let fullValue := (fullEnv.find? `pm).bind (·.value? (allowOpaque := true))
@@ -107,7 +107,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let ctx : Command.Context := { fileName := "N.lean", fileMap := nSource.toFileMap, snap? := none, cancelTk? := none }
   let st := { kept.before with env := replayed, ngen }
   let (_, after) ← ((elabCommandTopLevel next.stx).run ctx |>.run st).toIO fun _ => IO.userError "failed"
-  IO.println s!"N, command 2 sets the generator back: stateOnly {ce.stateOnly}, generator after it below the one \
+  IO.println s!"N, command 2 sets the generator back: refusals {ce.refusals}, generator after it below the one \
     before it {decide (kept.after.ngen.idx < kept.before.ngen.idx)}; command 3: full run {localNames nEnv}, \
     after keeping command 2 {localNames after.env}"
 

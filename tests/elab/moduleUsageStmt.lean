@@ -35,7 +35,7 @@ def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
     throw <| IO.userError s!"lean {args} failed ({out.exitCode}):\n{out.stdout}\n{out.stderr}"
 
 #eval IO.FS.withTempDir fun dir => do
-  IO.FS.writeFile (dir / "X.lean") "import Lean\nopen Lean\n@[simp] theorem xs : 1 = 1 := rfl\ndef xd := 1\ninitialize unreplayableExt : PersistentEnvExtension Name (Name × Nat) (Array Name) ← registerPersistentEnvExtension { mkInitial := pure #[], addImportedFn := fun _ => pure #[], addEntryFn := fun s (n, _) => s.push n, exportEntriesFn := fun s => s }\ninitialize registerBuiltinAttribute { name := `unreplayable, descr := \"test\", add := fun decl _ _ => modifyEnv (unreplayableExt.addEntry · (decl, 0)) }\n"
+  IO.FS.writeFile (dir / "X.lean") "import Lean\nopen Lean\n@[simp] theorem xs : 1 = 1 := rfl\ndef xd := 1\ninitialize unreplayableExt : PersistentEnvExtension Name (Name × Nat) (Array Name) ← registerPersistentEnvExtension { mkInitial := pure #[], addImportedFn := fun _ => pure #[], addEntryFn := fun s (n, _) => s.push n, exportEntriesFn := fun s => s, stateDelta? := some fun s₀ s₁ => .entries (s₁.extract s₀.size s₁.size) }\ninitialize registerBuiltinAttribute { name := `unreplayable, descr := \"test\", add := fun decl _ _ => modifyEnv (unreplayableExt.addEntry · (decl, 0)) }\n"
   IO.FS.writeFile (dir / "M.lean") "import X\ndef m := xd\ntheorem m2 : 1 = 1 := xs\n@[unreplayable] def unsupported := 0\n"
   runLean dir #["-o", "X.olean", "X.lean"]
   runLean dir #["-o", "M.olean", "M.lean"]
@@ -53,7 +53,7 @@ def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
   -- conversion back cannot be replayed, so the module is declined with the extension's name
   let declined := (m.getObjValAs? Bool "noskip").toOption == some true &&
     (m.getObjValAs? String "noskipReason").toOption ==
-      some "unreplayable extension unreplayableExt"
+      some "declaration command 2: entries for unreplayableExt, which has no `ofOLeanEntry?` to replay them"
   IO.println s!"{(m.getObjValAs? Nat "version").toOption == some 4} {(arr m "stmt").any (named `m2)} \
     {xsAttrs.isSome && xsUsed == xsAttrs} {usedAttrsX.any (named `xd)} \
     {declined} {(m.getObjValAs? (Array Json) "commands").toOption.isSome}"

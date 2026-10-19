@@ -1,12 +1,12 @@
 import Lean
 /-! A command that changes an extension's state without adding an entry to it or logging a stack operation (a
-declaration attribute that edits the simp state through the scoped extension's underlying persistent extension) records
-the extension in its payload's `stateOnly`, and `replayCommandEntries` refuses that payload instead of replaying it
+declaration attribute that edits the simp state through the scoped extension's underlying persistent extension) is
+refused for the extension (`Refusal.inexpressible`), and `replayCommandEntries` refuses that payload instead of replaying it
 without the change. An erasure (`attribute [-simp] x`) is a `ScopedEnvExtension.modifyState` (`Op.modify`), which
 `ScopedEnvExtension.stackDelta` does not express, so it is refused too. A declaration command with such a change
 declines the module (`noskip`). An erasure inside `attribute [-simp] x in theorem …` is undone on the main branch by
 the command's own scope, but the theorem's asynchronous branch forked inside that scope and keeps it, and no stack
-operation expresses an erasure, so that command is refused too (`CommandEntries.branchStateOnly`). The commands after
+operation expresses an erasure, so that command is refused too (a refusal in the theorem's record). The commands after
 an erasure see which lemma it erased in their context digest (`ctx`). -/
 open Lean
 

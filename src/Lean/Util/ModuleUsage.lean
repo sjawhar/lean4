@@ -201,6 +201,7 @@ builtin_initialize ext : PersistentEnvExtension (Name × Digest) (Name × Digest
       let es := #[(.anonymous, default)] ++ s.localDigests?.getD (compute env s)
       { exported := #[], server := #[], «private» := es }
     asyncMode := .mainOnly
+    perCommand := .recorder
   }
 
 def state (env : Environment) : State := ext.getState (asyncMode := .mainOnly) env
@@ -294,6 +295,7 @@ builtin_initialize stmtExt : PersistentEnvExtension (Name × Digest × Digest) (
       let es := #[(.anonymous, default, default)] ++ s.localStmt?.getD (computeStmt env s own)
       { exported := #[], server := #[], «private» := es }
     asyncMode := .mainOnly
+    perCommand := .recorder
   }
 
 def stmtState (env : Environment) : StmtState := stmtExt.getState (asyncMode := .mainOnly) env
@@ -320,7 +322,8 @@ def importedDigests? (env : Environment) (i : ModuleIdx) (c : Name) :
 
 /-- Per defining module, sorted: every imported constant that the current module's own constants refer to or
 that is in `extra`, with its full and attrs digests. Constants of a module without digests are left out
-(`importedDigests?`). -/
+(`importedDigests?`), and so are names in `extra` that are no constant (an IR-only name, or one a rejected
+declaration referred to), for which `commandRecords` refuses the module. -/
 def moduleUsed (env : Environment) (extra : NameSet) (consts := ownConsts env) :
     Except String (Array (Name × Array (Name × Digest × Digest))) := do
   let used := consts.foldl (init := extra) fun u (_, _, rs) => rs.foldl (·.insert ·) u
@@ -328,6 +331,7 @@ def moduleUsed (env : Environment) (extra : NameSet) (consts := ownConsts env) :
   for c in used do
     -- the current module's constants are in `own`
     let some i := env.getModuleIdxFor? c | continue
+    unless env.contains c do continue
     let some (d, _, attrs) ← importedDigests? env i c | continue
     byMod := byMod.alter env.header.modules[i.toNat]!.module fun o => some ((o.getD #[]).push (c, d, attrs))
   return byMod.toArray.map (fun (k, v) => (k, v.qsort fun a b => Name.quickLt a.1 b.1))
@@ -631,38 +635,37 @@ inductive CommandStateField where
   | reset
   /-- Read by no later command's elaboration; the reason is at `commandStateFields`. -/
   | unread
-  /-- A change makes the command's payload `stateOnly` (`commandStateChanges`). -/
-  | stateOnly
+  /-- A change refuses the command's payload (`commandStateChanges`). -/
+  | refused
   deriving Repr, BEq
 
 /--
 Every field of `Elab.Command.State`, classified:
 - `env`: the extension payload.
 - `messages`, `traceState`, `snapshotTasks`: reset before every command, reported per command.
-- `scopes`: `stateOnly` when `scopesEnc` differs; a kept command's scopes are not recorded.
+- `scopes`: refused when `scopesEnc` differs; a kept command's scopes are not recorded.
 - `usedQuotCtxts`, `auxDeclNGen`, `maxRecDepth`, `ngen`: `post` and `ctx`. `ngen` reaches the environment (see
   `CommandPost.ngen`), so a command elaborated from another generator can declare other names or values.
-- `nextMacroScope`: `withInitQuotContext` restores it after every top-level command with source; `stateOnly`
-  otherwise.
-- `infoState`: reset by `elabCommandTopLevel` except `enabled`, which is `stateOnly` when it differs.
+- `nextMacroScope`: `withInitQuotContext` restores it after every top-level command with source; refused otherwise.
+- `infoState`: reset by `elabCommandTopLevel` except `enabled`, which is refused when it differs.
 - `prevLinterStates`: read only by stateful linters, which run under `withoutModifyingEnv` and only log messages.
 -/
 def commandStateFields : Array (Name × CommandStateField) := #[
-  (`env, .env), (`messages, .reset), (`scopes, .stateOnly), (`usedQuotCtxts, .replayed),
-  (`nextMacroScope, .stateOnly), (`maxRecDepth, .replayed), (`ngen, .replayed), (`auxDeclNGen, .replayed),
-  (`infoState, .stateOnly), (`traceState, .reset), (`snapshotTasks, .reset), (`prevLinterStates, .unread)]
+  (`env, .env), (`messages, .reset), (`scopes, .refused), (`usedQuotCtxts, .replayed),
+  (`nextMacroScope, .refused), (`maxRecDepth, .replayed), (`ngen, .replayed), (`auxDeclNGen, .replayed),
+  (`infoState, .refused), (`traceState, .reset), (`snapshotTasks, .reset), (`prevLinterStates, .unread)]
 
-/-- The `stateOnly` markers (`Lean.Elab.Command.<field>`) of the `commandStateFields` a command changed. -/
-def commandStateChanges (before after : Elab.Command.State) : Array Name := Id.run do
-  let mut markers := #[]
+/-- The refusals for the `commandStateFields` a command changed that payloads do not carry. -/
+def commandStateChanges (before after : Elab.Command.State) : Array Refusal := Id.run do
+  let mut refused := #[]
   unless SharedDiff.sameObject before.scopes after.scopes ||
       (scopesEnc {} before.scopes).finish == (scopesEnc {} after.scopes).finish do
-    markers := markers.push `Lean.Elab.Command.scopes
+    refused := refused.push (.commandState `scopes)
   if before.nextMacroScope != after.nextMacroScope then
-    markers := markers.push `Lean.Elab.Command.nextMacroScope
+    refused := refused.push (.commandState `nextMacroScope)
   if before.infoState.enabled != after.infoState.enabled then
-    markers := markers.push `Lean.Elab.Command.infoState
-  return markers
+    refused := refused.push (.commandState `infoState)
+  return refused
 
 /-- The command-context portion available before payload recording is folded in by the reuse frontend.
 `quotCtxts` is the digest of `st.usedQuotCtxts`. -/
@@ -742,6 +745,14 @@ def isAuxName (env : Environment) (n : Name) : Bool :=
     s.contains "._auxLemma" || s.contains "._proof_" || s.contains "._eq_" ||
     s.endsWith "._sunfold" || s.endsWith "._native"
 
+/-- What a command's record holds for one name it used. -/
+private inductive UseDigests where
+  /-- a constant of an imported module that carries no usage digests (`importedDigests?`) -/
+  | untracked
+  | digests (full core attrs : Digest)
+  /-- no digest stands for the name; `commandRecords` writes no records -/
+  | unattributed (reason : String)
+
 /-- The constants the transient declaration `n` stands for: what it used, each transient declaration among
 those replaced in turn. -/
 private partial def transientDeps (transient : Std.HashMap Name NameSet) (seen out : NameSet) :
@@ -753,9 +764,12 @@ private partial def transientDeps (transient : Std.HashMap Name NameSet) (seen o
       | some ds => transientDeps transient (seen.insert c) out (ds.toList ++ cs)
       | none => transientDeps transient (seen.insert c) (out.insert c) cs
 
+/-- The per-command records, or none and why, when a command used a name no digest stands for: one that names no
+constant (a declaration the kernel or the elaborator rejected referred to it; an IR-only name), or a constant of this
+module the kernel environment does not hold. The module is then `noskip`. -/
 def commandRecords (env : Environment) (own : Array (Name × Digest))
     (stmt : Array (Name × Digest × Digest)) (payloads : Array CommandEntries) :
-    IO (Array CommandRecord) := IO.FS.withTempDir fun dir => do
+    IO (Array CommandRecord × Option String) := IO.FS.withTempDir fun dir => do
   let observations ← commandObservationsRef.get
   let declEntries ← declsByCommandRef.get
   let explicitUses ← usedByCommandRef.get
@@ -769,17 +783,18 @@ def commandRecords (env : Environment) (own : Array (Name × Digest))
   let transient : Std.HashMap Name NameSet := declEntries.foldl (init := {}) fun m (_, ns, used) =>
     ns.foldl (init := m) fun m n =>
       if env.contains n then m else m.insert n (used.foldl (·.insert ·) (m.getD n {}))
-  let digestsOf (i : Nat) (n : Name) : Except String (Option (Digest × Digest × Digest)) := do
+  let digestsOf (i : Nat) (n : Name) : Except String UseDigests := do
+    if !env.contains n then
+      return .unattributed s!"command {i} uses `{n}`, which names no constant of this module or its imports"
     if let some m := env.getModuleIdxFor? n then
-      return ← importedDigests? env m n
-    let some full := fullLocal[n]? | throw <| if env.contains n then
-        s!"usage: command {i} uses `{n}`, a constant of this module without a full digest"
-      else
-        s!"usage: command {i} uses `{n}`, which is neither imported, a constant of this module, nor a \
-          declaration this module elaborated"
+      return match ← importedDigests? env m n with
+        | some (full, core, attrs) => .digests full core attrs
+        | none => .untracked
+    let some full := fullLocal[n]? |
+      return .unattributed s!"command {i} uses `{n}`, a constant of this module the kernel environment does not hold"
     let some (core, attrs) := stmtLocal[n]? |
       throw s!"usage: command {i} uses `{n}`, a constant of this module without a statement digest"
-    return some (full, core, attrs)
+    return .digests full core attrs
   let mut occurrences : Std.HashMap (Name × Digest) Nat := {}
   let payloadByIdx : Std.HashMap Nat CommandEntries :=
     payloads.foldl (fun m p => m.insert p.idx p) {}
@@ -848,9 +863,12 @@ def commandRecords (env : Environment) (own : Array (Name × Digest))
     let mut fullUses := #[]
     let mut stmtUses := #[]
     for n in used do
-      let some (d, core, attrs) ← IO.ofExcept (digestsOf obs.i n) | continue
-      if full.contains n then fullUses := fullUses.push (n, d, attrs)
-      else stmtUses := stmtUses.push (n, core)
+      match ← IO.ofExcept (digestsOf obs.i n) with
+      | .untracked => pure ()
+      | .unattributed reason => return (#[], some reason)
+      | .digests d core attrs =>
+        if full.contains n then fullUses := fullUses.push (n, d, attrs)
+        else stmtUses := stmtUses.push (n, core)
     let usesFull := fullUses.qsort fun a b => Name.quickLt a.1 b.1
     let usesStmt := stmtUses.qsort fun a b => Name.quickLt a.1 b.1
     let text := textDigest obs.stx
@@ -895,9 +913,46 @@ def commandRecords (env : Environment) (own : Array (Name × Digest))
       let _ ← unsafe CompactedRegion.save path `commandEntries payload #[] none
       entries := (({} : Enc).digest entries |>.digest (Digest.ofBytes (← IO.FS.readBinFile path))).finish
       -- a change no entry expresses (an erasure) is determined by the command's text and context
-      unless payload.stateOnly.isEmpty do
+      unless payload.refusals.isEmpty do
         entries := (({} : Enc).digest entries |>.digest text |>.digest ctx).finish
-  return out
+  return (out, none)
+
+/-- The command payloads of the observed commands (`recordCommandDelta`), each also refused for the command-state
+fields it changed (`commandStateChanges`) and the attributes with handlers outside core Lean it ran
+(`foreignAttributesByCommandRef`). -/
+def commandPayloads (observations : Array CommandObservation) : IO (Array CommandEntries) := do
+  let foreign : Std.HashMap Nat (Array Refusal) := (← foreignAttributesByCommandRef.get).foldl (init := {})
+    fun m (i, attr) => m.alter i fun rs => some ((rs.getD #[]).push (.foreignAttribute attr))
+  (observations.qsort (·.i < ·.i)).mapM fun obs => do
+    let ce ← recordCommandDelta obs.before.env obs.after.env obs.i
+    let extra := commandStateChanges obs.before obs.after ++ foreign.getD obs.i #[]
+    return { ce with refusals := extra.foldl (fun rs r => if rs.contains r then rs else rs.push r) ce.refusals }
+
+/-- What a module records for reuse: its command payloads, its `.usage` command records, and why it is `noskip`. -/
+structure ModuleRecords where
+  payloads : Array CommandEntries := #[]
+  commands : Array CommandRecord := #[]
+  noskipReason? : Option String := none
+
+/-- The module's payloads, records and `noskip` reason, from the observations (`commandObservationsRef`):
+- a frontend the module ran in-process (`sessionChanged`: `runFrontend` reset the recording references; or a repeated
+  command index: `Lean.Elab.process` recorded from index 0 again) leaves observations that are not the module's: none;
+- a module-system file is never partially re-elaborated: no payloads, `noskip`;
+- a command that used a name no digest stands for: no records, `noskip` (`commandRecords`);
+- a declaration command with a refusal: `noskip` (`commandEntriesNoskipReason?`). -/
+def moduleRecords (env : Environment) (own : Array (Name × Digest)) (stmt : Array (Name × Digest × Digest))
+    (sessionChanged : Bool) : IO ModuleRecords := do
+  let observations ← commandObservationsRef.get
+  let nested := sessionChanged ||
+    (observations.foldl (fun s o => s.insert o.i) ({} : Std.HashSet Nat)).size != observations.size
+  let moduleSystem? := guard env.header.isModule *> some "module-system"
+  if nested then
+    return { noskipReason? := moduleSystem? <|> some "command observations of a nested frontend" }
+  let payloads ← if env.header.isModule then pure #[] else commandPayloads observations
+  let (commands, unattributed?) ← commandRecords env own stmt payloads
+  let declIdxs := commands.foldl (init := ({} : Std.HashSet Nat)) fun s c => if c.isDecl then s.insert c.i else s
+  return { payloads, commands,
+           noskipReason? := moduleSystem? <|> unattributed? <|> commandEntriesNoskipReason? payloads declIdxs.contains }
 
 /-- A digest of the module's import closure: its sorted module names. -/
 def closureDigest (env : Environment) : Digest :=

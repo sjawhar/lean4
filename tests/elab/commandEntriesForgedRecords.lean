@@ -1,19 +1,14 @@
 import Lean
 /-! A declaration command that writes an extension through a sanctioned writer (`PersistentEnvExtension.addEntry` or
-`modifyState`, `ScopedEnvExtension.addLocalEntry`) called with a record other than the registered one is recorded as
-`stateOnly` and refused, and the module is `noskip` (`decl2f-delta2-review.md` finding 1): a record with another
+`modifyState`, `ScopedEnvExtension.addLocalEntry`) called with a record other than the registered one is refused, and
+the module is `noskip` (`decl2f-delta2-review.md` finding 1): a record with another
 `addEntryFn`; one with `stateDeltaSeesDirectWrites` set where the registered record leaves it unset; another
 extension's record over this extension's `EnvExtension`; a scoped record with another descriptor; and the registered
 record over an `EnvExtension` whose index was changed through a structure extending `EnvExtension` (its constructor
-is private, a child's is not). A write through the registered record replays. -/
+is private, a child's is not). A write through the registered record replays. The attributes are registered by an
+imported module, so each command is also refused for its attribute (`Refusal.foreignAttribute`); the replay drops that
+refusal to check the records themselves. -/
 open Lean
-
-/-- The extensions `keep` selects among a payload's entries, as `name.view`: checked entries, main entries, then the
-scoped extensions' operations. -/
-def shownEntries (ce : CommandEntries) (keep : Name → Bool) : Array String :=
-  let named (view : String) (es : Array (Name × Array EnvExtensionEntry)) :=
-    es.filterMap fun (n, _) => if keep n then some s!"{n}.{view}" else none
-  named "checked" ce.checked.entries ++ named "main" ce.main.entries ++ named "main" ce.main.scopedOps
 
 def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
   let out ← IO.Process.output { cmd := "lean", args, cwd := dir, env := #[("LEAN_PATH", some dir.toString)] }
@@ -90,13 +85,14 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let names := [`logExt, `otherExt, `scopeExt]
   for o in obs do
     let some ce := payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"
+    let ce := { ce with refusals := ce.refusals.filter (!· matches .foreignAttribute _) }
     let replay ← try
         let env ← replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}
         let full ← view o.after.env
         let got ← view env
         pure (if full == got then "replay matches" else s!"replay differs:\n    full     {full}\n    replayed {got}")
       catch _ => pure "refused"
-    IO.println s!"{o.i}: stateOnly {ce.stateOnly.filter names.contains}, \
-      entries {shownEntries ce names.contains}; {replay}"
+    IO.println s!"{o.i}: refused for {(ce.refusals.filterMap (·.ext?)).filter names.contains}, \
+      entries {CommandEntries.Testing.shownEntries ce names.contains}; {replay}"
 
 #eval main

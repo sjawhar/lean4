@@ -8,6 +8,7 @@ module
 prelude
 public import Lean.CoreM
 public import Lean.Compiler.MetaAttr
+import Lean.Util.UsedByChecks
 
 public section
 
@@ -28,6 +29,11 @@ structure AttributeImplCore where
   name : Name
   descr : String
   applicationTime := AttributeApplicationTime.afterTypeChecking
+  /-- Whether `add` and `erase` run core Lean's code only, whichever module registers the attribute (as for the
+  attributes `registerSimpAttr` and `registerLabelAttr` make). The handlers of an attribute registered while a module is
+  imported (`initialize`) that does not set it may run that module's code, which may write state no command payload
+  carries: a command that runs them is not kept (`foreignAttributesByCommandRef`). -/
+  onlyCoreCode : Bool := false
   deriving Inhabited
 
 /-- You can tag attributes with the 'local' or 'scoped' kind.
@@ -65,12 +71,20 @@ structure AttributeImpl extends AttributeImplCore where
 
 builtin_initialize attributeMapRef : IO.Ref (Std.HashMap Name AttributeImpl) ← IO.mkRef {}
 
-/-- Low level attribute registration function. -/
+/-- `attr` with `add` and `erase` recording that the running command ran them (`recordForeignAttribute`). -/
+private def recordingForeignRuns (attr : AttributeImpl) : AttributeImpl :=
+  { attr with
+    add := fun decl stx kind => do recordForeignAttribute attr.name; attr.add decl stx kind
+    erase := fun decl => do recordForeignAttribute attr.name; attr.erase decl }
+
+/-- Low level attribute registration function. An attribute registered after the builtin initializers (by a module's
+`initialize`) records its handlers' runs unless it runs core code only (`onlyCoreCode`). -/
 def registerBuiltinAttribute (attr : AttributeImpl) : IO Unit := do
   let m ← attributeMapRef.get
   if m.contains attr.name then throw (IO.userError s!"Invalid builtin attribute declaration: `{attr.name}` has already been used")
   unless (← initializing) do
     throw (IO.userError "Failed to register attribute: Attributes can only be registered during initialization")
+  let attr := if (← IO.initializing) || attr.onlyCoreCode then attr else recordingForeignRuns attr
   attributeMapRef.modify fun m => m.insert attr.name attr
 
 /-!
@@ -435,9 +449,15 @@ abbrev AttributeImplBuilderTable := Std.HashMap Name AttributeImplBuilder
 
 builtin_initialize attributeImplBuilderTableRef : IO.Ref AttributeImplBuilderTable ← IO.mkRef {}
 
+/-- Registers an attribute implementation builder. The attributes a builder registered after the builtin initializers
+(by a module's `initialize`) builds record their handlers' runs unless they run core code only (`onlyCoreCode`). -/
 def registerAttributeImplBuilder (builderId : Name) (builder : AttributeImplBuilder) : IO Unit := do
   let table ← attributeImplBuilderTableRef.get
   if table.contains builderId then throw (IO.userError s!"Attribute implementation builder `{builderId}` has already been declared")
+  let builder : AttributeImplBuilder ← if (← IO.initializing) then pure builder else
+    pure fun ref args => do
+      let attr ← builder ref args
+      return if attr.onlyCoreCode then attr else recordingForeignRuns attr
   attributeImplBuilderTableRef.modify fun table => table.insert builderId builder
 
 structure AttributeExtensionOLeanEntry where

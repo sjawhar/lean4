@@ -2,7 +2,7 @@ import Lean
 /-! Every field of the states a declaration command can change behaves as the recorder classifies it, and the test
 throws when a field is added, removed or misclassified. For `Elab.Command.State` (`ModuleUsage.commandStateFields`)
 each field is changed on its own and must show its class: the payload for `env`, `post` and `ctx` for `replayed`, a
-`stateOnly` marker for `stateOnly`; a `reset` field must be empty when a later command starts although the command
+`commandState` refusal for `refused`; a `reset` field must be empty when a later command starts although the command
 before it left the field non-empty (`messages` also because `elabCommandTopLevel` clears them,
 `src/Lean/Elab/Command.lean:853-854`, so only `traceState` and `snapshotTasks` show `doElab`'s reset), and an
 `unread` field must not change what the next command declares. Every
@@ -138,19 +138,18 @@ unsafe def main : IO Unit := do
     let some cls := classOf field | throw <| IO.userError s!"{field} unclassified"
     let st' := change st
     let markers := ModuleUsage.commandStateChanges st st'
-    let marker := `Lean.Elab.Command ++ field
+    let marker : Refusal := .commandState field
     let ctxChanged := ctxOf st != ctxOf st'
     let postChanged := !(ModuleUsage.CommandPost.ofStates st st' == ModuleUsage.CommandPost.ofStates st st)
     let shown ← match cls with
       | .env =>
-        let recorded ← recordCommandDelta st.env st'.env 0
-        let some ce := (commandEntriesExt.getState recorded).back? | throw <| IO.userError "no payload"
+        let ce ← recordCommandDelta st.env st'.env 0
         expect (!(ce.main.entries ++ ce.checked.entries).isEmpty && markers.isEmpty) s!"{field}: no payload entry"
         pure s!"payload {ce.checked.entries.map (·.1.toString ++ ".checked") ++ ce.main.entries.map (·.1.toString ++ ".main")}"
       | .replayed =>
         expect (postChanged && ctxChanged && markers.isEmpty) s!"{field}: post {postChanged}, ctx {ctxChanged}"
         pure "post and ctx change"
-      | .stateOnly =>
+      | .refused =>
         expect (markers == #[marker]) s!"{field}: markers {markers}"
         pure s!"marker {marker}"
       | .reset =>

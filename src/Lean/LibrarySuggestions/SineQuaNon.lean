@@ -109,6 +109,8 @@ builtin_initialize sineQuaNonExt : PersistentEnvExtension (NameMap (List (Name �
       let ents := env.unsafeRunMetaM do return #[← prepareTriggers (env.constants.map₂.toArray.map (·.1))]
       .uniform ents
     statsFn         := fun _ => "sine qua non premise selection extension"
+    -- computed for the export from the final environment
+    perCommand      := .notCarried
   }
 
 /-- A global `IO.Ref` containing the "sine qua non" triggers. This is initialized on first use. -/

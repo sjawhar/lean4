@@ -285,6 +285,13 @@ structure Environment where
   environment is created or its extension array grows. Read by accounted writes only.
   -/
   private extIdentities : Array (Option EnvExtensionIdentity) := #[]
+  /--
+  How many declarations this kernel environment holds differently from what checking the elaborator's constants would
+  give: added without the kernel checking them (`addDeclWithoutChecking`), committed as another constant than the
+  elaborator committed or not at all (`AddConstAsyncResult.commitCheckEnv`, a dropped `addConstAsync`), or realized
+  and then rejected by the kernel at the realization's merge. The per-command recorder compares it across a command.
+  -/
+  private divergentAdds : Nat := 0
 deriving Nonempty
 
 /-- Whether `id` is the identity registered at extension index `idx`. -/
@@ -342,15 +349,21 @@ private def isQuotInit (env : Environment) : Bool :=
 opaque addDeclCore (env : Environment) (maxHeartbeats : USize) (maxRecDepth : USize)
   (decl : @& Declaration) (cancelTk? : @& Option IO.CancelToken) : Except Exception Environment
 
+@[extern "lean_add_decl_without_checking"]
+private opaque addDeclWithoutCheckingCore (env : Environment) (decl : @& Declaration) : Except Exception Environment
+
+private def countDivergentAdd (env : Environment) : Environment :=
+  { env with divergentAdds := env.divergentAdds + 1 }
+
 /--
-Add declaration to kernel without type checking it.
+Add declaration to kernel without type checking it. The addition is counted in the result's `divergentAdds`.
 
 **WARNING** This function is meant for temporarily working around kernel performance issues.
 It compromises soundness because, for example, a buggy tactic may produce an invalid proof,
 and the kernel will not catch it if the new option is set to true.
 -/
-@[extern "lean_add_decl_without_checking"]
-opaque addDeclWithoutChecking (env : Environment) (decl : @& Declaration) : Except Exception Environment
+def addDeclWithoutChecking (env : Environment) (decl : Declaration) : Except Exception Environment :=
+  return (← addDeclWithoutCheckingCore env decl).countDivergentAdd
 
 @[export lean_environment_add]
 private def add (env : Environment) (cinfo : ConstantInfo) : Environment :=
@@ -752,7 +765,8 @@ private opaque addDeclWithoutChecking (env : Environment) (decl : @& Declaration
   Except Kernel.Exception Environment
 
 /--
-Adds given declaration to the environment, type checking it unless `doCheck` is false.
+Adds given declaration to the environment, type checking it unless `doCheck` is false; an unchecked addition is
+counted in the kernel environment's `divergentAdds`.
 
 This is a plumbing function for the implementation of `Lean.addDecl`, most users should use it
 instead.
@@ -767,7 +781,8 @@ def addDeclCore (env : Environment) (maxHeartbeats : USize) (maxRecDepth : USize
   let mut env ← if doCheck then
     addDeclCheck env maxHeartbeats maxRecDepth decl cancelTk?
   else
-    addDeclWithoutChecking env decl
+    let env ← addDeclWithoutChecking env decl
+    pure { env with checked := env.checked.map (sync := true) (·.countDivergentAdd) }
 
   -- Let the elaborator know about the new constants. This uses the same constant for both
   -- visibility scopes but the caller can still customize the public one on the main elaboration
@@ -906,6 +921,21 @@ system, this is any definition. -/
 def hasExposedBody (env : Environment) (n : Name) : Bool :=
   env.setExporting true |>.find? n |>.any (·.hasValue)
 
+/-- The realization context `forConst`'s realizations run in: the import context for an imported constant, else the one
+`enableRealizationsForConst` registered for it. -/
+private def realizationContext? (env : Environment) (forConst : Name) : Option RealizationContext :=
+  if env.base.get env |>.const2ModIdx.contains forConst then env.importRealizationCtx?
+  else env.localRealizationCtxMap.find? forConst
+
+/-- `env` with `ctxEnv` and `opts` as the realization context of the local constant `c`, with an empty cache. -/
+private def insertRealizationContext (env : Environment) (c : Name) (ctxEnv : Environment) (opts : Options) :
+    BaseIO Environment :=
+  return { env with localRealizationCtxMap := env.localRealizationCtxMap.insert c {
+    -- safety: `RealizationContext` is private
+    env := unsafe unsafeCast ctxEnv
+    opts
+    realizeMapRef := (← IO.mkRef {}) } }
+
 /--
 Allows `realizeConst` calls for the given declaration in all derived environment branches.
 Realizations will run using the given environment and options to ensure deterministic results. Note
@@ -931,14 +961,10 @@ def enableRealizationsForConst (env : Environment) (opts : Options) (c : Name) :
       return env
   if env.localRealizationCtxMap.contains c then
     return env
-  return { env with localRealizationCtxMap := env.localRealizationCtxMap.insert c {
-    -- safety: `RealizationContext` is private
-    env := unsafe unsafeCast env
-    opts
-    realizeMapRef := (← IO.mkRef {}) } }
+  env.insertRealizationContext c env opts
 
 def areRealizationsEnabledForConst (env : Environment) (c : Name) : Bool :=
-  (env.base.get env |>.const2ModIdx.contains c) || env.localRealizationCtxMap.contains c
+  (env.realizationContext? c).isSome
 
 /-- Returns debug output about the asynchronous state of the environment. -/
 def dbgFormatAsyncState (env : Environment) : BaseIO String :=
@@ -966,6 +992,8 @@ structure PromiseCheckedResult where
   -/
   asyncEnv : Environment
   private checkedEnvPromise : IO.Promise Kernel.Environment
+  /-- The kernel environment the branch started from. -/
+  private start : Task Kernel.Environment
 
 def realizingStack (env : Environment) : List Name :=
   env.asyncCtx?.map (·.realizingStack) |>.getD []
@@ -997,13 +1025,18 @@ def promiseChecked (env : Environment) : BaseIO PromiseCheckedResult := do
     -- Do not allow adding new constants
     asyncEnv := env.enterAsync `__reserved__Environment_promiseChecked
     checkedEnvPromise
+    start := env.checked
   }
 
-/-- Commits the kernel environment of the given environment back to the main branch. -/
+/-- Commits the kernel environment of the given environment back to the main branch. A constant map other than the
+branch's start (a constant added to the kernel environment alone, as the branch may not add constants) counts in
+`divergentAdds`. -/
 def PromiseCheckedResult.commitChecked (res : PromiseCheckedResult) (env : Environment) :
     BaseIO Unit :=
   assert! env.asyncCtx?.isSome
-  res.checkedEnvPromise.resolve env.toKernelEnv
+  let kenv := env.toKernelEnv
+  res.checkedEnvPromise.resolve <|
+    if SharedDiff.sameObject kenv.constants res.start.get.constants then kenv else kenv.countDivergentAdd
 
 /-- Data transmitted by `AddConstAsyncResult.commitConst`. -/
 private structure ConstPromiseVal where
@@ -1120,9 +1153,10 @@ def addConstAsync (env : Environment) (constName : Name) (kind : ConstantKind)
         «public»  := exportedAsyncConst?.map (env.asyncConstsMap.public.add ·)
           |>.getD env.asyncConstsMap.public
       }
+      -- a dropped commit leaves the elaborator's fallback constant without a kernel one
       checked := checkedEnvPromise.result?.bind (sync := true) fun
         | some kenv => .pure kenv
-        | none      => env.checked
+        | none      => env.checked.map (sync := true) (·.countDivergentAdd)
       allRealizations := allRealizationsPromise.result?.bind (sync := true) fun
         | some r => .pure r
         | none   => env.allRealizations }
@@ -1178,11 +1212,25 @@ def AddConstAsyncResult.commitConst (res : AddConstAsyncResult) (env : Environme
     nestedConsts := env.asyncConstsMap
   }
 
+/-- Whether `kenv` holds the constant `info` describes, as `info` (kind, level parameters, type and value): checking
+`info` again then gives the kernel's constant. -/
+private def kernelHolds (kenv : Kernel.Environment) (info : ConstantInfo) : Bool :=
+  match kenv.find? info.name with
+  | none => false
+  | some k => SharedDiff.sameObject k info || (ConstantKind.ofConstantInfo k == .ofConstantInfo info &&
+      k.levelParams == info.levelParams && k.type.equal info.type &&
+      match k.value? (allowOpaque := true), info.value? (allowOpaque := true) with
+      | some v, some w => v.equal w
+      | none, none => true
+      | _, _ => false)
+
 /--
 Assuming `Lean.addDecl` has been run for the constant to be added on the async environment branch,
 commits the full constant info from that call to the main environment, (asynchronously) waits for
 the final kernel environment resulting from the `addDecl` call, and commits it to the main branch as
-well, unblocking kernel additions there. All `commitConst` preconditions apply.
+well, unblocking kernel additions there. All `commitConst` preconditions apply. A kernel environment that does not
+hold the committed constant as committed (`addDecl`'s fallback for a declaration the kernel rejected, or none) counts
+in `divergentAdds`.
 -/
 def AddConstAsyncResult.commitCheckEnv (res : AddConstAsyncResult) (env : Environment) :
     IO Unit := do
@@ -1191,7 +1239,9 @@ def AddConstAsyncResult.commitCheckEnv (res : AddConstAsyncResult) (env : Enviro
   if !(← res.constPromise.isResolved) then
     res.commitConst env
   BaseIO.chainTask (sync := true) env.checked fun checked => do
-    res.checkedEnvPromise.resolve checked
+    let committed? := (← IO.wait res.constPromise.result?).map (·.privateConstInfo)
+    res.checkedEnvPromise.resolve <|
+      if committed?.all (kernelHolds checked) then checked else checked.countDivergentAdd
     BaseIO.chainTask (sync := true) env.allRealizations res.allRealizationsPromise.resolve
 
 /--
@@ -1833,6 +1883,17 @@ def ofPHashMap [BEq κ] [Hashable κ] (lt : κ → κ → Bool) (entry : κ → 
 
 end StateDelta
 
+/-- How the per-command recorder (`recordCommandDelta`) treats a persistent extension's state. -/
+inductive PersistentEnvExtension.PerCommand where
+  /-- A command's change is recorded in its payload and replayed. -/
+  | recorded
+  /-- Payloads do not carry the state (set at the header, computed for the export, or set by a module-level command
+  such as `deprecated_module`): a command that changes it is elaborated again. -/
+  | notCarried
+  /-- The recording itself writes the state; it is never compared. -/
+  | recorder
+  deriving Inhabited, BEq
+
 /--
 An environment extension with support for storing/retrieving entries from a .olean file.
  - α is the type of the entries that are stored in .olean files.
@@ -1908,6 +1969,8 @@ structure PersistentEnvExtension (α : Type) (β : Type) (σ : Type) where
   `EnvExtension.unaccountedWrites`.
   -/
   stateDeltaSeesDirectWrites : Bool := false
+  /-- How the per-command recorder treats the state. -/
+  perCommand : PersistentEnvExtension.PerCommand := .recorded
   /--
   Function to transform state into data that should be imported into other modules. Returns entries
   for all three olean levels at once so that expensive computations can be shared. When using the
@@ -1934,6 +1997,7 @@ instance {α β σ} [Inhabited σ] : Inhabited (PersistentEnvExtension α β σ)
      ofOLeanEntry? := none,
      stateDelta? := none,
      stateDeltaSeesDirectWrites := false,
+     perCommand := .recorded,
      exportEntriesFn := fun _ _ => .uniform #[],
      statsFn := fun _ => Format.nil
   }
@@ -2020,6 +2084,8 @@ structure PersistentEnvExtensionDescrCore (α β σ : Type) where
   stateDelta?       : Option (σ → σ → StateDelta α) := none
   /-- See `PersistentEnvExtension.stateDeltaSeesDirectWrites`. -/
   stateDeltaSeesDirectWrites : Bool := false
+  /-- See `PersistentEnvExtension.perCommand`. -/
+  perCommand        : PersistentEnvExtension.PerCommand := .recorded
   exportEntriesFnEx : Environment → σ → OLeanEntries (Array α)
   statsFn           : σ → Format := fun _ => Format.nil
   asyncMode         : EnvExtension.AsyncMode := .mainOnly
@@ -2065,6 +2131,7 @@ unsafe def registerPersistentEnvExtensionUnsafe {α β σ : Type} [Inhabited σ]
     ofOLeanEntry?   := descr.ofOLeanEntry?,
     stateDelta?     := descr.stateDelta?,
     stateDeltaSeesDirectWrites := descr.stateDeltaSeesDirectWrites,
+    perCommand      := descr.perCommand,
     exportEntriesFn := descr.exportEntriesFnEx,
     statsFn         := descr.statsFn
   }
@@ -2964,16 +3031,11 @@ def realizeValue [BEq α] [Hashable α] [TypeName α] (env : Environment) (forCo
   -- the following code is inherently non-deterministic in number of heartbeats, reset them at the
   -- end
   let heartbeats ← IO.getNumHeartbeats
-  -- find `RealizationContext` for `forConst` in `importRealizationCtx?` or `localRealizationCtxMap`
-  let ctx ← if env.base.get env |>.const2ModIdx.contains forConst then
-    env.importRealizationCtx?.getDM <|
-      throw <| .userError s!"Environment.realizeConst: `realizedImportedConsts` is empty"
-  else
-    match env.localRealizationCtxMap.find? forConst with
-    | some ctx => pure ctx
-    | none =>
-      throw <| .userError s!"trying to realize `{TypeName.typeName α}` value but \
-        `enableRealizationsForConst` must be called for '{forConst}' first"
+  let imported := env.base.get env |>.const2ModIdx.contains forConst
+  let some ctx := env.realizationContext? forConst | throw <| .userError <|
+    if imported then s!"Environment.realizeConst: `realizedImportedConsts` is empty"
+    else s!"trying to realize `{TypeName.typeName α}` value but \
+      `enableRealizationsForConst` must be called for '{forConst}' first"
   let res ← (do
     -- First try checking for the key non-atomically as (de)allocating the promise is expensive.
     let m ← ctx.realizeMapRef.get
@@ -3082,7 +3144,8 @@ private def mergeRealizeConstResult (env : Environment) (res : RealizeConstResul
         | .ok kenv' => return kenv'
         | .error e => do
           exPromise.resolve e
-          return kenv)
+          -- the merged constants stay in the elaborator's maps without kernel ones
+          return kenv.countDivergentAdd)
     allRealizations := env.allRealizations.map (sync := true) fun allRealizations =>
       res.newConsts.private.foldl (init := allRealizations) fun allRealizations c =>
         allRealizations.insert c.constInfo.name c
@@ -3118,14 +3181,16 @@ deriving TypeName
 Re-adds a realization a kept command made: `realizeConst forConst constName` with `realize` replaced by `build`,
 which re-creates the realization's constants and recorded extension states in the realization's environment (the
 realization context's, inside the realization's async context). The result is cached as `realizeConst` caches it,
-so a later request elsewhere merges it as a full run's would; the merge into `env` adds the constants only,
-because the kept command's recorded checked view already holds the extension writes a merge replays. When the
-context already holds a result for the key, `build` does not run and that result is merged, as `realizeConst` does.
-Throws when `build` does; the task holds the kernel's exception, if any. A failed `build` stays cached in the
-context, and a later `Meta.realizeConst` of the key then fails (`unreachable!`): a caller aborts on a failed keep.
+so a later request elsewhere merges it as a full run's would. The merge into a kept command's `env` adds the constants
+only, because its recorded checked view already holds the extension writes a merge replays; a merge into another
+realization's environment (`replayExts`) replays them as `realizeConst` does. When the context already holds a result
+for the key, `build` does not run and that result is merged, as `realizeConst` does. Throws when `build` does; the
+task holds the kernel's exception, if any. A failed `build` stays cached in the context, and a later
+`Meta.realizeConst` of the key then fails (`unreachable!`): a caller aborts on a failed keep.
 -/
 private def readdRealizeConst (env : Environment) (forConst constName : Name)
-    (build : Environment → Options → IO Environment) : IO (Environment × Task (Option Kernel.Exception)) := do
+    (build : Environment → Options → IO Environment) (replayExts := false) :
+    IO (Environment × Task (Option Kernel.Exception)) := do
   let res ← env.realizeValue forConst { constName : RealizeConstKey } fun realizeEnv realizeOpts => do
     let realizeEnv := realizeEnv.enterAsyncRealizing constName
     match ← (build realizeEnv realizeOpts).toBaseIO with
@@ -3136,7 +3201,27 @@ private def readdRealizeConst (env : Environment) (forConst constName : Name)
   if let some failure := res.get? ReaddRealizationFailure then
     throw <| .userError s!"re-adding the realization of {constName} for {forConst}: {failure.message}"
   let some res := res.get? RealizeConstResult | unreachable!
-  mergeRealizeConstResult env res (replayExts := false)
+  mergeRealizeConstResult env res replayExts
+
+private unsafe def realizationMergesImpl (env : Environment) (forConst constName : Name) :
+    BaseIO (Array (Name × Name)) := do
+  let some ctx := env.realizationContext? forConst | return #[]
+  let some m := (← ctx.realizeMapRef.get).find? (TypeName.typeName RealizeConstKey) | return #[]
+  let m : PHashMap RealizeConstKey (Task Dynamic) := unsafeCast m
+  let some t := m[({ constName } : RealizeConstKey)] | return #[]
+  let some res := t.get.get? RealizeConstResult | return #[]
+  let mut out := #[]
+  for c in res.newConsts.private do
+    if let some info := c.realization? then
+      let key := (info.forConst, info.constName)
+      unless key == (forConst, constName) || out.contains key do out := out.push key
+  return out
+
+/-- The realizations, as `(forConst, constName)`, whose results the cached realization `constName` for `forConst`
+merged while it ran (requested inside it), in the order their constants entered it: its new constants that another
+realization added (`RealizationInfo`). Empty when the context caches no result for the key. -/
+@[implemented_by realizationMergesImpl]
+private opaque realizationMerges (env : Environment) (forConst constName : Name) : BaseIO (Array (Name × Name))
 
 /-- Registers `ctxEnv` and `opts` as the realization context of the local constant `c` in `env`, with an empty cache,
 as `enableRealizationsForConst` does with the environment and options at that point: a kept command re-creates each
@@ -3145,10 +3230,7 @@ private def registerRealizationContext (env : Environment) (c : Name) (ctxEnv : 
     IO Environment := do
   if env.localRealizationCtxMap.contains c then
     throw <| .userError s!"reuse: the realization context of {c} is already registered"
-  return { env with localRealizationCtxMap := env.localRealizationCtxMap.insert c {
-    -- safety: `RealizationContext` is private
-    env := unsafe unsafeCast ctxEnv
-    opts, realizeMapRef := ← IO.mkRef {} } }
+  env.insertRealizationContext c ctxEnv opts
 
 end Environment
 

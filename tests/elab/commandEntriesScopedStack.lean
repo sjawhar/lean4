@@ -3,7 +3,7 @@ import Lean
 namespace activated by a macro's `open` or by `activateScoped`, `setDelimitsLocal`, a per-extension `pushScope` or
 `popScope`, a pop and push that replace a level, with or without a new local entry in the new level, a local entry on
 a level deeper than the command scope) records those operations in its payload's `scopedOps` and is replayed, and
-the replay reproduces the stack (`simpView`); the extension is not in `stateOnly` and the module is not declined for
+the replay reproduces the stack (`simpView`); the payload is not refused for the extension and the module is not declined for
 it. Stack changes a declaration makes and undoes (`open … in`, `attribute [local simp] … in`, dotted names,
 `classical`) and a top-level local entry replay as well. -/
 open Lean
@@ -32,14 +32,14 @@ unsafe def check (dir : System.FilePath) (label src : String) (probes : List Nam
   for o in obs do
     let some ce := payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"
     let kind := (cmds[o.i]?.bind fun c => (c.getObjValAs? String "kind").toOption).getD "?"
-    let simpStateOnly := ce.stateOnly.contains Meta.simpExtension.ext.name
+    let simpRefused := (ce.refusals.filterMap (·.ext?)).contains Meta.simpExtension.ext.name
     let replay ← try
         let env ← replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}
         let full := simpView o.after.env probes
         let got := simpView env probes
         pure (if full == got then s!"replay matches: {full}" else s!"replay differs: full {full}, replayed {got}")
       catch _ => pure "refused"
-    IO.println s!"{o.i} {kind}: simp stateOnly {simpStateOnly}; {replay}"
+    IO.println s!"{o.i} {kind}: simp refused {simpRefused}; {replay}"
 
 def header : String := "import Lean\nopen Lean Elab Command\n"
 

@@ -18,12 +18,6 @@ unsafe def compactBytes (dir : System.FilePath) (tag : String) (a : α)
   let _ ← CompactedRegion.save path `compare a #[] none (allowClosures := allowClosures)
   IO.FS.readBinFile path
 
-def excludedExtension (n : Name) : Bool :=
-  let s := n.toString
-  n == commandEntriesExt.name || n == `Lean.ModuleUsage.ext || n == `Lean.ModuleUsage.stmtExt ||
-    s.endsWith ".exportedAxiomsExt" || s.endsWith ".modPkgExt" ||
-    s.endsWith ".deprecatedModuleExt" || s.endsWith "symbolFrequency" || s.endsWith "sineQueNon"
-
 def sameParse (expected actual : Environment) (input : String) : Bool :=
   match Parser.runParserCategory expected `term input, Parser.runParserCategory actual `term input with
   | .ok a, .ok b => a == b
@@ -45,6 +39,9 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let baseEnv := first.before.env
   let (md, region) ← readModuleData (dir / "M.olean")
   let entries := CommandEntries.ofModuleData md
+  -- extensions the recorder does not record (`PersistentEnvExtension.perCommand`)
+  let excluded : NameSet := (← persistentEnvExtensionsRef.get).foldl (init := {}) fun s ext =>
+    if ext.perCommand == .recorded then s else s.insert ext.name
   -- the view `computeExtEntries` exports each extension from: checked for `.sync` and `.async _`, else main
   let exportView : Std.HashMap Name EnvExtension.View := (← persistentEnvExtensionsRef.get).foldl
     (fun m ext => m.insert ext.name
@@ -62,7 +59,8 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   IO.println s!"parser extension: {names.contains `Lean.Parser.parserExtension}"
   IO.println s!"macro attribute: {names.contains `Lean.Elab.macroAttribute}"
   IO.println s!"cpass extension: {names.contains `Lean.Compiler.LCNF.passManagerExt}"
-  let unreplayable := entries.foldl (fun s entry => entry.unreplayable.foldl (·.insert ·) s) ({} : NameSet)
+  let unreplayable := entries.foldl (init := ({} : NameSet)) fun s entry => entry.refusals.foldl (init := s)
+    fun s r => match r with | .unreplayable ext _ => s.insert ext | _ => s
   IO.println s!"unreplayable: {unreplayable.toArray}"
   IO.println s!"scoped operations: {scopedOps.size}"
   IO.println s!"simp operations: {scopedOps.contains `Lean.Meta.simpExtension}"
@@ -72,25 +70,26 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   IO.println s!"cache names resolve: {cacheNames.all registeredCaches.contains}"
   let scopedExts := (← scopedEnvExtensionsRef.get).map (·.ext.name)
   for entry in entries do
-    let scopedStateOnly := entry.stateOnly.any scopedExts.contains
+    let refusedExts := entry.refusals.filterMap (·.ext?)
+    let scopedRefused := refusedExts.any scopedExts.contains
     IO.println s!"{entry.idx} extensions={exported entry} \
       scoped operations={entry.main.scopedOps.map (·.1)} \
-      caches={(entry.main.caches ++ entry.checked.caches).map (·.1)} stateOnly={entry.stateOnly.filter (!scopedExts.contains ·)}\
-      {if scopedStateOnly then " and scoped extensions" else ""}"
+      caches={(entry.main.caches ++ entry.checked.caches).map (·.1)} refusals={entry.refusals.filter fun r =>
+        !(r.ext?.any scopedExts.contains)}{if scopedRefused then " and scoped extensions" else ""}"
   let afterOf : Std.HashMap Nat Environment :=
     observations.foldl (fun m obs => m.insert obs.i obs.after.env) {}
   let mut replayed ← CommandEntries.Testing.rollbackTo baseEnv expectedEnv
   replayed := replayed.setMainModule `M
   let mut elaborated := #[]
   for entry in entries do
-    if entry.stateOnly.isEmpty then
+    if entry.refusals.isEmpty then
       replayed ← replayCommandEntries replayed entry {}
     else
       let refused ← try
           discard <| replayCommandEntries replayed entry {}; pure false
         catch _ => pure true
       unless refused do
-        throw <| IO.userError s!"payload {entry.idx} with state-only changes was replayed"
+        throw <| IO.userError s!"refused payload {entry.idx} was replayed"
       let some after := afterOf[entry.idx]? | throw <| IO.userError s!"no observation {entry.idx}"
       replayed ← CommandEntries.Testing.rollbackTo after replayed
       elaborated := elaborated.push entry.idx
@@ -108,14 +107,14 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
     replayedEntries.foldl (fun m (n, es) => m.insert n es) {}
   let mut mismatches := #[]
   for (name, es) in md.entries do
-    unless excludedExtension name do
+    unless excluded.contains name do
       let got := actual.getD name #[]
       unless es.size == got.size &&
           (← compactBytes dir s!"expected-{name.hash}" es) ==
             (← compactBytes dir s!"actual-{name.hash}" got) do
         mismatches := mismatches.push name
   for (name, _) in replayedEntries do
-    unless excludedExtension name || expected.contains name do
+    unless excluded.contains name || expected.contains name do
       mismatches := mismatches.push name
   -- Closure-bearing state has no canonical byte encoding; compare its serialized descriptors and behavior.
   let closureScoped := #[

@@ -1,18 +1,13 @@
 import Lean
 /-! A declaration command that adds an entry to an extension whose state delta reads an entry log (a simple
 persistent extension, a parametric attribute, a scoped extension) and in the same command writes that extension's
-state directly (`modifyState`, `setState`, or a scoped extension's `ext.ext.modifyState`) records the extension in
-its payload's `stateOnly`: replaying the entry alone would lose the direct write. A direct write alone is
-`stateOnly` too. Extensions whose delta diffs the whole state (map families) see direct writes and stay
-replayable: a `simproc` declaration inserts into its map directly, and compiling a definition memoizes types. -/
+state directly (`modifyState`, `setState`, or a scoped extension's `ext.ext.modifyState`) refuses its payload for
+the extension: replaying the entry alone would lose the direct write. A direct write alone refuses it too.
+Extensions whose delta diffs the whole state (map families) see direct writes and stay
+replayable: a `simproc` declaration inserts into its map directly, and compiling a definition memoizes types. The
+attributes are registered by an imported module, so each command that runs one is also refused for it
+(`Refusal.foreignAttribute`); the per-command lines show each extension's refusal. -/
 open Lean
-
-/-- The extensions `keep` selects among a payload's entries, as `name.view`: checked entries, main entries, then the
-scoped extensions' operations. -/
-def shownEntries (ce : CommandEntries) (keep : Name → Bool) : Array String :=
-  let named (view : String) (es : Array (Name × Array EnvExtensionEntry)) :=
-    es.filterMap fun (n, _) => if keep n then some s!"{n}.{view}" else none
-  named "checked" ce.checked.entries ++ named "main" ce.main.entries ++ named "main" ce.main.scopedOps
 
 def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
   let out ← IO.Process.output { cmd := "lean", args, cwd := dir, env := #[("LEAN_PATH", some dir.toString)] }
@@ -92,7 +87,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
         pure (if view env == view o.after.env then s!"replay matches {view env}"
           else s!"replay differs: full {view o.after.env}, replayed {view env}")
       catch _ => pure "refused"
-    IO.println s!"{o.i}: stateOnly {ce.stateOnly.filter watched.contains}, \
-      entries {shownEntries ce watched.contains}; {replay}"
+    IO.println s!"{o.i}: refused for {(ce.refusals.filterMap (·.ext?)).filter watched.contains}, \
+      entries {CommandEntries.Testing.shownEntries ce watched.contains}; {replay}"
 
 #eval main

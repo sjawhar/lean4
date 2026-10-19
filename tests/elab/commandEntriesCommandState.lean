@@ -1,8 +1,8 @@
 import Lean
 /-! The parts of `Elab.Command.State` other than the environment that a declaration command can change, and how
 the recorder treats each (`ModuleUsage.commandStateFields`). A change to the command scope (`scopes`: an option, a
-`variable`, a `universe`, made by a macro next to a `def`) is recorded as `Lean.Elab.Command.scopes` in the
-payload's `stateOnly`: the payload is refused and the module is declined (`noskip`); a scope the command restores
+`variable`, a `universe`, made by a macro next to a `def`) refuses the payload (`Refusal.commandState`) and declines
+the module (`noskip`); a scope the command restores
 (`set_option … in`, `open … in`, dotted names) is not. `maxRecDepth`, which `set_option maxRecDepth … in` leaves
 changed after the command, and the name generator `ngen` are replayed: the record's `post` holds them after the
 command and the next command's context digest includes them (`commandEntriesNgenRestore`, `commandEntriesNgenDiff`
@@ -29,10 +29,7 @@ unsafe def elabM (dir : System.FilePath) (src : String) : IO Run := do
   let records := (usage.getObjValAs? (Array Json) "commands").toOption.getD #[]
   return { obs, payloads, usage, records }
 
-def stateMarkers : List Name :=
-  [`Lean.Elab.Command.scopes, `Lean.Elab.Command.nextMacroScope, `Lean.Elab.Command.infoState]
-
-/-- Per command: its kind, the command-state markers in its payload's `stateOnly`, and whether replay accepts it. -/
+/-- Per command: its kind, the command-state fields its payload is refused for, and whether replay accepts it. -/
 unsafe def report (dir : System.FilePath) (label src : String) : IO Run := do
   let r ← elabM dir src
   IO.println s!"== {label}: noskip {(r.usage.getObjValAs? Bool "noskip").toOption}, \
@@ -40,7 +37,7 @@ unsafe def report (dir : System.FilePath) (label src : String) : IO Run := do
   for o in r.obs do
     let some ce := r.payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"
     let kind := (r.records[o.i]?.bind fun c => (c.getObjValAs? String "kind").toOption).getD "?"
-    let markers := ce.stateOnly.filter stateMarkers.contains
+    let markers := ce.refusals.filterMap fun | .commandState field => some field | _ => none
     let replay ← try
         discard <| replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}
         pure "replayed"

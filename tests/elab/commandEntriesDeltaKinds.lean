@@ -8,15 +8,10 @@ reducibility overwrites, hash-map states (compiled declarations, structures, `si
 declarations), namespaces, a pass installer, a constant folder, and an extension written from an asynchronous
 proof. The check compares each extension's private export under the after-environment and, for the test's own
 extensions, the states themselves (log and set, scoped stack, map bindings). Payloads of `namespace` and `end`
-are refused: they change the scope stack, which no entry expresses. -/
+are refused: they change the scope stack, which no entry expresses. The test's attributes are registered by an
+imported module, so each command that runs one is also refused for it (`Refusal.foreignAttribute`); the replay drops
+that refusal to check the records themselves. -/
 open Lean
-
-/-- The extensions `keep` selects among a payload's entries, as `name.view`: checked entries, main entries, then the
-scoped extensions' operations. -/
-def shownEntries (ce : CommandEntries) (keep : Name → Bool) : Array String :=
-  let named (view : String) (es : Array (Name × Array EnvExtensionEntry)) :=
-    es.filterMap fun (n, _) => if keep n then some s!"{n}.{view}" else none
-  named "checked" ce.checked.entries ++ named "main" ce.main.entries ++ named "main" ce.main.scopedOps
 
 def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
   let out ← IO.Process.output { cmd := "lean", args, cwd := dir, env := #[("LEAN_PATH", some dir.toString)] }
@@ -27,12 +22,6 @@ unsafe def compactBytes (dir : System.FilePath) (a : α) : IO ByteArray := do
   let path := dir / "cmp.bin"
   let _ ← CompactedRegion.save path `compare a #[] none
   IO.FS.readBinFile path
-
-def excludedExtension (n : Name) : Bool :=
-  let s := n.toString
-  n == commandEntriesExt.name || n == `Lean.ModuleUsage.ext || n == `Lean.ModuleUsage.stmtExt ||
-    s.endsWith ".exportedAxiomsExt" || s.endsWith ".modPkgExt" ||
-    s.endsWith ".deprecatedModuleExt" || s.endsWith "symbolFrequency" || s.endsWith "sineQueNon"
 
 abbrev PExt := PersistentEnvExtension EnvExtensionEntry EnvExtensionEntry EnvExtensionState
 
@@ -128,10 +117,13 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let obs := (← ModuleUsage.commandObservationsRef.get).qsort (·.i < ·.i)
   let (md, _) ← readModuleData (dir / "M.olean")
   let payloads := CommandEntries.ofModuleData md
-  let pExts := (← persistentEnvExtensionsRef.get).filter (!excludedExtension ·.name)
+  let pExts := (← persistentEnvExtensionsRef.get).filter (·.perCommand == .recorded)
   for o in obs do
     let some ce := payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"
-    let shown := shownEntries ce watched.contains
+    -- the test's attributes are registered by an imported module, so a command that runs one is refused for it
+    -- (`Refusal.foreignAttribute`); the replay drops that refusal to check the records themselves
+    let ce := { ce with refusals := ce.refusals.filter (!· matches .foreignAttribute _) }
+    let shown := CommandEntries.Testing.shownEntries ce watched.contains
     -- as when a kept command is replayed: its constants are present, every extension is in its before-state
     let base ← CommandEntries.Testing.rollbackTo o.before.env o.after.env
     let replayed? : Option Environment ← try
@@ -140,8 +132,9 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
     match replayed? with
     | none =>
       let scopedExts := (← scopedEnvExtensionsRef.get).map (·.ext.name)
-      IO.println s!"{o.i}: refused {shown}: stateOnly {ce.stateOnly.filter (!scopedExts.contains ·)} and \
-        scoped extensions: {ce.stateOnly.any scopedExts.contains}"
+      let refusedExts := ce.refusals.filterMap (·.ext?)
+      IO.println s!"{o.i}: refused {shown}: for {refusedExts.filter (!scopedExts.contains ·)}, \
+        {(ce.refusals.filter (·.ext?.isNone)).map toString} and scoped extensions: {refusedExts.any scopedExts.contains}"
     | some replayed =>
       let mut mismatches := #[]
       for ext in pExts do

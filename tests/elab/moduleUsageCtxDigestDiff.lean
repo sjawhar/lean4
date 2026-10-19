@@ -20,7 +20,7 @@ def check (env : Environment) (label : String) : IO Unit := do
   let own := ModuleUsage.localDigests env consts
   let stmt := ModuleUsage.computeStmt env (ModuleUsage.stmtState env) own consts
   let obs := (← ModuleUsage.commandObservationsRef.get).qsort (·.i < ·.i)
-  let recs ← ModuleUsage.commandRecords env own stmt #[]
+  let (recs, _) ← ModuleUsage.commandRecords env own stmt #[]
   let mut bad := #[]
   let mut sizes := #[]
   for o in obs, r in recs do

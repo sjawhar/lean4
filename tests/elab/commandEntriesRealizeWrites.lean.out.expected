@@ -1,5 +1,5 @@
-noskip (some true), reason (some (state-only change to foldLog in the branch of base.raw in declaration command 1))
-0: stateOnly #[], entries #[]; replay matches: checked=[]/[], main=[]/[]
-1: stateOnly #[foldLog], entries #[]; refused
-2: stateOnly #[], entries #[foldLog.checked]; replay matches: checked=[base.entry, base.raw]/[(base.raw, 99), (base.entry, 1)], main=[]/[]
-3: stateOnly #[], entries #[]; replay matches: checked=[base.entry, base.raw]/[(base.raw, 99), (base.entry, 1)], main=[]/[]
+noskip (some true), reason (some (declaration command 1: a change to foldLog that no entry expresses))
+0: refused for #[], entries #[]; replay matches: checked=[]/[], main=[]/[]
+1: refused for #[foldLog, foldLog], entries #[]; refused
+2: refused for #[], entries #[foldLog.checked]; replay matches: checked=[base.entry, base.raw]/[(base.raw, 99), (base.entry, 1)], main=[]/[]
+3: refused for #[], entries #[]; replay matches: checked=[base.entry, base.raw]/[(base.raw, 99), (base.entry, 1)], main=[]/[]

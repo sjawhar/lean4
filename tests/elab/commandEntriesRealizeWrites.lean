@@ -3,16 +3,9 @@ import Lean
 realization into the caller (`replayConsts`) applies each extension's `replay?` and carries the realization's count
 of unaccounted writes to that extension (`decl2f-delta2-review.md` finding 4). A command whose realization writes a
 `.sync` log extension through `toEnvExtension.modifyState`, beside an entry, which the extension's `replay?` copies,
-is recorded as `stateOnly` and refused; one whose realization only adds the entry replays, both views equal to the
+is refused; one whose realization only adds the entry replays, both views equal to the
 full run's. -/
 open Lean
-
-/-- The extensions `keep` selects among a payload's entries, as `name.view`: checked entries, main entries, then the
-scoped extensions' operations. -/
-def shownEntries (ce : CommandEntries) (keep : Name → Bool) : Array String :=
-  let named (view : String) (es : Array (Name × Array EnvExtensionEntry)) :=
-    es.filterMap fun (n, _) => if keep n then some s!"{n}.{view}" else none
-  named "checked" ce.checked.entries ++ named "main" ce.main.entries ++ named "main" ce.main.scopedOps
 
 def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
   let out ← IO.Process.output { cmd := "lean", args, cwd := dir, env := #[("LEAN_PATH", some dir.toString)] }
@@ -76,7 +69,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
         let got ← view env
         pure (if full == got then s!"replay matches: {full}" else s!"replay differs:\n    full     {full}\n    replayed {got}")
       catch _ => pure "refused"
-    IO.println s!"{o.i}: stateOnly {ce.stateOnly.filter (· == `foldLog)}, \
-      entries {shownEntries ce (· == `foldLog)}; {replay}"
+    IO.println s!"{o.i}: refused for {(ce.refusals.filterMap (·.ext?)).filter (· == `foldLog)}, \
+      entries {CommandEntries.Testing.shownEntries ce (· == `foldLog)}; {replay}"
 
 #eval main

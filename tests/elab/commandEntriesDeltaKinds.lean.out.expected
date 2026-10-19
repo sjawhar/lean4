@@ -3,9 +3,9 @@
 2: ok #[Lean.Compiler.LCNF.baseExt.checked, logExt.main]
 3: ok #[Lean.Compiler.LCNF.baseExt.checked, scopeExt.main]
 4: ok #[Lean.Compiler.LCNF.baseExt.checked, scopeExt.main]
-5: refused #[_private.Lean.Namespace.0.Lean.namespacesExt.main, scopeExt.main]: stateOnly #[Lean.Elab.Command.scopes] and scoped extensions: false
+5: refused #[_private.Lean.Namespace.0.Lean.namespacesExt.main, scopeExt.main]: for #[], #[a change to the command state's scopes] and scoped extensions: false
 6: ok #[Lean.Compiler.LCNF.baseExt.checked, scopeExt.main]
-7: refused #[scopeExt.main]: stateOnly #[Lean.Elab.Command.scopes] and scoped extensions: false
+7: refused #[scopeExt.main]: for #[], #[a change to the command state's scopes] and scoped extensions: false
 8: ok #[Lean.Compiler.LCNF.baseExt.checked, mapExt.checked, mapExt.main]
 9: ok #[Lean.Compiler.LCNF.baseExt.checked, _private.Lean.Namespace.0.Lean.namespacesExt.main]
 10: ok #[Lean.Compiler.LCNF.baseExt.checked, Lean.Compiler.nospecializeAttr.main]

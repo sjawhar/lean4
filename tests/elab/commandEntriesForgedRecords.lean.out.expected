@@ -1,8 +1,8 @@
-noskip (some true), reason (some (state-only change to logExt in the branch of d1 in declaration command 1))
-0: stateOnly #[], entries #[logExt.main]; replay matches
-1: stateOnly #[logExt], entries #[]; refused
-2: stateOnly #[logExt], entries #[]; refused
-3: stateOnly #[logExt], entries #[]; refused
-4: stateOnly #[scopeExt], entries #[]; refused
-5: stateOnly #[otherExt], entries #[]; refused
-6: stateOnly #[], entries #[]; replay matches
+noskip (some true), reason (some (declaration command 0: the attribute honest, whose handlers may run code outside core Lean))
+0: refused for #[], entries #[logExt.main]; replay matches
+1: refused for #[logExt, logExt], entries #[]; refused
+2: refused for #[logExt, logExt], entries #[]; refused
+3: refused for #[logExt, logExt], entries #[]; refused
+4: refused for #[scopeExt, scopeExt], entries #[]; refused
+5: refused for #[otherExt, otherExt], entries #[]; refused
+6: refused for #[], entries #[]; replay matches

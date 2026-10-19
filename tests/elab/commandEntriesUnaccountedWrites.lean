@@ -1,21 +1,16 @@
 import Lean
-/-! A declaration command whose writes to a persistent extension's state the recorder cannot see records that
-extension in its payload's `stateOnly`, and the payload is refused: an entry plus a write through the extension's
+/-! A declaration command whose writes to a persistent extension's state the recorder cannot see has its payload
+refused for that extension: an entry plus a write through the extension's
 underlying `EnvExtension` (`toEnvExtension.modifyState`) on a simple, a parametric and a scoped extension; such a raw
 write alone in each view a write can reach (the main-branch view of a `.mainOnly` extension, both views of a `.sync`
 extension, the main-branch view alone of a `.sync` extension); and a log-based extension's `modifyState` in the
 main-branch view alone of an `.async` extension. Writes the recorder sees are replayed into the views they reached,
 and replay reproduces both views: an entry added to the main-branch view alone (`addEntry` with
 `asyncMode := .local`) of an `.async` extension, one added on the main thread (both views), and one added from an
-asynchronous proof (checked view only). -/
+asynchronous proof (checked view only). The attributes are registered by an imported module, so each command that runs
+one is also refused for it (`Refusal.foreignAttribute`); the replay drops that refusal to check the records themselves.
+-/
 open Lean
-
-/-- The extensions `keep` selects among a payload's entries, as `name.view`: checked entries, main entries, then the
-scoped extensions' operations. -/
-def shownEntries (ce : CommandEntries) (keep : Name → Bool) : Array String :=
-  let named (view : String) (es : Array (Name × Array EnvExtensionEntry)) :=
-    es.filterMap fun (n, _) => if keep n then some s!"{n}.{view}" else none
-  named "checked" ce.checked.entries ++ named "main" ce.main.entries ++ named "main" ce.main.scopedOps
 
 def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
   let out ← IO.Process.output { cmd := "lean", args, cwd := dir, env := #[("LEAN_PATH", some dir.toString)] }
@@ -114,13 +109,14 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let exts := (← persistentEnvExtensionsRef.get).toList.filter (names.contains ·.name)
   for o in obs do
     let some ce := payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"
+    let ce := { ce with refusals := ce.refusals.filter (!· matches .foreignAttribute _) }
     let replay ← try
         let env ← replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}
         let full := view exts o.after.env
         let got := view exts env
         pure (if full == got then "replay matches" else s!"replay differs:\n    full     {full}\n    replayed {got}")
       catch _ => pure "refused"
-    IO.println s!"{o.i}: stateOnly {ce.stateOnly.filter names.contains}, \
-      entries {shownEntries ce names.contains}; {replay}"
+    IO.println s!"{o.i}: refused for {(ce.refusals.filterMap (·.ext?)).filter names.contains}, \
+      entries {CommandEntries.Testing.shownEntries ce names.contains}; {replay}"
 
 #eval main

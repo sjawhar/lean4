@@ -1,4 +1,4 @@
 full run: export after command 0 #[], after command 1 #[(d.later, 42)]
-command 0 (@[pre_tag] def d): refused: command 0 changed #[preExt] without entries; it must be elaborated again
+command 0 (@[pre_tag] def d): refused: command 0 is not replayable (#[a change to preExt that no entry expresses, a change to preExt that no entry expresses in the record of d, the attribute pre_tag, whose handlers may run code outside core Lean]); it must be elaborated again
 command 1 (def d.later): preExt payload #[]
-noskip: (some true), reason: (some (state-only change to preExt in the branch of d in declaration command 0))
+noskip: (some true), reason: (some (declaration command 0: a change to preExt that no entry expresses))

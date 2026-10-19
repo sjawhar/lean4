@@ -1,12 +1,12 @@
-noskip (some true), reason (some (state-only change to mainLog in the branch of d1 in declaration command 0))
-0: stateOnly #[mainLog], entries #[]; refused
-1: stateOnly #[myParamExt], entries #[]; refused
-2: stateOnly #[scopeExt], entries #[]; refused
-3: stateOnly #[mainLog], entries #[]; refused
-4: stateOnly #[syncLog], entries #[]; refused
-5: stateOnly #[syncLog], entries #[]; refused
-6: stateOnly #[], entries #[asyncLog.main]; replay matches
-7: stateOnly #[asyncLog], entries #[]; refused
-8: stateOnly #[], entries #[asyncLog.checked, asyncLog.main]; replay matches
-9: stateOnly #[], entries #[branchLog.checked]; replay matches
-10: stateOnly #[], entries #[]; replay matches
+noskip (some true), reason (some (declaration command 0: a change to mainLog that no entry expresses))
+0: refused for #[mainLog, mainLog], entries #[]; refused
+1: refused for #[myParamExt, myParamExt], entries #[]; refused
+2: refused for #[scopeExt, scopeExt], entries #[]; refused
+3: refused for #[mainLog, mainLog], entries #[]; refused
+4: refused for #[syncLog, syncLog], entries #[]; refused
+5: refused for #[syncLog, syncLog], entries #[]; refused
+6: refused for #[], entries #[asyncLog.main]; replay matches
+7: refused for #[asyncLog, asyncLog], entries #[]; refused
+8: refused for #[], entries #[asyncLog.checked, asyncLog.main]; replay matches
+9: refused for #[], entries #[branchLog.checked]; replay matches
+10: refused for #[], entries #[]; replay matches

@@ -388,6 +388,7 @@ def mkSimprocAttr (attrName : Name) (attrDescr : String) (ext : SimprocExtension
     name  := attrName
     descr := attrDescr
     applicationTime := AttributeApplicationTime.afterCompilation
+    onlyCoreCode := true
     add   := addSimprocAttr attrName ext
     erase := eraseSimprocAttr ext
   }

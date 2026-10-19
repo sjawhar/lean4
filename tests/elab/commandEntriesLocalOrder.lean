@@ -1,7 +1,7 @@
 import Lean
 /-! A declaration command that adds a local entry and then a global entry to the same scoped extension records the
 extension's stack operations in its payload's `scopedOps`, in the order they were logged, and replay applies them in
-that order (it no longer records `stateOnly` for the pair). One case per order-sensitive kind: macro rules
+that order (it no longer refuses the payload for the pair). One case per order-sensitive kind: macro rules
 (`KeyedDeclsAttribute` prepends, so the most recent rule wins), instances (the most recent of equal priority wins),
 simp lemmas and notations. For macro rules and instances the test also elaborates the rest of the module on top of the
 replayed payload, as a kept command would be, and prints what a later command sees. -/
@@ -46,7 +46,7 @@ unsafe def check (dir : System.FilePath) (label : String) (ext : Name) (src : St
   let some ce := r.payloads.find? (·.idx == i) | throw <| IO.userError s!"no payload {i}"
   let kind := (((r.usage.getObjValAs? (Array Json) "commands").toOption.getD #[])[i]?.bind
     fun c => (c.getObjValAs? String "kind").toOption).getD "?"
-  IO.println s!"{label}: command {i} {kind}, {ext} in stateOnly {ce.stateOnly.contains ext}, entries \
+  IO.println s!"{label}: command {i} {kind}, refused for {ext} {(ce.refusals.filterMap (·.ext?)).contains ext}, entries \
     {(ce.checked.entries ++ ce.main.entries).any (·.1 == ext)}, scoped ops {ce.main.scopedOps.any (·.1 == ext)}, \
     noskip {(r.usage.getObjValAs? Bool "noskip").toOption}"
   let replayed? ← try

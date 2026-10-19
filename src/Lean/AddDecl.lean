@@ -228,14 +228,20 @@ is true, exposes the declaration body, i.e. preserves the full representation in
 independently of `Environment.isExporting` and even for theorems.
 -/
 def addDecl (decl : Declaration) (forceExpose := false) : CoreM Unit := do
-  if (← usageRecordingRef.get) then
-    let used := decl.foldExprM (m := Id) (fun s e => e.foldConsts s fun c s => s.insert c) ({} : NameSet)
+  let recording ← usageRecordingRef.get
+  let mut used : NameSet := {}
+  if recording then
+    used := decl.foldExprM (m := Id) (fun s e => e.foldConsts s fun c s => s.insert c) {}
     usedByChecksRef.modify fun acc => used.foldl (·.insert ·) acc
     declsByCommandRef.modify (·.push (← commandIdx, decl.getNames.toArray, used))
-    -- a realization's constants are added unchecked and then checked when the realization is merged
-    if debug.skipKernelTC.get (← getOptions) && !(← getEnv).isRealizing then
-      uncheckedDeclsByCommandRef.modify (·.insert (← commandIdx))
   addDeclCore decl forceExpose
+  if recording then
+    -- the kernel adds a nested inductive's auxiliary recursors, named after its first type, which `getNames` lacks
+    if let .inductDecl _ _ (t :: _) _ := decl then
+      if let some (.inductInfo v) := (← getEnv).find? t.name then
+        unless v.numNested == 0 do
+          let recs := (Array.range v.numNested).map fun i => (mkRecName t.name).appendIndexAfter (i + 1)
+          declsByCommandRef.modify (·.push (← commandIdx, recs, used))
   discard <| decl.getTopLevelNames.mapM snapshotEnvLinterOptions
 
 def addAndCompile (decl : Declaration) (logCompileErrors : Bool := true)

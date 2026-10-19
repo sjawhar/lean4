@@ -1,11 +1,11 @@
 import Lean
 /-! The public test-support function `CommandEntries.Testing.rollbackTo` writes extension states through the counted
-core, so a declaration command whose attribute uses it to install a changed state of a log extension is recorded as
-`stateOnly` and the module is `noskip` (`decl2f-delta3-review.md` finding 5). Writing below the counters would leave
+core, so a declaration command whose attribute uses it to install a changed state of a log extension is refused and
+the module is `noskip` (`decl2f-delta3-review.md` finding 5). Writing below the counters would leave
 the payload empty and its replay would lose the change. The attribute builds a state with an extra derived element in
 a scratch environment and copies it into the real one. `d0` is the module's only declaration, so the module's
 `noskip` comes from it alone; the copy writes every extension, each counted, so the reason names the first extension
-in registration order, and the test checks that `logExt` is among the command's `stateOnly`. -/
+in registration order, and the test checks that `logExt` is among the extensions the command is refused for. -/
 open Lean
 
 def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
@@ -56,6 +56,6 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
         let got ← view env
         pure (if full == got then "replay matches" else s!"replay differs:\n    full     {full}\n    replayed {got}")
       catch _ => pure "refused"
-    IO.println s!"{o.i}: stateOnly contains logExt {ce.stateOnly.contains `logExt}; {replay}"
+    IO.println s!"{o.i}: refused for logExt {(ce.refusals.filterMap (·.ext?)).contains `logExt}; {replay}"
 
 #eval main

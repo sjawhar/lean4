@@ -1,7 +1,7 @@
-command 3 (attribute [-simp] victim): refused: command 3 changed #[Lean.Meta.simpExtension] without entries; it must be elaborated again
-command 4 (attribute [-simp] keep in theorem t1): refused: command 4 changed #[Lean.Meta.simpExtension] without entries; it must be elaborated again
-command 5 (@[erase_probe] def d): refused: command 5 changed #[Lean.Meta.simpExtension] without entries; it must be elaborated again
-command 7 (@[raw_erase] def d2): refused: command 7 changed #[Lean.Meta.simpExtension] without entries; it must be elaborated again
-noskip: (some true), reason: (some (state-only change to Lean.Meta.simpExtension in the branch of t1 in declaration command 4))
+command 3 (attribute [-simp] victim): refused: command 3 is not replayable (#[a change to Lean.Meta.simpExtension that no entry expresses]); it must be elaborated again
+command 4 (attribute [-simp] keep in theorem t1): refused: command 4 is not replayable (#[a change to Lean.Meta.simpExtension that no entry expresses, a change to Lean.Meta.simpExtension that no entry expresses in the record of t1]); it must be elaborated again
+command 5 (@[erase_probe] def d): refused: command 5 is not replayable (#[a change to Lean.Meta.simpExtension that no entry expresses, a change to Lean.Meta.simpExtension that no entry expresses in the record of d, the attribute erase_probe, whose handlers may run code outside core Lean]); it must be elaborated again
+command 7 (@[raw_erase] def d2): refused: command 7 is not replayable (#[a change to Lean.Meta.simpExtension that no entry expresses, a change to Lean.Meta.simpExtension that no entry expresses in the record of d2, the attribute raw_erase, whose handlers may run code outside core Lean]); it must be elaborated again
+noskip: (some true), reason: (some (declaration command 4: a change to Lean.Meta.simpExtension that no entry expresses))
 ctx after erasing victim vs other differs: [true, true, true]
 ctx before the erasure equal: [true, true, true, true]

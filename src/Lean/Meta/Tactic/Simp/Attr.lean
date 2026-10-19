@@ -40,6 +40,7 @@ def mkSimpAttr (attrName : Name) (attrDescr : String) (ext : SimpExtension)
     name  := attrName
     descr := attrDescr
     applicationTime := AttributeApplicationTime.afterCompilation
+    onlyCoreCode := true
     add   := fun declName stx attrKind => do
       if (← isSimproc declName <||> isBuiltinSimproc declName) then
         let simprocAttrName := simpAttrNameToSimprocAttrName attrName

@@ -1,16 +1,11 @@
 import Lean
 /-! A declaration command that removes a binding from an extension whose state delta diffs a map (a map declaration
-extension, a tag attribute, a hash-map state, the namespace set) records the extension in its payload's
-`stateOnly`: no entry expresses a removal, so the payload is refused and the module is declined (`noskip`). The
-removals are direct state writes, which these deltas see without the direct-write counter. -/
+extension, a tag attribute, a hash-map state, the namespace set) refuses its payload for the extension: no entry
+expresses a removal, so the module is declined (`noskip`). The
+removals are direct state writes, which these deltas see without the direct-write counter. The attributes are
+registered by an imported module, so each command that runs one is also refused for it (`Refusal.foreignAttribute`),
+and the module's `noskip` reason names the first such command; the per-command lines show each extension's refusal. -/
 open Lean
-
-/-- The extensions `keep` selects among a payload's entries, as `name.view`: checked entries, main entries, then the
-scoped extensions' operations. -/
-def shownEntries (ce : CommandEntries) (keep : Name → Bool) : Array String :=
-  let named (view : String) (es : Array (Name × Array EnvExtensionEntry)) :=
-    es.filterMap fun (n, _) => if keep n then some s!"{n}.{view}" else none
-  named "checked" ce.checked.entries ++ named "main" ce.main.entries ++ named "main" ce.main.scopedOps
 
 def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
   let out ← IO.Process.output { cmd := "lean", args, cwd := dir, env := #[("LEAN_PATH", some dir.toString)] }
@@ -66,7 +61,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let watched := [`mapExt, `tagAttr, `Lean.Meta.Simp.simprocDeclExt, .num `_private.Lean.Namespace 0 ++ `Lean.namespacesExt]
   for o in obs do
     let some ce := payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"
-    IO.println s!"{o.i}: stateOnly {ce.stateOnly.filter watched.contains}, \
-      entries {shownEntries ce watched.contains}"
+    IO.println s!"{o.i}: refused for {(ce.refusals.filterMap (·.ext?)).filter watched.contains}, \
+      entries {CommandEntries.Testing.shownEntries ce watched.contains}"
 
 #eval main

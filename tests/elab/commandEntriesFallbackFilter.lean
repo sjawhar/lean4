@@ -1,8 +1,8 @@
 import Lean
 /-! An extension with no typed state delta whose exporter keeps only keys that are constants: a declaration
 attribute inserts `d.later` (command 0) before `def d.later` declares it (command 1), so the entry shows up in
-the export one command after the state change. Its state change is recorded as `stateOnly` on command 0, whose
-payload `replayCommandEntries` then refuses, and the module is declined (`noskip`); nothing is recorded for
+the export one command after the state change. Its state change refuses command 0's payload (`replayCommandEntries`
+throws on it), and the module is declined (`noskip`); nothing is recorded for
 command 1, whose state did not change. -/
 open Lean
 

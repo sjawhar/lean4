@@ -94,6 +94,8 @@ builtin_initialize symbolFrequencyExt : PersistentEnvExtension (NameMap Nat) Emp
       let ents := env.unsafeRunMetaM do return #[← cachedLocalSymbolFrequencyMap]
       .uniform ents
     statsFn         := fun _ => "symbol frequency extension"
+    -- computed for the export from the final environment
+    perCommand      := .notCarried
   }
 
 /-- A global `IO.Ref` containing the symbol frequency map. This is initialized on first use. -/
