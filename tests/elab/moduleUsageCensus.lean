@@ -307,11 +307,11 @@ for another module's name is dropped by the writer or never read. `moduleDigest`
 in every digest of the module. `tableDigest`: a cross-module table whose exported entries are in the module's
 cross-module table digest. `specKeys`: the specialization cache; the module records the keys it looked up and
 exports the keys it created, and Lake compares the providers of every looked-up key in the closure.
-`moduleLocal`: never exported to another module's compile. `uncovered`: none of these. -/
+`uncovered`: none of these. -/
 inductive Mechanism where
-  | ownDeclDigest | moduleDigest | tableDigest | specKeys | moduleLocal
+  | ownDeclDigest | moduleDigest | tableDigest | specKeys
   | uncovered
-deriving BEq, Repr
+deriving BEq
 
 /-- Reasons shared by the writers that go through one library function. -/
 def tagAttrReason : String :=
@@ -548,7 +548,6 @@ inductive GlobalClass where
   /-- Read only to format messages and traces, never to generate code. -/
   | messagesOnly
   | uncovered
-deriving BEq
 
 /-- `global → (class, reason)`, keyed by the name without the private-name prefix. -/
 def globals : List (Name × GlobalClass × String) := [
@@ -612,7 +611,6 @@ inductive MetaClass where
   /-- Formats messages and traces only. -/
   | messagesOnly
   | uncovered
-deriving BEq
 
 /-- `Meta` function the compiler calls directly → (class, reason). -/
 def metaEntries : List (Name × MetaClass × String) := [
