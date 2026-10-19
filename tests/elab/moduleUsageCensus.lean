@@ -153,8 +153,8 @@ def classification : List (Name × UsageClass × String) := [
   (`Lean.IR.declMapExt, .R1,
     "Own-declaration IR code, read by `entriesEnc` for each own name, whoever wrote it. Importers resolve a \
     name's IR through its defining module (`findExtEntry?` by module index), so an entry written for another \
-    module's name is not read, except a name the module claims (`extraConstNames`) that has no \
-    compiler-generated shape, which `tableDigest` holds (`claimedForeignNames`)."),
+    module's name is not read, except a name the module claims (`extraConstNames`) that its own compile did not \
+    create (`compileCreatedNames`), whose list the module's `.olean` carries for `tableDigest` (`foreignClaims`)."),
   (Lean.mkPrivateNameCore `Lean.Compiler.LCNF.ToImpureType `Lean.Compiler.LCNF.impureTypeExt, .R1,
     "IR type of an inductive, written by `setImpureType` from `compileInductives` \
     (src/Lean/Compiler/LCNF/ToImpureType.lean). Not a function of the kernel data alone: \
@@ -420,7 +420,7 @@ def writers : List (Name × List (Name × Mechanism × String)) := [
     (`Lean.registerParametricAttribute, .ownDeclDigest, parametricAttrReason)]),
   (`Lean.IR.declMapExt, [
     (`Lean.IR.addDecl, .ownDeclDigest,
-      "Public (src/Lean/Compiler/IR/CompilerM.lean:197-198); an IR declaration of an own name is in `entriesEnc`, whoever added it. A declaration added for another module's name is not read by importers, which resolve a name's IR through its defining module (`findExtEntry?` by module index), except a name the module claims (`extraConstNames`) that has no compiler-generated shape: `tableDigest` holds those (`claimedForeignNames`)."),
+      "Public (src/Lean/Compiler/IR/CompilerM.lean:197-198); an IR declaration of an own name is in `entriesEnc`, whoever added it. A declaration added for another module's name is not read by importers, which resolve a name's IR through its defining module (`findExtEntry?` by module index), except a name the module claims (`extraConstNames`) that its own compile did not create: `tableDigest` holds those (`foreignClaims`, case `cs_nested`)."),
     (`Lean.IR.addDecls, .ownDeclDigest, "Called by `IR.compile` (src/Lean/Compiler/IR.lean:35), which `PassManager.run` calls."),
     (`Lean.IR.ToIR.addDecl, .ownDeclDigest,
       "Adds the dummy declaration of an extern (src/Lean/Compiler/IR/ToIR.lean:54-55,202); covered like `IR.addDecl`.")]),
@@ -573,6 +573,8 @@ def globals : List (Name × GlobalClass × String) := [
   (`Lean.specLookupsRef, .recording, "Private (src/Lean/Util/UsedByChecks.lean)."),
   (`Lean.compilerCodeRef, .recording, "Private (src/Lean/Util/UsedByChecks.lean); only ever set to `true`."),
   (`Lean.compileHintsRef, .recording, "Private (src/Lean/Util/UsedByChecks.lean); only ever added to."),
+  (`Lean.compiledNamesRef, .recording,
+    "Private (src/Lean/Util/UsedByChecks.lean); only added to, by the compiler through the export of the private `recordCompiledNames` (`PassManager.run`): per compile, the declarations it compiled and the names it created; `ModuleUsage.ownCreatedNames` counts only the names of compiles of the module's own constants as the module's own claims (cases `cs_nested`, `shadow`)."),
   (`Lean.extraModUsesByChecksRef, .recording, "Private (src/Lean/ExtraModUses.lean)."),
   (`Lean.Compiler.LCNF.baseTransparentDeclsExt, .moduleLocal,
     "`mkOrderedDeclSetExt` (src/Lean/Compiler/LCNF/PhaseExt.lean:26): non-persistent, initially empty."),
@@ -646,6 +648,136 @@ def metaEntries : List (Name × MetaClass × String) := [
   (``Lean.Meta.MetaM.run', .builds, "Runs a `MetaM` computation."),
   (``Lean.Meta.throwFunctionExpected, .builds, "Throws."),
   (``Lean.Meta.ppExpr, .messagesOnly, "LCNF pretty-printing for traces.")]
+
+/-- What a name the compiler builds from another name (appending a literal component to a computed name) is. -/
+inductive DerivedClass where
+  /-- A constant the compiler looks up by the derived name when it compiles a use of the base: in
+  `ModuleUsage.derivedSuffixes`, so it is a reference of a base of its module, a use of every module that uses or
+  defines the base (`derivedReads`), and listed in the `tableDigest` of a module that defines it for another
+  module's base. -/
+  | derived
+  /-- The name of a declaration the compile creates (`compileCreatedNames`); it folds into its owner, and a claim of
+  it by a module whose compile did not create it is in that module's `tableDigest` (`foreignClaims`). -/
+  | compilerOnly
+  /-- A name placed in the compiled code, so a compiled mention of the module that compiles it. -/
+  | codeName
+  /-- Matched against a name's own last component; no other name is read. -/
+  | shapeTest
+  /-- Not the name of a declaration: local variables and universe levels, trace classes, macro scopes, error and
+  type names. -/
+  | notDeclaration
+  | uncovered
+deriving BEq
+
+/-- `kind suffix` → (class, reason), where `kind` is how the reached code builds the name: `mkStr` (`Name.mkStr x
+"s"`, also with a string constant), `append`/`prepend` (`x ++ lit` / `lit ++ x`), `appendIndexAfter`. -/
+def derivedNames : List (String × DerivedClass × String) := [
+  ("mkStr _sunfold", .derived,
+    "`Meta.mkSmartUnfoldingNameFor`: `unfoldDefinition?` unfolds `X` through `X._sunfold`'s value, or a bare `X` not at all when it exists (src/Lean/Meta/WHNF.lean, `.app` and `.const` cases). Cases `vd_sunfold`, `vd_sunfold_bn`, `vd_sunfold_new`, `vd_sunfold_bare`."),
+  ("mkStr _unsafe_rec", .derived,
+    "`Compiler.mkUnsafeRecName`: `getDeclInfo?` compiles `X._unsafe_rec`'s value as `X`'s code, `declIsNotUnsafe` reads its existence (src/Lean/Compiler/LCNF/ToDecl.lean), `checkComputable` its `noncomputable` mark for every use of `X` (ToLCNF.lean). `isUnsafeRecName?` strips it, and `toDecl` reads the base's attributes: a prefix in `ModuleUsage.internalPrefixes`. Cases `dn_unsafe_rec`, `dn_noncomp`."),
+  ("mkStr casesOn", .derived,
+    "`mkCasesOnName`: `Code.toMono` rewrites a `cases` on `T` when `T.casesOn` has an `implemented_by` (src/Lean/Compiler/LCNF/ToMono.lean). No case: every `cases` the compiler reaches comes from a term that mentions `T.casesOn` (a `casesOn` application, a matcher, `noConfusion`), whose digest already covers the attribute; a projection compiles to `proj`, which `toMono` does not rewrite."),
+  ("append _impl", .codeName,
+    "`Code.toMono` names `T._impl` and `ctor._impl` (computed fields) as the `cases` type and alternatives of the code it produces: compiled mentions."),
+  ("mkStr _boxed", .compilerOnly,
+    "`mkBoxedName` names the boxed declaration `addBoxedVersions` creates; `isBoxedName`, `isDeclMeta` and `isDeclPublic` strip it to read the module's own state, and the interpreter looks it up in the base's module only (`findInterpDeclBoxed`)."),
+  ("append _redArg", .compilerOnly, "`Decl.reduceArity` names the reduced-arity declaration it creates."),
+  ("append _at_", .compilerOnly, "`Specialize.mkSpecDecl` names the specialization it creates."),
+  ("append spec", .compilerOnly, "`Specialize.mkSpecDecl` names the specialization it creates."),
+  ("appendIndexAfter <computed>", .compilerOnly,
+    "`LambdaLifting.mkAuxDeclName` (`_lam_N`, `_elam_N`, a fresh name: an existing one is skipped) and `mkSpecDecl` (`spec_N`). A kernel constant with such a name is in `tableDigest` (`compilerShapedConsts`), a claimed one in `foreignClaims`."),
+  ("appendIndexAfter _boxed_const", .compilerOnly, "`ExplicitBoxing.mkCast` names the auxiliary declaration it creates."),
+  ("appendIndexAfter _closed", .compilerOnly, "`ExtractClosed` names the closed term it extracts."),
+  ("append spill", .codeName,
+    "`spillCtorInfo` names a spill object's constructor info in IR after the constructor, a compiled mention that `State.ownerOf` strips to the constructor."),
+  ("mkStr toBitVec", .codeName, "`casesUIntToMono` refers to `UIntN.toBitVec` of a builtin `UIntN`: a compiled mention of a toolchain constant."),
+  ("mkStr _override", .shapeTest, "`inlineCandidate?` matches a name ending in `_override` (computed fields); no derived name is read."),
+  ("mkStr boxed", .notDeclaration, "`mkBoxedVersion`'s local variable name."),
+  ("mkStr overap", .notDeclaration, "`mkOverApplication`'s local variable name."),
+  ("appendIndexAfter u", .notDeclaration, "`normLevel`'s universe parameter names."),
+  ("appendIndexAfter x", .notDeclaration, "`abstractExprMVars`' binder names."),
+  ("append Compiler", .notDeclaration, "`checkpoint`'s trace class names."),
+  ("prepend Compiler", .notDeclaration, "`checkpoint`'s trace class names."),
+  ("append trace", .notDeclaration, "`checkTraceOption`'s option names."),
+  ("prepend trace", .notDeclaration, "`checkTraceOption`'s option names."),
+  ("mkStr _@", .notDeclaration, "Macro scopes (`addMacroScope`, `MacroScopesView.review`)."),
+  ("mkStr _hyg", .notDeclaration, "Macro scopes (`addMacroScope`, `MacroScopesView.review`)."),
+  ("mkStr _namedError", .notDeclaration, "`kindOfErrorName`'s message kind names."),
+  ("mkStr _sorry", .notDeclaration, "`SorryLabelView.decode?` matches a sorry label's own components."),
+  ("mkStr Lean", .notDeclaration, "Type and profiler names (`TypeName` instances, `realizeValue`, `setAllDiagRanges`)."),
+  ("mkStr Meta", .notDeclaration, "Type and profiler names (`TypeName` instances, `realizeValue`, `setAllDiagRanges`)."),
+  ("mkStr AsyncConsts", .notDeclaration, "A `TypeName` instance's type name."),
+  ("mkStr FunInfoEnvCacheKey", .notDeclaration, "A `TypeName` instance's type name."),
+  ("mkStr RealizeValueResult", .notDeclaration, "A `TypeName` instance's type name."),
+  ("mkStr realizeAndReport", .notDeclaration, "A profiler name in `realizeValue`."),
+  ("mkStr realizeValue", .notDeclaration, "A profiler name in `realizeValue`."),
+  ("mkStr setAllDiagRanges", .notDeclaration, "A profiler name in `setAllDiagRanges`.")]
+
+/-- The closed name literal `e` builds, if any. -/
+partial def litName? (e : Expr) : Option Name :=
+  match e.getAppFn, e.getAppArgs with
+  | .const ``Name.anonymous _, #[] => some .anonymous
+  | .const n _, args =>
+    let strs := args.filterMap fun a => match a with | .lit (.strVal s) => some s | _ => none
+    if [``Name.mkStr1, ``Name.mkStr2, ``Name.mkStr3, ``Name.mkStr4, ``Name.mkStr5, ``Name.mkStr6, ``Name.mkStr7,
+        ``Name.mkStr8].contains n then
+      if strs.size == args.size then some (strs.foldl Name.mkStr .anonymous) else none
+    else if (n == ``Name.mkStr || n == ``Name.str) && args.size == 2 then do
+      let p ← litName? args[0]!
+      let .lit (.strVal s) := args[1]! | none
+      some (.str p s)
+    else if n == ``Name.mkSimple && args.size == 1 then
+      match args[0]! with | .lit (.strVal s) => some (.str .anonymous s) | _ => none
+    else none
+  | _, _ => none
+
+/-- The `derivedNames` keys of the names `v` builds by appending a literal component, or a string constant's, to a
+computed name. A suffix that is neither (a computed string) is not reported, except after `appendIndexAfter`. -/
+def derivedKeys (env : Environment) (v : Expr) : Array String := Id.run do
+  let mut out := #[]
+  let mut stack := #[v]
+  let mut visited : Std.HashSet UInt64 := {}
+  while !stack.isEmpty do
+    let e := stack.back!
+    stack := stack.pop
+    if visited.contains e.hash then continue
+    visited := visited.insert e.hash
+    let args := e.getAppArgs
+    if let .const n _ := e.getAppFn then
+      if (n == ``Name.mkStr || n == ``Name.str) && args.size == 2 && (litName? args[0]!).isNone then
+        match args[1]! with
+        | .lit (.strVal s) => out := out.push s!"mkStr {s}"
+        | .const sc _ =>
+          if let some (.defnInfo { value := .lit (.strVal s), .. }) := env.find? sc then out := out.push s!"mkStr {s}"
+        | _ => pure ()
+      if (n == ``Name.append || n == ``Name.appendCore || n == ``HAppend.hAppend || n == ``Append.append) &&
+          args.size ≥ 2 then
+        match litName? args[args.size - 2]!, litName? args[args.size - 1]! with
+        | none, some l => if !l.isAnonymous then out := out.push s!"append {l}"
+        | some l, none => if !l.isAnonymous then out := out.push s!"prepend {l}"
+        | _, _ => pure ()
+      if (n == ``Name.appendIndexAfter || n == ``Name.appendAfter) && args.size ≥ 2 then
+        out := out.push s!"appendIndexAfter {(litName? args[0]!).elim "<computed>" toString}"
+    match e with
+    | .app f a => stack := stack.push f |>.push a
+    | .lam _ d b _ | .forallE _ d b _ => stack := stack.push d |>.push b
+    | .letE _ t v b _ => stack := stack.push t |>.push v |>.push b
+    | .mdata _ b | .proj _ _ b => stack := stack.push b
+    | _ => pure ()
+  return out
+
+/-- Reached functions that take a name's prefix (`Name.getPrefix`) → (whether the prefix is read as a declaration,
+reason). A read prefix must be covered by `ModuleUsage.internalPrefixes`. -/
+def prefixReaders : List (Name × Bool × String) := [
+  (`Lean.hasNeverExtractAttribute.visit, true,
+    "Reads the `never_extract` tag of each prefix while the name is internal (src/Lean/Compiler/NeverExtractAttr.lean): exactly `ModuleUsage.internalPrefixes`, which a module that uses or defines the name uses (`derivedReads`). Case `dn_never_extract`."),
+  (`Lean.Compiler.LCNF.ToLCNF.toLCNF.visitNoConfusion, false,
+    "`typeName := declName.getPrefix` is bound and never read (src/Lean/Compiler/LCNF/ToLCNF.lean)."),
+  (`Lean.Compiler.LCNF.ToLCNF.toLCNF.visitProjFn, false,
+    "Compares the constructor's prefix with the hard-coded runtime builtin types (`isRuntimeBuiltinType`)."),
+  (`Lean.Compiler.LCNF.ToLCNF.bindCases.go, false, "Compares a local binder name's prefix with `_alt`."),
+  (`Lean.Compiler.LCNF.mayReuse, false, "Compares two constructors' prefixes; no declaration is read.")]
 
 #eval show CoreM Unit from do
   let env ← getEnv
@@ -798,5 +930,40 @@ def metaEntries : List (Name × MetaClass × String) := [
   for (n, _, _) in metaEntries do
     unless reachedMeta.contains n do
       errors := errors.push s!"`metaEntries` names `{n}`, which the compiler does not call"
+  -- Derived names: every name the reached code builds by appending a literal component to a computed name needs a
+  -- `derivedNames` row, none `uncovered`, and the `derived` rows are exactly `ModuleUsage.derivedSuffixes`; every
+  -- reached function taking a name's prefix needs a `prefixReaders` row.
+  let mut scanned : Std.HashMap String (Array Name) := {}
+  let mut prefixUsers : NameSet := {}
+  for c in queue do
+    let some ci := env.find? c | continue
+    let some v := ci.value? (allowOpaque := true) | continue
+    for k in derivedKeys env v do
+      scanned := scanned.alter k fun o => some ((o.getD #[]).push c)
+    if v.getUsedConstants.contains ``Name.getPrefix then
+      prefixUsers := prefixUsers.insert ((userName c).eraseSuffix? `_unsafe_rec |>.getD (userName c))
+  let derivedMap : Std.HashMap String (DerivedClass × String) :=
+    derivedNames.foldl (fun m (k, c, r) => m.insert k (c, r)) {}
+  for (k, cs) in scanned do
+    match derivedMap[k]? with
+    | none => errors := errors.push s!"`{cs[0]!}` builds a derived name `{k}`, which is missing from `derivedNames`"
+    | some (.uncovered, reason) => errors := errors.push s!"derived name `{k}` is `uncovered`: {reason}"
+    | some _ => pure ()
+  for (k, cls, _) in derivedNames do
+    unless scanned.contains k do
+      errors := errors.push s!"`derivedNames` lists `{k}`, which no reached code builds"
+    match k.dropPrefix? "mkStr " with
+    | some s =>
+      if (cls == .derived) != ModuleUsage.derivedSuffixes.contains s.toString then
+        errors := errors.push s!"`derivedNames` and `ModuleUsage.derivedSuffixes` disagree on `{k}`"
+    | none =>
+      if cls == .derived then
+        errors := errors.push s!"`{k}` is classified derived, which only a `mkStr` suffix in `ModuleUsage.derivedSuffixes` can be"
+  for c in prefixUsers do
+    unless prefixReaders.any (·.1 == c) do
+      errors := errors.push s!"`{c}` takes a name's prefix (`Name.getPrefix`) and is missing from `prefixReaders`"
+  for (n, _, _) in prefixReaders do
+    unless prefixUsers.contains n do
+      errors := errors.push s!"`prefixReaders` names `{n}`, which is not a reached function taking a prefix"
   unless errors.isEmpty do
     throwError "moduleUsageCensus found {errors.size} issue(s) (of {registered.size} registered, {reachedExts.size} reachable extensions):\n{"\n".intercalate errors.toList}"

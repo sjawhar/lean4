@@ -136,6 +136,11 @@ private unsafe def isBuiltinCompilerUnsafe (manager : PassManager)
 @[implemented_by isBuiltinCompilerUnsafe]
 private opaque isBuiltinCompiler (manager : PassManager) (folders : SMap Name Simp.ConstantFold.Folder) : Bool
 
+set_option compiler.ignoreBorrowAnnotation true in
+/-- `Lean.recordCompiledNames`, private to its module so that only the compiler records the names it created. -/
+@[extern "lean_usage_record_compiled_names"]
+private opaque recordCompiledNames (inputs names : Array Name) : BaseIO Unit
+
 namespace PassManager
 
 partial def run (declNames : Array Name) (baseOpts : Options) : CompilerM Unit := withAtLeastMaxRecDepth 8192 do
@@ -229,7 +234,10 @@ partial def run (declNames : Array Name) (baseOpts : Options) : CompilerM Unit :
       -- or consider running clear? unclear
       profileitM Exception "compilation (IR)" (← getOptions) do
         let irDecls ← IR.toIR decls
-        discard <| IR.compile irDecls
+        let compiled ← IR.compile irDecls
+        -- The usage data counts a compiler-only name as the module's own only if a compile of its own constants
+        -- created it.
+        recordCompiledNames declNames (decls.map (·.name) ++ compiled.map (·.name))
 where
   runPassManagerPart (inPhase outPhase : Purity) (profilerName : String)
       (passes : Array Pass) (decls : Array (Decl inPhase)) (isCheckEnabled : Bool) :

@@ -1435,6 +1435,55 @@ claim_nsb_s1() { claim_z 'def NS : Nat := 0' NS.foo._boxed lean_nat_pred; }
 claim_nsb_priv_s0() { claim_boxed_files; }
 claim_nsb_priv_s1() { claim_z 'private def NS.foo : Nat := 0' NS.foo._boxed lean_nat_pred; }
 
+# A claim of a name `A`'s compile created inside another specialization: `A`'s specialization of `h` created inside
+# its specialization of `g` is `h._at_.g._at_.useIt.spec_0.spec_0`; `Z` defines `useIt.spec_0`, a reading of that
+# name's creator, and claims the name (`cs_nested`; `cs_nested_ctl` without the definition). `C` specializes `h` at
+# the same key, so the cache gives it `A`'s name, which resolves to `Z`'s claim. A module owns a claimed name only
+# if its own compile created it.
+cs_nested_files() {
+  lakefile_app; mkdir_t
+  cat > T/A.lean <<'EOF'
+@[specialize] def h (f : Nat → Nat) : List Nat → List Nat
+  | [] => []
+  | x :: xs => f x :: h f xs
+@[specialize] def g (f : Nat → Nat) (xs : List Nat) : List Nat := h f xs ++ [0]
+def useIt (xs : List Nat) : List Nat := g (· + 1) xs
+EOF
+  printf 'import Lean\ndef zdummy : Nat := 1\n' > T/Z.lean
+  printf 'import T.Z\nimport T.A\n@[noinline] def useC (xs : List Nat) : List Nat := h (· + 1) xs\n' > T/C.lean
+  printf 'import T.C\ndef main : IO Unit := IO.println (useC [1, 2])\n' > Main.lean
+}
+cs_nested_s0() { cs_nested_files; }
+cs_nested_s1() { claim_z 'def useIt.spec_0 : Nat := 0' h._at_.g._at_.useIt.spec_0.spec_0 lean_nat_succ; }
+cs_nested_ctl_s0() { cs_nested_files; }
+cs_nested_ctl_s1() { claim_z '' h._at_.g._at_.useIt.spec_0.spec_0 lean_nat_succ; }
+# The same name created by `Z`'s own compile from ordinary code: `Z` defines `@[specialize] h._at_.g` and the creator
+# `useIt.spec_0`, so its compile generates `h._at_.g._at_.useIt.spec_0.spec_0` (`cs_collide`; the creator `useIt2`
+# in `cs_collide_ctl`). A kept `C` must match a fresh one.
+cs_collide_z() {
+  cat > T/Z.lean <<EOF
+def zdummy : Nat := 1
+@[specialize] def h._at_.g (f : Nat → Nat) : List Nat → List Nat
+  | [] => []
+  | x :: xs => f x :: h._at_.g f xs
+def $1 (xs : List Nat) : List Nat := h._at_.g (· + 2) xs
+EOF
+}
+cs_collide_s0() { cs_nested_files; }
+cs_collide_s1() { cs_collide_z useIt.spec_0; }
+cs_collide_ctl_s0() { cs_nested_files; }
+cs_collide_ctl_s1() { cs_collide_z useIt2; }
+# A claim of `A`'s kernel constant `foo` by `Z`, which `D` imports before `A`; `E` imports only `D` and calls `foo`.
+cs_kern_s0() {
+  lakefile_app; mkdir_t
+  printf '@[noinline] def foo (n : Nat) : Nat := n + 5\n' > T/A.lean
+  printf 'import Lean\ndef zdummy : Nat := 1\n' > T/Z.lean
+  printf 'import T.Z\nimport T.A\ndef dd : Nat := 0\n' > T/D.lean
+  printf 'import T.D\n@[noinline] def useFoo (n : Nat) : Nat := foo n\n' > T/E.lean
+  printf 'import T.E\ndef main : IO Unit := IO.println (useFoo 1)\n' > Main.lean
+}
+cs_kern_s1() { claim_z '' foo lean_nat_succ; }
+
 # A control for the comparison of failing builds: `scoped_inst` with a module `N` that fails in state 1, so the
 # build fails while `M` and `W` are kept; the outputs both builds produced must still agree.
 negfail_scoped_s0() {
@@ -1895,6 +1944,121 @@ bn_alias_s0() {
 }
 bn_alias_s1() { printf 'namespace T\n@[reducible] def F : Type := (y : Nat) → Nat\nend T\n' > T/A.lean; }
 
+# `mdata` an importer copies: a custom annotation (term elaborator `mark%` in `P`) whose payload changes 1 -> 2 in a
+# `@[macro_inline]` body, a reducible type alias, a type alias with the annotation at the head and an `@[inline]` body
+# (`vd_mdata`), and in the type of a definition `M`'s elaboration copies into its own terms (`vd_mdata_type`). A
+# kept `M`'s `.olean` must match a fresh one.
+vd_mdata_p() {
+  cat > T/P.lean <<'EOF'
+import Lean
+open Lean Elab Term
+namespace T
+syntax (name := markStx) "mark% " num term:max : term
+@[term_elab markStx] def elabMark : TermElab := fun stx ety? => do
+  let n := stx[1].isNatLit?.getD 0
+  let e ← elabTerm stx[2] ety?
+  return .mdata (KVMap.empty.insert `vdmark (.ofNat n)) e
+end T
+EOF
+}
+vd_mdata_a() {
+  cat > T/A.lean <<EOF
+import T.P
+namespace T
+@[macro_inline] def mi (n : Nat) : Nat := mark% $1 (n + 1)
+@[reducible] def F : Type := (x : mark% $1 Nat) → mark% $1 Nat
+def G : Type := mark% $1 ((y : Nat) → Nat)
+@[inline] def il (n : Nat) : Nat := mark% $1 (n * 2)
+end T
+EOF
+}
+vd_mdata_s0() {
+  lakefile_app; mkdir_t; vd_mdata_p; vd_mdata_a 1
+  cat > T/M.lean <<'EOF'
+import T.A
+namespace T
+@[noinline] def h (f : F) (g : G) (n : Nat) : Nat := f (mi n) + g (il n)
+end T
+EOF
+  printf 'import T.M\ndef main : IO Unit := IO.println (T.h (fun x => x + 1) (fun y => y * 3) 5)\n' > Main.lean
+}
+vd_mdata_s1() { vd_mdata_a 2; }
+vd_mdata_type_a() { printf 'import T.P\nnamespace T\ndef x : mark%% %s Nat := 5\nend T\n' "$1" > T/A.lean; }
+vd_mdata_type_s0() {
+  lakefile_app; mkdir_t; vd_mdata_p; vd_mdata_type_a 1
+  printf 'import T.A\nnamespace T\ndef y := x\n@[noinline] def k (n : Nat) : Nat := n + y\nend T\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println (T.k 5)\n' > Main.lean
+}
+vd_mdata_type_s1() { vd_mdata_type_a 2; }
+
+# Smart unfolding: computing the code type of `h`'s parameter reduces `F 0` through `F._sunfold` when that constant
+# exists (`Meta.unfoldDefinition?`), a constant no term of `M` or `F` mentions. `F._sunfold`'s value changes
+# (`vd_sunfold`), only a binder name of the type it unfolds to (`vd_sunfold_bn`), or it appears in another import
+# `B` that `M` uses nothing of (`vd_sunfold_new`).
+vd_sunfold_a() { printf 'namespace T\ndef F (_ : Nat) : Type := Nat\ndef F._sunfold (_ : Nat) : Type := %s\nend T\n' "$1" > T/A.lean; }
+vd_sunfold_m() {
+  printf 'import T.A\nnamespace T\n@[noinline] def h (_f : F 0) (n : Nat) : Nat := n + 1\n@[noinline] def k (n : Nat) : Nat := n * 2\nend T\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println (T.k 5)\n' > Main.lean
+}
+vd_sunfold_s0() { lakefile_app; mkdir_t; vd_sunfold_a Nat; vd_sunfold_m; }
+vd_sunfold_s1() { vd_sunfold_a UInt8; }
+vd_sunfold_bn_a() {
+  printf 'namespace T\ndef F (_ : Nat) : Type := (x : Nat) → Nat\ndef F._sunfold (_ : Nat) : Type := (%s : Nat) → Nat\nend T\n' "$1" > T/A.lean
+}
+vd_sunfold_bn_s0() { lakefile_app; mkdir_t; vd_sunfold_bn_a y; vd_sunfold_m; }
+vd_sunfold_bn_s1() { vd_sunfold_bn_a z; }
+vd_sunfold_new_s0() {
+  lakefile_app; mkdir_t
+  printf 'namespace T\ndef F (_ : Nat) : Type := Nat\nend T\n' > T/A.lean
+  printf 'namespace T\ndef b : Nat := 0\nend T\n' > T/B.lean
+  vd_sunfold_m
+  printf 'import T.A\nimport T.B\nnamespace T\n@[noinline] def h (_f : F 0) (n : Nat) : Nat := n + 1\n@[noinline] def k (n : Nat) : Nat := n * 2\nend T\n' > T/M.lean
+}
+vd_sunfold_new_s1() { printf 'namespace T\ndef b : Nat := 0\ndef F._sunfold (_ : Nat) : Type := UInt8\nend T\n' > T/B.lean; }
+# The bare-constant path: a nullary alias `F` is not unfolded when `F._sunfold` exists (`vd_sunfold_bare`: `A`
+# gains it).
+vd_sunfold_bare_s0() {
+  lakefile_app; mkdir_t
+  printf 'namespace T\ndef F : Type := UInt8\nend T\n' > T/A.lean
+  printf 'import T.A\nnamespace T\n@[noinline] def h (_f : F) (n : Nat) : Nat := n + 1\n@[noinline] def k (n : Nat) : Nat := n * 2\nend T\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println (T.k 5)\n' > Main.lean
+}
+vd_sunfold_bare_s1() { printf 'namespace T\ndef F : Type := UInt8\ndef F._sunfold : Type := UInt8\nend T\n' > T/A.lean; }
+
+# Other derived constants the compiler reads by name for a base of another module: `B` gains a `noncomputable`
+# (so not compiled) `T.f._unsafe_rec`, whose value compiling `M`'s own `T.f` uses as its code (`dn_unsafe_rec`), or
+# whose `noncomputable` mark fails the compile of every use of `A`'s `T.f` (`dn_noncomp`). `M` uses nothing of `B`.
+dn_unsafe_rec_s0() {
+  lakefile_app; mkdir_t
+  printf 'namespace T\ndef b : Nat := 0\nend T\n' > T/B.lean
+  printf 'import T.B\nnamespace T\ndef f (n : Nat) : Nat := n + 1\nend T\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println (T.f 1)\n' > Main.lean
+}
+dn_unsafe_rec_s1() {
+  printf 'namespace T\ndef b : Nat := 0\nnoncomputable def f._unsafe_rec (n : Nat) : Nat := n + 100\nend T\n' > T/B.lean
+}
+dn_noncomp_s0() {
+  lakefile_app; mkdir_t
+  printf 'namespace T\n@[noinline] def f (n : Nat) : Nat := n + 1\nend T\n' > T/A.lean
+  printf 'import T.A\nnamespace T\ndef b : Nat := 0\nend T\n' > T/B.lean
+  printf 'import T.A\nimport T.B\nnamespace T\n@[noinline] def g (n : Nat) : Nat := f n + 2\nend T\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println (T.g 1)\n' > Main.lean
+}
+dn_noncomp_s1() {
+  printf 'import T.A\nnamespace T\ndef b : Nat := 0\nnoncomputable def f._unsafe_rec (n : Nat) : Nat := Classical.choice ⟨n⟩\nend T\n' > T/B.lean
+}
+# The `never_extract` mark of a prefix the compiler reads with an internal name: `B` defines `T.g._x`, whose prefix
+# is `A`'s `T.g` (`B` does not import `A`); `A` marks `T.g` in state 1, so a fresh `M` no longer extracts the closed
+# term `T.g._x 3`.
+dn_never_extract_a() { printf 'namespace T\n%sdef g (n : Nat) : Nat := n\nend T\n' "$1" > T/A.lean; }
+dn_never_extract_s0() {
+  lakefile_app; mkdir_t; dn_never_extract_a ''
+  printf 'namespace T\ndef g._x (n : Nat) : Nat := n + 5\nend T\n' > T/B.lean
+  printf 'import T.A\nimport T.B\nnamespace T\n@[noinline] def m (n : Nat) : Nat := g._x 3 + n\nend T\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println (T.m 1)\n' > Main.lean
+}
+dn_never_extract_s1() { dn_never_extract_a '@[never_extract] '; }
+
 all_cases="spec_transitive spec_link spec_type spec_precomp plugin_replay csimp_transitive csimp_late specialize_attr
   cov_projfn cov_projfn_rev cov_mlike cov_sparse cov_auxrec cov_sibmatch cov_sibmatch_rev cov_ctlmatch
   cov_sibinst cov_sibclass cov_sibmeta cov_ckind_rev cov_recarg_rev
@@ -1919,6 +2083,8 @@ all_cases="spec_transitive spec_link spec_type spec_precomp plugin_replay csimp_
   binder_fun binder_jp binder_param owner_macro owner_boxed owner_move binder_info_param binder_info_type
   pre_summary ng ng_ctrl shadow shadow2 perkey_unrelated_spec perkey_provider r3_order r3_mdata_rev r3_nat r3_natg
   borrow_proj borrow_ctor borrow_alias tc_hint ba_implicit bi_inl bi_inl_rev bn_mi bi_down2 bn_alias
+  cs_nested cs_nested_ctl cs_collide cs_collide_ctl cs_kern vd_mdata vd_mdata_type vd_sunfold vd_sunfold_bn
+  vd_sunfold_new vd_sunfold_bare dn_unsafe_rec dn_noncomp dn_never_extract
   spec_transitive:cache"
 # `spec_transitive:cache`: the state the cutoff build of `spec_transitive` leaves behind, after another build and
 # in a fresh tree that shares its artifact cache.

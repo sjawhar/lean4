@@ -42,13 +42,15 @@ kernel constant of the same module (`ownerOf`), whose digest covers them.
 namespace Lean.ModuleUsage
 
 /-- Everything of `c`'s kernel data except its own name and the meaning of the constants it refers to. Types and every
-value but a theorem's keep binder names and infos (`BinderMode.namesInfos`) and `[borrowed]` annotations
-(`MDataMode.compilerRead`): the compiler reads all three from imported values, from `@[macro_inline]` bodies it
-inlines and from type aliases it unfolds into code types. A theorem's proof is never compiled, so its binders' names
-and infos and its `mdata` are left out. -/
+value but a theorem's keep binder names and infos (`BinderMode.namesInfos`) and every `mdata` payload
+(`MDataMode.eqv`): the compiler reads binders and `[borrowed]` annotations from imported values, from
+`@[macro_inline]` bodies it inlines and from type aliases it unfolds into code types, and elaboration and inlining
+copy them, `mdata` included, into the importer's own terms and `.olean`. A theorem's proof is never compiled or
+copied, so its binders' names and infos and its `mdata` are left out; proof-mode annotations in proofs carry
+fresh-name counters that differ between two builds of the same sources. -/
 def localHash (c : ConstantInfo) : Digest :=
-  let v := exprDigest .namesInfos .compilerRead
-  let e := ({} : Enc).names c.levelParams |>.digest (exprDigest .namesInfos .compilerRead c.type)
+  let v := exprDigest .namesInfos .eqv
+  let e := ({} : Enc).names c.levelParams |>.digest (v c.type)
   let e := match c with
     | .defnInfo d => hintsEnc (e.u8 1 |>.digest (v d.value)) d.hints |> (safetyEnc · d.safety)
     | .thmInfo t => e.u8 2 |>.digest (exprDigest .none .none t.value)
@@ -122,25 +124,52 @@ def ownerOf (isNode : Name → Bool) (x : Name) : Name := Id.run do
     | none => return x
   return x
 
+/-- The suffixes the compiler and the `Meta` functions it calls append to a declaration's name to look a constant up:
+`X._sunfold` (`Meta.mkSmartUnfoldingNameFor`; `whnf` unfolds `X` through it, or not at all), `X._unsafe_rec`
+(`Compiler.mkUnsafeRecName`; compiled in place of `X`, and its `noncomputable` mark read for every use of `X`) and
+`T.casesOn` (`mkCasesOnName`; its `implemented_by` rewrites every `cases` on `T`). No term mentions the derived
+constant, so a digest covers it three ways: it is a reference of its base when both are in one module
+(`ownNodes`), a module that uses or defines the base uses it (`derivedReads`), and a module that defines it for
+another module's base lists it in its `tableDigest`, so that its appearing rebuilds every module downstream. -/
+def derivedSuffixes : List String := ["_sunfold", "_unsafe_rec", "casesOn"]
+
+/-- The base of a derived constant name (`derivedSuffixes`). -/
+def derivedBase? : Name → Option Name
+  | .str p s => if derivedSuffixes.contains s then some p else none
+  | _ => none
+
+/-- The prefixes of `n` whose attributes the compiler reads when it compiles a use of `n`: while the name is internal
+(a component starts with `_`), its `getPrefix` (`hasNeverExtractAttribute`; `toDecl` reads the base of an
+`_unsafe_rec` name, `isUnsafeRecName?`). -/
+def internalPrefixes (n : Name) : Array Name := Id.run do
+  let mut out := #[]
+  let mut c := n
+  while c.isInternal do
+    c := c.getPrefix
+    out := out.push c
+  return out
+
 structure State where
   /-- Per imported module: empty if its `.olean` carries no digests (written without `lean --usage`, or by a
-  toolchain without this extension); otherwise a marker entry at index 0, whose digest is the module's
-  `closureDigest`, then the module's digests sorted by name. The marker's name is never looked up, so no user
-  constant can collide with it. -/
+  toolchain without this extension); otherwise two marker entries, whose digests are the module's `closureDigest`
+  (index 0) and the digest of the compiler-only names it claims without having created them (`claimsDigestOf`,
+  index 1), then the module's digests sorted by name. The markers' name is never looked up, so no user constant
+  can collide with it. -/
   importedModuleEntries : Array (Array (Name × Digest)) := #[]
-  /-- The current module's digests and `closureDigest`, if `setLocalDigests` stored them for the `.olean` write. -/
-  localDigests? : Option (Array (Name × Digest) × Digest) := none
+  /-- The current module's digests, `closureDigest` and claims digest, if `setLocalDigests` stored them for the
+  `.olean` write. -/
+  localDigests? : Option (Array (Name × Digest) × Digest × Digest) := none
 instance : Inhabited State := ⟨{}⟩
 
 /-- The digest of node `c` if module `i` (the module defining `c`) wrote one. -/
 def State.findAt? (s : State) (i : ModuleIdx) (c : Name) : Option Digest := do
   let es ← s.importedModuleEntries[i.toNat]?
-  (·.2) <$> es.binSearch (c, default) (fun a b => Name.quickLt a.1 b.1) (lo := 1)
+  (·.2) <$> es.binSearch (c, default) (fun a b => Name.quickLt a.1 b.1) (lo := 2)
 
 def State.find? (s : State) (env : Environment) (c : Name) : Option Digest := do
   s.findAt? (← env.getModuleIdxFor? c) c
 
-/-- Whether module `i`'s `.olean` carries digests (it has the marker entry). -/
+/-- Whether module `i`'s `.olean` carries digests (it has the marker entries). -/
 def State.hasEntries (s : State) (i : ModuleIdx) : Bool :=
   !(s.importedModuleEntries[i.toNat]?.getD #[]).isEmpty
 
@@ -153,7 +182,12 @@ def moduleDigestOf (own : Array (Name × Digest)) : Digest :=
 def State.importedDigests? (s : State) (i : ModuleIdx) : Option (Digest × Digest) := do
   let es ← s.importedModuleEntries[i.toNat]?
   let (_, closure) ← es[0]?
-  return (moduleDigestOf (es.extract 1 es.size), closure)
+  return (moduleDigestOf (es.extract 2 es.size), closure)
+
+/-- Module `i`'s claims digest (`claimsDigestOf`), from its `.olean`, or `none` if it carries no digests. -/
+def State.importedClaims? (s : State) (i : ModuleIdx) : Option Digest := do
+  let es ← s.importedModuleEntries[i.toNat]?
+  (·.2) <$> es[1]?
 
 /-- The node of the imported name `x`, found in its defining module's digests: a module's nodes are its
 kernel constants and the compiler-only names that fold into none (`ownNodes`), so the first of `x`'s
@@ -173,7 +207,8 @@ private builtin_initialize ext : PersistentEnvExtension (Name × Digest) (Name �
     -- Private level only: digests cover private constants and unexposed bodies, which must not change the
     -- exported `.olean` of a `module` file. Non-module files are written and read at the private level.
     exportEntriesFnEx := fun _ s =>
-      let es := s.localDigests?.elim #[] fun (own, closure) => #[(.anonymous, closure)] ++ own
+      let es := s.localDigests?.elim #[] fun (own, closure, claims) =>
+        #[(.anonymous, closure), (.anonymous, claims)] ++ own
       { exported := #[], server := #[], «private» := es }
     asyncMode := .mainOnly
   }
@@ -209,6 +244,11 @@ def ownNodes (env : Environment) (consts : Array (Name × ConstantInfo × Array 
       folded := folded.alter (ownerOf kernel.contains x) fun o => some ((o.getD #[]).push x)
   let localOwner (x : Name) : Name :=
     if kernel.contains x || folded.contains x then x else ownerOf kernel.contains x
+  -- Each base of the module with its derived constants of the module (`derivedBase?`).
+  let fwd : Std.HashMap Name (Array Name) := consts.foldl (init := {}) fun m (n, _) =>
+    match derivedBase? n with
+    | some p => if kernel.contains p then m.alter p fun o => some ((o.getD #[]).push n) else m
+    | none => m
   let pkg := env.getModulePackage?
   let names := consts.map (·.1) ++ (folded.toArray.filterMap fun (n, _) => if kernel.contains n then none else some n)
   return names.map fun n => Id.run do
@@ -219,7 +259,8 @@ def ownNodes (env : Environment) (consts : Array (Name × ConstantInfo × Array 
     c := c.nat fs.size
     for x in fs do
       c := compiledEnc env lc x (c.name x)
-    let mentions := (k?.elim #[] (·.2)).foldl (·.insert ·) c.ms
+    -- A base of the module refers to its derived constants of the module, which no term mentions.
+    let mentions := (k?.elim #[] (·.2)).foldl (·.insert ·) ((fwd.getD n #[]).foldl (·.insert ·) c.ms)
     let rs : NameSet := mentions.foldl (init := {}) fun rs m =>
       let o := if (env.getModuleIdxFor? m).isSome then s.ownerOf env m else localOwner m
       if o == n then rs else rs.insert o
@@ -249,19 +290,29 @@ def compute (env : Environment) (s : State) (nodes : Array Node) : Array (Name �
 def localDigests (env : Environment) (nodes := ownNodes env (ownConsts env)) : Array (Name × Digest) :=
   compute env (state env) nodes
 
-/-- Stores `own` (`localDigests env`) and the module's `closureDigest` for the extension to export. Without it, the
-`.olean` carries no digests. -/
-def setLocalDigests (env : Environment) (own : Array (Name × Digest)) (closure : Digest) : Environment :=
-  ext.modifyState (asyncMode := .mainOnly) env ({ · with localDigests? := some (own, closure) })
+/-- Stores `own` (`localDigests env`), the module's `closureDigest` and its claims digest (`ownClaimsDigest`) for the
+extension to export. Without it, the `.olean` carries no digests. -/
+def setLocalDigests (env : Environment) (own : Array (Name × Digest)) (closure claims : Digest) : Environment :=
+  ext.modifyState (asyncMode := .mainOnly) env ({ · with localDigests? := some (own, closure, claims) })
+
+/-- The imported constants the compiler reads by a name derived from `x` when it compiles a use of `x`: `x`'s derived
+constants (`derivedSuffixes`) and the prefixes whose attributes it reads with `x`'s (`internalPrefixes`). -/
+def derivedReads (env : Environment) (x : Name) : Array Name :=
+  (derivedSuffixes.toArray.map x.str ++ internalPrefixes x).filter fun d =>
+    (env.getModuleIdxFor? d).isSome && env.contains d
 
 /-- Per defining module, sorted: the node of every imported name that the current module's nodes refer to or
-that is in `extra`, with its digest. Names without a digest (from a module whose `.olean` carries none) are left
-out. -/
+that is in `extra`, and of every imported constant the compiler reads by a name derived from one of those or from
+a node (`derivedReads`), with its digest. Names without a digest (from a module whose `.olean` carries none) are
+left out. -/
 def moduleUsed (env : Environment) (extra : NameSet) (nodes := ownNodes env (ownConsts env)) :
     Array (Name × Array (Name × Digest)) :=
   let s := state env
   let used := extra.foldl (init := (∅ : NameSet)) fun u x => u.insert (s.ownerOf env x)
   let used := nodes.foldl (init := used) fun u n => n.refs.foldl (·.insert ·) u
+  let sources := nodes.foldl (·.insert ·.name) (extra.foldl (·.insert ·) used)
+  let used := sources.foldl (init := used) fun u x =>
+    (derivedReads env x).foldl (fun u d => u.insert (s.ownerOf env d)) u
   let byMod := used.foldl (init := (∅ : Std.HashMap Name (Array (Name × Digest)))) fun m c => Id.run do
     let some i := env.getModuleIdxFor? c | return m
     let some d := s.findAt? i c | return m
@@ -346,59 +397,57 @@ def compilerShapedName (n : Name) : Bool :=
       (idx "spec_" && p.components.contains `_at_)
   | _ => false
 
+/-- Module `i?`'s kernel constants, sorted for the current module. -/
+private def moduleConsts (env : Environment) (i? : Option ModuleIdx) : Array Name :=
+  match i? with
+  | some i => env.header.moduleData[i.toNat]?.elim #[] (·.constNames)
+  | none => (env.checked.get.constants.foldStage2 (fun acc n _ => acc.push n) #[]).qsort Name.quickLt
+
 /-- Module `i?`'s kernel constants whose names have a compiler-generated shape. A compiler-only name belongs to
 the first module in import order that lists it (`Environment.lean`, `finalizeImport`), so such a constant can take
 the name over from another module's compiler-only declaration. -/
 private def compilerShapedConsts (env : Environment) (i? : Option ModuleIdx) : Array Name :=
-  match i? with
-  | some i => (env.header.moduleData[i.toNat]?.elim #[] (·.constNames)).filter compilerShapedName
-  | none => (env.checked.get.constants.foldStage2 (fun acc n _ => if compilerShapedName n then acc.push n else acc)
-      #[]).qsort Name.quickLt
+  (moduleConsts env i?).filter compilerShapedName
 
-/-- Every reading of a specialization name `d._at_.c.spec_N` (`compilerShapedName`) as a specialization of `d`
-created by `c`: one `c` per `_at_` component, the components between it and `spec_N`, joined as `atOwner?` joins
-them. A specialization of a specialization, or one created inside a specialization, has more than one `_at_`, so
-the name alone does not say which split is the creator. -/
-def specCreators (x : Name) : Array Name := Id.run do
-  let cs := x.components.toArray
-  let some (.str .anonymous s) := cs.back? | return #[]
-  unless s.startsWith "spec_" do return #[]
-  let body := cs.pop
-  let mut out := #[]
-  for j in [0:body.size] do
-    unless body[j]! == `_at_ do continue
-    let c := (body.extract (j + 1) body.size).foldl Name.appendCore .anonymous
-    unless c.isAnonymous do out := out.push c
-  return out
+/-- Module `i?`'s derived constants (`derivedBase?`) whose base it does not define: the compiler finds them by name
+when it compiles a use of the base in any module that also imports this one, and no term mentions them. -/
+private def foreignDerivedConsts (priv : Environment) (i? : Option ModuleIdx) : Array Name :=
+  (moduleConsts priv i?).filter fun n => (derivedBase? n).any (!definedIn priv i? ·)
 
-/-- Whether module `i?` owns the claimed compiler-only name `n`: `n` is a constant the module defines, or `n` has a
-compiler shape (`compilerShapedName`) and a name it comes from by one compiler suffix is owned: for a specialization
-name, any reading of its creator (`specCreators`), otherwise `stripSuffix?`. The walk stops at the first name
-without a compiler shape, so a module that defines a namespace prefix of another module's declaration (`NS` for
-`NS.foo._redArg`) does not own the claim. -/
-private def ownsClaim (priv : Environment) (i? : Option ModuleIdx) (n : Name) : Bool :=
-  go (n.getNumParts + 1) n
-where
-  go : Nat → Name → Bool
-    | 0, _ => false
-    | k + 1, c =>
-      definedIn priv i? c || (compilerShapedName c &&
-        match specCreators c with
-        | #[] => (stripSuffix? c).any (go k)
-        | creators => creators.any (go k))
+/-- The current module's claimed compiler-only names that its compile did not create for its own constants, and
+its IR declarations named like another module's kernel constant. Importers resolve such a name to the first module
+in import order that declares or claims it (`findExtEntry?`). `created` holds the names the compiler recorded
+producing while it compiled the module's own constants (`ownCreatedNames`): such a name folds into the declaration
+it was created for, whose digest covers it. Any other claimed name, such as one a module adds with `IR.addDecl` or
+copies from a compile in a discarded environment, can take a call to that name over from another module, so it is
+listed; so is a name the compile produced under another module's constant (`toDecl` compiles `B.f._unsafe_rec`
+under the name `B.f`). -/
+def foreignClaims (env : Environment) (created : NameSet) : Array Name :=
+  let priv := env.setExporting false
+  let names := (IR.getDecls priv).toArray.filterMap fun (d : IR.Decl) =>
+    let listed := if priv.contains d.name (skipRealize := false) then !definedIn priv none d.name
+      else !created.contains d.name
+    if listed then some d.name else none
+  (names.qsort Name.quickLt).eraseReps
 
-/-- Module `i?`'s claimed compiler-only names (IR declarations without a kernel constant, which importers resolve
-to the first module in import order that claims them, `findExtEntry?`) that the module does not own
-(`ownsClaim`). A name the module's own compile generates strips through compiler suffixes to a constant the module
-defines, whose digest covers its entries; any other claimed name can take a call to that name over from another
-module, so it is listed. -/
-private def claimedForeignNames (priv : Environment) (i? : Option ModuleIdx) : Array Name :=
-  let names := match i? with
-    | some i => priv.header.moduleData[i.toNat]?.elim #[] (·.extraConstNames)
-    | none => (IR.getDecls priv).toArray.filterMap fun (d : IR.Decl) =>
-        if priv.contains d.name (skipRealize := false) then none else some d.name
-  let foreign := names.filter (!ownsClaim priv i? ·)
-  (foreign.qsort Name.quickLt).eraseReps
+/-- A digest of a module's `foreignClaims`: what importers' `tableDigest` holds of them, from the module's `.olean`
+(`State.importedClaims?`). -/
+def claimsDigestOf (claims : Array Name) : Digest :=
+  (claims.foldl Enc.name (({} : Enc).nat claims.size)).finish
+
+/-- The names the compiler recorded creating in runs that compiled only the current module's own constants
+(`compileCreatedNames`); a run for a declaration of an environment that was then discarded does not count, nor does
+a run that also compiled one. If a compile recorded compiler code (`compilerCodeSeen`), which covers passes, folders
+and hooks other than the toolchain's that could have produced any name, no name counts. -/
+def ownCreatedNames (env : Environment) : BaseIO NameSet := do
+  if (← compilerCodeSeen) then return {}
+  let priv := env.setExporting false
+  return (← compileCreatedNames).foldl (init := {}) fun s (inputs, names) =>
+    if !inputs.isEmpty && inputs.all (definedIn priv none ·) then names.foldl (·.insert ·) s else s
+
+/-- The current module's claims digest (`claimsDigestOf` of `foreignClaims`). -/
+def ownClaimsDigest (env : Environment) : BaseIO Digest := do
+  return claimsDigestOf (foreignClaims env (← ownCreatedNames env))
 
 /-- A discrimination-tree key, encoded so that two keys encode alike exactly when they are `==`, as the tree
 compares them when it matches. -/
@@ -416,10 +465,12 @@ def discrKeyEnc (e : Enc) : Meta.DiscrTree.Key → Enc
 and classes declared for another module's declaration, reducibility set for another module's declaration,
 unification hints, `@[cpass]` installers and constant folders, each hint (with its discrimination-tree keys),
 installer and folder with its declaration's digest (`digestOf`), matcher info and IR meta marks written for another
-module's declaration; its kernel constants with compiler-generated names (`compilerShapedConsts`) and its claimed
-compiler-only names whose owner it does not define (`claimedForeignNames`). `i? = none` is the current module. -/
-def tableDigest (env : Environment) (i? : Option ModuleIdx) (digestOf : Name → Option Digest) : Digest :=
-  Id.run do
+module's declaration; its kernel constants with compiler-generated names (`compilerShapedConsts`), its derived
+constants for another module's base with their digests (`foreignDerivedConsts`), and `claims`, the
+digest of its claimed compiler-only names that its compile did not create (`claimsDigestOf`). `i? = none` is the
+current module. -/
+def tableDigest (env : Environment) (i? : Option ModuleIdx) (digestOf : Name → Option Digest) (claims : Digest) :
+    Digest := Id.run do
   let priv := env.setExporting false
   let csimp := pickEntries i? (Compiler.CSimp.ext.ext.getModuleEntries env ·)
     (Compiler.CSimp.ext.ext.getState env).newEntries
@@ -476,10 +527,10 @@ def tableDigest (env : Environment) (i? : Option ModuleIdx) (digestOf : Name →
   let shaped := compilerShapedConsts env i?
   e := e.nat shaped.size
   for n in shaped do e := e.name n
-  let claimed := claimedForeignNames priv i?
-  e := e.nat claimed.size
-  for n in claimed do e := e.name n
-  return e.finish
+  let derived := foreignDerivedConsts priv i?
+  e := e.nat derived.size
+  for n in derived do e := withDigest e n
+  return e.digest claims |>.finish
 
 /-- The registered names of the environment extensions whose entries for other modules' names `tableDigest`
 reads. The census test checks that every extension it classifies as a cross-module table is listed here. -/
@@ -494,7 +545,7 @@ in which every compiler table applies their entries, so that the last import win
 for every module (imported ones with digests, and the current one) the digest of its cross-module compiler
 tables (`tableDigest`). Importers compare it through Lake's `closureHash`, so a change to any module's tables,
 or to the import order, rebuilds every module downstream. -/
-def closureDigest (env : Environment) (own : Array (Name × Digest)) : Digest := Id.run do
+def closureDigest (env : Environment) (own : Array (Name × Digest)) (claims : Digest) : Digest := Id.run do
   let s := state env
   let ownMap : Std.HashMap Name Digest := own.foldl (fun m (n, d) => m.insert n d) {}
   let digestOf (n : Name) : Option Digest := ownMap[n]? <|> s.find? env n
@@ -502,8 +553,8 @@ def closureDigest (env : Environment) (own : Array (Name × Digest)) : Digest :=
   let mut e : Enc := ({} : Enc).nat mods.size
   for (m, i) in mods.zipIdx do
     e := e.name m
-    e := e.opt (if s.hasEntries i then some (tableDigest env (some i) digestOf) else none) Enc.digest
-  return e.digest (tableDigest env none digestOf) |>.finish
+    e := e.opt (s.importedClaims? i |>.map (tableDigest env (some i) digestOf ·)) Enc.digest
+  return e.digest (tableDigest env none digestOf claims) |>.finish
 
 /-- The imported modules whose `.olean` carries digests (`State.hasEntries`), sorted. -/
 def digestedModules (env : Environment) : Array Name :=
