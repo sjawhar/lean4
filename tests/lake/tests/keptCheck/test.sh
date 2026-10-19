@@ -482,18 +482,19 @@ no_match_text 'not asked' produced.out
 # A checker without the usage cutoff is refused: its records decide which modules may be re-checked
 LAKE_USAGE_CUTOFF=false LAKE_KEPT_CHECKER="$STUB" test_err 'needs the usage cutoff' -d t40 build P
 
-# Interrupting Lake (`SIGINT` to its process group, as a terminal's Ctrl-C does) while the checker
-# hangs: the checker, in a session of its own, does not get the signal, so Lake kills it before it
-# exits; and the checker never holds the workspace build lock, so the next build does not wait
+# Interrupting Lake (`SIGINT` to its process group, as a terminal's Ctrl-C does) while the checker is
+# busy: the checker, in a session of its own, does not get the signal, but its standard input reaches
+# its end when Lake dies, and it stops (as the stub does in `mute-once`); it never held the workspace
+# build lock, so the next build does not wait
 mkp t50
 test_run -d t50 build P
 seta t50 2
 export STUB_LOG="$PWD/t50.log"
 set -m
-LAKE_KEPT_CHECKER="$STUB" STUB_MODE=hang-once "$LAKE" -d t50 build P > t50.out 2>&1 &
+LAKE_KEPT_CHECKER="$STUB" STUB_MODE=mute-once "$LAKE" -d t50 build P > t50.out 2>&1 &
 lake_pid=$!
 set +m
-# (the stub hangs on its first request, whichever candidate that is)
+# (the stub stops answering at its first request, whichever candidate that is)
 for _ in $(seq 300); do [ -s t50.log ] && break; sleep 0.1; done
 test_exp -s t50.log
 test_cmd kill -INT -- "-$lake_pid"
@@ -510,7 +511,7 @@ mkp t51
 test_run -d t51 build P
 seta t51 2
 export STUB_LOG="$PWD/t51.log"
-if LAKE_KEPT_CHECKER="$STUB" STUB_MODE=hang-once timeout 5 "$LAKE" -d t51 build P > t51.out 2>&1; then
+if LAKE_KEPT_CHECKER="$STUB" STUB_MODE=mute-once timeout 5 "$LAKE" -d t51 build P > t51.out 2>&1; then
   rc=0; else rc=$?; fi
 test_exp "$rc" = 124
 stub_pid=$(head -1 t51.log.pids)
