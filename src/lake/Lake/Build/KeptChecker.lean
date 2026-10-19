@@ -41,6 +41,9 @@ jobs that ask it, nor the watchdog that kills it; a request that cannot be writt
 The checker does not inherit the workspace build lock (`spawnProc`). Its session is its own, so a
 terminal's interrupt does not reach it; when Lake exits, however it exits, the checker's standard
 input reaches its end, and a checker is expected to stop then.
+
+The process group is Unix-only: on Windows the checker gets no session of its own, and a kill ends
+the checker process alone, not processes it started.
 -/
 
 open Lean
@@ -189,8 +192,8 @@ partial def watch (self : KeptChecker) : IO Unit := do
 
 /-- Starts checker number `gen` with its reader and writer tasks. -/
 def start (self : KeptChecker) (gen : Nat) : IO Running := do
-  -- `Child.takeStdin` is not used: the child it returns has lost `setsid`, so its `kill` would
-  -- reach the checker only
+  -- The writer task writes to this child's `stdin`: the child `Child.takeStdin` returns has lost
+  -- `setsid`, so its `kill` would reach the checker only
   let proc ← spawnProc (inheritBuildLock := false) {
     cmd := self.cmd
     env := #[("LEAN_SYSROOT", some self.sysroot.toString)]
