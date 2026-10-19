@@ -1,0 +1,726 @@
+/*
+Copyright (c) 2026 Lean FRO, LLC. All rights reserved.
+Released under Apache 2.0 license as described in the file LICENSE.
+Author: Sebastian Ullrich
+*/
+#include <algorithm>
+#include <atomic>
+#include <vector>
+#include <lean/lean.h>
+#include "runtime/alloc.h"
+
+namespace lean {
+/*
+Caches for imported-constant lookups.
+
+The imported-constants views of an environment are immutable per import set, so lookup results
+(including misses) can be cached. Each view created by `finalizeImport` owns a cache via the
+`ImportedNode.cached` node at its root, which is freed together with the view; lookups in other
+views, such as ones loaded from header snapshots or modified for testing, use a process-global cache.
+
+Slots hold immutable entries behind a single atomic pointer each, so lookups are lock-free; races
+merely lose an insertion. Entries pin their key and value with references that are never dropped,
+so hits perform no reference counting on the root and key (pointer comparison and read-only name
+comparison only). Entries of the global cache additionally pin their root, so that its address
+cannot be reused by another view. The value is marked persistent so that hits are free of atomic
+reference counting. `lean_mark_persistent` must NOT be used here: it plain-writes reference counts
+while other elaboration threads concurrently update them atomically, corrupting shared object
+graphs. Freeing a view's cache thus frees its entries and tables but leaks the pinned keys and
+values.
+
+The cache uses open addressing with a short probe window and never replaces an entry: a replaced
+entry would have to be leaked (it may still be read concurrently), and colliding hot keys would
+then leak one entry per alternation, without bound. Instead, a miss inserts into the first empty
+slot of the window, or not at all if the window is full.
+
+The table doubles once half its slots are filled, so its size tracks the working set of distinct
+names actually looked up: with more such names than slots, sweep-style workloads (e.g.
+per-declaration linting at mathlib scale) displace each other's entries and degrade every lookup
+to a full tree walk. Growth migrates the existing entries (they are immutable, so old and new
+table can share them) and publishes the new table via an atomic pointer; old tables are kept until
+the cache is freed as concurrent readers may still probe them, with total overhead below the final
+table's size thanks to geometric growth. Insertions racing with a swap go to the old table and are
+merely lost.
+
+An entry of the constants view also memoizes `modIdxCached?`'s result for its key: the index of
+the first module having the name as a constant or as an extra constant, which needs a walk of the
+extra constants view too. The first such lookup computes it and publishes it with the extra
+constants view it was computed for; the entry's other fields stay immutable. A repeated lookup thus
+costs one probe, as a constant lookup does.
+
+Heartbeats count a thread's allocations, and heartbeat limits (`maxHeartbeats`) are deterministic
+only if a computation's heartbeats depend on that computation alone. Whether a lookup hits depends
+on what other threads looked up before, and a lazily merged node of a view (`ImportedNode.lazy`)
+is computed by whichever thread needs it first. So a lookup costs no heartbeats, hit or miss: a miss
+restores the thread's heartbeat count after computing its result, and marks the result persistent
+even when the cache does not keep it, so that the caller gets a shared value either way and
+allocates the same afterwards; lazy nodes are forced through `lean_imported_consts_force_shared`,
+which does not count their computation either.
+*/
+
+extern "C" void lean_mark_persistent_unshared(lean_object * o);
+
+namespace {
+/* `modIdxCached?`'s result for an entry's key. */
+struct mod_memo {
+    // the extra constants view the result was computed with
+    lean_object * m_extras;
+    // the persistent `Option Nat` result
+    lean_object * m_val;
+};
+
+struct entry {
+    // `entry_hash(m_root, m_key)`; migration must not touch keys, which may point into regions
+    // freed since by `Environment.freeRegions`
+    uint64_t m_hash;
+    lean_object * m_root;
+    lean_object * m_key;
+    // the cached `Option` result object
+    lean_object * m_val;
+    // set once by the first `modIdxCached?` of the key
+    std::atomic<mod_memo *> m_mod;
+    // next entry inserted into the same cache, for freeing
+    entry * m_next;
+};
+
+constexpr size_t global_initial_num_slots = 1 << 18;
+constexpr size_t view_initial_num_slots = 1 << 16;
+constexpr size_t max_num_slots = 1 << 26;
+constexpr size_t probe_window = 8;
+// constructor index of `ImportedNode.cached`; an `ImportedConsts` view is its root node at runtime
+constexpr unsigned cached_tag = 3;
+
+struct table {
+    // power of two
+    size_t m_num_slots;
+    std::atomic<entry *> * m_slots;
+    // successful insertions into `m_slots`; slightly underestimates occupancy when a swap loses
+    // migrated-over entries, which only delays the next doubling
+    std::atomic<size_t> m_num_entries;
+    // claimed by the one thread that migrates and replaces this table
+    std::atomic<bool> m_growing;
+    // the table this one replaced, for freeing
+    table * m_prev;
+};
+
+struct cache {
+    std::atomic<table *> m_table;
+    // all entries inserted into some table of an owned cache
+    std::atomic<entry *> m_entries;
+};
+
+std::atomic<entry *> g_global_slots[global_initial_num_slots];
+table g_global_table = { global_initial_num_slots, g_global_slots, {0}, {false}, nullptr };
+cache g_global_cache = { {&g_global_table}, {nullptr} };
+std::atomic<size_t> g_num_live_caches{0};
+
+uint64_t entry_hash(lean_object * root, lean_object * key) {
+    return lean_name_hash(key) ^ (reinterpret_cast<uintptr_t>(root) >> 4);
+}
+
+/* Inserts `e`, taken from the table being replaced, into the first empty slot of its probe window
+   in `t`, or drops it if the window is full. Entries of a table are pairwise distinct, so no
+   comparison is needed. Returns whether `e` was inserted. */
+bool migrate_entry(table * t, entry * e) {
+    size_t slot = static_cast<size_t>(e->m_hash) & (t->m_num_slots - 1);
+    for (size_t i = 0; i < probe_window; i++) {
+        size_t s = (slot + i) & (t->m_num_slots - 1);
+        entry * expected = nullptr;
+        if (t->m_slots[s].compare_exchange_strong(expected, e, std::memory_order_release,
+                std::memory_order_acquire))
+            return true;
+    }
+    return false;
+}
+
+/* Doubles `t` if it is still the current table of `c`, migrating its entries. */
+void grow(cache & c, table * t) {
+    if (t->m_num_slots >= max_num_slots || c.m_table.load(std::memory_order_acquire) != t)
+        return;
+    if (t->m_growing.exchange(true, std::memory_order_acq_rel))
+        return;
+    size_t num_slots = 2 * t->m_num_slots;
+    table * nt = new table{num_slots, new std::atomic<entry *>[num_slots](), {0}, {false}, t};
+    size_t migrated = 0;
+    for (size_t i = 0; i < t->m_num_slots; i++) {
+        // a concurrent insertion into an already-visited slot is lost with the old table
+        if (entry * e = t->m_slots[i].load(std::memory_order_acquire))
+            if (migrate_entry(nt, e))
+                migrated++;
+    }
+    nt->m_num_entries.store(migrated, std::memory_order_relaxed);
+    // only this thread swaps `t` out, so the exchange cannot fail
+    c.m_table.store(nt, std::memory_order_release);
+}
+
+void cache_finalize(void * p) {
+    cache * c = static_cast<cache *>(p);
+    // no concurrent readers remain, as they would hold a reference to the owning view
+    entry * e = c->m_entries.load(std::memory_order_acquire);
+    while (e) {
+        entry * next = e->m_next;
+        delete e->m_mod.load(std::memory_order_acquire);
+        delete e;
+        e = next;
+    }
+    table * t = c->m_table.load(std::memory_order_acquire);
+    while (t) {
+        table * prev = t->m_prev;
+        delete[] t->m_slots;
+        delete t;
+        t = prev;
+    }
+    delete c;
+    g_num_live_caches.fetch_sub(1, std::memory_order_relaxed);
+}
+
+void cache_foreach(void *, b_lean_obj_arg) {
+    // pinned objects are deliberately not visited: they are never released
+}
+
+lean_external_class * get_cache_class() {
+    static lean_external_class * cls = lean_register_external_class(cache_finalize, cache_foreach);
+    return cls;
+}
+}  // namespace
+
+namespace {
+/*
+The lookups of an imported view (`ImportedConsts.findEntry?` and `modIdxCore` in src/Lean/ConstTrie.lean), walked
+natively: the same nodes, the same child-index probes and the same results, but over the name's prefixes on the stack
+instead of an array of them. Views and tries are never modified after they are built, and a lazy node's thunks are
+forced as `ImportedConsts.forceShared` forces them (the callers here do not count the heartbeats of a lookup), so
+everything is read without locks and borrowed from the view.
+*/
+// `ConstTrie`: key, val?, children, childIndex
+inline lean_object * trie_key(lean_object * t) { return lean_ctor_get(t, 0); }
+inline lean_object * trie_val(lean_object * t) { return lean_ctor_get(t, 1); }
+inline lean_object * trie_children(lean_object * t) { return lean_ctor_get(t, 2); }
+inline lean_object * trie_index(lean_object * t) { return lean_ctor_get(t, 3); }
+
+// `ImportedNode` constructors: `mod` (modIdx, tree), `merged` (key, entry?, children, childIndex),
+// `lazy` (key, entry, expanded), `cached` (cache, tree; `cached_tag`)
+constexpr unsigned node_mod = 0;
+constexpr unsigned node_lazy = 2;
+
+/* `lastPartEq`: whether two names whose prefixes are equal have equal final components. */
+inline bool last_part_eq(lean_object * a, lean_object * b) {
+    if (lean_is_scalar(a) || lean_is_scalar(b)) return lean_is_scalar(a) && lean_is_scalar(b);
+    if (lean_ptr_tag(a) != lean_ptr_tag(b)) return false;
+    lean_object * x = lean_ctor_get(a, 1);
+    lean_object * y = lean_ctor_get(b, 1);
+    // tag 1: `.str`, tag 2: `.num`
+    return lean_ptr_tag(a) == 1 ? lean_string_eq(x, y) : lean_nat_eq(x, y);
+}
+
+/* `prefixesOf n`: `n` and its prefixes, innermost first, without the anonymous root. */
+class name_path {
+    static constexpr size_t inline_size = 16;
+    lean_object *               m_inline[inline_size];
+    std::vector<lean_object *>  m_heap;
+    lean_object **              m_data = m_inline;
+    size_t                      m_size = 0;
+public:
+    explicit name_path(b_lean_obj_arg n) {
+        for (lean_object * p = n; !lean_is_scalar(p); p = lean_ctor_get(p, 0)) m_size++;
+        if (m_size > inline_size) {
+            m_heap.resize(m_size);
+            m_data = m_heap.data();
+        }
+        size_t i = 0;
+        for (lean_object * p = n; !lean_is_scalar(p); p = lean_ctor_get(p, 0)) m_data[i++] = p;
+    }
+    size_t size() const { return m_size; }
+    lean_object * operator[](size_t i) const { return m_data[i]; }
+};
+
+inline size_t get_u16(uint8_t const * b, size_t o) { return static_cast<size_t>(b[o]) | (static_cast<size_t>(b[o + 1]) << 8); }
+inline size_t get_u32(uint8_t const * b, size_t o) {
+    return static_cast<size_t>(b[o]) | (static_cast<size_t>(b[o + 1]) << 8) | (static_cast<size_t>(b[o + 2]) << 16) |
+        (static_cast<size_t>(b[o + 3]) << 24);
+}
+
+/* `findHashIdx?`: the child of `cs` (sorted by key hash, indexed by `index`) whose key is `k`, or null. */
+template <class KeyOf>
+inline lean_object * find_child(lean_object * index, lean_object * cs, lean_object * k, KeyOf key_of) {
+    size_t size = lean_sarray_size(index);
+    if (size == 0) return nullptr;
+    uint8_t const * b = lean_sarray_cptr(index);
+    uint64_t h = lean_name_hash(k);
+    uint8_t header = b[0];
+    unsigned bits = header & 0x1F;
+    // `buildChildIndex` writes `1 ≤ bits ≤ maxSlotBits`
+    size_t slot = static_cast<size_t>(h >> (64 - bits));
+    size_t lo, hi, fp_off;
+    if ((header & 0x80) == 0) {
+        lo = get_u16(b, 1 + 2 * slot);
+        hi = get_u16(b, 3 + 2 * slot);
+        fp_off = 3 + 2 * (static_cast<size_t>(1) << bits);
+    } else {
+        lo = get_u32(b, 1 + 4 * slot);
+        hi = get_u32(b, 5 + 4 * slot);
+        fp_off = 5 + 4 * (static_cast<size_t>(1) << bits);
+    }
+    uint8_t fp = static_cast<uint8_t>(h >> 32);
+    for (size_t j = lo; j < hi; j++) {
+        lean_object * c = lean_array_get_core(cs, j);
+        if (b[fp_off + j] == fp && last_part_eq(key_of(c), k)) return c;
+    }
+    return nullptr;
+}
+
+/* `ImportedConsts.key`. */
+inline lean_object * node_key(lean_object * t) {
+    while (true) {
+        switch (lean_ptr_tag(t)) {
+        case node_mod:   return trie_key(lean_ctor_get(t, 1));
+        case cached_tag: t = lean_ctor_get(t, 1); break;
+        default:         return lean_ctor_get(t, 0);
+        }
+    }
+}
+
+/* `ConstTrie.findAux t path i`: the `val?` of the node for `path[0]` below `t`, the node for `path[i]`, or null if there
+   is no such node. */
+inline lean_object * trie_find(lean_object * t, name_path const & path, size_t i) {
+    for (; i > 0; i--) {
+        t = find_child(trie_index(t), trie_children(t), path[i - 1], trie_key);
+        if (!t) return nullptr;
+    }
+    return trie_val(t);
+}
+
+/* The `Array ImportedNode × ByteArray` of a lazy node's children, forced as `forceShared` forces it. */
+inline lean_object * lazy_expanded(lean_object * t) { return lean_thunk_get(lean_ctor_get(t, 2)); }
+
+/* `findEntryAux t path i`, owned. */
+lean_object * node_find_entry(lean_object * t, name_path const & path, size_t i) {
+    while (true) {
+        switch (lean_ptr_tag(t)) {
+        case node_mod: {
+            lean_object * v = trie_find(lean_ctor_get(t, 1), path, i);
+            if (!v || lean_is_scalar(v)) return lean_box(0);
+            lean_object * val = lean_ctor_get(v, 0);
+            lean_object * idx = lean_ctor_get(t, 0);
+            lean_inc(val); lean_inc(idx);
+            lean_object * p = lean_alloc_ctor(0, 2, 0);
+            lean_ctor_set(p, 0, val);
+            lean_ctor_set(p, 1, idx);
+            lean_object * r = lean_alloc_ctor(1, 1, 0);
+            lean_ctor_set(r, 0, p);
+            return r;
+        }
+        case node_lazy:
+            if (i == 0) {
+                lean_object * e = lean_thunk_get(lean_ctor_get(t, 1));
+                lean_inc(e);
+                return e;
+            } else {
+                lean_object * ex = lazy_expanded(t);
+                t = find_child(lean_ctor_get(ex, 1), lean_ctor_get(ex, 0), path[--i], node_key);
+                if (!t) return lean_box(0);
+            }
+            break;
+        case cached_tag:
+            t = lean_ctor_get(t, 1);
+            break;
+        default: // merged
+            if (i == 0) {
+                lean_object * e = lean_ctor_get(t, 1);
+                lean_inc(e);
+                return e;
+            }
+            t = find_child(lean_ctor_get(t, 3), lean_ctor_get(t, 2), path[--i], node_key);
+            if (!t) return lean_box(0);
+        }
+    }
+}
+
+/* The module index of an `Option (α × Nat)` entry, or null for `none`. */
+inline lean_object * entry_mod_idx(lean_object * e) {
+    return lean_is_scalar(e) ? nullptr : lean_ctor_get(lean_ctor_get(e, 0), 1);
+}
+
+/* `findModIdxAux t path i` if `bound` is null, else `findModIdxBelowAux bound t path i`: the borrowed module index, or
+   null for `none`. */
+lean_object * node_find_mod_idx(lean_object * t, name_path const & path, size_t i, lean_object * bound) {
+    while (true) {
+        switch (lean_ptr_tag(t)) {
+        case node_mod: {
+            lean_object * idx = lean_ctor_get(t, 0);
+            if (bound && !lean_nat_lt(idx, bound)) return nullptr;
+            lean_object * v = trie_find(lean_ctor_get(t, 1), path, i);
+            return v && !lean_is_scalar(v) ? idx : nullptr;
+        }
+        case node_lazy:
+            if (i == 0) {
+                lean_object * idx = entry_mod_idx(lean_thunk_get(lean_ctor_get(t, 1)));
+                return idx && (!bound || lean_nat_lt(idx, bound)) ? idx : nullptr;
+            } else {
+                lean_object * ex = lazy_expanded(t);
+                t = find_child(lean_ctor_get(ex, 1), lean_ctor_get(ex, 0), path[--i], node_key);
+                if (!t) return nullptr;
+            }
+            break;
+        case cached_tag:
+            t = lean_ctor_get(t, 1);
+            break;
+        default: // merged
+            if (i == 0) {
+                lean_object * idx = entry_mod_idx(lean_ctor_get(t, 1));
+                return idx && (!bound || lean_nat_lt(idx, bound)) ? idx : nullptr;
+            }
+            t = find_child(lean_ctor_get(t, 3), lean_ctor_get(t, 2), path[--i], node_key);
+            if (!t) return nullptr;
+        }
+    }
+}
+
+/* `findEntry? root n`, owned. */
+lean_object * find_entry_native(b_lean_obj_arg root, b_lean_obj_arg n) {
+    name_path path(n);
+    return node_find_entry(root, path, path.size());
+}
+
+inline lean_object * mk_some_nat(lean_object * idx) {
+    lean_inc(idx);
+    lean_object * r = lean_alloc_ctor(1, 1, 0);
+    lean_ctor_set(r, 0, idx);
+    return r;
+}
+
+/* `modIdxCore entry extras n`, owned. */
+lean_object * mod_idx_native(b_lean_obj_arg entry, b_lean_obj_arg extras, b_lean_obj_arg n) {
+    name_path path(n);
+    if (lean_object * i = entry_mod_idx(entry)) {
+        lean_object * j = node_find_mod_idx(extras, path, path.size(), i);
+        return mk_some_nat(j ? j : i);
+    }
+    lean_object * j = node_find_mod_idx(extras, path, path.size(), nullptr);
+    return j ? mk_some_nat(j) : lean_box(0);
+}
+}
+
+/* Looks `n` up in the view `root` through the cache `c`, computing a miss with `find_entry_native`: returns the
+   entry, with a reference for the caller, and sets `*e_out` to the cache entry holding it, or to null
+   if the cache does not keep it. Specialized per `owned` and inlined into `find_cached`: a shared
+   out-of-line copy measurably slows down the hot path. */
+template <bool owned>
+static inline __attribute__((always_inline)) lean_obj_res find_cached_in(cache & c,
+        b_lean_obj_arg root, b_lean_obj_arg n, entry ** e_out) {
+    table * t = c.m_table.load(std::memory_order_acquire);
+    uint64_t h = entry_hash(root, n);
+    size_t slot = static_cast<size_t>(h) & (t->m_num_slots - 1);
+    size_t empty = t->m_num_slots;
+    for (size_t i = 0; i < probe_window; i++) {
+        size_t s = (slot + i) & (t->m_num_slots - 1);
+        entry * e = t->m_slots[s].load(std::memory_order_acquire);
+        if (!e) {
+            empty = s;
+            // entries are only inserted at the window's first empty slot, so stop searching
+            break;
+        }
+        if (e->m_root == root && lean_name_eq(e->m_key, n)) {
+            // the value is pinned by the entry and persistent or multi-threaded
+            lean_inc(e->m_val);
+            *e_out = e;
+            return e->m_val;
+        }
+    }
+    // not counted, see above
+    uint64_t heartbeats = get_num_heartbeats();
+    lean_object * r = find_entry_native(root, n);
+    // The value is handed to and `inc`ed by arbitrary reader threads; marking it persistent keeps
+    // hits free of atomic RC and of coherence traffic on hot values. The unshared variant only
+    // writes thread-owned counts, so it is race-free where plain `lean_mark_persistent` is not.
+    // A value the cache does not keep, as its window is full or an insertion race is lost, is
+    // marked too so that a miss returns what a hit would, and is leaked.
+    lean_mark_persistent_unshared(r);
+    set_heartbeats(heartbeats);
+    *e_out = nullptr;
+    if (empty == t->m_num_slots)
+        return r;
+    // Pin the key, and the root unless it owns the cache; hits only compare them, so they need no
+    // special marking.
+    if (!owned)
+        lean_inc(root);
+    lean_inc(n);
+    entry * ne = new entry{h, root, n, r, nullptr, nullptr};
+    entry * expected = nullptr;
+    if (!t->m_slots[empty].compare_exchange_strong(expected, ne, std::memory_order_release,
+            std::memory_order_relaxed)) {
+        // lost an insertion race; drop the new entry rather than probing on
+        if (!owned)
+            lean_dec(root);
+        lean_dec(n);
+        delete ne;
+        return r;
+    }
+    if (owned) {
+        entry * head = c.m_entries.load(std::memory_order_relaxed);
+        do {
+            ne->m_next = head;
+        } while (!c.m_entries.compare_exchange_weak(head, ne, std::memory_order_release,
+                    std::memory_order_relaxed));
+    }
+    lean_inc(r);
+    *e_out = ne;
+    if (2 * (t->m_num_entries.fetch_add(1, std::memory_order_relaxed) + 1) >= t->m_num_slots)
+        grow(c, t);
+    return r;
+}
+
+/* The `Option LookupCache` field of a `cached` root; `dropCache` may concurrently empty it. */
+static lean_object * cache_field(b_lean_obj_arg root) {
+    return __atomic_load_n(lean_ctor_obj_cptr(root), __ATOMIC_RELAXED);
+}
+
+/* The cache of a `cached` root, or null if `root` has none (or `dropCache` emptied it). */
+static cache * own_cache(b_lean_obj_arg root) {
+    if (lean_ptr_tag(root) == cached_tag) {
+        lean_object * opt = cache_field(root);
+        if (!lean_is_scalar(opt))
+            return static_cast<cache *>(lean_get_external_data(lean_ctor_get(opt, 0)));
+    }
+    return nullptr;
+}
+
+static bool has_own_cache(b_lean_obj_arg root) {
+    return own_cache(root) != nullptr;
+}
+
+static lean_obj_res find_cached(b_lean_obj_arg root, b_lean_obj_arg n, entry ** e_out) {
+    if (cache * c = own_cache(root))
+        return find_cached_in<true>(*c, root, n, e_out);
+    return find_cached_in<false>(g_global_cache, root, n, e_out);
+}
+
+extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_find_entry_cached(b_lean_obj_arg root, b_lean_obj_arg n) {
+    entry * e;
+    return find_cached(root, n, &e);
+}
+
+/* ImportedConsts.modIdxCached? (consts : @& ImportedConsts ConstantInfo)
+     (extras : @& ImportedConsts Unit) (n : @& Name) : Option Nat */
+extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_find_mod_idx_cached(b_lean_obj_arg consts,
+        b_lean_obj_arg extras, b_lean_obj_arg n) {
+    entry * e;
+    lean_object * val = find_cached(consts, n, &e);
+    if (e) {
+        mod_memo * m = e->m_mod.load(std::memory_order_acquire);
+        if (m && m->m_extras == extras) {
+            lean_dec(val);
+            // pinned by the memo and persistent
+            lean_inc(m->m_val);
+            return m->m_val;
+        }
+    }
+    // not counted, see above
+    uint64_t heartbeats = get_num_heartbeats();
+    lean_object * r = mod_idx_native(val, extras, n);
+    lean_dec(val);
+    // marked and leaked like an entry's value, also when not memoized
+    lean_mark_persistent_unshared(r);
+    if (e && !e->m_mod.load(std::memory_order_relaxed)) {
+        // Like the roots of its entries, the global cache pins the extra constants view, so that
+        // its address cannot be reused by another view; a view's own cache is freed with the
+        // environment that holds both views.
+        bool pin = !has_own_cache(consts);
+        if (pin)
+            lean_inc(extras);
+        mod_memo * nm = new mod_memo{extras, r};
+        mod_memo * expected = nullptr;
+        // a concurrent lookup may have memoized the same result already
+        if (!e->m_mod.compare_exchange_strong(expected, nm, std::memory_order_release,
+                std::memory_order_relaxed)) {
+            if (pin)
+                lean_dec(extras);
+            delete nm;
+        }
+    }
+    set_heartbeats(heartbeats);
+    return r;
+}
+
+/* ImportedConsts.forceShared (t : @& Thunk α) : α */
+extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_force_shared(b_lean_obj_arg t) {
+    lean_object * r = lean_to_thunk(t)->m_value;
+    if (!r) {
+        // not counted, see above
+        uint64_t heartbeats = get_num_heartbeats();
+        r = lean_thunk_get_core(t);
+        set_heartbeats(heartbeats);
+    }
+    lean_inc(r);
+    return r;
+}
+
+/* LookupCache.new : BaseIO LookupCache */
+extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_cache_new() {
+    size_t num_slots = view_initial_num_slots;
+    table * t = new table{num_slots, new std::atomic<entry *>[num_slots](), {0}, {false}, nullptr};
+    cache * c = new cache{{t}, {nullptr}};
+    g_num_live_caches.fetch_add(1, std::memory_order_relaxed);
+    return lean_alloc_external(get_cache_class(), c);
+}
+
+/* LookupCache.numLive : BaseIO Nat */
+extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_cache_num_live() {
+    return lean_usize_to_nat(g_num_live_caches.load(std::memory_order_relaxed));
+}
+
+/* ImportedConsts.dropCache (t : @& ImportedConsts α) : BaseIO Unit */
+extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_drop_cache(b_lean_obj_arg root) {
+    if (lean_ptr_tag(root) == cached_tag) {
+        // the old `some` cell and its cache are leaked: concurrent lookups may still use them
+        __atomic_store_n(lean_ctor_obj_cptr(root), lean_box(0), __ATOMIC_RELAXED);
+    }
+    return lean_box(0);
+}
+
+/* resetCache : IO Unit */
+extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_cache_reset() {
+    table * t = g_global_cache.m_table.load(std::memory_order_acquire);
+    for (size_t i = 0; i < t->m_num_slots; i++) {
+        // entries (and their pins) are leaked: concurrent readers may still dereference them
+        t->m_slots[i].store(nullptr, std::memory_order_release);
+    }
+    // occupancy is only ever an estimate; a racing insert after the reset merely re-adds one
+    t->m_num_entries.store(0, std::memory_order_relaxed);
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+namespace {
+/*
+`ImportedConsts.collectDuplicates`, walking the per-module tries (`ConstTrie`: key, val?, children, childIndex) as
+`collectDupsAux` does, node for node and in the same order, but over plain vectors: no object per flattened child, and
+a sort without boxed keys. A trie's nodes are never modified after it is built, so they are read without locks.
+*/
+/* `ConstTrie` accessors and `last_part_eq` are those of the lookups above. */
+
+struct dup_cand {
+    size_t         m_idx;
+    lean_object *  m_node;
+};
+
+struct dup_child {
+    uint64_t       m_hash;
+    size_t         m_idx;
+    lean_object *  m_node;
+};
+
+class dup_sweep {
+    b_lean_obj_arg          m_covered;
+    size_t                  m_num_covered;
+    // the flattened children of the nodes on the current path, each node's after its parent's
+    std::vector<dup_child>  m_children;
+    lean_object *           m_acc;
+
+    uint64_t covered(size_t i) const {
+        return i < m_num_covered ? lean_unbox_uint64(lean_array_get_core(m_covered, i)) : 0;
+    }
+
+    /* `acc.push { name := key, entries }` when more than one candidate has a value. */
+    void push_entries(lean_object * key, std::vector<dup_cand> const & cands) {
+        size_t n = 0;
+        for (dup_cand const & c : cands)
+            if (!lean_is_scalar(trie_val(c.m_node))) n++;
+        if (n < 2) return;
+        lean_object * entries = lean_alloc_array(n, n);
+        size_t k = 0;
+        for (dup_cand const & c : cands) {
+            lean_object * v = trie_val(c.m_node);
+            if (lean_is_scalar(v)) continue;
+            lean_object * val = lean_ctor_get(v, 0);
+            lean_inc(val);
+            lean_object * e = lean_alloc_ctor(0, 2, 0);
+            lean_ctor_set(e, 0, val);
+            lean_ctor_set(e, 1, lean_usize_to_nat(c.m_idx));
+            lean_array_set_core(entries, k++, e);
+        }
+        lean_inc(key);
+        lean_object * d = lean_alloc_ctor(0, 2, 0);
+        lean_ctor_set(d, 0, key);
+        lean_ctor_set(d, 1, entries);
+        m_acc = lean_array_push(m_acc, d);
+    }
+
+public:
+    dup_sweep(b_lean_obj_arg covered, lean_object * acc) :
+        m_covered(covered), m_num_covered(lean_array_size(covered)), m_acc(acc) {}
+
+    lean_object * result() { return m_acc; }
+
+    /* `collectDupsAux covered key cands`. */
+    void visit(lean_object * key, std::vector<dup_cand> const & cands) {
+        if (m_num_covered != 0) {
+            uint64_t common = ~static_cast<uint64_t>(0);
+            for (dup_cand const & c : cands) common &= covered(c.m_idx);
+            if (common != 0) return;
+        }
+        push_entries(key, cands);
+        // `foldChildGroups`: the children by (key hash, module order), each run of one hash split by key
+        size_t begin = m_children.size();
+        for (dup_cand const & c : cands) {
+            lean_object * cs = trie_children(c.m_node);
+            size_t n = lean_array_size(cs);
+            for (size_t j = 0; j < n; j++) {
+                lean_object * ch = lean_array_get_core(cs, j);
+                m_children.push_back(dup_child{lean_name_hash(trie_key(ch)), c.m_idx, ch});
+            }
+        }
+        size_t end = m_children.size();
+        std::sort(m_children.begin() + begin, m_children.begin() + end, [](dup_child const & a, dup_child const & b) {
+            return a.m_hash < b.m_hash || (a.m_hash == b.m_hash && a.m_idx < b.m_idx);
+        });
+        std::vector<dup_cand> group;
+        std::vector<bool> taken;
+        size_t i = begin;
+        while (i < end) {
+            size_t j = i + 1;
+            while (j < end && m_children[j].m_hash == m_children[i].m_hash) j++;
+            // a child alone in its run is in one module only: nothing below it can be a duplicate
+            if (j > i + 1) {
+                taken.assign(j - i, false);
+                for (size_t a = i; a < j; a++) {
+                    if (taken[a - i]) continue;
+                    // `m_children` may grow (and move) in the recursive `visit` below; indices stay valid
+                    lean_object * k = trie_key(m_children[a].m_node);
+                    group.clear();
+                    group.push_back(dup_cand{m_children[a].m_idx, m_children[a].m_node});
+                    for (size_t b = a + 1; b < j; b++) {
+                        if (!taken[b - i] && last_part_eq(k, trie_key(m_children[b].m_node))) {
+                            taken[b - i] = true;
+                            group.push_back(dup_cand{m_children[b].m_idx, m_children[b].m_node});
+                        }
+                    }
+                    if (group.size() > 1) visit(k, group);
+                }
+            }
+            i = j;
+        }
+        m_children.resize(begin);
+    }
+};
+}
+
+/* ImportedConsts.collectDuplicates (trees : @& Array (Nat × ConstTrie α)) (covered : @& Array UInt64) :
+   Array (Duplicate α) */
+extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_collect_duplicates(b_lean_obj_arg trees,
+        b_lean_obj_arg covered) {
+    size_t n = lean_array_size(trees);
+    if (n < 2) return lean_alloc_array(0, 0);
+    std::vector<dup_cand> cands;
+    cands.reserve(n);
+    for (size_t i = 0; i < n; i++) {
+        lean_object * p = lean_array_get_core(trees, i);
+        lean_object * idx = lean_ctor_get(p, 0);
+        // module indices are array positions, always small
+        assert(lean_is_scalar(idx));
+        cands.push_back(dup_cand{lean_unbox(idx), lean_ctor_get(p, 1)});
+    }
+    dup_sweep s(covered, lean_alloc_array(0, 16));
+    s.visit(lean_box(0), cands);
+    return s.result();
+}
+}

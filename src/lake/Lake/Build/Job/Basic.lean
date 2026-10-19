@@ -40,6 +40,11 @@ Tried to fetch a build from a remote store (e.g., set when downloading an artifa
 on-demand from a cache service in `buildArtifactUnlessUpToDate`).
 -/
 | fetch
+/--
+Kept a module's existing outputs after a kept-module checker accepted them for the module's
+current imports (see `BuildContext.keptChecker?`).
+-/
+| check
 /-- Tried to perform a build action (e.g., set by `buildAction`). -/
 | build
 deriving Inhabited, Repr, DecidableEq, Ord
@@ -60,6 +65,7 @@ public def verb (failed : Bool) : (self : JobAction) → String
 | .replay => if failed then "Replaying" else "Replayed"
 | .unpack => if failed then "Unpacking" else "Unpacked"
 | .fetch => if failed then "Fetching" else "Fetched"
+| .check => if failed then "Checking" else "Checked"
 | .build => if failed then "Building" else "Built"
 
 end JobAction
@@ -78,8 +84,24 @@ public structure JobState where
   canceled : Bool := false
   /-- Current trace of a build job. -/
   trace : BuildTrace := .nil
-  /-- How long the job spent building (in milliseconds). -/
+  /--
+  How long the job spent building (in milliseconds), not counting the time it waited for a build
+  slot through `withJobBuildSlot` (`slotWait`).
+  -/
   buildTime : Nat := 0
+  /--
+  The priority at which the job's module compile asks for a build slot (`withJobBuildSlot`): the
+  priority the job was scheduled with (`Job.mapM`, `Job.bindM`, `Job.async`).
+  -/
+  slotPrio : Task.Priority := .max
+  /-- How long the job's commands waited for a build slot (in milliseconds; `withJobBuildSlot`). -/
+  slotWait : Nat := 0
+  /--
+  Whether a build action of this job (see `buildAction`) completed: this process ran the compiler
+  or linker. It is merged from the jobs this job continues, so read it only through `trackBuilds`,
+  which clears it first.
+  -/
+  built : Bool := false
   deriving Inhabited
 
 public def JobState.merge (a b : JobState) : JobState where
@@ -89,6 +111,9 @@ public def JobState.merge (a b : JobState) : JobState where
   canceled := a.canceled || b.canceled
   trace := mixTrace a.trace b.trace
   buildTime := a.buildTime + b.buildTime
+  slotPrio := max a.slotPrio b.slotPrio
+  slotWait := a.slotWait + b.slotWait
+  built := a.built || b.built
 
 @[inline] public def JobState.modifyLog (f : Log → Log) (s : JobState) : JobState :=
   {s with log := f s.log}
@@ -188,12 +213,12 @@ Useful if the job is already known to be completed.
 
 @[inline] public def mapResult
   [OptDataKind β] (f : JobResult α → JobResult β) (self : Job α)
-  (prio := Task.Priority.default) (sync := false)
+  (prio := Task.Priority.max) (sync := false)
 : Job β := {self with task := self.task.map f prio sync, kind := inferInstance}
 
 @[inline] public def mapOk
   [OptDataKind β] (f : α → JobState → JobResult β) (self : Job α)
-  (prio := Task.Priority.default) (sync := false)
+  (prio := Task.Priority.max) (sync := false)
 : Job β :=
   self.mapResult (prio := prio) (sync := sync) fun
     | .ok a s => f a s
@@ -201,7 +226,7 @@ Useful if the job is already known to be completed.
 
 @[inline] public protected def map
   [OptDataKind β] (f : α → β) (self : Job α)
-  (prio := Task.Priority.default) (sync := false)
+  (prio := Task.Priority.max) (sync := false)
 : Job β := self.mapResult (·.map f) prio sync
 
 public instance : Functor Job where map := Job.map

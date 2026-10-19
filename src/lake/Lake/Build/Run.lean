@@ -11,6 +11,12 @@ import Lake.Config.Monad
 import Lake.Build.Job.Monad
 import Lake.Build.Index
 import Init.Omega
+import Lake.Util.JsonObject
+import Lake.Util.IO
+import Lake.Config.PushQueue
+import Lake.Build.Claim
+import Lake.Util.RemoteExec
+import Lake.Build.RemoteExec
 
 /-! # Build Runner
 
@@ -18,7 +24,7 @@ This module defines the top-level functions used to execute a
 Lake build, monitor its progress, and await the result.
 -/
 
-open System
+open System Lean
 
 namespace Lake
 
@@ -150,7 +156,8 @@ where
     else s!"{ms}ms"
 
 def drainQueue : MonitorM (Array OpaqueJob) := do
-  let newJobs ← (← read).jobs.modifyGet ((·, #[]))
+  -- The queue holds the most recently registered job first (see `JobQueue`).
+  let newJobs := (← (← read).jobs.modifyGet ((·, []))).toArray.reverse
   modify fun s => {s with totalJobs := s.totalJobs + newJobs.size}
   return newJobs
 
@@ -259,7 +266,7 @@ def monitorJobs'
 @[inline, deprecated "Deprecated without replacement." (since := "2025-01-08")]
 public def monitorJobs
   (initJobs : Array OpaqueJob)
-  (jobs : IO.Ref (Array OpaqueJob))
+  (jobs : IO.Ref (List OpaqueJob))
   (out : IO.FS.Stream)
   (failLv outLv : LogLevel)
   (minAction : JobAction)
@@ -341,10 +348,81 @@ def monitorJob (ctx : MonitorContext) (job : Job α) : BaseIO (BuildResult α) :
   else
     return {toMonitorResult := result, out := .error "build failed"}
 
+/--
+The kept-module check settings from the environment: the checker command `LAKE_KEPT_CHECKER`, with
+`LAKE_KEPT_CHECKER_TIMEOUT` (seconds without a reply, while requests are outstanding, before the
+checker is killed; positive, default 900), and `LAKE_KEPT_EXCLUDE`, a file of module names, one per
+line. The checker runs with the workspace toolchain's sysroot as `LEAN_SYSROOT`. It needs the usage
+cutoff, which is off unless `LAKE_USAGE_CUTOFF` turns it on; its records say which modules may be
+re-checked instead of compiled (`Module.usageVerdict`).
+-/
+def mkKeptCheck (ws : Workspace) : IO (Option KeptChecker × Lean.NameSet) := do
+  let checker? ← do
+    let some cmd := (← IO.getEnv "LAKE_KEPT_CHECKER") | pure none
+    if cmd.isEmpty then pure none else
+    unless ws.lakeEnv.usageCutoff do
+      throw <| IO.userError "LAKE_KEPT_CHECKER needs the usage cutoff (LAKE_USAGE_CUTOFF=1), whose \
+        records say which modules may be re-checked instead of compiled"
+    let timeout ← do
+      let some s := (← IO.getEnv "LAKE_KEPT_CHECKER_TIMEOUT") | pure 900
+      let some n := s.toNat?
+        | throw <| IO.userError s!"LAKE_KEPT_CHECKER_TIMEOUT: expected seconds, got '{s}'"
+      if n == 0 then
+        throw <| IO.userError "LAKE_KEPT_CHECKER_TIMEOUT: must be at least 1 second, got '0'"
+      pure n
+    some <$> KeptChecker.new cmd ws.lakeEnv.lean.sysroot (timeout * 1000)
+  let mut exclude : Lean.NameSet := {}
+  if let some file := (← IO.getEnv "LAKE_KEPT_EXCLUDE") then
+    for line in (← IO.FS.lines file) do
+      let line := line.trimAscii.copy
+      if line.isEmpty then continue
+      let name := line.toName
+      if name.isAnonymous then
+        throw <| IO.userError s!"LAKE_KEPT_EXCLUDE: {file}: '{line}' is not a module name"
+      exclude := exclude.insert name
+  return (checker?, exclude)
+
+/--
+The last record of each path in the stamped digest log at `file` (`DigestLog`) whose file still has the recorded stamp,
+or none if the log cannot be read. A log with more than 10,000 paths has each path's file stamped (in this task, off
+the build's way): a record whose file is gone or changed can never be used again. The log is written again from the
+records kept (a new file renamed over it) when it has bytes after its last intact record (a crash cut a record short,
+or bytes were damaged: records appended after them would never be read), when more than a tenth of its paths are
+dead, or when it holds more than twice as many records as paths. A process that appends meanwhile (a check without
+the build lock, `Workspace.checkNoBuild`) loses its appends to the replaced file, which costs it hashes, never a wrong
+one. Every append of this process waits for this read (`appendDigestLog`).
+-/
+def loadDigestLog (file : FilePath) :
+    BaseIO (Std.HashMap FilePath (Lean.ModuleUsage.FileStamp × Lean.ModuleUsage.Digest)) := do
+  let .ok bytes ← (IO.FS.readBinFile file).toBaseIO | return {}
+  let (records, intact) := DigestLog.decode bytes
+  let latest := records.foldl (fun m (p, s, d) => m.insert p (s, d)) ({} : Std.HashMap _ _)
+  let live ← if latest.size ≤ 10000 then pure latest else
+    latest.foldM (init := {}) fun m p (s, d) => do
+      let now? := match (← (Lean.ModuleUsage.fileStamp p).toBaseIO) with
+        | .ok s? => s?
+        | .error _ => none
+      return if now? == some s then m.insert p (s, d) else m
+  if intact < bytes.size || 10 * (latest.size - live.size) > latest.size || records.size > 2 * latest.size then
+    let compact := live.fold (fun b p (s, d) => b.append (DigestLog.encode p s d)) ByteArray.empty
+    let tmp := file.addExtension s!"tmp.{← IO.Process.getPID}"
+    discard <| (do IO.FS.writeBinFile tmp compact; IO.FS.rename tmp file : IO Unit).toBaseIO
+  return live
+
+/-- The workspace's stamped digest log (`DigestLogState`), read in a task, if usage cutoff is on. -/
+def mkDigestLog (ws : Workspace) : BaseIO DigestLogState := do
+  unless ws.lakeEnv.usageCutoff do
+    return { loaded := .pure {}, file? := none, handle := ← Std.Mutex.new (some none) }
+  let file := DigestLog.file ws.root.lakeDir
+  return { loaded := ← BaseIO.asTask (loadDigestLog file), file? := some file, handle := ← Std.Mutex.new none }
+
 def mkBuildContext
   (ws : Workspace) (cfg : BuildConfig) (jobs : JobQueue)
-  (cancelTk? : Option IO.CancelToken := none)
+  (cancelTk? : Option IO.CancelToken := none) (moduleTimes? : Option ModuleTimes := none)
+  (kept : Option KeptChecker × Lean.NameSet := (none, {}))
 : BaseIO BuildContext := return {
+  keptChecker? := kept.1
+  keptExclude := kept.2
   opaqueWs := ws
   toBuildConfig := {cfg with
     macosxDeploymentTarget? := ← id do
@@ -363,6 +441,15 @@ def mkBuildContext
     else
       return none
   registeredJobs := jobs
+  moduleTimes?
+  sidecarCache := ← Shards.new 1024 {}
+  fileDigests := ← Shards.new 1024 {}
+  digestLog := ← mkDigestLog ws
+  kernelProviders := ← Std.Mutex.new {}
+  remoteReadStatus := ← IO.mkRef {}
+  usageViews := ← Shards.new 1024 {}
+  usageCutoffInFlight := ← IO.mkRef 0
+  remoteStats := ← IO.mkRef {}
   leanTrace := .ofHash (pureHash ws.lakeEnv.leanGithash)
     s!"Lean {Lean.versionStringCore}, commit {ws.lakeEnv.leanGithash}"
   cancelTk?
@@ -392,10 +479,71 @@ def Workspace.startBuild
   let compute := Job.async build (caption := caption)
   compute.run.run'.run bctx |>.run nilTrace
 
+/--
+Atomically replace the status left by remote mapping reads in one build, with `stopped` if the
+build stopped reading the remote cache (see `noteRemoteRead`).
+-/
+def writeRemoteReadStatus (cache : Cache) (status : RemoteReadStatus) : IO Unit := do
+  let obj := JsonObject.empty
+    |>.insert "at" (← wallClockSecs)
+    |>.insert "failures" status.failures
+    |>.insert "lastError" status.lastError
+  let obj := status.stopped?.elim obj (obj.insert "stopped" ·)
+  writeFileAtomic cache.readStatusFile (obj : Json).pretty
+
+/--
+At the end of a build that takes claims (see `Env.remoteCacheClaimService?`) on a machine without
+the shell that a detached push needs (see `canDetachPush`), runs `lake cache push` in the
+foreground if the queue holds lines, with a warning (see `runForegroundPush`). With that shell,
+the build's one detached push follows the build and uploads its last outputs (see
+`startBuildPush`), so nothing is left to do here.
+-/
+def runQueuedPush (ws : Workspace) (logger : MonadLog BaseIO) : BaseIO Unit := do
+  unless ws.lakeEnv.remoteCacheClaimService?.isSome do
+    return
+  if ← canDetachPush ws.lakeEnv then
+    return
+  let cache := ws.lakeCache
+  let .ok md ← cache.pushQueueFile.metadata.toBaseIO
+    | return
+  if md.byteSize == 0 then
+    return
+  logger.logEntry (.warning s!"`{ws.lakeEnv.pushShell}` is missing (see `LAKE_PUSH_SHELL`), so \
+    `lake cache push` runs before the build ends; log: {cache.pushLogFile}")
+  match (← (runForegroundPush ws.lakeEnv cache).toBaseIO) with
+  | .ok 0 => pure ()
+  | .ok rc => logger.logEntry (.warning s!"`lake cache push` exited with code {rc}")
+  | .error e => logger.logEntry (.warning s!"could not run `lake cache push`: {e}")
+
 def finalizeBuild
   (cfg : BuildConfig) (bctx : BuildContext) (mctx : MonitorContext) (result : BuildResult α)
 : IO α := do
   reportResult cfg mctx.out result
+  if let some mt := bctx.moduleTimes? then
+    -- The record only orders compiles, so failing to save it warns instead of failing the build.
+    let saved ← (mt.save (logger := mctx.logger)
+      fun name => (·.leanFile) <$> bctx.workspace.findTargetModule? name).toBaseIO
+    match saved with
+    | .ok n =>
+      if n > 0 && cfg.verbosity matches .verbose then
+        print! mctx.out s!"Recorded compile times of {n} modules in {mt.path}\n"
+    | .error e =>
+      mctx.logger.logEntry (.warning s!"{mt.path}: failed to save module compile times: {e}")
+  if bctx.workspace.lakeEnv.remoteExec?.isSome && cfg.verbosity != .quiet then
+    let stats ← bctx.remoteStats.get
+    -- `ok`, `unreachable` or `off: <reason>` from this process's decision; `idle` when no `hello`.
+    let state ← remoteDecisionState
+    print! mctx.out s!"{({stats with state}).line}\n"
+    flush mctx.out
+  -- The build is done with the service; stop the bridge before Lake goes on (e.g. `lake exe` runs).
+  RemoteExec.shutdown
+  let remoteStatus ← bctx.remoteReadStatus.get
+  if remoteStatus.failures > 0 then
+    if let .error e ← (writeRemoteReadStatus bctx.workspace.lakeCache remoteStatus).toBaseIO then
+      mctx.logger.logEntry (.trace s!"could not write remote cache read status: {e}")
+  -- The build's push (if it started one) ends with the build, not with this process
+  endBuildPush
+  runQueuedPush bctx.workspace mctx.logger
   if let some outputsFile := cfg.outputsFile? then
     bctx.saveOutputs (logger := mctx.logger) mctx.out outputsFile
   match result.out with
@@ -411,9 +559,11 @@ def finalizeBuild
 Runs `act` holding an exclusive `flock` on the workspace's `.lake/build.lock`, so that two Lake
 processes never build the same workspace at once (they would delete, rewrite, and cache each
 other's outputs mid-build). The lock is released when `act` finishes, or by the OS when the
-process dies. On Unix-like systems, the processes spawned while it is held inherit it, so if Lake
-is killed, the lock is held until they exit too: the compiler of a killed Lake cannot write into
-the workspace while another Lake builds it. (Windows releases the lock with the process.)
+process dies. On Unix-like systems, the processes spawned while it is held inherit it (`spawnProc`,
+which registers it as `buildLockHandle`), so if Lake is killed, the lock is held until they exit
+too: the compiler of a killed Lake cannot write into the workspace while another Lake builds it.
+A process that runs in a session of its own (the kept-module checker, the detached `lake cache push`,
+the cache token command) does not inherit it. (Windows releases the lock with the process.)
 Setting `LAKE_NO_BUILD_LOCK=1` disables it.
 -/
 public def Workspace.withBuildLock (ws : Workspace) (act : IO α) : IO α := do
@@ -432,7 +582,10 @@ public def Workspace.withBuildLock (ws : Workspace) (act : IO α) : IO α := do
       (lock: {lockFile})"
     h.lock
   h.setInheritable true
-  try act finally h.unlock
+  buildLockHandle.set (some h)
+  try act finally
+    buildLockHandle.set none
+    h.unlock
 
 /--
 Run a build function in the Workspace's context using the provided configuration.
@@ -445,9 +598,11 @@ public def Workspace.runFetchM
   let jobs ← mkJobQueue
   let cancelTk? ← if cfg.failFast then some <$> IO.CancelToken.new else pure none
   let mctx ← mkMonitorContext cfg jobs cancelTk?
-  let bctx ← mkBuildContext ws cfg jobs cancelTk?
+  let moduleTimes ← ModuleTimes.load (logger := mctx.logger) (ws.lakeDir / moduleTimesFileName)
+  let bctx ← mkBuildContext ws cfg jobs cancelTk? (moduleTimes? := some moduleTimes) (kept := ← mkKeptCheck ws)
   let job ← startBuild bctx build caption
   let result ← monitorJob mctx job
+  if let some checker := bctx.keptChecker? then checker.close
   finalizeBuild cfg bctx mctx result
 
 def monitorBuild (mctx : MonitorContext) (job : Job (Job α)) : BaseIO (BuildResult α) := do
@@ -466,17 +621,21 @@ def monitorBuild (mctx : MonitorContext) (job : Job (Job α)) : BaseIO (BuildRes
 /--
 Returns whether a build is needed to validate `build`. Does not report on the attempted build.
 
-This is equivalent to checking whether `lake build --no-build` exits with code 0.
+This is equivalent to checking whether `lake build --no-build` exits with code 0: it reads the same
+kept-module settings (`mkKeptCheck`), so a module `LAKE_KEPT_EXCLUDE` lists needs a build when its
+outputs were kept. Invalid settings, which fail that build, throw their error.
 -/
 public def Workspace.checkNoBuild
   (ws : Workspace) (build : FetchM (Job α))
-: BaseIO Bool := do
+: IO Bool := do
+  let kept ← mkKeptCheck ws
   let jobs ← mkJobQueue
   let cfg := {noBuild := true}
   let mctx ← mkMonitorContext cfg jobs
-  let bctx ← mkBuildContext ws cfg jobs
+  let bctx ← mkBuildContext ws cfg jobs (kept := kept)
   let job ← startBuild bctx build
   let result ← monitorBuild mctx job
+  if let some checker := bctx.keptChecker? then discard <| checker.close.toBaseIO
   return result.isOk -- `isOk` means no failures, and thus no `--no-build` failures
 
 /-- Run a build function in the Workspace's context and await the result. -/
@@ -486,9 +645,12 @@ public def Workspace.runBuild
   let jobs ← mkJobQueue
   let cancelTk? ← if cfg.failFast then some <$> IO.CancelToken.new else pure none
   let mctx ← mkMonitorContext cfg jobs cancelTk?
-  let bctx ← mkBuildContext ws cfg jobs cancelTk?
+  let moduleTimes ← ModuleTimes.load (logger := mctx.logger) (ws.lakeDir / moduleTimesFileName)
+  let bctx ← mkBuildContext ws cfg jobs cancelTk? (moduleTimes? := some moduleTimes) (kept := ← mkKeptCheck ws)
   let job ← startBuild bctx build
   let result ← monitorBuild mctx job
+  if cfg.forgetContext then Runtime.forget bctx
+  if let some checker := bctx.keptChecker? then checker.close
   finalizeBuild cfg bctx mctx result
 
 /-- Produce a build job in the Lake monad's workspace and await the result. -/
