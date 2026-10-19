@@ -8,6 +8,7 @@ module
 prelude
 public import Lake.CLI.Actions
 public import Lake.CLI.Build
+public import Lake.CLI.CachePush
 public import Lake.CLI.Error
 public import Lake.CLI.Help
 public import Lake.CLI.Init

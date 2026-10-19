@@ -20,7 +20,7 @@ git add .
 git config user.name test
 git config user.email test@example.com
 git commit -am 'first commit in a'
-git tag init
+git -c tag.gpgSign=false tag init
 popd
 
 # b@1: require a@master, manifest a@1
