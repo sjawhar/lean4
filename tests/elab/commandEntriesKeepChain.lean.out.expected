@@ -1,0 +1,20 @@
+chain: 19 commands, 17 kept, refused #[12, 14], 0 differences
+R4: 3 commands, 3 kept, refused #[], 0 differences
+R6: 3 commands, 3 kept, refused #[], 0 differences
+R7: 6 commands, 6 kept, refused #[], 0 differences
+secondRealizer: 5 commands, 5 kept, refused #[], 0 differences
+options: 5 commands, 5 kept, refused #[], 0 differences
+h2: 5 commands, 5 kept, refused #[], 0 differences
+header: 4 commands, 4 kept, refused #[], 0 differences
+kernel: 3 commands, 3 kept, refused #[], 0 differences
+nestedHelper: 3 commands, 3 kept, refused #[], 0 differences
+wfHelper: 2 commands, 2 kept, refused #[], 0 differences
+docHelper: 2 commands, 2 kept, refused #[], 0 differences
+tree: 3 commands, 3 kept, refused #[], 0 differences
+rose: 3 commands, 3 kept, refused #[], 0 differences
+matcher: 3 commands, 3 kept, refused #[], 0 differences
+inheritDoc: 3 commands, 3 kept, refused #[], 0 differences
+branchStates: 15 commands, 11 kept, refused #[1, 4, 11, 12], 0 differences
+chain, command 1 with a tampered realization record: threw
+corrupted theorem: threw, with the kernel's message: true
+corrupted definition: threw, with the kernel's message: true

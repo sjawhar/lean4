@@ -1,5 +1,0 @@
-full run, t: docstring in checked view true, in main-branch view false, read with asyncDecl true
-command 0 payload: stateOnly #[]
-keep succeeded
-after keep, t: docstring in checked view true, in main-branch view false, read with asyncDecl true
-next command @[inherit_doc t] def g: docstring full run (some (doc of t )), after keep (some (doc of t ))

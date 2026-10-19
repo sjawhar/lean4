@@ -1,5 +1,0 @@
-1 defeqAttr: full [f.eq_2:[backward_defeq], f.eq_1:[backward_defeq]], kept [f.eq_2:[backward_defeq], f.eq_1:[backward_defeq]]; later command full errors [], kept errors []
-2 matchEqnsExt: full [_private.M.0.h.match_1.eq_2, _private.M.0.h.match_1.eq_1], kept [_private.M.0.h.match_1.eq_2, _private.M.0.h.match_1.eq_1]; later command full errors [], kept errors []
-3 congrKindsExt: full [g.congr_simp:3], kept [g.congr_simp:3]; later command full errors [], kept errors []
-4 funIndInfoExt: full [cnt.induct_unfolding:cnt], kept [cnt.induct_unfolding:cnt]; later command full errors [], kept errors []
-5 inlineAttrs: full [_private.M.0.h.match_1.splitter:inline], kept [_private.M.0.h.match_1.splitter:inline]

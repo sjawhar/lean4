@@ -1,8 +1,0 @@
-Tree reads: full [Tree.rec_1: contains true, auxRec false, range line none, doc none; Tree.rec: contains true, auxRec false, range line none, doc none]; kept [Tree.rec_1: contains true, auxRec false, range line none, doc none; Tree.rec: contains true, auxRec false, range line none, doc none]; same
-Tree: next command full errors []; after the keep: errors []
-Rose reads: full [Rose.rec_1: contains true, auxRec false, range line none, doc none; Rose.rec: contains true, auxRec false, range line none, doc none]; kept [Rose.rec_1: contains true, auxRec false, range line none, doc none; Rose.rec: contains true, auxRec false, range line none, doc none]; same
-Rose: next command full errors []; after the keep: errors []
-tm reads: full [matcher info true, tm: contains true, auxRec false, range line (some 1), doc (some (doc of tm ))]; kept [matcher info true, tm: contains true, auxRec false, range line (some 1), doc (some (doc of tm ))]; same
-tm: next command full errors []; after the keep: errors []
-corrupted theorem: error has the kernel's text: true
-corrupted definition: error has the kernel's text: true

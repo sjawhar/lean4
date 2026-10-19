@@ -1,4 +1,0 @@
-a reads: full [reducibility of t.go Lean.ReducibilityStatus.irreducible, matcher info of t.match_1_1 true]; kept [reducibility of t.go Lean.ReducibilityStatus.irreducible, matcher info of t.match_1_1 true]; same
-a next command: full errors [], value (some (OfNat.ofNat.{0} Nat 2 (instOfNatNat 2))); after the keep: errors [], value (some (OfNat.ofNat.{0} Nat 2 (instOfNatNat 2)))
-b reads: full [reducibility of t.go Lean.ReducibilityStatus.irreducible]; kept [reducibility of t.go Lean.ReducibilityStatus.irreducible]; same
-c reads: full [doc of t.go (some (doc of go ))]; kept [doc of t.go (some (doc of go ))]; same
