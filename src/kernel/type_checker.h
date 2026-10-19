@@ -40,6 +40,9 @@ public:
         expr_pair_set             m_success;
         expr_pair_set             m_failure;
         expr_map<expr>            m_unfold;
+        /* Recursor rules' right-hand sides with the recursor's universe levels instantiated, keyed by
+           (recursor constant, rule rhs). */
+        lean::unordered_map<expr_pair, expr, expr_pair_hash, expr_pair_eq> m_rec_rhs;
         friend type_checker;
     public:
         state(environment const & env);
