@@ -24,6 +24,8 @@ cd work
 # Store the Lake cache in the test directory, never the system cache
 export LAKE_CACHE_DIR=
 export LAKE_ARTIFACT_CACHE=false
+# The cutoff is off by default; the cutoff tree turns it on, the fresh tree off (each explicitly)
+export LAKE_USAGE_CUTOFF=1
 
 # Observations of a package directory after a build: its exit code (first argument) and log (second). The
 # messages are those of Lean modules (`info: FILE:LINE:COL: …`), which a replayed module logs again.
