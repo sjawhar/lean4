@@ -394,16 +394,17 @@ def runFrontend
     let recorded ← recordedDeclConsts
     let usage? := usageFileName?.map fun usageFileName =>
       let nodes := ModuleUsage.ownNodes env (ModuleUsage.ownConsts env recorded)
-      (usageFileName, nodes, ModuleUsage.localDigests env nodes)
+      let own := ModuleUsage.localDigests env nodes
+      (usageFileName, nodes, own, ModuleUsage.closureDigest env own)
     profileitIO ".olean serialization" finalOpts do
       let commandLints := collectCommandLints snaps none #[]
       let env ← Linter.recordLints inputCtx.fileMap env commandLints
-      let env := usage?.elim env fun (_, _, own) => ModuleUsage.setLocalDigests env own
+      let env := usage?.elim env fun (_, _, own, closure) => ModuleUsage.setLocalDigests env own closure
       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
-    if let some (usageFileName, nodes, own) := usage? then
+    if let some (usageFileName, nodes, own, closure) := usage? then
       let used := ModuleUsage.usedFromInfoTrees trees (← usedNames)
-      ModuleUsage.writeUsage env nodes own used (← lookedUpSpecKeys) (incrLoaded := incrLoadFileName?.isSome)
-        usageFileName
+      ModuleUsage.writeUsage env nodes own closure used (← lookedUpSpecKeys)
+        (incrLoaded := incrLoadFileName?.isSome) usageFileName
 
   if let some ileanFileName := ileanFileName? then
     let references := Lean.Server.findModuleRefs inputCtx.fileMap trees (localVars := false)

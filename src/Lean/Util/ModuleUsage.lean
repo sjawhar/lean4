@@ -127,11 +127,12 @@ def ownerOf (isNode : Name → Bool) (x : Name) : Name := Id.run do
 
 structure State where
   /-- Per imported module: empty if its `.olean` carries no digests (written without `lean --usage`, or by a
-  toolchain without this extension); otherwise a marker entry at index 0, then the module's digests sorted by
-  name. The marker's name is never looked up, so no user constant can collide with it. -/
+  toolchain without this extension); otherwise a marker entry at index 0, whose digest is the module's
+  `closureDigest`, then the module's digests sorted by name. The marker's name is never looked up, so no user
+  constant can collide with it. -/
   importedModuleEntries : Array (Array (Name × Digest)) := #[]
-  /-- The current module's digests, if `setLocalDigests` stored them for the `.olean` write. -/
-  localDigests? : Option (Array (Name × Digest)) := none
+  /-- The current module's digests and `closureDigest`, if `setLocalDigests` stored them for the `.olean` write. -/
+  localDigests? : Option (Array (Name × Digest) × Digest) := none
 instance : Inhabited State := ⟨{}⟩
 
 /-- The digest of node `c` if module `i` (the module defining `c`) wrote one. -/
@@ -145,6 +146,17 @@ def State.find? (s : State) (env : Environment) (c : Name) : Option Digest := do
 /-- Whether module `i`'s `.olean` carries digests (it has the marker entry). -/
 def State.hasEntries (s : State) (i : ModuleIdx) : Bool :=
   !(s.importedModuleEntries[i.toNat]?.getD #[]).isEmpty
+
+/-- A module's `moduleDigest`: a digest of its digests (`own`, sorted by name), as its `.usage` records it. -/
+def moduleDigestOf (own : Array (Name × Digest)) : Digest :=
+  (own.foldl (fun e (n, d) => e.name n |>.digest d) (({} : Enc).nat own.size)).finish
+
+/-- Module `i`'s `moduleDigest` and `closureDigest` as the current module imported them, from its `.olean`, or
+`none` if it carries no digests. -/
+def State.importedDigests? (s : State) (i : ModuleIdx) : Option (Digest × Digest) := do
+  let es ← s.importedModuleEntries[i.toNat]?
+  let (_, closure) ← es[0]?
+  return (moduleDigestOf (es.extract 1 es.size), closure)
 
 /-- The node of the imported name `x`, found in its defining module's digests: a module's nodes are its
 kernel constants and the compiler-only names that fold into none (`ownNodes`), so the first of `x`'s
@@ -164,7 +176,7 @@ private builtin_initialize ext : PersistentEnvExtension (Name × Digest) (Name �
     -- Private level only: digests cover private constants and unexposed bodies, which must not change the
     -- exported `.olean` of a `module` file. Non-module files are written and read at the private level.
     exportEntriesFnEx := fun _ s =>
-      let es := s.localDigests?.elim #[] (#[(.anonymous, default)] ++ ·)
+      let es := s.localDigests?.elim #[] fun (own, closure) => #[(.anonymous, closure)] ++ own
       { exported := #[], server := #[], «private» := es }
     asyncMode := .mainOnly
   }
@@ -240,9 +252,10 @@ def compute (env : Environment) (s : State) (nodes : Array Node) : Array (Name �
 def localDigests (env : Environment) (nodes := ownNodes env (ownConsts env)) : Array (Name × Digest) :=
   compute env (state env) nodes
 
-/-- Stores `own` (`localDigests env`) for the extension to export. Without it, the `.olean` carries no digests. -/
-def setLocalDigests (env : Environment) (own : Array (Name × Digest)) : Environment :=
-  ext.modifyState (asyncMode := .mainOnly) env ({ · with localDigests? := some own })
+/-- Stores `own` (`localDigests env`) and the module's `closureDigest` for the extension to export. Without it, the
+`.olean` carries no digests. -/
+def setLocalDigests (env : Environment) (own : Array (Name × Digest)) (closure : Digest) : Environment :=
+  ext.modifyState (asyncMode := .mainOnly) env ({ · with localDigests? := some (own, closure) })
 
 /-- Per defining module, sorted: the node of every imported name that the current module's nodes refer to or
 that is in `extra`, with its digest. Names without a digest (from a module whose `.olean` carries none) are left
@@ -558,17 +571,20 @@ private def specLookups (env : Environment) (lookups : Array Expr) : Array (Dige
 
 /-- The format version of the `.usage` sidecar and of Lake's `.usekey`; Lake reads a sidecar of any other
 version as absent. -/
-def usageVersion : Nat := 9
+def usageVersion : Nat := 10
 
-/-- `own` is `localDigests env nodes`; `used` holds the imported names recorded while elaborating
-(`moduleUsed`'s `extra`); `lookups` the specialization-cache keys looked up (`specLookups`). The extra module uses
-are the environment's and `extraModUsesByChecks` (those of commands whose environment was discarded); if a
-compile ran passes or constant folders beyond the built-in ones (`compilerCodeSeen`), whose code can read any
-environment state, every imported module with digests is one. `noskip` is set when the run reused commands from an
-`--incr-load` snapshot, since reused commands never call `addDecl` in this process and `used` may miss constants
-they used. -/
-def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Digest)) (used : NameSet)
-    (lookups : Array Expr) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
+/-- `own` is `localDigests env nodes` and `closure` the module's `closureDigest`, as `setLocalDigests` stored them;
+`used` holds the imported names recorded while elaborating (`moduleUsed`'s `extra`); `lookups` the
+specialization-cache keys looked up (`lookedUpSpecKeys`). The extra module uses are the environment's and
+`extraModUsesByChecks` (those of commands whose environment was discarded); if a compile ran code or read state the
+used names do not cover (`compilerCodeSeen`), every imported module with digests is one. `imported` records, for
+each direct import and extra module with digests, its `moduleDigest` and `closureDigest` as this compile imported
+them, from their `.olean` files: Lake writes a `.usekey` only if those are still what the modules' `.usage` files
+say when it writes it, so the key describes what the compile read. `noskip` is set when the run reused commands
+from an `--incr-load` snapshot, since reused commands never call `addDecl` in this process and `used` may miss
+constants they used. -/
+def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Digest)) (closure : Digest)
+    (used : NameSet) (lookups : Array Expr) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
   let s := state env
   let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecks)
   let allExtra ← if (← compilerCodeSeen) then
@@ -578,12 +594,17 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
   let extraMods := allExtra.toArray.filter (fun u => (env.getModuleIdx? u.module).any s.hasEntries)
     |>.qsort fun a b => let k (u : ExtraModUse) := 2 * u.isExported.toNat + u.isMeta.toNat
       Name.quickLt a.module b.module || (a.module == b.module && k a < k b)
+  let importedNames : NameSet := extraMods.foldl (·.insert ·.module) <|
+    env.header.imports.foldl (·.insert ·.module) {}
+  let imported := importedNames.toArray.qsort Name.quickLt |>.filterMap fun m => do
+    let (md, cd) ← s.importedDigests? (← env.getModuleIdx? m)
+    return Json.arr #[nameToJson m, toJson md, toJson cd]
   let pair (n : Name) (d : Digest) := Json.arr #[nameToJson n, toJson d]
-  let moduleDigest := (own.foldl (fun e (n, d) => e.name n |>.digest d) (({} : Enc).nat own.size)).finish
   let j := Json.mkObj [("version", usageVersion), ("noskip", incrLoaded),
-    ("moduleDigest", toJson moduleDigest),
-    ("closure", toJson (closureDigest env own)),
+    ("moduleDigest", toJson (moduleDigestOf own)),
+    ("closure", toJson closure),
     ("digested", Json.arr ((digestedModules env).map nameToJson)),
+    ("imported", Json.arr imported),
     ("own", Json.arr (own.map fun (n, d) => pair n d)),
     ("used", Json.arr ((moduleUsed env used nodes).map fun (m, cs) =>
       Json.arr #[nameToJson m, Json.arr (cs.map fun (n, d) => pair n d)])),
