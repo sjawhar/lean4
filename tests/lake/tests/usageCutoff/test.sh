@@ -467,14 +467,20 @@ match_text "Built Test.A" produced.out
 match_text "Replayed Test.B" produced.out
 match_text "Replayed Test.C" produced.out
 match_text "Replayed Test.D" produced.out
-# a restored key is bound to its module's .olean: B.olean replaced behind Lake's back builds B
+# a restored key is bound to its module's .olean: B.olean replaced behind Lake's back is not replayed. The cache's
+# usage index offers cache1's compile of B, which passes the check, so B is restored from the cache, not built
 printf 'def a := 1\ntheorem ta : a = 1 := sorry\ndef unrelated := 4\n' > Test/A.lean
 { cat .lake/build/lib/lean/Test/B.olean; printf 'x'; } > B.tmp
+cp B.tmp replaced.tmp
 mv -f B.tmp .lake/build/lib/lean/Test/B.olean
 rm .lake/build/lib/lean/Test/B.olean.hash
-test_out "Built Test.B" build Test.B
-# as is the rest of what its trace describes: B.ilean or B.c replaced behind Lake's back builds B again, and
-# no cache entry takes the replaced bytes
+test_out "usage index: restored" build -v Test.B
+no_match_text "Replayed Test.B" produced.out
+test_cmd_fails cmp replaced.tmp .lake/build/lib/lean/Test/B.olean
+test_cmd cmp .lake/build/lib/lean/Test/B.olean \
+  "$LAKE_CACHE_DIR/artifacts/$(cat .lake/build/lib/lean/Test/B.olean.hash).olean"
+# as is the rest of what its trace describes: B.ilean or B.c replaced behind Lake's back is not replayed (B is
+# restored from the cache, as above), and no cache entry takes the replaced bytes
 u=4
 for f in lib/lean/Test/B.ilean ir/Test/B.c; do
   u=$((u + 1))
@@ -483,7 +489,8 @@ for f in lib/lean/Test/B.ilean ir/Test/B.c; do
   cat .lake/build/$f > good$u.tmp
   { cat good$u.tmp; printf '\n/* replaced */\n'; } > B.tmp
   mv -f B.tmp .lake/build/$f
-  test_out "Built Test.B" build -v Test.B
+  test_out "usage index: restored" build -v Test.B
+  no_match_text "Replayed Test.B" produced.out
   test_cmd cmp good$u.tmp .lake/build/$f
   test_cmd_fails grep -rqF -- '/* replaced */' "$LAKE_CACHE_DIR/artifacts"
 done
