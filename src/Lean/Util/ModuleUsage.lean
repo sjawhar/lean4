@@ -149,22 +149,39 @@ def internalPrefixes (n : Name) : Array Name := Id.run do
     out := out.push c
   return out
 
+/-- The entries that open a module's digest payload in its `.olean`, before the module's digests sorted by name
+(`Markers.entries`). Their name is never looked up, so no user constant can collide with it. -/
+structure Markers where
+  /-- The module's `closureDigest`. -/
+  closure : Digest
+  /-- The digest of the compiler-only names the module claims without having created them (`claimsDigestOf`). -/
+  claims : Digest
+  deriving Inhabited
+
+/-- `m`'s payload entries, in payload order. -/
+def Markers.entries (m : Markers) : Array (Name × Digest) := #[(.anonymous, m.closure), (.anonymous, m.claims)]
+
+/-- The number of marker entries: the index of a payload's first digest. -/
+def Markers.count : Nat := (default : Markers).entries.size
+
+/-- The markers of a module's payload, or `none` if it is empty (its `.olean` carries no digests). -/
+def Markers.ofPayload? (payload : Array (Name × Digest)) : Option Markers := do
+  let #[(_, closure), (_, claims)] := payload.extract 0 count | none
+  return { closure, claims }
+
 structure State where
-  /-- Per imported module: empty if its `.olean` carries no digests (written without `lean --usage`, or by a
-  toolchain without this extension); otherwise two marker entries, whose digests are the module's `closureDigest`
-  (index 0) and the digest of the compiler-only names it claims without having created them (`claimsDigestOf`,
-  index 1), then the module's digests sorted by name. The markers' name is never looked up, so no user constant
-  can collide with it. -/
+  /-- Per imported module, its digest payload: empty if its `.olean` carries no digests (written without
+  `lean --usage`, or by a toolchain without this extension); otherwise its `Markers.entries`, then its digests
+  sorted by name. -/
   importedModuleEntries : Array (Array (Name × Digest)) := #[]
-  /-- The current module's digests, `closureDigest` and claims digest, if `setLocalDigests` stored them for the
-  `.olean` write. -/
-  localDigests? : Option (Array (Name × Digest) × Digest × Digest) := none
+  /-- The current module's digests and markers, if `setLocalDigests` stored them for the `.olean` write. -/
+  localDigests? : Option (Array (Name × Digest) × Markers) := none
 instance : Inhabited State := ⟨{}⟩
 
 /-- The digest of node `c` if module `i` (the module defining `c`) wrote one. -/
 def State.findAt? (s : State) (i : ModuleIdx) (c : Name) : Option Digest := do
   let es ← s.importedModuleEntries[i.toNat]?
-  (·.2) <$> es.binSearch (c, default) (fun a b => Name.quickLt a.1 b.1) (lo := 2)
+  (·.2) <$> es.binSearch (c, default) (fun a b => Name.quickLt a.1 b.1) (lo := Markers.count)
 
 def State.find? (s : State) (env : Environment) (c : Name) : Option Digest := do
   s.findAt? (← env.getModuleIdxFor? c) c
@@ -175,19 +192,18 @@ def State.hasEntries (s : State) (i : ModuleIdx) : Bool :=
 
 /-- A module's `moduleDigest`: a digest of its digests (`own`, sorted by name), as its `.usage` records it. -/
 def moduleDigestOf (own : Array (Name × Digest)) : Digest :=
-  (own.foldl (fun e (n, d) => e.name n |>.digest d) (({} : Enc).nat own.size)).finish
+  (({} : Enc).array own fun e (n, d) => e.name n |>.digest d).finish
 
 /-- Module `i`'s `moduleDigest` and `closureDigest` as the current module imported them, from its `.olean`, or
 `none` if it carries no digests. -/
 def State.importedDigests? (s : State) (i : ModuleIdx) : Option (Digest × Digest) := do
   let es ← s.importedModuleEntries[i.toNat]?
-  let (_, closure) ← es[0]?
-  return (moduleDigestOf (es.extract 2 es.size), closure)
+  let m ← Markers.ofPayload? es
+  return (moduleDigestOf (es.extract Markers.count es.size), m.closure)
 
 /-- Module `i`'s claims digest (`claimsDigestOf`), from its `.olean`, or `none` if it carries no digests. -/
 def State.importedClaims? (s : State) (i : ModuleIdx) : Option Digest := do
-  let es ← s.importedModuleEntries[i.toNat]?
-  (·.2) <$> es[1]?
+  (·.claims) <$> Markers.ofPayload? (← s.importedModuleEntries[i.toNat]?)
 
 /-- The node of the imported name `x`, found in its defining module's digests: a module's nodes are its
 kernel constants and the compiler-only names that fold into none (`ownNodes`), so the first of `x`'s
@@ -207,8 +223,7 @@ private builtin_initialize ext : PersistentEnvExtension (Name × Digest) (Name �
     -- Private level only: digests cover private constants and unexposed bodies, which must not change the
     -- exported `.olean` of a `module` file. Non-module files are written and read at the private level.
     exportEntriesFnEx := fun _ s =>
-      let es := s.localDigests?.elim #[] fun (own, closure, claims) =>
-        #[(.anonymous, closure), (.anonymous, claims)] ++ own
+      let es := s.localDigests?.elim #[] fun (own, markers) => markers.entries ++ own
       { exported := #[], server := #[], «private» := es }
     asyncMode := .mainOnly
   }
@@ -275,15 +290,10 @@ def compute (env : Environment) (s : State) (nodes : Array Node) : Array (Name �
   let mut out : Std.HashMap Name Digest := {}
   for scc in sccs do
     let members := NameSet.ofList scc
-    let sorted := scc.toArray.qsort Name.quickLt
-    let mut e : Enc := ({} : Enc).nat sorted.size
-    for m in sorted do
+    let d := ({} : Enc).array (scc.toArray.qsort Name.quickLt) (fun e m =>
       let node := byName[m]!
-      let outside := node.refs.filter (!members.contains ·)
-      e := e.name m |>.digest node.localDigest |>.nat outside.size
-      for r in outside do
-        e := e.name r |>.opt (out[r]? <|> s.find? env r) Enc.digest
-    let d := e.finish
+      e.name m |>.digest node.localDigest |>.array (node.refs.filter (!members.contains ·)) fun e r =>
+        e.name r |>.opt (out[r]? <|> s.find? env r) Enc.digest) |>.finish
     for m in scc do out := out.insert m d
   return (nodes.map fun n => (n.name, out[n.name]!)).qsort fun a b => Name.quickLt a.1 b.1
 
@@ -293,7 +303,7 @@ def localDigests (env : Environment) (nodes := ownNodes env (ownConsts env)) : A
 /-- Stores `own` (`localDigests env`), the module's `closureDigest` and its claims digest (`ownClaimsDigest`) for the
 extension to export. Without it, the `.olean` carries no digests. -/
 def setLocalDigests (env : Environment) (own : Array (Name × Digest)) (closure claims : Digest) : Environment :=
-  ext.modifyState (asyncMode := .mainOnly) env ({ · with localDigests? := some (own, closure, claims) })
+  ext.modifyState (asyncMode := .mainOnly) env ({ · with localDigests? := some (own, { closure, claims }) })
 
 /-- The imported constants the compiler reads by a name derived from `x` when it compiles a use of `x`: `x`'s derived
 constants (`derivedSuffixes`) and the prefixes whose attributes it reads with `x`'s (`internalPrefixes`). -/
@@ -433,7 +443,7 @@ def foreignClaims (env : Environment) (created : NameSet) : Array Name :=
 /-- A digest of a module's `foreignClaims`: what importers' `tableDigest` holds of them, from the module's `.olean`
 (`State.importedClaims?`). -/
 def claimsDigestOf (claims : Array Name) : Digest :=
-  (claims.foldl Enc.name (({} : Enc).nat claims.size)).finish
+  (({} : Enc).array claims Enc.name).finish
 
 /-- The names the compiler recorded creating in runs that compiled only the current module's own constants
 (`compileCreatedNames`); a run for a declaration of an environment that was then discarded does not count, nor does
@@ -470,7 +480,7 @@ constants for another module's base with their digests (`foreignDerivedConsts`),
 digest of its claimed compiler-only names that its compile did not create (`claimsDigestOf`). `i? = none` is the
 current module. -/
 def tableDigest (env : Environment) (i? : Option ModuleIdx) (digestOf : Name → Option Digest) (claims : Digest) :
-    Digest := Id.run do
+    Digest :=
   let priv := env.setExporting false
   let csimp := pickEntries i? (Compiler.CSimp.ext.ext.getModuleEntries env ·)
     (Compiler.CSimp.ext.ext.getState env).newEntries
@@ -493,44 +503,28 @@ def tableDigest (env : Environment) (i? : Option ModuleIdx) (digestOf : Name →
   let matchers := matchers.filter (!definedIn priv i? ·.name)
   let metas := (declMetaEntries env i?).filter (!definedIn priv i? ·)
   let withDigest (e : Enc) (n : Name) := e.name n |>.opt (digestOf n) Enc.digest
-  let mut e : Enc := ({} : Enc).nat csimp.size
-  for x in csimp do
-    e := scopedEnc (fun e (c : Compiler.CSimp.Entry) =>
+  ({} : Enc)
+    |>.array csimp (scopedEnc fun e (c : Compiler.CSimp.Entry) =>
       let ⟨fromDeclName, toDeclName, thmName⟩ := c
-      e.name fromDeclName |>.name toDeclName |>.name thmName) e x
-  e := e.nat insts.size
-  for x in insts do
-    e := scopedEnc instanceEntryEnc e x
-  e := e.nat reds.size
-  for x in reds do
-    e := scopedEnc (fun e ((n, st) : Name × ReducibilityStatus) => reducibilityEnc (e.name n) st) e x
-  e := e.nat classes.size
-  for c in classes do
-    let ⟨name, outParams, outLevelParams⟩ := c
-    e := e.name name |>.nats outParams |>.nats outLevelParams
-  e := e.nat passes.size
-  for p in passes do e := withDigest e p
-  e := e.nat folders.size
-  for f in folders do
-    let ⟨declName, folderDeclName⟩ := f
-    e := withDigest (e.name declName) folderDeclName
-  e := e.nat hints.size
-  for x in hints do
-    e := scopedEnc (fun e (h : Meta.UnificationHintEntry) =>
-      withDigest (h.keys.foldl discrKeyEnc (e.nat h.keys.size)) h.val) e x
-  e := e.nat matchers.size
-  for m in matchers do
-    let ⟨name, info⟩ := m
-    e := (matcherInfoEnc { e := e.name name } info).e
-  e := e.nat metas.size
-  for n in metas do e := e.name n
-  let shaped := compilerShapedConsts env i?
-  e := e.nat shaped.size
-  for n in shaped do e := e.name n
-  let derived := foreignDerivedConsts priv i?
-  e := e.nat derived.size
-  for n in derived do e := withDigest e n
-  return e.digest claims |>.finish
+      e.name fromDeclName |>.name toDeclName |>.name thmName)
+    |>.array insts (scopedEnc instanceEntryEnc)
+    |>.array reds (scopedEnc fun e ((n, st) : Name × ReducibilityStatus) => reducibilityEnc (e.name n) st)
+    |>.array classes (fun e c =>
+      let ⟨name, outParams, outLevelParams⟩ := c
+      e.name name |>.nats outParams |>.nats outLevelParams)
+    |>.array passes withDigest
+    |>.array folders (fun e f =>
+      let ⟨declName, folderDeclName⟩ := f
+      withDigest (e.name declName) folderDeclName)
+    |>.array hints (scopedEnc fun e (h : Meta.UnificationHintEntry) =>
+      withDigest (e.array h.keys discrKeyEnc) h.val)
+    |>.array matchers (fun e m =>
+      let ⟨name, info⟩ := m
+      (matcherInfoEnc { e := e.name name } info).e)
+    |>.array metas Enc.name
+    |>.array (compilerShapedConsts env i?) Enc.name
+    |>.array (foreignDerivedConsts priv i?) withDigest
+    |>.digest claims |>.finish
 
 /-- The registered names of the environment extensions whose entries for other modules' names `tableDigest`
 reads. The census test checks that every extension it classifies as a cross-module table is listed here. -/
@@ -545,16 +539,13 @@ in which every compiler table applies their entries, so that the last import win
 for every module (imported ones with digests, and the current one) the digest of its cross-module compiler
 tables (`tableDigest`). Importers compare it through Lake's `closureHash`, so a change to any module's tables,
 or to the import order, rebuilds every module downstream. -/
-def closureDigest (env : Environment) (own : Array (Name × Digest)) (claims : Digest) : Digest := Id.run do
+def closureDigest (env : Environment) (own : Array (Name × Digest)) (claims : Digest) : Digest :=
   let s := state env
   let ownMap : Std.HashMap Name Digest := own.foldl (fun m (n, d) => m.insert n d) {}
   let digestOf (n : Name) : Option Digest := ownMap[n]? <|> s.find? env n
-  let mods := env.header.moduleNames
-  let mut e : Enc := ({} : Enc).nat mods.size
-  for (m, i) in mods.zipIdx do
-    e := e.name m
-    e := e.opt (s.importedClaims? i |>.map (tableDigest env (some i) digestOf ·)) Enc.digest
-  return e.digest (tableDigest env none digestOf claims) |>.finish
+  ({} : Enc).array env.header.moduleNames.zipIdx (fun e (m, i) =>
+      e.name m |>.opt (s.importedClaims? i |>.map (tableDigest env (some i) digestOf ·)) Enc.digest)
+    |>.digest (tableDigest env none digestOf claims) |>.finish
 
 /-- The imported modules whose `.olean` carries digests (`State.hasEntries`), sorted. -/
 def digestedModules (env : Environment) : Array Name :=
@@ -595,7 +586,7 @@ def specProviders (keys : Array Digest) (modules : Array (Name × Array (Digest 
       if wanted.contains k then providers := providers.alter k fun o => some ((o.getD #[]).push (m, n))
   return keys.map fun k =>
     let ps := (providers.getD k #[]).qsort (Name.quickLt ·.1 ·.1)
-    (k, (ps.foldl (fun e (m, n) => e.name m |>.name n) (({} : Enc).nat ps.size)).finish)
+    (k, (({} : Enc).array ps fun e (m, n) => e.name m |>.name n).finish)
 
 /-- The specialization-cache keys the current module created (its own cache entries, `specKeysOf`), sorted: what
 importers' `specLookups` are checked against. -/
