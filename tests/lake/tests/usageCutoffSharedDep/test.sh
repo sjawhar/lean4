@@ -7,7 +7,7 @@ cd work
 
 # Store the Lake cache in the test directory, never the system cache
 export LAKE_CACHE_DIR=
-export LAKE_ARTIFACT_CACHE=false
+export LAKE_ARTIFACT_CACHE=false LAKE_USAGE_CUTOFF=1
 
 # Workspaces `a` and `b` require the same path dependency `dep`. Each build holds only its own
 # workspace's lock, so `b` can rebuild `dep` while a build of `a` is running.

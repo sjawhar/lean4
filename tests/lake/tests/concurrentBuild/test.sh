@@ -47,7 +47,7 @@ test_run build
 
 # Usage cutoff still operates while the workspace lock is active.
 cd ..
-export LAKE_ARTIFACT_CACHE=false
+export LAKE_ARTIFACT_CACHE=false LAKE_USAGE_CUTOFF=1
 printf 'import Test.Slow\ndef U.u : Nat := slow + 1\n' > Test/U.lean
 printf 'import Test.U\ndef V.v : Nat := U.u\n' > Test/V.lean
 test_run build Test.V
