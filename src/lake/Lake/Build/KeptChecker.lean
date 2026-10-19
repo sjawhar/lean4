@@ -10,7 +10,6 @@ public import Std.Sync.Mutex
 public import Std.Sync.Channel
 public import Std.Data.HashMap.Basic
 public import Init.System.Promise
-public import Std.Async.Signal
 import Init.Data.String.TakeDrop
 import Lake.Util.Proc
 
@@ -39,9 +38,9 @@ to `maxSpawns` start attempts per build; after that every request is a reject. R
 by one task per checker, outside the client's lock, so a checker that stops reading cannot block the
 jobs that ask it, nor the watchdog that kills it; a request that cannot be written is a reject.
 
-The checker does not inherit the workspace build lock (`spawnProc`), and since its session is its
-own, a terminal's interrupt does not reach it: while a checker client is open, `SIGINT` and `SIGTERM`
-kill the running checker before Lake exits, so that no checker outlives Lake.
+The checker does not inherit the workspace build lock (`spawnProc`). Its session is its own, so a
+terminal's interrupt does not reach it; when Lake exits, however it exits, the checker's standard
+input reaches its end, and a checker is expected to stop then.
 -/
 
 open Lean
@@ -79,8 +78,6 @@ public structure KeptChecker.State where
   lastFailure : String := ""
   /-- Whether the watchdog (`KeptChecker.watch`) runs. -/
   watching : Bool := false
-  /-- The `SIGINT` and `SIGTERM` handlers (`KeptChecker.trapSignals`), stopped by `close`. -/
-  signals : Array Std.Async.Signal.Waiter := #[]
   closed : Bool := false
 
 /-- A client of a kept-module checker, shared by the jobs of one build. -/
@@ -190,23 +187,6 @@ partial def watch (self : KeptChecker) : IO Unit := do
     try r.proc.kill catch _ => pure ()
     watch self
 
-/--
-Traps `SIGINT` (a terminal's interrupt goes to Lake's process group, which the checker's own session
-is not in) and `SIGTERM` (as `timeout` sends): the handler kills the running checker and exits Lake
-as the signal would.
--/
-def trapSignals (self : KeptChecker) : IO (Array Std.Async.Signal.Waiter) := do
-  #[(Std.Async.Signal.sigint, (130 : UInt8)), (.sigterm, 143)].mapM fun (signal, exitCode) => do
-    let waiter ← Std.Async.Signal.Waiter.mk signal false
-    let received ← waiter.wait
-    discard <| IO.asTask (prio := .dedicated) do
-      -- fails once `close` stops the waiter
-      if let .ok _ ← IO.wait received then
-        if let some r ← self.state.atomically (return (← get).running?) then
-          try r.proc.kill catch _ => pure ()
-        IO.Process.exit exitCode
-    return waiter
-
 /-- Starts checker number `gen` with its reader and writer tasks. -/
 def start (self : KeptChecker) (gen : Nat) : IO Running := do
   -- `Child.takeStdin` is not used: the child it returns has lost `setsid`, so its `kill` would
@@ -237,10 +217,9 @@ def ensureRunning (self : KeptChecker) : Std.AtomicT State IO (Except String Run
   let gen := s.spawns
   match (← (self.start gen).toBaseIO) with
   | .ok r =>
-    let signals ← if s.watching then pure s.signals else
+    unless s.watching do
       discard <| IO.asTask (prio := .dedicated) self.watch
-      self.trapSignals
-    set {s with running? := some r, spawns := gen + 1, watching := true, signals}
+    set {s with running? := some r, spawns := gen + 1, watching := true}
     return .ok r
   | .error e =>
     let reason := s!"could not start the checker '{self.cmd}': {e}"
@@ -274,14 +253,12 @@ public def check (self : KeptChecker) (module : Name) (olean src : System.FilePa
       self.reject r.gen id s!"the checker (number {r.gen}) stopped before the request was sent"
     return (← IO.wait promise.result?).getD (.rejected "the checker's reply was lost")
 
-/-- Stops the checker at the end of a build, and the interrupt handlers. -/
+/-- Stops the checker at the end of a build. -/
 public def close (self : KeptChecker) : IO Unit := do
-  let (running?, signals) ← self.state.atomically do
+  let running? ← self.state.atomically do
     let s ← get
-    set {s with closed := true, running? := none, signals := #[]}
-    return (s.running?, s.signals)
-  for signal in signals do
-    try signal.stop catch _ => pure ()
+    set {s with closed := true, running? := none}
+    return s.running?
   if let some r := running? then
     discard <| r.outbox.close.toBaseIO
     try r.proc.kill catch _ => pure ()
