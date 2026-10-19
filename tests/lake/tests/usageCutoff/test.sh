@@ -55,7 +55,7 @@ rm -f .lake/build/lib/lean/Test/HU.usekey
 printf '\377' > .lake/build/lib/lean/Test/HU.usekey
 test_out "Test/HU.usekey" build Test.HU
 match_text "Built Test.HU" produced.out
-# a sidecar of another format version (an older toolchain wrote it) reads as absent: built, no warning
+# a sidecar of another format version (another toolchain wrote it) reads as absent: built, no warning
 rm -f .lake/build/lib/lean/Test/HU.usekey
 printf '{"version":3,"local":"0000000000000000","olean":"00000000000000000000000000000000","modsys":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","extra":[]}' > .lake/build/lib/lean/Test/HU.usekey
 printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 2\n' > Test/H.lean
@@ -86,7 +86,7 @@ printf '[leanOptions]\nmaxRecDepth = 1000\n' >> lakefile.toml
 test_out "Built Test.B" build Test.B
 cp lakefile.toml.bak lakefile.toml
 test_run build Test.B
-# missing key: stock path
+# missing key: the module builds
 rm .lake/build/lib/lean/Test/B.usekey
 printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 3\n' > Test/A.lean
 test_out "Built Test.B" build Test.B
@@ -306,10 +306,9 @@ printf 'partial def f (n : Nat) : Nat := if n = 0 then 2 else f (n - 1)\n' > Tes
 test_run build Test.PM
 printf 'partial def f (n : Nat) : Nat := if n = 0 then 3 else f (n - 1)\n' > Test/PX.lean
 LAKE_USAGE_CUTOFF=0 test_err "error: Test/PM.lean" build -v Test.PM
-# a user constant with the name the extension once used for its marker entry (`_moduleUsage`) has its
-# own digest: a change to its value rebuilds a module that proved it through an intermediate `def`. The same
-# for a name declared by `addDecl` from `run_cmd`, which can declare any name (no compiled code, so the
-# intermediate is `noncomputable`)
+# a user constant named `_moduleUsage` has its own digest, like any other constant: a change to its value
+# rebuilds a module that proved it through an intermediate `def`. The same for a name declared by `addDecl` from
+# `run_cmd`, which can declare any name (no compiled code, so the intermediate is `noncomputable`)
 printf 'def _moduleUsage : Nat := 1\n' > Test/MX.lean
 printf 'import Test.MX\ndef md : Nat := _moduleUsage\n' > Test/MA.lean
 printf 'import Test.MA\ntheorem mb : md = 1 := rfl\n' > Test/MB.lean
@@ -402,8 +401,8 @@ for v in false off no; do
   test_exp ! -f .lake/build/lib/lean/Test/EV.usage
 done
 # control: a C body change behind a precompiled module's `@[extern]` reaches M only through `libext_X.so`, which
-# links `libleanext.so` dynamically, so its bytes and M's trace do not change. Stock Lake replays M too; cutoff
-# must match stock here, not do worse
+# links `libleanext.so` dynamically, so its bytes and M's trace do not change. Lake with the cutoff off replays M
+# too; the cutoff must do the same here, not worse
 mkdir -p ext/X ext/M
 cat > ext/lakefile.lean <<'EOF'
 import Lake
@@ -626,7 +625,7 @@ cp cache12/Test/*.lean cache16/Test/
 (cd cache16 && LAKE_USAGE_CUTOFF=0 test_out "Built Test.SB" build -v Test.SB)
 test_exp "$(depHash cache16/.lake/build/lib/lean/Test/SB.trace)" = "$(depHash cache13/.lake/build/lib/lean/Test/SB.trace)"
 # the tree that skipped, with the cutoff off and its sources unchanged since the skip, builds SB rather
-# than keep the skip's outputs, as a stock build of those sources would
+# than keep the skip's outputs, as a build of those sources without the cutoff does
 printf 'def sa := 1\ndef unrelated := 3\n' > cache12/Test/SA.lean
 (cd cache12 && test_out "Replayed Test.SB" build -v Test.SB)
 (cd cache12 && LAKE_USAGE_CUTOFF=0 test_out "Built Test.SB" build -v Test.SB)

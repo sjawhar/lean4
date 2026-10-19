@@ -238,8 +238,8 @@ spec_precomp_s1() {
 }
 
 # A module compiled with plugins (the shared library of a `precompileModules` library it imports, and Lake's own)
-# keeps its usual dependencies: plugins that register no reserved-name predicate record nothing, so an unrelated
-# change to an import `Q.Use` uses nothing of replays it (`plugin_replay`).
+# keeps its usual dependencies: plugins that register no reserved-name predicate record nothing, so a change to
+# `T.F`, an import of `Q.Use` that `Q.Use` uses nothing of, replays `Q.Use` (`plugin_replay`).
 plugin_replay_s0() {
   mkdir -p T P Q
   printf 'name = "test"\ndefaultTargets = ["Q"]\n[[lean_lib]]\nname = "T"\n' > lakefile.toml
@@ -1010,7 +1010,7 @@ inl_instance_s0() {
 }
 inl_instance_s1() { inl_ic '(· * 10)' $'@[inline] instance instFooNat : Foo Nat where\n  foo xs := ism Nat.succ xs'; }
 
-## Guards: changes the cutoff catches today, some by mechanisms a redesign may replace.
+## Guards: further changes to compiled code that the cutoff must catch.
 
 # Further shapes of a reused specialization reaching the executable's root module.
 spec_shape_s0() {

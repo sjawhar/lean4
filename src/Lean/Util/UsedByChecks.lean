@@ -36,8 +36,8 @@ def usageRecordingEnabled : BaseIO Bool :=
 
 /--
 Records `n` as used when recording is on: names that reach the current module's compiled code or elaboration
-without occurring in any of its terms, namely a specialization reused from another module's cache, the
-replacement of a `@[csimp]` theorem, and every declaration the IR interpreter resolves (called from
+without occurring in any of its terms, namely a specialization the specialization cache returns (possibly another
+module's), the replacement of a `@[csimp]` theorem, and every declaration the IR interpreter resolves (called from
 `src/library/ir_interpreter.cpp`, possibly on several threads).
 -/
 @[export lean_usage_record_used]
@@ -108,8 +108,9 @@ environment created afterwards, unlike that of an imported module's initializers
 def pluginLoading : BaseIO Bool :=
   pluginLoadingRef.get
 
-/-- The option `Lean.Compiler.LCNF.main` sets while it compiles. Not a registered option: only `main` sets it, and
-`recordIfCompiling` reads it. -/
+/-- The option `Lean.Compiler.LCNF.main` sets while it compiles. Not a registered option: only `main` sets it,
+`PassManager.run` drops it from the options it stores for a postponed compile, and `recordIfCompiling` and
+`recordHintsIfCompiling` read it. -/
 def inCompileOption : Name := `_inCompile
 
 /-- Records compiler code (`recordCompilerCode`) if `opts` are a compile's (`inCompileOption`). Instance resolution
