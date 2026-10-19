@@ -104,48 +104,85 @@ if(NOT CMAKE_SYSTEM_NAME MATCHES "Emscripten")
     endif()
     list(APPEND EXTRA_DEPENDS cadical)
   endif()
-  find_program(LEANTAR leantar)
-  if(NOT LEANTAR)
-    set(LEANTAR_VERSION v0.1.20)
-    if(CMAKE_SYSTEM_NAME MATCHES "Windows")
-      set(LEANTAR_ARCHIVE_SUFFIX .zip)
-      set(LEANTAR_TARGET x86_64-pc-windows-msvc)
-    else()
-      set(LEANTAR_ARCHIVE_SUFFIX .tar.gz)
-      if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
-        set(LEANTAR_TARGET_ARCH aarch64)
-      else()
-        set(LEANTAR_TARGET_ARCH x86_64)
-      endif()
-      if(CMAKE_SYSTEM_NAME MATCHES "Darwin")
-        set(LEANTAR_TARGET_OS apple-darwin)
-      else()
-        set(LEANTAR_TARGET_OS unknown-linux-musl)
-      endif()
-      set(LEANTAR_TARGET ${LEANTAR_TARGET_ARCH}-${LEANTAR_TARGET_OS})
+  # Lake packs and unpacks `.ltar` artifacts with leantar. leantar releases up to at least v0.1.21 unpack every
+  # ByteArray of an `.olean` with element size 0, which corrupts `.olean` files holding constant prefix trees. Unless
+  # LEANTAR names one, leantar is built here from the pinned leangz source with the fix in `script/leantar`, before
+  # stage 0, whose Lake builds stage 1 with the artifact cache. Either leantar must pass `script/leantar/probe.cmake`.
+  set(LEANTAR "" CACHE FILEPATH "leantar to use instead of building one")
+  set(LEANTAR_PROBE -DWORK=${CMAKE_BINARY_DIR}/leantar-probe -P ${CMAKE_SOURCE_DIR}/script/leantar/probe.cmake)
+  if(LEANTAR)
+    execute_process(COMMAND ${CMAKE_COMMAND} -DLEANTAR=${LEANTAR} ${LEANTAR_PROBE} RESULT_VARIABLE LEANTAR_PROBE_RESULT)
+    if(NOT LEANTAR_PROBE_RESULT EQUAL 0)
+      message(FATAL_ERROR "LEANTAR=${LEANTAR} failed the round-trip probe")
     endif()
-    set(
-      LEANTAR
-      ${CMAKE_BINARY_DIR}/leantar/leantar-${LEANTAR_VERSION}-${LEANTAR_TARGET}/leantar${CMAKE_EXECUTABLE_SUFFIX}
+  else()
+    find_program(CARGO cargo)
+    if(NOT CARGO)
+      message(
+        FATAL_ERROR
+        "Building leantar needs cargo. Install it, or pass -DLEANTAR=<leantar built with script/leantar/leangz-sarray-elem-size.patch>."
+      )
+    endif()
+    # As for the bundled Rust checkers (src/CMakeLists.txt), cargo and the `cc` crate use the host toolchain, except in
+    # a standalone Linux build, which builds leantar against the bundled sysroot like every other shipped binary.
+    set(LEANTAR_ENV)
+    if(LEAN_STANDALONE AND CMAKE_SYSTEM_NAME MATCHES "Linux")
+      # Compile leantar's C dependencies like cadical.
+      set(LEANTAR_CFLAGS "${CMAKE_CXX_FLAGS}")
+      # Stage 1 carries only some of the bundled clang's builtin headers; zstd also needs the intrinsics headers, which
+      # the resource directory of CMAKE_CXX_COMPILER, from the same LLVM, has.
+      execute_process(
+        COMMAND ${CMAKE_CXX_COMPILER} -print-resource-dir
+        OUTPUT_VARIABLE LEANTAR_RESOURCE_DIR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        COMMAND_ERROR_IS_FATAL ANY
+      )
+      string(APPEND LEANTAR_CFLAGS " -resource-dir ${LEANTAR_RESOURCE_DIR}")
+      # Link like leanc does for every other shipped binary: against the bundled glibc in stage 1 and with the default
+      # ELF interpreter, not the build host's glibc.
+      string(REPLACE "ROOT" "${CMAKE_BINARY_DIR}/stage1" LEANTAR_LDFLAGS "${LEANC_INTERNAL_LINKER_FLAGS}")
+      separate_arguments(LEANTAR_LDFLAGS UNIX_COMMAND "${LEANTAR_LDFLAGS}")
+      list(TRANSFORM LEANTAR_LDFLAGS PREPEND "-Clink-arg=")
+      list(JOIN LEANTAR_LDFLAGS " " LEANTAR_RUSTFLAGS)
+      string(TOUPPER "${CMAKE_SYSTEM_PROCESSOR}_unknown_linux_gnu" LEANTAR_RUST_TARGET)
+      list(
+        APPEND
+        LEANTAR_ENV
+        "CARGO_TARGET_${LEANTAR_RUST_TARGET}_LINKER=${CMAKE_C_COMPILER}"
+        "CARGO_TARGET_${LEANTAR_RUST_TARGET}_RUSTFLAGS=${LEANTAR_RUSTFLAGS}"
+        "CC=${CMAKE_C_COMPILER}"
+        "CFLAGS=${LEANTAR_CFLAGS}"
+      )
+    elseif(CMAKE_SYSTEM_NAME MATCHES "Windows")
+      # The runner's cargo targets MSVC, so the `cc` crate has to find `cl.exe` itself rather than take MSYS2's `CC`.
+      list(APPEND LEANTAR_ENV --unset=CC --unset=CXX)
+    endif()
+    set(LEANTAR ${CMAKE_BINARY_DIR}/leangz/src/leantar/target/release/leantar${CMAKE_EXECUTABLE_SUFFIX})
+    ExternalProject_Add(
+      leantar
+      PREFIX leangz
+      GIT_REPOSITORY https://github.com/digama0/leangz
+      # v0.1.21
+      GIT_TAG ae32f35b8c1bee986bc8d8cad4bcc5a9788fc7bc
+      # The source is a fixed commit, so there is nothing to update. The patch step resets the source before applying
+      # the patch, so that it can re-run when the patch changes.
+      UPDATE_COMMAND ""
+      PATCH_COMMAND git checkout -q -- . COMMAND git apply ${CMAKE_SOURCE_DIR}/script/leantar/leangz-sarray-elem-size.patch
+      CONFIGURE_COMMAND ""
+      BUILD_COMMAND ${CMAKE_COMMAND} -E env ${LEANTAR_ENV} ${CARGO} build --release --locked --bin leantar
+      BUILD_IN_SOURCE ON
+      INSTALL_COMMAND ${CMAKE_COMMAND} -DLEANTAR=${LEANTAR} ${LEANTAR_PROBE}
+      BUILD_BYPRODUCTS ${LEANTAR}
     )
-    if(NOT EXISTS "${LEANTAR}")
-      file(
-        DOWNLOAD
-          https://github.com/digama0/leangz/releases/download/${LEANTAR_VERSION}/leantar-${LEANTAR_VERSION}-${LEANTAR_TARGET}${LEANTAR_ARCHIVE_SUFFIX}
-        ${CMAKE_BINARY_DIR}/leantar${LEANTAR_ARCHIVE_SUFFIX}
-        STATUS LEANTAR_DOWNLOAD_STATUS
-      )
-      list(GET LEANTAR_DOWNLOAD_STATUS 0 LEANTAR_DOWNLOAD_CODE)
-      if(NOT LEANTAR_DOWNLOAD_CODE EQUAL 0)
-        list(GET LEANTAR_DOWNLOAD_STATUS 1 LEANTAR_DOWNLOAD_ERROR)
-        message(FATAL_ERROR "Failed to download leantar: ${LEANTAR_DOWNLOAD_ERROR}")
-      endif()
-      file(
-        ARCHIVE_EXTRACT
-        INPUT ${CMAKE_BINARY_DIR}/leantar${LEANTAR_ARCHIVE_SUFFIX}
-        DESTINATION ${CMAKE_BINARY_DIR}/leantar
-      )
-    endif()
+    ExternalProject_Add_StepDependencies(leantar patch ${CMAKE_SOURCE_DIR}/script/leantar/leangz-sarray-elem-size.patch)
+    ExternalProject_Add_StepDependencies(
+      leantar
+      install
+      ${CMAKE_SOURCE_DIR}/script/leantar/probe.cmake
+      ${CMAKE_SOURCE_DIR}/script/leantar/probe.olean
+      ${CMAKE_SOURCE_DIR}/script/leantar/probe.trace
+    )
+    list(APPEND EXTRA_DEPENDS leantar)
   endif()
   set(
     CADICAL_ARGS

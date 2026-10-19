@@ -2215,7 +2215,7 @@ v___f_703_ = lean_alloc_closure((void*)(l___private_Lake_Build_Target_Fetch_0__L
 lean_closure_set(v___f_703_, 0, v_fst_690_);
 lean_closure_set(v___f_703_, 1, v_kind_694_);
 lean_closure_set(v___f_703_, 2, v___x_699_);
-v___x_704_ = lean_unsigned_to_nat(0u);
+v___x_704_ = lean_unsigned_to_nat(8u);
 v___x_705_ = lean_obj_once(&l___private_Lake_Build_Target_Fetch_0__Lake_PartialBuildKey_fetchInCoreAux___closed__3, &l___private_Lake_Build_Target_Fetch_0__Lake_PartialBuildKey_fetchInCoreAux___closed__3_once, _init_l___private_Lake_Build_Target_Fetch_0__Lake_PartialBuildKey_fetchInCoreAux___closed__3);
 v___x_706_ = l_Lake_Job_bindM___redArg(v_outKind_702_, v_snd_685_, v___f_703_, v___x_704_, v___x_682_, v_a_323_, v_a_324_, v_a_325_, v_a_326_, v_a_327_, v___x_705_);
 if (v_isShared_681_ == 0)
@@ -3210,7 +3210,7 @@ v___f_1066_ = lean_alloc_closure((void*)(l___private_Lake_Build_Target_Fetch_0__
 lean_closure_set(v___f_1066_, 0, v_target_1051_);
 lean_closure_set(v___f_1066_, 1, v_kind_1059_);
 lean_closure_set(v___f_1066_, 2, v_facet_1052_);
-v___x_1067_ = lean_unsigned_to_nat(0u);
+v___x_1067_ = lean_unsigned_to_nat(8u);
 v___x_1068_ = lean_obj_once(&l___private_Lake_Build_Target_Fetch_0__Lake_PartialBuildKey_fetchInCoreAux___closed__3, &l___private_Lake_Build_Target_Fetch_0__Lake_PartialBuildKey_fetchInCoreAux___closed__3_once, _init_l___private_Lake_Build_Target_Fetch_0__Lake_PartialBuildKey_fetchInCoreAux___closed__3);
 v___x_1069_ = l_Lake_Job_bindM___redArg(v_outKind_1065_, v_a_1054_, v___f_1066_, v___x_1067_, v___x_1060_, v_a_897_, v_a_898_, v_a_899_, v_a_900_, v_a_901_, v___x_1068_);
 if (v_isShared_1058_ == 0)

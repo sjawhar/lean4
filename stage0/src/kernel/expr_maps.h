@@ -12,5 +12,5 @@ Author: Leonardo de Moura
 namespace lean {
 // Maps based on structural equality. That is, two keys are equal iff they are structurally equal
 template<typename T>
-using expr_map = typename lean::unordered_map<expr, T, expr_hash, std::equal_to<expr>>;
+using expr_map = typename lean::dense_map<expr, T, expr_hash, std::equal_to<expr>>;
 };
