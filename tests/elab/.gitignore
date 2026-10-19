@@ -3,5 +3,6 @@
 /getline_crash.lean.tmp
 /handleInheritable.lean.tmp
 /handleLocking.lean.lock
+/moduleUsageUsed.lean.dir/
 /isSameFile.lean.dir/
 /stdio.lean.stdout*.txt
