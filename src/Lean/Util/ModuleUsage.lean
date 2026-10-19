@@ -342,19 +342,37 @@ private def compilerShapedConsts (env : Environment) (i? : Option ModuleIdx) : A
   | none => (env.checked.get.constants.foldStage2 (fun acc n _ => if compilerShapedName n then acc.push n else acc)
       #[]).qsort Name.quickLt
 
-/-- Whether module `i?` owns the claimed compiler-only name `n`: `n` is a constant the module defines, or `n` is
-compiler-shaped (`compilerShapedName`) and stripping one compiler suffix (`stripSuffix?`) gives a name the module
-owns. The walk stops at the first name without a compiler shape, so a module that defines a namespace prefix of
-another module's declaration (`NS` for `NS.foo._redArg`) does not own the claim. -/
-private def ownsClaim (priv : Environment) (i? : Option ModuleIdx) (n : Name) : Bool := Id.run do
-  let mut c := n
-  for _ in [0:n.getNumParts + 1] do
-    if definedIn priv i? c then return true
-    unless compilerShapedName c do return false
-    match stripSuffix? c with
-    | some p => c := p
-    | none => return false
-  return false
+/-- Every reading of a specialization name `d._at_.c.spec_N` (`compilerShapedName`) as a specialization of `d`
+created by `c`: one `c` per `_at_` component, the components between it and `spec_N`, joined as `atOwner?` joins
+them. A specialization of a specialization, or one created inside a specialization, has more than one `_at_`, so
+the name alone does not say which split is the creator. -/
+def specCreators (x : Name) : Array Name := Id.run do
+  let cs := x.components.toArray
+  let some (.str .anonymous s) := cs.back? | return #[]
+  unless s.startsWith "spec_" do return #[]
+  let body := cs.pop
+  let mut out := #[]
+  for j in [0:body.size] do
+    unless body[j]! == `_at_ do continue
+    let c := (body.extract (j + 1) body.size).foldl Name.appendCore .anonymous
+    unless c.isAnonymous do out := out.push c
+  return out
+
+/-- Whether module `i?` owns the claimed compiler-only name `n`: `n` is a constant the module defines, or `n` has a
+compiler shape (`compilerShapedName`) and a name it comes from by one compiler suffix is owned: for a specialization
+name, any reading of its creator (`specCreators`), otherwise `stripSuffix?`. The walk stops at the first name
+without a compiler shape, so a module that defines a namespace prefix of another module's declaration (`NS` for
+`NS.foo._redArg`) does not own the claim. -/
+private def ownsClaim (priv : Environment) (i? : Option ModuleIdx) (n : Name) : Bool :=
+  go (n.getNumParts + 1) n
+where
+  go : Nat → Name → Bool
+    | 0, _ => false
+    | k + 1, c =>
+      definedIn priv i? c || (compilerShapedName c &&
+        match specCreators c with
+        | #[] => (stripSuffix? c).any (go k)
+        | creators => creators.any (go k))
 
 /-- Module `i?`'s claimed compiler-only names (IR declarations without a kernel constant, which importers resolve
 to the first module in import order that claims them, `findExtEntry?`) that the module does not own
