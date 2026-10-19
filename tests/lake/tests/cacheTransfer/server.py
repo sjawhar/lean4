@@ -3,7 +3,7 @@
 # Released under Apache 2.0 license as described in the file LICENSE.
 # Authors: Mac Malone, Claude Code
 
-"""A mock remote artifact cache for `test.sh`.
+"""A mock remote artifact cache for `test.sh` and the tests of `../remoteCache/lib.sh`.
 
 Serves an S3-style bucket (`GET`/`PUT` of `<store>/<path>`) and the part of the
 Reservoir API that Lake uses. Faults are selected by the first path segment, so
@@ -18,9 +18,47 @@ a test picks one by pointing an endpoint at it (e.g. `.../corrupt/a0`):
             in the store, so that curl leaves no output file to read
   badcount  Reservoir artifact URL lookup returns too few URLs
   apierror  Reservoir requests return an API error object
+  bearer    401 unless the request carries `Authorization: Bearer <token>`
+            for a token listed in the `--tokens` file (read on each request,
+            so a test can change it), and otherwise as `ok`
+  redirect  302 to the same object path under the `--redirect` URL
+  slow      as `ok`, but each `GET` is answered after 2 seconds
+  slowput   as `ok`, but each `PUT` is answered after 2 seconds
+  oversize  mappings are normal; an artifact advertises 119596321 bytes and no body
+  denyart   403 for a `GET` of an object in an `a/` directory (an artifact of the
+            shared remote cache), and otherwise as `ok`
+  stallput  as `ok`, but each `PUT` reads its body and then sends no answer for
+            15 minutes
+  slowobj   as `ok`, but each `PUT` of an object outside a `claim` directory
+            (an artifact or a mapping, not a claim of the shared remote cache)
+            is answered after 4 seconds
+  denyartonce
+            403 for the first `PUT` of each object in an `a/` directory (an
+            artifact of the shared remote cache), and otherwise as `ok`
+  badclaim  as `ok`, but every claim (`<endpoint>/claim/...`) exists and is
+            unreadable: its `GET` answers 200 with an invalid body, a generation
+            and no `Date` or `Last-Modified`, and its `PUT` answers 412
+  streamclaim
+            as `ok`, but a `PUT` of a claim is answered 200 with a body that does
+            not end (4 KiB every 100 ms, for 2 minutes)
+  notimes   as `ok`, but a `GET` of a claim is answered without `Date` and
+            `Last-Modified`
 
 A fault that does not apply to a request kind (e.g. `badcount` on a `GET`)
-behaves as `ok`. Each request is logged to stdout as `<method> <path> -> <status>`.
+behaves as `ok`. Like Cloud Storage, each object has a generation, which a new
+write of the object changes and which responses to a `GET`, a `HEAD` or a
+`PUT` report in `x-goog-generation` (`GET` and `HEAD` also report
+`Last-Modified`). A `PUT` with the header `x-goog-if-generation-match: 0`
+only creates an object: if the object exists, it is left untouched and the
+response is 412. A `PUT` with `x-goog-if-generation-match: <generation>`
+replaces the object only if it has that generation, and is otherwise answered
+with 412.
+
+Each request is logged to stdout as
+`<method> <path> -> <status> auth=<bearer|none|other> gen=<value|->`, where
+`auth` is the scheme of the `Authorization` header (`other` for any scheme but
+`Bearer`, e.g. AWS Signature Version 4) and `gen` is the value of the
+`x-goog-if-generation-match` header.
 
 This is Python rather than `Std.Http` because `truncate` and `reset` are
 transport-level faults: a body cut short of its declared `Content-Length` and a
@@ -33,6 +71,9 @@ import argparse
 import json
 import os
 import sys
+import threading
+import time
+from email.utils import formatdate
 from enum import StrEnum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
@@ -45,7 +86,90 @@ DENY_BODY = (
     b"<Error><Code>AccessDenied</Code><Message>mock denial</Message></Error>\n"
 )
 
+UNAUTHORIZED_BODY = (
+    b'<?xml version="1.0" encoding="UTF-8"?>\n'
+    b"<Error><Code>AuthenticationRequired</Code>"
+    b"<Message>mock authentication required</Message></Error>\n"
+)
+
+PRECONDITION_BODY = (
+    b'<?xml version="1.0" encoding="UTF-8"?>\n'
+    b"<Error><Code>PreconditionFailed</Code>"
+    b"<Message>mock object already exists</Message></Error>\n"
+)
+
 STORE = "."
+
+# The file listing the bearer tokens that `bearer` mode accepts, one per line
+TOKENS = None
+
+# The URL that `redirect` mode sends every request to, followed by the object path
+REDIRECT = None
+
+# Serializes the request records that the handler threads write to stdout
+LOG_LOCK = threading.Lock()
+
+# The generation of each object of the store that a request has seen, by path
+GENERATIONS = {}
+# Serializes the generations, and each check of a precondition with its write
+STORE_LOCK = threading.Lock()
+# The last generation given out, of the size of Cloud Storage's generations
+LAST_GENERATION = [1792925620545348]
+
+# The object paths that `denyartonce` mode has refused once
+REFUSED_ONCE = set()
+
+# The claim paths that `resetclaimslowobj` has reset once
+RESET_CLAIM_ONCE = set()
+
+
+def first_put(parts):
+    """Whether this is the first `PUT` of the object at `parts` (and records it)."""
+    key = "/".join(parts)
+    with STORE_LOCK:
+        if key in REFUSED_ONCE:
+            return False
+        REFUSED_ONCE.add(key)
+        return True
+
+
+def first_reset_claim(parts):
+    """Whether this is the first conditional claim write at `parts`."""
+    key = "/".join(parts)
+    with STORE_LOCK:
+        if key in RESET_CLAIM_ONCE:
+            return False
+        RESET_CLAIM_ONCE.add(key)
+        return True
+
+
+def new_generation(path):
+    """Gives the object at `path` a new generation; the caller holds `STORE_LOCK`."""
+    LAST_GENERATION[0] += 1
+    GENERATIONS[path] = LAST_GENERATION[0]
+    return LAST_GENERATION[0]
+
+
+def generation(path):
+    """The generation of the object at `path`, or `None` if there is none.
+
+    An object that a test put into the store directly gets one when it is first
+    seen. The caller holds `STORE_LOCK`.
+    """
+    if not os.path.isfile(path):
+        GENERATIONS.pop(path, None)
+        return None
+    return GENERATIONS.get(path) or new_generation(path)
+
+
+def object_headers(path):
+    """The headers of a `GET` or `HEAD` response for the object at `path`."""
+    with STORE_LOCK:
+        gen = generation(path)
+    headers = {"Last-Modified": formatdate(os.path.getmtime(path), usegmt=True)}
+    if gen is not None:
+        headers["x-goog-generation"] = str(gen)
+    return headers
 
 
 class Mode(StrEnum):
@@ -59,6 +183,19 @@ class Mode(StrEnum):
     EMPTY = "empty"
     BAD_COUNT = "badcount"
     API_ERROR = "apierror"
+    BEARER = "bearer"
+    REDIRECT = "redirect"
+    SLOW = "slow"
+    OVERSIZE = "oversize"
+    SLOW_PUT = "slowput"
+    DENY_ART = "denyart"
+    STALL_PUT = "stallput"
+    SLOW_OBJ = "slowobj"
+    RESET_CLAIM_SLOW_OBJ = "resetclaimslowobj"
+    DENY_ART_ONCE = "denyartonce"
+    BAD_CLAIM = "badclaim"
+    STREAM_CLAIM = "streamclaim"
+    NO_TIMES = "notimes"
 
 
 def content_type(path):
@@ -82,7 +219,31 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def log(self, status):
-        print("%s %s -> %s" % (self.command, self.path, status), flush=True)
+        auth = self.headers.get("Authorization")
+        if auth is None:
+            scheme = "none"
+        elif auth.startswith("Bearer "):
+            scheme = "bearer"
+        else:
+            scheme = "other"
+        gen = self.headers.get("x-goog-if-generation-match", "-")
+        record = "%s %s -> %s auth=%s gen=%s\n" % (self.command, self.path, status, scheme, gen)
+        # One record per line: requests on other threads log their records whole
+        with LOG_LOCK:
+            sys.stdout.write(record)
+            sys.stdout.flush()
+
+    def authorized(self):
+        """Whether the request carries a bearer token that `--tokens` lists."""
+        auth = self.headers.get("Authorization", "")
+        if TOKENS is None or not auth.startswith("Bearer "):
+            return False
+        try:
+            with open(TOKENS) as f:
+                accepted = set(f.read().split())
+        except FileNotFoundError:
+            return False
+        return auth[len("Bearer ") :] in accepted
 
     def parse(self):
         """Split a path into its fault mode and the object path under it.
@@ -102,13 +263,17 @@ class Handler(BaseHTTPRequestHandler):
             return None, [], {}
         return mode, parts[1:], parse_qs(url.query)
 
-    def respond(self, status, body, ctype):
+    def respond(self, status, body, ctype, headers=None):
+        # Logged before the response is sent, so that a request the client sends
+        # after it has the response is always logged after this one
+        self.log(status)
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
-        self.log(status)
 
     def not_found(self, message):
         body = json.dumps({"error": {"status": 404, "message": message}})
@@ -117,6 +282,16 @@ class Handler(BaseHTTPRequestHandler):
     def deny(self):
         self.respond(403, DENY_BODY, "application/xml")
 
+    def unauthorized(self):
+        self.respond(401, UNAUTHORIZED_BODY, "application/xml")
+
+    def redirect(self, parts):
+        self.send_response(302)
+        self.send_header("Location", "%s/%s" % (REDIRECT, "/".join(parts)))
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        self.log(302)
+
     def reset(self):
         # Neither a response nor a body: `curl` reports an empty reply and,
         # importantly, does not create its output file.
@@ -124,6 +299,18 @@ class Handler(BaseHTTPRequestHandler):
         self.log("reset")
 
     def serve(self, mode, path, ctype=None):
+        if mode == Mode.OVERSIZE and f"{os.sep}a{os.sep}" in path:
+            # curl checks --max-filesize against the header before receiving the
+            # body, so this exercises the reader's bound without allocating it.
+            self.send_response(200)
+            self.send_header("Content-Type", ctype or content_type(path))
+            self.send_header("Content-Length", "119596321")
+            self.end_headers()
+            self.close_connection = True
+            self.log("oversize")
+            return
+        if mode == Mode.SLOW:
+            time.sleep(2)
         try:
             with open(path, "rb") as f:
                 data = f.read()
@@ -141,9 +328,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.not_found("no such object: %s" % self.path)
             return
         ctype = ctype or content_type(path)
+        headers = object_headers(path)
         if mode == Mode.CORRUPT:
             data = data[:-1] + bytes([data[-1] ^ 0xFF]) if data else b"corrupt"
-            self.respond(200, data, ctype)
+            self.respond(200, data, ctype, headers)
         elif mode == Mode.TRUNCATE:
             self.send_response(200)
             self.send_header("Content-Type", ctype)
@@ -153,7 +341,7 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             self.log("truncated")
         else:
-            self.respond(200, data, ctype)
+            self.respond(200, data, ctype, headers)
 
     def find_revision(self, scope, rev):
         """Locate a revision's outputs, ignoring any platform/toolchain path."""
@@ -203,10 +391,39 @@ class Handler(BaseHTTPRequestHandler):
         mode, parts, query = self.parse()
         if mode is None:
             self.not_found("no fault mode in path: %s" % self.path)
+        elif mode == Mode.BEARER and not self.authorized():
+            self.unauthorized()
+        elif mode == Mode.REDIRECT:
+            self.redirect(parts)
         elif mode == Mode.RESET:
             self.reset()
-        elif mode == Mode.DENY:
+        elif mode == Mode.DENY or (mode == Mode.DENY_ART and parts[-2:-1] == ["a"]):
             self.deny()
+        elif mode == Mode.BAD_CLAIM and parts[1:2] == ["claim"]:
+            # An unreadable claim with a generation and no times, which nothing rewrites
+            body = b'{"invalid":"claim"}'
+            self.log(200)
+            self.send_response_only(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("x-goog-generation", "1")
+            self.end_headers()
+            self.wfile.write(body)
+        elif mode == Mode.NO_TIMES and parts[1:2] == ["claim"]:
+            # The stored claim, with its generation but without `Date` and `Last-Modified`
+            path = os.path.join(STORE, *parts)
+            if not os.path.isfile(path):
+                self.not_found("no such object: %s" % self.path)
+                return
+            with open(path, "rb") as f:
+                body = f.read()
+            with STORE_LOCK:
+                gen = generation(path)
+            self.log(200)
+            self.send_response_only(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("x-goog-generation", str(gen))
+            self.end_headers()
+            self.wfile.write(body)
         elif parts[:2] == ["api", "v1"]:
             self.reservoir_get(mode, parts[2:], query)
         else:
@@ -216,6 +433,8 @@ class Handler(BaseHTTPRequestHandler):
         mode, parts, _ = self.parse()
         if mode is None:
             self.not_found("no fault mode in path: %s" % self.path)
+        elif mode == Mode.BEARER and not self.authorized():
+            self.unauthorized()
         elif mode == Mode.RESET:
             self.reset()
         elif mode == Mode.DENY:
@@ -225,6 +444,30 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.not_found("no such endpoint: %s" % self.path)
 
+    def do_HEAD(self):
+        mode, parts, _ = self.parse()
+        if mode is None:
+            self.not_found("no fault mode in path: %s" % self.path)
+        elif mode == Mode.BEARER and not self.authorized():
+            self.unauthorized()
+        elif mode == Mode.RESET:
+            self.reset()
+        elif mode == Mode.DENY:
+            self.deny()
+        else:
+            path = os.path.join(STORE, *parts)
+            if not os.path.isfile(path):
+                self.not_found("no such object: %s" % self.path)
+                return
+            size = os.path.getsize(path)
+            self.log(200)
+            self.send_response(200)
+            self.send_header("Content-Type", content_type(path))
+            self.send_header("Content-Length", str(size))
+            for name, value in object_headers(path).items():
+                self.send_header(name, value)
+            self.end_headers()
+
     def do_PUT(self):
         mode, parts, _ = self.parse()
         # The body is always consumed so that `curl` sees a complete exchange
@@ -232,16 +475,79 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         if mode is None:
             self.not_found("no fault mode in path: %s" % self.path)
+        elif mode == Mode.BEARER and not self.authorized():
+            self.unauthorized()
+        elif mode == Mode.REDIRECT:
+            self.redirect(parts)
         elif mode == Mode.RESET:
             self.reset()
         elif mode == Mode.DENY:
             self.deny()
+        elif mode == Mode.DENY_ART_ONCE and parts[-2:-1] == ["a"] and first_put(parts):
+            self.deny()
+        elif (
+            mode == Mode.RESET_CLAIM_SLOW_OBJ
+            and parts[1:2] == ["claim"]
+            and self.headers.get("x-goog-if-generation-match") not in (None, "0")
+            and first_reset_claim(parts)
+        ):
+            self.reset()
+        elif mode == Mode.BAD_CLAIM and parts[1:2] == ["claim"]:
+            # The claim exists: its create is refused
+            self.respond(412, PRECONDITION_BODY, "application/xml")
+        elif mode == Mode.STREAM_CLAIM and parts[1:2] == ["claim"]:
+            # Accepted, and then an answer that never ends, fast enough for any speed limit
+            self.log(200)
+            self.send_response(200)
+            self.send_header("x-goog-generation", "1")
+            self.end_headers()
+            try:
+                for _ in range(1200):
+                    self.wfile.write(b"x" * 4096)
+                    self.wfile.flush()
+                    time.sleep(0.1)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            self.close_connection = True
         else:
+            if mode == Mode.SLOW_PUT:
+                time.sleep(2)
+            elif mode == Mode.STALL_PUT:
+                time.sleep(900)
+            # A claim is `<endpoint>/claim/...`; any `claim` deeper in the path is a package
+            elif (
+                mode in (Mode.SLOW_OBJ, Mode.RESET_CLAIM_SLOW_OBJ)
+                and parts[1:2] != ["claim"]
+            ):
+                time.sleep(4)
             path = os.path.join(STORE, *parts)
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "wb") as f:
-                f.write(body)
-            self.respond(200, b"", "application/xml")
+            want = self.headers.get("x-goog-if-generation-match")
+            # The precondition and the replacement are one atomic step, as Cloud Storage makes
+            # them. In particular, a GET never sees a partially written claim body: it sees the
+            # old object, no object, or the new complete object. The test used to write `path`
+            # directly while it held STORE_LOCK, but GET does not take that lock.
+            with STORE_LOCK:
+                if want == "0" and generation(path) is not None:
+                    self.respond(412, PRECONDITION_BODY, "application/xml")
+                    return
+                if want is not None and want != "0":
+                    # Replace only the generation the request names
+                    if str(generation(path) or 0) != want:
+                        self.respond(412, PRECONDITION_BODY, "application/xml")
+                        return
+                tmp = f"{path}.put.{threading.get_ident()}"
+                try:
+                    with open(tmp, "xb") as f:
+                        f.write(body)
+                    os.replace(tmp, path)
+                finally:
+                    try:
+                        os.remove(tmp)
+                    except FileNotFoundError:
+                        pass
+                gen = new_generation(path)
+            self.respond(200, b"", "application/xml", {"x-goog-generation": str(gen)})
 
 
 class Server(ThreadingHTTPServer):
@@ -260,10 +566,16 @@ def main():
         "--port-file", required=True, help="where to write the bound port"
     )
     parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument(
+        "--tokens", help="file listing the bearer tokens that `bearer` mode accepts"
+    )
+    parser.add_argument("--redirect", help="the URL that `redirect` mode redirects to")
     args = parser.parse_args()
 
-    global STORE
+    global STORE, TOKENS, REDIRECT
     STORE = args.store
+    TOKENS = args.tokens
+    REDIRECT = args.redirect
     os.makedirs(STORE, exist_ok=True)
 
     # Port 0 lets the OS pick a free port, so parallel tests cannot collide

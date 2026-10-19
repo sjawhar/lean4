@@ -11,6 +11,8 @@ public import Lake.Config.Monad
 public import Lake.Util.JsonObject
 public import Lake.Util.IO
 public import Lake.Build.Actions
+public import Lake.Build.RemoteCache
+public import Lake.Build.Claim
 
 /-! # Common Build Tools
 This file defines general utilities that abstract common
@@ -45,10 +47,15 @@ and will be rebuilt on different host platforms.
 @[inline] public def addLeanTrace : JobM PUnit := do
   addTrace (← getLeanTrace)
 
+/-- The trace of a pure value. -/
+@[inline] public def pureTrace
+  [ToString α] [ComputeHash α Id] (a : α) (caption := "pure")
+: BuildTrace := .ofHash (pureHash a) s!"{caption}: {toString a}"
+
 /-- Mixes the trace of a pure value into the current job's trace. -/
 @[inline] public def addPureTrace
   [ToString α] [ComputeHash α Id] (a : α) (caption := "pure")
-: JobM PUnit := addTrace <| .ofHash (pureHash a) s!"{caption}: {toString a}"
+: JobM PUnit := addTrace <| pureTrace a caption
 
 /--
 The build trace file format,
@@ -61,18 +68,27 @@ public structure BuildMetadata where
   log : Log
   /-- A trace file that was created from fetching an artifact from the cache. -/
   synthetic : Bool
+  /--
+  For a module, the hash of its inputs other than its imports (`ModulePreSetup.localTrace`). It is
+  kept out of `outputs?`, which a module archive (`.ltar`) carries,
+  so that an archive's contents depend only on the module's outputs.
+  -/
+  localHash? : Option Hash := none
 
 /-- The current version of the trace file format. -/
 def BuildMetadata.schemaVersion : String := "2025-09-10"
 
 public protected def BuildMetadata.toJson (self : BuildMetadata) : Json :=
-  ({} : JsonObject)
-  |>.insert "schemaVersion" schemaVersion
-  |>.insert "depHash" self.depHash
-  |>.insert "inputs" self.inputs
-  |>.insert "outputs" self.outputs?
-  |>.insert "log" self.log
-  |>.insert "synthetic" self.synthetic
+  let obj := ({} : JsonObject)
+    |>.insert "schemaVersion" schemaVersion
+    |>.insert "depHash" self.depHash
+    |>.insert "inputs" self.inputs
+    |>.insert "outputs" self.outputs?
+    |>.insert "log" self.log
+    |>.insert "synthetic" self.synthetic
+  match self.localHash? with
+  | some hash => obj.insert "localHash" hash
+  | none => obj
 
 public instance : ToJson BuildMetadata := ⟨BuildMetadata.toJson⟩
 
@@ -94,7 +110,8 @@ public def BuildMetadata.fromJsonObject? (obj : JsonObject) : Except String Buil
   let outputs? ← obj.getD "outputs" none
   let log ← obj.getD "log" {}
   let synthetic ← obj.getD "synthetic" false
-  return {depHash, inputs, outputs?, log, synthetic}
+  let localHash? ← obj.get? "localHash"
+  return {depHash, inputs, outputs?, log, synthetic, localHash?}
 
 public protected def BuildMetadata.fromJson? (json : Json) : Except String BuildMetadata := do
   match json with
@@ -122,9 +139,11 @@ public instance : FromJson BuildMetadata := ⟨BuildMetadata.fromJson?⟩
 public def BuildMetadata.parse (contents : String) : Except String BuildMetadata := do
   Json.parse contents >>= fromJson?
 
-/-- Construct build metadata from a cached input-to-output mapping. -/
-public def BuildMetadata.ofFetch (inputHash : Hash) (outputs : Json) : BuildMetadata :=
-  {depHash := inputHash, outputs? := outputs, synthetic := true, inputs := #[], log := {}}
+/-- Construct build metadata from a cached input-to-output mapping and the build log stored with it. -/
+public def BuildMetadata.ofFetch
+  (inputHash : Hash) (outputs : Json) (log : Log) (localHash? : Option Hash := none)
+: BuildMetadata :=
+  {depHash := inputHash, outputs? := outputs, synthetic := true, inputs := #[], log, localHash?}
 
 partial def serializeInputs (inputs : Array BuildTrace) : Array (String × Json) :=
   inputs.foldl (init := {}) fun r trace =>
@@ -136,24 +155,30 @@ partial def serializeInputs (inputs : Array BuildTrace) : Array (String × Json)
     r.push (trace.caption, val)
 
 def BuildMetadata.ofBuildCore
-  (depTrace : BuildTrace) (outputs : Json) (log : Log)
+  (depTrace : BuildTrace) (outputs : Json) (log : Log) (localHash? : Option Hash := none)
 : BuildMetadata where
   inputs := serializeInputs depTrace.inputs
   depHash := depTrace.hash
   outputs? := outputs
   synthetic := false
   log
+  localHash?
 
 /-- Construct trace file contents from a build's trace, outputs, and log. -/
 @[inline] public def BuildMetadata.ofBuild
-   [ToJson α]  (depTrace : BuildTrace) (outputs : α) (log : Log)
-:= BuildMetadata.ofBuildCore depTrace (toJson outputs) log
+   [ToJson α]  (depTrace : BuildTrace) (outputs : α) (log : Log) (localHash? : Option Hash := none)
+:= BuildMetadata.ofBuildCore depTrace (toJson outputs) log localHash?
 
 /-- The state of the trace file data saved on the file system. -/
 public inductive SavedTrace
 | missing
 | invalid
 | ok (data : BuildMetadata)
+
+/-- The build log recorded in the saved trace (empty if there is none). -/
+public def SavedTrace.log : SavedTrace → Log
+| .ok data => data.log
+| _ => {}
 
 /--
 Try to read data from a trace file.
@@ -178,14 +203,33 @@ public def BuildMetadata.writeFile (path : FilePath) (data : BuildMetadata) : IO
   createParentDirs path
   IO.FS.writeFile path (toJson data).pretty
 
-/-- Write a trace file containing metadata on an artifact fetched from a cache. -/
-@[inline] public def writeFetchTrace (path : FilePath) (inputHash : Hash) (outputs : Json) : IO Unit :=
-  BuildMetadata.writeFile path (.ofFetch inputHash outputs)
+/--
+Replays the log of an up-to-date trace, setting the current build action to `replay`,
+or to `reuse` for a synthetic trace with an empty log.
+-/
+def BuildMetadata.replayCached (data : BuildMetadata) : JobM Unit := do
+  if data.synthetic && data.log.isEmpty then
+    updateAction .reuse
+  else
+    updateAction .replay
+    data.log.replay
+
+/--
+Write a trace file containing metadata on an artifact fetched from a cache,
+including the log of its build stored in the cache, and replay that log.
+-/
+public def writeFetchTrace
+  (path : FilePath) (inputHash : Hash) (outputs : Json) (log : Log) (localHash? : Option Hash := none)
+: JobM Unit := do
+  let data := BuildMetadata.ofFetch inputHash outputs log localHash?
+  data.writeFile path
+  data.replayCached
 
 /-- Write a trace file containing metadata about a build. -/
 @[inline] public def writeBuildTrace
   [ToJson α] (path : FilePath) (depTrace : BuildTrace) (outputs : α) (log : Log)
-: IO Unit := BuildMetadata.writeFile path (.ofBuild depTrace outputs log)
+  (localHash? : Option Hash := none)
+: IO Unit := BuildMetadata.writeFile path (.ofBuild depTrace outputs log localHash?)
 
 /-- Indicator of whether a build's output(s) are up-to-date. -/
 public inductive OutputStatus
@@ -276,11 +320,7 @@ or if the trace is not up-to-date, the build action will be set to `reuse`.
 public def SavedTrace.replayCachedIfUpToDate (inputHash : Hash) (self : SavedTrace) : JobM Bool := do
   if let .ok data := self then
     if data.depHash == inputHash then
-      if data.synthetic && data.log.isEmpty then
-        updateAction .reuse
-      else
-        updateAction .replay
-        data.log.replay
+      data.replayCached
       return true
   updateAction .reuse
   return false
@@ -306,14 +346,15 @@ open ToOutputJson in
 /--
 Runs `build` as a build action of kind `action`.
 
-The build's input trace (`depTrace`), JSON description of the result of `build`,
-and log are saved to `traceFile`, if the build completes without a fatal error
-(i.e., it does not `throw`).
+The build's input trace (`depTrace`), JSON description of the result of `build`, and log are saved to `traceFile`
+(with `localHash?`, see `BuildMetadata.localHash?`) if the build completes without a fatal error (i.e., it does not
+`throw`). Then, for an action of kind `.build`, it sets the job's `JobState.built`: set after `build` returns, so a
+site within `build` that clears the flag cannot clear it for this action.
 -/
 @[specialize] public def buildAction
   [ToOutputJson α]
   (depTrace : BuildTrace) (traceFile : FilePath) (build : JobM α)
-  (action : JobAction := .build)
+  (action : JobAction := .build) (localHash? : Option Hash := none)
 : JobM α := do
   updateAction action
   let noBuildTraceFile := traceFile.addExtension "nobuild"
@@ -328,14 +369,28 @@ and log are saved to `traceFile`, if the build completes without a fatal error
       let iniPos ← getLogPos
       let a ← build -- fatal errors will abort here
       let log := (← getLog).takeFrom iniPos
-      writeBuildTrace traceFile depTrace (toOutputJson a) log
+      writeBuildTrace traceFile depTrace (toOutputJson a) log localHash?
       removeFileIfExists noBuildTraceFile
+      if action matches .build then
+        modify ({· with built := true})
       return a
     finally
       let endTime ← IO.monoMsNow
       let elapsed := endTime - startTime
       modify fun s => {s with buildTime := s.buildTime + elapsed}
 
+/--
+**For internal use only.**
+Starts tracking whether this job completes a build action (`JobState.built`, which `buildAction`
+sets), and returns the action that tells whether one completed since. It clears the flag first:
+a job's state carries the flag of its earlier build actions (e.g., a target that builds two files
+in one job) and of the unregistered jobs it continues, so a reader that skipped the clear would
+count their builds. (A registered job, such as a module's, reaches the jobs that continue it
+renewed, without the flag; see `Job.renew`.) Read the flag only through this.
+-/
+public def trackBuilds : JobM (JobM Bool) := do
+  modify ({· with built := false})
+  return JobState.built <$> getThe JobState
 
 /--
 Checks whether `info` is up-to-date, and runs `build` to recreate it if not.
@@ -461,90 +516,6 @@ public def buildFileUnlessUpToDate'
   setTrace (← fetchFileTrace file text)
 
 /--
-Like `Cache.saveArtifact`, but if `expected?` is a hash that `file`'s contents do not have,
-caches nothing, leaves `file` and its `.hash` untouched, and returns `file`'s actual hash (`none`
-for text that is not valid UTF-8, which has no hash).
--/
-public def Cache.saveArtifactIfMatches
-  (cache : Cache) (file : FilePath) (expected? : Option Hash)
-  (ext := "art") (text exe useLocalFile := false)
-: IO (Except (Option Hash) Artifact) := do
-  try
-    if text then
-      let bytes ← IO.FS.readBinFile file
-      let some contents := String.fromUTF8? bytes
-        | if expected?.isSome then return .error none else
-            throw <| IO.userError s!"Tried to read file '{file}' containing non UTF-8 data."
-      let normalized := contents.crlfToLf
-      let hash := Hash.ofString normalized
-      if let some expected := expected? then
-        if hash != expected then return .error (some hash)
-      let descr := artifactWithExt hash ext
-      let cacheFile := cache.artifactDir / descr.relPath
-      -- make the local file unwritable where possible to discourage users from
-      -- writing to such paths as this can corrupt the cache if the file was hard linked
-      let r := {read := true, write := false, execution := false}
-      IO.setAccessRights file ⟨r, r, r⟩
-      unless (← cacheFile.pathExists) do
-        createParentDirs cacheFile
-        -- other functions can race to create the file
-        -- use `writeFileIfNew` to prevent errors on races
-        writeFileIfNew cacheFile normalized
-      IO.setAccessRights cacheFile ⟨r, r, r⟩
-      writeFileHash file hash
-      let mtime ← getMTime cacheFile
-      let path := if useLocalFile then file else cacheFile
-      return .ok {descr, name := file.toString, path, mtime}
-    else
-      let contents ← IO.FS.readBinFile file
-      let hash := Hash.ofByteArray contents
-      if let some expected := expected? then
-        if hash != expected then return .error (some hash)
-      let descr := artifactWithExt hash ext
-      let cacheFile := cache.artifactDir / descr.relPath
-      -- make the local file unwritable where possible to discourage users from
-      -- writing to such paths as this can corrupt the cache if the file is hard linked
-      let r := {read := true, write := false, execution := exe}
-      IO.setAccessRights file ⟨r, r, r⟩
-      unless (← cacheFile.pathExists) do
-        createParentDirs cacheFile
-        if let .error e ← (IO.FS.hardLink file cacheFile).toBaseIO then
-          -- other functions can race to create the file
-          unless e matches .alreadyExists .. do
-            -- use `writeBinFileIfNew` to prevent errors on races
-            writeBinFileIfNew cacheFile contents
-      IO.setAccessRights cacheFile ⟨r, r, r⟩
-      writeFileHash file hash
-      let mtime ← getMTime cacheFile
-      let path := if useLocalFile then file else cacheFile
-      return .ok {descr, name := file.toString, path, mtime}
-  catch e =>
-    error s!"failed to cache artifact: {e}"
-
-/--
-Copies `file` to the Lake cache with the file extension `ext`, and
-saves its hash in its `.hash` file.
-
-**Additional Options:**
-* `text`: the contents of `file` are hashed as text rather than as a binary blob.
-* `exe`: the cached file will be executable.
-* `useLocalFile`: the resulting artifact will use `file`'s path instead of path to
-the file in the cache.
--/
-public def Cache.saveArtifact
-  (cache : Cache) (file : FilePath) (ext := "art") (text exe useLocalFile := false)
-: IO Artifact := do
-  match (← cache.saveArtifactIfMatches file none ext text exe useLocalFile) with
-  | .ok art => return art
-  | .error _ => unreachable!
-
-@[inline, inherit_doc Cache.saveArtifact]
-public def cacheArtifact
-  [MonadWorkspace m] [MonadLiftT IO m] [Monad m]
-  (file : FilePath) (ext := "art") (text exe useLocalFile := false)
-: m Artifact := do (← getLakeCache).saveArtifact file ext text exe useLocalFile
-
-/--
 The directory where Lake moves cache entries and build outputs that were found not to match
 their recorded hashes. Their bytes are kept there for diagnosis; Lake never reads them back.
 -/
@@ -582,12 +553,180 @@ public def Cache.quarantine (cache : Cache) (file : FilePath) (name : String) : 
   IO.FS.createDirAll cache.quarantineDir
   quarantineAs cache.quarantineDir file name 0
 
+/-- Describes where `Cache.quarantine` moved a file, given its result. -/
+def describeMoved : Option FilePath → String
+  | some dest => s!"moved it to: {dest}"
+  | none => "it was already moved away by another process"
+
 /-- Describes the outcome of `Cache.quarantine`; a failure to quarantine is reported, not thrown. -/
-def describeQuarantine (cache : Cache) (file : FilePath) (name : String) : BaseIO String := do
+public def describeQuarantine (cache : Cache) (file : FilePath) (name : String) : BaseIO String := do
   match (← (cache.quarantine file name).toBaseIO) with
-  | .ok (some dest) => return s!"moved it to: {dest}"
-  | .ok none => return "it was already moved away by another process"
+  | .ok moved => return describeMoved moved
   | .error e => return s!"could not move it into quarantine: {e}"
+
+/-- Hashes `bytes` as `computeFileHash` does; text that is not valid UTF-8 has no hash. -/
+def hashBytes? (bytes : ByteArray) (text : Bool) : Option Hash :=
+  if text then Hash.ofText <$> String.fromUTF8? bytes else some (Hash.ofByteArray bytes)
+
+/-- Performs `x`; an error fails with `failed to cache artifact: <error>`. -/
+@[inline] def cacheIO (x : IO α) : LogIO α := do
+  match (← x.toBaseIO) with
+  | .ok a => return a
+  | .error e => error s!"failed to cache artifact: {e}"
+
+/--
+Whether `e`, the error of a hard link into a cache, means that the cache's file system cannot
+hard-link: `EPERM` (`osCode` 1), which Linux's `link` reports for such a file system. Lean decodes
+other errors as `permissionDenied` too, e.g., `EACCES` for a directory that Lake cannot write to, or
+`EROFS` for a read-only file system; those are not this. On Windows, libuv reports
+`ERROR_ACCESS_DENIED` (e.g., for such a directory) as `EPERM`, so there no error counts.
+-/
+def cannotHardLink (e : IO.Error) : Bool :=
+  !System.Platform.isWindows && match e with
+    | .permissionDenied _ code _ => code == 1
+    | _ => false
+
+/--
+The artifact directories of caches into which a hard link failed in this process because the file
+system cannot hard-link (`cannotHardLink`), each with that error. `Cache.insertEntry` tries no more
+hard links into them, and writes no temporary copies there.
+-/
+builtin_initialize noHardLinkDirs : IO.Ref (Array (FilePath × IO.Error)) ← IO.mkRef #[]
+
+/--
+Makes the entry of `cache` for the artifact `descr` hold the build output `file`, whose contents
+Lake has just hashed to `descr.hash`. `bytes` are what the entry holds: those contents, with
+normalized line endings if `text`.
+
+A file that already has the entry's name is kept if it is `file` itself (e.g., `file` was restored
+from the entry as a hard link) or has the artifact's hash, or if it cannot be read. Any other file
+there (e.g., the first part of the output, left by a write that stopped part way) is moved into the
+quarantine directory, with a warning, and replaced. Without this, the build would map its input to
+those bytes, and every later restore would serve them. If that file cannot be moved, the insert
+fails, where a restore only reports it (`describeQuarantine`): the file would keep the entry's name,
+and the build would map its input to it.
+
+A new binary entry is a hard link to `file` where the file system allows it. A text entry is always
+written, because its normalized bytes can differ from those of `file` (e.g., in line endings).
+Entries are written by `writeBinFileIfNew`, so an entry's name never holds part of a file.
+
+Returns whether the entry exists afterwards. Where a hard link into the cache fails (other than for
+an existing file), nothing publishes a whole entry without replacing a file, so this caches nothing
+and logs that at the verbose level; the build goes on with `file`. A hard link that fails because
+the file system cannot hard-link (`cannotHardLink`, i.e., `EPERM`) is remembered for the cache's
+artifact directory (`noHardLinkDirs`): later inserts into it in this process try no hard link, and
+write no temporary copy (which could not be linked either). Another error of a hard link of `file`
+(e.g., `EACCES` for a directory that Lake cannot write to, or `EXDEV` for a cache on another file
+system) goes on to the temporary copy, whose write reports an error that prevents it.
+-/
+def Cache.insertEntry
+  (cache : Cache) (descr : ArtifactDescr) (file : FilePath) (bytes : ByteArray) (text : Bool)
+: LogIO Bool := do
+  let entry := cache.artifactDir / descr.relPath
+  if (← entry.pathExists) then
+    if (← (file.isSameFile entry).toBaseIO) matches .ok true then
+      return true
+    match (← (IO.FS.readBinFile entry).toBaseIO) with
+    | .ok held =>
+      if hashBytes? held text == some descr.hash then
+        return true
+      match (← (cache.quarantine entry descr.relPath.toString).toBaseIO) with
+      | .ok moved =>
+        logWarning s!"{entry}: cached artifact does not match its content hash; \
+          {describeMoved moved}; caching {file} in its place"
+      | .error e =>
+        error s!"failed to cache artifact: {entry}: cached artifact does not match its content \
+          hash, and it could not be moved into quarantine: {e}"
+    | .error (.noFileOrDirectory ..) => pure () -- removed since, e.g., by a garbage collection
+    | .error _ => return true
+  else
+    cacheIO <| createParentDirs entry
+  if let some (_, e) := (← noHardLinkDirs.get).find? (·.1 == cache.artifactDir) then
+    logVerbose s!"{entry}: not cached: the cache's file system did not hard-link an earlier \
+      entry: {e}"
+    return false
+  let linked : Except IO.Error Unit ← cacheIO do
+    unless text do
+      match (← (IO.FS.hardLink file entry).toBaseIO) with
+      | .ok _ | .error (.alreadyExists ..) => return .ok ()
+      | .error e =>
+        -- The file system cannot hard-link, so the temporary copy cannot be linked either
+        if cannotHardLink e then return .error e
+    writeBinFileIfNew entry bytes
+  match linked with
+  | .ok _ => return true
+  | .error e =>
+    if cannotHardLink e then
+      noHardLinkDirs.modify (·.push (cache.artifactDir, e))
+    logVerbose s!"{entry}: not cached: the cache's file system did not hard-link the entry: {e}"
+    return false
+
+/--
+Returns the bytes that the cache entry of `file` holds (its contents, with normalized line endings
+if `text`) and their hash, or `none` for text that is not valid UTF-8, which has no hash.
+-/
+def readEntryBytes? (file : FilePath) (text : Bool) : IO (Option (ByteArray × Hash)) := do
+  let contents ← IO.FS.readBinFile file
+  if text then
+    return String.fromUTF8? contents |>.map fun s =>
+      let normalized := s.crlfToLf
+      (normalized.toUTF8, Hash.ofString normalized)
+  else
+    return some (contents, Hash.ofByteArray contents)
+
+/--
+Like `Cache.saveArtifact`, but if `expected?` is a hash that `file`'s contents do not have,
+caches nothing, leaves `file` and its `.hash` untouched, and returns `file`'s actual hash (`none`
+for text that is not valid UTF-8, which has no hash).
+-/
+public def Cache.saveArtifactIfMatches
+  (cache : Cache) (file : FilePath) (expected? : Option Hash)
+  (ext := "art") (text exe useLocalFile := false)
+: LogIO (Except (Option Hash) Artifact) := do
+  let some (bytes, hash) ← cacheIO <| readEntryBytes? file text
+    | if expected?.isSome then return .error none else
+        error s!"failed to cache artifact: Tried to read file '{file}' containing non UTF-8 data."
+  if let some expected := expected? then
+    if hash != expected then return .error (some hash)
+  let descr := artifactWithExt hash ext
+  let cacheFile := cache.artifactDir / descr.relPath
+  -- make the local file unwritable where possible to discourage users from
+  -- writing to such paths as this can corrupt the cache if the file is hard linked
+  let r := {read := true, write := false, execution := exe && !text}
+  cacheIO <| IO.setAccessRights file ⟨r, r, r⟩
+  let cached ← cache.insertEntry descr file bytes text
+  cacheIO do
+    if cached then IO.setAccessRights cacheFile ⟨r, r, r⟩
+    writeFileHash file hash
+  let mtime ← cacheIO <| getMTime (if cached then cacheFile else file)
+  let path := if useLocalFile || !cached then file else cacheFile
+  return .ok {descr, name := file.toString, path, mtime, cacheSkipped := !cached}
+
+/--
+Copies `file` to the Lake cache with the file extension `ext`, and
+saves its hash in its `.hash` file. A file with other bytes under the artifact's name in the cache
+is moved into the quarantine directory, with a warning, and replaced (see `Cache.insertEntry`).
+Where the cache's file system does not hard-link, nothing is cached: the artifact's path is `file`,
+and its `cacheSkipped` is set.
+
+**Additional Options:**
+* `text`: the contents of `file` are hashed as text rather than as a binary blob.
+* `exe`: the cached file will be executable.
+* `useLocalFile`: the resulting artifact will use `file`'s path instead of path to
+the file in the cache.
+-/
+public def Cache.saveArtifact
+  (cache : Cache) (file : FilePath) (ext := "art") (text exe useLocalFile := false)
+: LogIO Artifact := do
+  match (← cache.saveArtifactIfMatches file none ext text exe useLocalFile) with
+  | .ok art => return art
+  | .error _ => unreachable!
+
+@[inline, inherit_doc Cache.saveArtifact]
+public def cacheArtifact
+  [MonadWorkspace m] [MonadLiftT LogIO m] [Monad m]
+  (file : FilePath) (ext := "art") (text exe useLocalFile := false)
+: m Artifact := do (← getLakeCache).saveArtifact file ext text exe useLocalFile
 
 /--
 Caches `file` like `cacheArtifact`, unless its contents no longer hash to `expected`, the hash
@@ -622,16 +761,18 @@ public class ResolveOutputs (α : Type) where
 open ResolveOutputs in
 /--
 Retrieve artifacts from the Lake cache using only the outputs
-stored in the cached input-to-content mapping.
+stored in the cached input-to-content mapping, along with the build log stored with them.
+
+A local mapping that cannot be used (e.g., its artifacts were pruned from the cache) does not hide
+the shared remote cache: the remote mapping is then read (see `readRemoteOutputs?`, which reads
+nothing unless `LAKE_REMOTE_CACHE` names a service) and replaces the local one.
 
 **For internal use only.**
 -/
 @[specialize] def getArtifactsUsingCache?
-  [ResolveOutputs α] (inputHash : Hash) (pkg : Package)
-: JobM (Option α) := do
-  try
-    (← (← getLakeCache).readOutputs? pkg.cacheScope inputHash).mapM resolveOutputs
-  catch e =>
+  [ResolveOutputs α] (inputHash : Hash) (pkg : Package) (target : String) (srcHash? : Option Hash)
+: JobM (Option (α × Log)) := do
+  let reportIssue (e : Log.Pos) : JobM Unit := do
     let log ← takeLogFrom e
     let msg := s!"input '{inputHash.toString.take 7}' found in package artifact cache, \
       but some output(s) have issues:"
@@ -639,14 +780,32 @@ stored in the cached input-to-content mapping.
     -- Must be `trace` to avoid breaking `--wfail` / `--iofail` builds
     -- TODO: Figure out a way to split cache and build failures
     logVerbose msg
-    return none
+  let resolve (out : CacheOutput) : JobM (Option (α × Log)) := do
+    try
+      return some (← resolveOutputs out, out.log?.getD {})
+    catch e =>
+      reportIssue e
+      return none
+  let cache ← getLakeCache
+  let local? ← try cache.readOutputs? pkg.cacheScope inputHash catch e =>
+    reportIssue e
+    pure none
+  if let some out := local? then
+    if let some a ← resolve out then
+      return some a
+  -- A local mapping file that exists but cannot be used (it does not parse, or its artifacts are
+  -- gone) is replaced by the remote one, so that it does not hide the remote cache again
+  let hadLocal ← (cache.outputsFile pkg.cacheScope inputHash).pathExists
+  let some out ← readRemoteOutputs? inputHash pkg target srcHash? (replace := hadLocal)
+    | return none
+  resolve out
 
 open ResolveOutputs in
 /--
 Retrieve artifacts from the Lake cache using only the outputs stored in the saved trace file.
 
-If the cache is writable, saves the input-to-output mapping derived from the trace to the cache,
-unless a mapping for the `inputHash` already exists.
+If the cache is writable, saves the input-to-output mapping derived from the trace
+(with the trace's log) to the cache, unless a mapping for the `inputHash` already exists.
 
 **For internal use only.**
 -/
@@ -659,7 +818,8 @@ unless a mapping for the `inputHash` already exists.
         try
           let arts ← resolveOutputs (.ofData out)
           if (← pkg.isArtifactCacheWritable) then
-            let act := (← getLakeCache).writeOutputs pkg.cacheScope inputHash out (overwrite := false)
+            let act := (← getLakeCache).writeOutputs pkg.cacheScope inputHash out
+              (log := data.log) (overwrite := false)
             if let .error e ← act.toBaseIO then
               logWarning s!"could not write outputs to cache: {e}"
           return some arts
@@ -670,16 +830,18 @@ unless a mapping for the `inputHash` already exists.
 open ResolveOutputs in
 /--
 Retrieve artifacts from the Lake cache using the outputs stored in either
-the saved trace file or in the cached input-to-content mapping.
+the saved trace file or in the cached input-to-content mapping,
+along with the build log stored with them.
 
 **For internal use only.**
 -/
 @[inline] public nonrec def getArtifacts?
   [ResolveOutputs α] (inputHash : Hash) (savedTrace : SavedTrace) (pkg : Package)
-: JobM (Option α) := do
+  (target : String) (srcHash? : Option Hash)
+: JobM (Option (α × Log)) := do
   if let some a ← getArtifactsUsingTrace? inputHash savedTrace pkg then
-    return some a
-  if let some a ← getArtifactsUsingCache? inputHash pkg then
+    return some (a, savedTrace.log)
+  if let some a ← getArtifactsUsingCache? inputHash pkg target srcHash? then
     return some a
   return none
 
@@ -687,6 +849,7 @@ the saved trace file or in the cached input-to-content mapping.
 public def resolveArtifact
   (descr : ArtifactDescr)
   (service? : Option CacheServiceName) (scope? : Option CacheServiceScope) (exe := false)
+  (sha256? : Option Sha256Map := none)
 : JobM Artifact := do
   let ws ← getWorkspace
   let path := ws.lakeCache.artifactDir / descr.relPath
@@ -695,17 +858,42 @@ public def resolveArtifact
     return {descr, path, mtime}
   | .error (.noFileOrDirectory ..) => withLogErrorPos do
     -- we redownload artifacts on any error
-    if let some service := service? then
-      updateAction .fetch
-      if let some service := ws.findCacheService? service.toString then
+    if let some serviceName := service? then
+      if let some service := ws.findCacheService? serviceName.toString then
         let some scope := scope?
           | error s!"artifact with associated cache service but no scope"
-        let url := service.artifactUrl descr.hash scope
-        logVerbose s!"\
-          downloaded artifact {descr.hash}\
-          \n  local path: {path}\
-          \n  remote URL: {url}"
-        liftM <| downloadArtifactCore descr.hash url path
+        match sha256? with
+        | some sha256s =>
+          -- A mapping of the shared remote cache. Its artifacts are read only while
+          -- `LAKE_REMOTE_CACHE` names that service: a mapping that an earlier build wrote stays
+          -- in the cache, and must not send a request after the user has opted out.
+          unless ws.lakeEnv.remoteCache? == some serviceName.toString do
+            error s!"artifact not found in cache:\n  {path}\n\
+              Its mapping reads it from the remote cache `{serviceName}`, which \
+              `LAKE_REMOTE_CACHE` does not name."
+          let some sha256 := sha256s.get? descr.relPath.toString
+            | error s!"remote mapping has no SHA-256 for artifact `{descr}`"
+          let url := service.remoteArtifactUrl scope.toString sha256
+          -- The job downloads: only now is it a fetch (a job that got this far without one keeps
+          -- the caption of what it did instead, e.g. a replay)
+          updateAction .fetch
+          logVerbose s!"\
+            downloaded remote artifact {descr.hash}\
+            \n  local path: {path}\
+            \n  remote URL: {url}"
+          try
+            liftM <| downloadArtifactCore descr.hash url path (service.sendsCacheToken url)
+              (sha256? := some sha256) (maxFileSize? := some remoteCacheMaxFileSize)
+          catch e =>
+            error (← recordRemoteReadFailure (← takeLogFrom e) "remote artifact download failed")
+        | none =>
+          let url := service.artifactUrl descr.hash scope
+          updateAction .fetch
+          logVerbose s!"\
+            downloaded artifact {descr.hash}\
+            \n  local path: {path}\
+            \n  remote URL: {url}"
+          liftM <| downloadArtifactCore descr.hash url path (service.sendsCacheToken url)
         let r := {read := true, write := false, execution := exe}
         if let .error e ← IO.setAccessRights path ⟨r, r, r⟩ |>.toBaseIO then
           logWarning s!"could not mark downloaded artifact read-only: {e}"
@@ -715,7 +903,7 @@ public def resolveArtifact
         | .error e =>
           error s!"download succeeded, but artifact failed to resolve: {e}"
       else
-        error s!"artifact cache service is not configured: {service}"
+        error s!"artifact cache service is not configured: {serviceName}"
     else
       error s!"artifact not found in cache:\n  {path}"
   | .error e =>
@@ -724,7 +912,7 @@ public def resolveArtifact
 /-- **For internal use only.** -/
 public def resolveArtifactOutput (out : CacheOutput) (exe := false) : JobM Artifact := do
   match fromJson? out.data with
-  | .ok descr => resolveArtifact descr out.service? out.scope? exe
+  | .ok descr => resolveArtifact descr out.service? out.scope? (exe := exe) (sha256? := out.sha256?)
   | .error e => error s!"ill-formed artifact output:\n{out.data.render.pretty 80 2}\n{e}"
 
 set_option linter.unusedVariables false in
@@ -743,15 +931,20 @@ public def computeArtifact (path : FilePath) (ext := "art") (text := false) : Jo
   let mtime := (← getMTime path |>.toBaseIO).toOption.getD 0
   return {descr := artifactWithExt hash ext, name := path.toString, path, mtime}
 
-/-- Hashes `bytes` as `computeFileHash` does; text that is not valid UTF-8 has no hash. -/
-def hashBytes? (bytes : ByteArray) (text : Bool) : Option Hash :=
-  if text then Hash.ofText <$> String.fromUTF8? bytes else some (Hash.ofByteArray bytes)
+/--
+`computeArtifact` for a file whose hash the caller computed from the bytes it just read: saves that hash to the
+file's `.hash` file, as `fetchFileHash` does.
+-/
+public def computeArtifactOfHash (path : FilePath) (hash : Hash) (ext := "art") : JobM Artifact := do
+  writeFileHash path hash
+  let mtime := (← getMTime path |>.toBaseIO).toOption.getD 0
+  return {descr := artifactWithExt hash ext, name := path.toString, path, mtime}
 
 /--
 Moves the cache entry of `art` into the cache's quarantine directory if it is an entry of the
 cache's artifact directory, and describes what happened to it.
 -/
-def quarantineEntry (art : Artifact) : JobM String := do
+public def quarantineEntry (art : Artifact) : JobM String := do
   let cache ← getLakeCache
   -- Never move a path that a mapping could point outside the artifact directory.
   if art.descr.relPath.components.length == 1 &&
@@ -854,17 +1047,20 @@ public def buildArtifactUnlessUpToDate
   (text := false) (ext := "art") (restore := false) (exe := false)
   (platformIndependent := false)
 : JobM Artifact := do
+  -- Whether this call completes a build action (not a job it continues)
+  let builtHere ← trackBuilds
   let depTrace ← getTrace
   let traceFile := FilePath.mk <| file.toString ++ ".trace"
   let savedTrace ← readTraceFile traceFile
   if let some pkg ← getCurrPackage? then
     let inputHash := depTrace.hash
     let fetchArt? restore := do
-      let some (art : XArtifact exe) ← getArtifacts? inputHash savedTrace pkg
+      let target ← currentRemoteCacheTarget
+      let some ((art : XArtifact exe), log) ← getArtifacts? inputHash savedTrace pkg target none
         | return none
       unless (← savedTrace.replayCachedIfUpToDate inputHash) do
         removeFileIfExists file
-        writeFetchTrace traceFile inputHash (toJson art.descr)
+        writeFetchTrace traceFile inputHash (toJson art.descr) log
       if restore then
         some <$> restoreArtifact file art exe text
       else
@@ -876,22 +1072,40 @@ public def buildArtifactUnlessUpToDate
           return art
         else
           let status ← savedTrace.replayIfUpToDate' file depTrace
+          -- Before it compiles, a build that writes the shared remote cache claims the input,
+          -- and while another build holds the claim, waits for that build's outputs
+          let mut claim? : Option HeldClaim := none
           unless status.isUpToDate do
-            discard <| doBuild depTrace traceFile
-          if status.isCacheable then
-            let art ← id do
-              -- On a replay, `file` is the one the saved trace describes, unless it changed since;
-              -- with no hash recorded there is nothing to check it against, so rebuild it
-              if status.isUpToDate then
-                if let some descr := savedTrace.artifactDescr? then
-                  if let some art ← recacheArtifact? none file descr.hash ext text exe restore then
-                    return art
-                discard <| doBuild depTrace traceFile
-              cacheArtifact file ext text exe restore
-            (← getLakeCache).writeOutputs pkg.cacheScope inputHash art.descr
-            return art
-          else
-            computeArtifact file ext text
+            match ← waitForClaim pkg inputHash (fetchArt? restore) with
+            | .found art => return art
+            | .compile c? => claim? := c?
+          withClaim claim? do
+            unless status.isUpToDate do
+              discard <| doBuild depTrace traceFile
+            if status.isCacheable then
+              let art ← id do
+                -- On a replay, `file` is the one the saved trace describes, unless it changed since;
+                -- with no hash recorded there is nothing to check it against, so rebuild it
+                if status.isUpToDate then
+                  if let some descr := savedTrace.artifactDescr? then
+                    if let some art ← recacheArtifact? none file descr.hash ext text exe restore then
+                      return art
+                  discard <| doBuild depTrace traceFile
+                cacheArtifact file ext text exe restore
+              -- The trace holds the log of the action that produced `file`: its replay or its build
+              let log := (← readTraceFile traceFile).log
+              -- Queued before the local mapping is written: a build that finds the mapping never
+              -- compiles (or queues) this input. After a crash between the two, the next build
+              -- restores the outputs through the trace without queueing them, so they stay queued once.
+              -- A queue line or a mapping would name an artifact that the cache does not hold.
+              unless art.cacheSkipped do
+                if (← builtHere) then
+                  queueCompiledOutputs claim? pkg inputHash (← currentRemoteCacheTarget) none
+                    (toJson art.descr) log
+                (← getLakeCache).writeOutputs pkg.cacheScope inputHash art.descr (log := log)
+              return art
+            else
+              computeArtifact file ext text
       else if (← savedTrace.replayIfUpToDate file depTrace) then
         computeArtifact file ext text
       else
