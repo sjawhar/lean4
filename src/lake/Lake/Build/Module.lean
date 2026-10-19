@@ -1370,10 +1370,14 @@ def Module.checkSourceUnchanged (mod : Module) (presetup : ModulePreSetup) : Job
 /--
 Compiles the module. `setup?` is its `ModuleSetup` if the caller already computed it
 (`Module.skipOrBuild`); otherwise it is computed here. Only with usage cutoff enabled does Lean
-record usage (`--usage`: digests in the `.olean`, the `.usage`) and Lake write the `.usekey`.
+record usage (`--usage`: digests in the `.olean`, the `.usage`) and Lake write the `.usekey`. The `modsysHash` the
+key compares with the closure's after the compile is taken from `hashes?`, the module's decision before the compile
+(`Module.skipOrBuild`), if given: the files it hashed were read before the compile, which makes the comparison
+stricter (`usekeyBefore`).
 -/
 def Module.buildLean
   (mod : Module) (presetup : ModulePreSetup) (setup? : Option ModuleSetup := none)
+  (hashes? : Option ContentHashes := none)
 : JobM ModuleOutputArtifacts := do
   buildAction (← getTrace) mod.traceFile (localHash? := some presetup.localTrace.hash) do
   let usage ← usageCutoffEnabled
@@ -1384,7 +1388,7 @@ def Module.buildLean
   let outputPaths := mod.mkArtifacts presetup.srcFile presetup.isModule
   mod.clearOutputArtifacts
   mod.clearOutputHashes
-  let before? ← if usage then some <$> usekeyBefore setup.importArts else pure none
+  let before? ← if usage then some <$> usekeyBefore setup.importArts hashes? else pure none
   compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile outputPaths args
     (← getLeanPath) (← getLean)
   mod.checkSourceUnchanged presetup
@@ -1392,6 +1396,67 @@ def Module.buildLean
   if let some (modsysBefore, untrustedBefore?) := before? then
     mod.writeUsekey presetup setup.importArts modsysBefore untrustedBefore?
   return arts
+
+/--
+Reads a usage-index file (`Cache.writeUsageIndex`): the module outputs it records, or `none` if it cannot be read
+or parsed (e.g., another process removed it).
+-/
+def readUsageIndexEntry? (file : FilePath) : BaseIO (Option ModuleOutputDescrs) := do
+  let .ok contents ← (IO.FS.readFile file).toBaseIO | return none
+  let .ok (out : CacheOutput) := Json.parse contents >>= fromJson? | return none
+  return (ModuleOutputDescrs.fromJson? out.data).toOption
+
+/--
+Whether the cache entry `art` still has the bytes its name records (`computeBinFileHash`). If not, it changed in
+place: it is moved into the cache's quarantine directory, with a warning, so that no build restores it again.
+-/
+def checkUsageIndexEntry (art : Artifact) : JobM Bool := do
+  if let .ok hash ← (computeBinFileHash art.path).toBaseIO then
+    if hash == art.hash then return true
+  logWarning s!"usage index: {art.path}: its bytes are not those its name records; {← quarantineEntry art}"
+  return false
+
+/--
+Looks in the usage index (`Cache.usageCandidates`) for a compile of the module, with its local inputs
+(`ModulePreSetup.localTrace`), whose outputs pass the usage cutoff's check against the module's current imports
+(`importArts`). Each candidate, most recently written first, is resolved against the local cache only (no artifact is
+downloaded), pre-filtered (`usagePrefilter`), and decided by the cutoff's own check (`Module.usageVerdict`) on its
+cache files, which reads them in `hashes`, the module's decision. A candidate that passes goes to `accept`, with its
+name (the hash of its `.usekey`) and its outputs in the cache; the first one `accept` takes ends the lookup. A
+candidate that cannot be read or resolved, that is a module-system file's (`m`), or that names no `.usage` or
+`.usekey`, is skipped. A candidate whose check found its `.olean` is not the one its key records has that cache entry
+checked (`checkUsageIndexEntry`).
+-/
+def Module.lookupUsageIndex (mod : Module) (presetup : ModulePreSetup) (importArts : NameMap ImportArtifacts)
+    (hashes : ContentHashes) (accept : String → ModuleOutputArtifacts → JobM (Option α)) : JobM (Option α) := do
+  let candidates ← (← getLakeCache).usageCandidates mod.pkg.cacheScope presetup.localTrace.hash
+  -- An importee as the module's decision bound it, if it did, else as the build's view of it
+  let importee? (m : Name) : JobM (Option (Option ModuleUsage.Digest × UsageImport)) := do
+    if let some bound := (← hashes.imports.get).find? m then
+      let some (olean, imp) := bound | return none
+      if (importArts.find? m).any (·.oleanServer?.isSome) then return some (none, imp)
+      return some ((← hashes.files.get)[olean]?, imp)
+    return (← usageView? importArts m).1
+  for file in candidates do
+    let some descrs ← readUsageIndexEntry? file | continue
+    if descrs.isModule then continue
+    let arts? : Option ModuleOutputArtifacts ← id do
+      try
+        return some (← descrs.resolve none none)
+      catch e =>
+        dropLogFrom e
+        return none
+    let some arts := arts? | continue
+    let (some usage, some usekey) := (arts.usage?, arts.usekey?) | continue
+    let .passed keyOlean ← usagePrefilter presetup importArts hashes importee? usekey.path usage.path | continue
+    let files : UsageFiles := {usekey := usekey.path, usage := usage.path, olean := arts.olean.path}
+    unless (← mod.usageVerdict presetup importArts hashes files) matches .upToDate do
+      if let some hash := (← hashes.files.get)[arts.olean.path]? then
+        if hash != keyOlean then discard <| checkUsageIndexEntry arts.olean
+      continue
+    if let some result ← accept (file.fileStem.getD file.toString) arts then
+      return some result
+  return none
 
 /--
 Whether usage cutoff can apply to the module: cutoff is enabled, and the module is neither a module-system file nor
@@ -1427,17 +1492,19 @@ Skips compiling a module whose trace is stale if usage cutoff applies to it
 (`Module.usageCutoffApplies`), its verdict (`Module.usageVerdict`) is `upToDate`, and its outputs are still what
 the saved trace describes (`Module.keepOutputs?`): replays its saved log and rewrites its trace with `depTrace`,
 which vouches for those outputs under the new input hash. Otherwise, builds it with `compile`, passing the verdict
-and the module setup the check computed, if the cutoff applies. With `cacheWith? = some useLocalFile`, the outputs
+and the module setup the check computed, if the cutoff applies, and what the module's decision read
+(`ContentHashes`). With `cacheWith? = some useLocalFile`, the outputs
 it returns are in the cache: kept ones were checked while saving them (`recacheOutputArtifacts?`), as were outputs
 `compile` reports it kept and cached (a kept-module check's accept), and built ones are saved after the build.
 -/
 def Module.skipOrBuild (mod : Module) (presetup : ModulePreSetup) (savedTrace : SavedTrace)
     (depTrace : BuildTrace) (cacheWith? : Option Bool := none)
-    (compile : Option (UsageVerdict × ModuleSetup) → JobM (ModuleOutputArtifacts × Bool) :=
-      fun d? => return (← mod.buildLean presetup (d?.map (·.2)), false)) :
+    (compile : Option (UsageVerdict × ModuleSetup) → ContentHashes → JobM (ModuleOutputArtifacts × Bool) :=
+      fun d? hashes => return (← mod.buildLean presetup (d?.map (·.2)) hashes, false)) :
     JobM ModuleOutputArtifacts := do
+  let hashes ← ContentHashes.new
   let build (decided? : Option (UsageVerdict × ModuleSetup)) : JobM ModuleOutputArtifacts := do
-    let (arts, cached) ← compile decided?
+    let (arts, cached) ← compile decided? hashes
     match cacheWith? with
     | some useLocalFile =>
       if cached then return arts
@@ -1446,7 +1513,7 @@ def Module.skipOrBuild (mod : Module) (presetup : ModulePreSetup) (savedTrace : 
   let .ok data := savedTrace | build none
   unless (← mod.usageCutoffApplies presetup) do return ← build none
   let setup ← mkModuleSetup mod presetup
-  let verdict ← mod.usageVerdict presetup setup.importArts
+  let verdict ← mod.usageVerdict presetup setup.importArts hashes
   unless verdict matches .upToDate do return ← build (some (verdict, setup))
   let some arts ← mod.keepOutputs? presetup.isModule presetup.postponeCompile savedTrace.moduleOutputDescrs?
       cacheWith?
@@ -1678,12 +1745,13 @@ where
   Compiles the module (with its `ModuleSetup`, if the caller computed it), unless its existing
   outputs are a kept candidate (`keptCandidate?`) and the kept-module checker accepts them for the
   module's current imports. `Module.skipOrBuild` calls it for a module the usage cutoff does not skip,
-  with the module's verdict when the cutoff applies. With `cacheWith?`, accepted outputs are saved to
+  with the module's verdict when the cutoff applies, and what the module's decision read (`hashes`), which the
+  compile takes its `modsysHash` from. With `cacheWith?`, accepted outputs are saved to
   the cache as a skip saves its outputs (`Module.keepOutputs?`). Returns the outputs and whether
   they were kept and cached.
   -/
   checkOrBuild (presetup : ModulePreSetup) (savedTrace : SavedTrace) (cacheWith? : Option Bool)
-    (decided? : Option (UsageVerdict × ModuleSetup))
+    (decided? : Option (UsageVerdict × ModuleSetup)) (hashes : ContentHashes)
   : JobM (ModuleOutputArtifacts × Bool) := do
     if let some checker := (← getBuildContext).keptChecker? then
       if let some (data, descrs, setup) ← keptCandidate? presetup savedTrace decided? then
@@ -1701,7 +1769,7 @@ where
               compiling"
         | .rejected reason =>
           logInfo s!"kept-module check: {reason}; compiling"
-    return (← mod.buildLean presetup (decided?.map (·.2)), false)
+    return (← mod.buildLean presetup (decided?.map (·.2)) hashes, false)
   /-
   The saved trace, its output descriptions and the module's setup if the module's existing outputs
   may be kept for its current input: they were produced from the same local inputs
