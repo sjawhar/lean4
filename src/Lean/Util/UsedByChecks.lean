@@ -18,6 +18,9 @@ builtin_initialize currentCommandRef : IO.Ref Nat ← IO.mkRef 0
 builtin_initialize declsByCommandRef : IO.Ref (Array (Nat × Array Name × NameSet)) ← IO.mkRef #[]
 /-- Constants whose values were consulted without leaving a reference in the elaborated term. -/
 builtin_initialize usedByCommandRef : IO.Ref (Array (Nat × Name)) ← IO.mkRef #[]
+/-- Top-level commands that gave `addDecl` a declaration with `debug.skipKernelTC` set: the kernel did not check it,
+so a keep, which does, may reject it. -/
+builtin_initialize uncheckedDeclsByCommandRef : IO.Ref (Std.HashSet Nat) ← IO.mkRef {}
 
 /-- Monads that know the top-level command whose elaboration they run (`Core.Context.cmdIdx?`). -/
 class MonadCommandIdx (m : Type → Type) where
@@ -44,4 +47,5 @@ def resetCommandUsageRefs : IO Unit := do
   currentCommandRef.set 0
   declsByCommandRef.set #[]
   usedByCommandRef.set #[]
+  uncheckedDeclsByCommandRef.set {}
 end Lean

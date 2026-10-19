@@ -80,10 +80,15 @@ private unsafe def ofModuleDataImpl (md : ModuleData) : Array CommandEntries :=
 @[implemented_by ofModuleDataImpl]
 opaque CommandEntries.ofModuleData (md : ModuleData) : Array CommandEntries
 
-private def excludedExtension (n : Name) : Bool :=
+/-- The extensions the recording itself writes, which a payload never carries. -/
+private def recordingExtension (n : Name) : Bool :=
+  n == commandEntriesExt.name || n == `Lean.ModuleUsage.ext || n == `Lean.ModuleUsage.stmtExt
+
+/-- Extensions whose state the payload does not carry, because it is set at the header or computed for the export;
+a command that changes one anyway is refused (`viewStates`). -/
+private def unrecordedExtension (n : Name) : Bool :=
   let s := n.toString
-  n == commandEntriesExt.name || n == `Lean.ModuleUsage.ext || n == `Lean.ModuleUsage.stmtExt ||
-    s.endsWith ".exportedAxiomsExt" || s.endsWith ".modPkgExt" ||
+  s.endsWith ".exportedAxiomsExt" || s.endsWith ".modPkgExt" ||
     s.endsWith ".deprecatedModuleExt" || s.endsWith "symbolFrequency" || s.endsWith "sineQueNon"
 
 private abbrev ErasedPersistentEnvExtension :=
@@ -155,11 +160,14 @@ private def viewStates (regs : Registries) (view : EnvExtension.View) (k₀ k₁
   let mut refused := #[]
   let mut unreplayable := #[]
   for ext in regs.persistent do
-    if excludedExtension ext.name then continue
+    if recordingExtension ext.name then continue
     let idx := ext.toEnvExtension.idx
     unless idx < k₀.extensions.size && idx < k₁.extensions.size do continue
     let s₀ := stateIn ext k₀
     let s₁ := stateIn ext k₁
+    if unrecordedExtension ext.name then
+      unless SharedDiff.sameObject s₀ s₁ do refused := refused.push ext.name
+      continue
     let isScoped := regs.scopedByName.contains ext.name
     if k₀.unaccountedWrites[idx]?.getD 0 != k₁.unaccountedWrites[idx]?.getD 0 then
       refused := refused.push ext.name
@@ -260,8 +268,9 @@ private partial def addedConsts (regs : Registries) (w : Walk) (cells : List (As
       out := out.push pending.head!.2
       pending := pending.tail
     let name := c.constInfo.name
-    -- the full run logged the kernel's error and went on; a keep cannot reproduce the rejection
-    unless (w.afterKernel.find? name).isSome do
+    -- the full run logged the kernel's error and went on (holding no constant, or the fallback axiom `addDecl` adds);
+    -- a keep re-adds the kernel's constant and cannot reproduce the elaborator's
+    unless (w.afterKernel.find? name).any (ConstantKind.ofConstantInfo · == c.constInfo.kind) do
       refused := refused.push (name, `Lean.Environment.kernelRejected)
       continue
     if self? == some name then

@@ -269,6 +269,10 @@ private def setMainModule (snap : Language.Lean.InitialSnapshot) (m : Name) :
     result? := some { parsed with
       processedSnap := .finished none newProcessed } }
 
+/-- Counts `runFrontend` calls in this process; a call compares it at the end with its own to detect a frontend that
+ran in-process meanwhile and reset the global recording references. -/
+private builtin_initialize recordingSessionRef : IO.Ref Nat ← IO.mkRef 0
+
 def runFrontend
     (input : String)
     (opts : Options)
@@ -287,6 +291,8 @@ def runFrontend
     (incrHeaderSaveFileName? : Option System.FilePath := none)
     : IO (Option Environment) := do
   let startTime := (← IO.monoNanosNow).toFloat / 1000000000
+  -- the recording references are global: a frontend this module runs in-process resets them, which `session` detects
+  let session ← recordingSessionRef.modifyGet fun n => (n + 1, n + 1)
   if oleanFileName?.isSome then
     usageRecordingRef.set true
     usedByChecksRef.set {}
@@ -396,12 +402,15 @@ def runFrontend
     let observations ← ModuleUsage.commandObservationsRef.get
     -- module-system files are never partially re-elaborated, so their payloads would be unused
     let mut entries := #[]
+    let unchecked ← uncheckedDeclsByCommandRef.get
     unless env.header.isModule do
       for obs in observations.qsort (·.i < ·.i) do
         let recorded ← recordCommandDelta obs.before.env obs.after.env obs.i
         if let some entry := (commandEntriesExt.getState recorded).back? then
+          -- a keep checks every constant with the kernel, which the full run skipped here
+          let skipped := if unchecked.contains obs.i then #[`debug.skipKernelTC] else #[]
           entries := entries.push { entry with
-            stateOnly := entry.stateOnly ++ ModuleUsage.commandStateChanges obs.before obs.after }
+            stateOnly := entry.stateOnly ++ ModuleUsage.commandStateChanges obs.before obs.after ++ skipped }
     let env := setCommandEntries env entries
     let commands ← ModuleUsage.commandRecords env own stmt entries
     profileitIO ".olean serialization" finalOpts do
@@ -412,9 +421,10 @@ def runFrontend
     let used := ModuleUsage.usedFromInfoTrees trees (← usedByChecksRef.get)
     let declIdxs := commands.foldl (init := ({} : Std.HashSet Nat)) fun s c =>
       if c.isDecl then s.insert c.i else s
-    -- a frontend the module runs in-process (`Lean.Elab.process` in an `#eval`) records its own commands into the same
-    -- references, from index 0 again
-    let nested := (observations.foldl (fun s o => s.insert o.i) ({} : Std.HashSet Nat)).size != observations.size
+    -- a frontend the module runs in-process records its own commands into the same references: `Lean.Elab.process`
+    -- from index 0 again, `runFrontend` after resetting them
+    let nested := (← recordingSessionRef.get) != session ||
+      (observations.foldl (fun s o => s.insert o.i) ({} : Std.HashSet Nat)).size != observations.size
     let noskipReason? := if env.header.isModule then some "module-system"
       else if nested then some "command observations of a nested frontend"
       else commandEntriesNoskipReason? entries declIdxs.contains
