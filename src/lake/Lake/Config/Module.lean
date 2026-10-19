@@ -55,9 +55,18 @@ public def LeanLib.findModuleBySrc? (path : FilePath) (self : LeanLib) : Option 
   let modName := FilePath.components modPath.toString |>.foldl .str .anonymous
   self.findModule? modName
 
-/-- Locate the named, buildable, importable, local module in the package.  -/
+/--
+Locate the named, buildable, importable, local module in the package. Makes a `LeanLib` only for the library that has
+the module, where `leanLibs` would make one for each library, on each call.
+-/
 public def Package.findModule? (mod : Name) (self : Package) : Option Module :=
-  self.leanLibs.findSomeRev? (·.findModule? mod)
+  self.targetDecls.findSomeRev? fun t =>
+    let {name := n, kind := k, config, pkg_eq, ..} := t
+    if kind_eq : k = LeanLib.configKind then
+      let lib : LeanLib := ⟨self, n, kind_eq ▸ pkg_eq ▸ config⟩
+      if lib.isBuildableModule mod then some {lib, name := mod} else none
+    else
+      none
 
 /-- Get an `Array` of the library's modules (as specified by its globs). -/
 public def LeanLib.getModuleArray (self : LeanLib) : IO (Array Module) :=
@@ -102,6 +111,15 @@ public abbrev pkg (self : Module) : Package :=
 @[inline] public def oleanFile (self : Module) : FilePath :=
   self.leanLibPath "olean"
 
+@[inline] public def usageFile (self : Module) : FilePath :=
+  self.leanLibPath "usage"
+
+@[inline] public def resolvedFile (self : Module) : FilePath :=
+  self.leanLibPath "resolved"
+
+@[inline] public def usekeyFile (self : Module) : FilePath :=
+  self.leanLibPath "usekey"
+
 @[inline] public def oleanServerFile (self : Module) : FilePath :=
   self.leanLibPath "olean.server"
 
@@ -120,8 +138,22 @@ public abbrev pkg (self : Module) : Package :=
 @[inline] public def traceFile (self : Module) : FilePath :=
   self.leanLibPath "trace"
 
+/--
+The stamp of the module's source: the source's hash and import header, with its device, inode,
+size, and modification and status change times when Lake last read it.
+-/
+@[inline] public def sourceStampFile (self : Module) : FilePath :=
+  self.leanLibPath "lean.stamp"
+
 @[inline] public def irTraceFile (self : Module) : FilePath :=
   self.leanLibPath "ir.trace"
+
+/--
+The stamp of the module's outputs: each output's artifact, with its file's device, inode, size and
+modification time when a build last found the file to be the artifact cache's entry.
+-/
+@[inline] public def outputsStampFile (self : Module) : FilePath :=
+  self.leanLibPath "outputs.stamp"
 
 @[inline] public def irPath (ext : String) (self : Module) : FilePath :=
   self.filePath self.pkg.irDir ext

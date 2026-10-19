@@ -533,7 +533,10 @@ def loadLakeConfigCore (path : FilePath) (lakeEnv : Lake.Env) : LogIO LoadedLake
         | .s3 => do
           let artifactEndpoint ← validateUrl cfg.name "artifactEndpoint" cfg.artifactEndpoint
           let revisionEndpoint ← validateUrl cfg.name "revisionEndpoint" cfg.revisionEndpoint
-          let service :=  .downloadService artifactEndpoint revisionEndpoint (some (.ofString cfg.name))
+          let service : CacheService :=
+            .downloadService artifactEndpoint revisionEndpoint (some (.ofString cfg.name))
+          let service :=
+            if lakeEnv.cacheTokenService? == some cfg.name then service.withCacheToken else service
           return map.insert (.mkSimple cfg.name) service
         | _ =>
           error s!"cache service `{cfg.name}` is missing field `kind`"

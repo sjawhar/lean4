@@ -16,13 +16,13 @@ git config user.name test
 git config user.email test@example.com
 git add --all
 git commit -m "commit v1"
-git tag v1
+git -c tag.gpgSign=false tag v1
 git commit --allow-empty -m "commit v2"
-git tag v2
+git -c tag.gpgSign=false tag v2
 git commit --allow-empty -m "commit venom"
-git tag venom
+git -c tag.gpgSign=false tag venom
 git commit --allow-empty -m "commit etc"
-git tag etc
+git -c tag.gpgSign=false tag etc
 set +x
 
 # Test thae Lake returns the version-like tags

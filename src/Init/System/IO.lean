@@ -421,6 +421,12 @@ to wall clock time.
 @[extern "lean_io_mono_nanos_now"] opaque monoNanosNow : BaseIO Nat
 
 /--
+CPU time consumed by the current thread in nanoseconds. Returns `0` where the platform has no current-thread CPU
+clock.
+-/
+@[extern "lean_io_thread_cpu_nanos_now"] opaque threadCpuNanosNow : BaseIO Nat
+
+/--
 Reads bytes from a system entropy source. It is not guaranteed to be cryptographically secure.
 
 If `nBytes` is `0`, returns immediately with an empty buffer.
@@ -1136,6 +1142,21 @@ structure Metadata where
   type     : FileType
   /-- The number of hard links to the file. -/
   numLinks : UInt64
+  /--
+  The time of the file's last status change (`st_ctime`): a write to it, a change of its size, its
+  access rights, its owner or its number of hard links, a rename, and a change of its modification
+  time. On Unix-like systems no system call sets it to a chosen time; on Windows it is the NTFS
+  change time, which an application can set.
+  -/
+  statusChanged : SystemTime
+  /-- The device that holds the file (the volume serial number on Windows). -/
+  device   : UInt64
+  /--
+  The file's identifier on its device (the inode number on Unix-like systems). Paths with equal
+  `device` and `inode` name the same file on filesystems that give stable identifiers; some (FAT,
+  some network filesystems) do not. On Windows, `symlinkMetadata` follows symbolic links.
+  -/
+  inode    : UInt64
   deriving Repr
 
 end FS

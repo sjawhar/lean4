@@ -27,6 +27,9 @@ Authors: Leonardo de Moura, Sebastian Ullrich
 #endif
 #endif
 #ifndef LEAN_WINDOWS
+#include <time.h>
+#endif
+#ifndef LEAN_WINDOWS
 #include <csignal>
 #endif
 #include <dirent.h>
@@ -888,6 +891,28 @@ extern "C" LEAN_EXPORT obj_res lean_io_mono_nanos_now() {
     return uint64_to_nat(tm.count());
 }
 
+/* threadCpuNanosNow : BaseIO Nat */
+extern "C" LEAN_EXPORT obj_res lean_io_thread_cpu_nanos_now() {
+#if defined(LEAN_WINDOWS)
+    FILETIME created, exited, kernel, user;
+    if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) return uint64_to_nat(0);
+    ULARGE_INTEGER kernel_ticks, user_ticks;
+    kernel_ticks.LowPart = kernel.dwLowDateTime;
+    kernel_ticks.HighPart = kernel.dwHighDateTime;
+    user_ticks.LowPart = user.dwLowDateTime;
+    user_ticks.HighPart = user.dwHighDateTime;
+    return uint64_to_nat((kernel_ticks.QuadPart + user_ticks.QuadPart) * 100);
+#elif defined(CLOCK_THREAD_CPUTIME_ID)
+    timespec tm;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &tm) == 0) {
+        return uint64_to_nat(uint64_t(tm.tv_sec) * 1000000000ULL + uint64_t(tm.tv_nsec));
+    }
+    return uint64_to_nat(0);
+#else
+    return uint64_to_nat(0);
+#endif
+}
+
 /* getRandomBytes (nBytes : USize) : IO ByteArray */
 extern "C" LEAN_EXPORT obj_res lean_io_get_random_bytes (size_t nbytes) {
     // Adapted from https://github.com/rust-random/getrandom/blob/30308ae845b0bf3839e5a92120559eaf56048c28/src/
@@ -1134,6 +1159,10 @@ structure Metadata where
   modified : SystemTime
   byteSize : UInt64
   type     : FileType
+  numLinks : UInt64
+  statusChanged : SystemTime
+  device   : UInt64
+  inode    : UInt64
 
 constant metadata : @& FilePath → IO IO.FS.Metadata
 */
@@ -1145,12 +1174,17 @@ static obj_res timespec_to_obj(uv_timespec_t const & ts) {
 }
 
 static obj_res metadata_core(uv_stat_t const & st) {
-    object * mdata = alloc_cnstr(0, 2, 2 * sizeof(uint64) + sizeof(uint8));
+    // The compiler's layout of `IO.FS.Metadata` (src/Init/System/IO.lean): object fields in declaration
+    // order, then scalar fields by decreasing size, each size in declaration order
+    object * mdata = alloc_cnstr(0, 3, 4 * sizeof(uint64) + sizeof(uint8));
     cnstr_set(mdata, 0, timespec_to_obj(st.st_atim));
     cnstr_set(mdata, 1, timespec_to_obj(st.st_mtim));
-    cnstr_set_uint64(mdata, 2 * sizeof(object *), st.st_size);
-    cnstr_set_uint64(mdata, 2 * sizeof(object *) + sizeof(uint64), st.st_nlink);
-    cnstr_set_uint8(mdata, 2 * sizeof(object *) + 2 * sizeof(uint64),
+    cnstr_set(mdata, 2, timespec_to_obj(st.st_ctim));
+    cnstr_set_uint64(mdata, 3 * sizeof(object *), st.st_size);
+    cnstr_set_uint64(mdata, 3 * sizeof(object *) + sizeof(uint64), st.st_nlink);
+    cnstr_set_uint64(mdata, 3 * sizeof(object *) + 2 * sizeof(uint64), st.st_dev);
+    cnstr_set_uint64(mdata, 3 * sizeof(object *) + 3 * sizeof(uint64), st.st_ino);
+    cnstr_set_uint8(mdata, 3 * sizeof(object *) + 4 * sizeof(uint64),
                     S_ISDIR(st.st_mode) ? 0 :
                     S_ISREG(st.st_mode) ? 1 :
 #ifndef LEAN_WINDOWS
