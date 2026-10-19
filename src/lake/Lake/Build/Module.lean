@@ -712,7 +712,8 @@ def Module.recFetchPreSetup (mod : Module) : FetchM (Job ModulePreSetup) := ensu
     let {dynlibs, plugins} ← computeModuleDeps impLibs externLibs dynlibs plugins
     let extra := (← getLeanOptOverrides).find? mod.pkg.baseName |>.getD {}
     let leanOptions := mod.leanOptions ++ extra
-    -- Every input of the module's trace except its imports (`info.trace`, mixed in via `depTrace`).
+    -- Every input of the module's trace except `depTrace` (the imports' `info.trace` and `extraDepJob`'s trace,
+    -- which `localTrace` mixes in separately).
     let localInputs := libTraces ++ #[
       ← getLeanTrace, input.trace, traceOptions leanOptions "options",
       pureTrace input.header.isModule "isModule", pureTrace mod.name "Module.name",
