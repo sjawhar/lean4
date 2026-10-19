@@ -22,9 +22,9 @@ unsafe def recordsCost (k : Nat) : IO Nat := do
   usageRecordingRef.set true
   usedByChecksRef.set {}
   extraModUsesByChecksRef.set {}
-  extraModUsesByCmdRef.set {}
+  extraModUsesByCmdRef.set []
   resetCommandUsageRefs
-  ModuleUsage.commandObservationsRef.set #[]
+  ModuleUsage.commandObservationsRef.set []
   let some env ← Elab.runFrontend (moduleOf k) {} "M.lean" `M |
     throw <| IO.userError s!"elaboration for {k} failed"
   unless env.contains `big do throw <| IO.userError "big was not added"

@@ -29,9 +29,9 @@ unsafe def main : IO Unit := do
   initSearchPath (← getBuildDir)
   enableInitializersExecution
   usageRecordingRef.set true
-  ModuleUsage.commandObservationsRef.set #[]
+  ModuleUsage.commandObservationsRef.set []
   let some _ ← Elab.runFrontend mSource {} "M.lean" `M | throw <| IO.userError "elaboration failed"
-  let obs := (← ModuleUsage.commandObservationsRef.get).qsort (·.i < ·.i)
+  let obs := (← ModuleUsage.commandObservations).qsort (·.i < ·.i)
   let ctx : Command.Context := { fileName := "M.lean", fileMap := mSource.toFileMap, snap? := none, cancelTk? := none }
   let mut differing := #[]
   let mut sameCtx := #[]

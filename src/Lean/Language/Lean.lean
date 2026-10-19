@@ -679,7 +679,7 @@ where
           reportSnap := { stx? := none, reportingRange := initRange?, task := reportPromise.result!, cancelTk? := none }
         }
       }
-      let cmdState ← doElab stx cmds cmdState beginPos
+      let (cmdState, info) ← doElab stx cmds cmdState beginPos
         { old? := old?.map fun old => ⟨old.stx, old.elabSnap.elabSnap⟩, new := elabPromise }
         elabCmdCancelTk ctx
 
@@ -695,7 +695,7 @@ where
       }
 
       -- report info tree when relevant tasks are finished
-      BaseIO.chainTask (sync := true) (t := cmdState.infoState.substituteLazy) fun infoSt => do
+      BaseIO.chainTask (sync := true) (t := info) fun infoSt => do
         let infoTree := infoSt.trees[0]!
         let opts := cmdState.scopes.head!.opts
         let mut msgLog := MessageLog.empty
@@ -753,7 +753,7 @@ where
 
   doElab (stx : Syntax) (cmds : Array Syntax) (cmdState : Command.State) (beginPos : String.Pos.Raw)
       (snap : SnapshotBundle DynamicSnapshot) (cancelTk : IO.CancelToken) :
-      LeanProcessingM Command.State := do
+      LeanProcessingM (Command.State × Task Elab.InfoState) := do
     let ctx ← read
     let cmdIdx := cmds.size
     if ← usageRecordingRef.get then
@@ -787,14 +787,16 @@ where
         data     := output
       }
     let cmdState : Command.State := { cmdState with messages }
+    -- the info trees with their lazy parts substituted: the snapshot reports them and the recorder reads them
+    let info := cmdState.infoState.substituteLazy
     if ← usageRecordingRef.get then
-      ModuleUsage.recordCommandObservation cmdIdx stx cmdStateBefore cmdState
+      ModuleUsage.recordCommandObservation cmdIdx stx cmdStateBefore cmdState info
     -- definitely resolve eventually
     snap.new.resolve <| .ofTyped { diagnostics := .empty : SnapshotLeaf }
 
     -- The reported `cmdState` in the snapshot may be minimized as seen above, so we return the full
     -- state here for further processing on the same thread
-    return cmdState
+    return (cmdState, info)
 
 /--
 Convenience function for tool uses of the language processor that skips header handling.

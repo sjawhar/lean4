@@ -265,6 +265,33 @@ static std::vector<std::pair<size_t, ptrdiff_t>> read_lib_table_from_buffer(char
     return relocs;
 }
 
+// The `mmap` base address a region saved under the key `mod` is laid out for, aligned to `align`.
+static size_t compacted_base_addr(b_obj_arg mod, size_t align) {
+    // Derive a base address that is uniformly distributed but deterministic, and should most
+    // likely work for `mmap` on all interesting platforms.
+    // NOTE: an overlapping/non-compatible base address does not prevent the module from being
+    // imported, merely from using `mmap` for that.
+    // Start with a hash of the module name. While our string hash is a dubious 32-bit
+    // algorithm, the mixing of multiple `Name` parts seems to result in a nicely distributed
+    // 64-bit output.
+    size_t base_addr = name(mod, true).hash();
+    // x86-64 user space is currently limited to the lower 47 bits
+    // (https://en.wikipedia.org/wiki/X86-64#Virtual_address_space_details).
+    // On Linux at least, the stack grows down from ~0x7fff... followed by shared libraries,
+    // so reserve a bit of space for them (0x7fff...-0x7f00... = 1TB).
+    base_addr = base_addr % 0x7f0000000000;
+    return base_addr & ~(align - 1);
+}
+
+static olean_header mk_olean_header(uint8_t version, object_compactor const & compactor, size_t file_offset) {
+    olean_header header = {};
+    header.version = version;
+    header.base_addr = reinterpret_cast<size_t>(compactor.base_addr()) + file_offset;
+    strncpy(header.lean_version, get_short_version_string().c_str(), sizeof(header.lean_version));
+    strncpy(header.githash, LEAN_GITHASH, sizeof(header.githash));
+    return header;
+}
+
 extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_obj_arg mod, b_obj_arg odata,
                                                            b_obj_arg odep_regions, obj_arg oprev,
                                                            uint8 allow_closures_u8, object *) {
@@ -278,20 +305,7 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_o
     if (prev) {
         cs_obj = prev.get_val();
     } else {
-        // Derive a base address that is uniformly distributed but deterministic, and should most
-        // likely work for `mmap` on all interesting platforms.
-        // NOTE: an overlapping/non-compatible base address does not prevent the module from being
-        // imported, merely from using `mmap` for that.
-        // Start with a hash of the module name. While our string hash is a dubious 32-bit
-        // algorithm, the mixing of multiple `Name` parts seems to result in a nicely distributed
-        // 64-bit output.
-        size_t base_addr = name(mod, true).hash();
-        // x86-64 user space is currently limited to the lower 47 bits
-        // (https://en.wikipedia.org/wiki/X86-64#Virtual_address_space_details).
-        // On Linux at least, the stack grows down from ~0x7fff... followed by shared libraries,
-        // so reserve a bit of space for them (0x7fff...-0x7f00... = 1TB).
-        base_addr = base_addr % 0x7f0000000000;
-        base_addr = base_addr & ~(ALIGN - 1);
+        size_t base_addr = compacted_base_addr(mod, ALIGN);
         std::vector<region_view> dep_regions = extract_dep_regions(odep_regions);
         cs_obj = object_ref(mk_compactor(reinterpret_cast<void *>(base_addr),
                                          std::move(dep_regions), allow_closures));
@@ -324,11 +338,7 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_o
             // `base_addr`-relative offsets land in the right spot. The header is written directly
             // to `out` below; these reserved bytes are never read back.
             compactor.alloc(sizeof(olean_header));
-            olean_header header = {};
-            header.version = 2;
-            header.base_addr = reinterpret_cast<size_t>(compactor.base_addr()) + file_offset;
-            strncpy(header.lean_version, get_short_version_string().c_str(), sizeof(header.lean_version));
-            strncpy(header.githash, LEAN_GITHASH, sizeof(header.githash));
+            olean_header header = mk_olean_header(2, compactor, file_offset);
             out.write(reinterpret_cast<char *>(&header), sizeof(header));
 
             compactor(odata);
@@ -345,11 +355,7 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_o
             size_t file_offset = compactor.size();
 
             compactor.alloc(sizeof(olean_header));
-            olean_header header = {};
-            header.version = 3;
-            header.base_addr = reinterpret_cast<size_t>(compactor.base_addr()) + file_offset;
-            strncpy(header.lean_version, get_short_version_string().c_str(), sizeof(header.lean_version));
-            strncpy(header.githash, LEAN_GITHASH, sizeof(header.githash));
+            olean_header header = mk_olean_header(3, compactor, file_offset);
             out.write(reinterpret_cast<char *>(&header), sizeof(header));
 
             // `data_size`: reserve its slot now so the data lands at the right buffer offset (and
@@ -426,6 +432,28 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_o
     }
 
     return io_result_mk_ok(cs_obj.steal());
+}
+
+/* The contents of the file `lean_compacted_region_save` writes for `odata` under the key `mod` with no dependency
+regions, no previous compactor and no closures (the `v2` format), built in memory. The compactor starts at 4 KiB and
+64 max-sharing buckets, not the defaults sized for whole modules; the sizes do not change the bytes. */
+extern "C" LEAN_EXPORT object * lean_compacted_region_bytes(b_obj_arg mod, b_obj_arg odata, object *) {
+    try {
+        object_compactor compactor(reinterpret_cast<void *>(compacted_base_addr(mod, 1LL<<16)), {}, false,
+                                   4096, 64);
+        compactor.alloc(sizeof(olean_header));
+        olean_header header = mk_olean_header(2, compactor, 0);
+        compactor(odata);
+        size_t data_size = compactor.size() - sizeof(olean_header);
+        size_t size = sizeof(olean_header) + data_size;
+        object * r = lean_alloc_sarray(1, size, size);
+        memcpy(lean_sarray_cptr(r), &header, sizeof(olean_header));
+        memcpy(lean_sarray_cptr(r) + sizeof(olean_header),
+               static_cast<char const *>(compactor.data()) + sizeof(olean_header), data_size);
+        return io_result_mk_ok(r);
+    } catch (exception & ex) {
+        return io_result_mk_error((sstream() << "failed to compact: " << ex.what()).str());
+    }
 }
 
 static object * mk_compacted_region(b_obj_arg ofname, object * root,

@@ -206,12 +206,23 @@ cannot replay, and a write to an extension that is neither persistent nor a comm
 the environments were created (by initializers an `#eval` ran) have no state in them and are skipped. -/
 private def viewStates (regs : Registries) (view : EnvExtension.View) (k₀ k₁ : Kernel.Environment)
     (at? : Option Name := none) : ViewStates × Array Refusal := Id.run do
+  let n := min k₀.extensions.size k₁.extensions.size
+  let sameWrites := SharedDiff.sameObject k₀.unaccountedWrites k₁.unaccountedWrites
+  -- per extension index below `n`, whether its state slot or its unaccounted-write count differs: an extension where
+  -- neither does records nothing below, and for most commands nearly every extension is such
+  let mut changed : Array Bool := .emptyWithCapacity n
+  for idx in [:n] do
+    let sameSlot := match k₀.extensions[idx]?, k₁.extensions[idx]? with
+      | some s₀, some s₁ => SharedDiff.sameObject s₀ s₁
+      | _, _ => true
+    changed := changed.push <|
+      !sameSlot || (!sameWrites && k₀.unaccountedWrites[idx]?.getD 0 != k₁.unaccountedWrites[idx]?.getD 0)
   let mut st : ViewStates := {}
   let mut refused := #[]
   for ext in regs.persistent do
     if ext.perCommand == .recorder then continue
     let idx := ext.toEnvExtension.idx
-    unless idx < k₀.extensions.size && idx < k₁.extensions.size do continue
+    unless changed[idx]?.getD false do continue
     let s₀ := stateIn ext k₀
     let s₁ := stateIn ext k₁
     if ext.perCommand == .notCarried then
@@ -236,13 +247,10 @@ private def viewStates (regs : Registries) (view : EnvExtension.View) (k₀ k₁
     unless idx < k₀.extensions.size && idx < k₁.extensions.size do continue
     let es := cache.stateDelta (cacheStateIn cache k₀) (cacheStateIn cache k₁)
     unless es.isEmpty do st := { st with caches := st.caches.push (cache.name, es) }
-  for idx in [0:min k₀.extensions.size k₁.extensions.size] do
+  for idx in [:n] do
+    unless changed[idx]?.getD false do continue
     if regs.recordedIdxs.contains idx then continue
-    let sameState := match k₀.extensions[idx]?, k₁.extensions[idx]? with
-      | some s₀, some s₁ => SharedDiff.sameObject s₀ s₁
-      | _, _ => true
-    unless sameState && k₀.unaccountedWrites[idx]?.getD 0 == k₁.unaccountedWrites[idx]?.getD 0 do
-      refused := refused.push (.unrecorded idx at?)
+    refused := refused.push (.unrecorded idx at?)
   return (st, refused)
 
 /-- The cells of `l` in front of its tail `stop` (by cell identity), oldest first, each with the list after it. -/
@@ -381,16 +389,9 @@ private partial def attachMerges (after : Environment) : AddedConst → BaseIO A
   | .async n exportedKind? states nested => return .async n exportedKind? states (← nested.mapM (attachMerges after))
   | a => return a
 
-/-- One command's payload: the change of each view (`viewStates`); what the command added on its main branch, with
-each asynchronous constant's branch additions and states, each realization's constants, states and the realizations
-it merged, each realization merged from the cache, and each realization context it registered with its options and
-states, in order (`CommandEntries.added`); and why it cannot be replayed (`CommandEntries.refusals`), including a
-declaration whose kernel constant checking the elaborator's would not give (`Kernel.Environment.divergentAdds`; a
-realization adds its constants unchecked in its own environment and is checked where it is merged, so only the
-command's own count). Takes time proportional to what the command changed, apart from the per-extension state reads.
--/
-def recordCommandDelta (before after : Environment) (idx : Nat) : IO CommandEntries := do
-  let regs ← Registries.get
+/-- One command's payload (`recordCommandDelta`) with the registries `regs`. -/
+private def recordCommandDeltaWith (regs : Registries) (before after : Environment) (idx : Nat) :
+    BaseIO CommandEntries := do
   let (main, r₁) := viewStates regs .main before.base.private after.base.private
   let (checked, r₂) := viewStates regs .checked before.checked.get after.checked.get
   let mut refusals := r₁ ++ r₂
@@ -408,6 +409,22 @@ def recordCommandDelta (before after : Environment) (idx : Nat) : IO CommandEntr
     refusals := refusals ++ rc ++ r
   let distinct := refusals.foldl (init := #[]) fun rs r => if rs.contains r then rs else rs.push r
   return { idx, main, checked, added, refusals := distinct }
+
+/-- One command's payload: the change of each view (`viewStates`); what the command added on its main branch, with
+each asynchronous constant's branch additions and states, each realization's constants, states and the realizations
+it merged, each realization merged from the cache, and each realization context it registered with its options and
+states, in order (`CommandEntries.added`); and why it cannot be replayed (`CommandEntries.refusals`), including a
+declaration whose kernel constant checking the elaborator's would not give (`Kernel.Environment.divergentAdds`; a
+realization adds its constants unchecked in its own environment and is checked where it is merged, so only the
+command's own count). Takes time proportional to what the command changed, apart from the per-extension state reads.
+-/
+def recordCommandDelta (before after : Environment) (idx : Nat) : IO CommandEntries := do
+  recordCommandDeltaWith (← Registries.get) before after idx
+
+/-- `recordCommandDelta` of each `(before, after, idx)`, reading the extension registries once. -/
+def recordCommandDeltas (commands : Array (Environment × Environment × Nat)) : IO (Array CommandEntries) := do
+  let regs ← Registries.get
+  commands.mapM fun (before, after, idx) => recordCommandDeltaWith regs before after idx
 
 /-- Replaces the current module's command payload with `entries` before writing its `.olean`. -/
 def setCommandEntries (env : Environment) (entries : Array CommandEntries) : Environment :=

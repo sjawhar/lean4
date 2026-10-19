@@ -682,13 +682,20 @@ structure CommandObservation where
   stx : Syntax
   before : Elab.Command.State
   after : Elab.Command.State
+  /-- `after.infoState` with its lazy parts substituted: the task whose trees the command's snapshot reports. -/
+  info : Task Elab.InfoState
   deriving Nonempty
 
-builtin_initialize commandObservationsRef : IO.Ref (Array CommandObservation) ← IO.mkRef #[]
+/-- The observed commands, newest first (a list, like the per-command logs of `Lean.Util.UsedByChecks`). -/
+builtin_initialize commandObservationsRef : IO.Ref (List CommandObservation) ← IO.mkRef []
 
-def recordCommandObservation (i : Nat) (stx : Syntax) (before after : Elab.Command.State) :
-    BaseIO Unit :=
-  commandObservationsRef.modify (·.push { i, stx, before, after })
+def recordCommandObservation (i : Nat) (stx : Syntax) (before after : Elab.Command.State)
+    (info : Task Elab.InfoState) : BaseIO Unit :=
+  commandObservationsRef.modify ({ i, stx, before, after, info } :: ·)
+
+/-- The observed commands in observation order. -/
+def commandObservations : BaseIO (Array CommandObservation) :=
+  return (← commandObservationsRef.get).toArray.reverse
 
 unsafe structure WalkState where
   /-- Visited metavariable-free subterms: their constants do not depend on any assignment. -/
@@ -769,11 +776,12 @@ constant (a declaration the kernel or the elaborator rejected referred to it; an
 module the kernel environment does not hold. The module is then `noskip`. -/
 def commandRecords (env : Environment) (own : Array (Name × Digest))
     (stmt : Array (Name × Digest × Digest)) (payloads : Array CommandEntries) :
-    IO (Array CommandRecord × Option String) := IO.FS.withTempDir fun dir => do
-  let observations ← commandObservationsRef.get
-  let declEntries ← declsByCommandRef.get
-  let explicitUses ← usedByCommandRef.get
-  let extras ← extraModUsesByCmdRef.get
+    IO (Array CommandRecord × Option String) := do
+  let observations ← commandObservations
+  let declEntries := (← declsByCommandRef.get).toArray.reverse
+  let explicitUses := (← usedByCommandRef.get).toArray.reverse
+  -- the set the log's records, inserted in recording order, make
+  let extras : Std.HashSet (Nat × ExtraModUse) := (← extraModUsesByCmdRef.get).reverse.foldl (·.insert ·) {}
   let fullLocal : Std.HashMap Name Digest := own.foldl (fun m (n, d) => m.insert n d) {}
   let stmtLocal : Std.HashMap Name (Digest × Digest) :=
     stmt.foldl (fun m (n, d, a) => m.insert n (d, a)) {}
@@ -843,7 +851,7 @@ def commandRecords (env : Environment) (own : Array (Name × Digest))
       refsSet := used.foldl (·.insert ·) refsSet
     for n in explicitByIdx.getD obs.i #[] do
       full := full.insert n
-    let infoSt := obs.after.infoState.substituteLazy.get
+    let infoSt := obs.info.get
     let infoUsed := usedFromInfoTrees infoSt.trees.toArray {}
     for n in infoUsed do
       unless refsSet.contains n do full := full.insert n
@@ -909,24 +917,24 @@ def commandRecords (env : Environment) (own : Array (Name × Digest))
       caches := { matcher, auxLemma, eqnsInv, sparseCasesOn, structRes }
     }
     if let some payload := payloadByIdx[obs.i]? then
-      let path := dir / s!"command-{obs.i}"
-      let _ ← unsafe CompactedRegion.save path `commandEntries payload #[] none
-      entries := (({} : Enc).digest entries |>.digest (Digest.ofBytes (← IO.FS.readBinFile path))).finish
+      let bytes ← CompactedRegion.bytes `commandEntries payload
+      entries := (({} : Enc).digest entries |>.digest (Digest.ofBytes bytes)).finish
       -- a change no entry expresses (an erasure) is determined by the command's text and context
       unless payload.refusals.isEmpty do
         entries := (({} : Enc).digest entries |>.digest text |>.digest ctx).finish
   return (out, none)
 
-/-- The command payloads of the observed commands (`recordCommandDelta`), each also refused for the command-state
+/-- The command payloads of the observed commands (`recordCommandDeltas`), each also refused for the command-state
 fields it changed (`commandStateChanges`) and the attributes with handlers outside core Lean it ran
 (`foreignAttributesByCommandRef`). -/
 def commandPayloads (observations : Array CommandObservation) : IO (Array CommandEntries) := do
-  let foreign : Std.HashMap Nat (Array Refusal) := (← foreignAttributesByCommandRef.get).foldl (init := {})
+  let foreign : Std.HashMap Nat (Array Refusal) := (← foreignAttributesByCommandRef.get).reverse.foldl (init := {})
     fun m (i, attr) => m.alter i fun rs => some ((rs.getD #[]).push (.foreignAttribute attr))
-  (observations.qsort (·.i < ·.i)).mapM fun obs => do
-    let ce ← recordCommandDelta obs.before.env obs.after.env obs.i
+  let sorted := observations.qsort (·.i < ·.i)
+  let deltas ← recordCommandDeltas (sorted.map fun obs => (obs.before.env, obs.after.env, obs.i))
+  return (sorted.zip deltas).map fun (obs, ce) =>
     let extra := commandStateChanges obs.before obs.after ++ foreign.getD obs.i #[]
-    return { ce with refusals := extra.foldl (fun rs r => if rs.contains r then rs else rs.push r) ce.refusals }
+    { ce with refusals := extra.foldl (fun rs r => if rs.contains r then rs else rs.push r) ce.refusals }
 
 /-- What a module records for reuse: its command payloads, its `.usage` command records, and why it is `noskip`. -/
 structure ModuleRecords where
@@ -942,7 +950,7 @@ structure ModuleRecords where
 - a declaration command with a refusal: `noskip` (`commandEntriesNoskipReason?`). -/
 def moduleRecords (env : Environment) (own : Array (Name × Digest)) (stmt : Array (Name × Digest × Digest))
     (sessionChanged : Bool) : IO ModuleRecords := do
-  let observations ← commandObservationsRef.get
+  let observations ← commandObservations
   let nested := sessionChanged ||
     (observations.foldl (fun s o => s.insert o.i) ({} : Std.HashSet Nat)).size != observations.size
   let moduleSystem? := guard env.header.isModule *> some "module-system"

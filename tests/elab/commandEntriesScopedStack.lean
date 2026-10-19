@@ -22,7 +22,7 @@ unsafe def check (dir : System.FilePath) (label src : String) (probes : List Nam
   enableInitializersExecution
   let some _ ← Elab.runFrontend src {} "M.lean" `M (oleanFileName? := some (dir / "M.olean")) |
     throw <| IO.userError s!"elaboration of {label} failed"
-  let obs := (← ModuleUsage.commandObservationsRef.get).qsort (·.i < ·.i)
+  let obs := (← ModuleUsage.commandObservations).qsort (·.i < ·.i)
   let (md, _) ← readModuleData (dir / "M.olean")
   let payloads := CommandEntries.ofModuleData md
   let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))

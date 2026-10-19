@@ -54,7 +54,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   enableInitializersExecution
   let some fullEnv ← Elab.runFrontend mSource {} "M.lean" `M (oleanFileName? := some (dir / "M.olean")) |
     throw <| IO.userError "full elaboration failed"
-  let obs := (← ModuleUsage.commandObservationsRef.get).qsort (·.i < ·.i)
+  let obs := (← ModuleUsage.commandObservations).qsort (·.i < ·.i)
   let (md, _) ← readModuleData (dir / "M.olean")
   let payloads := CommandEntries.ofModuleData md
   let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
@@ -93,7 +93,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   enableInitializersExecution
   let some nEnv ← Elab.runFrontend nSource {} "N.lean" `N (oleanFileName? := some (dir / "N.olean")) |
     throw <| IO.userError "full elaboration of N failed"
-  let obs := (← ModuleUsage.commandObservationsRef.get).qsort (·.i < ·.i)
+  let obs := (← ModuleUsage.commandObservations).qsort (·.i < ·.i)
   let (md, _) ← readModuleData (dir / "N.olean")
   let payloads := CommandEntries.ofModuleData md
   let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "N.usage"))

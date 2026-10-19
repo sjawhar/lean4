@@ -15,10 +15,10 @@ def moduleOf (n : Nat) : String := Id.run do
 unsafe def recordingCost (n : Nat) : IO Nat := do
   enableInitializersExecution
   usageRecordingRef.set true
-  ModuleUsage.commandObservationsRef.set #[]
+  ModuleUsage.commandObservationsRef.set []
   let some _ ← Elab.runFrontend (moduleOf n) {} "M.lean" `M |
     throw <| IO.userError s!"elaboration of {n} commands failed"
-  let observations ← ModuleUsage.commandObservationsRef.get
+  let observations ← ModuleUsage.commandObservations
   if observations.size < 2 * n then
     throw <| IO.userError s!"expected {2 * n} command observations, got {observations.size}"
   let start ← IO.getNumHeartbeats

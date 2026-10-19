@@ -52,7 +52,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   enableInitializersExecution
   let some _ ← Elab.runFrontend mSource {} "M.lean" `M (oleanFileName? := some (dir / "M.olean")) |
     throw <| IO.userError "elaboration of M failed"
-  let obs := (← ModuleUsage.commandObservationsRef.get).qsort (·.i < ·.i)
+  let obs := (← ModuleUsage.commandObservations).qsort (·.i < ·.i)
   let (md, _) ← readModuleData (dir / "M.olean")
   let payloads := CommandEntries.ofModuleData md
   let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))

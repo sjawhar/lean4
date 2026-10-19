@@ -63,9 +63,9 @@ unsafe def costs (d k : Nat) : IO (Nat × Nat) := do
   usageRecordingRef.set true
   usedByChecksRef.set {}
   extraModUsesByChecksRef.set {}
-  extraModUsesByCmdRef.set {}
+  extraModUsesByCmdRef.set []
   resetCommandUsageRefs
-  ModuleUsage.commandObservationsRef.set #[]
+  ModuleUsage.commandObservationsRef.set []
   let some env ← Elab.runFrontend (moduleOf d k) {} "M.lean" `M |
     throw <| IO.userError s!"elaboration for {d} failed"
   let some (.defnInfo c) := env.find? `elabCost | throw <| IO.userError "no elabCost"

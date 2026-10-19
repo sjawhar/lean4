@@ -17,10 +17,10 @@ def moduleOf (n : Nat) : String := Id.run do
 unsafe def cacheCost (n : Nat) : IO (Nat × Nat) := do
   enableInitializersExecution
   usageRecordingRef.set true
-  ModuleUsage.commandObservationsRef.set #[]
+  ModuleUsage.commandObservationsRef.set []
   let some _ ← Elab.runFrontend (moduleOf n) {} "M.lean" `M |
     throw <| IO.userError s!"elaboration of {n} units failed"
-  let observations ← ModuleUsage.commandObservationsRef.get
+  let observations ← ModuleUsage.commandObservations
   let caches ← commandCacheExtensionsRef.get
   let sink ← IO.mkRef 0
   let start ← IO.getNumHeartbeats

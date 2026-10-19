@@ -32,7 +32,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let some _ ← Elab.runFrontend src {} (dir / "M.lean").toString `M
       (oleanFileName? := some (dir / "M.olean")) |
     throw <| IO.userError "elaboration of M failed"
-  let obs := (← ModuleUsage.commandObservationsRef.get).qsort (·.i < ·.i)
+  let obs := (← ModuleUsage.commandObservations).qsort (·.i < ·.i)
   let some ext := (← persistentEnvExtensionsRef.get).find? (·.name == `preExt) |
     throw <| IO.userError "preExt not registered"
   let state (env : Environment) : NameMap Nat := unsafeCast (ext.getState (asyncMode := .mainOnly) env)

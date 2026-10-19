@@ -16,10 +16,10 @@ def moduleOf (n : Nat) : String := Id.run do
 unsafe def recorderCost (n : Nat) : IO (Nat × Nat) := do
   enableInitializersExecution
   usageRecordingRef.set true
-  ModuleUsage.commandObservationsRef.set #[]
+  ModuleUsage.commandObservationsRef.set []
   let some _ ← Elab.runFrontend (moduleOf n) {} "M.lean" `M |
     throw <| IO.userError s!"elaboration of {n} theorems failed"
-  let obs ← ModuleUsage.commandObservationsRef.get
+  let obs ← ModuleUsage.commandObservations
   let start ← IO.getNumHeartbeats
   for o in obs do
     discard <| recordCommandDelta o.before.env o.after.env o.i

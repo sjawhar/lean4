@@ -297,9 +297,9 @@ def runFrontend
     usageRecordingRef.set true
     usedByChecksRef.set {}
     extraModUsesByChecksRef.set {}
-    extraModUsesByCmdRef.set {}
+    extraModUsesByCmdRef.set []
     resetCommandUsageRefs
-    ModuleUsage.commandObservationsRef.set #[]
+    ModuleUsage.commandObservationsRef.set []
   let inputCtx := Parser.mkInputContext input fileName
   -- default `cmdlineSnapshots` to true (not done as default value for API back-compat reasons)
   -- except when full-snapshotting so that enough information for resumption is available

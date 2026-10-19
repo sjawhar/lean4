@@ -34,7 +34,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let some expectedEnv ← Elab.runFrontend input {} (dir / "M.lean").toString `M
       (oleanFileName? := some (dir / "M.olean")) |
     throw <| IO.userError "normal elaboration failed"
-  let observations ← ModuleUsage.commandObservationsRef.get
+  let observations ← ModuleUsage.commandObservations
   let some first := observations[0]? | throw <| IO.userError "missing first command observation"
   let baseEnv := first.before.env
   let (md, region) ← readModuleData (dir / "M.olean")

@@ -62,9 +62,9 @@ def resetSize (st : Command.State) : Name → Option Nat
 unsafe def observe (src : String) : IO (Array ModuleUsage.CommandObservation) := do
   enableInitializersExecution
   usageRecordingRef.set true
-  ModuleUsage.commandObservationsRef.set #[]
+  ModuleUsage.commandObservationsRef.set []
   let some _ ← Elab.runFrontend src {} "M.lean" `M | throw <| IO.userError s!"elaboration failed:\n{src}"
-  return (← ModuleUsage.commandObservationsRef.get).qsort (·.i < ·.i)
+  return (← ModuleUsage.commandObservations).qsort (·.i < ·.i)
 
 /-- Probe commands whose declarations depend on what a later command may read: a plain definition, a command
 elaborator that names a declaration with `mkFreshId`, and a proof-mode theorem, whose value carries generated names. -/

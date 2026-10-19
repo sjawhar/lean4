@@ -135,10 +135,10 @@ unsafe def elabModule (dir : System.FilePath) (src : String) :
   IO.FS.writeFile (dir / "M.lean") src
   enableInitializersExecution
   usageRecordingRef.set true
-  ModuleUsage.commandObservationsRef.set #[]
+  ModuleUsage.commandObservationsRef.set []
   let some _ ← Elab.runFrontend src {} "M.lean" `M (oleanFileName? := some (dir / "M.olean")) |
     throw <| IO.userError "elaboration failed"
-  let obs := (← ModuleUsage.commandObservationsRef.get).qsort (·.i < ·.i)
+  let obs := (← ModuleUsage.commandObservations).qsort (·.i < ·.i)
   let (md, _) ← readModuleData (dir / "M.olean")
   return (obs, CommandEntries.ofModuleData md)
 

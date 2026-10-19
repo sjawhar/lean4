@@ -17,15 +17,15 @@ unsafe def recordsCost (n : Nat) : IO (Nat × Nat) := do
   usageRecordingRef.set true
   usedByChecksRef.set {}
   extraModUsesByChecksRef.set {}
-  extraModUsesByCmdRef.set {}
+  extraModUsesByCmdRef.set []
   resetCommandUsageRefs
-  ModuleUsage.commandObservationsRef.set #[]
+  ModuleUsage.commandObservationsRef.set []
   let some env ← Elab.runFrontend (moduleOf n) {} "M.lean" `M |
     throw <| IO.userError s!"elaboration of {n} units failed"
   let consts := ModuleUsage.ownConsts env
   let own := ModuleUsage.localDigests env consts
   let stmt := ModuleUsage.computeStmt env (ModuleUsage.stmtState env) own consts
-  let commands := (← ModuleUsage.commandObservationsRef.get).size
+  let commands := (← ModuleUsage.commandObservations).size
   let start ← IO.getNumHeartbeats
   discard <| ModuleUsage.commandRecords env own stmt #[]
   return (commands, (← IO.getNumHeartbeats) - start)

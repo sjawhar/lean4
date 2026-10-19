@@ -233,7 +233,7 @@ def addDecl (decl : Declaration) (forceExpose := false) : CoreM Unit := do
   if recording then
     used := decl.foldExprM (m := Id) (fun s e => e.foldConsts s fun c s => s.insert c) {}
     usedByChecksRef.modify fun acc => used.foldl (·.insert ·) acc
-    declsByCommandRef.modify (·.push (← commandIdx, decl.getNames.toArray, used))
+    declsByCommandRef.modify ((← commandIdx, decl.getNames.toArray, used) :: ·)
   addDeclCore decl forceExpose
   if recording then
     -- the kernel adds a nested inductive's auxiliary recursors, named after its first type, which `getNames` lacks
@@ -241,7 +241,7 @@ def addDecl (decl : Declaration) (forceExpose := false) : CoreM Unit := do
       if let some (.inductInfo v) := (← getEnv).find? t.name then
         unless v.numNested == 0 do
           let recs := (Array.range v.numNested).map fun i => (mkRecName t.name).appendIndexAfter (i + 1)
-          declsByCommandRef.modify (·.push (← commandIdx, recs, used))
+          declsByCommandRef.modify ((← commandIdx, recs, used) :: ·)
   discard <| decl.getTopLevelNames.mapM snapshotEnvLinterOptions
 
 def addAndCompile (decl : Declaration) (logCompileErrors : Bool := true)

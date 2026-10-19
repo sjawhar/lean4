@@ -19,7 +19,7 @@ def check (env : Environment) (label : String) : IO Unit := do
   let consts := ModuleUsage.ownConsts env
   let own := ModuleUsage.localDigests env consts
   let stmt := ModuleUsage.computeStmt env (ModuleUsage.stmtState env) own consts
-  let obs := (← ModuleUsage.commandObservationsRef.get).qsort (·.i < ·.i)
+  let obs := (← ModuleUsage.commandObservations).qsort (·.i < ·.i)
   let (recs, _) ← ModuleUsage.commandRecords env own stmt #[]
   let mut bad := #[]
   let mut sizes := #[]
@@ -35,11 +35,11 @@ unsafe def main : IO Unit := do
   enableInitializersExecution
   usageRecordingRef.set true
   resetCommandUsageRefs
-  ModuleUsage.commandObservationsRef.set #[]
+  ModuleUsage.commandObservationsRef.set []
   let some env ← Elab.runFrontend (moduleOf 40) {} "M.lean" `M | throw <| IO.userError "elaboration failed"
   check env "real observations"
   -- same observations, `usedQuotCtxts` replaced by unshared pseudo-random subsets of a 64-name pool
-  let real ← ModuleUsage.commandObservationsRef.get
+  let real ← ModuleUsage.commandObservations
   let pool : Array Name := (List.range 64).toArray.map fun k => Name.mkSimple s!"q{k}" |>.num k
   let mut seed := 12345
   let mut mutated := #[]
@@ -49,7 +49,7 @@ unsafe def main : IO Unit := do
       seed := (seed * 1103515245 + 12345) % 2147483648
       if seed % 3 == 0 then s := s.insert p
     mutated := mutated.push { o with before := { o.before with usedQuotCtxts := s } }
-  ModuleUsage.commandObservationsRef.set mutated
+  ModuleUsage.commandObservationsRef.set mutated.toList.reverse
   check env "random unshared sets"
 
 #eval main
