@@ -399,9 +399,12 @@ case10() {
   jobhas Test.B "usage index: restored"
 }
 
-# 11. Outputs a kept-module check accepted keep their lineage (`kf`) when a lookup restores them: in the trace, the
-# alias and `-o`; a module `LAKE_KEPT_EXCLUDE` lists is restored from a compile instead. `P.B` uses `A.w`: kept
-# while `A.w := 2 - 2`, its kept outputs, newer than its compile's, pass the check once `A.w` is `1 - 1` again.
+# 11. Outputs a kept-module check accepted. `P.B` uses `A.w`: compiled while `A.w := 1 - 1`, then kept while
+# `A.w := 2 - 2`, which indexes the same `.olean` again, with a kept key and lineage (`kf`). Once `A.w` is `1 - 1`
+# again, both pass the check: the compile is restored, not the kept outputs, whose key makes importers distrust the
+# module's `.usage`, and so is it for a module `LAKE_KEPT_EXCLUDE` lists. With the compile's index file gone (as the
+# trim to 8 removes it), only the kept outputs pass: they are restored and keep their lineage, in the trace, the
+# alias and `-o`.
 case11() {
   mkp() {
     mkdir -p "$1/P"
@@ -410,25 +413,55 @@ case11() {
     setw "$1" "$2" "$3"
   }
   setw() { rm -f "$1/P/A.lean"; printf 'def A.v : Nat := %s\ndef A.w : Nat := %s - %s\n' "$2" "$3" "$3" > "$1/P/A.lean"; }
-  local POUT=.lake/build/lib/lean/P
+  local POUT=.lake/build/lib/lean/P c0
   PKG=p
   mkp k 1 1
   test_run -d k build P.B
+  c0=$(idxname k B $POUT)
+  test_exp -f "$(idxdir k B $POUT)/$c0"
   setw k 2 2
   LAKE_KEPT_CHECKER="$STUB" test_out "Checked P.B" -d k build P.B
   test_cmd grep -q '"kf"' k/$POUT/B.trace
+  test_exp "$(find "$(idxdir k B $POUT)" -name '*.json' | wc -l)" = 2
   mkp t 3 1
   lake_out -d t build -v P.B
-  jobhas P.B "usage index: restored"
-  test_cmd grep -q '"kf"' t/$POUT/B.trace
-  test_cmd grep -q '"kf"' "$(entry t B $POUT)"
-  test_run -d t build P.B -o "$PWD/o.jsonl"
-  test_cmd_out '"kf"' grep -F "\"$(depHash t/$POUT/B.trace)\"" o.jsonl
+  jobhas P.B "usage index: restored ${c0%.json} ("
+  test_cmd_fails grep -q '"kf"' t/$POUT/B.trace
   printf 'P.B\n' > exclude
   mkp t2 4 1
   LAKE_KEPT_EXCLUDE="$PWD/exclude" lake_out -d t2 build -v P.B
-  jobhas P.B "usage index: restored"
+  jobhas P.B "usage index: restored ${c0%.json} ("
   test_cmd_fails grep -q '"kf"' t2/$POUT/B.trace
+  test_cmd rm "$(idxdir k B $POUT)/$c0"
+  mkp t3 5 1
+  lake_out -d t3 build -v P.B
+  jobhas P.B "usage index: restored"
+  test_cmd grep -q '"kf"' t3/$POUT/B.trace
+  test_cmd grep -q '"kf"' "$(entry t3 B $POUT)"
+  test_run -d t3 build P.B -o "$PWD/o.jsonl"
+  test_cmd_out '"kf"' grep -F "\"$(depHash t3/$POUT/B.trace)\"" o.jsonl
+  # an excluded module takes no kept outputs: with only those indexed, it is compiled
+  mkp t4 6 1
+  LAKE_KEPT_EXCLUDE="$PWD/exclude" lake_out -d t4 build -v P.B
+  jobhas P.B "Built P.B"
+  jobnot P.B "usage index: restored"
+}
+
+# 12. A candidate whose cached `.olean` cannot be read when the check hashes it (here it has no read permission: the
+# file is there for the resolve, but its open fails, as it does for an entry another process deletes in between) is
+# a miss: B is compiled, and the build succeeds. C, in the same build, is restored.
+case12() {
+  local art
+  mkpkg f
+  test_run -d f build $ALL
+  art="$LAKE_CACHE_DIR/artifacts/$(cat f/$OUT/B.olean.hash).olean"
+  test_cmd chmod 000 "$art"
+  mkpkg t
+  edx t
+  lake_out -d t build -v Test.B Test.C
+  jobhas Test.C "usage index: restored"
+  jobhas Test.B "usage index: no match (1 candidates, 1 parsed, 1 fully checked"
+  jobhas Test.B "Built Test.B"
 }
 
 runcase() {
@@ -441,7 +474,7 @@ runcase() {
   )
 }
 
-if [ $# = 0 ]; then set -- 1 2 3 4 5 6a 6b 7 8 9 10 11; fi
+if [ $# = 0 ]; then set -- 1 2 3 4 5 6a 6b 7 8 9 10 11 12; fi
 for c in "$@"; do runcase "$c"; done
 
 rm -f produced.out
