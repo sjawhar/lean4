@@ -278,10 +278,11 @@ def classification : List (Name × UsageClass × String) := [
     (`addUnificationHint`, src/Lean/Meta/UnificationHint.lean); the writer's exported entries \
     are part of the cross-module table digest, each with its discrimination-tree keys, which the writer \
     computes in its own environment and `tryUnificationHints` matches on when it reads the whole table, so \
-    the table digest stays exact against the matcher. A compile that matches a hint's keys records compiler \
-    code (`recordIfCompiling` in `tryUnificationHints`; `synthInstanceCore?` in src/Lean/Meta/SynthInstance.lean \
-    does so for every instance search inside a compile), so every digested import is an extra use of a module \
-    whose compile used a hint (case `tc_hint`)."),
+    the table digest stays exact against the matcher. The hints that match inside a compile are recorded \
+    (`recordHintsIfCompiling` in `tryUnificationHints`): if one comes from an imported module with digests, \
+    every digested import is an extra use of the module (`ModuleUsage.writeUsage`; a toolchain hint is pinned \
+    by the Lean githash). An instance a hint resolves records compiler code (`recordIfCompiling` in \
+    `synthInstanceCore?`, src/Lean/Meta/SynthInstance.lean) (case `tc_hint`)."),
   (`Lean.auxParentProjInfoExt, .R1,
     "`addAuxParentProjectionInfo` (src/Lean/ProjFns.lean:77-78) is public; the elaborator calls it in \
     `mkCoercionToCopiedParent` (src/Lean/Elab/Structure.lean:1440) for the parent projection of the \
@@ -571,6 +572,7 @@ def globals : List (Name × GlobalClass × String) := [
   (`Lean.usageRecordingRef, .recording, "Private (src/Lean/Util/UsedByChecks.lean)."),
   (`Lean.specLookupsRef, .recording, "Private (src/Lean/Util/UsedByChecks.lean)."),
   (`Lean.compilerCodeRef, .recording, "Private (src/Lean/Util/UsedByChecks.lean); only ever set to `true`."),
+  (`Lean.compileHintsRef, .recording, "Private (src/Lean/Util/UsedByChecks.lean); only ever added to."),
   (`Lean.extraModUsesByChecksRef, .recording, "Private (src/Lean/ExtraModUses.lean)."),
   (`Lean.Compiler.LCNF.baseTransparentDeclsExt, .moduleLocal,
     "`mkOrderedDeclSetExt` (src/Lean/Compiler/LCNF/PhaseExt.lean:26): non-persistent, initially empty."),
@@ -597,7 +599,8 @@ def globals : List (Name × GlobalClass × String) := [
 inductive MetaClass where
   /-- Reduces or infers types: reads the definitions it unfolds (used names, digested), their reducibility
   (`attrsEnc`, `tableDigest`), projection and structure data (`attrsEnc`), and through `isDefEq` can reach
-  unification hints and instance resolution, which record compiler code inside a compile (`recordIfCompiling`). -/
+  unification hints and instance resolution, which a compile records (`recordHintsIfCompiling`,
+  `recordIfCompiling`). -/
   | reduces
   /-- Reads one declaration's attribute data by name (matcher info, instance membership, inductive kind), which
   `attrsEnc` or the declaration's digest covers. -/

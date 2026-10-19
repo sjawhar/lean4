@@ -96,11 +96,24 @@ def pluginLoading : BaseIO Bool :=
 `recordIfCompiling` reads it. -/
 def inCompileOption : Name := `_inCompile
 
-/-- Records compiler code (`recordCompilerCode`) if `opts` are a compile's (`inCompileOption`). `Meta` calls it where
-a query reads elaboration state no used name records: instance resolution, which reads the instance table, its
-priorities and scoped activation, and unification hints. -/
+/-- Records compiler code (`recordCompilerCode`) if `opts` are a compile's (`inCompileOption`). Instance resolution
+calls it: it reads the instance table, its priorities and scoped activation, which no used name records. -/
 def recordIfCompiling (opts : Options) : BaseIO Unit := do
   if opts.get inCompileOption false then recordCompilerCode
+
+/-- The unification hints that matched inside a compile in this process (`recordHintsIfCompiling`). -/
+private builtin_initialize compileHintsRef : IO.Ref NameSet ← IO.mkRef {}
+
+/-- Records `hints`, the unification hints that match a query, if `opts` are a compile's (`inCompileOption`). A hint
+from an imported module with digests makes every such module an extra use of the module (`ModuleUsage.writeUsage`):
+the hint table is cross-module state no used name records. A toolchain hint is pinned by the Lean githash, and an
+instance it resolves is recorded by `recordIfCompiling`. -/
+def recordHintsIfCompiling (opts : Options) (hints : Array Name) : BaseIO Unit := do
+  if opts.get inCompileOption false then compileHintsRef.modify fun s => hints.foldl (·.insert ·) s
+
+/-- The unification hints recorded by `recordHintsIfCompiling`. -/
+def compileHints : BaseIO NameSet :=
+  compileHintsRef.get
 
 /-- The constants of a declaration's type and value, with that type and value. -/
 structure DeclConsts where

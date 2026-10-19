@@ -582,7 +582,8 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
     (used : NameSet) (lookups : Array Expr) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
   let s := state env
   let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecks)
-  let allExtra := if (← compilerCodeSeen) then
+  let importedHint := (← compileHints).any fun n => (env.getModuleIdxFor? n).any s.hasEntries
+  let allExtra := if (← compilerCodeSeen) || importedHint then
       env.header.moduleNames.foldl (·.insert { module := ·, isExported := false, isMeta := false }) allExtra
     else allExtra
   let extraMods := allExtra.toArray.filter (fun u => (env.getModuleIdx? u.module).any s.hasEntries)

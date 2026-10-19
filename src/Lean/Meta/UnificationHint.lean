@@ -114,8 +114,8 @@ def tryUnificationHints (t s : Expr) : MetaM Bool := do
     return false
   let hints ← getRecordedHints
   let candidates ← withConfigWithKey config <| hints.discrTree.getMatch t
-  -- Inside a compile, a hint that applies is recorded as compiler code (`recordIfCompiling`).
-  unless candidates.isEmpty do recordIfCompiling (← getOptionsUnrestricted)
+  -- Inside a compile, the hints that apply are recorded (`recordHintsIfCompiling`).
+  unless candidates.isEmpty do recordHintsIfCompiling (← getOptionsUnrestricted) candidates
   for candidate in candidates do
     if (← tryCandidate candidate) then
       return true
