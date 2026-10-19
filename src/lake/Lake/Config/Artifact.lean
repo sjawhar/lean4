@@ -43,6 +43,18 @@ namespace ArtifactDescr
 @[inline] public def relPath (self : ArtifactDescr) : FilePath :=
   artifactPath self.hash self.ext
 
+/--
+Whether `ext` is one of the extensions Lake writes in its local artifact cache.
+
+Remote mappings are untrusted input. Keeping this list here ensures their descriptors cannot
+choose a path outside `Cache.artifactDir`.
+-/
+public def isCacheExtension (ext : String) : Bool :=
+  ext == "" || ext == "art" || ext == "olean" || ext == "olean.server" ||
+  ext == "olean.private" || ext == "ilean" || ext == "ir.sig" || ext == "ir" ||
+  ext == "c" || ext == "bc" || ext == "o" || ext == "a" || ext == "so" ||
+  ext == "dylib" || ext == "dll" || ext == "exe" || ext == "ltar"
+
 public instance : ToString ArtifactDescr := ⟨(·.relPath.toString)⟩
 public instance : ToJson ArtifactDescr := ⟨(toJson ·.relPath)⟩
 
@@ -69,6 +81,30 @@ public instance : FromJson ArtifactDescr := ⟨ArtifactDescr.fromJson?⟩
 
 end ArtifactDescr
 
+/--
+Extracts the artifact descriptors of one output value (as a cache mapping records it), failing on
+the first one that is malformed. `null` and boolean values are metadata, not artifacts, and so is the `kf` entry of
+module outputs that a kept-module check accepted (the input hash they were compiled for,
+`ModuleOutputDescrs.keptFrom?`).
+-/
+public partial def outputArtifactDescrs? (output : Json) : Except String (Array ArtifactDescr) :=
+  go #[] output
+where
+  go descrs output := do
+    match output with
+    | .null | .bool _ => -- boolean metadata is allowed (as of 2025-03-13)
+      return descrs
+    | .num n =>
+      match Hash.ofJsonNumber? n with
+      | .ok hash => return descrs.push {hash}
+      | .error reason => throw s!"{reason}: {n}"
+    | .str name =>
+      return descrs.push (← ArtifactDescr.ofFilePath? name)
+    | .arr values =>
+      values.foldlM (init := descrs) go
+    | .obj values =>
+      values.foldlM (init := descrs) fun descrs key value => if key == "kf" then pure descrs else go descrs value
+
 /-- A file with a known content hash. -/
 public structure Artifact extends descr : ArtifactDescr where
   /-- The preferred path to the artifact on the file system. -/
@@ -77,6 +113,13 @@ public structure Artifact extends descr : ArtifactDescr where
   name := path.toString
   /-- The artifact's modification time. -/
   mtime : MTime
+  /--
+  Whether Lake was to save the artifact in its local cache but did not, because the cache's file
+  system did not hard-link it to its name (see `Cache.saveArtifact`). Then `path` is the build
+  output, and Lake writes no input-to-output mapping for the target, which would name an artifact
+  that the cache does not hold.
+  -/
+  cacheSkipped : Bool := false
   deriving Inhabited, Repr
 
 namespace Artifact
