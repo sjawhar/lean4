@@ -11,12 +11,6 @@ import Lake.Config.Monad
 import Lake.Build.Job.Monad
 import Lake.Build.Index
 import Init.Omega
-import Lake.Util.JsonObject
-import Lake.Util.IO
-import Lake.Config.PushQueue
-import Lake.Build.Claim
-import Lake.Util.RemoteExec
-import Lake.Build.RemoteExec
 
 /-! # Build Runner
 
@@ -24,7 +18,7 @@ This module defines the top-level functions used to execute a
 Lake build, monitor its progress, and await the result.
 -/
 
-open System Lean
+open System
 
 namespace Lake
 
@@ -369,8 +363,7 @@ def mkBuildContext
     else
       return none
   registeredJobs := jobs
-  remoteReadStatus := ← IO.mkRef {}
-  remoteStats := ← IO.mkRef {}
+  sidecarCache := ← Std.Mutex.new {}
   leanTrace := .ofHash (pureHash ws.lakeEnv.leanGithash)
     s!"Lean {Lean.versionStringCore}, commit {ws.lakeEnv.leanGithash}"
   cancelTk?
@@ -400,81 +393,10 @@ def Workspace.startBuild
   let compute := Job.async build (caption := caption)
   compute.run.run'.run bctx |>.run nilTrace
 
-/--
-Atomically replace the status left by remote mapping reads in one build, with `stopped` if the
-build stopped reading the remote cache (see `noteRemoteRead`).
--/
-def writeRemoteReadStatus (cache : Cache) (status : RemoteReadStatus) : IO Unit := do
-  let obj := JsonObject.empty
-    |>.insert "at" (← wallClockSecs)
-    |>.insert "failures" status.failures
-    |>.insert "lastError" status.lastError
-  let obj := status.stopped?.elim obj (obj.insert "stopped" ·)
-  writeFileAtomic cache.readStatusFile (obj : Json).pretty
-
-/--
-At the end of a build that takes claims (see `Env.remoteCacheClaimService?`) on a machine without
-the shell that a detached push needs (see `canDetachPush`), runs `lake cache push` in the
-foreground if the queue holds lines, with a warning (see `runForegroundPush`). With that shell,
-the build's one detached push follows the build and uploads its last outputs (see
-`startBuildPush`), so nothing is left to do here.
--/
-def runQueuedPush (ws : Workspace) (logger : MonadLog BaseIO) : BaseIO Unit := do
-  unless ws.lakeEnv.remoteCacheClaimService?.isSome do
-    return
-  if ← canDetachPush ws.lakeEnv then
-    return
-  let cache := ws.lakeCache
-  let .ok md ← cache.pushQueueFile.metadata.toBaseIO
-    | return
-  if md.byteSize == 0 then
-    return
-  logger.logEntry (.warning s!"`{ws.lakeEnv.pushShell}` is missing (see `LAKE_PUSH_SHELL`), so \
-    `lake cache push` runs before the build ends; log: {cache.pushLogFile}")
-  match (← (runForegroundPush ws.lakeEnv cache).toBaseIO) with
-  | .ok 0 => pure ()
-  | .ok rc => logger.logEntry (.warning s!"`lake cache push` exited with code {rc}")
-  | .error e => logger.logEntry (.warning s!"could not run `lake cache push`: {e}")
-
-/--
-Exit code of a build whose every failure is the build service's not answering, under
-`LAKE_REMOTE_EXEC_FALLBACK=fail`: 75 (`EX_TEMPFAIL`), so a caller can tell an outage from a broken
-build.
--/
-public def remoteUnavailableCode : ExitCode := 75
-
-/--
-Whether the build failed only because the build service did not answer, under
-`LAKE_REMOTE_EXEC_FALLBACK=fail`: every job that logged a failure is a module that
-`recordUnavailableFailure` counted. A job that fails because a dependency failed logs nothing, so it
-is not among the failures (`reportJob`).
--/
-def failedOnlyForService (bctx : BuildContext) (result : MonitorResult) : BaseIO Bool := do
-  let some rcfg := bctx.workspace.lakeEnv.remoteExec?
-    | return false
-  unless rcfg.fallback == .fail do
-    return false
-  return result.failures.size > 0 && result.failures.size == (← bctx.remoteStats.get).unavailableFailures
-
 def finalizeBuild
   (cfg : BuildConfig) (bctx : BuildContext) (mctx : MonitorContext) (result : BuildResult α)
 : IO α := do
   reportResult cfg mctx.out result
-  if bctx.workspace.lakeEnv.remoteExec?.isSome && cfg.verbosity != .quiet then
-    let stats ← bctx.remoteStats.get
-    -- `ok`, `unreachable` or `off: <reason>` from this process's decision; `idle` when no `hello`.
-    let state ← remoteDecisionState
-    print! mctx.out s!"{({stats with state}).line}\n"
-    flush mctx.out
-  -- The build is done with the service; stop the bridge before Lake goes on (e.g. `lake exe` runs).
-  RemoteExec.shutdown
-  let remoteStatus ← bctx.remoteReadStatus.get
-  if remoteStatus.failures > 0 then
-    if let .error e ← (writeRemoteReadStatus bctx.workspace.lakeCache remoteStatus).toBaseIO then
-      mctx.logger.logEntry (.trace s!"could not write remote cache read status: {e}")
-  -- The build's push (if it started one) ends with the build, not with this process
-  endBuildPush
-  runQueuedPush bctx.workspace mctx.logger
   if let some outputsFile := cfg.outputsFile? then
     bctx.saveOutputs (logger := mctx.logger) mctx.out outputsFile
   match result.out with
@@ -483,8 +405,6 @@ def finalizeBuild
   | .error e =>
     if cfg.noBuild && result.wantsRebuild then
       IO.Process.exit noBuildCode.toUInt8
-    else if (← failedOnlyForService bctx result) then
-      IO.Process.exit remoteUnavailableCode.toUInt8
     else
       throw (IO.userError e)
 

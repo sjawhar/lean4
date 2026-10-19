@@ -13,6 +13,7 @@ public import Lean.Meta.AbstractMVars
 public import Lean.Meta.Check
 import Init.While
 import Lean.Util.CollectFVars
+import Lean.Util.UsedByChecks
 
 public section
 namespace Lean.Meta
@@ -1207,6 +1208,8 @@ private def synthInstanceConfig : Config :=
     foApprox := true, ctxApprox := true, constApprox := false, univApprox := false }
 
 def synthInstanceCore? (type : Expr) (maxResultSize? : Option Nat := none) : MetaM (Option Expr) := do
+  -- Inside a compile, the instance table this search reads is recorded as compiler code (`recordIfCompiling`).
+  recordIfCompiling (← getOptionsUnrestricted)
   -- Inside an enclosing query, this lookup is recorded as its dependency.
   let maxResultSize ← match maxResultSize? with
     | some n => pure n

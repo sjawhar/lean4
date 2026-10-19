@@ -34,8 +34,9 @@ rm -rf .lake/build
 test_not_out "leantar" build +Test --no-build -v
 test_exp -f .lake/build/ir/Test.ltar
 
-# Test unpacking the archive from the cache
-rm -rf .lake/build .lake/cache/artifacts/*.[!l]*
+# Test unpacking the archive from the cache (the usage-cutoff sidecars stay: the archive does not
+# include them, and an entry whose `.usage` is missing is a miss)
+rm -rf .lake/build .lake/cache/artifacts/*.[!lu]*
 test_out "leantar" build +Test --no-build -v
 
 # Test caching an `ltar` through `-o` (with `restoreAllArtifacts = true`)

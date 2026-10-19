@@ -9,7 +9,8 @@ prelude
 public import Lake.Config.Cache
 public import Lake.Config.Context
 public import Lake.Build.Job.Basic
-public import Lake.Build.RemoteStats
+public import Std.Sync.Mutex
+public import Lean.Util.ModuleUsage
 
 open System
 namespace Lake
@@ -83,33 +84,11 @@ public def JobQueue := IO.Ref (Array OpaqueJob)
 @[inline] public def mkJobQueue : BaseIO JobQueue :=
   IO.mkRef #[]
 
-/-- Non-404 failures observed while reading input-hash mappings in one Lake build. -/
-public structure RemoteReadStatus where
-  failures : Nat := 0
-  lastError : String := ""
-  /--
-  How many reads of the shared remote cache in a row failed once their transfers had waited for a
-  remote that did not answer (see `noteRemoteRead`).
-  -/
-  timeoutsInRow : Nat := 0
-  /-- Why this build stopped reading the shared remote cache, once it has (see `noteRemoteRead`). -/
-  stopped? : Option String := none
-  deriving Inhabited
-
-/-- Add one read-through failure to a build's remote status. -/
-public def RemoteReadStatus.add (message : String) (status : RemoteReadStatus) : RemoteReadStatus :=
-  {status with failures := status.failures + 1, lastError := message}
-
-
 /-- A Lake context with a build configuration and additional build data. -/
 public structure BuildContext extends BuildConfig, Context where
   leanTrace : BuildTrace
   leanIncludeDirs : Array (Option (FilePath × BuildTrace))
   registeredJobs : JobQueue
-  /-- Read-through failures that `finalizeBuild` writes to `remote-status-read.json`. -/
-  remoteReadStatus : IO.Ref RemoteReadStatus
-  /-- Counts and state for the build-service end-of-build line (`lake: remote: …`, contract C5.1). -/
-  remoteStats : IO.Ref RemoteStats
   /--
   Input-to-output(s) map for hashes of the tracked package's artifacts.
   If `none`, tracking outputs is disabled for this build.
@@ -122,6 +101,13 @@ public structure BuildContext extends BuildConfig, Context where
    Only the build monitor should set this token: reporting assumes that a counted failure exists when the token is set.
   -/
   cancelTk? : Option IO.CancelToken := none
+  /--
+  Parsed usage-cutoff sidecars, shared by every module job in this build, each with the digest
+  (`Lean.ModuleUsage.Digest.ofBytes`) of the contents it was parsed from. Another process may rewrite a
+  sidecar during the build (e.g., a build of another workspace that requires the same path dependency),
+  so a cached parse serves only a read of the same contents.
+  -/
+  sidecarCache : Std.Mutex (Std.HashMap FilePath (Lean.ModuleUsage.Digest × Dynamic))
 
 /-- A transformer to equip a monad with a `BuildContext`. -/
 public abbrev BuildT := ReaderT BuildContext
@@ -135,7 +121,6 @@ public instance [Pure m] : MonadLift LakeM (BuildT m) where
 
 @[inline] public def getBuildContext [MonadBuild m] : m BuildContext :=
   readThe BuildContext
-
 
 @[inline] public def getLeanTrace [Functor m] [MonadBuild m] : m BuildTrace :=
   (·.leanTrace) <$> getBuildContext

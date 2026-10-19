@@ -28,6 +28,14 @@ public inductive NativeEqTrueResult where
   | notTrue
 
 /--
+Whether `n` has the shape of the name `nativeEqTrue` gives the axiom it adds: `mkAuxDeclName` of
+`` `_native ++ tacticName ++ `ax ``, which appends an index to the last component.
+-/
+public def isNativeAxiomName : Name → Bool
+  | .str p s => s.startsWith "ax_" && p.anyS (· == "_native")
+  | _ => false
+
+/--
 A call to `nativeEqTrue tacName e`, where `e` is a closed value of type `Bool`, will compile and run
 that value, check that it evaluates to `true`, and if so, will add an axiom asserting `e = true` and
 return that axiom.
