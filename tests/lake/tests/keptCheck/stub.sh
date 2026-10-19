@@ -12,7 +12,8 @@
 # - `garbage`: answer every request with a line that is not JSON
 # - `bogus-id`: before each answer, answer an id that was never asked, and repeat each answer
 # - `die-once` / `hang-once`: on the first request of all runs (marker `$STUB_LOG.once`), exit /
-#   stop answering, then behave normally
+#   stop answering (for at most two minutes, so that a stub no Lake kills ends by itself), then
+#   behave normally
 # - `fork-hang-once`: like `hang-once`, but the stub stays alive waiting on a child (`sleep 60`)
 #   that holds its pipes, as a wrapper script that does not `exec` its checker would
 # - `mute-once`: on the first request of all runs, stop answering but keep reading, and exit at the
@@ -37,7 +38,7 @@ while IFS= read -r line; do
     die) exit 3;;
     garbage) echo 'not json'; continue;;
     die-once) if [ ! -e "$STUB_LOG.once" ]; then touch "$STUB_LOG.once"; exit 3; fi;;
-    hang-once) if [ ! -e "$STUB_LOG.once" ]; then touch "$STUB_LOG.once"; exec sleep 600; fi;;
+    hang-once) if [ ! -e "$STUB_LOG.once" ]; then touch "$STUB_LOG.once"; exec sleep 120; fi;;
     fork-hang-once) if [ ! -e "$STUB_LOG.once" ]; then touch "$STUB_LOG.once"; sleep 60 & wait; fi;;
     mute-once) if [ ! -e "$STUB_LOG.once" ]; then touch "$STUB_LOG.once"; cat > /dev/null; exit 0; fi;;
     chatter-once)
