@@ -25,6 +25,16 @@ public structure ModuleOutputDescrs where
   c? : Option ArtifactDescr := none
   bc? : Option ArtifactDescr := none
   ltar? : Option ArtifactDescr := none
+  /-- Usage-cutoff sidecars (`.usage`, `.resolved`, `.usekey`), when the build wrote them. -/
+  usage? : Option ArtifactDescr := none
+  resolved? : Option ArtifactDescr := none
+  usekey? : Option ArtifactDescr := none
+  /--
+  Set when the outputs were not compiled for this input but kept: a kept-module checker accepted
+  them for imports other than those they were compiled against. The input hash of the build that
+  compiled them.
+  -/
+  keptFrom? : Option Hash := none
 
 public def ModuleOutputDescrs.oleanParts (self : ModuleOutputDescrs) : Array ArtifactDescr := Id.run do
   let mut descrs := #[self.olean]
@@ -49,6 +59,14 @@ public protected def ModuleOutputDescrs.toJson (self : ModuleOutputDescrs) : Jso
     obj := obj.insert "b" bc
   if let some ltar := self.ltar? then
     obj := obj.insert "l" ltar
+  if let some usage := self.usage? then
+    obj := obj.insert "u" usage
+  if let some resolved := self.resolved? then
+    obj := obj.insert "v" resolved
+  if let some usekey := self.usekey? then
+    obj := obj.insert "k" usekey
+  if let some hash := self.keptFrom? then
+    obj := obj.insert "kf" hash
   return obj
 
 public instance : ToJson ModuleOutputDescrs := ⟨ModuleOutputDescrs.toJson⟩
@@ -69,6 +87,10 @@ public protected def ModuleOutputDescrs.fromJson? (val : Json) : Except String M
     c? := ← obj.get? "c"
     bc? := ← obj.get? "b"
     ltar? := ← obj.get? "l"
+    usage? := ← obj.get? "u"
+    resolved? := ← obj.get? "v"
+    usekey? := ← obj.get? "k"
+    keptFrom? := ← obj.get? "kf"
   }
 
 public instance : FromJson ModuleOutputDescrs := ⟨ModuleOutputDescrs.fromJson?⟩
@@ -85,6 +107,12 @@ public structure ModuleOutputArtifacts where
   c? : Option Artifact := none
   bc? : Option Artifact := none
   ltar? : Option Artifact := none
+  /-- Usage-cutoff sidecars (`.usage`, `.resolved`, `.usekey`), when the build wrote them. -/
+  usage? : Option Artifact := none
+  resolved? : Option Artifact := none
+  usekey? : Option Artifact := none
+  /-- See `ModuleOutputDescrs.keptFrom?`. -/
+  keptFrom? : Option Hash := none
 
 /-- Content hashes of the artifacts. -/
 public def ModuleOutputArtifacts.descrs (arts : ModuleOutputArtifacts) : ModuleOutputDescrs where
@@ -98,3 +126,19 @@ public def ModuleOutputArtifacts.descrs (arts : ModuleOutputArtifacts) : ModuleO
   c? := arts.c?.map (·.descr)
   bc? := arts.bc?.map (·.descr)
   ltar? := arts.ltar?.map (·.descr)
+  usage? := arts.usage?.map (·.descr)
+  resolved? := arts.resolved?.map (·.descr)
+  usekey? := arts.usekey?.map (·.descr)
+  keptFrom? := arts.keptFrom?
+
+/--
+Whether Lake was to save any of the artifacts in its local cache but did not (see
+`Artifact.cacheSkipped`). Lake then writes no input-to-output mapping for the module.
+-/
+public def ModuleOutputArtifacts.cacheSkipped (arts : ModuleOutputArtifacts) : Bool :=
+  arts.olean.cacheSkipped || arts.oleanServer?.any (·.cacheSkipped) ||
+  arts.oleanPrivate?.any (·.cacheSkipped) || arts.ilean.cacheSkipped ||
+  arts.irSig?.any (·.cacheSkipped) || arts.ir?.any (·.cacheSkipped) ||
+  arts.c?.any (·.cacheSkipped) || arts.bc?.any (·.cacheSkipped) ||
+  arts.ltar?.any (·.cacheSkipped) || arts.usage?.any (·.cacheSkipped) ||
+  arts.resolved?.any (·.cacheSkipped) || arts.usekey?.any (·.cacheSkipped)

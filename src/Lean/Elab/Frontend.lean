@@ -14,6 +14,9 @@ import Lean.Compiler.Options
 import Lean.Compiler.InitAttr  -- for `runInitAttrsForModules` on snapshot load
 import Lean.Linter.PersistentLintLog
 import Lean.Util.ProfilerServer
+import Lean.Util.CollectAxioms
+import Lean.Util.ModuleUsage
+import Lean.Util.UsedByChecks
 
 public section
 
@@ -282,8 +285,11 @@ def runFrontend
     (incrSaveFileName? : Option System.FilePath := none)
     (incrLoadFileName? : Option System.FilePath := none)
     (incrHeaderSaveFileName? : Option System.FilePath := none)
+    (usageFileName? : Option System.FilePath := none)
+    (codegen : Environment → IO Unit := fun _ => pure ())
     : IO (Option Environment) := do
   let startTime := (← IO.monoNanosNow).toFloat / 1000000000
+  if oleanFileName?.isSome && usageFileName?.isSome then enableUsageRecording
   let inputCtx := Parser.mkInputContext input fileName
   -- default `cmdlineSnapshots` to true (not done as default value for API back-compat reasons)
   -- except when full-snapshotting so that enough information for resumption is available
@@ -359,11 +365,15 @@ def runFrontend
       IO Unit := do
     let toSave : IncrSnapshot :=
       { snap := snapToSave, initModIdxs := getRegularInitAttrModIdxs env }
+    -- lookup caches cannot be compacted; all environments in the snapshot share `env`'s views
+    env.dropImportedLookupCaches
     let compactor ← (unsafe CompactedRegion.save incrFile `_snap toSave
       env.header.regions none (allowClosures := true))
     let moduleArts := regionsToModuleArtifacts env.header.regions
     IO.FS.writeFile (incrFile.addExtension "deps") (toJson moduleArts).compress
     Runtime.forget compactor
+    -- The run ends after persisting, so cached lookups will not be useful anymore.
+    ImportedConsts.resetCache
 
   -- save full incremental snapshot for next invocation
   if let some incrFile := incrSaveFileName? then
@@ -385,14 +395,26 @@ def runFrontend
   if hasErrors then
     return none
 
-  if let some oleanFileName := oleanFileName? then
+  let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
+  let usage? ← oleanFileName?.bindM fun oleanFileName => do
+    let recorded ← recordedDeclConsts
+    -- the digests cover the exported axioms, so both take the stored ones
+    let env := if usageFileName?.isSome then storeExportedAxioms env else env
+    let usage? := usageFileName?.map fun usageFileName =>
+      let nodes := ModuleUsage.ownNodes env (ModuleUsage.ownConsts env recorded)
+      let own := ModuleUsage.localDigests env nodes
+      let provides := ModuleUsage.ownProvides env
+      let indirect := ModuleUsage.ownIndirect env
+      (usageFileName, nodes, own, ModuleUsage.closureDigest env own provides, provides, indirect)
     profileitIO ".olean serialization" finalOpts do
       let commandLints := collectCommandLints snaps none #[]
       let env ← Linter.recordLints inputCtx.fileMap env commandLints
+      let env := usage?.elim env fun (_, _, own, closure, provides, indirect) =>
+        ModuleUsage.setLocalDigests env own closure provides indirect
       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
+    return usage?
 
   if let some ileanFileName := ileanFileName? then
-    let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
     let references := Lean.Server.findModuleRefs inputCtx.fileMap trees (localVars := false)
     let (moduleRefs, decls) ← references.toLspModuleRefs
     let ilean := {
@@ -404,6 +426,8 @@ def runFrontend
     }
     IO.FS.writeFile ileanFileName $ Json.compress $ toJson ilean
 
+  codegen env
+
   if let some out := trace.profiler.output.get? opts then
     let traceStates := snaps.getAll.map (·.traces)
     let profile ← Firefox.Profile.export mainModuleName.toString startTime traceStates opts
@@ -412,6 +436,12 @@ def runFrontend
     let traceStates := snaps.getAll.map (·.traces)
     let profile ← Firefox.Profile.export mainModuleName.toString startTime traceStates opts
     Firefox.Profile.serve <| Json.compress <| toJson profile
+
+  -- Last of the outputs: the usage data records every name resolved in writing the others.
+  if let some (usageFileName, nodes, own, closure, provides, indirect) := usage? then
+    let used := ModuleUsage.usedFromInfoTrees trees (← usedNames)
+    ModuleUsage.writeUsage env nodes own closure provides indirect used (← lookedUpSpecKeys)
+      (incrLoaded := incrLoadFileName?.isSome) usageFileName
 
   -- no point in freeing the snapshot graph and all referenced data this close to process exit
   Runtime.forget snaps

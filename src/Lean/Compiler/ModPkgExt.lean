@@ -62,8 +62,7 @@ For many constants, this is the full symbol. However, initializers have an addit
 -/
 @[export lean_get_symbol_stem]
 public def getSymbolStem (env : Environment) (declName : Name) : String :=
-  let pkg? :=
-    match env.getModuleIdxFor? declName with
+  let pkg? := match env.getModuleIdxFor? declName with
     | some idx => env.getModulePackageByIdx? idx
     | none => env.getModulePackage?
   declName.mangle (mkPackageSymbolPrefix pkg?)

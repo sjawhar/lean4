@@ -2873,7 +2873,7 @@ lean_object* v___f_891_; lean_object* v___x_892_; lean_object* v___x_893_; uint8
 v___f_891_ = lean_alloc_closure((void*)(l_Lake_Job_map___redArg___lam__0), 2, 1);
 lean_closure_set(v___f_891_, 0, v_f_883_);
 v___x_892_ = lean_box(0);
-v___x_893_ = lean_unsigned_to_nat(0u);
+v___x_893_ = lean_unsigned_to_nat(8u);
 v___x_894_ = 0;
 v___x_895_ = lean_task_map(v___f_891_, v_task_885_, v___x_893_, v___x_894_);
 if (v_isShared_890_ == 0)
