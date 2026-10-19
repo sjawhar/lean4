@@ -123,7 +123,8 @@ struct olean_header {
     // 33 bytes: Lean version string, padded with '\0' to the right
     // e.g. "4.12.0-nightly-2024-10-18". Other suffixes after the version
     // triple currently in use are `-rcN` for some `N` and `-pre` for any
-    // other non-release commit. Not necessarily null-terminated.
+    // other non-release commit. Ends in `olean_format_tag` (see below).
+    // Not necessarily null-terminated.
     char lean_version[33];
     // 81b008650766442a0dfa9faa796e4588c9d7d3a1
     // 40 bytes: build githash, padded with `\0` to the right
@@ -142,6 +143,20 @@ struct olean_header {
 };
 // make sure we don't have any padding bytes, which also ensures `data` is properly aligned
 static_assert(sizeof(olean_header) == 5 + 1 + 1 + 33 + 40 + sizeof(size_t), "olean_header must be packed");
+
+/*
+Suffix of `olean_header::lean_version` marking the `ModuleData` layout that carries per-module constant prefix trees.
+Versions of Lean without them wrote the same header `version` with a different `ModuleData` layout, which this
+reader would misinterpret. leantar keeps a version string it cannot parse byte for byte through `.ltar` round trips.
+*/
+static char const olean_format_tag[] = "+consttrie";
+static constexpr size_t olean_format_tag_len = sizeof(olean_format_tag) - 1;
+
+static void set_lean_version(olean_header & header) {
+    std::string v = get_short_version_string().substr(0, sizeof(header.lean_version) - olean_format_tag_len);
+    v += olean_format_tag;
+    strncpy(header.lean_version, v.c_str(), sizeof(header.lean_version));
+}
 
 
 // Compactor external object: wraps a live `object_compactor` for incremental compaction.
@@ -327,7 +342,7 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_o
             olean_header header = {};
             header.version = 2;
             header.base_addr = reinterpret_cast<size_t>(compactor.base_addr()) + file_offset;
-            strncpy(header.lean_version, get_short_version_string().c_str(), sizeof(header.lean_version));
+            set_lean_version(header);
             strncpy(header.githash, LEAN_GITHASH, sizeof(header.githash));
             out.write(reinterpret_cast<char *>(&header), sizeof(header));
 
@@ -348,7 +363,7 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_o
             olean_header header = {};
             header.version = 3;
             header.base_addr = reinterpret_cast<size_t>(compactor.base_addr()) + file_offset;
-            strncpy(header.lean_version, get_short_version_string().c_str(), sizeof(header.lean_version));
+            set_lean_version(header);
             strncpy(header.githash, LEAN_GITHASH, sizeof(header.githash));
             out.write(reinterpret_cast<char *>(&header), sizeof(header));
 
