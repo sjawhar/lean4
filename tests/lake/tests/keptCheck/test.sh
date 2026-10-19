@@ -658,22 +658,28 @@ test_cmd_fails grep -qx P.B t58.log
 (unset LAKE_USAGE_CUTOFF; LAKE_KEPT_CHECKER="$STUB" test_err 'needs the usage cutoff (LAKE_USAGE_CUTOFF=1)' -d t40 build P)
 LAKE_USAGE_CUTOFF=false LAKE_KEPT_CHECKER="$STUB" test_err 'needs the usage cutoff' -d t40 build P
 
-# Interrupting Lake (`SIGINT` to its process group, as a terminal's Ctrl-C does) while the checker
-# hangs: the checker, in a session of its own, does not get the signal, so Lake kills it before it
-# exits; and the checker never holds the workspace build lock, so the next build does not wait
+# Interrupting Lake (`SIGINT` to its process group, as a terminal's Ctrl-C does) while the checker is
+# busy: the checker, in a session of its own, does not get the signal, but its standard input reaches
+# its end when Lake dies, and it stops (as the stub does in `mute-once`); it never held the workspace
+# build lock, so the next build does not wait
 mkp t50
 test_run -d t50 build P
 seta t50 2
 export STUB_LOG="$PWD/t50.log"
+# Lake runs under a script (`bash -c`), as a caller's would: Lake dies by the signal, and so the
+# script stops too rather than running on after it (`t50.after`)
 set -m
-LAKE_KEPT_CHECKER="$STUB" STUB_MODE=hang-once "$LAKE" -d t50 build P > t50.out 2>&1 &
-lake_pid=$!
+LAKE_KEPT_CHECKER="$STUB" STUB_MODE=mute-once \
+  bash -c '"$1" -d t50 build P > t50.out 2>&1; echo "Lake exited $?" > t50.after' t50 "$LAKE" &
+script_pid=$!
 set +m
-# (the stub hangs on its first request, whichever candidate that is)
+# (the stub stops answering at its first request, whichever candidate that is)
 for _ in $(seq 300); do [ -s t50.log ] && break; sleep 0.1; done
 test_exp -s t50.log
-test_cmd kill -INT -- "-$lake_pid"
-wait "$lake_pid" || true
+test_cmd kill -INT -- "-$script_pid"
+if wait "$script_pid"; then rc=0; else rc=$?; fi
+test_exp "$rc" = 130
+test_exp ! -e t50.after
 stub_pid=$(head -1 t50.log.pids)
 for _ in $(seq 50); do kill -0 "$stub_pid" 2>/dev/null || break; sleep 0.1; done
 test_cmd_fails kill -0 "$stub_pid"
@@ -686,7 +692,7 @@ mkp t51
 test_run -d t51 build P
 seta t51 2
 export STUB_LOG="$PWD/t51.log"
-if LAKE_KEPT_CHECKER="$STUB" STUB_MODE=hang-once timeout 5 "$LAKE" -d t51 build P > t51.out 2>&1; then
+if LAKE_KEPT_CHECKER="$STUB" STUB_MODE=mute-once timeout 5 "$LAKE" -d t51 build P > t51.out 2>&1; then
   rc=0; else rc=$?; fi
 test_exp "$rc" = 124
 stub_pid=$(head -1 t51.log.pids)
