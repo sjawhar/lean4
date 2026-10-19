@@ -51,8 +51,9 @@ unsafe def stackShape (s : EnvExtensionState) : String :=
   let st : ScopedEnvExtension.StateStack EnvExtensionEntry EnvExtensionEntry EnvExtensionState := unsafeCast s
   s!"{st.stateStack.map fun l => (l.activeScopes.toList, l.delimitsLocal)}/{st.newEntries.length}"
 
-/-- Everything the comparison reads for one command, from `before` to `after` (`consts`: what it added). -/
-unsafe def observe (scopedExts : NameSet) (start before after : Environment) (consts : List Name) :
+/-- Everything the comparison reads after one command, counted from `start`, the module's post-import environment
+(`consts`: what the command added). -/
+unsafe def observe (scopedExts : NameSet) (start _before after : Environment) (consts : List Name) :
     IO (Array (String × String)) := do
   let mut out := #[]
   for e in (← persistentEnvExtensionsRef.get) do
@@ -62,18 +63,24 @@ unsafe def observe (scopedExts : NameSet) (start before after : Environment) (co
     for v in [EnvExtension.View.checked, .main] do
       let s₁ := (te.getStateIn after v).state
       out := out.push (s!"{e.name}@{v}", if isScoped then stackShape s₁
-        else toString (deltaSize e (te.getStateIn before v).state s₁))
-    for c in consts do
-      for (mn, m) in [("asyncEnv", EnvExtension.AsyncMode.async .asyncEnv), ("mainEnv", .async .mainEnv)] do
+        else toString (deltaSize e (te.getStateIn start v).state s₁))
+    let declMode? : Option EnvExtension.AsyncMode :=
+      if te.asyncMode matches .async _ then some te.asyncMode
+      else if e.name == `Lean.Meta.Match.Extension.extension then some (.async .asyncEnv)
+      else none
+    if let some m := declMode? then
+      for c in consts do
         let s₁ := (te.getState (asyncMode := m) (asyncDecl := c) after).state
-        out := out.push (s!"{e.name}@{c}/{mn}", if isScoped then stackShape s₁
+        out := out.push (s!"{e.name}@{c}", if isScoped then stackShape s₁
           else toString (deltaSize e (te.getStateIn start .main).state s₁))
   for cache in (← commandCacheExtensionsRef.get) do
-    out := out.push (s!"cache {cache.name}", toString (cache.delta before after).size)
-    for c in consts do
-      let s₁ := cache.ext.getState (asyncMode := .async .asyncEnv) (asyncDecl := c) after
-      out := out.push (s!"cache {cache.name}@{c}",
-        toString (cache.stateDelta (cache.ext.getStateIn start cache.view) s₁).size)
+    out := out.push (s!"cache {cache.name}",
+      toString (cache.stateDelta (cache.ext.getStateIn start cache.view) (cache.ext.getStateIn after cache.view)).size)
+    if cache.ext.asyncMode matches .async _ then
+      for c in consts do
+        let s₁ := cache.ext.getState (asyncMode := cache.ext.asyncMode) (asyncDecl := c) after
+        out := out.push (s!"cache {cache.name}@{c}",
+          toString (cache.stateDelta (cache.ext.getStateIn start .main) s₁).size)
   return out
 
 
