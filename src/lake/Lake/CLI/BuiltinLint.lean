@@ -44,10 +44,24 @@ public structure Args where
   /-- An array of modules containing code quality checks that are
   imported alongside each top-level module -/
   checks : Array Name := #[]
-  /-- Source search path used to resolve modules to their `.lean` files when recording
-  exceptions for environment linters. Populated from the workspace's `LEAN_SRC_PATH`, since
+  /-- Source search path used to resolve modules that `moduleSrcFile?` does not know to their
+  `.lean` files, and given to package code quality checks as their `srcSearchPath`. Populated from
+  the workspace's library source directories (root package first) and `LEAN_SRC_PATH`, since
   `getSrcSearchPath` alone does not cover package sources during a `lake lint` run. -/
   srcSearchPath : SearchPath := {}
+  /-- The source file that Lake compiles for a module of the workspace, if Lake knows the module.
+  Linter findings are reported, and exceptions recorded, in this file. -/
+  moduleSrcFile? : Name → Option System.FilePath := fun _ => none
+
+/--
+The source file of the module `mod` for linter output and recorded exceptions: the one Lake
+compiles for it (`args.moduleSrcFile?`), or else the file `sp` resolves for it, if that exists.
+-/
+def Args.findSrcFile? (args : Args) (sp : SearchPath) (mod : Name) :
+    IO (Option System.FilePath) :=
+  match args.moduleSrcFile? mod with
+  | some file => return some file
+  | none => sp.findModuleWithExt "lean" mod
 
 /--
 Turns the `lake lint` extra arguments into an array of `Lean.Option`, that needs to be enabled
@@ -251,7 +265,7 @@ def runDeferredChecks (args : Args) (linterOpts : Linter.LinterOptions) (sp : Se
       for (failMod, c, _) in failures do
         match ← deferredSitePos? failMod c.site with
         | some pos =>
-          match ← sp.findWithExt "lean" failMod with
+          match ← args.findSrcFile? sp failMod with
           | some file =>
             recs := recs.push { file, pos, option := linter.doc.deferred.name }
           | none =>
@@ -268,7 +282,7 @@ def runDeferredChecks (args : Args) (linterOpts : Linter.LinterOptions) (sp : Se
     else
       for (failMod, c, msg) in failures do
         let context := if c.sourceString.isEmpty then "" else s!" ({c.sourceString})"
-        match ← sp.findWithExt "lean" failMod with
+        match ← args.findSrcFile? sp failMod with
         | some file =>
           IO.eprintln s!"{file}: error: in {describeSite c.site}{context}: {← msg.toString}"
         | none =>
@@ -290,13 +304,15 @@ overrides applied via `leanOptOverrides`) and are recovered here from the `.olea
 an environment imported at the `server` olean level. With `--lint-only`,
 the recorded entries are additionally filtered to the explicitly enabled linters.
 
-In `report` mode the warnings are printed to stdout. In `recordExceptions` mode, each entry
-carrying a command position is turned into an exception record for the caller to write; entries
-without one are reported on stderr and flagged as unlocated. In `codeQuality` mode, the warnings
-are aggregated per module/linter pair into code quality entries whose scalar value is the number
-of warnings, for the caller to emit as JSON.
+The recorded entries store no file name (see `Linter.LintEntry`), so each module's source file is
+found by `args.findSrcFile?`, as for environment linters. In `report` mode the warnings are printed
+to stdout under that file. In `recordExceptions` mode, each entry carrying a command position is
+turned into an exception record in that file for the caller to write; entries without one, or
+whose module's source file cannot be located, are reported on stderr and flagged as unlocated. In
+`codeQuality` mode, the warnings are aggregated per module/linter pair into code quality entries
+whose scalar value is the number of warnings, for the caller to emit as JSON.
 -/
-def runTextLinters (args : Args) (linterOpts : Linter.LinterOptions)
+def runTextLinters (args : Args) (linterOpts : Linter.LinterOptions) (sp : SearchPath)
     (env : Environment) (mod : Name) : IO LintingOutcome := do
   let textGroups := collectTextLints env mod.getRoot
   let textGroups :=
@@ -311,18 +327,25 @@ def runTextLinters (args : Args) (linterOpts : Linter.LinterOptions)
   | .report =>
       for (m, entries) in textGroups do
         IO.println s!"-- Text linter diagnostics in {m}:"
+        let file := (← args.findSrcFile? sp m).getD (modToFilePath "." m "lean")
         for e in entries do
-          IO.print e.message.toString
+          IO.print ({ e.message with fileName := file.toString } : SerialMessage).toString
       return .reported textFailed
   | .recordExceptions =>
       let mut records : Array ExceptionRecord := #[]
       let mut anyUnlocated := false
       for (m, entries) in textGroups do
+        let file? ← args.findSrcFile? sp m
         for e in entries do
-          match e.position? with
-          | some pos =>
-            records := records.push { file := e.file, pos, option := e.linter }
-          | none =>
+          match e.position?, file? with
+          | some pos, some file =>
+            records := records.push { file, pos, option := e.linter }
+          | some _, none =>
+            IO.eprintln s!"\
+              warning: could not locate source file for `{m}` \
+              to record a `{e.linter}` exception"
+            anyUnlocated := true
+          | none, _ =>
             IO.eprintln s!"\
               warning: could not determine the command position of a `{e.linter}` text-linter \
               warning in `{m}`; skipping its exception"
@@ -347,12 +370,13 @@ elaborated declarations, so they run here rather than during the build; per-decl
 By default all registered linters run; with `--lint-only`, only those explicitly enabled by the
 command-line overrides do.
 
-In `report` mode the findings are printed to stdout (grouped by file). In `recordExceptions` mode,
-each flagged declaration is resolved to a source position via its declaration range and to a file
-via `sp`, yielding exception records for the caller to write; declarations whose range or source
-file cannot be resolved are reported on stderr and flagged as unlocated. In `codeQuality` mode,
-the findings are aggregated per module/declaration/linter triple into code quality entries whose
-scalar value is the number of warnings, for the caller to emit as JSON.
+In `report` mode the findings are printed to stdout, grouped by the file that `args.findSrcFile?`
+finds for each module, as for text linters. In `recordExceptions` mode, each flagged declaration is
+resolved to a source position via its declaration range and to a file via `args.findSrcFile?`,
+yielding exception records for the caller to write; declarations whose range or source file cannot
+be resolved are reported on stderr and flagged as unlocated. In `codeQuality` mode, the findings
+are aggregated per module/declaration/linter triple into code quality entries whose scalar value is
+the number of warnings, for the caller to emit as JSON.
 -/
 def runEnvironmentLinters (args : Args) (linterOpts : Linter.LinterOptions) (sp : SearchPath)
     (env : Environment) (mod : Name) : IO LintingOutcome := do
@@ -370,7 +394,7 @@ def runEnvironmentLinters (args : Args) (linterOpts : Linter.LinterOptions) (sp 
           let fmtResults ←
             Linter.EnvLinter.formatLinterResults results decls
               (groupByFilename := true) (useErrorFormat := true)
-              s!"in {mod}" linters.size
+              s!"in {mod}" linters.size (findSrcFile := args.findSrcFile? sp)
           IO.print (← fmtResults.toString)
         else
           IO.println s!"-- Environment linting passed for {mod}."
@@ -384,7 +408,7 @@ def runEnvironmentLinters (args : Args) (linterOpts : Linter.LinterOptions) (sp 
           match ← findDeclarationRanges? declName with
           | some ranges =>
             let declMod := (← findModuleOf? declName).getD mainModule
-            match ← sp.findWithExt "lean" declMod with
+            match ← args.findSrcFile? sp declMod with
             | some file =>
               recs := recs.push { file, pos := ranges.range.pos, option := linter.optName }
             | none =>
@@ -472,7 +496,7 @@ public def run (args : Args) : IO UInt32 := do
       linterSets := (Lean.Linter.linterSetsExt.getState env).merged
     }
 
-    let textLintingOutcome ← runTextLinters args linterOpts env mod
+    let textLintingOutcome ← runTextLinters args linterOpts sp env mod
     match textLintingOutcome with
     | .reported textFailed =>
       anyFailed := anyFailed || textFailed

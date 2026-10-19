@@ -1123,7 +1123,16 @@ def runBuiltinLint
   for c in checks do
     unless (ws.findTargetModule? c).isSome do
       error s!"unknown checks module `{c}`; it must be a module of a package in the workspace"
-  let args := { args with mods, checks, srcSearchPath := ws.augmentedLeanSrcPath }
+  -- Lint loads and resolves modules as Lake built them: root package first, as
+  -- `Workspace.findModule?` does. (`Workspace.leanPath` and `leanSrcPath` list dependencies first.)
+  let lintLeanPath :=
+    ws.packages.foldr (fun pkg dirs => pkg.leanLibDir :: dirs) [] ++ ws.lakeEnv.leanPath
+  let lintSrcPath : SearchPath := ws.packages.foldr (init := []) fun pkg dirs =>
+    pkg.leanLibs.foldr (fun lib dirs => lib.srcDir :: dirs) dirs
+  -- Lint output names the source file Lake compiles for each module (as `+mod` resolves it).
+  let args := { args with
+    mods, checks, srcSearchPath := lintSrcPath ++ ws.lakeEnv.leanSrcPath,
+    moduleSrcFile? := fun mod => (ws.findTargetModule? mod).map (·.leanFile) }
   -- Checks modules are imported alongside each lint target, so they must be built as well.
   let buildMods := mods ++ checks.filter (!mods.contains ·)
   let specs ← parseTargetSpecs ws (buildMods.map (s!"+{·}") |>.toList)
@@ -1142,7 +1151,7 @@ def runBuiltinLint
     leanOptOverrides := overrides
   }
   ws.runBuild (buildSpecs specs) buildCfg
-  Lean.searchPathRef.set ws.augmentedLeanPath
+  Lean.searchPathRef.set lintLeanPath
   BuiltinLint.run args
 
 protected def lint : CliM PUnit := do

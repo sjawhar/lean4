@@ -27,6 +27,7 @@ namespace lean {
 static name * g_kernel_fresh = nullptr;
 static expr * g_dont_care    = nullptr;
 static name * g_bool_true    = nullptr;
+static name * g_bool_false   = nullptr;
 static name * g_eager_reduce = nullptr;
 /* Upper bound (in bytes) on the numerals the kernel computes while reducing `Nat`
    literals (see `reduce_nat`). Protects the kernel from spending unbounded memory
@@ -50,6 +51,30 @@ static expr * g_nat_lor      = nullptr;
 static expr * g_nat_xor      = nullptr;
 static expr * g_nat_shiftLeft  = nullptr;
 static expr * g_nat_shiftRight = nullptr;
+/* Typeclass `Nat` arithmetic `@HAdd.hAdd Nat Nat Nat (@instHAdd Nat instAddNat) a b` etc. (`reduce_nat_inst`). */
+static name * g_nat_hadd     = nullptr;
+static name * g_nat_hsub     = nullptr;
+static name * g_nat_hmul     = nullptr;
+static name * g_nat_hdiv     = nullptr;
+static name * g_nat_hmod     = nullptr;
+static name * g_nat_hpow     = nullptr;
+static expr * g_inst_hadd    = nullptr;
+static expr * g_inst_hsub    = nullptr;
+static expr * g_inst_hmul    = nullptr;
+static expr * g_inst_hdiv    = nullptr;
+static expr * g_inst_hmod    = nullptr;
+static expr * g_inst_hpow    = nullptr;
+/* `Decidable.decide` of `Decidable` instances decided on numerals (`reduce_dec_lit`). */
+static name * g_dec_decide      = nullptr;
+static name * g_nat_dec_eq      = nullptr;
+static name * g_nat_inst_dec_eq = nullptr;
+static name * g_nat_dec_le      = nullptr;
+static name * g_nat_dec_lt      = nullptr;
+static name * g_fin_inst_dec_eq = nullptr;
+static name * g_bv_dec_eq       = nullptr;
+static name * g_bv_inst_dec_eq  = nullptr;
+static name * g_fin_name        = nullptr;
+static name * g_bv_name         = nullptr;
 
 type_checker::state::state(environment const & env):
     m_env(env), m_ngen(*g_kernel_fresh) {}
@@ -610,6 +635,9 @@ optional<expr> type_checker::unfold_definition(expr const & e) {
 
 expr mk_bool_true();
 expr mk_bool_false();
+static inline bool is_bool_lit(expr const & e) {
+    return is_constant(e) && (const_name(e) == *g_bool_true || const_name(e) == *g_bool_false);
+}
 
 static inline bool is_nat_lit_ext(expr const & e) { return e == *g_nat_zero || is_nat_lit(e); }
 static inline nat get_nat_val(expr const & e) {
@@ -676,6 +704,65 @@ template<typename F> optional<expr> type_checker::reduce_bin_nat_pred(F const & 
     return f(v1.raw(), v2.raw()) ? some_expr(mk_bool_true()) : some_expr(mk_bool_false());
 }
 
+/* `@HAdd.hAdd Nat Nat Nat (@instHAdd Nat instAddNat) a b` (the elaborated `a + b`) and its `HSub`/`HMul`/`HDiv`/
+   `HMod`/`HPow` siblings on two numerals: computed like `Nat.add a b`, which they reach by unfolding the projection,
+   `instHAdd` and `instAddNat`. Only for exactly these instance terms. */
+optional<expr> type_checker::reduce_nat_inst(expr const & e) {
+    expr const & f = get_app_fn(e);
+    if (!is_constant(f) || get_app_num_args(e) != 6) return none_expr();
+    name const & n = const_name(f);
+    expr const & inst = app_arg(app_fn(app_fn(e)));
+    if (n == *g_nat_hadd) return inst == *g_inst_hadd ? reduce_bin_nat_op(nat_add, e, /* check_size */ true) : none_expr();
+    if (n == *g_nat_hsub) return inst == *g_inst_hsub ? reduce_bin_nat_op(nat_sub, e, /* check_size */ true) : none_expr();
+    if (n == *g_nat_hmul) return inst == *g_inst_hmul ? reduce_bin_nat_op(nat_mul, e, /* check_size */ true) : none_expr();
+    if (n == *g_nat_hdiv) return inst == *g_inst_hdiv ? reduce_bin_nat_op(nat_div, e) : none_expr();
+    if (n == *g_nat_hmod) return inst == *g_inst_hmod ? reduce_bin_nat_op(nat_mod, e) : none_expr();
+    if (n == *g_nat_hpow) return inst == *g_inst_hpow ? reduce_pow(e) : none_expr();
+    return none_expr();
+}
+
+/* The numeral `whnf(e)` reduces to, if any. */
+static optional<nat> to_nat_val(type_checker & tc, expr const & e) {
+    expr v = tc.whnf(e);
+    if (!is_nat_lit_ext(v)) return optional<nat>();
+    return optional<nat>(get_nat_val(v));
+}
+
+/* `Decidable.decide p d` for `d` a `Decidable` instance of `Nat` equality or order, `Fin` equality or `BitVec`
+   equality whose arguments reduce to numerals: the Boolean literal that `whnf` reaches by unfolding `d` down to
+   `Nat.beq`/`Nat.ble` on the numerals (`Nat.decEq`/`instDecidableEqNat`/`Nat.decLe` directly, `Nat.decLt n m` as
+   `Nat.decLe (n+1) m`, `instDecidableEqFin` through `Nat.decEq` on `Fin.val`, `BitVec.decEq`/`instDecidableEqBitVec`
+   through `instDecidableEqFin` on `toFin`). Only `decide` is shortcut, never `d` itself: `whnf d` stays the structure
+   whose `decide` field is unevaluated, which is what projections in `lazy_delta_reduction` compare against the other
+   side. Like the `Nat` literal rules there, this only applies to terms without free variables (or under
+   `eagerReduce`): an open argument such as `x.toNat + 4294967244` unfolds `Nat.add` once per unit of its literal.
+   Only `whnf` applies it, where the value is demanded, and `lazy_delta_reduction` when the other side is a Boolean
+   literal. Two closed `decide` terms are compared by their arguments, as without the rule, which settles
+   `decide (f (n + 1) = c) =?= decide (f m = c)` without evaluating `f`, however costly `f` is. */
+optional<expr> type_checker::reduce_dec_lit(expr const & e) {
+    if (get_app_num_args(e) != 2 || !is_constant(app_fn(app_fn(e)), *g_dec_decide)) return none_expr();
+    expr const & d = app_arg(e);
+    expr const & f = get_app_fn(d);
+    if (!is_constant(f)) return none_expr();
+    name const & n = const_name(f);
+    unsigned nargs = get_app_num_args(d);
+    bool is_nat = nargs == 2 && (n == *g_nat_dec_eq || n == *g_nat_inst_dec_eq || n == *g_nat_dec_le || n == *g_nat_dec_lt);
+    bool is_fin = nargs == 3 && n == *g_fin_inst_dec_eq;
+    bool is_bv  = nargs == 3 && (n == *g_bv_dec_eq || n == *g_bv_inst_dec_eq);
+    if (!is_nat && !is_fin && !is_bv) return none_expr();
+    if ((has_fvar(d) && !m_eager_reduce) || !is_delta(d)) return none_expr();
+    auto val_of = [&](expr const & a) {
+        if (is_nat) return to_nat_val(*this, a);
+        if (is_fin) return to_nat_val(*this, mk_proj(*g_fin_name, 0u, a));
+        return to_nat_val(*this, mk_proj(*g_fin_name, 0u, mk_proj(*g_bv_name, 0u, a)));
+    };
+    optional<nat> a = val_of(app_arg(app_fn(d)));
+    if (!a) return none_expr();
+    optional<nat> b = val_of(app_arg(d));
+    if (!b) return none_expr();
+    bool val = n == *g_nat_dec_le ? *a <= *b : n == *g_nat_dec_lt ? *a < *b : *a == *b;
+    return some_expr(val ? mk_bool_true() : mk_bool_false());
+}
 optional<expr> type_checker::reduce_nat(expr const & e) {
     unsigned nargs = get_app_num_args(e);
     if (nargs == 1) {
@@ -688,6 +775,8 @@ optional<expr> type_checker::reduce_nat(expr const & e) {
             check_nat_size(env(), nat_size_in_bytes(v));
             return some_expr(mk_lit(literal(v)));
         }
+    } else if (nargs == 6) {
+        return reduce_nat_inst(e);
     } else if (nargs == 2) {
         expr const & f = app_fn(app_fn(e));
         if (!is_constant(f)) return none_expr();
@@ -705,6 +794,7 @@ optional<expr> type_checker::reduce_nat(expr const & e) {
         if (f == *g_nat_xor)  return reduce_bin_nat_op(nat_lxor, e);
         if (f == *g_nat_shiftLeft) return reduce_shiftLeft(e);
         if (f == *g_nat_shiftRight) return reduce_bin_nat_op(lean_nat_shiftr, e);
+        return none_expr();
     }
     return none_expr();
 }
@@ -736,7 +826,9 @@ expr type_checker::whnf(expr const & e) {
     expr t = e;
     while (true) {
         expr t1 = whnf_core(t);
-        if (auto v = reduce_nat(t1)) {
+        optional<expr> v = reduce_nat(t1);
+        if (!v) v = reduce_dec_lit(t1);
+        if (v) {
             m_st->m_whnf.insert(mk_pair(e, *v));
             return *v;
         } else if (auto next_t = unfold_definition(t1)) {
@@ -1069,6 +1161,10 @@ lbool type_checker::lazy_delta_reduction(expr & t_n, expr & s_n) {
                 return to_lbool(is_def_eq_core(*t_v, s_n));
             } else if (auto s_v = reduce_nat(s_n)) {
                 return to_lbool(is_def_eq_core(t_n, *s_v));
+            } else if (is_bool_lit(s_n)) {
+                if (auto t_v = reduce_dec_lit(t_n)) return to_lbool(is_def_eq_core(*t_v, s_n));
+            } else if (is_bool_lit(t_n)) {
+                if (auto s_v = reduce_dec_lit(s_n)) return to_lbool(is_def_eq_core(t_n, *s_v));
             }
         }
 
@@ -1236,6 +1332,18 @@ inline static expr * new_persistent_expr_const(name const & n) {
     return e;
 }
 
+inline static name * new_persistent_name(name const & n) {
+    name * r = new name(n);
+    mark_persistent(r->raw());
+    return r;
+}
+
+inline static expr * new_persistent_expr(expr const & e) {
+    expr * r = new expr(e);
+    mark_persistent(r->raw());
+    return r;
+}
+
 /* Read `var` as a byte count, falling back to `default_value` when it is unset
    or malformed. */
 static size_t read_nat_size_env(char const * var, size_t default_value) {
@@ -1255,6 +1363,8 @@ void initialize_type_checker() {
     mark_persistent(g_kernel_fresh->raw());
     g_bool_true    = new name{"Bool", "true"};
     mark_persistent(g_bool_true->raw());
+    g_bool_false   = new name{"Bool", "false"};
+    mark_persistent(g_bool_false->raw());
     g_eager_reduce = new name{"eagerReduce"};
     g_dont_care    = new_persistent_expr_const("dontcare");
     g_nat_zero     = new_persistent_expr_const({"Nat", "zero"});
@@ -1274,12 +1384,42 @@ void initialize_type_checker() {
     g_nat_shiftLeft  = new_persistent_expr_const({"Nat", "shiftLeft"});
     g_nat_shiftRight = new_persistent_expr_const({"Nat", "shiftRight"});
     g_string_mk    = new_persistent_expr_const({"String", "ofList"});
+    g_nat_hadd     = new_persistent_name({"HAdd", "hAdd"});
+    g_nat_hsub     = new_persistent_name({"HSub", "hSub"});
+    g_nat_hmul     = new_persistent_name({"HMul", "hMul"});
+    g_nat_hdiv     = new_persistent_name({"HDiv", "hDiv"});
+    g_nat_hmod     = new_persistent_name({"HMod", "hMod"});
+    g_nat_hpow     = new_persistent_name({"HPow", "hPow"});
+    expr nat       = mk_constant({"Nat"});
+    levels l0(mk_level_zero());
+    levels l00{mk_level_zero(), mk_level_zero()};
+    auto inst_h = [&](char const * h, char const * inst) {
+        return new_persistent_expr(mk_app(mk_constant(name(h), l0), nat, mk_constant(name(inst))));
+    };
+    g_inst_hadd    = inst_h("instHAdd", "instAddNat");
+    g_inst_hsub    = inst_h("instHSub", "instSubNat");
+    g_inst_hmul    = inst_h("instHMul", "instMulNat");
+    g_inst_hdiv    = new_persistent_expr(mk_app(mk_constant(name("instHDiv"), l0), nat, mk_constant(name({"Nat", "instDiv"}))));
+    g_inst_hmod    = new_persistent_expr(mk_app(mk_constant(name("instHMod"), l0), nat, mk_constant(name({"Nat", "instMod"}))));
+    g_inst_hpow    = new_persistent_expr(mk_app(mk_constant(name("instHPow"), l00), nat, nat,
+                         mk_app(mk_constant(name("instPowNat"), l0), nat, mk_constant(name("instNatPowNat")))));
+    g_dec_decide      = new_persistent_name({"Decidable", "decide"});
+    g_nat_dec_eq      = new_persistent_name({"Nat", "decEq"});
+    g_nat_inst_dec_eq = new_persistent_name("instDecidableEqNat");
+    g_nat_dec_le      = new_persistent_name({"Nat", "decLe"});
+    g_nat_dec_lt      = new_persistent_name({"Nat", "decLt"});
+    g_fin_inst_dec_eq = new_persistent_name("instDecidableEqFin");
+    g_bv_dec_eq       = new_persistent_name({"BitVec", "decEq"});
+    g_bv_inst_dec_eq  = new_persistent_name("instDecidableEqBitVec");
+    g_fin_name        = new_persistent_name("Fin");
+    g_bv_name         = new_persistent_name("BitVec");
     register_name_generator_prefix(*g_kernel_fresh);
 }
 
 void finalize_type_checker() {
     delete g_kernel_fresh;
     delete g_bool_true;
+    delete g_bool_false;
     delete g_eager_reduce;
     delete g_dont_care;
     delete g_nat_succ;
@@ -1299,5 +1439,27 @@ void finalize_type_checker() {
     delete g_nat_shiftLeft;
     delete g_nat_shiftRight;
     delete g_string_mk;
+    delete g_nat_hadd;
+    delete g_nat_hsub;
+    delete g_nat_hmul;
+    delete g_nat_hdiv;
+    delete g_nat_hmod;
+    delete g_nat_hpow;
+    delete g_inst_hadd;
+    delete g_inst_hsub;
+    delete g_inst_hmul;
+    delete g_inst_hdiv;
+    delete g_inst_hmod;
+    delete g_inst_hpow;
+    delete g_dec_decide;
+    delete g_nat_dec_eq;
+    delete g_nat_inst_dec_eq;
+    delete g_nat_dec_le;
+    delete g_nat_dec_lt;
+    delete g_fin_inst_dec_eq;
+    delete g_bv_dec_eq;
+    delete g_bv_inst_dec_eq;
+    delete g_fin_name;
+    delete g_bv_name;
 }
 }
