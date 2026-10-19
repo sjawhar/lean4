@@ -15,6 +15,8 @@
 #   stop answering, then behave normally
 # - `fork-hang-once`: like `hang-once`, but the stub stays alive waiting on a child (`sleep 60`)
 #   that holds its pipes, as a wrapper script that does not `exec` its checker would
+# - `mute-once`: on the first request of all runs, stop answering but keep reading, and exit at the
+#   end of input, as a checker should when Lake goes away
 # - `wait-go`: before answering for `P.B`, wait (at most 30 s) until the file `$STUB_GO` exists
 # - `chatter-once`: on the first request of all runs, stop reading and answer an id that was never
 #   asked once a second (for at most two minutes, so that a stub no Lake kills ends by itself)
@@ -37,6 +39,7 @@ while IFS= read -r line; do
     die-once) if [ ! -e "$STUB_LOG.once" ]; then touch "$STUB_LOG.once"; exit 3; fi;;
     hang-once) if [ ! -e "$STUB_LOG.once" ]; then touch "$STUB_LOG.once"; exec sleep 600; fi;;
     fork-hang-once) if [ ! -e "$STUB_LOG.once" ]; then touch "$STUB_LOG.once"; sleep 60 & wait; fi;;
+    mute-once) if [ ! -e "$STUB_LOG.once" ]; then touch "$STUB_LOG.once"; cat > /dev/null; exit 0; fi;;
     chatter-once)
       if [ ! -e "$STUB_LOG.once" ]; then
         touch "$STUB_LOG.once"
