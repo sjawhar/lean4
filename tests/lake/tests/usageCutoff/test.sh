@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 source ../common.sh
 ./clean.sh
+# Work on a copy: the test edits `lakefile.toml`, and CI makes tracked files read-only
+copy_to_work lakefile.toml
 # Store the Lake cache in the package, never the system cache (cache-env runs set their own directory below)
 export LAKE_CACHE_DIR=
 mkdir -p Test
@@ -33,22 +35,29 @@ test_cmd_out '"extra":[[["Test","Rules"],"' cat .lake/build/lib/lean/Test/Ex.use
 printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 0\n' > Test/H.lean
 test_not_out "warning" build -v Test.HU
 match_text "Replayed Test.HU" produced.out
-# a name component that is neither a string nor a number is corrupt input: warned, then built
+# the `.usekey` is read first, and only the `.usage` it was written from is accepted: any other `.usage` (here one
+# that would not even parse) leaves HU stale: built, no warning
 # (sidecars are removed before being rewritten: under an artifact cache they are read-only links)
 printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 1\n' > Test/H.lean
 rm -f .lake/build/lib/lean/Test/HU.usage
-printf '{"version":9,"noskip":false,"moduleDigest":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","digested":[],"own":[],"used":[[[true],[]]],"extra":[],"specKeys":[],"specLookups":[]}' > .lake/build/lib/lean/Test/HU.usage
+printf '{"version":10,"noskip":false,"moduleDigest":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","digested":[],"imported":[],"own":[],"used":[[[true],[]]],"extra":[],"specKeys":[],"specLookups":[]}' > .lake/build/lib/lean/Test/HU.usage
+test_not_out "warning" build -v Test.HU
+match_text "Built Test.HU" produced.out
+# a name component that is neither a string nor a number is corrupt input: warned, then built
+printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 3\n' > Test/H.lean
+rm -f .lake/build/lib/lean/Test/HU.usekey
+printf '{"version":10,"usage":"00000000000000000000000000000000","local":"0000000000000000","olean":"00000000000000000000000000000000","modsys":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","extra":[[[true],"00000000000000000000000000000000","00000000000000000000000000000000"]]}' > .lake/build/lib/lean/Test/HU.usekey
 test_out "expected a name component" build Test.HU
 match_text "Built Test.HU" produced.out
 # so is a sidecar that is not UTF-8
-printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 3\n' > Test/H.lean
-rm -f .lake/build/lib/lean/Test/HU.usage
-printf '\377' > .lake/build/lib/lean/Test/HU.usage
-test_out "Test/HU.usage" build Test.HU
+printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 4\n' > Test/H.lean
+rm -f .lake/build/lib/lean/Test/HU.usekey
+printf '\377' > .lake/build/lib/lean/Test/HU.usekey
+test_out "Test/HU.usekey" build Test.HU
 match_text "Built Test.HU" produced.out
 # a sidecar of another format version (an older toolchain wrote it) reads as absent: built, no warning
-rm -f .lake/build/lib/lean/Test/HU.usage
-printf '{"version":3,"noskip":false,"moduleDigest":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","own":[],"used":[],"extra":[]}' > .lake/build/lib/lean/Test/HU.usage
+rm -f .lake/build/lib/lean/Test/HU.usekey
+printf '{"version":3,"local":"0000000000000000","olean":"00000000000000000000000000000000","modsys":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","extra":[]}' > .lake/build/lib/lean/Test/HU.usekey
 printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 2\n' > Test/H.lean
 test_not_out "warning" build -v Test.HU
 match_text "Built Test.HU" produced.out
@@ -275,6 +284,11 @@ sed -e 's/"used":\[/"used":[[["Init","Prelude"],[[["Nat","add"],"000000000000000
   -e 's/"extra":\[\]/"extra":[[["Init","Prelude"],false]]/' \
   .lake/build/lib/lean/Test/TB.usage > TB.usage.tmp
 mv -f TB.usage.tmp .lake/build/lib/lean/Test/TB.usage
+# the key accepts only the `.usage` it was written from (`usage`: the first 128 bits of its SHA-256), so point it at
+# the edited one
+d=$(sha256sum .lake/build/lib/lean/Test/TB.usage | cut -c1-32)
+sed -e "s/\"usage\":\"[0-9a-f]*\"/\"usage\":\"$d\"/" .lake/build/lib/lean/Test/TB.usekey > TB.usekey.tmp
+mv -f TB.usekey.tmp .lake/build/lib/lean/Test/TB.usekey
 test_cmd_out '"used":[[["Init","Prelude"],' cat .lake/build/lib/lean/Test/TB.usage
 test_cmd_out '"extra":[[["Init","Prelude"],false]' cat .lake/build/lib/lean/Test/TB.usage
 printf 'def ta1 := 1\ndef ta2 := 2\n' > Test/TA.lean

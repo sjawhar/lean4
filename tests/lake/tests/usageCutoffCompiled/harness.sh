@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-source ../common.sh
+# The usage-cutoff compiled-code cases and their harness. Each `sN/test.sh` runs slice N of `all_cases` (every
+# `SLICES`-th case from the Nth) in its own `work` directory, so that ctest runs the slices as separate tests;
+# `CASES` runs a chosen subset instead.
+source "$(dirname "${BASH_SOURCE[0]}")/../common.sh"
 
-./clean.sh
+rm -rf work
 mkdir -p work/cut work/fresh
 cd work
 
@@ -11,12 +14,12 @@ cd work
 # what the executable `app` prints, what `lake env lean` prints for each `Check*.lean`, and the C file of
 # every module, which for a module the cutoff skipped must be what compiling its sources now produces. The
 # `.olean`, `.ilean` and `.ir` files the cutoff kept must also be byte for byte those of a clean build of
-# state 1 with the cutoff on, made in the same directory. A module that
-# specialized a function itself where a fresh build would reuse another module's specialization of the same
-# function at the same arguments is built again (`perkey_provider`), and one whose imports gain a
-# specialization it never looked up is replayed (`perkey_unrelated_spec`). A case may also check the build
-# itself with `CASE_c_check`, run in the cutoff tree. A case writes its state-0 files with `CASE_s0` and the
-# files state 1 changes with `CASE_s1`, both in the package directory.
+# state 1 with the cutoff on, made in the same directory. A module that specialized a function itself where a
+# fresh build would reuse another module's specialization of the same function at the same arguments is built
+# again (`perkey_provider`), and one whose imports gain a specialization it never looked up is replayed
+# (`perkey_unrelated_spec`). A case may also check the build itself with `CASE_c_check`, run in the cutoff tree.
+# A case writes its state-0 files with `CASE_s0` and the files state 1 changes with `CASE_s1`, both in the
+# package directory.
 
 # Store the Lake cache in the test directory, never the system cache
 export LAKE_CACHE_DIR=
@@ -431,9 +434,9 @@ red_order_s1() { order_x Z2 Z1; }
 
 # A specialization-cache miss that becomes a hit. `M` specializes `myMap k` itself; then `Y`, which `M` imports
 # but uses nothing of, starts specializing the same call, so a fresh `M` reuses `Y`'s specialization instead.
-# `M` is built again (`perkey_provider`). With a constant folder for `k`
-# registered in `Z` (`d2_folder`), which `Y` does not import and which is not meaning-preserving (it returns 42),
-# the two specializations compute different things as well.
+# `M` is built again (`perkey_provider`). With a constant folder for `k` registered in `Z` (`d2_folder`), which
+# `Y` does not import and which is not meaning-preserving (it returns 42), the two specializations compute
+# different things as well.
 d2_files() {
   lakefile_app; mkdir_t
   printf 'namespace T\n@[noinline] def k (n : Nat) : Nat := n + 1\n' > T/B.lean
@@ -1616,8 +1619,10 @@ hard_extramod_s0() {
 hard_extramod_s1() { hard_extramod_a 20; }
 hard_extramod_c_check() { hard_rejected hard_extramod; }
 
-hard_moduleext_try="$(hard_try 'run_meta modifyEnv fun env => Lean.ModuleUsage.ext.modifyState (asyncMode := .mainOnly) env fun s => { s with importedModuleEntries := #[] }')"
-hard_moduleext_s0() { f3_files; f3_y '' ''; hard_m $'import Lean\n' "$hard_moduleext_try"; }
+hard_moduleext_s0() {
+  f3_files; f3_y '' ''
+  hard_m $'import Lean\n' "$(hard_try 'run_meta modifyEnv fun env => Lean.ModuleUsage.ext.modifyState (asyncMode := .mainOnly) env fun s => { s with importedModuleEntries := #[] }')"
+}
 hard_moduleext_s1() { f3_y '' 'def y : List Nat := myMap k [0]'; }
 hard_moduleext_c_check() { hard_rejected hard_moduleext && grep -qE 'Built T\.M( |$)' ../hard_moduleext.1.log; }
 
@@ -1629,17 +1634,17 @@ hard_speclookups_c_check() { hard_rejected hard_speclookups && grep -qE 'Built T
 
 hard_compilercode_s0() { fold_env_s0; hard_try 'run_meta Lean.compilerCodeRef.set false' >> T/M.lean; }
 hard_compilercode_s1() { env_flag; }
-hard_compilercode_c_check() { hard_rejected hard_compilercode; }
+hard_compilercode_c_check() { hard_rejected hard_compilercode && grep -qE 'Built T\.M( |$)' ../hard_compilercode.1.log; }
 
-hard_reservedpred_s0() {
+# `M` adds a reserved-name predicate to its own environment before `h` is compiled, so the predicate runs inside
+# every lookup of that compile: `M`'s usage data then depends on every import, and a change to `Y` that `M` does not
+# use and that provides no key `M` looked up builds `M` again.
+rp_own_s0() {
   f3_files; f3_y '' ''
-  hard_m $'import Lean\n' \
-    "$(hard_try 'run_meta modifyEnv fun env => Lean.reservedNamePredicatesExt.modifyState env (·.push fun _ _ => false)')"
+  hard_m $'import Lean\nrun_meta Lean.modifyEnv fun env => Lean.reservedNamePredicatesExt.modifyState (log := .unlogged) env (·.push fun _ _ => false)\n'
 }
-hard_reservedpred_s1() { f3_y '' 'def y : List Nat := myMap k [0]'; }
-hard_reservedpred_c_check() {
-  hard_rejected hard_reservedpred && grep -qE 'Built T\.M( |$)' ../hard_reservedpred.1.log
-}
+rp_own_s1() { f3_y '' 'def yOther : Nat := 1'; }
+rp_own_c_check() { grep -qE 'Built T\.M( |$)' ../rp_own.1.log; }
 
 ## Tables a module writes through public functions.
 
@@ -1871,9 +1876,8 @@ r3_y() {
     printf '%s\n' "$2"; } > T/Y.lean
 }
 r3_ab() { r3_ev evA 100; r3_ev evB 200; }
-r3_nl=$'\n'
-r3_order_s0() { cs_files; r3_y "$(r3_ab)" "$(r3_cs "$r3_key" evA)$r3_nl$(r3_cs "$r3_key" evB)"; }
-r3_order_s1() { r3_y "$(r3_ab)" "$(r3_cs "$r3_key" evB)$r3_nl$(r3_cs "$r3_key" evA)"; }
+r3_order_s0() { cs_files; r3_y "$(r3_ab)" "$(r3_cs "$r3_key" evA; r3_cs "$r3_key" evB)"; }
+r3_order_s1() { r3_y "$(r3_ab)" "$(r3_cs "$r3_key" evB; r3_cs "$r3_key" evA)"; }
 r3_mdata_rev_s0() { cs_files; r3_y "$(r3_ev evil 100)" "$(r3_cs "$r3_key" evil)"; }
 r3_mdata_rev_s1() { r3_y "$(r3_ev evil 100)" "$(r3_cs "(mkMData {} $r3_key)" evil)"; }
 
@@ -1933,10 +1937,63 @@ borrow_alias_s0() {
 }
 borrow_alias_s1() { printf '%s\n' 'def Fn : Type := (@& List Nat) → List Nat' > T/B.lean; }
 
+# Instance resolution inside a compile: computing the code type of `f`'s parameter reduces an `Eq.rec` over
+# `P 0 = Q 0`, which reaches `K`'s unification hint, whose instance argument is resolved from the instances in
+# scope. `I`'s instance makes the type `UInt8`; state 1 makes it a plain definition, so a fresh `M` takes
+# `lean_object*`. `M` uses nothing of `I`.
+tc_hint_s0() {
+  lakefile_app; mkdir_t
+  printf 'namespace T\nclass C (α : Type) : Type where\n  mk ::\naxiom P : Nat → Type\naxiom Q : Nat → Type\nend T\n' > T/A.lean
+  printf 'import T.A\nnamespace T\n@[unification_hint] def hQ (n : Nat) (X : Type) [_inst : C X] : Prop := Q n = X\nend T\n' > T/K.lean
+  printf 'import T.A\nnamespace T\ninstance instCP : C (P 0) := {}\nend T\n' > T/I.lean
+  printf 'import T.A\nimport T.K\nimport T.I\nnamespace T\n@[noinline] def f (h : P 0 = Q 0) (_x : @Eq.rec Type (P 0) (fun _ _ => Type) UInt8 (Q 0) h) : Nat := 0\nend T\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println "ok"\n' > Main.lean
+}
+tc_hint_s1() { printf 'import T.A\nnamespace T\ndef instCP : C (P 0) := {}\nend T\n' > T/I.lean; }
+
+# Binder names and infos the compiler reads from an imported value: a `@[macro_inline]` body `M` inlines (its
+# lambda's binder becomes an LCNF parameter, and an implicit one is eta-reduced, `ba_implicit`, `bi_inl` and the
+# reverse `bi_inl_rev`, `bn_mi` for a name only), the same body reaching `N` through `M` (`bi_down2`), and a type
+# alias the compiler unfolds into `M`'s code type (`bn_alias`). State 1 changes only that name or binder info.
+mi_a() {
+  printf 'namespace T\n@[%s] def g (n k : Nat) : Nat := %s\n@[macro_inline] def mi (n : Nat) : Nat → Nat := %s\nend T\n' \
+    "$1" "$2" "$3" > T/A.lean
+}
+mi_files() {
+  lakefile_app; mkdir_t
+  mi_a "$@"
+  printf 'import T.A\nnamespace T\ndef h (n : Nat) (xs : List Nat) : List Nat := List.map (mi n) xs\nend T\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println (T.h 5 [1, 5, 9])\n' > Main.lean
+}
+mi_g='if n == k then n * 7 else k + n * 3'
+ba_implicit_s0() { mi_files noinline 'n + k' '@fun {k : Nat} => g n k'; }
+ba_implicit_s1() { mi_a noinline 'n + k' '@fun (k : Nat) => g n k'; }
+bi_inl_s0() { mi_files inline "$mi_g" '@fun {k : Nat} => g n k'; }
+bi_inl_s1() { mi_a inline "$mi_g" '@fun (k : Nat) => g n k'; }
+bi_inl_rev_s0() { mi_files inline "$mi_g" '@fun (k : Nat) => g n k'; }
+bi_inl_rev_s1() { mi_a inline "$mi_g" '@fun {k : Nat} => g n k'; }
+bn_mi_s0() { mi_files noinline 'n + k' 'fun k => g n k'; }
+bn_mi_s1() { mi_a noinline 'n + k' 'fun jjj => g n jjj'; }
+bi_down2_s0() {
+  lakefile_app; mkdir_t
+  mi_a inline "$mi_g" '@fun {k : Nat} => g n k'
+  printf 'import T.A\nnamespace T\n@[noinline] def h (n : Nat) : Nat → Nat := mi n\n@[noinline] def hl (n : Nat) (xs : List Nat) : List Nat := List.map (mi n) xs\nend T\n' > T/M.lean
+  printf 'import T.M\nnamespace T\n@[inline] def k (n : Nat) : List Nat := hl n [1, 5, 9]\ndef j (n : Nat) : Nat := h n 4 + h n 5\nend T\n' > T/N.lean
+  printf 'import T.N\ndef main : IO Unit := IO.println (T.k 5, T.j 5)\n' > Main.lean
+}
+bi_down2_s1() { mi_a inline "$mi_g" '@fun (k : Nat) => g n k'; }
+bn_alias_s0() {
+  lakefile_app; mkdir_t
+  printf 'namespace T\n@[reducible] def F : Type := (x : Nat) → Nat\nend T\n' > T/A.lean
+  printf 'import T.A\nnamespace T\n@[noinline] def h (f : F) : Nat := f 1\nend T\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println (T.h (fun n => n + 1))\n' > Main.lean
+}
+bn_alias_s1() { printf 'namespace T\n@[reducible] def F : Type := (y : Nat) → Nat\nend T\n' > T/A.lean; }
+
 all_cases="spec_transitive spec_link spec_type spec_precomp csimp_transitive csimp_late specialize_attr
   cov_projfn cov_projfn_rev cov_mlike cov_sparse cov_auxrec cov_sibmatch cov_sibmatch_rev cov_ctlmatch
   cov_sibinst cov_sibclass cov_sibmeta cov_ckind_rev cov_recarg_rev
-  collide_first collide_after hard_recording hard_moduleext hard_speclookups hard_compilercode hard_reservedpred
+  collide_first collide_after hard_recording hard_moduleext hard_speclookups hard_compilercode rp_own
   hard_usedbychecks hard_declconsts
   hard_extramod d2_down
   class_same class_cross nospec_type folder_cross reducible_cross binder_inline d2_folder
@@ -1956,20 +2013,26 @@ all_cases="spec_transitive spec_link spec_type spec_precomp csimp_transitive csi
   outparam_pos folder_removal r4_simproc r4_parser r4_tactic r4_elab r4_delab r4_eval
   binder_fun binder_jp binder_param owner_macro owner_boxed owner_move binder_info_param binder_info_type
   pre_summary ng ng_ctrl shadow shadow2 perkey_unrelated_spec perkey_provider r3_order r3_mdata_rev r3_nat r3_natg
-  borrow_proj borrow_ctor borrow_alias"
+  borrow_proj borrow_ctor borrow_alias tc_hint ba_implicit bi_inl bi_inl_rev bn_mi bi_down2 bn_alias
+  spec_transitive:cache"
+# `spec_transitive:cache`: the state the cutoff build of `spec_transitive` leaves behind, after another build and
+# in a fresh tree that shares its artifact cache.
+cases=${CASES:-}
+if [ -z "$cases" ]; then
+  i=0
+  for c in $all_cases; do
+    if [ -z "${SLICE:-}" ] || [ $((i % SLICES)) = $((SLICE - 1)) ]; then cases+=" $c"; fi
+    i=$((i + 1))
+  done
+fi
 failed=()
-# `CASES` runs a subset; `NAME:cache` runs a case with the artifact cache (see `run_case`).
-for c in ${CASES:-$all_cases}; do
+# `NAME:cache` runs a case with the artifact cache (see `run_case`).
+for c in $cases; do
   case $c in
     *:cache) run_case "${c%:cache}" cache || failed+=("$c") ;;
     *) run_case $c || failed+=($c) ;;
   esac
 done
-# The state the cutoff build of `spec_transitive` leaves behind, after another build and in a fresh tree that
-# shares its artifact cache.
-if [ -z "${CASES:-}" ]; then
-  run_case spec_transitive cache || failed+=("spec_transitive (artifact cache)")
-fi
 if [ ${#failed[@]} -gt 0 ]; then
   echo "FAILURE: cases differing from a fresh build: ${failed[*]}"
   exit 1

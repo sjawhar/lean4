@@ -1,1 +1,1 @@
-rm -rf work
+rm -rf work s*/work

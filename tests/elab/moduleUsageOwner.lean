@@ -9,10 +9,7 @@ open Lean ModuleUsage
 def scopedDecl : Name := .num (.str (.str (.str (.str .anonymous "f") "_@") "M") "_hyg") 3
 
 /-- `g._at_.f._@.M._hyg.3.spec_0`: a specialization of `g` that `scopedDecl` created. -/
-def specName : Name := .str (scopedDecl.components.foldl (init := (`g).str "_at_") fun acc c => match c with
-  | .str _ s => acc.str s
-  | .num _ n => acc.num n
-  | .anonymous => acc) "spec_0"
+def specName : Name := ((`g).appendCore `_at_ |>.appendCore scopedDecl).str "spec_0"
 
 #guard atOwner? ((`g).str "_at_" ++ `o) == some `o
 #guard ownerOf (· == scopedDecl) specName == scopedDecl
