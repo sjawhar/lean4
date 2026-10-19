@@ -223,6 +223,8 @@ private structure Walk where
   before : Kernel.Environment
   /-- The checked view of the command's before-environment. -/
   beforeKernel : Kernel.Environment
+  /-- The checked view of the command's after-environment: a constant it lacks was rejected by the kernel. -/
+  afterKernel : Kernel.Environment
 
 private unsafe def contextEnvImpl (ctx : RealizationContext) : Environment := unsafeCast ctx.env
 
@@ -258,6 +260,10 @@ private partial def addedConsts (regs : Registries) (w : Walk) (cells : List (As
       out := out.push pending.head!.2
       pending := pending.tail
     let name := c.constInfo.name
+    -- the full run logged the kernel's error and went on; a keep cannot reproduce the rejection
+    unless (w.afterKernel.find? name).isSome do
+      refused := refused.push (name, `Lean.Environment.kernelRejected)
+      continue
     if self? == some name then
       out := out.push (.plain name)
       continue
@@ -328,7 +334,8 @@ def recordCommandDelta (before after : Environment) (idx : Nat) : IO Environment
   let mut unreplayable : Array Name := #[]
   for ext in u₁ ++ u₂ do
     unless unreplayable.contains ext do unreplayable := unreplayable.push ext
-  let w : Walk := { after, before := before.base.private, beforeKernel := viewKEnv before .checked }
+  let w : Walk := { after, before := before.base.private, beforeKernel := viewKEnv before .checked,
+                    afterKernel := viewKEnv after .checked }
   let exportedKind (c : AsyncConst) := (after.asyncConstsMap.public.find? c.constInfo.name).map (·.constInfo.kind)
   let mut branchStateOnly := #[]
   let mut added := #[]
