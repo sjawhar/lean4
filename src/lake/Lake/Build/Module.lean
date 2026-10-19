@@ -1579,6 +1579,61 @@ def modsysHash (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) :
   return e.finish
 
 /--
+Reads the sidecars of the importee whose `.olean` is `olean` as `importUsage?` does, without hashing the `.olean`:
+for a module-system file (`modsys`), its `.usage`; otherwise its `.usekey` first, then the `.usage` it was written
+from, with the `olean` hash the key records. `none` if `importUsage?` would take no `.usage` from them.
+-/
+def readImportSidecars (olean : FilePath) (modsys : Bool) :
+    JobM (Option (Option ModuleUsage.Digest × UsageImport)) := do
+  let usageFile := olean.withExtension "usage"
+  if modsys then
+    return (none, ·) <$> (← readUsageSidecar UsageImport usageFile)
+  let some key ← readUsageSidecar UsekeySidecar (olean.withExtension "usekey") | return none
+  if key.kept then return none
+  let some usage ← readUsageSidecar UsageImport usageFile (expected? := key.usage) | return none
+  return some (some key.olean, usage)
+
+/--
+What a build first read of an imported module's sidecars (`readImportSidecars`), kept in `BuildContext.usageViews`
+under the module's `.usage`. Every importer-side read fills it, if it is empty: `importUsage?`, in any module's check
+or `Module.writeUsekey`, and the usage index's pre-filter (`usagePrefilter`). A module's reads of its own sidecars do
+not. In a build no other process writes to, an importee's view is what every check of the build reads of it, since a
+module is checked after its whole closure is done, and built at most once per build.
+-/
+structure UsageView where
+  read? : Option (Option ModuleUsage.Digest × UsageImport)
+  deriving TypeName
+
+/--
+The build's view of the importee whose `.usage` is `usageFile` (`UsageView`), made `read?` if it has none: returns
+it, and whether it was made now. A view is never replaced.
+-/
+def freezeUsageView (usageFile : FilePath) (read? : Option (Option ModuleUsage.Digest × UsageImport)) :
+    JobM (Option (Option ModuleUsage.Digest × UsageImport) × Bool) := do
+  (← getBuildContext).usageViews.atomically do
+    if let some view := (← getThe (Std.HashMap FilePath Dynamic))[usageFile]? then
+      let some view := view.get? UsageView | error s!"{usageFile}: cached usage view has the wrong type"
+      return (view.read?, false)
+    modifyThe (Std.HashMap FilePath Dynamic) (·.insert usageFile (Dynamic.mk (UsageView.mk read?)))
+    return (read?, true)
+
+/--
+The build's view of importee `m` (`UsageView`), read now if the build has none, and whether it was read now. `none`
+if `m` has no `.olean` in `importArts`.
+-/
+def usageView? (importArts : NameMap ImportArtifacts) (m : Name) :
+    JobM (Option (Option ModuleUsage.Digest × UsageImport) × Bool) := do
+  let some arts := importArts.find? m | return (none, false)
+  let some olean := arts.olean? | return (none, false)
+  let usageFile := olean.withExtension "usage"
+  let frozen? ← (← getBuildContext).usageViews.atomically do
+    return (← getThe (Std.HashMap FilePath Dynamic))[usageFile]?
+  if let some view := frozen? then
+    let some view := view.get? UsageView | error s!"{usageFile}: cached usage view has the wrong type"
+    return (view.read?, false)
+  freezeUsageView usageFile (← readImportSidecars olean arts.oleanServer?.isSome)
+
+/--
 The `.olean` of importee `m` in `importArts` and its `.usage`, or `none` if either is missing, the
 `.usage` is invalid, or nothing shows that the `.usage` describes that `.olean`: unless `m` is a
 module-system file, its `.usekey` is read first, and the `.usage` must be the one it was written from (its digest,
@@ -1588,19 +1643,33 @@ one of the two comparisons, so the check sees one state of the module or none. A
 back (e.g., by `lean -o` of other contents, which leaves the old sidecars and `.hash`) is not checked against the
 old `.usage` either. A module-system file's bytes are pinned by `modsysHash` instead. Nor is a `.usage` whose module
 a kept-module check kept (`UsekeySidecar.kept`): its digests may be stale, so an importer that used it is not skipped.
+The build's view of `m` (`UsageView`) is what this read found, if the build had none.
 -/
 def importUsage? (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) (m : Name) :
     JobM (Option (FilePath × UsageImport)) := do
   let some arts := importArts.find? m | return none
   let some olean := arts.olean? | return none
-  let usageFile := olean.withExtension "usage"
-  if arts.oleanServer?.isSome then
-    return (olean, ·) <$> (← readUsageSidecar UsageImport usageFile)
-  let some key ← readUsageSidecar UsekeySidecar (olean.withExtension "usekey") | return none
-  if key.kept then return none
-  let some usage ← readUsageSidecar UsageImport usageFile (expected? := key.usage) | return none
-  unless key.olean == (← contentHash hashes olean) do return none
+  let read? ← readImportSidecars olean arts.oleanServer?.isSome
+  discard <| freezeUsageView (olean.withExtension "usage") read?
+  let some (keyOlean?, usage) := read? | return none
+  if let some keyOlean := keyOlean? then
+    unless keyOlean == (← contentHash hashes olean) do return none
   return some (olean, usage)
+
+/--
+`Lean.ModuleUsage.specProviders` of the module's specialization-cache lookups (`UsageSidecar.specLookups`) over the
+keys (`UsageImport.specKeys`) of its closure's non-module workspace modules, which `specKeys? m` gives, or `none` if
+it gives none for one.
+-/
+def UsageSidecar.closureSpecProviders (usage : UsageSidecar) (importArts : NameMap ImportArtifacts)
+    (specKeys? : Name → JobM (Option (Array (ModuleUsage.Digest × Name)))) :
+    JobM (Option (Array (ModuleUsage.Digest × ModuleUsage.Digest))) := do
+  let mut modules : Array (Name × Array (ModuleUsage.Digest × Name)) := #[]
+  for (m, arts) in importArts do
+    if arts.oleanServer?.isSome then continue
+    let some keys ← specKeys? m | return none
+    modules := modules.push (m, keys)
+  return some (ModuleUsage.specProviders (usage.specLookups.map (·.1)) modules)
 
 /--
 Whether every key the module looked up in the specialization cache (`UsageSidecar.specLookups`) has the same
@@ -1614,12 +1683,23 @@ module's keys are pinned by `modsysHash`, a toolchain module's by the Lean githa
 def UsageSidecar.specProvidersUnchanged (usage : UsageSidecar) (hashes : ContentHashes)
     (importArts : NameMap ImportArtifacts) : JobM Bool := do
   if usage.specLookups.isEmpty then return true
-  let mut modules : Array (Name × Array (ModuleUsage.Digest × Name)) := #[]
-  for (m, arts) in importArts do
-    if arts.oleanServer?.isSome then continue
-    let some (_, imp) ← importUsage? hashes importArts m | return false
-    modules := modules.push (m, imp.specKeys)
-  return ModuleUsage.specProviders (usage.specLookups.map (·.1)) modules == usage.specLookups
+  let providers ← usage.closureSpecProviders importArts fun m =>
+    return (← importUsage? hashes importArts m).map (·.2.specKeys)
+  return providers == some usage.specLookups
+
+/--
+The digest `closureHash` folds from the recorded `closure` digest of each direct workspace import, which
+`closure? m` gives, with its name, or `none` if it gives none for one.
+-/
+def foldClosureHash (presetup : ModulePreSetup) (closure? : Name → JobM (Option ModuleUsage.Digest)) :
+    JobM (Option ModuleUsage.Digest) := do
+  let mods := presetup.directImports.filterMap (·.module?) |>.map (·.name)
+    |>.qsort Name.quickLt |>.toList.eraseDups
+  let mut e := ({} : ModuleUsage.Enc).nat mods.length
+  for m in mods do
+    let some closure ← closure? m | return none
+    e := e.name m |>.digest closure
+  return some e.finish
 
 /--
 A digest of the recorded `closure` digest of each direct workspace import, with its name, or `none`
@@ -1633,16 +1713,12 @@ closure.
 def closureHash (hashes : ContentHashes) (presetup : ModulePreSetup)
     (importArts : NameMap ImportArtifacts)
     (importedClosures? : Option (NameMap ModuleUsage.Digest) := none) :
-    JobM (Option ModuleUsage.Digest) := do
-  let mods := presetup.directImports.filterMap (·.module?) |>.map (·.name)
-    |>.qsort Name.quickLt |>.toList.eraseDups
-  let mut e := ({} : ModuleUsage.Enc).nat mods.length
-  for m in mods do
+    JobM (Option ModuleUsage.Digest) :=
+  foldClosureHash presetup fun m => do
     let some (_, imp) ← importUsage? hashes importArts m | return none
     if let some imported := importedClosures? then
       unless imported.find? m == some imp.closure do return none
-    e := e.name m |>.digest imp.closure
-  return some e.finish
+    return some imp.closure
 
 /--
 Whether every workspace module of the closure (`importArts`) carried digests when Lean compiled the
@@ -1800,6 +1876,64 @@ def Module.usageVerdict (mod : Module) (presetup : ModulePreSetup)
   unless (← closureHash hashes presetup importArts) == some key.closure do return .recheck
   unless (← usage.specProvidersUnchanged hashes importArts) do return .recheck
   return .upToDate
+
+/--
+Reads a cached compile's `.usage` for the usage index's pre-filter (`usagePrefilter`), without checking its digest:
+the check that decides (`Module.usageVerdict`) reads it by the digest its key records. `none` if it cannot be read
+or parsed, or has another format version.
+-/
+def readCandidateUsage? (path : FilePath) : BaseIO (Option UsageSidecar) := do
+  let .ok bytes ← (IO.FS.readBinFile path).toBaseIO | return none
+  let .ok (some usage) := parseUsageSidecar UsageSidecar bytes | return none
+  return some usage
+
+/-- How far a cached compile got in the usage index's pre-filter (`usagePrefilter`). -/
+inductive UsagePrefilter
+  /-- Rejected on its `.usekey`, before its `.usage` was read. -/
+  | key
+  /-- Rejected on its `.usage`. -/
+  | usage
+  /-- Passed, with its `.usekey`. -/
+  | passed (key : UsekeySidecar)
+
+/--
+The usage index's pre-filter of a cached compile of the module, whose `.usekey` and `.usage` are `usekeyFile` and
+`usageFile`: whether it may pass the cutoff's check (`Module.usageVerdict`) against the module's current imports
+(`importArts`). It only rejects, and it binds no importee: it compares the importees as `importee? m` gives them
+(the module's own bindings, `ContentHashes`, or else the build's views, `UsageView`), and hashes no `.olean`; the
+check, which every accept passes, reads them again. It looks at the importees the check binds. In order: the key's
+local inputs, its `modsys` against the closure's (`modsysHash`, which the module's compile takes too) and its
+`closure` against the fold of the direct imports' recorded closures; then the `.usage`, which must have no `noskip`,
+cover the closure, and record for each constant it used from a workspace module the digest that module's `.usage`
+records, for each workspace `extra` module the `moduleDigest` and, unless it is a module-system file (pinned by
+`modsys`), the `.olean` hash its `.usekey` records, and for its specialization-cache lookups the providers in the
+closure.
+-/
+def usagePrefilter (presetup : ModulePreSetup) (importArts : NameMap ImportArtifacts) (hashes : ContentHashes)
+    (importee? : Name → JobM (Option (Option ModuleUsage.Digest × UsageImport)))
+    (usekeyFile usageFile : FilePath) : JobM UsagePrefilter := do
+  let some key ← readUsageSidecar UsekeySidecar usekeyFile | return .key
+  if key.localHash != presetup.localTrace.hash then return .key
+  unless (← modsysHash hashes importArts) == key.modsys do return .key
+  let closure ← foldClosureHash presetup fun m => return (← importee? m).map (·.2.closure)
+  unless closure == some key.closure do return .key
+  let some usage ← readCandidateUsage? usageFile | return .usage
+  if usage.noskip || !usage.coversClosure importArts then return .usage
+  -- A module outside the workspace is a toolchain module, pinned by the Lean githash in `localTrace`.
+  for (m, consts) in usage.used do
+    if (← findModule? m).isNone then continue
+    let some (_, imp) ← importee? m | return .usage
+    for (c, d) in consts do
+      unless imp.own.find? c == some d do return .usage
+  for m in usage.extra do
+    if (← findModule? m).isNone then continue
+    let some (oleanHash, digest) := key.extra.find? m | return .usage
+    let some (keyOlean?, imp) ← importee? m | return .usage
+    unless imp.moduleDigest == digest && keyOlean?.all (· == oleanHash) do return .usage
+  unless usage.specLookups.isEmpty do
+    let providers ← usage.closureSpecProviders importArts fun m => return (← importee? m).map (·.2.specKeys)
+    unless providers == some usage.specLookups do return .usage
+  return .passed key
 
 /--
 Whether usage cutoff can apply to the module: cutoff is enabled, and the module is neither a module-system file nor
