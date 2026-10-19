@@ -1883,7 +1883,7 @@ where
   fetchFromCache? presetup savedTrace restoreAll : JobM ModuleFetchState := do
     let inputHash := (← getTrace).hash
     -- A module excluded from kept checks takes no kept outputs from the cache, and under `--no-build`
-    -- it unpacks no archive to find out what it holds: it just needs a build, and no file changes
+    -- it unpacks no archive to find out what it holds: it just needs a build, and no output changes
     if (← isKeptExcluded) then
       if let some out ← cachedOutputs? inputHash then
         if (out.getObjVal? "kf").isOk || ((← getNoBuild) && !(out.getObjVal? "o").isOk) then
@@ -1906,8 +1906,8 @@ where
       -- Note: This branch implies that only the ltar output is (validly) cached.
       -- Thus, we use only the new trace unpacked from the ltar to resolve further artifacts.
       let savedTrace ← readTraceFile mod.traceFile
-      -- (an archive whose mapping does not say it holds kept outputs, as an `-o` file of the
-      -- previous Lake recorded them)
+      -- An excluded module takes no kept outputs from an archive either. The unpacked trace says
+      -- whether they are kept: a mapping that names the archive alone does not
       if (← isKeptExcluded) && savedTrace.keptFrom?.isSome then
         mod.clearOutputArtifacts
         mod.clearOutputHashes
@@ -2037,7 +2037,7 @@ where
   anything but accepted outputs, in any of the forms Lake writes or installs: outputs compiled from
   source, which replace the kept ones, or an archive (the `-o` and `lake cache add`/`get` form),
   whose own trace then decides the module's lineage when it is unpacked. Returns whether it set the
-  trace aside; a `--no-build` build changes no file, and the module just needs a build.
+  trace aside; a `--no-build` build changes no output, and the module just needs a build.
   -/
   reviewKept (savedTrace : SavedTrace) : JobM (SavedTrace × Bool) := do
     unless savedTrace.keptFrom?.isSome do return (savedTrace, false)

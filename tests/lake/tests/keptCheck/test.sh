@@ -10,6 +10,13 @@ source ../common.sh
 # imports, and on a yes records the module as up to date without compiling it. `LAKE_KEPT_EXCLUDE`
 # makes Lake decide the modules it lists as if nothing had been kept for them.
 
+# The stub checker is a bash script, and the cases rely on POSIX process groups and signals
+# (`setsid`, killing a checker's group, `kill -INT` to a group)
+if [ "$OS" = Windows_NT ]; then
+  echo "SKIPPED: not supported on Windows"
+  exit 0
+fi
+
 STUB="$PWD/stub.sh"
 mkdir -p work && cd work
 export LAKE_ARTIFACT_CACHE=false
@@ -429,20 +436,22 @@ seta t34n 2
 export STUB_LOG="$PWD/t34n.log"
 LAKE_KEPT_CHECKER="$STUB" test_out 'Checked P.B' -d t34n build P
 test_cmd cp "t34n/$OUT/B.olean" b34n.olean
-LAKE_KEPT_EXCLUDE="$PWD/exclude34" test_status 3 -d t34n build P --old --no-build
+printf 'P.B\n' > exclude34n
+LAKE_KEPT_EXCLUDE="$PWD/exclude34n" test_status 3 -d t34n build P --old --no-build
 test_cmd cmp b34n.olean "t34n/$OUT/B.olean"
 test_cmd grep -q '"kf"' "t34n/$OUT/B.trace"
-# ... a `--no-build` build needs a build for it (and changes no file) ...
+# ... a `--no-build` build needs a build for it (and changes no output) ...
 mkp t35
 test_run -d t35 build P
 seta t35 2
 export STUB_LOG="$PWD/t35.log"
 LAKE_KEPT_CHECKER="$STUB" test_out 'Checked P.B' -d t35 build P
-LAKE_KEPT_EXCLUDE="$PWD/exclude34" test_status 3 -d t35 build P --no-build
+printf 'P.B\n' > exclude35
+LAKE_KEPT_EXCLUDE="$PWD/exclude35" test_status 3 -d t35 build P --no-build
 test_cmd grep -q '"kf"' "t35/$OUT/B.trace"
 # ... and so does `lake shake`'s check that the oleans are current
 sed_i 's/^name = "p"$/name = "p"\ndefaultTargets = ["P"]/' t35/lakefile.toml
-LAKE_KEPT_EXCLUDE="$PWD/exclude34" test_err 'out of date oleans' -d t35 shake
+LAKE_KEPT_EXCLUDE="$PWD/exclude35" test_err 'out of date oleans' -d t35 shake
 # Invalid kept-module settings fail `lake shake` with their own error, as they fail the build
 LAKE_KEPT_CHECKER="$STUB" LAKE_KEPT_CHECKER_TIMEOUT=0 test_err 'at least 1 second' -d t35 shake
 LAKE_KEPT_EXCLUDE="$PWD/no-such-exclude" test_err 'no-such-exclude' -d t35 shake
@@ -479,8 +488,10 @@ test_cmd grep -qx P.C t40.log
 seta t40 3
 LAKE_KEPT_CHECKER="$STUB" test_out 'Checked P.B' -d t40 build P
 no_match_text 'not asked' produced.out
-# A checker without the usage cutoff is refused: its records decide which modules may be re-checked
+# A checker without the usage cutoff is refused: its records decide which modules may be re-checked.
+# `lake setup-file`, which the language server runs, says why too
 LAKE_USAGE_CUTOFF=false LAKE_KEPT_CHECKER="$STUB" test_err 'needs the usage cutoff' -d t40 build P
+LAKE_USAGE_CUTOFF=false LAKE_KEPT_CHECKER="$STUB" test_err 'needs the usage cutoff' -d t40 setup-file t40/P/C.lean
 
 # Interrupting Lake (`SIGINT` to its process group, as a terminal's Ctrl-C does) while the checker is
 # busy: the checker, in a session of its own, does not get the signal, but its standard input reaches
@@ -490,15 +501,20 @@ mkp t50
 test_run -d t50 build P
 seta t50 2
 export STUB_LOG="$PWD/t50.log"
+# Lake runs under a script (`bash -c`), as a caller's would: Lake dies by the signal, and so the
+# script stops too rather than running on after it (`t50.after`)
 set -m
-LAKE_KEPT_CHECKER="$STUB" STUB_MODE=mute-once "$LAKE" -d t50 build P > t50.out 2>&1 &
-lake_pid=$!
+LAKE_KEPT_CHECKER="$STUB" STUB_MODE=mute-once \
+  bash -c '"$1" -d t50 build P > t50.out 2>&1; echo "Lake exited $?" > t50.after' t50 "$LAKE" &
+script_pid=$!
 set +m
 # (the stub stops answering at its first request, whichever candidate that is)
 for _ in $(seq 300); do [ -s t50.log ] && break; sleep 0.1; done
 test_exp -s t50.log
-test_cmd kill -INT -- "-$lake_pid"
-wait "$lake_pid" || true
+test_cmd kill -INT -- "-$script_pid"
+if wait "$script_pid"; then rc=0; else rc=$?; fi
+test_exp "$rc" = 130
+test_exp ! -e t50.after
 stub_pid=$(head -1 t50.log.pids)
 for _ in $(seq 50); do kill -0 "$stub_pid" 2>/dev/null || break; sleep 0.1; done
 test_cmd_fails kill -0 "$stub_pid"
@@ -582,7 +598,8 @@ test_cmd grep -q '"kf"' "$(mapping t12b B)"
 test_cmd rm -f "$LAKE_CACHE_DIR/artifacts/$(cat "t12/$OUT/B.olean.hash").olean"
 mkp t12c
 seta t12c 2
-LAKE_KEPT_EXCLUDE="$PWD/exclude7" test_out 'Built P.B' -d t12c build P.B
+printf 'P.B\n' > exclude12c
+LAKE_KEPT_EXCLUDE="$PWD/exclude12c" test_out 'Built P.B' -d t12c build P.B
 test_cmd_fails grep -q '"kf"' "t12c/$OUT/B.trace"
 
 # A module restored from the cache is a candidate the next time its imports change
@@ -752,7 +769,7 @@ for a in t39x/.lake/build/ir/*.ltar t39x/.lake/build/ir/P/*.ltar; do
   test_cmd cp "$a" "$LAKE_CACHE_DIR/artifacts/$(cat "$a.hash").ltar"
 done
 test_run -d t39 cache get "$PWD/o39.jsonl" --scope=p
-# `--no-build` only reports that `P.B` needs a build: it unpacks nothing and changes no file
+# `--no-build` only reports that `P.B` needs a build: it unpacks nothing and changes no output
 test_cmd cp "t39/$OUT/B.olean" b39kept.olean
 (unset LAKE_ARTIFACT_CACHE LAKE_RESTORE_ARTIFACTS; test_status 3 -d t39 build P --no-build)
 test_cmd cmp b39kept.olean "t39/$OUT/B.olean"
@@ -779,8 +796,9 @@ done
 test_run -d t53 cache add "$PWD/o53.jsonl"
 test_cmd cp "t53/$OUT/B.olean" b53.olean
 sed_i 's/^name = "p"$/name = "p"\ndefaultTargets = ["P"]/' t53/lakefile.toml
+printf 'P.B\n' > exclude53
 (unset LAKE_ARTIFACT_CACHE LAKE_RESTORE_ARTIFACTS
- LAKE_KEPT_EXCLUDE="$PWD/exclude34" test_status 3 -d t53 build P --no-build
- LAKE_KEPT_EXCLUDE="$PWD/exclude34" test_err 'out of date oleans' -d t53 shake)
+ LAKE_KEPT_EXCLUDE="$PWD/exclude53" test_status 3 -d t53 build P --no-build
+ LAKE_KEPT_EXCLUDE="$PWD/exclude53" test_err 'out of date oleans' -d t53 shake)
 test_cmd cmp b53.olean "t53/$OUT/B.olean"
 test_cmd grep -q '"kf"' "t53/$OUT/B.trace"
