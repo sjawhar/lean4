@@ -151,6 +151,13 @@ public structure BuildContext extends BuildConfig, Context where
   -/
   kernelProviders : Std.Mutex KernelProviders
   /--
+  What this build first read of each imported module's usage-cutoff sidecars, keyed by the module's `.usage`, as a
+  `Lake.UsageView` (`Lake.freezeUsageView`): an entry is added once and never replaced, so a view can be older
+  than the files when another process rewrote them since. Only the usage index's pre-filter reads views, and it only
+  rejects: a check that accepts reads the files again.
+  -/
+  usageViews : Std.Mutex (Std.HashMap FilePath Dynamic)
+  /--
   The kept-module checker (`LAKE_KEPT_CHECKER`): a module whose own source and options did not
   change since its outputs were built, but whose imports did, keeps those outputs if the usage
   cutoff's records show the machinery it used unchanged and the checker accepts them. If `none`,
