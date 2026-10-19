@@ -40,7 +40,7 @@ match_text "Replayed Test.HU" produced.out
 # (sidecars are removed before being rewritten: under an artifact cache they are read-only links)
 printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 1\n' > Test/H.lean
 rm -f .lake/build/lib/lean/Test/HU.usage
-printf '{"version":10,"noskip":false,"moduleDigest":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","digested":[],"imported":[],"own":[],"used":[[[true],[]]],"extra":[],"specKeys":[],"specLookups":[]}' > .lake/build/lib/lean/Test/HU.usage
+printf '{"version":10,"noskip":false,"moduleDigest":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","digested":[],"importedClosures":[],"importedDigests":[],"own":[],"used":[[[true],[]]],"extra":[],"specKeys":[],"specLookups":[]}' > .lake/build/lib/lean/Test/HU.usage
 test_not_out "warning" build -v Test.HU
 match_text "Built Test.HU" produced.out
 # a name component that is neither a string nor a number is corrupt input: warned, then built

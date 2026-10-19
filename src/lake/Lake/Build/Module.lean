@@ -1324,9 +1324,10 @@ structure UsageSidecar where
   /-- The imported modules whose `.olean` carried digests when Lean compiled the module
   (`Lean.ModuleUsage.digestedModules`), sorted by `Name.quickLt`. -/
   digested : Array Name
-  /-- For each direct import and `extra` module with digests, its `moduleDigest` and `closure` as the compile
-  imported them (`Lean.ModuleUsage.writeUsage`). -/
-  imported : NameMap (ModuleUsage.Digest × ModuleUsage.Digest)
+  /-- Each direct import's `closure` as the compile imported it (`Lean.ModuleUsage.writeUsage`). -/
+  importedClosures : NameMap ModuleUsage.Digest
+  /-- Each `extra` module's `moduleDigest` as the compile imported it. -/
+  importedDigests : NameMap ModuleUsage.Digest
   own : NameMap ModuleUsage.Digest
   used : Array (Name × Array (Name × ModuleUsage.Digest))
   extra : Array Name
@@ -1388,7 +1389,10 @@ instance : FromJson UsageSidecar where
       moduleDigest := ← j.getObjValAs? ModuleUsage.Digest "moduleDigest"
       closure := ← j.getObjValAs? ModuleUsage.Digest "closure"
       digested := (← j.getObjValAs? (Array SidecarName) "digested").map (·.name)
-      imported := ← nameDigestPairs (← j.getObjVal? "imported")
+      importedClosures := (← j.getObjValAs? (Array (SidecarName × ModuleUsage.Digest)) "importedClosures").foldl
+        (init := {}) fun m (n, d) => m.insert n.name d
+      importedDigests := (← j.getObjValAs? (Array (SidecarName × ModuleUsage.Digest)) "importedDigests").foldl
+        (init := {}) fun m (n, d) => m.insert n.name d
       own := own.foldl (init := {}) fun m (n, d) => m.insert n.name d
       used := used.map fun (m, cs) => (m.name, cs.map fun (c, d) => (c.name, d))
       extra := extra.map (·.1.name)
@@ -1582,8 +1586,8 @@ def UsageSidecar.specProvidersUnchanged (usage : UsageSidecar) (hashes : Content
 
 /--
 A digest of the recorded `closure` digest of each direct workspace import, with its name, or `none`
-if `importUsage?` accepts no `.usage` for one, or, given `imported?` (`UsageSidecar.imported`), if one's `closure`
-is not the one the compile imported. A module's closure is its direct imports plus their
+if `importUsage?` accepts no `.usage` for one, or, given `importedClosures?` (`UsageSidecar.importedClosures`), if
+one's `closure` is not the one the compile imported. A module's closure is its direct imports plus their
 closures; a direct toolchain import is pinned by the source text and the Lean githash (local
 trace). A module is replayed only if this digest is unchanged, so every workspace module's recorded
 closure digest stays equal to its current closure, and this digest covers the importer's whole
@@ -1591,15 +1595,15 @@ closure.
 -/
 def closureHash (hashes : ContentHashes) (presetup : ModulePreSetup)
     (importArts : NameMap ImportArtifacts)
-    (imported? : Option (NameMap (ModuleUsage.Digest × ModuleUsage.Digest)) := none) :
+    (importedClosures? : Option (NameMap ModuleUsage.Digest) := none) :
     JobM (Option ModuleUsage.Digest) := do
   let mods := presetup.directImports.filterMap (·.module?) |>.map (·.name)
     |>.qsort Name.quickLt |>.toList.eraseDups
   let mut e := ({} : ModuleUsage.Enc).nat mods.length
   for m in mods do
     let some (_, imp) ← importUsage? hashes importArts m | return none
-    if let some imported := imported? then
-      unless imported.find? m |>.any (·.2 == imp.closure) do return none
+    if let some imported := importedClosures? then
+      unless imported.find? m == some imp.closure do return none
     e := e.name m |>.digest imp.closure
   return some e.finish
 
@@ -1625,8 +1629,9 @@ is of its bytes (`contentHash`).
 
 The key must describe what the compile read, and another workspace can rebuild a shared dependency while the module
 compiles. So every direct import's `closure` and every `extra` module's `moduleDigest`, read now through
-`importUsage?`, must be what the compile imported (`UsageSidecar.imported`, which Lean took from the `.olean` files it
-loaded), and the closure's module-system files must have the bytes they had before the compile (`modsysBefore`).
+`importUsage?`, must be what the compile imported (`UsageSidecar.importedClosures`, `importedDigests`, which Lean
+took from the `.olean` files it loaded), and the closure's module-system files must have the bytes they had before
+the compile (`modsysBefore`).
 Writes nothing if not, or if the `.usage` does not cover the closure (`UsageSidecar.coversClosure`) or is missing,
 or if `importUsage?` accepts no `.usage` for a direct import or a workspace `extra` module, so the module is never
 skipped.
@@ -1638,12 +1643,13 @@ def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
   let hashes ← IO.mkRef {}
   let modsys ← modsysHash hashes importArts
   unless modsys == modsysBefore do return
-  let some closure ← closureHash hashes presetup importArts (imported? := some usage.imported) | return
+  let some closure ← closureHash hashes presetup importArts (importedClosures? := some usage.importedClosures)
+    | return
   let mut extra := #[]
   for m in usage.extra do
     if (← findModule? m).isNone then continue
     let some (olean, imp) ← importUsage? hashes importArts m | return
-    unless usage.imported.find? m |>.any (·.1 == imp.moduleDigest) do return
+    unless usage.importedDigests.find? m == some imp.moduleDigest do return
     extra := extra.push <|
       Json.arr #[ModuleUsage.nameToJson m, toJson (← contentHash hashes olean), toJson imp.moduleDigest]
   let key := Json.mkObj [

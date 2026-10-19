@@ -572,12 +572,13 @@ def usageVersion : Nat := 10
 `used` holds the imported names recorded while elaborating (`moduleUsed`'s `extra`); `lookups` the
 specialization-cache keys looked up (`lookedUpSpecKeys`). The extra module uses are the environment's and
 `extraModUsesByChecks` (those of commands whose environment was discarded); if a compile ran code or read state the
-used names do not cover (`compilerCodeSeen`), every imported module with digests is one. `imported` records, for
-each direct import and extra module with digests, its `moduleDigest` and `closureDigest` as this compile imported
-them, from their `.olean` files: Lake writes a `.usekey` only if those are still what the modules' `.usage` files
-say when it writes it, so the key describes what the compile read. `noskip` is set when the run reused commands
-from an `--incr-load` snapshot, since reused commands never call `addDecl` in this process and `used` may miss
-constants they used. -/
+used names do not cover (`compilerCodeSeen`, or a unification hint from an imported module with digests matched
+inside a compile, `compileHints`), every imported module with digests is one. `importedClosures` records each direct
+import's `closureDigest` and `importedDigests` each extra module's `moduleDigest`, as this compile imported them
+from their `.olean` files: Lake writes a `.usekey` only if those are still what the modules' `.usage` files say when
+it writes it, so the key describes what the compile read. `noskip` is set when the run reused commands from an
+`--incr-load` snapshot, since reused commands never call `addDecl` in this process and `used` may miss constants
+they used. -/
 def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Digest)) (closure : Digest)
     (used : NameSet) (lookups : Array Expr) (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
   let s := state env
@@ -589,17 +590,16 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
   let extraMods := allExtra.toArray.filter (fun u => (env.getModuleIdx? u.module).any s.hasEntries)
     |>.qsort fun a b => let k (u : ExtraModUse) := 2 * u.isExported.toNat + u.isMeta.toNat
       Name.quickLt a.module b.module || (a.module == b.module && k a < k b)
-  let importedNames : NameSet := extraMods.foldl (·.insert ·.module) <|
-    env.header.imports.foldl (·.insert ·.module) {}
-  let imported := importedNames.toArray.qsort Name.quickLt |>.filterMap fun m => do
-    let (md, cd) ← s.importedDigests? (← env.getModuleIdx? m)
-    return Json.arr #[nameToJson m, toJson md, toJson cd]
+  let imported (ms : Array Name) (field : Digest × Digest → Digest) : Json :=
+    Json.arr <| (ms.qsort Name.quickLt).toList.eraseDups.toArray.filterMap fun m => do
+      return Json.arr #[nameToJson m, toJson (field (← s.importedDigests? (← env.getModuleIdx? m)))]
   let pair (n : Name) (d : Digest) := Json.arr #[nameToJson n, toJson d]
   let j := Json.mkObj [("version", usageVersion), ("noskip", incrLoaded),
     ("moduleDigest", toJson (moduleDigestOf own)),
     ("closure", toJson closure),
     ("digested", Json.arr ((digestedModules env).map nameToJson)),
-    ("imported", Json.arr imported),
+    ("importedClosures", imported (env.header.imports.map (·.module)) (·.2)),
+    ("importedDigests", imported (extraMods.map (·.module)) (·.1)),
     ("own", Json.arr (own.map fun (n, d) => pair n d)),
     ("used", Json.arr ((moduleUsed env used nodes).map fun (m, cs) =>
       Json.arr #[nameToJson m, Json.arr (cs.map fun (n, d) => pair n d)])),
