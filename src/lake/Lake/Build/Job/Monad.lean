@@ -7,6 +7,7 @@ module
 
 prelude
 public import Lake.Build.Fetch
+public import Init.Task
 
 open System Lean
 
@@ -167,7 +168,7 @@ namespace Job
 
 /-- Spawn a job that asynchronously performs `act`. -/
 @[nospecialize] public protected def async
-  [OptDataKind α] (act : JobM α) (prio := Task.Priority.default) (caption := "")
+  [OptDataKind α] (act : JobM α) (prio := Task.Priority.max) (caption := "")
 : SpawnM (Job α) := .ofFn fun fetch pkg? stack store ctx _ =>
   .ofTask (caption := caption) <$> BaseIO.asTask (prio := prio) do
     (withLoggedIO act).toFn fetch pkg? stack store ctx {}
@@ -221,7 +222,7 @@ If the build's cancellation token is set, errors without running `f`.
 -/
 @[nospecialize] public protected def mapM
   [kind : OptDataKind β] (self : Job α) (f : α → JobM β)
-  (prio := Task.Priority.default) (sync := false)
+  (prio := Task.Priority.max) (sync := false)
 : SpawnM (Job β) := .ofFn fun fetch pkg? stack store ctx trace => do
   self.bindTask fun task => do
   BaseIO.mapTask (t := task) (prio := prio) (sync := sync) fun
@@ -239,7 +240,7 @@ If the build's cancellation token is set, errors without running `f`.
 -/
 @[nospecialize] public def bindM
   [kind : OptDataKind β] (self : Job α) (f : α → JobM (Job β))
-  (prio := Task.Priority.default) (sync := false)
+  (prio := Task.Priority.max) (sync := false)
 : SpawnM (Job β) := .ofFn fun fetch pkg? stack store ctx trace => do
   self.bindTask fun task => do
   BaseIO.bindTask task (prio := prio) (sync := sync) fun
@@ -261,11 +262,16 @@ results of `a` and `b`. The job `c` errors if either `a` or `b` error.
 -/
 @[inline] public def zipResultWith
   [OptDataKind γ] (f : JobResult α → JobResult β → JobResult γ) (self : Job α) (other : Job β)
-  (prio := Task.Priority.default) (sync := false)
+  (prio := Task.Priority.max) (sync := false)
 : Job γ := Job.ofTask $
   self.task.bind (prio := prio) (sync := true) fun rx =>
   other.task.map (prio := prio) (sync := sync) fun ry =>
   f rx ry
+
+/-- The result of `a.zipWith f b` from the results of `a` and `b`. -/
+@[inline] public def zipResults (f : α → β → γ) : JobResult α → JobResult β → JobResult γ
+  | .ok a sa, .ok b sb => .ok (f a b) (sa.merge sb)
+  | ra, rb => .error 0 (ra.state.merge rb.state)
 
 /--
 `a.zipWith f b` produces a new job `c` that applies `f` to the
@@ -273,11 +279,9 @@ results of `a` and `b`. The job `c` errors if either `a` or `b` error.
 -/
 @[inline] public def zipWith
   [OptDataKind γ] (f : α → β → γ) (self : Job α) (other : Job β)
-  (prio := Task.Priority.default) (sync := false)
+  (prio := Task.Priority.max) (sync := false)
 : Job γ :=
-  self.zipResultWith (other := other) (prio := prio) (sync := sync) fun
-  | .ok a sa, .ok b sb => .ok (f a b) (sa.merge sb)
-  | ra, rb => .error 0 (ra.state.merge rb.state)
+  self.zipResultWith (zipResults f) (other := other) (prio := prio) (sync := sync)
 
 /-- Merges this job with another, discarding its output and trace. -/
 public def add (self : Job α) (other : Job β) : Job α :=
@@ -290,28 +294,70 @@ public def add (self : Job α) (other : Job β) : Job α :=
 public def mix (self : Job α) (other : Job β) : Job Unit :=
   self.zipWith (sync := true) (fun _ _ => ()) other
 
+/-!
+A chain of tasks that folds the results of many jobs, one `zipWith` per job, takes time quadratic in
+the number of jobs when a job is still running as the chain is built: Lean marks the result of a
+task that had to wait as shared between threads and never updates such a value in place, so every
+later step copies the arrays it extends (e.g., the log and the trace inputs that `JobState.merge`
+accumulates). The folds below wait for all the jobs with `Task.mapList`, whose chain only prepends
+each result to a list, and then fold their results in one task.
+-/
+
+/--
+The job `jobs.foldl (·.zipWith (sync := true) f ·) init`: `f` folded over the outputs of `jobs`, in
+order, from the output of `init`, in one task once every job is done.
+-/
+public def zipWithAll
+  [OptDataKind β] (f : β → α → β) (init : Job β) (jobs : Array (Job α))
+: Job β :=
+  let rs := Task.mapList (sync := true) id (jobs.toList.map (·.task))
+  Job.ofTask <| init.task.bind (sync := true) fun r =>
+  rs.map (sync := true) (·.foldl (zipResults f) r)
+
+/--
+The job `jobs.foldr (zipWith (sync := true) f) init`, in one task once every job is done.
+
+`JobState.merge a b` appends the log of `b` to the log of `a`, and in a right fold `b` holds the
+logs merged so far, so a fold that merged the logs would copy them at each step. This fold merges
+the states without their logs and joins the logs separately, left to right.
+-/
+public def zipWithAllRight
+  [OptDataKind β] (f : α → β → β) (jobs : List (Job α)) (init : Job β)
+: Job β :=
+  let rs := Task.mapList (sync := true) id (jobs.map (·.task))
+  Job.ofTask <| init.task.bind (sync := true) fun r =>
+  rs.map (sync := true) fun rs =>
+    let log := rs.foldl (init := ({} : Log)) (· ++ ·.state.log) ++ r.state.log
+    let noLog (s : JobState) : JobState := {s with log := {}}
+    let r := rs.foldr (init := r.modifyState noLog) fun ra r =>
+      zipResults f (ra.modifyState noLog) r
+    r.modifyState fun s => {s with log}
+
 /-- Merge a `List` of jobs into one, discarding their outputs. -/
 public def mixList (jobs : List (Job α)) (traceCaption := "<collection>")  : Job Unit :=
-  jobs.foldr (·.mix ·) (traceRoot () traceCaption)
+  zipWithAllRight (fun _ _ => ()) jobs (traceRoot () traceCaption)
 
 /-- Merge an `Array` of jobs into one, discarding their outputs. -/
 public def mixArray (jobs : Array (Job α)) (traceCaption := "<collection>")  : Job Unit :=
-  jobs.foldl (·.mix ·) (traceRoot () traceCaption)
+  (traceRoot () traceCaption).zipWithAll (fun _ _ => ()) jobs
 
 /-- Merge a `List` of jobs into one, collecting their outputs into a `List`. -/
 public def collectList (jobs : List (Job α)) (traceCaption := "<collection>") : Job (List α) :=
-  jobs.foldr (zipWith (sync := true) List.cons) (traceRoot [] traceCaption)
+  zipWithAllRight List.cons jobs (traceRoot [] traceCaption)
 
 /-- Merge an `Array` of jobs into one, collecting their outputs into an `Array`. -/
 public def collectArray (jobs : Array (Job α)) (traceCaption := "<collection>") : Job (Array α) :=
-  jobs.foldl (zipWith (sync := true) Array.push) (traceRoot (Array.mkEmpty jobs.size) traceCaption)
+  (traceRoot (Array.mkEmpty jobs.size) traceCaption).zipWithAll Array.push jobs
 
 instance : Nonempty ({α : Type u} → [Nonempty α] → α) := ⟨Classical.ofNonempty⟩
 
 /-- Merge an `Vector` of jobs into one, collecting their outputs into an `Array`. -/
 public def collectVector {α : Type u} [Nonempty α] (jobs : Vector (Job α) n) (traceCaption := "<collection>") : Job (Vector α n) :=
   let placeholder := unsafe have : Nonempty α := inferInstance; (unsafeCast () : α)
-  n.fold (init := traceRoot (Vector.replicate n placeholder) traceCaption) fun i h job =>
-    job.zipWith (sync := true) (Vector.set · i · h) jobs[i]
+  let init : JobResult (Vector α n) := .ok (Vector.replicate n placeholder) {trace := .nil traceCaption}
+  Job.ofTask <| Task.mapList (sync := true) (tasks := jobs.toList.map (·.task)) fun rs =>
+    let rs := rs.toArray
+    n.fold (init := init) fun i h r =>
+      if h' : i < rs.size then zipResults (Vector.set · i · h) r rs[i] else r
 
 end Job

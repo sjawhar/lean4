@@ -113,6 +113,11 @@ jobs:
       - name: Configure Build
         run: |
           ulimit -c unlimited  # coredumps
+          # msys2 hides the runner's preinstalled cargo by trimming the Windows `PATH`; configure records its path to
+          # build leantar
+          if command -v cygpath > /dev/null && [ -n "${USERPROFILE:-}" ]; then
+            export PATH="$(cygpath -u "$USERPROFILE")/.cargo/bin:$PATH"
+          fi
           [ -d build ] || mkdir build
           cd build
           # arguments passed to `cmake`

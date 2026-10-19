@@ -80,6 +80,12 @@ public structure JobState where
   trace : BuildTrace := .nil
   /-- How long the job spent building (in milliseconds). -/
   buildTime : Nat := 0
+  /--
+  Whether a build action of this job (see `buildAction`) completed: this process ran the compiler
+  or linker. It is merged from the jobs this job continues, so read it only through `trackBuilds`,
+  which clears it first.
+  -/
+  built : Bool := false
   deriving Inhabited
 
 public def JobState.merge (a b : JobState) : JobState where
@@ -89,6 +95,7 @@ public def JobState.merge (a b : JobState) : JobState where
   canceled := a.canceled || b.canceled
   trace := mixTrace a.trace b.trace
   buildTime := a.buildTime + b.buildTime
+  built := a.built || b.built
 
 @[inline] public def JobState.modifyLog (f : Log → Log) (s : JobState) : JobState :=
   {s with log := f s.log}
@@ -188,12 +195,12 @@ Useful if the job is already known to be completed.
 
 @[inline] public def mapResult
   [OptDataKind β] (f : JobResult α → JobResult β) (self : Job α)
-  (prio := Task.Priority.default) (sync := false)
+  (prio := Task.Priority.max) (sync := false)
 : Job β := {self with task := self.task.map f prio sync, kind := inferInstance}
 
 @[inline] public def mapOk
   [OptDataKind β] (f : α → JobState → JobResult β) (self : Job α)
-  (prio := Task.Priority.default) (sync := false)
+  (prio := Task.Priority.max) (sync := false)
 : Job β :=
   self.mapResult (prio := prio) (sync := sync) fun
     | .ok a s => f a s
@@ -201,7 +208,7 @@ Useful if the job is already known to be completed.
 
 @[inline] public protected def map
   [OptDataKind β] (f : α → β) (self : Job α)
-  (prio := Task.Priority.default) (sync := false)
+  (prio := Task.Priority.max) (sync := false)
 : Job β := self.mapResult (·.map f) prio sync
 
 public instance : Functor Job where map := Job.map
