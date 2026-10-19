@@ -1,10 +1,11 @@
 import Lean
-/-! A command that changes an extension's state without adding an entry to it (`attribute [-simp] x`, a
-declaration attribute that erases a simp lemma, or one that edits the simp state through the scoped extension's
-underlying persistent extension) records the extension in its payload's `stateOnly`, and `replayCommandEntries`
-refuses that payload instead of replaying it without the erasure. A declaration command with such a change declines
-the module (`noskip`). An erasure inside `attribute [-simp] x in theorem …` is undone on the main branch by the
-command's own scope, but the theorem's asynchronous branch forked inside that scope and keeps it, and no stack
+/-! A command that changes an extension's state without adding an entry to it or logging a stack operation (a
+declaration attribute that edits the simp state through the scoped extension's underlying persistent extension) records
+the extension in its payload's `stateOnly`, and `replayCommandEntries` refuses that payload instead of replaying it
+without the change. An erasure (`attribute [-simp] x`) is a `ScopedEnvExtension.modifyState` (`Op.modify`), which
+`ScopedEnvExtension.stackDelta` does not express, so it is refused too. A declaration command with such a change
+declines the module (`noskip`). An erasure inside `attribute [-simp] x in theorem …` is undone on the main branch by
+the command's own scope, but the theorem's asynchronous branch forked inside that scope and keeps it, and no stack
 operation expresses an erasure, so that command is refused too (`CommandEntries.branchStateOnly`). The commands after
 an erasure see which lemma it erased in their context digest (`ctx`). -/
 open Lean
@@ -41,7 +42,7 @@ unsafe def replayed (obs : Array ModuleUsage.CommandObservation) (payloads : Arr
   let some o := obs.find? (·.i == i) | throw <| IO.userError s!"no observation {i}"
   let some ce := payloads.find? (·.idx == i) | throw <| IO.userError s!"no payload {i}"
   try
-    let env ← replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce (scopeDepth o.before.env) {}
+    let env ← replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}
     return s!"replayed: {n} unfolds {unfolds env n} (full run: {unfolds o.after.env n})"
   catch e =>
     return s!"refused: {e}"

@@ -1,11 +1,11 @@
 import Lean
-/-! A declaration command that changes a scoped extension's scope stack in a way its entries and local entries do
-not express records that extension in its payload's `stateOnly`; the payload is refused and the module is declined
-(`noskip`). The shapes: a namespace activated without scoped entries (by a macro's `open`, or by `activateScoped`
-directly), `setDelimitsLocal`, a per-extension `pushScope` or `popScope`, a pop and push that replace a level (with
-or without a new local entry in the new level), and a local entry on a level deeper than the command scope, which
-replay does not install. Stack changes a declaration makes and undoes (`open … in`, `attribute [local simp] … in`,
-dotted names, `classical`) and a top-level local entry stay replayable, and replay reproduces them. -/
+/-! A declaration command that changes a scoped extension's scope stack only through the stack's operations (a
+namespace activated by a macro's `open` or by `activateScoped`, `setDelimitsLocal`, a per-extension `pushScope` or
+`popScope`, a pop and push that replace a level, with or without a new local entry in the new level, a local entry on
+a level deeper than the command scope) records those operations in its payload's `scopedOps` and is replayed, and
+the replay reproduces the stack (`simpView`); the extension is not in `stateOnly` and the module is not declined for
+it. Stack changes a declaration makes and undoes (`open … in`, `attribute [local simp] … in`, dotted names,
+`classical`) and a top-level local entry replay as well. -/
 open Lean
 
 /-- What a later command sees of the simp extension: per stack level, the active namespaces and whether local
@@ -34,7 +34,7 @@ unsafe def check (dir : System.FilePath) (label src : String) (probes : List Nam
     let kind := (cmds[o.i]?.bind fun c => (c.getObjValAs? String "kind").toOption).getD "?"
     let simpStateOnly := ce.stateOnly.contains Meta.simpExtension.ext.name
     let replay ← try
-        let env ← replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce (scopeDepth o.before.env) {}
+        let env ← replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}
         let full := simpView o.after.env probes
         let got := simpView env probes
         pure (if full == got then s!"replay matches: {full}" else s!"replay differs: full {full}, replayed {got}")

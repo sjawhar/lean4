@@ -64,8 +64,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let some ce := payloads.find? (·.idx == 1) | throw <| IO.userError "no payload 1"
   let post := (records[1]?.bind fun r => (r.getObjVal? "post").toOption).getD .null
   IO.println s!"full run: {localNames fullEnv}; command 1 stateOnly {ce.stateOnly}"
-  let replayed ← replayCommandEntries (← CommandEntries.Testing.rollbackTo kept.before.env kept.after.env) ce
-    (scopeDepth kept.before.env) {}
+  let replayed ← replayCommandEntries (← CommandEntries.Testing.rollbackTo kept.before.env kept.after.env) ce {}
   let ctx : Command.Context := { fileName := "M.lean", fileMap := mSource.toFileMap, snap? := none, cancelTk? := none }
   let fullValue := (fullEnv.find? `pm).bind (·.value? (allowOpaque := true))
   let ahead := { kept.before.ngen with idx := kept.after.ngen.idx + 100 }
@@ -103,8 +102,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let some next := obs.find? (·.i == 3) | throw <| IO.userError "no observation 3 in N"
   let some ce := payloads.find? (·.idx == 2) | throw <| IO.userError "no payload 2 in N"
   let post := (records[2]?.bind fun r => (r.getObjVal? "post").toOption).getD .null
-  let replayed ← replayCommandEntries (← CommandEntries.Testing.rollbackTo kept.before.env kept.after.env) ce
-    (scopeDepth kept.before.env) {}
+  let replayed ← replayCommandEntries (← CommandEntries.Testing.rollbackTo kept.before.env kept.after.env) ce {}
   let ngen ← IO.ofExcept (restored post kept.before.ngen)
   let ctx : Command.Context := { fileName := "N.lean", fileMap := nSource.toFileMap, snap? := none, cancelTk? := none }
   let st := { kept.before with env := replayed, ngen }

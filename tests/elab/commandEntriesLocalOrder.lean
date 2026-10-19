@@ -1,11 +1,10 @@
 import Lean
 /-! A declaration command that adds a local entry and then a global entry to the same scoped extension records the
-extension in its payload's `stateOnly`: replay installs a payload's entries before its local entries, so it would apply
-the two in the opposite order, and for order-sensitive states the result differs. The payload is refused and the
-module is declined (`noskip`). One case per order-sensitive kind: macro rules (`KeyedDeclsAttribute` prepends, so the
-most recent rule wins), instances (the most recent of equal priority wins), simp lemmas and notations. For macro
-rules and instances the test also elaborates the rest of the module on top of the replayed payload, as a kept command
-would be, and prints what a later command sees. -/
+extension's stack operations in its payload's `scopedOps`, in the order they were logged, and replay applies them in
+that order (it no longer records `stateOnly` for the pair). One case per order-sensitive kind: macro rules
+(`KeyedDeclsAttribute` prepends, so the most recent rule wins), instances (the most recent of equal priority wins),
+simp lemmas and notations. For macro rules and instances the test also elaborates the rest of the module on top of the
+replayed payload, as a kept command would be, and prints what a later command sees. -/
 open Lean
 
 structure Run where
@@ -48,11 +47,10 @@ unsafe def check (dir : System.FilePath) (label : String) (ext : Name) (src : St
   let kind := (((r.usage.getObjValAs? (Array Json) "commands").toOption.getD #[])[i]?.bind
     fun c => (c.getObjValAs? String "kind").toOption).getD "?"
   IO.println s!"{label}: command {i} {kind}, {ext} in stateOnly {ce.stateOnly.contains ext}, entries \
-    {ce.entries.any (·.ext == ext)}, locals {ce.locals.any (·.2.1 == ext)}, \
+    {(ce.checked.entries ++ ce.main.entries).any (·.1 == ext)}, scoped ops {ce.main.scopedOps.any (·.1 == ext)}, \
     noskip {(r.usage.getObjValAs? Bool "noskip").toOption}"
   let replayed? ← try
-      pure (some (← replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce
-        (scopeDepth o.before.env) {}))
+      pure (some (← replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}))
     catch _ => pure none
   match replayed?, probe? with
   | none, _ => IO.println "  replay refused"

@@ -1,53 +1,53 @@
-== macro open: noskip (some true), reason (some (state-only change to reducibilityExtra in declaration command 6))
-0 other: simp stateOnly true; refused
-1 other: simp stateOnly true; refused
+== macro open: noskip (some true), reason (some (state-only change to Lean.Elab.Command.scopes in declaration command 6))
+0 other: simp stateOnly false; refused
+1 other: simp stateOnly false; refused
 2 decl: simp stateOnly false; replay matches: levels=[([Foo, Lean.Elab, Lean, Lean.Elab.Command], true), ([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[]
-3 other: simp stateOnly true; refused
+3 other: simp stateOnly false; refused
 4 decl: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[]
 5 other: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[]
-6 decl: simp stateOnly true; refused
+6 decl: simp stateOnly false; refused
 7 other: simp stateOnly false; replay matches: levels=[([Foo, Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[]
-== activateScoped: noskip (some true), reason (some (state-only change to Lean.Meta.simpExtension in declaration command 1))
-0 other: simp stateOnly true; refused
-1 decl: simp stateOnly true; refused
+== activateScoped: noskip (some false), reason none
+0 other: simp stateOnly false; refused
+1 decl: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command, NeverOpened], true)] lemmas=[]
 2 other: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command, NeverOpened], true)] lemmas=[]
-== setDelimitsLocal: noskip (some true), reason (some (state-only change to Lean.Meta.simpExtension in declaration command 2))
-0 other: simp stateOnly true; refused
-1 other: simp stateOnly true; refused
-2 decl: simp stateOnly true; refused
+== setDelimitsLocal: noskip (some false), reason none
+0 other: simp stateOnly false; refused
+1 other: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command], true), ([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[]
+2 decl: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command], false), ([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[]
 3 other: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command], false), ([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[]
-== popScope: noskip (some true), reason (some (state-only change to Lean.Meta.simpExtension in declaration command 2))
-0 other: simp stateOnly true; refused
-1 other: simp stateOnly true; refused
-2 decl: simp stateOnly true; refused
+== popScope: noskip (some false), reason none
+0 other: simp stateOnly false; refused
+1 other: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command], true), ([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[]
+2 decl: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[]
 3 other: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[]
-== pushScope: noskip (some true), reason (some (state-only change to Lean.Meta.simpExtension in declaration command 1))
-0 other: simp stateOnly true; refused
-1 decl: simp stateOnly true; refused
+== pushScope: noskip (some false), reason none
+0 other: simp stateOnly false; refused
+1 decl: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command], true), ([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[]
 2 other: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command], true), ([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[]
-== pop and push replace a level: noskip (some true), reason (some (state-only change to Lean.Meta.simpExtension in declaration command 3))
-0 other: simp stateOnly true; refused
-1 other: simp stateOnly true; refused
-2 other: simp stateOnly true; refused
-3 decl: simp stateOnly true; refused
+== pop and push replace a level: noskip (some false), reason none
+0 other: simp stateOnly false; refused
+1 other: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command], true), ([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[]
+2 other: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command], true), ([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[Nat.add_comm]
+3 decl: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command], true), ([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[]
 4 other: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command], true), ([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[]
-== pop and push replace a level, then a local entry: noskip (some true), reason (some (state-only change to Lean.Meta.simpExtension in declaration command 3))
-0 other: simp stateOnly true; refused
-1 other: simp stateOnly true; refused
-2 other: simp stateOnly true; refused
-3 decl: simp stateOnly true; refused
+== pop and push replace a level, then a local entry: noskip (some false), reason none
+0 other: simp stateOnly false; refused
+1 other: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command], true), ([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[]
+2 other: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command], true), ([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[Nat.add_comm]
+3 decl: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command], true), ([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[t2]
 4 other: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command], true), ([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[t2]
-== local entry on a level deeper than the command scope: noskip (some true), reason (some (state-only change to Lean.Meta.simpExtension in declaration command 2))
-0 other: simp stateOnly true; refused
-1 other: simp stateOnly true; refused
-2 decl: simp stateOnly true; refused
+== local entry on a level deeper than the command scope: noskip (some false), reason none
+0 other: simp stateOnly false; refused
+1 other: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command], true), ([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[]
+2 decl: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command], true), ([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[t3]
 3 other: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command], true), ([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[t3]
 == replayable stack changes: noskip (some false), reason none
-0 other: simp stateOnly true; refused
-1 other: simp stateOnly true; refused
+0 other: simp stateOnly false; refused
+1 other: simp stateOnly false; refused
 2 decl: simp stateOnly false; replay matches: levels=[([Foo, Lean.Elab, Lean, Lean.Elab.Command], true), ([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[]
 3 decl: simp stateOnly false; replay matches: levels=[([Foo, Lean.Elab, Lean, Lean.Elab.Command], true), ([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[Foo.s]
-4 other: simp stateOnly true; refused
+4 other: simp stateOnly false; refused
 5 decl: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[]
 6 decl: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[]
 7 decl: simp stateOnly false; replay matches: levels=[([Lean.Elab, Lean, Lean.Elab.Command], true)] lemmas=[]

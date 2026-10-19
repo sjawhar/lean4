@@ -412,8 +412,6 @@ structure CommandPost where
   auxDeclNGen : DeclNGenRecord
   /-- The quotation contexts the command added to `usedQuotCtxts`, sorted. -/
   quotCtxts : Array Name
-  /-- The length of the local-entry log after the command. -/
-  localEntries : Nat
   /-- `maxRecDepth` after the command: `set_option maxRecDepth n in` leaves it set (`elabSetOption` caches it in
   the state, and the `in` macro's `end` restores only the scope). -/
   maxRecDepth : Nat
@@ -429,7 +427,6 @@ def CommandPost.ofStates (before after : Elab.Command.State) : CommandPost :=
   let g := after.auxDeclNGen.toRecord
   { auxDeclNGen := { namePrefix := g.namePrefix, idx := g.idx, parentIdxs := g.parentIdxs }
     quotCtxts := (NameSet.sharedDiff before.usedQuotCtxts after.usedQuotCtxts).1 |>.qsort Name.quickLt
-    localEntries := localEntryCount after.env
     maxRecDepth := after.maxRecDepth
     ngen := .ofNameGenerator after.ngen
     ngenBefore := .ofNameGenerator before.ngen }
@@ -445,12 +442,11 @@ def CommandPost.restoreNgen (post : CommandPost) (current : NameGenerator) : Exc
   return post.ngen.toNameGenerator
 
 instance : ToJson CommandPost := ⟨fun p => Json.mkObj [("auxDeclNGen", toJson p.auxDeclNGen),
-  ("quotCtxts", .arr (p.quotCtxts.map nameToJson)), ("localEntries", p.localEntries),
+  ("quotCtxts", .arr (p.quotCtxts.map nameToJson)),
   ("maxRecDepth", p.maxRecDepth), ("ngen", toJson p.ngen), ("ngenBefore", toJson p.ngenBefore)]⟩
 instance : FromJson CommandPost := ⟨fun j => return {
   auxDeclNGen := ← j.getObjValAs? DeclNGenRecord "auxDeclNGen"
   quotCtxts := (← j.getObjValAs? (Array JName) "quotCtxts").map (·.name)
-  localEntries := ← j.getObjValAs? Nat "localEntries"
   maxRecDepth := ← j.getObjValAs? Nat "maxRecDepth"
   ngen := ← j.getObjValAs? NGenRecord "ngen"
   ngenBefore := ← j.getObjValAs? NGenRecord "ngenBefore" }⟩

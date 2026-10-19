@@ -3,8 +3,9 @@ import Lean
 core, so a declaration command whose attribute uses it to install a changed state of a log extension is recorded as
 `stateOnly` and the module is `noskip` (`decl2f-delta3-review.md` finding 5). Writing below the counters would leave
 the payload empty and its replay would lose the change. The attribute builds a state with an extra derived element in
-a scratch environment and copies it into the real one; it is the only command of the module, so the module's
-`noskip` comes from it alone. -/
+a scratch environment and copies it into the real one. `d0` is the module's only declaration, so the module's
+`noskip` comes from it alone; the copy writes every extension, each counted, so the reason names the first extension
+in registration order, and the test checks that `logExt` is among the command's `stateOnly`. -/
 open Lean
 
 def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
@@ -50,8 +51,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   for o in obs do
     let some ce := payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"
     let replay ← try
-        let env ← replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce
-          (scopeDepth o.before.env) {}
+        let env ← replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}
         let full ← view o.after.env
         let got ← view env
         pure (if full == got then "replay matches" else s!"replay differs:\n    full     {full}\n    replayed {got}")

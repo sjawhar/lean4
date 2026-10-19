@@ -1,7 +1,7 @@
-noskip (some true), reason (some (state-only change to mainLog in declaration command 4))
+noskip (some true), reason (some (state-only change to mainLog in the branch of d4 in declaration command 4))
 0: stateOnly #[], entries #[mainLog.checked, mainLog.main]; replay matches
 1: stateOnly #[], entries #[localLog.checked, localLog.main]; replay matches
 2: stateOnly #[], entries #[syncLog.main]; replay matches
-3: stateOnly #[], entries #[mainLog.main, localLog.main, syncLog.checked, syncLog.main]; replay matches
+3: stateOnly #[], entries #[syncLog.checked, mainLog.main, localLog.main, syncLog.main]; replay matches
 4: stateOnly #[mainLog], entries #[]; refused
 5: stateOnly #[], entries #[]; replay matches

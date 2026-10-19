@@ -11,6 +11,13 @@ extensions, the states themselves (log and set, scoped stack, map bindings). Pay
 are refused: they change the scope stack, which no entry expresses. -/
 open Lean
 
+/-- The extensions `keep` selects among a payload's entries, as `name.view`: checked entries, main entries, then the
+scoped extensions' operations. -/
+def shownEntries (ce : CommandEntries) (keep : Name → Bool) : Array String :=
+  let named (view : String) (es : Array (Name × Array EnvExtensionEntry)) :=
+    es.filterMap fun (n, _) => if keep n then some s!"{n}.{view}" else none
+  named "checked" ce.checked.entries ++ named "main" ce.main.entries ++ named "main" ce.main.scopedOps
+
 def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
   let out ← IO.Process.output { cmd := "lean", args, cwd := dir, env := #[("LEAN_PATH", some dir.toString)] }
   unless out.exitCode = 0 do
@@ -124,11 +131,11 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let pExts := (← persistentEnvExtensionsRef.get).filter (!excludedExtension ·.name)
   for o in obs do
     let some ce := payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"
-    let shown := ce.entries.filterMap fun e => if watched.contains e.ext then some s!"{e.ext}.{e.view}" else none
+    let shown := shownEntries ce watched.contains
     -- as when a kept command is replayed: its constants are present, every extension is in its before-state
     let base ← CommandEntries.Testing.rollbackTo o.before.env o.after.env
     let replayed? : Option Environment ← try
-        pure (some (← replayCommandEntries base ce (scopeDepth o.before.env) {}))
+        pure (some (← replayCommandEntries base ce {}))
       catch _ => pure none
     match replayed? with
     | none =>

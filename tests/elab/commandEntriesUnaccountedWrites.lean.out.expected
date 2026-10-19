@@ -1,4 +1,4 @@
-noskip (some true), reason (some (state-only change to mainLog in declaration command 0))
+noskip (some true), reason (some (state-only change to mainLog in the branch of d1 in declaration command 0))
 0: stateOnly #[mainLog], entries #[]; refused
 1: stateOnly #[myParamExt], entries #[]; refused
 2: stateOnly #[scopeExt], entries #[]; refused

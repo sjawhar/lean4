@@ -758,6 +758,8 @@ where
     let cmdIdx := cmds.size
     if ← usageRecordingRef.get then
       currentCommandRef.set cmdIdx
+    -- each command's scoped-stack operations are logged afresh (`StateStack.ops`)
+    let cmdState := { cmdState with env := ← clearScopedOps cmdState.env }
     let cmdStateBefore := cmdState
     let scope := cmdState.scopes.head!
     -- reset per-command state

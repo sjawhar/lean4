@@ -1,6 +1,6 @@
 import Lean
-/-! Per-command `.olean` payloads include all persistent extension additions and scoped local entries,
-including dynamically registered extensions and parser/macro state, and replaying them reproduces every
+/-! Per-command `.olean` payloads include all persistent extension additions and the scoped extensions' stack
+operations, including dynamically registered extensions and parser/macro state, and replaying them reproduces every
 extension's export, also for an extension whose `.olean` entries differ from its state entries
 (`@[cpass]`: `passManagerExt` exports installer names and rebuilds the pass manager from them). The extensions
 listed per payload are those with entries in the view the export reads (`AsyncMode.forExport`). Commands whose
@@ -50,9 +50,11 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
     (fun m ext => m.insert ext.name
       (if ext.toEnvExtension.asyncMode.forExport matches .sync then .checked else .main)) {}
   let exported (entry : CommandEntries) : Array Name :=
-    entry.entries.filterMap fun e => if exportView[e.ext]? == some e.view then some e.ext else none
+    (entry.checked.entries.filterMap fun (n, _) => if exportView[n]? == some .checked then some n else none) ++
+    ((entry.main.entries ++ entry.main.scopedOps).filterMap fun (n, _) =>
+      if exportView[n]? == some .main then some n else none)
   let names : Array Name := entries.flatMap exported
-  let locals : Array (Nat × Name × EnvExtensionEntry) := entries.flatMap fun entry => entry.locals
+  let scopedOps : Array Name := entries.flatMap fun entry => entry.main.scopedOps.map (·.1)
   IO.println s!"commands: {entries.size}"
   IO.println s!"payload extensions: {names.size}"
   IO.println s!"user extension: {names.contains `myExt}"
@@ -62,11 +64,9 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   IO.println s!"cpass extension: {names.contains `Lean.Compiler.LCNF.passManagerExt}"
   let unreplayable := entries.foldl (fun s entry => entry.unreplayable.foldl (·.insert ·) s) ({} : NameSet)
   IO.println s!"unreplayable: {unreplayable.toArray}"
-  IO.println s!"local entries: {locals.size}"
-  IO.println s!"local simp: {locals.any (fun (_, n, _) => n == `Lean.Meta.simpExtension)}"
-  let localDepths : Array Nat := locals.map fun entry => entry.1
-  IO.println s!"transient local depth: {localDepths.any fun depth => depth > 0}"
-  let cacheNames := entries.flatMap fun entry => entry.caches.deltas.map (·.1)
+  IO.println s!"scoped operations: {scopedOps.size}"
+  IO.println s!"simp operations: {scopedOps.contains `Lean.Meta.simpExtension}"
+  let cacheNames := entries.flatMap fun entry => (entry.main.caches ++ entry.checked.caches).map (·.1)
   IO.println s!"cache payloads: {!cacheNames.isEmpty}"
   let registeredCaches := (← commandCacheExtensionsRef.get).map (·.name)
   IO.println s!"cache names resolve: {cacheNames.all registeredCaches.contains}"
@@ -74,8 +74,8 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   for entry in entries do
     let scopedStateOnly := entry.stateOnly.any scopedExts.contains
     IO.println s!"{entry.idx} extensions={exported entry} \
-      locals={entry.locals.map fun (depth, name, _) => (depth, name)} \
-      caches={entry.caches.deltas.map (·.1)} stateOnly={entry.stateOnly.filter (!scopedExts.contains ·)}\
+      scoped operations={entry.main.scopedOps.map (·.1)} \
+      caches={(entry.main.caches ++ entry.checked.caches).map (·.1)} stateOnly={entry.stateOnly.filter (!scopedExts.contains ·)}\
       {if scopedStateOnly then " and scoped extensions" else ""}"
   let afterOf : Std.HashMap Nat Environment :=
     observations.foldl (fun m obs => m.insert obs.i obs.after.env) {}
@@ -84,10 +84,10 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let mut elaborated := #[]
   for entry in entries do
     if entry.stateOnly.isEmpty then
-      replayed ← replayCommandEntries replayed entry (scopeDepth replayed) {}
+      replayed ← replayCommandEntries replayed entry {}
     else
       let refused ← try
-          discard <| replayCommandEntries replayed entry (scopeDepth replayed) {}; pure false
+          discard <| replayCommandEntries replayed entry {}; pure false
         catch _ => pure true
       unless refused do
         throw <| IO.userError s!"payload {entry.idx} with state-only changes was replayed"

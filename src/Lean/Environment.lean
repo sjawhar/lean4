@@ -485,13 +485,12 @@ Constant info and environment extension states eventually resulting from async e
 private structure AsyncConst where
   constInfo   : AsyncConstantInfo
   /--
-  Reported extension state eventually fulfilled by promise; may be missing for tasks (e.g. kernel
-  checking, synchronous decl addition) that can eagerly guarantee they will not report any state.
+  The main-branch kernel environment of the constant's branch, eventually fulfilled by promise: its extension states
+  are what `getState (asyncDecl := c)` reads, and its write counters what the per-command recorder checks. May be
+  missing for tasks (e.g. kernel checking, synchronous decl addition) that can eagerly guarantee they will not report
+  any state.
   -/
-  exts?       : Option (Task (Array EnvExtensionState))
-  /-- The branch's main-branch kernel environment whose extensions `exts?` holds, with its write counters, for the
-  per-command recorder. -/
-  branchKEnv? : Option (Task Kernel.Environment) := none
+  kenv?       : Option (Task Kernel.Environment)
   /--
   `Task AsyncConsts` except for problematic recursion. The set of nested constants created while
   elaborating this constant.
@@ -777,14 +776,14 @@ def addDeclCore (env : Environment) (maxHeartbeats : USize) (maxRecDepth : USize
     let some info := env.checked.get.find? n | unreachable!
     env := { env with asyncConstsMap.private := env.asyncConstsMap.private.add {
       constInfo := .ofConstantInfo info
-      exts? := none
+      kenv? := none
       aconstsImpl := .pure <| .mk (α := AsyncConsts) default
     } }
     -- TODO
     if true /- !isPrivateName n-/ then
       env := { env with asyncConstsMap.public := env.asyncConstsMap.public.add {
         constInfo := .ofConstantInfo info
-        exts? := none
+        kenv? := none
         aconstsImpl := .pure <| .mk (α := AsyncConsts) default
       } }
 
@@ -806,7 +805,7 @@ private def lakeAdd (env : Environment) (cinfo : ConstantInfo) : Environment :=
     env with
     asyncConstsMap := env.asyncConstsMap.map (·.add {
       constInfo := .ofConstantInfo cinfo
-      exts? := none
+      kenv? := none
       aconstsImpl := .pure <| .mk (α := AsyncConsts) default
     })
   }
@@ -1010,7 +1009,6 @@ def PromiseCheckedResult.commitChecked (res : PromiseCheckedResult) (env : Envir
 private structure ConstPromiseVal where
   privateConstInfo     : ConstantInfo
   exportedConstInfo    : ConstantInfo
-  exts                 : Array EnvExtensionState
   kenv                 : Kernel.Environment
   nestedConsts         : VisibilityMap AsyncConsts
 deriving Nonempty
@@ -1095,12 +1093,9 @@ def addConstAsync (env : Environment) (constName : Name) (kind : ConstantKind)
         | some c => c.privateConstInfo
         | none   => mkFallbackConstInfo constName kind
     }
-    exts? := guard reportExts *> some (constPromise.result?.map (sync := true) fun
-      | some v => v.exts
-      -- any value should work here, `base` does not block
-      | none   => env.base.private.extensions)
-    branchKEnv? := guard reportExts *> some (constPromise.result?.map (sync := true) fun
+    kenv? := guard reportExts *> some (constPromise.result?.map (sync := true) fun
       | some v => v.kenv
+      -- any value should work here, `base` does not block
       | none   => env.base.private)
     aconstsImpl := constPromise.result?.map (sync := true) fun
       | some v => .mk v.nestedConsts.private
@@ -1179,7 +1174,6 @@ def AddConstAsyncResult.commitConst (res : AddConstAsyncResult) (env : Environme
   res.constPromise.resolve {
     privateConstInfo := info
     exportedConstInfo := (exportedInfo? <|> (env.setExporting true).find? res.constName).getD info
-    exts := env.base.private.extensions
     kenv := env.base.private
     nestedConsts := env.asyncConstsMap
   }
@@ -1491,7 +1485,7 @@ def asyncMayModify (ext : EnvExtension σ) (env : Environment) (asyncDecl : Name
     -- The async env's async context should either be `asyncDecl` itself or `asyncDecl` is a nested
     -- declaration that is known not to contribute env ext state (e.g. synchronously added decls).
     | .async .asyncEnv => ctx.declPrefix == asyncDecl ||
-      (ctx.mayContain asyncDecl && (env.findAsyncConst? asyncDecl).any (·.exts?.isNone))
+      (ctx.mayContain asyncDecl && (env.findAsyncConst? asyncDecl).any (·.kenv?.isNone))
     | _ => true
 
 /-- How a write to an extension's state is counted in `Kernel.Environment.unaccountedWrites`: an `unaccounted` write
@@ -1610,35 +1604,35 @@ private unsafe def getStateUnsafe {σ : Type} [Inhabited σ] (ext : EnvExtension
     if let some c := env.asyncConsts.find? asyncDecl then
       match branch with
       | .asyncEnv =>
-        if let some exts := c.exts? then
-          return ext.getStateImpl exts.get
+        if let some kenv := c.kenv? then
+          return ext.getStateImpl kenv.get.extensions
         else
           return ext.getStateImpl env.base.private.extensions
       | .mainEnv =>
         if c.isRealized then
-          if let some exts := c.exts? then
-            return ext.getStateImpl exts.get
+          if let some kenv := c.kenv? then
+            return ext.getStateImpl kenv.get.extensions
         else
           return ext.getStateImpl env.base.private.extensions
 
     if let some (c, parent?) := env.asyncConsts.findRecAndParent? asyncDecl then
       -- If `parent?` is `none`, the current branch is the parent
-      let parentExts? := match parent? with
-        | some c => c.exts?
-        | none   => some <| .pure env.base.private.extensions
-      if let some exts := (match branch with
+      let parentKEnv? := match parent? with
+        | some c => c.kenv?
+        | none   => some <| .pure env.base.private
+      if let some kenv := (match branch with
           -- If the constant is not async, fall back to parent
-          | .asyncEnv => c.exts? <|> parentExts?
+          | .asyncEnv => c.kenv? <|> parentKEnv?
           -- If the constant is realized, parent branch is empty and we should always look at `c`. In
           -- this specific case, accessing the latter will in particular not block longer than the
           -- former.
-          | .mainEnv => if c.isRealized then c.exts? else parentExts?) then
-        return ext.getStateImpl exts.get
-      -- NOTE: if `exts?` is `none`, we should *not* try the following, more expensive branches that
+          | .mainEnv => if c.isRealized then c.kenv? else parentKEnv?) then
+        return ext.getStateImpl kenv.get.extensions
+      -- NOTE: if `kenv?` is `none`, we should *not* try the following, more expensive branches that
       -- will just come to the same conclusion
     else if let some c := env.allRealizations.get.find? asyncDecl then
-      if let some exts := c.exts? then
-        return ext.getStateImpl exts.get
+      if let some kenv := c.kenv? then
+        return ext.getStateImpl kenv.get.extensions
     -- fallback; we could enforce that `asyncDecl` and its extension state always exist but the
     -- upside of doing is unclear and it is not true in e.g. the compiler. One alternative would be
     -- to add a `getState?` that does not panic in such cases.
@@ -2805,7 +2799,7 @@ private def updateBaseAfterKernelAdd (env : Environment) (kenv : Kernel.Environm
         if looksLikeOldCodegenName n then
           asyncConsts.add {
             constInfo := .ofConstantInfo (kenv.find? n |>.get!)
-            exts? := none
+            kenv? := none
             aconstsImpl := .pure <| .mk (α := AsyncConsts) default
           }
         else asyncConsts
@@ -2893,8 +2887,9 @@ def replayConsts (dest : Environment) (oldEnv newEnv : Environment) (skipExistin
         allRealizations.insert c.constInfo.name c
   }
 where
-  /-- Adds `consts` to `kenv`, kernel-checked; with `replayExts`, first applies each extension's `replay?` to the
-  difference between `oldEnv` and `newEnv` and carries that difference's unaccounted writes. -/
+  /-- Adds `consts` to `kenv`, kernel-checking each safe one (an unsafe one is added unchecked, below); with
+  `replayExts`, first applies each extension's `replay?` to the difference between `oldEnv` and `newEnv` and carries
+  that difference's unaccounted writes. -/
   replayKernel (oldEnv newEnv : Kernel.Environment)
       (exts : Array (EnvExtension EnvExtensionState)) (consts : List AsyncConst)
       (kenv : Kernel.Environment) (replayExts := true) : Except Kernel.Exception Kernel.Environment := do
@@ -3047,10 +3042,8 @@ private def RealizeConstResult.ofRealization (forConst constName : Name)
   let info : RealizationInfo := { forConst, constName, base := realizeEnv.base.private }
   let mark (c : AsyncConst) : AsyncConst :=
     let c := { c with isRealized := true }
-    if c.exts?.isNone then
-      { c with exts? := some <| .pure realizeEnv'.base.private.extensions
-               branchKEnv? := some <| .pure realizeEnv'.base.private
-               realization? := some info }
+    if c.kenv?.isNone then
+      { c with kenv? := some <| .pure realizeEnv'.base.private, realization? := some info }
     else c
   -- find new constants incl. nested realizations, add current extension state, and compute
   -- closure
@@ -3126,8 +3119,10 @@ Re-adds a realization a kept command made: `realizeConst forConst constName` wit
 which re-creates the realization's constants and recorded extension states in the realization's environment (the
 realization context's, inside the realization's async context). The result is cached as `realizeConst` caches it,
 so a later request elsewhere merges it as a full run's would; the merge into `env` adds the constants only,
-because the kept command's recorded checked view already holds the extension writes a merge replays. Throws when
-`build` does; the task holds the kernel's exception, if any.
+because the kept command's recorded checked view already holds the extension writes a merge replays. When the
+context already holds a result for the key, `build` does not run and that result is merged, as `realizeConst` does.
+Throws when `build` does; the task holds the kernel's exception, if any. A failed `build` stays cached in the
+context, and a later `Meta.realizeConst` of the key then fails (`unreachable!`): a caller aborts on a failed keep.
 -/
 private def readdRealizeConst (env : Environment) (forConst constName : Name)
     (build : Environment → Options → IO Environment) : IO (Environment × Task (Option Kernel.Exception)) := do
@@ -3143,18 +3138,17 @@ private def readdRealizeConst (env : Environment) (forConst constName : Name)
   let some res := res.get? RealizeConstResult | unreachable!
   mergeRealizeConstResult env res (replayExts := false)
 
-/-- Sets the environment realizations for the local constant `c` run in to `ctxEnv`, keeping the context's cache
-of realized values if `env` has one, else registering it with `opts` as `enableRealizationsForConst` does. A kept
-command registers the contexts its full run registered, with its final environment. -/
-private def setRealizationContext (env : Environment) (opts : Options) (c : Name) (ctxEnv : Environment) :
-    BaseIO Environment := do
-  let (opts, realizeMapRef) ← match env.localRealizationCtxMap.find? c with
-    | some ctx => pure (ctx.opts, ctx.realizeMapRef)
-    | none => pure (opts, ← IO.mkRef {})
+/-- Registers `ctxEnv` and `opts` as the realization context of the local constant `c` in `env`, with an empty cache,
+as `enableRealizationsForConst` does with the environment and options at that point: a kept command re-creates each
+context its full run registered. Throws when `env` already has one for `c`. -/
+private def registerRealizationContext (env : Environment) (c : Name) (ctxEnv : Environment) (opts : Options) :
+    IO Environment := do
+  if env.localRealizationCtxMap.contains c then
+    throw <| .userError s!"reuse: the realization context of {c} is already registered"
   return { env with localRealizationCtxMap := env.localRealizationCtxMap.insert c {
     -- safety: `RealizationContext` is private
     env := unsafe unsafeCast ctxEnv
-    opts, realizeMapRef } }
+    opts, realizeMapRef := ← IO.mkRef {} } }
 
 end Environment
 

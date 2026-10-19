@@ -13,7 +13,7 @@ def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
 
 /-- `preExt`'s entries in `ce`'s main-branch view, the view its `.mainOnly` writes reach. -/
 unsafe def preEntries (ce : CommandEntries) : Array (Name × Nat) :=
-  ((ce.entries.find? fun e => e.view == .main && e.ext == `preExt).map (·.entries) |>.getD #[]).map unsafeCast
+  ((ce.main.entries.find? fun (n, _) => n == `preExt).map (·.2) |>.getD #[]).map unsafeCast
 
 unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   IO.FS.writeFile (dir / "X.lean") "import Lean\nopen Lean\n\
@@ -46,8 +46,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let some ce₀ := payloads.find? (·.idx == 0) | throw <| IO.userError "no payload 0"
   let some ce₁ := payloads.find? (·.idx == 1) | throw <| IO.userError "no payload 1"
   try
-    let env ← replayCommandEntries (← CommandEntries.Testing.rollbackTo o₀.before.env o₀.after.env) ce₀
-      (scopeDepth o₀.before.env) {}
+    let env ← replayCommandEntries (← CommandEntries.Testing.rollbackTo o₀.before.env o₀.after.env) ce₀ {}
     IO.println s!"command 0 (@[pre_tag] def d): replayed: state has d.later {(state env).contains `d.later} \
       (full run: {(state o₀.after.env).contains `d.later})"
   catch e =>

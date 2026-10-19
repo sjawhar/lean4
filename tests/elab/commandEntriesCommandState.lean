@@ -42,7 +42,7 @@ unsafe def report (dir : System.FilePath) (label src : String) : IO Run := do
     let kind := (r.records[o.i]?.bind fun c => (c.getObjValAs? String "kind").toOption).getD "?"
     let markers := ce.stateOnly.filter stateMarkers.contains
     let replay ← try
-        discard <| replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce (scopeDepth o.before.env) {}
+        discard <| replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}
         pure "replayed"
       catch _ => pure "refused"
     IO.println s!"{o.i} {kind}: command-state markers {markers}, {replay}"

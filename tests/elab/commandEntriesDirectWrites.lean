@@ -7,6 +7,13 @@ its payload's `stateOnly`: replaying the entry alone would lose the direct write
 replayable: a `simproc` declaration inserts into its map directly, and compiling a definition memoizes types. -/
 open Lean
 
+/-- The extensions `keep` selects among a payload's entries, as `name.view`: checked entries, main entries, then the
+scoped extensions' operations. -/
+def shownEntries (ce : CommandEntries) (keep : Name → Bool) : Array String :=
+  let named (view : String) (es : Array (Name × Array EnvExtensionEntry)) :=
+    es.filterMap fun (n, _) => if keep n then some s!"{n}.{view}" else none
+  named "checked" ce.checked.entries ++ named "main" ce.main.entries ++ named "main" ce.main.scopedOps
+
 def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
   let out ← IO.Process.output { cmd := "lean", args, cwd := dir, env := #[("LEAN_PATH", some dir.toString)] }
   unless out.exitCode = 0 do
@@ -81,11 +88,11 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   for o in obs do
     let some ce := payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"
     let replay ← try
-        let env ← replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce (scopeDepth o.before.env) {}
+        let env ← replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}
         pure (if view env == view o.after.env then s!"replay matches {view env}"
           else s!"replay differs: full {view o.after.env}, replayed {view env}")
       catch _ => pure "refused"
     IO.println s!"{o.i}: stateOnly {ce.stateOnly.filter watched.contains}, \
-      entries {ce.entries.filterMap fun e => if watched.contains e.ext then some s!"{e.ext}.{e.view}" else none}; {replay}"
+      entries {shownEntries ce watched.contains}; {replay}"
 
 #eval main

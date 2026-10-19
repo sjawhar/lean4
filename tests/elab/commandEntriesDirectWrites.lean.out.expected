@@ -1,4 +1,4 @@
-noskip (some true), reason (some (state-only change to logExt in declaration command 0))
+noskip (some true), reason (some (state-only change to logExt in the branch of d1 in declaration command 0))
 0: stateOnly #[logExt], entries #[]; refused
 1: stateOnly #[logExt], entries #[]; refused
 2: stateOnly #[logExt], entries #[]; refused

@@ -7,9 +7,9 @@ before it left the field non-empty (`messages` also because `elabCommandTopLevel
 `src/Lean/Elab/Command.lean:853-854`, so only `traceState` and `snapshotTasks` show `doElab`'s reset), and an
 `unread` field must not change what the next command declares. Every
 field of `Elab.Command.Scope` must change `scopesEnc`. Every field of a scoped extension's `ScopedEnvExtension.State`
-and `StateStack` is changed on its own and must give the state delta (`ScopedEnvExtension.stateDelta`,
-`localEntriesAccountedFor`) its documented result; `ops`, the log of stack operations, is outside the command-level
-replay contract and gives no entries. The fields with a case must be exactly the structure's fields. -/
+and `StateStack` is changed on its own, without logging an operation, and `ScopedEnvExtension.stackDelta` must give
+`none` (not expressible); only an operation logged in `ops` gives a delta, and a logged `modify` or a log that is not
+a tail of the later one gives `none` again. The fields with a case must be exactly the structure's fields. -/
 open Lean Elab Command
 
 def expect (cond : Bool) (msg : String) : IO Unit :=
@@ -26,9 +26,9 @@ def quotDigest (s : NameSet) : ModuleUsage.NameSetDigest := s.foldl (·.insert �
 
 def ctxOf (st : Command.State) : ModuleUsage.Digest := ModuleUsage.ctxDigest st (quotDigest st.usedQuotCtxts) default
 
-def deltaStr : StateDelta α → String
-  | .entries es => s!"entries {es.size}"
-  | .stateOnly => "stateOnly"
+def deltaStr : Option (Array (ScopedEnvExtension.Op α)) → String
+  | some ops => s!"ops {ops.size}"
+  | none => "none"
 
 /-- A module that reports, as string constants, what a command sees of the fields reset before every command: once
 as the first command, once directly after `leave_state`, which leaves a message, a trace and a snapshot task in its
@@ -145,8 +145,8 @@ unsafe def main : IO Unit := do
       | .env =>
         let recorded ← recordCommandDelta st.env st'.env 0
         let some ce := (commandEntriesExt.getState recorded).back? | throw <| IO.userError "no payload"
-        expect (!ce.entries.isEmpty && markers.isEmpty) s!"{field}: no payload entry"
-        pure s!"payload {ce.entries.map fun e => s!"{e.ext}.{e.view}"}"
+        expect (!(ce.main.entries ++ ce.checked.entries).isEmpty && markers.isEmpty) s!"{field}: no payload entry"
+        pure s!"payload {ce.checked.entries.map (·.1.toString ++ ".checked") ++ ce.main.entries.map (·.1.toString ++ ".main")}"
       | .replayed =>
         expect (postChanged && ctxChanged && markers.isEmpty) s!"{field}: post {postChanged}, ctx {ctxChanged}"
         pure "post and ctx change"
@@ -193,36 +193,27 @@ unsafe def main : IO Unit := do
     expect ((ModuleUsage.scopesEnc {} [scope]).finish != (ModuleUsage.scopesEnc {} [scope']).finish)
       s!"Scope.{field} does not change scopesEnc"
   IO.println "every Scope field changes scopesEnc"
-  -- `ScopedEnvExtension.State` and `StateStack`: two levels; `n` local entries recorded for the extension
+  -- `ScopedEnvExtension.State` and `StateStack`: two levels
   let lvl : ScopedEnvExtension.State Nat := { state := 0 }
   let s₀ : ScopedEnvExtension.StateStack Name Name Nat := { stateStack := [lvl, lvl] }
   let top (f : ScopedEnvExtension.State Nat → ScopedEnvExtension.State Nat) :
       ScopedEnvExtension.StateStack Name Name Nat :=
     { s₀ with stateStack := [f lvl, lvl] }
-  -- (field, case, before, after, local entries replayed, expected delta, expected accounting)
+  -- (field, case, before, after, expected delta)
   let cases : Array (Name × String × ScopedEnvExtension.StateStack Name Name Nat ×
-      ScopedEnvExtension.StateStack Name Name Nat × Nat × String × Bool) := #[
-    (`state, "changed alone, without an entry or a local entry", s₀, top ({ · with state := 1 }), 0,
-      "stateOnly", true),
-    (`activeScopes, "a namespace activated", s₀, top ({ · with activeScopes := ({} : NameSet).insert `Foo }), 0,
-      "stateOnly", true),
-    (`delimitsLocal, "changed", s₀, top ({ · with delimitsLocal := false }), 0, "stateOnly", true),
-    (`modCount, "a write without an entry", s₀, top ({ · with modCount := 1 }), 0, "stateOnly", true),
-    (`generation, "a level replaced", s₀, top ({ · with generation := 1 }), 0, "stateOnly", true),
-    (`localCount, "a local entry the payload replays", s₀, top ({ · with localCount := 1 }), 1, "entries 0", true),
-    (`localCount, "a local entry the payload does not replay", s₀, top ({ · with localCount := 1 }), 0,
-      "entries 0", false),
-    (`stateStack, "a level pushed", s₀, { s₀ with stateStack := [lvl, lvl, lvl] }, 0, "stateOnly", false),
-    (`scopedEntries, "changed without a scoped entry", s₀,
-      { s₀ with scopedEntries := { map := ({} : SMap Name (PArray Name)).insert `Foo {} } }, 0, "stateOnly", true),
-    (`newEntries, "an entry in front of the old log", s₀, { s₀ with newEntries := [.global `e] }, 0,
-      "entries 1", true),
-    (`newEntries, "the old log not a tail", { s₀ with newEntries := [.global `old] },
-      { s₀ with newEntries := [.global `e] }, 0, "stateOnly", true),
-    -- numbers levels for `generation` only; outside the replay contract
-    (`pushCount, "advanced", s₀, { s₀ with pushCount := 1 }, 0, "entries 0", true),
-    -- the log of stack operations is not part of the command-level replay contract
-    (`ops, "a push logged", s₀, { s₀ with ops := [.push] }, 0, "entries 0", true)]
+      ScopedEnvExtension.StateStack Name Name Nat × String) := #[
+    (`state, "changed alone, without an operation", s₀, top ({ · with state := 1 }), "none"),
+    (`activeScopes, "a namespace activated without an operation", s₀,
+      top ({ · with activeScopes := ({} : NameSet).insert `Foo }), "none"),
+    (`delimitsLocal, "changed without an operation", s₀, top ({ · with delimitsLocal := false }), "none"),
+    (`stateStack, "a level pushed without an operation", s₀, { s₀ with stateStack := [lvl, lvl, lvl] }, "none"),
+    (`scopedEntries, "changed without an operation", s₀,
+      { s₀ with scopedEntries := { map := ({} : SMap Name (PArray Name)).insert `Foo {} } }, "none"),
+    (`newEntries, "an entry in front of the old log without an operation", s₀,
+      { s₀ with newEntries := [.global `e] }, "none"),
+    (`ops, "a push logged", s₀, { s₀ with ops := [.push] }, "ops 1"),
+    (`ops, "a modify logged", s₀, { s₀ with ops := [.modify] }, "none"),
+    (`ops, "the old log not a tail", { s₀ with ops := [.pop] }, { s₀ with ops := [.push] }, "none")]
   let stateFields := getStructureFields env ``ScopedEnvExtension.State
   let stackFields := getStructureFields env ``ScopedEnvExtension.StateStack
   let caseFields := (cases.map (·.1)).toList.eraseDups.toArray
@@ -230,10 +221,9 @@ unsafe def main : IO Unit := do
   coverage "ScopedEnvExtension.StateStack cases" stackFields (caseFields.filter (!stateFields.contains ·))
   coverage "ScopedEnvExtension.State encoding" stateFields ScopedEnvExtension.stateFields
   coverage "ScopedEnvExtension.StateStack encoding" stackFields ScopedEnvExtension.stackFields
-  for (field, label, b, a, n, delta, accounted) in cases do
-    let got := deltaStr (ScopedEnvExtension.stateDelta b a)
-    let acc := ScopedEnvExtension.localEntriesAccountedFor b a n
-    expect (got == delta && acc == accounted) s!"{field} {label}: delta {got}, accounted {acc}"
-    IO.println s!"scoped {field}, {label}: {got}, local entries accounted for {acc}"
+  for (field, label, b, a, delta) in cases do
+    let got := deltaStr (ScopedEnvExtension.stackDelta b a)
+    expect (got == delta) s!"{field} {label}: delta {got}"
+    IO.println s!"scoped {field}, {label}: {got}"
 
 #eval main

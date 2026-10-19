@@ -5,6 +5,13 @@ extension, a tag attribute, a hash-map state, the namespace set) records the ext
 removals are direct state writes, which these deltas see without the direct-write counter. -/
 open Lean
 
+/-- The extensions `keep` selects among a payload's entries, as `name.view`: checked entries, main entries, then the
+scoped extensions' operations. -/
+def shownEntries (ce : CommandEntries) (keep : Name → Bool) : Array String :=
+  let named (view : String) (es : Array (Name × Array EnvExtensionEntry)) :=
+    es.filterMap fun (n, _) => if keep n then some s!"{n}.{view}" else none
+  named "checked" ce.checked.entries ++ named "main" ce.main.entries ++ named "main" ce.main.scopedOps
+
 def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
   let out ← IO.Process.output { cmd := "lean", args, cwd := dir, env := #[("LEAN_PATH", some dir.toString)] }
   unless out.exitCode = 0 do
@@ -60,6 +67,6 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   for o in obs do
     let some ce := payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"
     IO.println s!"{o.i}: stateOnly {ce.stateOnly.filter watched.contains}, \
-      entries {ce.entries.filterMap fun e => if watched.contains e.ext then some s!"{e.ext}.{e.view}" else none}"
+      entries {shownEntries ce watched.contains}"
 
 #eval main
