@@ -66,8 +66,9 @@ private builtin_initialize compilerCodeRef : IO.Ref Bool ← IO.mkRef false
 /--
 Records that a compile in this process ran code or read state the module's used names do not cover: passes or
 constant folders beyond the built-in ones (`Lean.Compiler.LCNF.PassManager.run`), an implementation of `compileDecls`
-other than the compiler's own (`Lean.runCompileDecls`), a plugin's initializers (`Lean.loadPlugin`), or instance
-resolution and unification hints inside the compile (`recordIfCompiling`). The module's usage data then makes every
+other than the compiler's own or reserved-name predicates other than those an environment starts with
+(`Lean.runCompileDecls`), a predicate a plugin registers (`Lean.registerReservedNamePredicate`), or instance
+resolution inside the compile (`recordIfCompiling`). The module's usage data then makes every
 imported module with digests an extra use (`ModuleUsage.writeUsage`). Never cleared. Unlike the other recorders it
 does not wait for `enableUsageRecording`: plugins are loaded before `runFrontend` switches recording on.
 -/
@@ -77,6 +78,19 @@ def recordCompilerCode : BaseIO Unit :=
 /-- Whether `recordCompilerCode` ran in this process. -/
 def compilerCodeSeen : BaseIO Bool :=
   compilerCodeRef.get
+
+/-- Whether a plugin's initializers are running (`withPluginLoading`). -/
+private builtin_initialize pluginLoadingRef : IO.Ref Bool ← IO.mkRef false
+
+/-- Runs `act`, a plugin's initializers (`Lean.loadPlugin`), marked as such for `pluginLoading`. -/
+def withPluginLoading (act : IO α) : IO α := do
+  pluginLoadingRef.set true
+  try act finally pluginLoadingRef.set false
+
+/-- Whether a plugin's initializers are running: state they set up before an environment exists is part of every
+environment created afterwards, unlike that of an imported module's initializers. -/
+def pluginLoading : BaseIO Bool :=
+  pluginLoadingRef.get
 
 /-- The option `Lean.Compiler.LCNF.main` sets while it compiles. Not a registered option: only `main` sets it, and
 `recordIfCompiling` reads it. -/

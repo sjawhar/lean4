@@ -237,6 +237,23 @@ spec_precomp_s1() {
   printf 'import P.Tac\n-- edited\n#gcheck\n' > Q/Use.lean
 }
 
+# A module compiled with plugins (the shared library of a `precompileModules` library it imports, and Lake's own)
+# keeps its usual dependencies: plugins that register no reserved-name predicate record nothing, so an unrelated
+# change to an import `Q.Use` uses nothing of replays it (`plugin_replay`).
+plugin_replay_s0() {
+  mkdir -p T P Q
+  printf 'name = "test"\ndefaultTargets = ["Q"]\n[[lean_lib]]\nname = "T"\n' > lakefile.toml
+  printf '[[lean_lib]]\nname = "P"\nprecompileModules = true\n[[lean_lib]]\nname = "Q"\n' >> lakefile.toml
+  printf 'def f0 : Nat := 0\n' > T/F.lean
+  printf 'import T.F\n' > T.lean
+  printf 'import P.Tac\n' > P.lean
+  printf 'import Q.Use\n' > Q.lean
+  printf '%s\n' 'import Lean' 'open Lean Elab Command in' 'elab "#hello" : command => logInfo m!"hello"' > P/Tac.lean
+  printf 'import P.Tac\nimport T.F\n#hello\ndef u : Nat := 1\n' > Q/Use.lean
+}
+plugin_replay_s1() { printf 'def f0 : Nat := 0\ndef f1 : Nat := 1\n' > T/F.lean; }
+plugin_replay_c_check() { grep -qE 'Replayed Q\.Use( |$)' ../plugin_replay.1.log; }
+
 # `A` replaces `f` with `g1` in compiled code (`@[csimp]`); `B.b` is inlined into `M.m`. When the replacement
 # becomes `g2`, M's compiled code must call `g2`.
 csimp_transitive_s0() {
@@ -1990,7 +2007,7 @@ bn_alias_s0() {
 }
 bn_alias_s1() { printf 'namespace T\n@[reducible] def F : Type := (y : Nat) → Nat\nend T\n' > T/A.lean; }
 
-all_cases="spec_transitive spec_link spec_type spec_precomp csimp_transitive csimp_late specialize_attr
+all_cases="spec_transitive spec_link spec_type spec_precomp plugin_replay csimp_transitive csimp_late specialize_attr
   cov_projfn cov_projfn_rev cov_mlike cov_sparse cov_auxrec cov_sibmatch cov_sibmatch_rev cov_ctlmatch
   cov_sibinst cov_sibclass cov_sibmeta cov_ckind_rev cov_recarg_rev
   collide_first collide_after hard_recording hard_moduleext hard_speclookups hard_compilercode rp_own
