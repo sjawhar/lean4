@@ -283,24 +283,38 @@ def readOwnUsage (path : FilePath) (expected? : Option ModuleUsage.Digest := non
   return some (usage, digest)
 
 /--
-The hashes of the files one usage-cutoff check (`Module.usageVerdict`, `Module.writeUsekey`) has
-read, so that it reads each file once, and every `importUsage?` binding of the check is to the same bytes. A check
-never reuses another's: another workspace's build can rebuild a shared dependency between two checks. Across checks,
-a file's hash is reused only while its stamp shows its bytes unchanged (`BuildContext.fileDigests`).
+What one module's decision before its build has read: its same-tree check (`Module.usageVerdict` of its own
+outputs) and the check of each cached compile the usage index offers (`Module.restoreFromUsageIndex?`), so that the
+decision reads each file once and every `importUsage?` binding in it, in every candidate's check, is to the same
+bytes. Another module's decision, and `Module.writeUsekey` after the module's own compile, never reuse it: another
+workspace's build can rebuild a shared dependency between two decisions. Across decisions, a file's hash is reused
+only while its stamp shows its bytes unchanged (`BuildContext.fileDigests`). What a build keeps across modules, its
+views of importees (`UsageView`), is frozen at their first read and may be stale: only the usage index's pre-filter
+reads them (`usagePrefilter`), and it only rejects, so a stale view can cost a miss but never a restore, since the
+check that accepts reads the files again.
 -/
-public abbrev ContentHashes := IO.Ref (Std.HashMap FilePath ModuleUsage.Digest)
+public structure ContentHashes where
+  /-- The hash of each file read (`contentHash`). -/
+  files : IO.Ref (Std.HashMap FilePath ModuleUsage.Digest)
+  /-- The binding of each importee (`importUsage?`). -/
+  imports : IO.Ref (NameMap (Option (FilePath × UsageImport)))
+  /-- The binding of each importee by a read that takes a kept module's `.usage` (`importUsage?` with `kept`). -/
+  keptImports : IO.Ref (NameMap (Option (FilePath × UsageImport)))
+
+public def ContentHashes.new : BaseIO ContentHashes :=
+  return {files := ← IO.mkRef {}, imports := ← IO.mkRef {}, keptImports := ← IO.mkRef {}}
 
 /--
 The hash of `file`'s current bytes (`Lean.ModuleUsage.fileDigest`, 128 bits), never read from a
 `.hash` file: an `.olean` rewritten behind Lake's back (e.g., by `lean -o`) keeps its old `.hash`,
-and a usage-cutoff decision must see the new bytes. Read at most once per check (`hashes`), and taken from an
-earlier check of the build only if the file's stamp (`Lean.ModuleUsage.fileStamp`) is the one recorded when those
+and a usage-cutoff decision must see the new bytes. Read at most once per decision (`hashes`), and taken from an
+earlier decision of the build only if the file's stamp (`Lean.ModuleUsage.fileStamp`) is the one recorded when those
 bytes were read (`BuildContext.fileDigests`).
 -/
 def contentHash (hashes : ContentHashes) (file : FilePath) : JobM ModuleUsage.Digest := do
-  if let some hash := (← hashes.get)[file]? then return hash
+  if let some hash := (← hashes.files.get)[file]? then return hash
   let hash ← stampedDigest
-  hashes.modify (·.insert file hash)
+  hashes.files.modify (·.insert file hash)
   return hash
 where
   stampedDigest : JobM ModuleUsage.Digest := do
@@ -400,19 +414,25 @@ them, which the accept did not compile again. With `kept`, a reader takes from i
 fixes: what the module provides (`UsageSidecar.resolvedUnchanged`), and its recorded closure as the one before the
 accept, to tell whether an importer's closure changed (`Module.usageVerdict`). No key is written and no module is
 skipped over a kept module's `.usage` (`untrustedClosureModule?`). Without `kept`, the build's view of `m`
-(`UsageView`) is what this read found, if the build had none.
+(`UsageView`) is what this read found, if the build had none. A decision binds `m` once, and once with `kept`
+(`ContentHashes.imports`, `ContentHashes.keptImports`).
 -/
 def importUsage? (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) (m : Name) (kept := false) :
     JobM (Option (FilePath × UsageImport)) := do
-  let some arts := importArts.find? m | return none
-  let some olean := arts.olean? | return none
-  let read? ← readImportSidecars olean arts.oleanServer?.isSome (kept := kept)
-  -- A read that can take a kept module's `.usage` is not the build's view of the module, which never takes one
-  unless kept do discard <| freezeUsageView (olean.withExtension "usage") read?
-  let some (keyOlean?, usage) := read? | return none
-  if let some keyOlean := keyOlean? then
-    unless keyOlean == (← contentHash hashes olean) do return none
-  return some (olean, usage)
+  let memo := if kept then hashes.keptImports else hashes.imports
+  if let some bound := (← memo.get).find? m then return bound
+  let bound ← id do
+    let some arts := importArts.find? m | return none
+    let some olean := arts.olean? | return none
+    let read? ← readImportSidecars olean arts.oleanServer?.isSome (kept := kept)
+    -- A read that can take a kept module's `.usage` is not the build's view of the module, which never takes one
+    unless kept do discard <| freezeUsageView (olean.withExtension "usage") read?
+    let some (keyOlean?, usage) := read? | return none
+    if let some keyOlean := keyOlean? then
+      unless keyOlean == (← contentHash hashes olean) do return none
+    return some (olean, usage)
+  memo.modify (·.insert m bound)
+  return bound
 
 /--
 `Lean.ModuleUsage.specProviders` of the module's specialization-cache lookups (`UsageSidecar.specLookups`) over the
@@ -498,12 +518,15 @@ def untrustedClosureModule? (hashes : ContentHashes) (importArts : NameMap Impor
 The closure state `Module.writeUsekey` must find unchanged after the compile: the `modsysHash` of the closure
 (`modsysBefore`), and whether any workspace module of the closure is untrusted — kept, or without a key binding its
 `.usage` to its `.olean` (`untrustedClosureModule?`). A compile reads these at its start; `writeUsekey` writes a key
-only when they still hold, because another workspace can change a shared dependency while the module compiles.
+only when they still hold, because another workspace can change a shared dependency while the module compiles. With
+`decision?`, the module's decision before the compile (`Module.skipOrBuild`), the `modsysHash` is taken from the
+files it read, which were read earlier, so the comparison is stricter. The untrusted module is read now: a dependency
+can be kept between the decision and the compile.
 -/
-public def usekeyBefore (importArts : NameMap ImportArtifacts) :
+public def usekeyBefore (importArts : NameMap ImportArtifacts) (decision? : Option ContentHashes := none) :
     JobM (ModuleUsage.Digest × Option Name) := do
-  let hashes ← IO.mkRef {}
-  return (← modsysHash hashes importArts, ← untrustedClosureModule? hashes importArts)
+  let hashes ← ContentHashes.new
+  return (← modsysHash (decision?.getD hashes) importArts, ← untrustedClosureModule? hashes importArts)
 
 /--
 Whether every workspace module of the closure (`importArts`) carried digests when Lean compiled the
@@ -717,7 +740,7 @@ public def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     (untrustedBefore? : Option Name) : JobM Unit := do
   let some (usage, usageDigest) ← readOwnUsage mod.usageFile | return
   unless usage.coversClosure importArts do return
-  let hashes ← IO.mkRef {}
+  let hashes ← ContentHashes.new
   let modsys ← modsysHash hashes importArts
   unless modsys == modsysBefore do return
   -- No key if the compile read an untrusted closure module (kept, or without a key binding its `.usage` to its
@@ -762,6 +785,16 @@ public inductive UsageVerdict
   -/
   | compile (reason : String)
 
+/-- The files a usage verdict (`Module.usageVerdict`) reads: a module's own, or a cached compile's. -/
+public structure UsageFiles where
+  usekey : FilePath
+  usage : FilePath
+  olean : FilePath
+
+/-- The module's own `.usekey`, `.usage` and `.olean`, in its build directory. -/
+public def Module.usageFiles (mod : Module) : UsageFiles :=
+  {usekey := mod.usekeyFile, usage := mod.usageFile, olean := mod.oleanFile}
+
 /--
 Decides a stale module from its usage records. `upToDate` if nothing the module used changed meaning since Lean
 wrote its `.usage`: its `.usekey` (read first) was written from its current `.usage` (`UsekeySidecar.usage`) and
@@ -783,19 +816,23 @@ used changed, the providers of a specialization-cache key it looked up, or a mod
 `recheck`: a kept module's digests describe its declarations as Lean compiled them, so an importer of a kept module is
 re-checked or compiled, never skipped, until that module compiles again. A kept import's recorded closure is the one
 before the accept (`closureHash` with `kept`): it serves only to tell whether the closure changed.
+
+The records are `files`: by default the module's own, in its build directory; the usage index's lookup
+(`Module.restoreFromUsageIndex?`) decides a cached compile of the module the same way. Every file is read in
+`hashes`, the module's decision (`ContentHashes`).
 -/
 public def Module.usageVerdict (mod : Module) (presetup : ModulePreSetup)
-    (importArts : NameMap ImportArtifacts) : JobM UsageVerdict := do
-  let some key ← readUsageSidecar UsekeySidecar mod.usekeyFile
+    (importArts : NameMap ImportArtifacts) (hashes : ContentHashes) (files : UsageFiles := mod.usageFiles) :
+    JobM UsageVerdict := do
+  let some key ← readUsageSidecar UsekeySidecar files.usekey
     | return .compile "it has no usage key"
-  let some (usage, _) ← readOwnUsage mod.usageFile (expected? := key.usage)
+  let some (usage, _) ← readOwnUsage files.usage (expected? := key.usage)
     | return .compile "its usage record is missing or is not the one its key was written from"
   if usage.noskip then return .compile "its usage record may be incomplete"
   if key.localHash != presetup.localTrace.hash then return .compile "its local inputs changed"
   unless usage.coversClosure importArts do
     return .compile "a module of its closure had no usage digests when it was compiled"
-  let hashes ← IO.mkRef {}
-  unless (← contentHash hashes mod.oleanFile) == key.olean do
+  unless (← contentHash hashes files.olean) == key.olean do
     return .compile "its usage record describes another .olean"
   unless (← modsysHash hashes importArts) == key.modsys do
     return .compile "a module-system file of its closure changed"

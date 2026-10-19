@@ -502,6 +502,28 @@ the usage cutoff's check against its current imports.
   cache.dir / "usage-index" / scope / localHash.toString
 
 /--
+The files in a usage-index directory (`usageIndexDir`) whose names end with `suffix`, with their modification
+times, most recently written first (ties by name). A file another process removes while they are listed is left out.
+-/
+def usageIndexFiles (dir : FilePath) (suffix : String) : IO (Array (FilePath × IO.FS.SystemTime)) := do
+  let entries ← match (← dir.readDir.toBaseIO) with
+    | .ok entries => pure entries
+    | .error (.noFileOrDirectory ..) => return #[]
+    | .error e => throw e
+  let mut files := #[]
+  for entry in entries do
+    unless entry.fileName.endsWith suffix do continue
+    match (← entry.path.metadata.toBaseIO) with
+    | .ok md => files := files.push (entry.path, md.modified)
+    | .error (.noFileOrDirectory ..) => pure ()
+    | .error e => throw e
+  return files.qsort fun (p, t) (q, u) =>
+    match compare t u with
+    | .gt => true
+    | .lt => false
+    | .eq => p.toString < q.toString
+
+/--
 Records a compile in the usage index (`usageIndexDir`): `out`, its outputs entry, as the file named by the content
 hash of its `.usekey` (`usekey`), with no cache service, so that it resolves only against this cache. The file is
 written whole under a temporary name and renamed onto its own: a reader sees the old complete file or the new one,
@@ -514,6 +536,13 @@ public def writeUsageIndex (cache : Cache) (scope : String) (localHash usekey : 
   let tmp := dir / s!"{usekey}.tmp-{← IO.Process.getPID}-{← IO.monoNanosNow}"
   IO.FS.writeFile tmp (toJson (CacheOutput.ofData out)).pretty
   IO.FS.rename tmp (dir / s!"{usekey}.json")
+
+/--
+The compiles that the usage index (`usageIndexDir`) records for a package's modules (`scope`) whose local inputs
+have the hash `localHash`, most recently written first: the files `writeUsageIndex` wrote, none if it wrote none.
+-/
+public def usageCandidates (cache : Cache) (scope : String) (localHash : Hash) : IO (Array FilePath) :=
+  (·.map (·.1)) <$> usageIndexFiles (cache.usageIndexDir scope localHash) ".json"
 
 /-- The directory where input-to-output mappings of downloaded package revisions are cached. -/
 @[inline] public def revisionDir (cache : Cache) : FilePath :=
