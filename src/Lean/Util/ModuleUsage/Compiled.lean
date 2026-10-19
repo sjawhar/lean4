@@ -299,7 +299,8 @@ def scopedEnc {α : Type} (f : Enc → α → Enc) (e : Enc) : ScopedEnvExtensio
   | .scoped ns a => f (e.u8 1 |>.name ns) a
 
 def instanceEntryEnc (e : Enc) (a : Meta.InstanceEntry) : Enc :=
-  e.opt a.globalName? Enc.name |>.nat a.priority |> (attrKindEnc · a.attrKind)
+  let ⟨_keys, _val, priority, globalName?, _synthOrder, attrKind⟩ := a
+  e.opt globalName? Enc.name |>.nat priority |> (attrKindEnc · attrKind)
 
 /-- The current module's data that `attrsEnc` and `entriesEnc` read besides the per-name extension states. -/
 structure LocalCompiled where
