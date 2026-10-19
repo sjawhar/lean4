@@ -1,0 +1,11 @@
+name = "lint-unknown-module"
+defaultTargets = ["FooOld"]
+
+# Keep the command positions of the persisted lint entries, as
+# `lake lint --record-exceptions` does for the modules it builds.
+[leanOptions]
+internal.cmdlineSnapshots = false
+
+[[lean_lib]]
+name = "FooOld"
+roots = ["Foo.Old"]
