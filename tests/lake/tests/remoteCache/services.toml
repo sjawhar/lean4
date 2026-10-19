@@ -1,0 +1,129 @@
+# Cache services for the tests of `lib.sh`, served by `../cacheTransfer/server.py`.
+# `lib.sh` replaces `%URL%` with the URL of one mock server,
+# `%URL2%` with the URL of a second one, which listens on another port,
+# and `%FLAKY%` with a fault mode of the first server.
+
+# Accepts only bearer tokens, as a Cloud Storage bucket without HMAC keys does
+[[cache.service]]
+name = "bearer"
+type = "s3"
+artifactEndpoint = "%URL%/bearer/a0"
+revisionEndpoint = "%URL%/bearer/r0"
+
+# The same store, for uploads through AWS Signature Version 4
+[[cache.service]]
+name = "ok"
+type = "s3"
+artifactEndpoint = "%URL%/ok/a0"
+revisionEndpoint = "%URL%/ok/r0"
+
+# A second service, on the second server
+[[cache.service]]
+name = "other"
+type = "s3"
+artifactEndpoint = "%URL2%/ok/a0"
+revisionEndpoint = "%URL2%/ok/r0"
+
+# A service whose revisions are on another host than its artifacts
+[[cache.service]]
+name = "split"
+type = "s3"
+artifactEndpoint = "%URL%/bearer/a0"
+revisionEndpoint = "%URL2%/ok/r0"
+
+[[cache.service]]
+name = "truncate"
+type = "s3"
+artifactEndpoint = "%URL%/truncate/a0"
+revisionEndpoint = "%URL%/ok/r0"
+
+[[cache.service]]
+name = "deny"
+type = "s3"
+artifactEndpoint = "%URL%/deny/a0"
+revisionEndpoint = "%URL%/deny/r0"
+
+# Redirects every request to the second server's `ok` store
+[[cache.service]]
+name = "redirect"
+type = "s3"
+artifactEndpoint = "%URL%/redirect/a0"
+revisionEndpoint = "%URL%/redirect/r0"
+
+# Unencrypted HTTP to a host that is not a loopback one (and that does not resolve)
+[[cache.service]]
+name = "cleartext"
+type = "s3"
+artifactEndpoint = "http://cache.invalid/a0"
+revisionEndpoint = "http://cache.invalid/r0"
+
+# As `ok`, but every download takes 2 seconds
+[[cache.service]]
+name = "slow"
+type = "s3"
+artifactEndpoint = "%URL%/slow/a0"
+revisionEndpoint = "%URL%/slow/r0"
+
+[[cache.service]]
+name = "reset"
+type = "s3"
+artifactEndpoint = "%URL%/reset/a0"
+revisionEndpoint = "%URL%/reset/r0"
+
+[[cache.service]]
+name = "oversize"
+type = "s3"
+artifactEndpoint = "%URL%/oversize/a0"
+revisionEndpoint = "%URL%/oversize/r0"
+
+# No mock fault mode selects this endpoint, so its GETs receive a 404.
+[[cache.service]]
+name = "miss"
+type = "s3"
+artifactEndpoint = "%URL%/miss/a0"
+revisionEndpoint = "%URL%/miss/r0"
+
+# Uploads through `lake cache push`: denied (403) while `%FLAKY%` is `deny`,
+# accepted when a copy of this file replaces it with `ok`
+[[cache.service]]
+name = "flaky"
+type = "s3"
+artifactEndpoint = "%URL%/%FLAKY%/a0"
+revisionEndpoint = "%URL%/%FLAKY%/r0"
+
+# As `ok`, but every upload takes 2 seconds, so that a push runs long enough
+# for a test to act while it runs
+[[cache.service]]
+name = "slowput"
+type = "s3"
+artifactEndpoint = "%URL%/slowput/a0"
+revisionEndpoint = "%URL%/slowput/r0"
+
+# Mappings are served; their artifacts are refused (403)
+[[cache.service]]
+name = "denyart"
+type = "s3"
+artifactEndpoint = "%URL%/denyart/a0"
+revisionEndpoint = "%URL%/denyart/r0"
+
+# Each upload reads its body and then gets no answer for 15 minutes
+[[cache.service]]
+name = "stallput"
+type = "s3"
+artifactEndpoint = "%URL%/stallput/a0"
+revisionEndpoint = "%URL%/stallput/r0"
+
+# As `ok`, but every upload of an artifact or a mapping takes 4 seconds (a claim's does not),
+# so that a detached push outlives the build that started it
+[[cache.service]]
+name = "slowobj"
+type = "s3"
+artifactEndpoint = "%URL%/slowobj/a0"
+revisionEndpoint = "%URL%/slowobj/r0"
+
+# As `ok`, but the first upload of each artifact is refused (403), so that a push must try it again
+[[cache.service]]
+name = "denyartonce"
+type = "s3"
+artifactEndpoint = "%URL%/denyartonce/a0"
+revisionEndpoint = "%URL%/denyartonce/r0"
