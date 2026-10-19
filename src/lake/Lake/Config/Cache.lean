@@ -502,17 +502,23 @@ the usage cutoff's check against its current imports.
   cache.dir / "usage-index" / scope / localHash.toString
 
 /--
-The files in a usage-index directory (`usageIndexDir`) whose names end with `suffix`, with their modification
-times, most recently written first (ties by name). A file another process removes while they are listed is left out.
+How many compiles of a module with one set of local inputs the usage index keeps, the most recently written: a
+lookup checks at most these.
 -/
-def usageIndexFiles (dir : FilePath) (suffix : String) : IO (Array (FilePath × IO.FS.SystemTime)) := do
+public def usageIndexSize : Nat := 8
+
+/--
+The files in a usage-index directory (`usageIndexDir`) whose names `select` takes, with their modification times, most
+recently written first (ties by name). A file another process removes while they are listed is left out.
+-/
+def usageIndexFiles (dir : FilePath) (select : String → Bool) : IO (Array (FilePath × IO.FS.SystemTime)) := do
   let entries ← match (← dir.readDir.toBaseIO) with
     | .ok entries => pure entries
     | .error (.noFileOrDirectory ..) => return #[]
     | .error e => throw e
   let mut files := #[]
   for entry in entries do
-    unless entry.fileName.endsWith suffix do continue
+    unless select entry.fileName do continue
     match (← entry.path.metadata.toBaseIO) with
     | .ok md => files := files.push (entry.path, md.modified)
     | .error (.noFileOrDirectory ..) => pure ()
@@ -528,21 +534,34 @@ Records a compile in the usage index (`usageIndexDir`): `out`, its outputs entry
 hash of its `.usekey` (`usekey`), with no cache service, so that it resolves only against this cache. The file is
 written whole under a temporary name and renamed onto its own: a reader sees the old complete file or the new one,
 and two writers of one name write the outputs of compiles with the same `.usekey`, either of which is valid. A
-rewrite makes the file recent again.
+rewrite makes the file recent again. Then removes the files beyond the `usageIndexSize` most recently written, and
+temporary files an hour older than this one (left by a writer that stopped). Two writers that trim at once can
+remove more than needed, which loses a candidate and never adds one. Nothing else removes them: a file whose
+artifacts were pruned from the cache no longer resolves and ages out.
 -/
 public def writeUsageIndex (cache : Cache) (scope : String) (localHash usekey : Hash) (out : Json) : IO Unit := do
   let dir := cache.usageIndexDir scope localHash
   IO.FS.createDirAll dir
   let tmp := dir / s!"{usekey}.tmp-{← IO.Process.getPID}-{← IO.monoNanosNow}"
   IO.FS.writeFile tmp (toJson (CacheOutput.ofData out)).pretty
-  IO.FS.rename tmp (dir / s!"{usekey}.json")
+  let file := dir / s!"{usekey}.json"
+  IO.FS.rename tmp file
+  let files ← usageIndexFiles dir (·.endsWith ".json")
+  for (old, _) in files.extract usageIndexSize files.size do
+    removeFileIfExists old
+  let .ok written ← file.metadata.toBaseIO | return
+  for (stale, mtime) in ← usageIndexFiles dir (!·.endsWith ".json") do
+    if written.modified.sec - mtime.sec > 3600 then
+      removeFileIfExists stale
 
 /--
 The compiles that the usage index (`usageIndexDir`) records for a package's modules (`scope`) whose local inputs
-have the hash `localHash`, most recently written first: the files `writeUsageIndex` wrote, none if it wrote none.
+have the hash `localHash`, most recently written first, at most `usageIndexSize`: the files `writeUsageIndex` wrote,
+none if it wrote none.
 -/
-public def usageCandidates (cache : Cache) (scope : String) (localHash : Hash) : IO (Array FilePath) :=
-  (·.map (·.1)) <$> usageIndexFiles (cache.usageIndexDir scope localHash) ".json"
+public def usageCandidates (cache : Cache) (scope : String) (localHash : Hash) : IO (Array FilePath) := do
+  let files ← usageIndexFiles (cache.usageIndexDir scope localHash) (·.endsWith ".json")
+  return (files.extract 0 usageIndexSize).map (·.1)
 
 /-- The directory where input-to-output mappings of downloaded package revisions are cached. -/
 @[inline] public def revisionDir (cache : Cache) : FilePath :=
