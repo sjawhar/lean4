@@ -9,6 +9,7 @@ prelude
 public import Init.System.IO
 import Init.Data.String.TakeDrop
 import Init.Data.ToString.Macro
+import Lean.Util.UsedByChecks
 
 public section
 
@@ -115,4 +116,8 @@ def loadPlugin (path : System.FilePath) (initFn? : Option String := none) : IO U
     is about as safe as it can be. The default initializer naming convention helps
     avoid accidentally mistaking non-plugins as plugins.
   -/
+  -- A plugin's initializers run user code that can set up state every later compile in this process reads (the
+  -- reserved-name predicates of environments created afterwards, `compileDeclsRef`), so the usage data of a
+  -- module compiled in this process depends on every import.
+  recordCompilerCode
   unsafe sym.runAsInit

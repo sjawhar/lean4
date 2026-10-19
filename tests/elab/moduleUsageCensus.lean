@@ -9,7 +9,8 @@ reachable from the compiler's code-generation entry points (BFS over
 `ConstantInfo.getUsedConstantsAsSet`, `@[implemented_by]` targets, `_unsafe_rec` definitions and
 extern-to-export edges: a reached constant with `@[extern "sym"]` data reaches the declaration
 marked `@[export sym]`, which is how `Meta.whnf`, `inferType` and the like are forward-declared,
-started from `Lean.Compiler.LCNF.main`, `Lean.IR.compile`, `Lean.Compiler.LCNF.emitC`,
+started from `Lean.compileDecls` (which calls the compiler through `compileDeclsRef`),
+`Lean.Compiler.LCNF.main`, `Lean.IR.compile`, `Lean.Compiler.LCNF.emitC`,
 `Lean.Compiler.LCNF.builtinPassManager`, `Lean.Compiler.LCNF.Simp.ConstantFold.builtinFolders`, plus
 the Lean functions the C++ IR interpreter (`src/library/ir_interpreter.cpp`) calls by
 `extern "C" lean_*` export name), and fails
@@ -53,6 +54,15 @@ may name only registered extensions. This test does not check that `attrsEnc`, `
 `isDeclMeta` or `tableDigest` read a listed table; the harness's `cov_*` cases catch a read
 dropped from them. `viaOwnEntries` is the one class for a table the digest code does not read itself: its
 effect reaches importers only through the declaration's own digested entries.
+
+The same BFS also finds every other process-global value a compile reads: each reached constant with an
+initializer (`initialize`, `builtin_initialize`) that is not a registered persistent extension. Option
+declarations and internal exception ids are covered by their type: an option's value comes from the module's
+options, which are in its trace, or from code that sets options around a compile, which is a hook; an exception
+id only names an exception. Every other one needs a row in `globals` (`GlobalClass`); a reached global without a
+row fails the test. The hooks are the values that hold code the compile calls (`hook`): each is either compared
+with its built-in value at every compile or private, so that a module that installs other code there gets every
+digested import as an extra use (`recordCompilerCode`).
 -/
 open Lean
 
@@ -519,15 +529,73 @@ def writers : List (Name × List (Name × Mechanism × String)) := [
       "Sole caller src/Lean/Elab/Structure.lean:1558; throws unless the structure is in this module's state (src/Lean/Structure.lean:128-131).")])
 ]
 
+/-- Coverage of a process-global value the compile reads (a reached constant with an initializer that is not a
+registered persistent environment extension). -/
+inductive GlobalClass where
+  /-- Holds code the compile calls; installing other code is detected (pointer identity with the built-in value at
+  compile time, or privacy), and then the module's usage data depends on every import. -/
+  | hook
+  /-- Usage-recording state: private, only switched on, added to or read. -/
+  | recording
+  /-- A non-persistent environment extension: its state starts from a constant and only the current module's own
+  elaboration and compile write it, so no import reaches it. -/
+  | moduleLocal
+  /-- Read only to format messages and traces, never to generate code. -/
+  | messagesOnly
+  | uncovered
+deriving BEq
+
+/-- `global → (class, reason)`, keyed by the name without the private-name prefix. -/
+def globals : List (Name × GlobalClass × String) := [
+  (`Lean.compileDeclsRef, .hook,
+    "Public `IO.Ref` holding the implementation `compileDecls` calls (src/Lean/CoreM.lean:905); an imported `initialize` can wrap it. `runCompileDecls` compares it by pointer with the value the compiler installed (`setBuiltinCompileDecls`, set once, src/Lean/Compiler/LCNF/Main.lean:258-259) at every call, from `compileDecls` and `resumeCompilation` (:125), and calls `recordCompilerCode` on any other value (cases `hk_fail`, `hk_opt`)."),
+  (`Lean.builtinCompileDeclsRef, .hook,
+    "Private; the compiler's own `compileDecls` implementation, set once by `setBuiltinCompileDecls`, which throws on a second call, and read by `runCompileDecls` to compare `compileDeclsRef` with."),
+  (`Lean.reservedNamePredicatesExt, .hook,
+    "Predicates `Environment.find?` calls (`isReservedName`, src/Lean/ResolveName.lean:55-57). Private, so a module's code cannot add one to its own environment (case `hard_reservedpred`). Its state is `reservedNamePredicatesRef` when the environment is created (:49-50), before an imported module's initializers run (src/Lean/Environment.lean:2726, :2774), so an import's `registerReservedNamePredicate` reaches only environments created later; a plugin's runs before, and loading a plugin calls `recordCompilerCode` (src/Lean/LoadDynlib.lean)."),
+  (`Lean.ppExt, .messagesOnly,
+    "Pretty-printing functions, called to format messages (src/Lean/Util/PPExt.lean:66-67,84-127); their state is `ppFnsRef` when the environment is created."),
+  (`Lean.internalExceptionsRef, .messagesOnly,
+    "Names of internal exception ids (src/Lean/InternalExceptionId.lean:22,31-34), read to print an exception."),
+  (`Lean.inheritedTraceOptions, .messagesOnly,
+    "Trace classes whose option is inherited by subclasses (src/Lean/Util/Trace.lean:77), read only to decide which traces to collect."),
+  (`Lean.manualRoot, .messagesOnly,
+    "The documentation URL root (src/Lean/DocString/Links.lean:35), read to build links in messages."),
+  (`Lean.usedByChecksRef, .recording, "Private (src/Lean/Util/UsedByChecks.lean)."),
+  (`Lean.usageRecordingRef, .recording, "Private (src/Lean/Util/UsedByChecks.lean)."),
+  (`Lean.specLookupsRef, .recording, "Private (src/Lean/Util/UsedByChecks.lean)."),
+  (`Lean.compilerCodeRef, .recording, "Private (src/Lean/Util/UsedByChecks.lean); only ever set to `true`."),
+  (`Lean.extraModUsesByChecksRef, .recording, "Private (src/Lean/ExtraModUses.lean)."),
+  (`Lean.Compiler.LCNF.baseTransparentDeclsExt, .moduleLocal,
+    "`mkOrderedDeclSetExt` (src/Lean/Compiler/LCNF/PhaseExt.lean:26): non-persistent, initially empty."),
+  (`Lean.Compiler.LCNF.monoTransparentDeclsExt, .moduleLocal,
+    "`mkOrderedDeclSetExt` (src/Lean/Compiler/LCNF/PhaseExt.lean): non-persistent, initially empty."),
+  (`Lean.Compiler.LCNF.impureTransparentDeclsExt, .moduleLocal,
+    "`mkOrderedDeclSetExt` (src/Lean/Compiler/LCNF/PhaseExt.lean): non-persistent, initially empty."),
+  (`Lean.Compiler.LCNF.declOrderExt, .moduleLocal,
+    "`mkOrderedDeclSetExt` (src/Lean/Compiler/LCNF/PhaseExt.lean:220): non-persistent, initially empty."),
+  (`Lean.Compiler.LCNF.impureExt, .moduleLocal,
+    "`registerEnvExtension (mkInitial := pure {})` (src/Lean/Compiler/LCNF/PhaseExt.lean:109-110)."),
+  (`Lean.closedTermCacheExt, .moduleLocal,
+    "`registerEnvExtension (pure {})` (src/Lean/Compiler/ClosedTermCache.lean:22-23)."),
+  (`Lean.Compiler.LCNF.publicDeclsExt, .moduleLocal,
+    "`mkOrderedDeclSetExt` (src/Lean/Compiler/LCNF/PublicDeclsExt.lean:32): non-persistent, initially empty."),
+  (`Lean.Compiler.LCNF.simpleGroundDeclExt, .moduleLocal,
+    "`registerEnvExtension (pure {})` (src/Lean/Compiler/LCNF/SimpleGroundExpr.lean:89-90)."),
+  (`Lean.Compiler.LCNF.auxDeclCacheExt, .moduleLocal,
+    "`CacheExtension.register` (src/Lean/Compiler/LCNF/AuxDeclCache.lean:21): a non-persistent environment extension (src/Lean/Compiler/LCNF/CompilerM.lean:552)."),
+  (`Lean.Compiler.LCNF.baseTypeExt, .moduleLocal,
+    "`CacheExtension.register` (src/Lean/Compiler/LCNF/BaseTypes.lean:20): a non-persistent environment extension (src/Lean/Compiler/LCNF/CompilerM.lean:552).")]
+
 #eval show CoreM Unit from do
   let env ← getEnv
-  -- Roots: the LCNF/IR code-generation entry points, plus the Lean functions
-  -- `src/library/ir_interpreter.cpp`'s `extern "C" lean_*` declarations call into (found by
+  -- Roots: `compileDecls`, which every compile goes through, the LCNF/IR code-generation entry points, plus the
+  -- Lean functions `src/library/ir_interpreter.cpp`'s `extern "C" lean_*` declarations call into (found by
   -- searching that file for `extern "C"` declarations with no body, i.e. implemented in Lean via
   -- `@[export lean_*]`, and mapping each to its defining declaration; two are `private`, whose
   -- real name is computed the way `Lean.mkPrivateName` does: `_private.<module>.0 ++ <decl>`).
   let roots := [
-    ``Lean.Compiler.LCNF.main, ``Lean.IR.compile, ``Lean.Compiler.LCNF.emitC,
+    ``Lean.compileDecls, ``Lean.Compiler.LCNF.main, ``Lean.IR.compile, ``Lean.Compiler.LCNF.emitC,
     ``Lean.Compiler.LCNF.builtinPassManager, ``Lean.Compiler.LCNF.Simp.ConstantFold.builtinFolders,
     ``Float.ofNat, ``Float32.ofNat, ``Lean.getSymbolStem, ``Lean.mkMangledBoxedName,
     ``Lean.getRegularInitFnNameFor?, ``Lean.getExportNameFor?, ``Lean.IR.getSorryDep,
@@ -631,5 +699,23 @@ def writers : List (Name × List (Name × Mechanism × String)) := [
       if cls == .specCache && !(ws.all fun (_, m, _) => m == .specKeys) then
         errors := errors.push s!"`{n}` is classified specCache but a writer is not covered by `specKeys`"
     | none => errors := errors.push s!"`writers` names `{n}`, which the classification table does not"
+  -- Process globals: every reached constant with an initializer that is not a persistent extension's holder,
+  -- an option declaration or an internal exception id needs a `globals` row, none `uncovered`.
+  let holders : NameSet := exts.foldl (fun s e => s.insert (holderOf e.name)) {}
+  let globalMap : NameMap (GlobalClass × String) := globals.foldl (fun m (n, c, r) => m.insert n (c, r)) {}
+  let mut reachedGlobals : NameSet := {}
+  for c in queue do
+    unless (getInitFnNameFor? env c).isSome && !holders.contains c do continue
+    let some ci := env.find? c | continue
+    let head := ci.type.getAppFn.constName?
+    if head == some ``Lean.Option || head == some ``Lean.InternalExceptionId then continue
+    reachedGlobals := reachedGlobals.insert (userName c)
+    match globalMap.find? (userName c) with
+    | none => errors := errors.push s!"reachable global `{c}` is missing from the `globals` table"
+    | some (.uncovered, reason) => errors := errors.push s!"reachable global `{c}` is `uncovered`: {reason}"
+    | some _ => pure ()
+  for (n, _, _) in globals do
+    unless reachedGlobals.contains n do
+      errors := errors.push s!"`globals` names `{n}`, which is not a global the compile reaches"
   unless errors.isEmpty do
     throwError "moduleUsageCensus found {errors.size} issue(s) (of {registered.size} registered, {reachedExts.size} reachable extensions):\n{"\n".intercalate errors.toList}"

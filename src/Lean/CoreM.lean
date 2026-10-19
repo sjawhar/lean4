@@ -11,6 +11,7 @@ public import Lean.ResolveName
 public import Lean.Language.Basic
 import Init.While
 import Lean.Compiler.NoncomputableAttr
+import Lean.Util.UsedByChecks
 
 public section
 
@@ -904,8 +905,37 @@ actual implementation of compileDeclsRef.
 builtin_initialize compileDeclsRef : IO.Ref (Array Name → Options → CoreM Unit) ←
   IO.mkRef (fun _ _ => throwError m!"call to compileDecls with uninitialized compileDeclsRef")
 
-private def compileDeclsImpl (declNames : Array Name) : CoreM Unit := do
-  (← compileDeclsRef.get) declNames {}
+/-- The implementation the compiler installs at startup (`setBuiltinCompileDecls`). -/
+private builtin_initialize builtinCompileDeclsRef : IO.Ref (Option (Array Name → Options → CoreM Unit)) ←
+  IO.mkRef none
+
+/-- Installs the compiler's own implementation of `compileDecls` in `compileDeclsRef`. Only the first call, from
+the compiler's `builtin_initialize`, succeeds; `runCompileDecls` compares the ref with that value. -/
+def setBuiltinCompileDecls (f : Array Name → Options → CoreM Unit) : IO Unit := do
+  if (← builtinCompileDeclsRef.get).isSome then
+    throw <| IO.userError "the compiler's implementation of `compileDecls` is already installed"
+  builtinCompileDeclsRef.set (some f)
+  compileDeclsRef.set f
+
+private unsafe def isBuiltinCompileDeclsUnsafe (f : Array Name → Options → CoreM Unit) : BaseIO Bool := do
+  let some b ← builtinCompileDeclsRef.get | return false
+  return ptrAddrUnsafe f == ptrAddrUnsafe b
+
+@[implemented_by isBuiltinCompileDeclsUnsafe]
+private opaque isBuiltinCompileDecls (f : Array Name → Options → CoreM Unit) : BaseIO Bool
+
+/-- Calls the implementation of `compileDecls` that `compileDeclsRef` holds. Any other value than the compiler's own
+(`setBuiltinCompileDecls`), such as a wrapper an imported `initialize` installed, runs code around the compile that
+can read any environment state or change the options, so the module's usage data then depends on every import
+(`recordCompilerCode`). Pointer identity decides: the ref holds the installed closure itself until something replaces
+it. -/
+def runCompileDecls (declNames : Array Name) (baseOpts : Options) : CoreM Unit := do
+  let f ← compileDeclsRef.get
+  unless (← isBuiltinCompileDecls f) do recordCompilerCode
+  f declNames baseOpts
+
+private def compileDeclsImpl (declNames : Array Name) : CoreM Unit :=
+  runCompileDecls declNames {}
 
 -- `ref?` is used for error reporting if available
 def compileDecls (decls : Array Name) (logErrors := true) : CoreM Unit := do

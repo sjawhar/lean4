@@ -598,6 +598,21 @@ cpass_env_s0() {
 }
 cpass_env_s1() { env_flag; }
 
+# The same read by a wrapper an imported module installs around every compile (`compileDeclsRef`), with the
+# built-in passes and folders: it fails the compile (`hk_fail`) or switches off closed-term extraction (`hk_opt`)
+# once `F` defines `T.flagOn`. `hk_ctl` (control) changes `F` in a way the wrapper does not read.
+hk_wrap() {
+  env_files 'open Lean
+initialize compileDeclsRef.modify fun f names opts => do
+  if (← getEnv).contains `T.flagOn then '"$1"' else f names opts'
+}
+hk_fail_s0() { hk_wrap 'throwError "flagOn is set"'; }
+hk_fail_s1() { env_flag; }
+hk_opt_s0() { hk_wrap 'withOptions (fun o => o.setBool `compiler.extract_closed false) (f names opts)'; }
+hk_opt_s1() { env_flag; }
+hk_ctl_s0() { hk_wrap 'throwError "flagOn is set"'; }
+hk_ctl_s1() { printf 'namespace T\ndef f0 : Nat := 0\ndef other : Nat := 0\nend T\n' > T/F.lean; }
+
 # A specialization-cache entry written through the public `cacheSpec`, not by the specializer: `Y`, which `M`
 # uses nothing of, maps the key of `M`'s own specialization of `myMap k` to `evil`, which adds 100
 # (`f1_cachespec`). With the entry there from state 0, `M` hits it, so the hit is recorded and an edit to `evil`
@@ -1616,6 +1631,16 @@ hard_compilercode_s0() { fold_env_s0; hard_try 'run_meta Lean.compilerCodeRef.se
 hard_compilercode_s1() { env_flag; }
 hard_compilercode_c_check() { hard_rejected hard_compilercode; }
 
+hard_reservedpred_s0() {
+  f3_files; f3_y '' ''
+  hard_m $'import Lean\n' \
+    "$(hard_try 'run_meta modifyEnv fun env => Lean.reservedNamePredicatesExt.modifyState env (·.push fun _ _ => false)')"
+}
+hard_reservedpred_s1() { f3_y '' 'def y : List Nat := myMap k [0]'; }
+hard_reservedpred_c_check() {
+  hard_rejected hard_reservedpred && grep -qE 'Built T\.M( |$)' ../hard_reservedpred.1.log
+}
+
 ## Tables a module writes through public functions.
 
 # Tables the compiler reads for an imported declaration, which the declaring module can write for its own
@@ -1911,12 +1936,14 @@ borrow_alias_s1() { printf '%s\n' 'def Fn : Type := (@& List Nat) → List Nat' 
 all_cases="spec_transitive spec_link spec_type spec_precomp csimp_transitive csimp_late specialize_attr
   cov_projfn cov_projfn_rev cov_mlike cov_sparse cov_auxrec cov_sibmatch cov_sibmatch_rev cov_ctlmatch
   cov_sibinst cov_sibclass cov_sibmeta cov_ckind_rev cov_recarg_rev
-  collide_first collide_after hard_recording hard_moduleext hard_speclookups hard_compilercode hard_usedbychecks hard_declconsts
+  collide_first collide_after hard_recording hard_moduleext hard_speclookups hard_compilercode hard_reservedpred
+  hard_usedbychecks hard_declconsts
   hard_extramod d2_down
   class_same class_cross nospec_type folder_cross reducible_cross binder_inline d2_folder
   local_inst_own erase_inst_own scoped_inst local_red_own2 local_red_own3 scoped_red_own
   table_order folder_order red_order
   flag_off_lean flag_off_reader f3_own_folder f3_own_cpass f3_runtime_folder f3_runtime_cpass fold_env cpass_env
+  hk_fail hk_opt hk_ctl
   f1_cachespec f1_cachespec_hit premise_ir ir_count ir_count_nd lcnf_override d2_down_rebuilt
   collide_boxed_trans irdup_first irdup_after claim_ns claim_nsb claim_nsb_priv negfail_scoped abi_mix abi_void
   abi_enum abi_monotype

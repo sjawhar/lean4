@@ -122,7 +122,7 @@ def resumeCompilation (declName : Name) (baseOpts : Options) : CoreM Unit := do
   -- we did to get here.
   withOptions (fun _ => opts) do
   Core.prependError m!"Failed to compile `{declName}`" do
-    (← compileDeclsRef.get) decls.declNames baseOpts
+    runCompileDecls decls.declNames baseOpts
 
 /-- Whether `manager` and `folders` are the built-in pass manager and constant folders, unchanged by any
 installer or folder from any module, whether added by an extension entry or written into the extension state
@@ -256,7 +256,7 @@ def main (declNames : Array Name) (baseOpts : Options) : CoreM Unit := do
     CompilerM.run <| PassManager.run declNames baseOpts
 
 builtin_initialize
-  compileDeclsRef.set main
+  setBuiltinCompileDecls main
 
 builtin_initialize
   registerTraceClass `Compiler.init (inherited := true)

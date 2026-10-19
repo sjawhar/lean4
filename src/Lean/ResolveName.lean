@@ -42,7 +42,11 @@ def registerReservedNamePredicate (p : Environment → Name → Bool) : IO Unit 
     throw (IO.userError "failed to register reserved name suffix predicate, this operation can only be performed during initialization")
   reservedNamePredicatesRef.modify fun ps => ps.push p
 
-builtin_initialize reservedNamePredicatesExt : EnvExtension (Array (Environment → Name → Bool)) ←
+/-- The reserved-name predicates of an environment: `reservedNamePredicatesRef` when the environment was created.
+`Environment.find?` calls them, so they run inside every compile. Private, so that a module's code cannot add a
+predicate to its own environment; predicates registered after the environment exists (an imported module's
+`initialize`) apply only to environments created later. -/
+private builtin_initialize reservedNamePredicatesExt : EnvExtension (Array (Environment → Name → Bool)) ←
   registerEnvExtension reservedNamePredicatesRef.get (logWrites := true)
 
 /--
