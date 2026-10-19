@@ -54,9 +54,10 @@ endif
 
 ifeq "${USE_LAKE}" "ON"
 
-# build in parallel
+# build in parallel; without usage-cutoff data, which no build reads for toolchain modules (the Lean githash pins
+# them) and which would otherwise be loaded by every import of them
 Init:
-	LEAN_GITHASH=${LAKE_LEAN_GITHASH} ${PREV_STAGE}/bin/lake build -f ${CMAKE_BINARY_DIR}/lakefile.toml ${LEAN_EXTRA_LAKE_OPTS} $(LAKE_EXTRA_ARGS)
+	LEAN_GITHASH=${LAKE_LEAN_GITHASH} LAKE_USAGE_CUTOFF=0 ${PREV_STAGE}/bin/lake build -f ${CMAKE_BINARY_DIR}/lakefile.toml ${LEAN_EXTRA_LAKE_OPTS} $(LAKE_EXTRA_ARGS)
 
 Std Lean LeanExport Lake Leanc LeanChecker LeanIR: Init
 
