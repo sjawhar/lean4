@@ -433,10 +433,11 @@ def compiledNames (env : Environment) (lc : LocalCompiled) : NameSet :=
   (LCNF.UnreachableBranches.functionSummariesExt.getState env).foldl (fun s n _ => s.insert n) s
 
 /-- The current module's compiled entries for `x`, which importers inline, specialize or call: its LCNF base
-and mono declarations, impure signature, IR declarations, specialization info and dead-branch summary, and, for
-an inductive type or constructor, the representation caches its module computed and persisted (trivial-structure
-info, impure trivial-structure info, IR type, mono type, constructor layout). The caches are computed with `Meta`
-at default transparency, so the module's local reducibility can change them. -/
+and mono declarations, impure signature, IR declarations, specialization info and dead-branch summary, and the
+representation caches its module computed and persisted for it (for an inductive type or constructor,
+trivial-structure info, impure trivial-structure info, IR type and constructor layout; for any name, its mono
+type). The caches are computed with `Meta` at default transparency, so the module's local reducibility can change
+them. -/
 def entriesEnc (env : Environment) (lc : LocalCompiled) (x : Name) (s : CEnc) : CEnc :=
   let s := s.opt ((LCNF.baseExt.getState env).find? x) LCNFEnc.decl
   let s := s.opt ((LCNF.monoExt.getState env).find? x) LCNFEnc.decl
