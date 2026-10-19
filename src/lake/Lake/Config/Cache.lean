@@ -492,6 +492,29 @@ public def readOutputs? (cache : Cache) (scope : String) (inputHash : Hash) : Lo
   | .error (.noFileOrDirectory ..) => return none
   | .error e => error s!"{path}: read failed: {e}"
 
+/--
+The directory of the usage index for a package's modules (`scope`) whose local inputs (`ModulePreSetup.localTrace`)
+have the hash `localHash`: one file per compile of such a module, named by the content hash of its `.usekey`
+(`writeUsageIndex`). A build that misses the cache by input hash reads them for an earlier compile whose outputs pass
+the usage cutoff's check against its current imports.
+-/
+@[inline] public def usageIndexDir (cache : Cache) (scope : String) (localHash : Hash) : FilePath :=
+  cache.dir / "usage-index" / scope / localHash.toString
+
+/--
+Records a compile in the usage index (`usageIndexDir`): `out`, its outputs entry, as the file named by the content
+hash of its `.usekey` (`usekey`), with no cache service, so that it resolves only against this cache. The file is
+written whole under a temporary name and renamed onto its own: a reader sees the old complete file or the new one,
+and two writers of one name write the outputs of compiles with the same `.usekey`, either of which is valid. A
+rewrite makes the file recent again.
+-/
+public def writeUsageIndex (cache : Cache) (scope : String) (localHash usekey : Hash) (out : Json) : IO Unit := do
+  let dir := cache.usageIndexDir scope localHash
+  IO.FS.createDirAll dir
+  let tmp := dir / s!"{usekey}.tmp-{← IO.Process.getPID}-{← IO.monoNanosNow}"
+  IO.FS.writeFile tmp (toJson (CacheOutput.ofData out)).pretty
+  IO.FS.rename tmp (dir / s!"{usekey}.json")
+
 /-- The directory where input-to-output mappings of downloaded package revisions are cached. -/
 @[inline] public def revisionDir (cache : Cache) : FilePath :=
   cache.dir / "revisions"
