@@ -31,3 +31,4 @@ public import Lake.Build.Target
 public import Lake.Build.Targets
 public import Lake.Build.Topological
 public import Lake.Build.Trace
+public import Lake.Build.UsageCutoff
