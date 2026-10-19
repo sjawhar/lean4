@@ -64,10 +64,12 @@ def lookedUpSpecKeys : BaseIO (Array Expr) :=
 private builtin_initialize compilerCodeRef : IO.Ref Bool ← IO.mkRef false
 
 /--
-Records that a compile in this process ran with passes or constant folders beyond the built-in ones
-(`Lean.Compiler.LCNF.PassManager.run`). Such code runs inside the compiler and can read any environment state, which
-no used name records, so the module's usage data then makes every imported module with digests an extra use
-(`ModuleUsage.writeUsage`). Never cleared.
+Records that a compile in this process ran code or read state the module's used names do not cover: passes or
+constant folders beyond the built-in ones (`Lean.Compiler.LCNF.PassManager.run`), an implementation of `compileDecls`
+other than the compiler's own (`Lean.runCompileDecls`), a plugin's initializers (`Lean.loadPlugin`), or instance
+resolution and unification hints inside the compile (`recordIfCompiling`). The module's usage data then makes every
+imported module with digests an extra use (`ModuleUsage.writeUsage`). Never cleared. Unlike the other recorders it
+does not wait for `enableUsageRecording`: plugins are loaded before `runFrontend` switches recording on.
 -/
 def recordCompilerCode : BaseIO Unit :=
   compilerCodeRef.set true
@@ -75,6 +77,16 @@ def recordCompilerCode : BaseIO Unit :=
 /-- Whether `recordCompilerCode` ran in this process. -/
 def compilerCodeSeen : BaseIO Bool :=
   compilerCodeRef.get
+
+/-- The option `Lean.Compiler.LCNF.main` sets while it compiles. Not a registered option: only `main` sets it, and
+`recordIfCompiling` reads it. -/
+def inCompileOption : Name := `_inCompile
+
+/-- Records compiler code (`recordCompilerCode`) if `opts` are a compile's (`inCompileOption`). `Meta` calls it where
+a query reads elaboration state no used name records: instance resolution, which reads the instance table, its
+priorities and scoped activation, and unification hints. -/
+def recordIfCompiling (opts : Options) : BaseIO Unit := do
+  if opts.get inCompileOption false then recordCompilerCode
 
 /-- The constants of a declaration's type and value, with that type and value. -/
 structure DeclConsts where

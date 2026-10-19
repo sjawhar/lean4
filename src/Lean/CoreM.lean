@@ -917,21 +917,26 @@ def setBuiltinCompileDecls (f : Array Name → Options → CoreM Unit) : IO Unit
   builtinCompileDeclsRef.set (some f)
   compileDeclsRef.set f
 
-private unsafe def isBuiltinCompileDeclsUnsafe (f : Array Name → Options → CoreM Unit) : BaseIO Bool := do
+/-- Whether the compile is about to run only the toolchain's own code around and inside `Environment.find?`:
+`f`, what `compileDeclsRef` holds, is the compiler's own implementation (`setBuiltinCompileDecls`), and the
+environment's reserved-name predicates are the array `reservedNamePredicatesRef` holds, which is what an environment
+starts with. Pointer identity decides: a ref or an extension state holds the same object until something replaces it. -/
+private unsafe def isBuiltinCompileUnsafe (f : Array Name → Options → CoreM Unit) (env : Environment) :
+    BaseIO Bool := do
   let some b ← builtinCompileDeclsRef.get | return false
-  return ptrAddrUnsafe f == ptrAddrUnsafe b
+  unless ptrAddrUnsafe f == ptrAddrUnsafe b do return false
+  return ptrAddrUnsafe (reservedNamePredicatesExt.getState env) == ptrAddrUnsafe (← reservedNamePredicatesRef.get)
 
-@[implemented_by isBuiltinCompileDeclsUnsafe]
-private opaque isBuiltinCompileDecls (f : Array Name → Options → CoreM Unit) : BaseIO Bool
+@[implemented_by isBuiltinCompileUnsafe]
+private opaque isBuiltinCompile (f : Array Name → Options → CoreM Unit) (env : Environment) : BaseIO Bool
 
-/-- Calls the implementation of `compileDecls` that `compileDeclsRef` holds. Any other value than the compiler's own
-(`setBuiltinCompileDecls`), such as a wrapper an imported `initialize` installed, runs code around the compile that
-can read any environment state or change the options, so the module's usage data then depends on every import
-(`recordCompilerCode`). Pointer identity decides: the ref holds the installed closure itself until something replaces
-it. -/
+/-- Calls the implementation of `compileDecls` that `compileDeclsRef` holds. Code other than the toolchain's own
+around the compile (a wrapper an imported `initialize` installs in `compileDeclsRef`) or inside it (a reserved-name
+predicate a module adds to its environment, which `Environment.find?` calls) can read any environment state or change
+the options, so the module's usage data then depends on every import (`recordCompilerCode`). -/
 def runCompileDecls (declNames : Array Name) (baseOpts : Options) : CoreM Unit := do
   let f ← compileDeclsRef.get
-  unless (← isBuiltinCompileDecls f) do recordCompilerCode
+  unless (← isBuiltinCompile f (← getEnv)) do recordCompilerCode
   f declNames baseOpts
 
 private def compileDeclsImpl (declNames : Array Name) : CoreM Unit :=

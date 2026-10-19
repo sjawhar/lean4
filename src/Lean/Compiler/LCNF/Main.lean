@@ -160,7 +160,7 @@ partial def run (declNames : Array Name) (baseOpts : Options) : CompilerM Unit :
     if let some fnName := Compiler.getImplementedBy? (← getEnv) declName then
       if (← getEnv).header.isModule && (← compiler.postponeCompile.getM) then
         -- must postpone here as well so that visibility marking happens in the correct process
-        modifyEnv (postponedCompileDeclsExt.addEntry · { declNames := #[declName], options := ← getOptions })
+        modifyEnv (postponedCompileDeclsExt.addEntry · { declNames := #[declName], options := (← getOptions).erase inCompileOption })
       else
         -- Ensure the impl target is compiled first so `getLocalDeclAt?` succeeds
         resumeCompilation fnName baseOpts
@@ -186,7 +186,7 @@ partial def run (declNames : Array Name) (baseOpts : Options) : CompilerM Unit :
 
   -- Now that we have done all input checks, check for postponement
   if (← getEnv).header.isModule && (← compiler.postponeCompile.getM) then
-    modifyEnv (postponedCompileDeclsExt.addEntry · { declNames := decls.map (·.name), options := ← getOptions })
+    modifyEnv (postponedCompileDeclsExt.addEntry · { declNames := decls.map (·.name), options := (← getOptions).erase inCompileOption })
     -- meta defs are compiled locally so they are available for execution/compilation without
     -- importing `.ir` but still marked for `leanir` compilation so that we do not have to persist
     -- module-local compilation information between the two processes
@@ -209,8 +209,6 @@ partial def run (declNames : Array Name) (baseOpts : Options) : CompilerM Unit :
 
   let decls := markRecDecls decls
   let manager ← getPassManager
-  -- Passes and folders beyond the built-in ones run code inside the compiler that can read any environment
-  -- state; the module's usage data then depends on every import (`recordCompilerCode`).
   unless isBuiltinCompiler manager (← Simp.ConstantFold.getFolders) do recordCompilerCode
   let isCheckEnabled := compiler.check.get (← getOptions)
   let decls ← runPassManagerPart .pure .pure "compilation (LCNF base)" manager.basePasses decls isCheckEnabled
@@ -251,9 +249,12 @@ where
 
 end PassManager
 
+/-- Compiles `declNames`. The compile's options carry `inCompileOption`, so that `Meta` queries it makes record the
+elaboration state they read (`recordIfCompiling`). -/
 def main (declNames : Array Name) (baseOpts : Options) : CoreM Unit := do
   withTraceNode `Compiler (fun _ => return m!"compiling: {declNames}") do
-    CompilerM.run <| PassManager.run declNames baseOpts
+    withOptions (·.setBool inCompileOption true) do
+      CompilerM.run <| PassManager.run declNames baseOpts
 
 builtin_initialize
   setBuiltinCompileDecls main
