@@ -158,6 +158,8 @@ partial def run (declNames : Array Name) (baseOpts : Options) : CompilerM Unit :
     -- the only place where that walk is guaranteed to succeed, so consumers rely on the persisted
     -- result. This could be postponed as well but the added complexity is likely not worth the
     -- slight gain in rebuild avoidance/parallelism.
+    -- Records no created names (`recordCompiledNames`), so the usage data counts any compiler-only name this
+    -- produces as a claim (`foreignClaims`), which only rebuilds more.
     compileInductives declNames
     return
 
