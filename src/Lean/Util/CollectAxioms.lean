@@ -17,6 +17,12 @@ structure State where
   seen   : NameMap (Array Name) := {}
   /-- Axioms accumulated for the current constant being processed. -/
   axioms : NameSet := {}
+  /-- Constants being walked whose strongly connected component is not complete, in walk order. -/
+  stack  : Array Name := #[]
+  /-- The position of each constant of `stack` in it. -/
+  stackPos : Std.HashMap Name Nat := {}
+  /-- The lowest `stack` position that the walk of the current constant has reached. -/
+  low    : Nat := 0
 
 abbrev M := ReaderT Environment $ StateM State
 
@@ -31,8 +37,10 @@ Collect axioms reachable from constant `c`, using `extFind?` to look up pre-comp
 for imported declarations. Results are cached in `State.seen`.
 
 When processing a constant not found in `extFind?` or the cache, the function temporarily
-clears the axiom accumulator, recurses into the constant's dependencies, caches the result
-in `seen`, and merges the collected axioms back.
+clears the axiom accumulator, recurses into the constant's dependencies, and merges the
+collected axioms back. Constants can reach each other (an inductive and its constructors), so the
+walk computes the strongly connected components of the reference graph (Tarjan's algorithm): a
+constant is cached only when its whole component is walked, and then with the component's axioms.
 -/
 partial def collect
     (extFind? : Environment → Name → Option (Array Name))
@@ -47,10 +55,17 @@ partial def collect
   if let some axs := s.seen.find? c then
     modify fun s => { s with axioms := insertArray s.axioms axs }
     return
+  -- `c` is being walked, so it is in the current constant's component. Its axioms reach the
+  -- component's first constant through the walk.
+  if let some pos := s.stackPos[c]? then
+    modify fun s => { s with low := min s.low pos }
+    return
   -- Recurse: temporarily clear axioms to isolate this constant's contribution.
-  -- Insert sentinel to prevent infinite recursion (e.g., inductives ↔ constructors).
   let savedAxioms := s.axioms
-  modify fun s => { s with axioms := {}, seen := s.seen.insert c #[] }
+  let savedLow := s.low
+  let pos := s.stack.size
+  modify fun s => { s with
+    axioms := {}, low := pos, stack := s.stack.push c, stackPos := s.stackPos.insert c pos }
   let collectExpr (e : Expr) : M Unit := e.getUsedConstants.forM (collect extFind?)
   -- Take constants from the kernel env, which may differ from the elab env for (async) errors.
   match env.checked.get.find? c with
@@ -65,13 +80,24 @@ partial def collect
   | some (.recInfo v)    => collectExpr v.type
   | some (.inductInfo v) => collectExpr v.type *> v.ctors.forM (collect extFind?)
   | none                 => pure ()
-  -- Cache result (sorted for canonical order) and merge back into saved axioms
-  let collected := (← get).axioms
-  let result := collected.toArray.qsort Name.lt
-  modify fun s => { s with
-    seen   := s.seen.insert c result
-    axioms := insertArray savedAxioms result
-  }
+  let s ← get
+  if s.low < pos then
+    -- `c` reaches a constant below it on the stack: the component is not complete, and the caller
+    -- is in it, so the caller takes over `c`'s axioms.
+    set { s with axioms := savedAxioms ++ s.axioms, low := min savedLow s.low }
+  else
+    -- `c` is the component's first constant, and the component is `c` and everything above it on
+    -- the stack. Cache the result (sorted for canonical order) for all of them and merge it back
+    -- into saved axioms.
+    let result := s.axioms.toArray.qsort Name.lt
+    let members := s.stack.extract pos
+    set { s with
+      seen     := members.foldl (·.insert · result) s.seen
+      axioms   := insertArray savedAxioms result
+      stack    := s.stack.shrink pos
+      stackPos := members.foldl (·.erase ·) s.stackPos
+      low      := savedLow
+    }
 
 /-- Collect axioms for `c` and return its sorted axiom list from the cache. -/
 def collectAndGet
