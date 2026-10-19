@@ -3,7 +3,7 @@
 # Released under Apache 2.0 license as described in the file LICENSE.
 # Authors: Mac Malone, Claude Code
 
-"""A mock remote artifact cache for `test.sh`.
+"""A mock remote artifact cache for `test.sh` and the tests of `../remoteCache/lib.sh`.
 
 Serves an S3-style bucket (`GET`/`PUT` of `<store>/<path>`) and the part of the
 Reservoir API that Lake uses. Faults are selected by the first path segment, so
@@ -18,9 +18,28 @@ a test picks one by pointing an endpoint at it (e.g. `.../corrupt/a0`):
             in the store, so that curl leaves no output file to read
   badcount  Reservoir artifact URL lookup returns too few URLs
   apierror  Reservoir requests return an API error object
+  bearer    401 unless the request carries `Authorization: Bearer <token>`
+            for a token listed in the `--tokens` file (read on each request,
+            so a test can change it), and otherwise as `ok`
+  redirect  302 to the same object path under the `--redirect` URL
+  slow      as `ok`, but each `GET` is answered after 2 seconds
+  slowput   as `ok`, but each `PUT` is answered after 2 seconds
+  oversize  mappings are normal; an artifact advertises 119596321 bytes and no body
+  denyart   403 for a `GET` of an object in an `a/` directory (an artifact of the
+            shared remote cache), and otherwise as `ok`
+  stallput  as `ok`, but each `PUT` reads its body and then sends no answer for
+            15 minutes
 
 A fault that does not apply to a request kind (e.g. `badcount` on a `GET`)
-behaves as `ok`. Each request is logged to stdout as `<method> <path> -> <status>`.
+behaves as `ok`. Like Cloud Storage, a `PUT` with the header
+`x-goog-if-generation-match: 0` only creates an object: if the object exists,
+it is left untouched and the response is 412.
+
+Each request is logged to stdout as
+`<method> <path> -> <status> auth=<bearer|none|other> gen=<value|->`, where
+`auth` is the scheme of the `Authorization` header (`other` for any scheme but
+`Bearer`, e.g. AWS Signature Version 4) and `gen` is the value of the
+`x-goog-if-generation-match` header.
 
 This is Python rather than `Std.Http` because `truncate` and `reset` are
 transport-level faults: a body cut short of its declared `Content-Length` and a
@@ -33,6 +52,8 @@ import argparse
 import json
 import os
 import sys
+import threading
+import time
 from enum import StrEnum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
@@ -45,7 +66,28 @@ DENY_BODY = (
     b"<Error><Code>AccessDenied</Code><Message>mock denial</Message></Error>\n"
 )
 
+UNAUTHORIZED_BODY = (
+    b'<?xml version="1.0" encoding="UTF-8"?>\n'
+    b"<Error><Code>AuthenticationRequired</Code>"
+    b"<Message>mock authentication required</Message></Error>\n"
+)
+
+PRECONDITION_BODY = (
+    b'<?xml version="1.0" encoding="UTF-8"?>\n'
+    b"<Error><Code>PreconditionFailed</Code>"
+    b"<Message>mock object already exists</Message></Error>\n"
+)
+
 STORE = "."
+
+# The file listing the bearer tokens that `bearer` mode accepts, one per line
+TOKENS = None
+
+# The URL that `redirect` mode sends every request to, followed by the object path
+REDIRECT = None
+
+# Serializes the request records that the handler threads write to stdout
+LOG_LOCK = threading.Lock()
 
 
 class Mode(StrEnum):
@@ -59,6 +101,13 @@ class Mode(StrEnum):
     EMPTY = "empty"
     BAD_COUNT = "badcount"
     API_ERROR = "apierror"
+    BEARER = "bearer"
+    REDIRECT = "redirect"
+    SLOW = "slow"
+    OVERSIZE = "oversize"
+    SLOW_PUT = "slowput"
+    DENY_ART = "denyart"
+    STALL_PUT = "stallput"
 
 
 def content_type(path):
@@ -82,7 +131,31 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def log(self, status):
-        print("%s %s -> %s" % (self.command, self.path, status), flush=True)
+        auth = self.headers.get("Authorization")
+        if auth is None:
+            scheme = "none"
+        elif auth.startswith("Bearer "):
+            scheme = "bearer"
+        else:
+            scheme = "other"
+        gen = self.headers.get("x-goog-if-generation-match", "-")
+        record = "%s %s -> %s auth=%s gen=%s\n" % (self.command, self.path, status, scheme, gen)
+        # One record per line: requests on other threads log their records whole
+        with LOG_LOCK:
+            sys.stdout.write(record)
+            sys.stdout.flush()
+
+    def authorized(self):
+        """Whether the request carries a bearer token that `--tokens` lists."""
+        auth = self.headers.get("Authorization", "")
+        if TOKENS is None or not auth.startswith("Bearer "):
+            return False
+        try:
+            with open(TOKENS) as f:
+                accepted = set(f.read().split())
+        except FileNotFoundError:
+            return False
+        return auth[len("Bearer ") :] in accepted
 
     def parse(self):
         """Split a path into its fault mode and the object path under it.
@@ -103,12 +176,14 @@ class Handler(BaseHTTPRequestHandler):
         return mode, parts[1:], parse_qs(url.query)
 
     def respond(self, status, body, ctype):
+        # Logged before the response is sent, so that a request the client sends
+        # after it has the response is always logged after this one
+        self.log(status)
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
-        self.log(status)
 
     def not_found(self, message):
         body = json.dumps({"error": {"status": 404, "message": message}})
@@ -117,6 +192,16 @@ class Handler(BaseHTTPRequestHandler):
     def deny(self):
         self.respond(403, DENY_BODY, "application/xml")
 
+    def unauthorized(self):
+        self.respond(401, UNAUTHORIZED_BODY, "application/xml")
+
+    def redirect(self, parts):
+        self.send_response(302)
+        self.send_header("Location", "%s/%s" % (REDIRECT, "/".join(parts)))
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        self.log(302)
+
     def reset(self):
         # Neither a response nor a body: `curl` reports an empty reply and,
         # importantly, does not create its output file.
@@ -124,6 +209,18 @@ class Handler(BaseHTTPRequestHandler):
         self.log("reset")
 
     def serve(self, mode, path, ctype=None):
+        if mode == Mode.OVERSIZE and f"{os.sep}a{os.sep}" in path:
+            # curl checks --max-filesize against the header before receiving the
+            # body, so this exercises the reader's bound without allocating it.
+            self.send_response(200)
+            self.send_header("Content-Type", ctype or content_type(path))
+            self.send_header("Content-Length", "119596321")
+            self.end_headers()
+            self.close_connection = True
+            self.log("oversize")
+            return
+        if mode == Mode.SLOW:
+            time.sleep(2)
         try:
             with open(path, "rb") as f:
                 data = f.read()
@@ -203,9 +300,13 @@ class Handler(BaseHTTPRequestHandler):
         mode, parts, query = self.parse()
         if mode is None:
             self.not_found("no fault mode in path: %s" % self.path)
+        elif mode == Mode.BEARER and not self.authorized():
+            self.unauthorized()
+        elif mode == Mode.REDIRECT:
+            self.redirect(parts)
         elif mode == Mode.RESET:
             self.reset()
-        elif mode == Mode.DENY:
+        elif mode == Mode.DENY or (mode == Mode.DENY_ART and parts[-2:-1] == ["a"]):
             self.deny()
         elif parts[:2] == ["api", "v1"]:
             self.reservoir_get(mode, parts[2:], query)
@@ -216,6 +317,8 @@ class Handler(BaseHTTPRequestHandler):
         mode, parts, _ = self.parse()
         if mode is None:
             self.not_found("no fault mode in path: %s" % self.path)
+        elif mode == Mode.BEARER and not self.authorized():
+            self.unauthorized()
         elif mode == Mode.RESET:
             self.reset()
         elif mode == Mode.DENY:
@@ -232,14 +335,32 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         if mode is None:
             self.not_found("no fault mode in path: %s" % self.path)
+        elif mode == Mode.BEARER and not self.authorized():
+            self.unauthorized()
+        elif mode == Mode.REDIRECT:
+            self.redirect(parts)
         elif mode == Mode.RESET:
             self.reset()
         elif mode == Mode.DENY:
             self.deny()
         else:
+            if mode == Mode.SLOW_PUT:
+                time.sleep(2)
+            elif mode == Mode.STALL_PUT:
+                time.sleep(900)
             path = os.path.join(STORE, *parts)
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "wb") as f:
+            if self.headers.get("x-goog-if-generation-match") == "0":
+                # Create only: an existing object, even one being written by
+                # another request, keeps its bytes and its modification time
+                try:
+                    f = open(path, "xb")
+                except FileExistsError:
+                    self.respond(412, PRECONDITION_BODY, "application/xml")
+                    return
+            else:
+                f = open(path, "wb")
+            with f:
                 f.write(body)
             self.respond(200, b"", "application/xml")
 
@@ -260,10 +381,16 @@ def main():
         "--port-file", required=True, help="where to write the bound port"
     )
     parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument(
+        "--tokens", help="file listing the bearer tokens that `bearer` mode accepts"
+    )
+    parser.add_argument("--redirect", help="the URL that `redirect` mode redirects to")
     args = parser.parse_args()
 
-    global STORE
+    global STORE, TOKENS, REDIRECT
     STORE = args.store
+    TOKENS = args.tokens
+    REDIRECT = args.redirect
     os.makedirs(STORE, exist_ok=True)
 
     # Port 0 lets the OS pick a free port, so parallel tests cannot collide

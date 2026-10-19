@@ -582,6 +582,7 @@ USAGE:
 COMMANDS:
   get [<mappings>]      download build outputs into the local Lake cache
   put <mappings>        upload build outputs to a remote cache
+  push                  upload the outputs that builds queued for the remote cache
   add <mappings>        add input-to-output mappings to the Lake cache
   clean                 removes ALL from the local Lake cache
   services              print configured remote cache services
@@ -673,6 +674,12 @@ Files are uploaded using the AWS Signature Version 4 authentication protocol
 via `curl`. Thus, the service should generally be an S3-compatible bucket.
 The authentication key is set via the `LAKE_CACHE_KEY` environment variable.
 
+A service that accepts only OAuth bearer tokens (e.g., a Cloud Storage bucket
+without HMAC keys) is instead named by `LAKE_REMOTE_CACHE`, with a command
+that prints a token in `LAKE_CACHE_TOKEN_CMD` (see `lake cache services`).
+Uploads to it need no key, and they only create objects: an object that is
+already present is left as it is, which is not an error.
+
 Since Lake does not currently use cryptographically secure hashes for
 artifacts and outputs, uploads to the cache are prefixed with a scope to
 avoid clashes. This is controlled by `--scope` or `--repo`. With `--repo`,
@@ -741,7 +748,8 @@ Reads the mappings file located at `outputs.jsonl` within the staging
 directory and writes the mappings to the Lake cache. Then, it copies the
 described artifacts from the staging directory into the cache. Mappings and
 artifacts already in the cache are not overwritten unless `--force-overwrite`
-is specified."
+is specified. An artifact whose bytes do not have the content hash in its file
+name is not copied, and the command fails without writing the mappings."
 
 def helpCachePutStaged :=
 "Upload build outputs from a staging directory to a remote service
@@ -765,6 +773,38 @@ code. However, because of this, the package's platform and toolchain settings
 will not be automatically detected for `--repo` and must be specified manually
 via `--platform` and `--toolchain` (if needed). Similarly, the source revision
 the outputs correspond to must be manually specified via `--rev`."
+
+def helpCachePush :=
+"Upload the outputs that builds queued for the shared remote cache
+
+USAGE:
+  lake cache push [--wait]
+
+OPTIONS:
+  --wait                          wait for a push that is running, then push
+
+With `LAKE_REMOTE_CACHE_QUEUE` set to true and `LAKE_REMOTE_CACHE` naming an
+`s3` service (see `lake cache services`), a build appends each output that it
+compiled (not one it replayed or restored) to the queue `push.jsonl` in the
+Lake cache directory. It uploads nothing itself. It queues nothing while
+`LEAN_GITHASH` names a Lean other than the one it runs, or while
+`LAKE_USAGE_CUTOFF` is true.
+
+This command empties the queue without loading a workspace. For each entry, it
+hashes the cache artifacts again. An entry whose artifact is gone, or no longer
+matches its hash, is dropped and recorded in `push-dropped.jsonl`, and a
+changed artifact is moved to the cache's `quarantine` directory. A module's
+outputs are packed into one archive. The push copies the bytes it uploads into
+`push-staging` in the cache directory, preparing up to 16 entries at once (one
+per CPU). Each artifact is uploaded under its SHA-256, then, once all of its
+artifacts are present, the entry's input-to-output mapping, each only if the
+object is not present yet. An entry that fails to be packed or uploaded stays
+in the queue.
+
+One push runs at a time. Another one exits at once (with status 0), unless
+`--wait` is set, and the running one also uploads any entry appended while it
+runs. At the end, the push writes its counts to `remote-status-push.json` in the
+cache directory. It exits with status 1 if entries remain in the queue."
 
 def helpCacheClean :=
 "Removes ALL files from the local Lake cache
@@ -798,7 +838,34 @@ The configuration of the system cache could look something like the following:
   artifactEndpoint = \"https://my-s3.com/a0\"
   revisionEndpoint = \"https://my-s3.com/r0\"
 
-If no `cache.defaultService` is configured, Lake will use Reservoir by default."
+If no `cache.defaultService` is configured, Lake will use Reservoir by default.
+
+Requests to an `s3` service that accepts only OAuth bearer tokens (e.g., a
+Cloud Storage bucket without HMAC keys) can carry a token:
+
+  LAKE_REMOTE_CACHE=<name>      the service that receives the token
+  LAKE_CACHE_TOKEN_CMD=<cmd>    a shell command that prints the token
+
+The command must print the bare token (not `Bearer <token>` or a JSON
+document), which may contain only the characters RFC 6750 allows: letters,
+digits, and `-._~+/=`. Lake refuses any other output, without showing it.
+
+Lake runs the command (with `sh -c`) when it first sends such a request, not
+at startup. It reuses the token for up to 45 minutes, and it runs the command
+again and retries the request once if the service refuses the token (HTTP
+401). The command runs in a session of its own, so a Ctrl-C that stops Lake
+does not stop it; a command that has not ended after 60 seconds is stopped,
+with every process it started, and fails. If the command fails, Lake reports
+the same error for 60 seconds without running it again (for 5 minutes if it
+was stopped after 60 seconds).
+
+The token goes only to the host of the service's artifact endpoint, as
+`Authorization: Bearer <token>`, and only through a temporary file that `curl`
+reads: never on a command line. That endpoint must use HTTPS, unless its host
+is a loopback address (`localhost`, `127.x.x.x`, `[::1]`). A request that
+carries the token follows no redirect (a redirect is an error) and ignores
+the user's `.curlrc`. A process Lake starts does not get the token, though
+it inherits both variables from Lake's environment."
 
 def helpScriptCli :=
 "Manage Lake scripts
@@ -966,6 +1033,7 @@ public def helpCache : (cmd : String) → String
 | "unstage"             => helpCacheUnstage
 | "put-staged"          => helpCachePutStaged
 | "clean"               => helpCacheClean
+| "push"                => helpCachePush
 | "services"            => helpCacheServices
 | _                     => helpCacheCli
 
