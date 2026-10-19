@@ -13,6 +13,7 @@ import Lean.Compiler.LCNF.ToExpr
 import Lean.Compiler.LCNF.Level
 import Lean.Compiler.LCNF.Closure
 import Lean.Meta.Transform
+import Lean.Util.UsedByChecks
 import Init.Omega
 namespace Lean.Compiler.LCNF
 namespace Specialize
@@ -41,8 +42,21 @@ builtin_initialize specCacheExt : SimplePersistentEnvExtension CacheEntry Cache 
 public def cacheSpec (key : Expr) (declName : Name) : CoreM Unit :=
   modifyEnv fun env => specCacheExt.addEntry env { key, declName }
 
-public def findSpecCache? (key : Expr) : CoreM (Option Name) :=
+/-- Looks `key` up in the specialization cache. Records the lookup for the module's usage data
+(`recordSpecLookup`): which modules in the closure provide the key decides which code the compile uses. -/
+public def findSpecCache? (key : Expr) : CoreM (Option Name) := do
+  recordSpecLookup key
   return specCacheExt.getState (← getEnv) |>.find? key
+
+/-- The specialization-cache entries module `i?` added (the current module's if `none`), oldest first, so that the
+last entry for a key is the one the cache keeps. Private (this file's default), so that a module's code cannot read
+the cache without `findSpecCache?` recording the lookup; the usage data (`Lean.ModuleUsage`) reads it through the
+export. -/
+@[export lean_spec_cache_entries]
+def specCacheEntries (env : Environment) (i? : Option ModuleIdx) : Array (Expr × Name) :=
+  match i? with
+  | some i => (specCacheExt.getModuleEntries env i).map fun e => (e.key, e.declName)
+  | none => (specCacheExt.getEntries env).toArray.reverse.map fun e => (e.key, e.declName)
 
 structure Context where
   /--
@@ -415,6 +429,9 @@ mutual
     let argsNew := params.map (.fvar ·.fvarId) ++ getRemainingArgs paramsInfo args
     if let some declName ← findSpecCache? key then
       trace[Compiler.specialize.step] "cached: {declName}"
+      -- The code may later inline `declName`, possibly another module's specialization, so that no
+      -- name in this module's compiled code shows it was used.
+      recordUsedName declName
       return some (.const declName usNew argsNew)
     else
       let specDecl ← mkSpecDecl decl us argMask params decls levelParamsNew

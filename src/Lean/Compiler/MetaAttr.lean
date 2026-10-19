@@ -68,6 +68,12 @@ def setDeclMeta (env : Environment) (declName : Name) : Environment :=
   else
     declMetaExt.addEntry env declName
 
+/-- The declarations `setDeclMeta` marked in module `i?` (the current module if `none`). -/
+def declMetaEntries (env : Environment) (i? : Option ModuleIdx) : Array Name :=
+  match i? with
+  | some i => declMetaExt.getModuleEntries env i
+  | none => (declMetaExt.getState env).toArray
+
 /--
 Returns the IR phases of the given declaration that should be considered accessible. Does not take
 additional IR loaded for language server purposes into account.

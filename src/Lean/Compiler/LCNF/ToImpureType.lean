@@ -57,6 +57,15 @@ public def setHasTrivialImpureStructure? (declName : Name) : CoreM Unit :=
 public def hasTrivialImpureStructure? (declName : Name) : CoreM (Option TrivialStructureInfo) :=
   Irrelevant.hasTrivialStructure? impureTrivialStructureInfoExt declName
 
+/-- The impure trivial-structure info persisted for `declName`, if the cache holds an entry for it. -/
+public def findTrivialImpureStructureInfo? (env : Environment) (declName : Name) :
+    Option (Option TrivialStructureInfo) :=
+  impureTrivialStructureInfoExt.find? env declName
+
+/-- The IR type persisted for inductive `name`, if the cache holds an entry for it. -/
+public def findImpureType? (env : Environment) (name : Name) : Option Expr :=
+  impureTypeExt.find? env name
+
 /--
 IR representations that are fixed independently of the environment: builtin scalar types and the
 compiler's pseudo-constants (`lcErased`/`lcVoid`, which are not inductives). These never need to be
@@ -319,6 +328,10 @@ public def getCtorLayout (ctorName : Name) : CoreM CtorLayout := do
   let some info := ctorLayoutExt.find? (← getEnv) ctorName
     | throwError "`{ctorName}` was not compiled; `compileDecls` must run on inductive types first"
   return info
+
+/-- The layout persisted for constructor `ctorName`, if the cache holds an entry for it. -/
+public def findCtorLayout? (env : Environment) (ctorName : Name) : Option CtorLayout :=
+  ctorLayoutExt.find? env ctorName
 
 /--
 Eagerly computes and persists all cross-module compiler caches for the inductive types `typeNames`
