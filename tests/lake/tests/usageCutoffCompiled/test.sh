@@ -1479,6 +1479,39 @@ irdup_first_s1() { irdup_z; }
 irdup_after_s0() { irdup_files A Z; }
 irdup_after_s1() { irdup_z; }
 
+# The same claim when `Z` also defines a namespace prefix of the claimed name: `A` defines `NS.foo` and `Z` defines
+# `NS`. `NS.foo` has no compiler shape, so `Z` does not own `NS.foo._redArg` (`claim_ns`) or `NS.foo._boxed`
+# (`claim_nsb`, where `C` passes `NS.foo : UInt8 → UInt8` as a closure, so its code names the boxed version);
+# `claim_nsb_priv` (control) defines the private `NS.foo` instead, a different kernel name.
+claim_files() {
+  lakefile_app; mkdir_t
+  printf 'namespace NS\n@[noinline] def foo (n _h : Nat) : Nat := n + 5\nend NS\n' > T/A.lean
+  printf 'import Lean\ndef zdummy : Nat := 1\n' > T/Z.lean
+  printf 'import T.Z\nimport T.A\n@[noinline] def useFoo (n : Nat) : Nat := NS.foo n 0\n' > T/C.lean
+  printf 'import T.C\ndef main : IO Unit := IO.println (useFoo 1)\n' > Main.lean
+}
+claim_boxed_files() {
+  lakefile_app; mkdir_t
+  printf 'namespace NS\n@[noinline] def foo (n : UInt8) : UInt8 := n + 1\nend NS\n' > T/A.lean
+  printf 'import Lean\ndef zdummy : Nat := 1\n' > T/Z.lean
+  printf 'import T.Z\nimport T.A\n@[noinline] def apply (g : UInt8 → UInt8) (x : UInt8) : UInt8 := g x\n' > T/C.lean
+  printf '@[noinline] def useFoo (x : UInt8) : UInt8 := apply NS.foo x\n' >> T/C.lean
+  printf 'import T.C\ndef main : IO Unit := IO.println (useFoo 1)\n' > Main.lean
+}
+# `Z` with the definitions `$1` and an `@[extern "$3"]` IR declaration for the name `$2`
+claim_z() {
+  printf '%s\n' 'import Lean' 'def zdummy : Nat := 1' "$1" 'open Lean IR in' \
+    "run_cmd Lean.Elab.Command.liftCoreM <| IR.addDecl <| (.extern \`$2" \
+    '  #[{ x := ⟨1⟩, borrow := false, ty := .object }] .object' \
+    "  { entries := [.standard \`all \"$3\"] })" > T/Z.lean
+}
+claim_ns_s0() { claim_files; }
+claim_ns_s1() { claim_z 'def NS : Nat := 0' NS.foo._redArg lean_nat_succ; }
+claim_nsb_s0() { claim_boxed_files; }
+claim_nsb_s1() { claim_z 'def NS : Nat := 0' NS.foo._boxed lean_nat_pred; }
+claim_nsb_priv_s0() { claim_boxed_files; }
+claim_nsb_priv_s1() { claim_z 'private def NS.foo : Nat := 0' NS.foo._boxed lean_nat_pred; }
+
 # A control for the comparison of failing builds: `scoped_inst` with a module `N` that fails in state 1, so the
 # build fails while `M` and `W` are kept; the outputs both builds produced must still agree.
 negfail_scoped_s0() {
@@ -1885,7 +1918,8 @@ all_cases="spec_transitive spec_link spec_type spec_precomp csimp_transitive csi
   table_order folder_order red_order
   flag_off_lean flag_off_reader f3_own_folder f3_own_cpass f3_runtime_folder f3_runtime_cpass fold_env cpass_env
   f1_cachespec f1_cachespec_hit premise_ir ir_count ir_count_nd lcnf_override d2_down_rebuilt
-  collide_boxed_trans irdup_first irdup_after negfail_scoped abi_mix abi_void abi_enum abi_monotype
+  collide_boxed_trans irdup_first irdup_after claim_ns claim_nsb claim_nsb_priv negfail_scoped abi_mix abi_void
+  abi_enum abi_monotype
   wh_ctrl wh_summary wh_extern wh_implby wh_sig tl_pre_extern tl2_pre_extern tl3_race_a tl3_race_b tl3_race_sig
   ir_eval macro_eval init_eval
   inl_small inl_inline inl_instance spec_nested spec_derived spec_local spec_renumber

@@ -309,7 +309,7 @@ every importer compiles without changing any digest of those declarations. -/
 /-- Whether module `i` (`none`: the current module) defines `n` as a kernel constant; `priv` is the environment
 in its private scope (`setExporting false`). `getModuleIdxFor?` alone also maps a module's claimed compiler-only
 names, and maps nothing for a name no import defines; neither is a declaration of the module, so an entry for it
-stays in `tableDigest`, and a claimed name it owns no prefix of is listed (`claimedForeignNames`). -/
+stays in `tableDigest`, and a claimed name the module does not own is listed (`claimedForeignNames`). -/
 private def definedIn (priv : Environment) (i? : Option ModuleIdx) (n : Name) : Bool :=
   priv.getModuleIdxFor? n == i? && priv.contains n (skipRealize := false)
 
@@ -342,17 +342,31 @@ private def compilerShapedConsts (env : Environment) (i? : Option ModuleIdx) : A
   | none => (env.checked.get.constants.foldStage2 (fun acc n _ => if compilerShapedName n then acc.push n else acc)
       #[]).qsort Name.quickLt
 
+/-- Whether module `i?` owns the claimed compiler-only name `n`: `n` is a constant the module defines, or `n` is
+compiler-shaped (`compilerShapedName`) and stripping one compiler suffix (`stripSuffix?`) gives a name the module
+owns. The walk stops at the first name without a compiler shape, so a module that defines a namespace prefix of
+another module's declaration (`NS` for `NS.foo._redArg`) does not own the claim. -/
+private def ownsClaim (priv : Environment) (i? : Option ModuleIdx) (n : Name) : Bool := Id.run do
+  let mut c := n
+  for _ in [0:n.getNumParts + 1] do
+    if definedIn priv i? c then return true
+    unless compilerShapedName c do return false
+    match stripSuffix? c with
+    | some p => c := p
+    | none => return false
+  return false
+
 /-- Module `i?`'s claimed compiler-only names (IR declarations without a kernel constant, which importers resolve
-to the first module in import order that claims them, `findExtEntry?`) whose owner the module does not define:
-stripping the name as `ownerOf` does reaches none of the module's kernel constants. A name the module's own
-compile generates folds into a constant the module defines, whose digest covers its entries; any other claimed
-name, compiler-shaped or not, can take a call to that name over from another module, so it is listed. -/
+to the first module in import order that claims them, `findExtEntry?`) that the module does not own
+(`ownsClaim`). A name the module's own compile generates strips through compiler suffixes to a constant the module
+defines, whose digest covers its entries; any other claimed name can take a call to that name over from another
+module, so it is listed. -/
 private def claimedForeignNames (priv : Environment) (i? : Option ModuleIdx) : Array Name :=
   let names := match i? with
     | some i => priv.header.moduleData[i.toNat]?.elim #[] (·.extraConstNames)
     | none => (IR.getDecls priv).toArray.filterMap fun (d : IR.Decl) =>
         if priv.contains d.name (skipRealize := false) then none else some d.name
-  let foreign := names.filter fun n => !definedIn priv i? (ownerOf (definedIn priv i?) n)
+  let foreign := names.filter (!ownsClaim priv i? ·)
   (foreign.qsort Name.quickLt).eraseReps
 
 /-- A discrimination-tree key, encoded so that two keys encode alike exactly when they are `==`, as the tree
