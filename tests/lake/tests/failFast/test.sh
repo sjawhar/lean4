@@ -25,8 +25,10 @@ if grep -E '^- (slowB|slowC|Slow)$' produced.out; then
   exit 1
 fi
 
-# Canceled jobs are reported as canceled: neither a failure nor a success.
-test_exp -n "$(grep -E '^⊘ .*Canceled (slowB|slowC|Slow)$' produced.out)"
+# Canceled jobs are reported as canceled: neither a failure nor a success. A
+# target's caption names its package (`test/slowB`); `Slow` makes no module jobs
+# under `--fail-fast` (see the lakefile).
+test_exp -n "$(grep -E '^⊘ .*Canceled ([^ /]+/)?(slowB|slowC|Slow)$' produced.out)"
 if grep -E '(✔|✖) .*(slowB|slowC|Slow)$' produced.out; then
   echo "FAILURE: canceled job reported as built or failed"
   exit 1
