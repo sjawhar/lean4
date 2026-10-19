@@ -772,7 +772,7 @@ def hashBytes? (bytes : ByteArray) (text : Bool) : Option Hash :=
 Moves the cache entry of `art` into the cache's quarantine directory if it is an entry of the
 cache's artifact directory, and describes what happened to it.
 -/
-def quarantineEntry (art : Artifact) : JobM String := do
+public def quarantineEntry (art : Artifact) : JobM String := do
   let cache ← getLakeCache
   -- Never move a path that a mapping could point outside the artifact directory.
   if art.descr.relPath.components.length == 1 &&
