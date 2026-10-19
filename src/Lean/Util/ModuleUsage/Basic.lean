@@ -81,7 +81,9 @@ where
     | .str p s, e => (go p e).u8 1 |>.str s
     | .num p k, e => (go p e).u8 2 |>.nat k
 def names (e : Enc) (ns : List Name) : Enc := ns.foldl name (e.nat ns.length)
-def nats (e : Enc) (ns : Array Nat) : Enc := ns.foldl nat (e.nat ns.size)
+/-- `xs`'s size, then each element encoded by `f`. -/
+@[inline] def array {α : Type} (e : Enc) (xs : Array α) (f : Enc → α → Enc) : Enc := xs.foldl f (e.nat xs.size)
+def nats (e : Enc) (ns : Array Nat) : Enc := e.array ns nat
 def opt {α : Type} (e : Enc) (o : Option α) (f : Enc → α → Enc) : Enc :=
   match o with
   | none => e.u8 0
@@ -150,7 +152,8 @@ opaque exprDigest (mode : BinderMode) (mdata : MDataMode) (e : @& Expr) : Digest
 opaque exprsDigest (mode : BinderMode) (mdata : MDataMode) (es : @& Array Expr) : Digest
 
 def externEnc (e : Enc) (d : ExternAttrData) : Enc :=
-  d.entries.foldl (init := e.nat d.entries.length) fun e x => match x with
+  let ⟨entries⟩ := d
+  entries.foldl (init := e.nat entries.length) fun e x => match x with
     | .adhoc b => e.u8 1 |>.name b
     | .inline b p => e.u8 2 |>.name b |>.str p
     | .standard b f => e.u8 3 |>.name b |>.str f
