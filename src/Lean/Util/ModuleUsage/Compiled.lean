@@ -72,7 +72,7 @@ names never reach generated code), and their constants as mentions. -/
 def flushTys (s : CEnc) : CEnc :=
   if s.tys.isEmpty then s.u8 0 else
   let ms := s.tys.foldl (init := s.ms) fun ms t => t.foldConsts ms fun c ms => ms.insert c
-  { e := s.e.u8 1 |>.digest (exprsDigest .infos s.tys), tys := #[], ms }
+  { e := s.e.u8 1 |>.digest (exprsDigest .infos .compilerRead s.tys), tys := #[], ms }
 end CEnc
 
 partial def levelEnc (e : Enc) : Level → Enc

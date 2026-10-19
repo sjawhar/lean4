@@ -41,13 +41,17 @@ kernel constant of the same module (`ownerOf`), whose digest covers them.
 
 namespace Lean.ModuleUsage
 
-/-- Everything of `c`'s kernel data except its own name and the meaning of the constants it refers to. -/
+/-- Everything of `c`'s kernel data except its own name and the meaning of the constants it refers to. Types and every
+value but a theorem's keep binder names and infos (`BinderMode.namesInfos`) and `[borrowed]` annotations
+(`MDataMode.compilerRead`): the compiler reads all three from imported values, from `@[macro_inline]` bodies it
+inlines and from type aliases it unfolds into code types. A theorem's proof is never compiled, so its binders' names
+and infos and its `mdata` are left out. -/
 def localHash (c : ConstantInfo) : Digest :=
-  let v := exprDigest .none
-  let e := ({} : Enc).names c.levelParams |>.digest (exprDigest .namesInfos c.type)
+  let v := exprDigest .namesInfos .compilerRead
+  let e := ({} : Enc).names c.levelParams |>.digest (exprDigest .namesInfos .compilerRead c.type)
   let e := match c with
     | .defnInfo d => hintsEnc (e.u8 1 |>.digest (v d.value)) d.hints |> (safetyEnc · d.safety)
-    | .thmInfo t => e.u8 2 |>.digest (v t.value)
+    | .thmInfo t => e.u8 2 |>.digest (exprDigest .none .none t.value)
     | .opaqueInfo o => e.u8 3 |>.digest (v o.value) |>.bool o.isUnsafe
     | .axiomInfo a => e.u8 4 |>.bool a.isUnsafe
     | .quotInfo q => e.u8 5 |>.u8 (match q.kind with | .type => 0 | .ctor => 1 | .lift => 2 | .ind => 3)
@@ -505,10 +509,10 @@ without recording a lookup. -/
 private opaque specCacheEntries (env : Environment) (i? : Option ModuleIdx) : Array (Expr × Name)
 
 /-- A specialization-cache key's identity in the usage data: a digest of exactly what the cache's key equality,
-`Expr.eqv`, compares (`BinderMode.none`, `mdata` included). It must be neither coarser nor finer: two keys the
+`Expr.eqv`, compares (`BinderMode.none`, `MDataMode.eqv`). It must be neither coarser nor finer: two keys the
 cache tells apart sharing an identity let one key's providers stand for the other's, so that a lookup turning from
 a miss into a hit goes unseen, and one key with two identities hides a provider. -/
-def specKeyDigest (key : Expr) : Digest := exprDigest .none key
+def specKeyDigest (key : Expr) : Digest := exprDigest .none .eqv key
 
 /-- One module's specialization-cache entries (oldest first) as its `specKeys`: each key's identity with the
 specialization of its last entry, the one the cache keeps (`Specialize.addEntry` replaces), sorted by identity. -/

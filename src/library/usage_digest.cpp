@@ -26,11 +26,13 @@ Released under Apache 2.0 license as described in the file LICENSE.
 
 /* Meaning digests for usage cutoff (`Lean.ModuleUsage`): the first 128 bits of a SHA-256. An expression's
 digest is a Merkle hash: each node hashes a tag for its kind, its own fields and its children's digests, with
-every variable-length field length-prefixed, so equal digests mean structurally equal terms, `mdata` included,
-unless SHA-256 collides. */
+every variable-length field length-prefixed, so equal digests mean structurally equal terms up to what the binder
+and `mdata` modes leave out, unless SHA-256 collides. */
 namespace lean {
 /* `Lean.ModuleUsage.mdataBytes`: an `mdata` payload's encoding, equal for two payloads exactly when they are `==`. */
 extern "C" object * lean_usage_mdata_bytes(obj_arg m);
+/* `Lean.ModuleUsage.mdataBorrowed`: whether an `mdata` node with this payload is a `[borrowed]` annotation. */
+extern "C" uint8 lean_usage_mdata_borrowed(obj_arg m);
 namespace {
 constexpr size_t digest_size = 16;
 struct digest { unsigned char b[digest_size]; };
@@ -125,9 +127,12 @@ enum : unsigned char {
 
 /* `Lean.ModuleUsage.BinderMode`: what of a binder counts besides its domain. */
 enum class binder_mode : unsigned char { none = 0, infos = 1, names_infos = 2 };
+/* `Lean.ModuleUsage.MDataMode`: what of an `mdata` node counts besides its expression. */
+enum class mdata_mode : unsigned char { none = 0, compiler_read = 1, eqv = 2 };
 
 class digester {
     binder_mode           m_mode;
+    mdata_mode            m_mdata_mode;
     ptr_digest_map        m_exprs, m_names, m_levels, m_mdata;
     std::vector<object *> m_todo;
     std::vector<object *> m_parts;
@@ -169,10 +174,15 @@ class digester {
 
     digest mdata_digest(kvmap const & m) {
         if (digest const * d = m_mdata.find(m.raw())) return *d;
-        object * bytes = lean_usage_mdata_bytes(m.to_obj_arg());
-        digest r = hasher(tag_mdata_data)
-            .str(reinterpret_cast<char const *>(lean_sarray_cptr(bytes)), lean_sarray_size(bytes)).finish();
-        lean_dec(bytes);
+        hasher h(tag_mdata_data);
+        if (m_mdata_mode == mdata_mode::compiler_read) {
+            h.u8(lean_usage_mdata_borrowed(m.to_obj_arg()));
+        } else {
+            object * bytes = lean_usage_mdata_bytes(m.to_obj_arg());
+            h.str(reinterpret_cast<char const *>(lean_sarray_cptr(bytes)), lean_sarray_size(bytes));
+            lean_dec(bytes);
+        }
+        digest r = h.finish();
         m_mdata.insert(m.raw(), r);
         return r;
     }
@@ -211,6 +221,7 @@ class digester {
             return hasher(tag_str_lit).str(v.get_string().data(), v.get_string().num_bytes()).finish();
         }
         case expr_kind::MData:
+            if (m_mdata_mode == mdata_mode::none) return child(mdata_expr(e));
             return hasher(tag_mdata).dig(mdata_digest(mdata_data(e))).dig(child(mdata_expr(e))).finish();
         case expr_kind::Proj:
             return hasher(tag_proj).dig(name_digest(proj_sname(e))).nat_val(proj_idx(e))
@@ -224,7 +235,7 @@ class digester {
     }
 
 public:
-    explicit digester(binder_mode mode):m_mode(mode) {}
+    digester(binder_mode mode, mdata_mode mdata):m_mode(mode), m_mdata_mode(mdata) {}
 
     /* Children first, with an explicit stack: proof terms can nest deeper than the C stack allows. */
     digest expr_digest(expr const & root) {
@@ -279,20 +290,21 @@ extern "C" LEAN_EXPORT obj_res lean_usage_digest_bytes(b_obj_arg bytes) {
 #endif
 }
 
-extern "C" LEAN_EXPORT obj_res lean_usage_expr_digest(uint8 mode, b_obj_arg e) {
+extern "C" LEAN_EXPORT obj_res lean_usage_expr_digest(uint8 mode, uint8 mdata, b_obj_arg e) {
 #ifdef LEAN_EMSCRIPTEN
     lean_internal_panic("usage digests require OpenSSL");
 #else
-    return mk_digest_obj(digester(static_cast<binder_mode>(mode)).expr_digest(TO_REF(expr, e)));
+    return mk_digest_obj(digester(static_cast<binder_mode>(mode), static_cast<mdata_mode>(mdata))
+        .expr_digest(TO_REF(expr, e)));
 #endif
 }
 
 /* One digest of an array of expressions, by one digester, so subterms they share are digested once. */
-extern "C" LEAN_EXPORT obj_res lean_usage_exprs_digest(uint8 mode, b_obj_arg es) {
+extern "C" LEAN_EXPORT obj_res lean_usage_exprs_digest(uint8 mode, uint8 mdata, b_obj_arg es) {
 #ifdef LEAN_EMSCRIPTEN
     lean_internal_panic("usage digests require OpenSSL");
 #else
-    digester d(static_cast<binder_mode>(mode));
+    digester d(static_cast<binder_mode>(mode), static_cast<mdata_mode>(mdata));
     size_t n = lean_array_size(es);
     std::vector<digest> ds;
     ds.reserve(n);

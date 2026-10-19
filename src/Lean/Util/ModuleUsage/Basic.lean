@@ -7,6 +7,7 @@ prelude
 public import Lean.Expr
 public import Lean.Data.Json.FromToJson
 public import Lean.Compiler.ExternAttr
+import Lean.Compiler.BorrowedAnnotation
 public section
 
 /-!
@@ -94,6 +95,16 @@ inductive BinderMode where
   /-- Names and infos: types whose binders steer elaboration downstream. -/
   | namesInfos
 
+/-- What of an `mdata` node an expression digest counts, besides its expression. -/
+inductive MDataMode where
+  /-- Nothing: the node is invisible. For theorem proofs, which the compiler never reads. -/
+  | none
+  /-- What the compiler reads: whether the node is a `[borrowed]` annotation (`isMarkedBorrowed`). Other payloads
+  are left out; some carry fresh-name counters (proof-mode annotations), which differ between two runs. -/
+  | compilerRead
+  /-- The whole payload, exactly as `Expr.eqv` compares it (`mdataBytes`). For specialization-cache keys. -/
+  | eqv
+
 /-- `s` encoded so that two syntax trees encode alike exactly when `Syntax.structEq` holds: source information
 is left out, and an identifier's raw text is the bytes `Substring.Raw.beq` compares. -/
 private partial def syntaxEnc (e : Enc) : Syntax → Enc
@@ -106,8 +117,7 @@ private partial def syntaxEnc (e : Enc) : Syntax → Enc
       | .decl n fs => fs.foldl Enc.str (e.u8 1 |>.name n |>.nat fs.length)
 
 /-- An `mdata` payload encoded so that two payloads encode alike exactly when they are `==` (`DataValue`'s derived
-`BEq`, which compares syntax with `Syntax.structEq`), as `Expr.eqv` compares them. The expression digester hashes
-it for every `mdata` node. -/
+`BEq`, which compares syntax with `Syntax.structEq`), as `Expr.eqv` compares them: what `MDataMode.eqv` hashes. -/
 @[export lean_usage_mdata_bytes]
 private def mdataBytes (m : KVMap) : ByteArray :=
   (m.entries.foldl (init := ({} : Enc).nat m.entries.length) fun e (k, v) => valueEnc (e.name k) v).buf
@@ -121,15 +131,20 @@ where
     | .ofInt (.negSucc n) => e.u8 5 |>.nat n
     | .ofSyntax s => syntaxEnc (e.u8 6) s
 
+/-- Whether an `mdata` node with payload `m` is a `[borrowed]` annotation, as the compiler decides it
+(`isMarkedBorrowed`): what `MDataMode.compilerRead` hashes. -/
+@[export lean_usage_mdata_borrowed]
+private def mdataBorrowed (m : KVMap) : Bool :=
+  isMarkedBorrowed (.mdata m (.bvar 0))
+
 /-- A Merkle SHA-256 digest of `e`'s structure (`src/library/usage_digest.cpp`), linear in its distinct
-subterms. It includes every `mdata` node's payload (`mdataBytes`): the compiler reads `[borrowed]` annotations in
-types, and `Expr.eqv`, which the specialization cache compares keys with, compares `mdata`. -/
+subterms, counting of binders what `mode` says and of `mdata` nodes what `mdata` says. -/
 @[extern "lean_usage_expr_digest"]
-opaque exprDigest (mode : BinderMode) (e : @& Expr) : Digest
+opaque exprDigest (mode : BinderMode) (mdata : MDataMode) (e : @& Expr) : Digest
 
 /-- One digest of `es` in order, by one digester, so subterms they share are digested once. -/
 @[extern "lean_usage_exprs_digest"]
-opaque exprsDigest (mode : BinderMode) (es : @& Array Expr) : Digest
+opaque exprsDigest (mode : BinderMode) (mdata : MDataMode) (es : @& Array Expr) : Digest
 
 def externEnc (e : Enc) (d : ExternAttrData) : Enc :=
   d.entries.foldl (init := e.nat d.entries.length) fun e x => match x with
