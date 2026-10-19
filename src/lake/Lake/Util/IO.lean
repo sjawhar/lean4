@@ -7,6 +7,8 @@ module
 
 prelude
 public import Init.System.IO
+import Init.Data.ToString.Macro
+import Std.Time.DateTime.Timestamp
 
 open System
 
@@ -24,25 +26,104 @@ public def removeFileIfExists (path : FilePath) : IO Unit := do
     | .noFileOrDirectory .. => pure ()
     | e => throw e
 
-/--
-Write the UTF-8 encoded string {lean}`content` to {lean}`path`.
-If the file already exists, does nothing.
--/
-public def writeFileIfNew (path : FilePath) (content : String) : IO Unit := do
-  let h ← try IO.FS.Handle.mk path IO.FS.Mode.writeNew catch
-    | .alreadyExists .. => return
-    | e => throw e
-  h.putStr content
+/-- Counts the temporary names returned in this process, so that each is new. -/
+builtin_initialize tmpPathCount : IO.Ref Nat ← IO.mkRef 0
 
 /--
-Write the bytes of {lean}`content` to {lean}`path`.
-If the file already exists, does nothing.
+Returns a new suffix for a temporary file, {lit}`.<pid>.<n>.<random>.tmp`, where {lit}`<n>` counts
+the suffixes that this process returned, and {lit}`<random>` is 64 random bits in hexadecimal.
+Appended to a path, it names a temporary file next to it (see {lit}`uniqueTmpPath`). No other call
+in this process returns the same suffix. A call in another process returns it only by chance, also
+in one with the same process ID (e.g., in another container that shares the directory, or on
+another host). A caller that must not use another process's file creates the file with
+{lean}`IO.FS.Mode.writeNew`.
 -/
-public def writeBinFileIfNew (path : FilePath) (content : ByteArray) : IO Unit := do
-  let h ← try IO.FS.Handle.mk path IO.FS.Mode.writeNew catch
-    | .alreadyExists .. => return
+public def uniqueTmpSuffix : IO String := do
+  let n ← tmpPathCount.modifyGet fun n => (n, n + 1)
+  let r := (← IO.getRandomBytes 8).foldl (init := 0) fun r b => r * 256 + b.toNat
+  return s!".{← IO.Process.getPID}.{n}.{String.ofList (Nat.toDigits 16 r)}.tmp"
+
+/--
+Returns a new temporary path next to {lean}`path`, {lit}`<path>.<pid>.<n>.<random>.tmp`: the path
+followed by {lean}`uniqueTmpSuffix`, with the same uniqueness.
+-/
+public def uniqueTmpPath (path : FilePath) : IO FilePath :=
+  return path.toString ++ (← uniqueTmpSuffix)
+
+/-- Writes {lean}`content` to a new temporary file next to {lean}`path`, then releases its handle. -/
+partial def writeBinFileToNewTmp (path : FilePath) (content : ByteArray) : IO FilePath := do
+  let tmp ← uniqueTmpPath path
+  let h ← try IO.FS.Handle.mk tmp .writeNew catch
+    | .alreadyExists .. => return ← writeBinFileToNewTmp path content
     | e => throw e
-  h.write content
+  try
+    h.write content
+    h.flush
+  catch e =>
+    removeFileIfExists tmp
+    throw e
+  return tmp
+
+/--
+Writes the bytes of {lean}`content` to the new file {lean}`path`. If a file already has that name,
+does nothing.
+
+The name never holds part of {lean}`content` where the file system supports hard links. The bytes
+go to a new temporary file next to {lean}`path` (see {lean}`uniqueTmpPath`), which is then
+hard-linked to {lean}`path` and removed. A hard link never replaces a file. A write that fails
+(e.g., on a full disk) leaves no file; one that stops part way (e.g., when the process is killed)
+leaves only the temporary file.
+
+Where the file system cannot hard-link, the helper creates {lean}`path` exclusively and writes
+{lean}`content` into it, as it did before it used a temporary file. The first of two concurrent
+writers wins. The temporary copy is removed. On this fallback, a write that fails or stops can
+leave a partial file under {lean}`path`; atomicity needs hard links.
+
+The bytes are flushed to the operating system, not synced to the disk: after a power loss, the
+name can hold a file whose data the disk did not keep.
+-/
+public partial def writeBinFileIfNew (path : FilePath) (content : ByteArray) : IO Unit := do
+  if (← path.pathExists) then return
+  let tmp ← writeBinFileToNewTmp path content
+  -- `tmp` is this call's own file, so it removes it on every path
+  try
+    match (← (IO.FS.hardLink tmp path).toBaseIO) with
+    | .ok _ | .error (.alreadyExists ..) => pure () -- another process created `path` first
+    | .error _ =>
+      -- `writeBinFileToNewTmp` returned only after it released the temporary handle.
+      removeFileIfExists tmp
+      let h ← try IO.FS.Handle.mk path .writeNew catch
+        | .alreadyExists .. => return -- another process created `path` first
+        | e => throw e
+      h.write content
+      h.flush
+  finally
+    discard <| (removeFileIfExists tmp).toBaseIO
+
+/--
+Writes the UTF-8 encoded string {lean}`content` to the new file {lean}`path`, as
+{lean}`writeBinFileIfNew` writes bytes. If a file already has that name, does nothing.
+-/
+public def writeFileIfNew (path : FilePath) (content : String) : IO Unit :=
+  writeBinFileIfNew path content.toUTF8
+
+/-- The wall-clock time, in whole seconds since the Unix epoch (e.g., for the `at` of a status file). -/
+public def wallClockSecs : IO Int := do
+  return Std.Time.Internal.UnitVal.val (α := 1) (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch
+
+/--
+Replaces the contents of {lean}`path` with {lean}`content`: writes a temporary file next to it
+(see {lean}`uniqueTmpPath`) and renames it into place, so that a reader sees either the old or
+the new contents, never a part.
+-/
+public def writeFileAtomic (path : FilePath) (content : String) : IO Unit := do
+  createParentDirs path
+  let tmp ← uniqueTmpPath path
+  try
+    IO.FS.writeFile tmp content
+    IO.FS.rename tmp path
+  finally
+    discard <| (removeFileIfExists tmp).toBaseIO
 
 /--
 Remove a directory and all its contents.
