@@ -11,10 +11,6 @@ import Lake.Config.Monad
 import Lake.Build.Job.Monad
 import Lake.Build.Index
 import Init.Omega
-import Lake.Util.JsonObject
-import Lake.Util.IO
-import Lake.Config.PushQueue
-import Lake.Build.Claim
 
 /-! # Build Runner
 
@@ -22,7 +18,7 @@ This module defines the top-level functions used to execute a
 Lake build, monitor its progress, and await the result.
 -/
 
-open System Lean
+open System
 
 namespace Lake
 
@@ -367,7 +363,7 @@ def mkBuildContext
     else
       return none
   registeredJobs := jobs
-  remoteReadStatus := ← IO.mkRef {}
+  sidecarCache := ← Std.Mutex.new {}
   leanTrace := .ofHash (pureHash ws.lakeEnv.leanGithash)
     s!"Lean {Lean.versionStringCore}, commit {ws.lakeEnv.leanGithash}"
   cancelTk?
@@ -397,53 +393,10 @@ def Workspace.startBuild
   let compute := Job.async build (caption := caption)
   compute.run.run'.run bctx |>.run nilTrace
 
-/--
-Atomically replace the status left by remote mapping reads in one build, with `stopped` if the
-build stopped reading the remote cache (see `noteRemoteRead`).
--/
-def writeRemoteReadStatus (cache : Cache) (status : RemoteReadStatus) : IO Unit := do
-  let obj := JsonObject.empty
-    |>.insert "at" (← wallClockSecs)
-    |>.insert "failures" status.failures
-    |>.insert "lastError" status.lastError
-  let obj := status.stopped?.elim obj (obj.insert "stopped" ·)
-  writeFileAtomic cache.readStatusFile (obj : Json).pretty
-
-/--
-At the end of a build that takes claims (see `Env.remoteCacheClaimService?`) on a machine without
-the shell that a detached push needs (see `canDetachPush`), runs `lake cache push` in the
-foreground if the queue holds lines, with a warning (see `runForegroundPush`). With that shell,
-the build's one detached push follows the build and uploads its last outputs (see
-`startBuildPush`), so nothing is left to do here.
--/
-def runQueuedPush (ws : Workspace) (logger : MonadLog BaseIO) : BaseIO Unit := do
-  unless ws.lakeEnv.remoteCacheClaimService?.isSome do
-    return
-  if ← canDetachPush ws.lakeEnv then
-    return
-  let cache := ws.lakeCache
-  let .ok md ← cache.pushQueueFile.metadata.toBaseIO
-    | return
-  if md.byteSize == 0 then
-    return
-  logger.logEntry (.warning s!"`{ws.lakeEnv.pushShell}` is missing (see `LAKE_PUSH_SHELL`), so \
-    `lake cache push` runs before the build ends; log: {cache.pushLogFile}")
-  match (← (runForegroundPush ws.lakeEnv cache).toBaseIO) with
-  | .ok 0 => pure ()
-  | .ok rc => logger.logEntry (.warning s!"`lake cache push` exited with code {rc}")
-  | .error e => logger.logEntry (.warning s!"could not run `lake cache push`: {e}")
-
 def finalizeBuild
   (cfg : BuildConfig) (bctx : BuildContext) (mctx : MonitorContext) (result : BuildResult α)
 : IO α := do
   reportResult cfg mctx.out result
-  let remoteStatus ← bctx.remoteReadStatus.get
-  if remoteStatus.failures > 0 then
-    if let .error e ← (writeRemoteReadStatus bctx.workspace.lakeCache remoteStatus).toBaseIO then
-      mctx.logger.logEntry (.trace s!"could not write remote cache read status: {e}")
-  -- The build's push (if it started one) ends with the build, not with this process
-  endBuildPush
-  runQueuedPush bctx.workspace mctx.logger
   if let some outputsFile := cfg.outputsFile? then
     bctx.saveOutputs (logger := mctx.logger) mctx.out outputsFile
   match result.out with

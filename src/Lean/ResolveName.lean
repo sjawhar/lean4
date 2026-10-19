@@ -10,6 +10,7 @@ public import Lean.Modifiers
 public import Lean.Exception
 public import Lean.Namespace
 public import Lean.Log
+import Lean.Util.UsedByChecks
 
 public section
 
@@ -35,11 +36,15 @@ def ensureReservedNameAvailable [Monad m] [MonadEnv m] [MonadError m] (declName 
 builtin_initialize reservedNamePredicatesRef : IO.Ref (Array (Environment → Name → Bool)) ← IO.mkRef #[]
 
 /--
-Registers a new reserved name predicate.
+Registers a new reserved name predicate. A predicate a plugin registers is in every environment created afterwards,
+so the usage data of a module compiled in this process then depends on every import (`recordCompilerCode`); one an
+imported module registers is in no environment that exists yet, and the compile's comparison catches it
+(`runCompileDecls`).
 -/
 def registerReservedNamePredicate (p : Environment → Name → Bool) : IO Unit := do
   unless (← initializing) do
     throw (IO.userError "failed to register reserved name suffix predicate, this operation can only be performed during initialization")
+  if (← pluginLoading) then recordCompilerCode
   reservedNamePredicatesRef.modify fun ps => ps.push p
 
 builtin_initialize reservedNamePredicatesExt : EnvExtension (Array (Environment → Name → Bool)) ←
