@@ -11,6 +11,7 @@ import Lake.Util.Proc
 import Lake.Util.FilePath
 import Lake.Util.IO
 import Lake.Util.Url
+import Lake.Util.CacheToken
 import Init.Data.String.Search
 import Init.Data.String.TakeDrop
 import Init.System.Platform
@@ -166,17 +167,54 @@ public def compileExe
     env :=  macosxDeploymentTarget?.elim #[] fun ver => #[("MACOSX_DEPLOYMENT_TARGET", some ver)]
   }
 
-/-- Download a file using `curl`, clobbering any existing file. -/
+/--
+Download a file using `curl`, replacing any existing file.
+
+`curl` writes to a temporary file next to `file`, unique to this download, which `check`
+vets before it is renamed into place. Thus, `file` never holds a partial download, and a
+failed download (whose temporary file is removed) leaves it as it was. The download gives up
+on a stalled transfer (see `transferTimeoutArgs`).
+
+With `cacheToken`, the request carries the cache token, ignores the user's `.curlrc` and does not
+follow redirects (see `withCacheTokenRequest`); a redirect is an error that names it.
+-/
 public def download
   (url : String) (file : FilePath) (headers : Array String := #[])
+  (cacheToken := false) (maxFileSize? : Option Nat := none)
+  (check : FilePath → LogIO PUnit := fun _ => pure ())
 : LogIO PUnit := do
-  if (← file.pathExists) then
-    IO.FS.removeFile file
-  else
-    createParentDirs file
-  let args := #["-s", "-S", "-f", "-o", file.toString, "-L", url]
-  let args := headers.foldl (init := args) (· ++ #["-H", ·])
-  proc (quiet := true) {cmd := ← Internal.getCurl, args}
+  createParentDirs file
+  let tmp ← uniqueTmpPath file
+  try
+    let (code, out, token) ← withCacheTokenRequest url cacheToken fun _ args => do
+      let args := args ++ #["-s", "-S", "-f", "-o", tmp.toString, "-w", "%{http_code}"]
+      let args := args ++ transferTimeoutArgs
+      let args := maxFileSize?.elim args fun size => args ++ #["--max-filesize", toString size]
+      let args := headers.foldl (init := args) (· ++ #["-H", ·])
+      let out ← rawProc {cmd := ← Internal.getCurl, args := args.push url}
+      return (out.stdout.trimAscii.toNat?.getD 0, out)
+    -- The standard output is the status code that `-w` reports
+    let out := {out with stdout := ""}
+    if out.exitCode = 0 then
+      logOutput out logVerbose
+    else
+      logOutput out logInfo
+      -- With `-f`, `curl` fails on an HTTP error status, which its exit code does not name
+      let status := if code == 0 then "" else s!" (HTTP {code})"
+      error s!"external command '{← Internal.getCurl}' exited with code {out.exitCode}{status}"
+    -- Without `-L`, `curl` succeeds on a redirect, having written the redirect's body
+    if 300 ≤ code && code < 400 then
+      if token then
+        error s!"{url}: the server redirected the download (status {code}), and a request \
+          that carries the token of `{CacheToken.cmdVar}` does not follow redirects"
+      else
+        error s!"{url}: the server answered the download with a redirect (status {code}) \
+          that `curl` could not follow"
+    check tmp
+    IO.FS.rename tmp file
+  finally
+    -- After a successful download, the temporary file is already gone
+    discard <| (removeFileIfExists tmp).toBaseIO
 
 /-- Unpack an archive `file` using `tar` into the directory `dir`. -/
 public def untar (file : FilePath) (dir : FilePath) (gzip := true) : LogIO PUnit := do
