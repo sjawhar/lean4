@@ -68,8 +68,8 @@ public def setupFile
     match (← setup.toBaseIO) with
     | .ok setup =>
       print! (toJson setup).compress
-    | .error _ =>
-      eprint! "Failed to build module dependencies.\n"
+    | .error e =>
+      eprint! s!"error: {e}\nFailed to build module dependencies.\n"
       return 1
 where
   print! msg := do

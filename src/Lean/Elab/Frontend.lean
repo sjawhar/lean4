@@ -14,6 +14,8 @@ import Lean.Compiler.Options
 import Lean.Compiler.InitAttr  -- for `runInitAttrsForModules` on snapshot load
 import Lean.Linter.PersistentLintLog
 import Lean.Util.ProfilerServer
+import Lean.Util.ModuleUsage
+import Lean.Util.UsedByChecks
 
 public section
 
@@ -282,8 +284,10 @@ def runFrontend
     (incrSaveFileName? : Option System.FilePath := none)
     (incrLoadFileName? : Option System.FilePath := none)
     (incrHeaderSaveFileName? : Option System.FilePath := none)
+    (usageFileName? : Option System.FilePath := none)
     : IO (Option Environment) := do
   let startTime := (← IO.monoNanosNow).toFloat / 1000000000
+  if oleanFileName?.isSome && usageFileName?.isSome then enableUsageRecording
   let inputCtx := Parser.mkInputContext input fileName
   -- default `cmdlineSnapshots` to true (not done as default value for API back-compat reasons)
   -- except when full-snapshotting so that enough information for resumption is available
@@ -359,11 +363,15 @@ def runFrontend
       IO Unit := do
     let toSave : IncrSnapshot :=
       { snap := snapToSave, initModIdxs := getRegularInitAttrModIdxs env }
+    -- lookup caches cannot be compacted; all environments in the snapshot share `env`'s views
+    env.dropImportedLookupCaches
     let compactor ← (unsafe CompactedRegion.save incrFile `_snap toSave
       env.header.regions none (allowClosures := true))
     let moduleArts := regionsToModuleArtifacts env.header.regions
     IO.FS.writeFile (incrFile.addExtension "deps") (toJson moduleArts).compress
     Runtime.forget compactor
+    -- The run ends after persisting, so cached lookups will not be useful anymore.
+    ImportedConsts.resetCache
 
   -- save full incremental snapshot for next invocation
   if let some incrFile := incrSaveFileName? then
@@ -385,14 +393,25 @@ def runFrontend
   if hasErrors then
     return none
 
+  let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
   if let some oleanFileName := oleanFileName? then
+    let recorded ← recordedDeclConsts
+    let claims ← ModuleUsage.ownClaimsDigest env
+    let usage? := usageFileName?.map fun usageFileName =>
+      let nodes := ModuleUsage.ownNodes env (ModuleUsage.ownConsts env recorded)
+      let own := ModuleUsage.localDigests env nodes
+      (usageFileName, nodes, own, ModuleUsage.closureDigest env own claims)
     profileitIO ".olean serialization" finalOpts do
       let commandLints := collectCommandLints snaps none #[]
       let env ← Linter.recordLints inputCtx.fileMap env commandLints
+      let env := usage?.elim env fun (_, _, own, closure) => ModuleUsage.setLocalDigests env own closure claims
       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
+    if let some (usageFileName, nodes, own, closure) := usage? then
+      let used := ModuleUsage.usedFromInfoTrees trees (← usedNames)
+      ModuleUsage.writeUsage env nodes own closure used (← lookedUpSpecKeys)
+        (incrLoaded := incrLoadFileName?.isSome) usageFileName
 
   if let some ileanFileName := ileanFileName? then
-    let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
     let references := Lean.Server.findModuleRefs inputCtx.fileMap trees (localVars := false)
     let (moduleRefs, decls) ← references.toLspModuleRefs
     let ilean := {
