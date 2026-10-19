@@ -1240,10 +1240,12 @@ def Module.outputsMatchDescrs (mod : Module) (isModule postponesCompile : Bool) 
 /--
 Keeps the module's outputs for a build that does not compile it, if each is still what the saved trace describes
 (`descrs?`): with `cacheWith? = some useLocalFile`, saves them to the cache, checking each while saving
-(`recacheOutputArtifacts?`); otherwise checks their bytes (`outputsMatchDescrs`). Returns `none` if the trace
-records no outputs or any output differs, so that the caller builds. Every path that keeps outputs it then vouches
-for under a new input hash, or caches, goes through here: an up-to-date replay that caches its outputs, a usage
-skip (`Module.skipOrBuild`), and a kept-module check's accept (`acceptKept`).
+(`recacheOutputArtifacts?`); otherwise checks their bytes (`outputsMatchDescrs`). Either way the outputs keep the
+lineage the trace records (`ModuleOutputDescrs.keptFrom?`), so kept outputs stay kept wherever they are recorded
+next (a trace, a cache mapping, an `-o` entry). Returns `none` if the trace records no outputs or any output differs,
+so that the caller builds. Every path that keeps outputs it then vouches for under a new input hash, or caches, goes
+through here: an up-to-date replay that caches its outputs, a usage skip (`Module.skipOrBuild`), and a kept-module
+check's accept (`acceptKept`).
 -/
 def Module.keepOutputs? (mod : Module) (isModule postponesCompile : Bool) (descrs? : Option ModuleOutputDescrs)
     (cacheWith? : Option Bool) : JobM (Option ModuleOutputArtifacts) := do
@@ -1252,7 +1254,7 @@ def Module.keepOutputs? (mod : Module) (isModule postponesCompile : Bool) (descr
   | some useLocalFile => mod.recacheOutputArtifacts? isModule useLocalFile postponesCompile descrs
   | none =>
     unless (← mod.outputsMatchDescrs isModule postponesCompile descrs) do return none
-    return some (← mod.computeArtifacts isModule postponesCompile)
+    return some {(← mod.computeArtifacts isModule postponesCompile) with keptFrom? := descrs.keptFrom?}
 
 /-- The `keptFrom?` recorded with a saved trace's module outputs. -/
 def SavedTrace.keptFrom? (self : SavedTrace) : Option Hash :=
