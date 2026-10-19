@@ -400,10 +400,14 @@ def runFrontend
     let own := ModuleUsage.localDigests env consts
     let stmt := ModuleUsage.computeStmt env (ModuleUsage.stmtState env) own consts
     let observations ← ModuleUsage.commandObservationsRef.get
+    -- a frontend the module runs in-process records its own commands into the same references: `Lean.Elab.process`
+    -- from index 0 again, `runFrontend` after resetting them; the observations are then not this module's
+    let nested := (← recordingSessionRef.get) != session ||
+      (observations.foldl (fun s o => s.insert o.i) ({} : Std.HashSet Nat)).size != observations.size
     -- module-system files are never partially re-elaborated, so their payloads would be unused
     let mut entries := #[]
     let unchecked ← uncheckedDeclsByCommandRef.get
-    unless env.header.isModule do
+    unless env.header.isModule || nested do
       for obs in observations.qsort (·.i < ·.i) do
         let recorded ← recordCommandDelta obs.before.env obs.after.env obs.i
         if let some entry := (commandEntriesExt.getState recorded).back? then
@@ -412,7 +416,7 @@ def runFrontend
           entries := entries.push { entry with
             stateOnly := entry.stateOnly ++ ModuleUsage.commandStateChanges obs.before obs.after ++ skipped }
     let env := setCommandEntries env entries
-    let commands ← ModuleUsage.commandRecords env own stmt entries
+    let commands ← if nested then pure #[] else ModuleUsage.commandRecords env own stmt entries
     profileitIO ".olean serialization" finalOpts do
       let commandLints := collectCommandLints snaps none #[]
       let env ← Linter.recordLints inputCtx.fileMap env commandLints
@@ -421,10 +425,6 @@ def runFrontend
     let used := ModuleUsage.usedFromInfoTrees trees (← usedByChecksRef.get)
     let declIdxs := commands.foldl (init := ({} : Std.HashSet Nat)) fun s c =>
       if c.isDecl then s.insert c.i else s
-    -- a frontend the module runs in-process records its own commands into the same references: `Lean.Elab.process`
-    -- from index 0 again, `runFrontend` after resetting them
-    let nested := (← recordingSessionRef.get) != session ||
-      (observations.foldl (fun s o => s.insert o.i) ({} : Std.HashSet Nat)).size != observations.size
     let noskipReason? := if env.header.isModule then some "module-system"
       else if nested then some "command observations of a nested frontend"
       else commandEntriesNoskipReason? entries declIdxs.contains
