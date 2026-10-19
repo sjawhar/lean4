@@ -9,6 +9,10 @@ prelude
 public import Lake.Config.Cache
 public import Lake.Config.Context
 public import Lake.Build.Job.Basic
+public import Lake.Build.ModuleTimes
+public import Std.Sync.Mutex
+public import Lean.Data.PersistentHashSet
+public import Lean.Util.ModuleUsage
 
 open System
 namespace Lake
@@ -74,13 +78,40 @@ Whether the build should show progress information.
 public def BuildConfig.showProgress (cfg : BuildConfig) : Bool :=
   (cfg.noBuild ∧ cfg.verbosity == .verbose) ∨ cfg.verbosity != .quiet
 
-/-- Mutable reference of registered build jobs. -/
+/--
+Mutable reference of registered build jobs, the most recently registered first.
+
+Registering a job prepends it, which takes constant time. The build's tasks reach the reference,
+so Lean marks it, and every value stored in it, as shared between threads, and never updates such
+a value in place: pushing onto an array here would copy every job queued since the build monitor
+last took them.
+-/
 @[expose] -- for codegen
-public def JobQueue := IO.Ref (Array OpaqueJob)
+public def JobQueue := IO.Ref (List OpaqueJob)
 
 /-- Returns a new empty job queue. -/
 @[inline] public def mkJobQueue : BaseIO JobQueue :=
-  IO.mkRef #[]
+  IO.mkRef []
+
+/--
+The kernel constants of the modules a usage-cutoff check may find a changed module's kernel constants duplicated in
+(`Lake.UsageSidecar.kernelDisjoint`), as name hashes (`Name.hash`). The checks of concurrent jobs share it, so its
+maps are persistent: an update copies only the nodes it changes, where a shared hash map would be copied whole.
+-/
+public structure KernelProviders where
+  /-- The workspace modules `byHash` lists, each with the digest of the state it was read in. -/
+  indexed : Lean.PHashSet (Lean.Name × Lean.ModuleUsage.Digest) := {}
+  /-- Each kernel constant's name hash with the modules that declare it, each with the digest of the state it was
+  read in (`default` for a toolchain module). -/
+  byHash : Lean.PHashMap UInt64 (Array (Lean.Name × Lean.ModuleUsage.Digest)) := {}
+  /-- The toolchain modules `byHash` lists, each with its direct imports, or `none` if its `.olean` could not be
+  read. -/
+  toolchain : Lean.PHashMap Lean.Name (Option (Array Lean.Name)) := {}
+
+/-- Lists module `m`, in the state with digest `d`, under each kernel constant name hash in `hs`. -/
+public def KernelProviders.index (s : KernelProviders) (m : Lean.Name) (d : Lean.ModuleUsage.Digest)
+    (hs : Array UInt64) : KernelProviders :=
+  { s with byHash := hs.foldl (fun b h => b.alter h fun o => some ((o.getD #[]).push (m, d))) s.byHash }
 
 /-- A Lake context with a build configuration and additional build data. -/
 public structure BuildContext extends BuildConfig, Context where
@@ -99,6 +130,38 @@ public structure BuildContext extends BuildConfig, Context where
    Only the build monitor should set this token: reporting assumes that a counted failure exists when the token is set.
   -/
   cancelTk? : Option IO.CancelToken := none
+  /--
+  The workspace's module-times record: compile priorities read at the start of the build, and the
+  compile times recorded during it. `none` when the build does not compile (`checkNoBuild`).
+  -/
+  moduleTimes? : Option ModuleTimes := none
+  /--
+  Parsed usage-cutoff sidecars, shared by every module job in this build, each with the digest
+  (`Lean.ModuleUsage.Digest.ofBytes`) of the contents it was parsed from and the stamp of the file those contents were
+  read from (`Lean.ModuleUsage.readFileStamped`), if it stands for them. Another process may rewrite a sidecar during
+  the build (e.g., a build of another workspace that requires the same path dependency), so a cached parse serves
+  only a read of the same contents, or a file whose current stamp is the recorded one.
+  -/
+  sidecarCache : Std.Mutex
+    (Std.HashMap FilePath (Option Lean.ModuleUsage.FileStamp × Lean.ModuleUsage.Digest × Dynamic))
+  /--
+  The content hashes (`Lean.ModuleUsage.fileDigest`) that usage-cutoff checks computed in this build, each with the
+  stamp of the file its bytes were read from (`Lean.ModuleUsage.fileDigestStamped`). A check reuses a hash only while
+  the file's current stamp is the recorded one; any write, truncation or replacement of the file through the file
+  system changes its stamp, so a check never takes a hash for bytes other than the file's current ones.
+
+  A store through a `MAP_SHARED` mapping changes a file's bytes without a `write`, and the kernel may update its
+  modification time late, so the reuse relies on no writer of a hashed file using one. Lean writes an `.olean`
+  through a stream to a temporary file it then renames (`src/library/module.cpp:314,408`) and maps the files it
+  reads `MAP_PRIVATE` (`:528`).
+  -/
+  fileDigests : Std.Mutex (Std.HashMap FilePath (Lean.ModuleUsage.FileStamp × Lean.ModuleUsage.Digest))
+  /--
+  The kernel constants of the workspace and toolchain modules usage-cutoff checks read, indexed by name hash. A
+  workspace module's entries are keyed by a digest of the state they were read in, so they stay valid however the
+  module is rebuilt: a check uses only the entries of the module's current state.
+  -/
+  kernelProviders : Std.Mutex KernelProviders
 
 /-- A transformer to equip a monad with a `BuildContext`. -/
 public abbrev BuildT := ReaderT BuildContext
@@ -118,6 +181,9 @@ public instance [Pure m] : MonadLift LakeM (BuildT m) where
 
 @[inline] public def getBuildConfig [Functor m] [MonadBuild m] : m BuildConfig :=
   (·.toBuildConfig) <$> getBuildContext
+
+@[inline] public def getModuleTimes? [Functor m] [MonadBuild m] : m (Option ModuleTimes) :=
+  (·.moduleTimes?) <$> getBuildContext
 
 @[inline, inherit_doc BuildConfig.oldMode]
 public def getIsOldMode [Functor m] [MonadBuild m] : m Bool :=

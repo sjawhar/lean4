@@ -1,0 +1,8 @@
+name = "dep"
+
+[[lean_lib]]
+name = "Dep"
+
+[[lean_exe]]
+name = "depmain"
+root = "Main"

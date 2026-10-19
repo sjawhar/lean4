@@ -343,6 +343,8 @@ public structure CacheOutput where
     data : Json
     service? : Option CacheServiceName := none
     scope? : Option CacheServiceScope := none
+    /-- The log of the build that produced the outputs, replayed when they are restored. -/
+    log? : Option Log := none
     deriving Inhabited
 
 namespace CacheOutput
@@ -357,6 +359,7 @@ public protected def toJson (out : CacheOutput) : Json := Id.run do
     |>.insert "service" out.service?
   if let some scope := out.scope? then
     obj := obj.insert (if scope.isRepo then "repo" else "scope") scope.toJson
+  obj := obj.insertSome "log" out.log?
   return obj.insert "data" out.data
 
 public instance : ToJson CacheOutput := ⟨CacheOutput.toJson⟩
@@ -377,7 +380,8 @@ public protected def fromJson? (json : Json) : Except String CacheOutput := do
           return some (.ofString scope)
         else
           return none
-      return {data, service?, scope?}
+      let log? ← obj.get? "log"
+      return {data, service?, scope?, log?}
   -- old format: just the data
   return .ofData json
 
@@ -434,30 +438,40 @@ public def getArtifact (cache : Cache) (descr : ArtifactDescr) : EIO String Arti
 def writeOutputsCore
   (cache : Cache) (scope : String) (inputHash : Hash) (out : Json)
   (service? : Option CacheServiceName) (remoteScope? : Option CacheServiceScope)
-  (overwrite : Bool)
+  (log : Log) (overwrite : Bool)
 : IO Unit := do
   let file := cache.outputsFile scope inputHash
+  unless overwrite do
+    -- A mapping that is kept as it is need not be rendered
+    if (← file.pathExists) then return
   createParentDirs file
-  let out := {service?, scope? := remoteScope?, data := out : CacheOutput}
+  -- Verbose entries (e.g., the command line of the build) are diagnostics of the build
+  -- in the tree that ran it and name its paths, so they are not kept with the outputs.
+  let log := log.filter (·.level ≥ .info)
+  let log? := if log.isEmpty then none else some log
+  let out := {service?, scope? := remoteScope?, data := out, log? : CacheOutput}
   let contents := (toJson out).pretty
   if overwrite then
     IO.FS.writeFile file contents
   else
     writeFileIfNew file contents
 
-/-- Cache the outputs corresponding to the given input for the package.  -/
+/--
+Cache the outputs corresponding to the given input for the package,
+along with the log of the build that produced them.
+-/
 @[inline] public def writeOutputs
   [ToJson α] (cache : Cache) (scope : String) (inputHash : Hash) (outputs : α)
   (service? : Option CacheServiceName := none) (remoteScope? : Option CacheServiceScope := none)
-  (overwrite := true)
-: IO Unit := cache.writeOutputsCore scope inputHash (toJson outputs) service? remoteScope? overwrite
+  (log : Log := {}) (overwrite := true)
+: IO Unit := cache.writeOutputsCore scope inputHash (toJson outputs) service? remoteScope? log overwrite
 
 /-- Cache the input-to-outputs mappings from a `CacheMap`.  -/
 public def writeMap
   (cache : Cache) (scope : String) (map : CacheMap)
   (service? : Option CacheServiceName := none) (remoteScope? : Option CacheServiceScope := none)
   (overwrite := true)
-: IO Unit := map.forM fun i e => cache.writeOutputsCore scope i e.out service? remoteScope? overwrite
+: IO Unit := map.forM fun i e => cache.writeOutputsCore scope i e.out service? remoteScope? {} overwrite
 
 /-- Retrieve the cached outputs corresponding to the given input for the package (if any). -/
 public def readOutputs? (cache : Cache) (scope : String) (inputHash : Hash) : LogIO (Option CacheOutput) := do
