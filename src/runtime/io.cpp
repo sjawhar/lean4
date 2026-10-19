@@ -27,6 +27,9 @@ Authors: Leonardo de Moura, Sebastian Ullrich
 #endif
 #endif
 #ifndef LEAN_WINDOWS
+#include <time.h>
+#endif
+#ifndef LEAN_WINDOWS
 #include <csignal>
 #endif
 #include <dirent.h>
@@ -886,6 +889,28 @@ extern "C" LEAN_EXPORT obj_res lean_io_mono_nanos_now() {
     auto now = std::chrono::steady_clock::now();
     auto tm = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch());
     return uint64_to_nat(tm.count());
+}
+
+/* threadCpuNanosNow : BaseIO Nat */
+extern "C" LEAN_EXPORT obj_res lean_io_thread_cpu_nanos_now() {
+#if defined(LEAN_WINDOWS)
+    FILETIME created, exited, kernel, user;
+    if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) return uint64_to_nat(0);
+    ULARGE_INTEGER kernel_ticks, user_ticks;
+    kernel_ticks.LowPart = kernel.dwLowDateTime;
+    kernel_ticks.HighPart = kernel.dwHighDateTime;
+    user_ticks.LowPart = user.dwLowDateTime;
+    user_ticks.HighPart = user.dwHighDateTime;
+    return uint64_to_nat((kernel_ticks.QuadPart + user_ticks.QuadPart) * 100);
+#elif defined(CLOCK_THREAD_CPUTIME_ID)
+    timespec tm;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &tm) == 0) {
+        return uint64_to_nat(uint64_t(tm.tv_sec) * 1000000000ULL + uint64_t(tm.tv_nsec));
+    }
+    return uint64_to_nat(0);
+#else
+    return uint64_to_nat(0);
+#endif
 }
 
 /* getRandomBytes (nBytes : USize) : IO ByteArray */

@@ -44,6 +44,17 @@ public structure Env where
   enableArtifactCache? : Option Bool
   /-- Whether to restore all artifacts from the Lake cache by default (i.e., `LAKE_RESTORE_ARTIFACTS`). -/
   restoreAllArtifacts? : Option Bool
+  /--
+  Whether to skip compiling a module when nothing it used changed meaning (i.e., `LAKE_USAGE_CUTOFF`,
+  off unless set to a true value).
+  -/
+  usageCutoff : Bool
+  /--
+  A fixed number of tasks each usage-cutoff check may spawn to read its closure (i.e., `LAKE_USAGE_CUTOFF_READ_TASKS`,
+  a number; at least 1 is used). Unset, a check takes more tasks the fewer checks run (`Lake.parallelRuns`). The
+  variable is for measuring that choice on another machine.
+  -/
+  usageCutoffReadTasks? : Option Nat := none
   /-- Whether the system cache has been disabled (`LAKE_CACHE_DIR` is set but empty). -/
   noSystemCache : Bool := false
   /--
@@ -70,6 +81,72 @@ public structure Env where
   cacheRevisionEndpoint? : Option String
   /-- The name of the cache service (i.e., `LAKE_CACHE_SERVICE`). -/
   cacheService? : Option CacheServiceName
+  /--
+  The shell command that prints the bearer token of the remote cache service
+  (i.e., `LAKE_CACHE_TOKEN_CMD`; see `CacheToken.get?`).
+  Lake does not add it to `baseVars`; a process Lake starts inherits it from Lake's own
+  environment, as it does `LAKE_CACHE_KEY`. The token itself is never passed on. The command runs
+  in a session of its own (so a Ctrl-C that stops Lake does not stop it), and Lake kills it after
+  60 seconds.
+  -/
+  cacheTokenCmd? : Option String := none
+  /--
+  The name of the `s3` cache service that the cache token is sent to (i.e., `LAKE_REMOTE_CACHE`).
+  Lake does not add it to `baseVars`; a process Lake starts inherits it from Lake's own
+  environment.
+  -/
+  remoteCache? : Option String := none
+  /--
+  Whether builds queue the outputs they compile for upload to the `LAKE_REMOTE_CACHE` service by
+  `lake cache push` (i.e., `LAKE_REMOTE_CACHE_QUEUE`; see `Cache.pushQueueFile`). Lake does not
+  add it to `baseVars`.
+  -/
+  remoteCacheQueue : Bool := false
+  /--
+  Whether a build that queues its outputs (see `remoteCacheQueue`) enables the claim and
+  build-following-push mechanism (i.e., `LAKE_REMOTE_CACHE_CLAIMS`, on unless set to a false
+  value; see `Lake.Build.Claim`). It starts one detached `lake cache push` that follows the
+  build after its first queued output. It physically claims inputs only when
+  `LAKE_CLAIM_SLOTS` is set; otherwise it queues and pushes without a claim. Lake does not add it
+  to `baseVars`.
+  -/
+  remoteCacheClaims : Bool := true
+  /--
+  How long a claim may go without a rewrite before a waiting build takes it over, in seconds
+  (i.e., `LAKE_CLAIM_TAKEOVER_SECS`, 600 unless set to another positive number).
+  Lake does not add it to `baseVars`.
+  -/
+  claimTakeoverSecs : Nat := 600
+  /--
+  How long a build leaves an input that another build of the same targets should claim, in
+  seconds (i.e., `LAKE_CLAIM_DEFER_SECS`, 15 unless set to another number; 0 leaves none). Each
+  build that takes claims gives every input it is about to compile to one of the builds it has
+  seen, by the input's hash, and compiles only its own; it takes one of another build's inputs
+  after that build has left it unclaimed for this long, so a build that stops costs the others
+  only this wait (see `Lake.Build.Claim`). Lake does not add it to `baseVars`.
+  -/
+  claimDeferSecs : Nat := 15
+  /--
+  How many compiles of inputs must already run before a build claims the next input and waits for
+  other builds, or `none` (the default) for a build that claims no input (i.e.,
+  `LAKE_CLAIM_SLOTS`, unset by default; `0` claims every input). A build that claims nothing
+  still queues its outputs and pushes them.
+
+  Claims are off by default because they were measured to cost wall time on both machines: on the
+  Task 6 targets (1,679 compiles) two machines took 263-266 s against 250-254 s for the faster
+  machine alone, and with four workers each (a saturated build) 412-422 s against 394-400 s, with
+  about a third of the inputs compiled on both. A build that waits for another build only wins
+  when it cannot compile more at once, and every claim request and every wait lies on its path
+  (see `Lake.Build.Claim`). Lake does not add it to `baseVars`.
+  -/
+  claimSlots : Option Nat := none
+  /--
+  The shell with which a build that takes claims starts its detached `lake cache push` (i.e.,
+  `LAKE_PUSH_SHELL`, `/bin/bash` unless set). It must be able to close every descriptor by
+  number; where it does not exist, the build runs the push in the foreground at its end (see
+  `Lake.Build.Claim`). Lake does not add it to `baseVars`.
+  -/
+  pushShell : FilePath := "/bin/bash"
   /-- The initial Lean library search path of the environment (i.e., `LEAN_PATH`). -/
   initLeanPath : SearchPath
   /-- The initial Lean source search path of the environment (i.e., `LEAN_SRC_PATH`). -/
@@ -176,11 +253,22 @@ public def compute
     noCache := (noCache <|> (← IO.getEnv "LAKE_NO_CACHE").bind envToBool?).getD false
     enableArtifactCache? := (← IO.getEnv "LAKE_ARTIFACT_CACHE").bind envToBool?
     restoreAllArtifacts? := (← IO.getEnv "LAKE_RESTORE_ARTIFACTS").bind envToBool?
+    usageCutoff := ((← IO.getEnv "LAKE_USAGE_CUTOFF").bind envToBool?).getD false
+    usageCutoffReadTasks? := (← IO.getEnv "LAKE_USAGE_CUTOFF_READ_TASKS").bind (·.trimAscii.toNat?)
     lakeConfig? := (← IO.getEnv "LAKE_CONFIG") <|> userHome?.map (· / ".lake" / "config.toml" |>.toString)
     cacheKey? := (← IO.getEnv "LAKE_CACHE_KEY").map (·.trimAscii.copy)
     cacheArtifactEndpoint? := (← IO.getEnv "LAKE_CACHE_ARTIFACT_ENDPOINT").map normalizeUrl
     cacheRevisionEndpoint? := (← IO.getEnv "LAKE_CACHE_REVISION_ENDPOINT").map normalizeUrl
     cacheService? := (← IO.getEnv "LAKE_CACHE_SERVICE").map (.ofString ·.trimAscii.copy)
+    cacheTokenCmd? := (← IO.getEnv "LAKE_CACHE_TOKEN_CMD").filter (!·.trimAscii.isEmpty)
+    remoteCache? := (← IO.getEnv "LAKE_REMOTE_CACHE").map (·.trimAscii.copy) |>.filter (!·.isEmpty)
+    remoteCacheQueue := ((← IO.getEnv "LAKE_REMOTE_CACHE_QUEUE").bind envToBool?).getD false
+    remoteCacheClaims := ((← IO.getEnv "LAKE_REMOTE_CACHE_CLAIMS").bind envToBool?).getD true
+    claimTakeoverSecs := ← computeClaimTakeoverSecs
+    claimDeferSecs := ← computeClaimDeferSecs
+    claimSlots := ← computeClaimSlots
+    pushShell := ((← IO.getEnv "LAKE_PUSH_SHELL").filter (!·.trimAscii.isEmpty)).map
+      (FilePath.mk ·.trimAscii.copy) |>.getD "/bin/bash"
     githashOverride := (← IO.getEnv "LEAN_GITHASH").getD ""
     toolchain
     initLeanPath := ← getSearchPath "LEAN_PATH",
@@ -207,6 +295,26 @@ where
     match Json.parse urlMapStr |>.bind fromJson? with
     | .ok urlMap => return urlMap
     | .error e => throw s!"'LAKE_PKG_URL_MAP' has invalid JSON: {e}"
+  computeClaimTakeoverSecs := do
+    let some secs ← IO.getEnv "LAKE_CLAIM_TAKEOVER_SECS"
+      | return 600
+    match secs.trimAscii.copy.toNat? with
+    | some n => if n > 0 then return n else throw (badTakeover secs)
+    | none => throw (badTakeover secs)
+  badTakeover (secs : String) : String :=
+    s!"'LAKE_CLAIM_TAKEOVER_SECS' must be a positive number of seconds, got '{secs}'"
+  computeClaimDeferSecs := do
+    let some secs := (← IO.getEnv "LAKE_CLAIM_DEFER_SECS").filter (!·.trimAscii.isEmpty)
+      | return 15
+    match secs.trimAscii.copy.toNat? with
+    | some n => return n
+    | none => throw s!"'LAKE_CLAIM_DEFER_SECS' must be a number of seconds, got '{secs}'"
+  computeClaimSlots := do
+    let some slots := (← IO.getEnv "LAKE_CLAIM_SLOTS").filter (!·.trimAscii.isEmpty)
+      | return none
+    match slots.trimAscii.copy.toNat? with
+    | some n => return some n
+    | none => throw s!"'LAKE_CLAIM_SLOTS' must be a number of compiles, got '{slots}'"
   @[macro_inline] getUrlD var default := do
     if let some url ← IO.getEnv var then
       return normalizeUrl url
@@ -214,6 +322,35 @@ where
        return default
   normalizeUrl url :=
     if url.back == '/' then url.dropEnd 1 |>.copy else url
+
+/--
+The name of the cache service that receives the cache token, if any:
+the one `LAKE_REMOTE_CACHE` names, if `LAKE_CACHE_TOKEN_CMD` is set.
+-/
+public def cacheTokenService? (env : Env) : Option String :=
+  if env.cacheTokenCmd?.isSome then env.remoteCache? else none
+
+/--
+The name of the cache service whose write-back queue builds append to, if any: the one
+`LAKE_REMOTE_CACHE` names, if `LAKE_REMOTE_CACHE_QUEUE` is set, and only while the githash that
+names the remote scope (`leanGithash`) is that of the `lean` Lake runs. A `LEAN_GITHASH` that
+names another Lean would publish this Lean's outputs in that Lean's scope. (Lake passes the true
+githash to the processes it starts, so a build under `lake env` still queues.)
+-/
+public def remoteCacheQueueService? (env : Env) : Option String :=
+  if env.remoteCacheQueue && !env.lean.githash.isEmpty &&
+      (env.githashOverride.isEmpty || env.githashOverride == env.lean.githash) then
+    env.remoteCache?
+  else
+    none
+
+/--
+The name of the cache service whose claims builds take, if any: the queue's service (see
+`remoteCacheQueueService?`), unless `LAKE_REMOTE_CACHE_CLAIMS` is false or usage cutoff is on
+(a build that publishes nothing claims nothing).
+-/
+public def remoteCacheClaimService? (env : Env) : Option String :=
+  if env.remoteCacheClaims && !env.usageCutoff then env.remoteCacheQueueService? else none
 
 /-- The toolchain identifier for the Lake cache corresponding to the environment's toolchain. -/
 @[inline] public def cacheToolchain (env : Env) : CacheToolchain :=
@@ -310,6 +447,7 @@ public def vars (env : Env) : Array (String × Option String)  :=
     ("LAKE_CACHE_DIR", if let some cache := env.lakeCache? then cache.dir.toString else ""),
     ("LAKE_ARTIFACT_CACHE", if let some b := env.enableArtifactCache? then toString b else ""),
     ("LAKE_RESTORE_ARTIFACTS", if let some b := env.restoreAllArtifacts? then toString b else ""),
+    ("LAKE_USAGE_CUTOFF", some (toString env.usageCutoff)),
     ("LEAN_PATH", some env.leanPath.toString),
     ("LEAN_SRC_PATH", some env.leanSrcPath.toString),
     ("LEAN_GITHASH", env.leanGithash),
