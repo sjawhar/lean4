@@ -167,7 +167,7 @@ namespace Job
 
 /-- Spawn a job that asynchronously performs `act`. -/
 @[nospecialize] public protected def async
-  [OptDataKind α] (act : JobM α) (prio := Task.Priority.default) (caption := "")
+  [OptDataKind α] (act : JobM α) (prio := Task.Priority.max) (caption := "")
 : SpawnM (Job α) := .ofFn fun fetch pkg? stack store ctx _ =>
   .ofTask (caption := caption) <$> BaseIO.asTask (prio := prio) do
     (withLoggedIO act).toFn fetch pkg? stack store ctx {}
@@ -221,7 +221,7 @@ If the build's cancellation token is set, errors without running `f`.
 -/
 @[nospecialize] public protected def mapM
   [kind : OptDataKind β] (self : Job α) (f : α → JobM β)
-  (prio := Task.Priority.default) (sync := false)
+  (prio := Task.Priority.max) (sync := false)
 : SpawnM (Job β) := .ofFn fun fetch pkg? stack store ctx trace => do
   self.bindTask fun task => do
   BaseIO.mapTask (t := task) (prio := prio) (sync := sync) fun
@@ -239,7 +239,7 @@ If the build's cancellation token is set, errors without running `f`.
 -/
 @[nospecialize] public def bindM
   [kind : OptDataKind β] (self : Job α) (f : α → JobM (Job β))
-  (prio := Task.Priority.default) (sync := false)
+  (prio := Task.Priority.max) (sync := false)
 : SpawnM (Job β) := .ofFn fun fetch pkg? stack store ctx trace => do
   self.bindTask fun task => do
   BaseIO.bindTask task (prio := prio) (sync := sync) fun
@@ -261,7 +261,7 @@ results of `a` and `b`. The job `c` errors if either `a` or `b` error.
 -/
 @[inline] public def zipResultWith
   [OptDataKind γ] (f : JobResult α → JobResult β → JobResult γ) (self : Job α) (other : Job β)
-  (prio := Task.Priority.default) (sync := false)
+  (prio := Task.Priority.max) (sync := false)
 : Job γ := Job.ofTask $
   self.task.bind (prio := prio) (sync := true) fun rx =>
   other.task.map (prio := prio) (sync := sync) fun ry =>
@@ -273,7 +273,7 @@ results of `a` and `b`. The job `c` errors if either `a` or `b` error.
 -/
 @[inline] public def zipWith
   [OptDataKind γ] (f : α → β → γ) (self : Job α) (other : Job β)
-  (prio := Task.Priority.default) (sync := false)
+  (prio := Task.Priority.max) (sync := false)
 : Job γ :=
   self.zipResultWith (other := other) (prio := prio) (sync := sync) fun
   | .ok a sa, .ok b sb => .ok (f a b) (sa.merge sb)
