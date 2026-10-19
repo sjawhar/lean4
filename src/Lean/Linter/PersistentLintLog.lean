@@ -16,11 +16,17 @@ public section
 
 namespace Lean.Linter
 
+/--
+A linter warning recorded in `lintLogExt` when its module is built.
+
+The entry stores no source path, so that the `.olean` does not depend on where the source file
+was: `message.fileName` is empty. The module that owns the entry (the key in `getAllLints`) names
+the source, and consumers such as `lake lint` resolve the module to its source file.
+-/
 structure LintEntry where
   linter  : Name
   message : SerialMessage
   position? : Option Position := none
-  file : String
 
 builtin_initialize lintLogExt :
     PersistentEnvExtension LintEntry LintEntry (Array LintEntry) ←
@@ -65,6 +71,7 @@ instance : MonadFileMap (ReaderT FileMap BaseIO) := ⟨read⟩
 /--
 Records linter warnings and looks up positions of their associated commands from a build
 into `lintLogExt` so that consumers (e.g. `lake lint`) can recover them from the `.olean`.
+The messages are stored without their file name (see `LintEntry`).
 -/
 def recordLints (fileMap : FileMap) (env : Environment)
     (commandLints : Array (Option Syntax × MessageLog)) : BaseIO Environment := do
@@ -80,7 +87,8 @@ def recordLints (fileMap : FileMap) (env : Environment)
       if kind.isAnonymous then
         return env
       let sm ← m.serialize
-      return lintLogExt.addEntry env { linter := kind, message := sm, position?, file := m.fileName }
+      return lintLogExt.addEntry env
+        { linter := kind, message := { sm with fileName := "" }, position? }
 
 /--
 Records the code quality entry `e` into `codeQualityLogExt` so that it is persisted into the

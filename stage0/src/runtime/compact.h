@@ -41,7 +41,7 @@ class LEAN_EXPORT object_compactor {
     struct max_sharing_table;
     friend struct max_sharing_hash;
     friend struct max_sharing_eq;
-    lean::unordered_map<object*, object_offset, std::hash<object*>, std::equal_to<object*>> m_obj_table;
+    lean::dense_map<object*, object_offset> m_obj_table;
     std::unique_ptr<max_sharing_table> m_max_sharing_table;
     // Scratch stack of child offsets, to avoid repeated stack allocs during recursion
     std::vector<object_offset> m_tmp;

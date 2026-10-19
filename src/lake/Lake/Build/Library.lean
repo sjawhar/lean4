@@ -13,6 +13,7 @@ import Lake.Build.Job.Register
 import Lake.Build.Target.Fetch
 import Lake.Build.Infos
 import Lake.Util.Proc
+import Lake.Util.BuildSlots
 
 /-! # Library Facet Builds
 Build function definitions for a library's builtin facets.
@@ -37,7 +38,11 @@ partial def LeanLib.recCollectLocalModules
   (self : LeanLib) : FetchM (Job (Array Module))
 := ensureJob do
   let mut col : ModuleCollection := {}
-  for mod in (← self.getModuleArray) do
+  let roots ← self.getModuleArray
+  -- `go` awaits each module's `imports` job before it walks the module's imports. Fetched first (here, and in `go`
+  -- for each module's imports), the sources are read side by side instead of one after another.
+  for mod in roots do discard mod.imports.fetch
+  for mod in roots do
     col ← go mod col (viaImport := false)
   if col.hasErrors then
     -- This is not considered a fatal error because we want the modules
@@ -55,6 +60,9 @@ where
         | let col' := {col with hasErrors := true}
           return if viaImport then col' else {col' with mods := col'.mods.push root}
       for mod in imps do
+        if mod.lib.name = self.name && !col.modSet.contains mod then
+          discard mod.imports.fetch
+      for mod in imps do
         if mod.lib.name = self.name then
           col ← go mod col (viaImport := true)
       col := {col with mods := col.mods.push root}
@@ -66,8 +74,7 @@ def LeanLib.modulesFacetConfig : LibraryFacetConfig modulesFacet :=
 
 def LeanLib.recBuildElabArts (self : LeanLib) : FetchM (Job Unit) := do
   let mods ← (← self.modules.fetch).await
-  mods.foldlM (init := Job.nil) fun job mod => do
-    return job.mix <| ← mod.elabArts.fetch
+  return Job.zipWithAll (fun _ _ => ()) Job.nil (← mods.mapM (·.elabArts.fetch))
 
 /-- The `LibraryFacetConfig` for the builtin `elabArtsFacet`. -/
 public def LeanLib.elabArtsFacetConfig : LibraryFacetConfig elabArtsFacet :=
@@ -75,8 +82,7 @@ public def LeanLib.elabArtsFacetConfig : LibraryFacetConfig elabArtsFacet :=
 
 def LeanLib.recBuildIRArts (self : LeanLib) : FetchM (Job Unit) := do
   let mods ← (← self.modules.fetch).await
-  mods.foldlM (init := Job.nil) fun job mod => do
-    return job.mix <| ← mod.irArts.fetch
+  return Job.zipWithAll (fun _ _ => ()) Job.nil (← mods.mapM (·.irArts.fetch))
 
 /-- The `LibraryFacetConfig` for the builtin `irArtsFacet`. -/
 public def LeanLib.irArtsFacetConfig : LibraryFacetConfig irArtsFacet :=
@@ -113,8 +119,8 @@ public def LeanLib.leanArtsFacetConfig : LibraryFacetConfig leanArtsFacet :=
           let filelistPath := libFile.addExtension "filelist"
           let h ← IO.FS.Handle.mk filelistPath .write
           oFiles.forM fun f => h.putStr s!"{f}\n"
-          proc {cmd := "libtool", args := #["-static", "-o", libFile.toString,
-            "-filelist", filelistPath.toString]}
+          withBuildSlot <| proc (lend := true) {cmd := "libtool", args := #["-static", "-o",
+            libFile.toString, "-filelist", filelistPath.toString]}
         else if System.Platform.isWindows then
           -- The Lean core build requires a thin static library
           -- with exported symbols as part of its build process on Windows.

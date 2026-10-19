@@ -13,6 +13,7 @@ public import Lake.CLI.Shake
 public import Lake.CLI.Check
 import Lake.Version
 import Lake.Build.Run
+import Lake.Build.RemoteExec
 import Lake.Build.Infos
 import Lake.Build.Targets
 import Lake.Build.Target.Fetch
@@ -21,12 +22,15 @@ import Lake.Load.Workspace
 import Lake.Load.Toml
 import Lake.Util.IO
 import Lake.Util.Git
+import Lake.Util.Proc
 import Lake.Util.MainM
 import Lake.Util.Cli
 import Lake.CLI.Init
 import Lake.CLI.Help
 import Lake.CLI.Build
 import LeanExport.Basic
+import Lake.CLI.CachePush
+import Lake.Config.PushQueue
 import Lake.CLI.Actions
 import Lake.CLI.Translate
 import Lake.CLI.Serve
@@ -80,6 +84,13 @@ public structure LakeOptions where
   toolchain? : Option CacheToolchain := none
   rev? : Option GitRev := none
   maxRevs : Nat := 100
+  /-- Whether `lake cache push` waits for a push that is running (via `--wait`). -/
+  wait : Bool := false
+  /--
+  The follow file of the build that `lake cache push` follows (via `--follow`): the push keeps
+  reading the queue while that build holds the file's lock (see `pushRemoteCache`).
+  -/
+  follow? : Option System.FilePath := none
   shake : Shake.Args := {}
   comparatorConfig? : Option FilePath := none
   /-- File received via `lake check --from-export` -/
@@ -99,6 +110,9 @@ public structure LakeOptions where
   builtinOnly : Bool := false
   samplyRaw : Bool := false
   samplyNoServe : Bool := false
+  /-- Whether the process exits after this command (`main`), so a build may leave its context allocated
+  (`BuildConfig.forgetContext`). -/
+  oneShot : Bool := false
 
 def LakeOptions.outLv (opts : LakeOptions) : LogLevel :=
   opts.outLv?.getD opts.verbosity.minLogLv
@@ -172,9 +186,9 @@ abbrev CliMainM := ExceptT CliError MainM
 abbrev CliStateM := StateT LakeOptions CliMainM
 abbrev CliM := ArgsT CliStateM
 
-def CliM.run (self : CliM α) (args : List String) : BaseIO ExitCode := do
+def CliM.run (self : CliM α) (args : List String) (oneShot := false) : BaseIO ExitCode := do
   let (elanInstall?, leanInstall?, lakeInstall?) ← findInstall?
-  let main := self.run' args |>.run' {args, elanInstall?, leanInstall?, lakeInstall?}
+  let main := self.run' args |>.run' {args, elanInstall?, leanInstall?, lakeInstall?, oneShot}
   let main := main.run >>= fun | .ok a => pure a | .error e => error e.toString
   main.run
 
@@ -321,6 +335,10 @@ def lakeLongOption : (opt : String) → CliM PUnit
 | "--force-download" => modifyThe LakeOptions ({· with forceDownload := true})
 | "--download-arts" => modifyThe LakeOptions ({· with mappingsOnly := false})
 | "--mappings-only" => modifyThe LakeOptions ({· with mappingsOnly := true})
+| "--wait"        => modifyThe LakeOptions ({· with wait := true})
+| "--follow" => do
+  let file ← takeOptArg "--follow" "follow file"
+  modifyThe LakeOptions ({· with follow? := some file})
 | "--package" => do
   let pkgName ← takeOptArg "--package" "package name"
   modifyThe LakeOptions ({· with package? := some pkgName})
@@ -666,23 +684,31 @@ def computeUploadService
   if let some service := service? then
     let some service := lakeCfg.cacheServices.find? (.mkSimple service)
       | error (serviceNotFound service lakeCfg.config.cache.services)
-    let some key := lakeEnv.cacheKey?
-      | error "uploads require an authentication key configured through `LAKE_CACHE_KEY`"
-    return service.withKey key
+    withUploadKey lakeEnv.cacheKey? service
   else
     match lakeEnv.cacheKey?, lakeEnv.cacheArtifactEndpoint?, lakeEnv.cacheRevisionEndpoint? with
     | some key, some artifactEndpoint, some revisionEndpoint =>
       return .uploadService key artifactEndpoint revisionEndpoint
     | key?, none, none =>
       if let some service := lakeCfg.defaultCacheUploadService? then
-        let some key := key?
-          | error "uploads require an authentication key configured through `LAKE_CACHE_KEY`"
-        return service.withKey key
+        withUploadKey key? service
       else
         error "no default upload service configured; the `--service` option must be set"
     | key?, artifactEndpoint?, revisionEndpoint? =>
       error (invalidEndpointConfig key? artifactEndpoint? revisionEndpoint?)
 where
+  /-
+  A service that uses the cache token needs no key for the uploads that carry it
+  (those to the host of its artifact endpoint).
+  -/
+  withUploadKey (key? : Option String) (service : CacheService) : CliStateM CacheService := do
+    if let some key := key? then
+      return service.withKey key
+    else if service.usesCacheToken then
+      return service
+    else
+      let name := service.name?.map (·.toString) |>.getD "the upload service"
+      error (CacheService.uploadCredentialError s!"`{name}`")
   invalidEndpointConfig key? artifactEndpoint? revisionEndpoint? :=
     s!"invalid endpoint configuration:\
     \n  LAKE_CACHE_KEY is {if key?.isNone then "unset" else "set"}\
@@ -831,23 +857,45 @@ protected def unstage : CliM PUnit := do
   let ok ← descrs.foldlM (init := true) fun ok descr => do
     let cachePath := artDir/ descr.relPath
     let stagingPath := stagingDir / descr.relPath
-    if (← cachePath.pathExists) then
-      if overwrite then
-        -- Cache artifacts are read-only, so the old artifact must be deleted first.
-        IO.FS.removeFile cachePath
-      else
-        return ok
-    match (← copyFile stagingPath cachePath |>.toBaseIO) with
-    | .ok _ =>
+    if !overwrite && (← cachePath.pathExists) then
       return ok
+    match (← IO.FS.readBinFile stagingPath |>.toBaseIO) with
     | .error (.noFileOrDirectory ..) =>
       logError s!"output artifact not found in staging directory: {stagingPath}"
       return false
     | .error e =>
-      logError s!"failed to copy artifact: {e}"
+      logError s!"failed to read staged artifact: {e}"
       return false
+    | .ok bytes =>
+      -- The name's hash is that of the entry's bytes, also for text: a text artifact's hash is the
+      -- hash of its normalized text, and a text entry holds that text's UTF-8 bytes. A staged file
+      -- without those bytes (e.g., one that a `stage` that stopped part way left) is not cached.
+      unless Hash.ofByteArray bytes == descr.hash do
+        logError s!"{stagingPath}: staged artifact does not match its content hash"
+        return false
+      let write : IO (Except IO.Error Unit) := do
+        -- With `overwrite`, a rename replaces the old artifact with the whole staged file at once
+        -- (without a hard link); otherwise `writeBinFileIfNew` publishes the new artifact.
+        let written : Except IO.Error Unit ← id do
+          if overwrite then
+            writeBinFileReplacing cachePath bytes
+            return .ok ()
+          writeBinFileIfNew cachePath bytes
+        if written matches .ok _ then
+          let r : IO.AccessRight := {read := true, write := false, execution := false}
+          IO.setAccessRights cachePath ⟨r, r, r⟩
+        return written
+      match (← write.toBaseIO) with
+      | .ok (.ok _) =>
+        return ok
+      | .ok (.error e) =>
+        logError s!"{cachePath}: not cached: the cache's file system did not hard-link the entry: {e}"
+        return false
+      | .error e =>
+        logError s!"failed to copy artifact: {e}"
+        return false
   unless ok do
-    logError "failed to copy all outputs to the staging directory"
+    logError "failed to copy all outputs from the staging directory"
     exit 1
   ws.lakeCache.writeMap localScope map service? opts.scope? overwrite
 
@@ -878,6 +926,20 @@ protected def services : CliM PUnit := do
   let cfg  ← loadLakeConfig lakeEnv
   cfg.config.cache.services.forM (IO.println ·.name)
 
+protected def push : CliM PUnit := do
+  processOptions lakeOption
+  let opts ← getThe LakeOptions
+  noArgsRem do
+  let lakeEnv ← opts.computeEnv
+  -- No workspace is loaded: the queue names everything the push needs
+  let some cache := lakeEnv.lakeCache?
+    | error "no system cache detected; set `LAKE_CACHE_DIR` to the cache that holds the queue"
+  let lakeCfg ← loadLakeConfig lakeEnv
+  let left ← pushRemoteCache lakeEnv lakeCfg cache opts.wait opts.follow?
+  if left > 0 then
+    logError s!"{left} queue entries could not be uploaded; they remain in {cache.pushQueueFile}"
+    exit 1
+
 protected def clean : CliM PUnit := do
   processOptions lakeOption
   let opts ← getThe LakeOptions
@@ -906,6 +968,7 @@ def cacheCli : (cmd : String) → CliM PUnit
 | "put-staged"  => cache.putStaged
 | "clean"       => cache.clean
 | "services"    => cache.services
+| "push"        => cache.push
 | "help"        => cache.help
 | cmd           => throw <| CliError.unknownCommand cmd
 
@@ -997,7 +1060,10 @@ protected def build : CliM PUnit := do
     | none, some _ => error "`--package` requires `-o`"
     | none, none => return none
   let buildConfig := mkBuildConfig opts (out := .stdout) (showSuccess := true) outputsPackage?
-  ws.runBuild (buildSpecs specs) buildConfig
+  -- Say `hello` to the build service at the build's start, so its GetCapabilities carries the
+  -- build's invocation id (contract C5.1). A no-op when service mode is off.
+  startRemoteSession ws
+  ws.runBuild (buildSpecs specs) {buildConfig with forgetContext := opts.oneShot}
 
 protected def checkBuild : CliM PUnit := do
   processOptions lakeOption
@@ -1111,6 +1177,20 @@ protected def checkTest : CliM PUnit := do
   let pkg ← loadPackage (← mkLoadConfig (← getThe LakeOptions))
   noArgsRem do exit <| if pkg.testDriver.isEmpty then 1 else 0
 
+/--
+The artifacts Lake built for `mods` and every module of the workspace they transitively import,
+as `Lean.importModules` takes them, so that `lake lint` imports exactly these files: each module's
+widest set (`.olean` parts and IR), which is what an import without artifacts loads from disk.
+-/
+def lintImportArts (mods : Array Module) : FetchM (Job (NameMap Lean.ImportArtifacts)) :=
+  Job.async do
+    let mut arts : NameMap Lean.ImportArtifacts := {}
+    for mod in mods do
+      for m in #[mod] ++ (← (← mod.transImports.fetch).await) do
+        unless arts.contains m.name do
+          arts := arts.insert m.name (← (← m.metaExportInfo.fetch).await).allArts
+    return arts
+
 def runBuiltinLint
     (opts : LakeOptions) (ws : Workspace) (specifiedMods : Array Lean.Name)
     : CliM UInt32 := do
@@ -1123,7 +1203,15 @@ def runBuiltinLint
   for c in checks do
     unless (ws.findTargetModule? c).isSome do
       error s!"unknown checks module `{c}`; it must be a module of a package in the workspace"
-  let args := { args with mods, checks, srcSearchPath := ws.augmentedLeanSrcPath }
+  -- Package checks, and the lookup of the source of a module Lake does not know, get the
+  -- libraries' source directories root package first (`Workspace.leanSrcPath` lists dependencies
+  -- first), so that the root's module wins a name both packages use.
+  let lintSrcPath : SearchPath := ws.packages.foldr (init := []) fun pkg dirs =>
+    pkg.leanLibs.foldr (fun lib dirs => lib.srcDir :: dirs) dirs
+  -- Lint output names the source file Lake compiles for each module (as `+mod` resolves it).
+  let args := { args with
+    mods, checks, srcSearchPath := lintSrcPath ++ ws.lakeEnv.leanSrcPath,
+    moduleSrcFile? := fun mod => (ws.findTargetModule? mod).map (·.leanFile) }
   -- Checks modules are imported alongside each lint target, so they must be built as well.
   let buildMods := mods ++ checks.filter (!mods.contains ·)
   let specs ← parseTargetSpecs ws (buildMods.map (s!"+{·}") |>.toList)
@@ -1141,9 +1229,17 @@ def runBuiltinLint
     outLv := .error
     leanOptOverrides := overrides
   }
-  ws.runBuild (buildSpecs specs) buildCfg
+  -- Lint imports each module Lake knows from the artifacts Lake built for it (as Lake passes them
+  -- to `lean` in a module's setup), so no `.olean` search order decides which file is loaded. Other
+  -- modules (the toolchain's, or ones Lake does not know) resolve through the same `LEAN_PATH` as
+  -- the `lean` processes Lake ran.
+  let lintMods := buildMods.filterMap ws.findTargetModule?
+  let importArts ← ws.runBuild (do
+    let built ← buildSpecs specs
+    let arts ← lintImportArts lintMods
+    return built.zipWith (fun _ arts => arts) arts) buildCfg
   Lean.searchPathRef.set ws.augmentedLeanPath
-  BuiltinLint.run args
+  BuiltinLint.run { args with importArts }
 
 protected def lint : CliM PUnit := do
   processOptions lakeOption
@@ -1280,7 +1376,7 @@ protected def env : CliM PUnit := do
     else
       pure config.lakeEnv.vars
   if let some cmd ← takeArg? then
-    let child ← IO.Process.spawn {cmd, args := (← takeArgs).toArray, env}
+    let child ← spawnProc {cmd, args := (← takeArgs).toArray, env}
     exit <| ← child.wait
   else
     env.forM fun (var, val?) =>
@@ -1460,5 +1556,6 @@ def lake : CliM PUnit := do
       else
         throw <| CliError.missingCommand
 
-public def cli (args : List String) : BaseIO ExitCode :=
-  inline <| (lake).run args
+/-- Runs the Lake command `args`. With `oneShot`, the process exits when it returns (`LakeOptions.oneShot`). -/
+public def cli (args : List String) (oneShot := false) : BaseIO ExitCode := do
+  try inline <| (lake).run args oneShot finally RemoteExec.shutdown
