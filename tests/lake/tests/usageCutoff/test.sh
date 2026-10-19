@@ -5,6 +5,8 @@ source ../common.sh
 copy_to_work lakefile.toml
 # Store the Lake cache in the package, never the system cache (cache-env runs set their own directory below)
 export LAKE_CACHE_DIR=
+# The cutoff is off by default: every arm that expects it turns it on (or off) explicitly
+export LAKE_USAGE_CUTOFF=1
 mkdir -p Test
 printf 'def a := 1\ntheorem ta : a = 1 := sorry\n' > Test/A.lean
 printf 'import Test.A\ndef b := a + 1\n' > Test/B.lean
@@ -630,5 +632,12 @@ test_exp "$(depHash cache16/.lake/build/lib/lean/Test/SB.trace)" = "$(depHash ca
 printf 'def sa := 1\ndef unrelated := 3\n' > cache12/Test/SA.lean
 (cd cache12 && test_out "Replayed Test.SB" build -v Test.SB)
 (cd cache12 && LAKE_USAGE_CUTOFF=0 test_out "Built Test.SB" build -v Test.SB)
+# with `LAKE_USAGE_CUTOFF` unset the cutoff is off: a stale module whose used constants are unchanged is built
+printf 'def sa := 1\ndef unrelated := 4\n' > cache12/Test/SA.lean
+(cd cache12 && test_run build -v Test.SB && printf 'def sa := 1\ndef unrelated := 5\n' > Test/SA.lean && \
+  env -u LAKE_USAGE_CUTOFF "$LAKE" build -v Test.SB) > default.log 2>&1 || { cat default.log; exit 1; }
+match_text "Built Test.SB" default.log
+no_match_text "Replayed Test.SB" default.log
+test_exp ! -f cache12/.lake/build/lib/lean/Test/SB.usage
 
 rm -f produced.out
