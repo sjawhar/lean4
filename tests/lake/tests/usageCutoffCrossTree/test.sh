@@ -456,12 +456,17 @@ case12() {
   test_run -d f build $ALL
   art="$LAKE_CACHE_DIR/artifacts/$(cat f/$OUT/B.olean.hash).olean"
   test_cmd chmod 000 "$art"
-  mkpkg t
-  edx t
-  lake_out -d t build -v Test.B Test.C
-  jobhas Test.C "usage index: restored"
-  jobhas Test.B "usage index: no match (1 candidates, 1 parsed, 1 fully checked"
-  jobhas Test.B "Built Test.B"
+  if cat "$art" > /dev/null 2>&1; then
+    echo "SKIPPED: the entry is still readable (running as root?)"
+  else
+    mkpkg t
+    edx t
+    lake_out -d t build -v Test.B Test.C
+    jobhas Test.C "usage index: restored"
+    jobhas Test.B "usage index: no match (1 candidates, 1 parsed, 1 fully checked"
+    jobhas Test.B "Built Test.B"
+  fi
+  test_cmd chmod 444 "$art"
 }
 
 runcase() {
