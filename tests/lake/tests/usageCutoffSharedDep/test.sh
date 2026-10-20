@@ -208,3 +208,32 @@ cp -r dep a fresh/
 rm -rf fresh/dep/.lake fresh/a/.lake
 (cd fresh/a && test_run build T.N)
 test_cmd cmp fresh/a/.lake/build/ir/T/N.c a/.lake/build/ir/T/N.c
+
+# A build hashes a module-system file once and reuses the hash in its later checks only while the file's stamp is
+# unchanged. `U` is a module-system file of `dep` that `D` imports; `a`'s build hashes it in the checks of `T.E`,
+# `T.X` and `T.Slow`, then `b` rebuilds `U` with another value while `T.Slow` holds the build. `M`, checked after
+# that, must see `U`'s new bytes: it is compiled again, and its proof fails as it does from scratch.
+printf '[[lean_lib]]\nname = "U"\n' >> dep/lakefile.toml
+printf 'module\npublic def uValue : Nat := 1\n' > dep/U.lean
+printf 'import U\ndef sharedValue : Nat := 1\n' > dep/D.lean
+printf 'import T.Slow\nimport U\ntheorem keptU : uValue = 1 := rfl\n' > a/T/M.lean
+printf 'import T.E\nimport D\ndef xs : Nat := 5\n' > a/T/X.lean
+write_a 0
+touch release
+(cd a && test_run build T.M)
+(cd b && test_run build U)
+# A hash is kept only for a file whose status-change time lies more than two seconds in the past.
+sleep 3
+rm -f ready release
+write_a 1
+(cd a && "$LAKE" build -v T.M) > race.log 2>&1 &
+pid=$!
+await_ready
+printf 'module\npublic def uValue : Nat := 2\n' > dep/U.lean
+(cd b && test_run build U)
+touch release
+wait $pid && rc=0 || rc=$?
+cat race.log
+test_exp $rc != 0
+no_match_text "Replayed T.M" race.log
+match_text "T/M.lean" race.log
