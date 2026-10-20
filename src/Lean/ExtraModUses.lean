@@ -95,21 +95,20 @@ whose environment is then discarded (`example`, `#check`, `#eval`, `#synth`, `#r
 clears it (`startFrontendRun`). -/
 builtin_initialize extraModUsesByChecksRef : IO.Ref (Std.HashSet ExtraModUse) ← IO.mkRef {}
 
-/-- Every extra module use attributed to the command that requested it, before environment-level deduplication;
-newest first, with repeats (a list, like the per-command logs of `Lean.Util.UsedByChecks`). Private, as
+/-- Every extra module use with the command that requested it, before environment-level deduplication. Private, as
 `extraModUsesByChecksRef`. -/
-builtin_initialize extraModUsesByCmdRef : IO.Ref (List (Nat × ExtraModUse)) ← IO.mkRef []
+builtin_initialize extraModUsesByCmdRef : IO.Ref (Std.HashSet (Nat × ExtraModUse)) ← IO.mkRef {}
 
 builtin_initialize registerRunLog do
   extraModUsesByChecksRef.set {}
-  extraModUsesByCmdRef.set []
+  extraModUsesByCmdRef.set {}
 
 /-- The extra module uses `extraModUsesByChecksRef` holds. -/
 public def extraModUsesByChecks : BaseIO (Std.HashSet ExtraModUse) :=
   extraModUsesByChecksRef.get
 
-/-- The extra module uses `extraModUsesByCmdRef` holds, newest first. -/
-public def extraModUsesByCommand : BaseIO (List (Nat × ExtraModUse)) :=
+/-- The extra module uses `extraModUsesByCmdRef` holds. -/
+public def extraModUsesByCommand : BaseIO (Std.HashSet (Nat × ExtraModUse)) :=
   extraModUsesByCmdRef.get
 
 def recordExtraModUseCore [MonadLiftT IO m] [MonadCommandIdx m] (mod : Name) (isMeta : Bool)
@@ -118,7 +117,7 @@ def recordExtraModUseCore [MonadLiftT IO m] [MonadCommandIdx m] (mod : Name) (is
   let recording ← (usageRecordingEnabled : IO Bool)
   if recording then
     let idx ← commandIdx
-    (extraModUsesByCmdRef.modify ((idx, entry) :: ·) : IO Unit)
+    (extraModUsesByCmdRef.modify (·.insert (idx, entry)) : IO Unit)
   if !(extraModUses.getState (asyncMode := .local) (← getEnv)).contains entry then
     trace[extraModUses] "recording {if entry.isExported then "public" else "private"} \
       {if isMeta then "meta" else "regular"} extra mod use {mod}\
