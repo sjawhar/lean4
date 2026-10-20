@@ -124,7 +124,7 @@ public def mkBelow (indName : Name) : MetaM Unit := do
   -- generate the constructions for the nested inductives now
   if indVal.all[0]! = indName then
     for i in *...indVal.numNested do
-      let recName := recName.appendIndexAfter (i + 1)
+      let recName := mkNestedRecName indName (i + 1)
       let belowName := belowName.appendIndexAfter (i + 1)
       mkBelowFromRec recName indVal.numParams belowName
 
@@ -321,7 +321,7 @@ public def mkBRecOn (indName : Name) : MetaM Unit := do
   -- generate the constructions for the nested inductives now.
   if indVal.all[0]! = indName then
     for i in *...indVal.numNested do
-      let recName := recName.appendIndexAfter (i + 1)
+      let recName := mkNestedRecName indName (i + 1)
       let brecOnName := brecOnName.appendIndexAfter (i + 1)
       mkBRecOnFromRec recName indVal.numParams indVal.all.toArray brecOnName
 

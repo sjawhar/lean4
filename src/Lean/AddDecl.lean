@@ -249,7 +249,7 @@ def addDecl (decl : Declaration) (forceExpose := false) : CoreM Unit := do
     if let .inductDecl _ _ (t :: _) _ := decl then
       if let some (.inductInfo v) := (← getEnv).find? t.name then
         unless v.numNested == 0 do
-          let recs := (Array.range v.numNested).map fun i => (mkRecName t.name).appendIndexAfter (i + 1)
+          let recs := (Array.range' 1 v.numNested).map (mkNestedRecName t.name)
           recordCommandDecls (← commandIdx) recs used
   discard <| decl.getTopLevelNames.mapM snapshotEnvLinterOptions
 

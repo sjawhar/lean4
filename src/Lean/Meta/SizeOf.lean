@@ -178,7 +178,7 @@ def mkSizeOfFns (typeName : Name) : MetaM (Array Name × NameMap Name) := do
     result := result.push sizeOfName
     i := i + 1
   for j in *...indInfo.numNested do
-    let recName := (mkRecName indInfo.all.head!).appendIndexAfter (j+1)
+    let recName := mkNestedRecName indInfo.all.head! (j+1)
     let sizeOfName := baseName.appendIndexAfter i
     mkSizeOfFn recName sizeOfName
     recMap := recMap.insert recName sizeOfName

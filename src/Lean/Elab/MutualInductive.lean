@@ -1246,7 +1246,7 @@ private def addAuxRecs (indTypes : List InductiveType) : TermElabM Unit := do
   for indType in indTypes do
     let mut i := 1
     while true do
-      let auxRecName := indType.name ++ `rec |>.appendIndexAfter i
+      let auxRecName := mkNestedRecName indType.name i
       let env ← getEnv
       let some const := env.toKernelEnv.find? auxRecName | break
       let res ← env.addConstAsync auxRecName .recursor
