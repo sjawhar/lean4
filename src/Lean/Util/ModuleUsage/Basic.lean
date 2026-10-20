@@ -56,6 +56,11 @@ not (or on Windows). -/
 @[extern "lean_usage_file_digest_stamped"]
 opaque fileDigestStamped (path : @& System.FilePath) : IO (Digest × Option FileStamp)
 
+/-- The file's bytes, with the stamp of the file they were read from if it stands for them, as for
+`fileDigestStamped`. -/
+@[extern "lean_usage_read_file_stamped"]
+opaque readFileStamped (path : @& System.FilePath) : IO (ByteArray × Option FileStamp)
+
 private def hex16 (v : UInt64) : String :=
   let s := String.ofList (Nat.toDigits 16 v.toNat); "".pushn '0' (16 - s.length) ++ s
 

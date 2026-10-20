@@ -179,19 +179,31 @@ instance : FromJson UsekeySidecar where
     }
 
 /--
-The bytes of the usage-cutoff sidecar at `path` with their digest, or `none` if it does not exist or its bytes do
-not have the digest `expected?` (the `.usage` a `.usekey` was written from). Fails if it exists but cannot be read.
+The bytes of the usage-cutoff sidecar at `path` with their digest and the stamp of the file they were read from, if
+it stands for them (`Lean.ModuleUsage.readFileStamped`), or `none` if it does not exist or its bytes do not have the
+digest `expected?` (the `.usage` a `.usekey` was written from). Fails if it exists but cannot be read.
 -/
 def readSidecarBytes? (path : FilePath) (expected? : Option ModuleUsage.Digest) :
-    JobM (Option (ByteArray × ModuleUsage.Digest)) := do
-  match (← IO.FS.readBinFile path |>.toBaseIO) with
-  | .ok bytes =>
+    JobM (Option (ByteArray × ModuleUsage.Digest × Option ModuleUsage.FileStamp)) := do
+  match (← ModuleUsage.readFileStamped path |>.toBaseIO) with
+  | .ok (bytes, stamp?) =>
     let digest := ModuleUsage.Digest.ofBytes bytes
-    return if expected?.any (· != digest) then none else some (bytes, digest)
+    return if expected?.any (· != digest) then none else some (bytes, digest, stamp?)
   | .error (.noFileOrDirectory ..) =>
     return none
   | .error e =>
     error s!"{path}: read failed: {e}"
+
+/-- An entry of `BuildContext.sidecarCache`. -/
+abbrev SidecarEntry := Option ModuleUsage.FileStamp × ModuleUsage.Digest × Dynamic
+
+/-- The build's parse of the sidecar at `path`, with the digest of the contents it was parsed from, if the file's
+current stamp is the one recorded with it (`BuildContext.sidecarCache`). -/
+def stampedSidecar? (path : FilePath) : JobM (Option (ModuleUsage.Digest × Dynamic)) := do
+  let some stamp ← ModuleUsage.fileStamp path | return none
+  let some (some recorded, digest, value) ← (← getBuildContext).sidecarCache.atomically (return (← get)[path]?)
+    | return none
+  return if recorded == stamp then some (digest, value) else none
 
 /-- Parses the bytes of the usage-cutoff sidecar at `path`: `none` if it has another format version than
 `Lean.ModuleUsage.usageVersion` (another toolchain wrote it), or, with a warning, if it is not valid, so that the
@@ -214,20 +226,25 @@ where
 Reads a usage-cutoff sidecar. Returns `none` if it does not exist, has another format version
 (`parseUsageSidecar`), or its bytes do not have the digest `expected?` (the `.usage` a `.usekey` was written
 from). If it exists but is not valid, logs a warning and returns `none`, so the module builds normally. Reuses
-the build's parse of the same contents (`BuildContext.sidecarCache`).
+the build's parse of the same contents (`BuildContext.sidecarCache`), without reading the file while its stamp is the
+one recorded with that parse.
 -/
 def readUsageSidecar (α : Type) [FromJson α] [TypeName α] (path : FilePath)
     (expected? : Option ModuleUsage.Digest := none) : JobM (Option α) := do
-  let some (bytes, digest) ← readSidecarBytes? path expected? | return none
+  if let some (digest, cached) ← stampedSidecar? path then
+    if expected?.any (· != digest) then return none
+    let some value := cached.get? α | error s!"{path}: cached sidecar has the wrong type"
+    return some value
+  let some (bytes, digest, stamp?) ← readSidecarBytes? path expected? | return none
   (← getBuildContext).sidecarCache.atomically do
-    let entries ← getThe (Std.HashMap FilePath (ModuleUsage.Digest × Dynamic))
-    if let some (parsedFrom, cached) := entries.get? path then
+    let entries ← getThe (Std.HashMap FilePath SidecarEntry)
+    if let some (_, parsedFrom, cached) := entries.get? path then
       if parsedFrom == digest then
         let some value := cached.get? α | error s!"{path}: cached sidecar has the wrong type"
+        modifyThe (Std.HashMap FilePath SidecarEntry) (·.insert path (stamp?, digest, cached))
         return some value
     let some value ← parseUsageSidecar α path bytes | return none
-    modifyThe (Std.HashMap FilePath (ModuleUsage.Digest × Dynamic))
-      (·.insert path (digest, Dynamic.mk value))
+    modifyThe (Std.HashMap FilePath SidecarEntry) (·.insert path (stamp?, digest, Dynamic.mk value))
     return some value
 
 /--
@@ -237,11 +254,10 @@ build's sidecar cache for the module's importers (`importUsage?`).
 -/
 def readOwnUsage (path : FilePath) (expected? : Option ModuleUsage.Digest := none) :
     JobM (Option (UsageSidecar × ModuleUsage.Digest)) := do
-  let some (bytes, digest) ← readSidecarBytes? path expected? | return none
+  let some (bytes, digest, stamp?) ← readSidecarBytes? path expected? | return none
   let some usage ← parseUsageSidecar UsageSidecar path bytes | return none
   (← getBuildContext).sidecarCache.atomically do
-    modifyThe (Std.HashMap FilePath (ModuleUsage.Digest × Dynamic))
-      (·.insert path (digest, Dynamic.mk usage.toImport))
+    modifyThe (Std.HashMap FilePath SidecarEntry) (·.insert path (stamp?, digest, Dynamic.mk usage.toImport))
   return some (usage, digest)
 
 /--
