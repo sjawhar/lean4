@@ -96,6 +96,13 @@ public unsafe opaque CompactedRegion.save {α : Type} (fname : @& System.FilePat
     (allowClosures := false) : IO Compactor
 
 /--
+The contents of the file `CompactedRegion.save fname key data #[] none` writes, built without writing it. Fails like
+`save` on data it cannot compact (a closure).
+-/
+@[extern "lean_compacted_region_bytes"]
+public opaque CompactedRegion.bytes {α : Type} (key : @& Name) (data : @& α) : IO ByteArray
+
+/--
 Reads a compacted region from disk.
 
 `depRegions` are existing compacted regions whose address ranges are needed for cross-region

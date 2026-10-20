@@ -29,9 +29,6 @@ Author: Leonardo de Moura
 #include <link.h>
 #endif
 
-#define LEAN_COMPACTOR_INIT_SZ 1024*1024
-#define LEAN_MAX_SHARING_TABLE_INITIAL_SIZE 1024*1024
-
 // uncomment to track the number of each kind of object in an .olean file
 // #define LEAN_TAG_COUNTERS
 
@@ -63,8 +60,8 @@ struct max_sharing_eq {
 
 struct object_compactor::max_sharing_table {
     lean::unordered_set<max_sharing_key, max_sharing_hash, max_sharing_eq> m_table;
-    max_sharing_table(object_compactor * manager):
-        m_table(LEAN_MAX_SHARING_TABLE_INITIAL_SIZE, max_sharing_hash(manager), max_sharing_eq(manager)) {
+    max_sharing_table(object_compactor * manager, size_t initial_buckets):
+        m_table(initial_buckets, max_sharing_hash(manager), max_sharing_eq(manager)) {
     }
 };
 
@@ -135,15 +132,15 @@ std::vector<lib_info> object_compactor::used_libs() const {
 }
 
 object_compactor::object_compactor(void * base_addr, std::vector<region_view> dep_regions,
-                                   bool allow_closures):
-    m_max_sharing_table(new max_sharing_table(this)),
+                                   bool allow_closures, size_t initial_size, size_t initial_buckets):
+    m_max_sharing_table(new max_sharing_table(this, initial_buckets)),
     m_dep_regions(std::move(dep_regions)),
     m_libs(get_loaded_libs()),
     m_allow_closures(allow_closures),
     m_base_addr(base_addr),
-    m_begin(malloc(LEAN_COMPACTOR_INIT_SZ)),
+    m_begin(malloc(initial_size)),
     m_end(m_begin),
-    m_capacity(static_cast<char*>(m_begin) + LEAN_COMPACTOR_INIT_SZ) {
+    m_capacity(static_cast<char*>(m_begin) + initial_size) {
     // Sort dep regions by `begin` address for binary search in `to_offset`.
     std::sort(m_dep_regions.begin(), m_dep_regions.end(),
               [](region_view const & a, region_view const & b) { return a.begin < b.begin; });

@@ -110,7 +110,7 @@ def runMetaMInScope (env : Environment) (mctx : MetavarContext) (lctx : LocalCon
     (withOptions (fun _ => opts) core).toIO
       { currNamespace := namingCtx.currNamespace, openDecls := namingCtx.openDecls
         fileName := cmdCtx.fileName, fileMap := cmdCtx.fileMap
-        cancelTk? := cmdCtx.cancelTk? }
+        cancelTk? := cmdCtx.cancelTk?, cmdIdx? := cmdCtx.cmdIdx? }
       { env, ngen := {} }
   modify fun s => { s with
     messages := s.messages ++ newCoreState.messages

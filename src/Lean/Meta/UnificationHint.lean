@@ -117,6 +117,7 @@ def tryUnificationHints (t s : Expr) : MetaM Bool := do
   -- Inside a compile, the hints that apply are recorded (`recordHintsIfCompiling`).
   unless candidates.isEmpty do recordHintsIfCompiling (← getOptionsUnrestricted) candidates
   for candidate in candidates do
+    recordUsedByCommand candidate
     if (← tryCandidate candidate) then
       return true
   return false

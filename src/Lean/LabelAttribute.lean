@@ -57,6 +57,7 @@ registerBuiltinAttribute {
   name  := attrName
   descr := attrDescr
   applicationTime := AttributeApplicationTime.afterCompilation
+  onlyCoreCode := true
   add   := fun declName _ kind =>
     ext.add declName kind
   erase := fun declName => do

@@ -13,8 +13,9 @@ namespace Lean
 
 /-!
 Process state the usage data reads (`runFrontend`, `ModuleUsage.writeUsage`). The references are private, and the
-public functions only switch recording on, add to what is recorded, or read it, so code that a module runs while
-it is elaborated cannot clear or switch off what its usage data will say.
+public functions only switch recording on, add to what is recorded, read it, or start a run (`startFrontendRun`), so
+code that a module runs while it is elaborated cannot clear or switch off what its usage data will say unnoticed: a
+run that finds another run started after it (`lastFrontendRun`) does not take the logs as its own.
 -/
 
 /-- Whether this process records usage: switched on by `runFrontend` when it will write an `.olean` and its
@@ -164,21 +165,116 @@ private def declConstVals : Declaration → Option (Array (Name × Expr × Optio
   | _ => none
 
 /-- When recording is on, records the constants of `decl` as used and, per constant it adds as given, its
-`DeclConsts`, computed here from `decl` itself. -/
-def recordDeclConsts (decl : Declaration) : BaseIO Unit := do
-  unless (← usageRecordingRef.get) do return
+`DeclConsts`, computed here from `decl` itself; returns the constants, `none` when recording is off. -/
+def recordDeclConsts (decl : Declaration) : BaseIO (Option NameSet) := do
+  unless (← usageRecordingRef.get) do return none
   let some vals := declConstVals decl | do
     let used := decl.foldExprM (m := Id) (fun s e => e.foldConsts s fun c s => s.insert c) ({} : NameSet)
     usedByChecksRef.modify fun acc => used.foldl (·.insert ·) acc
+    return some used
   -- one walk of type and value, so that a subterm they share is visited once
   let recs := vals.map fun (n, type, value?) =>
     let consts := (value?.elim type (.app type ·)).foldConsts ({} : NameSet) fun c s => s.insert c
     (n, ({ type, value?, consts } : DeclConsts))
-  usedByChecksRef.modify fun acc => recs.foldl (fun acc (_, r) => r.consts.foldl (·.insert ·) acc) acc
+  let used := recs.foldl (fun acc (_, r) => r.consts.foldl (·.insert ·) acc) ({} : NameSet)
+  usedByChecksRef.modify fun acc => used.foldl (·.insert ·) acc
   declConstsRef.modify fun m => recs.foldl (fun m (n, r) => m.insert n r) m
+  return some used
 
 /-- The `DeclConsts` recorded so far. -/
 def recordedDeclConsts : BaseIO (NameMap DeclConsts) :=
   declConstsRef.get
+
+/-- The number of `runFrontend` runs started in this process (`startFrontendRun`). -/
+private builtin_initialize frontendRunsRef : IO.Ref Nat ← IO.mkRef 0
+/-- The index of the command whose elaboration the frontend is currently running. Async elaboration outlives it:
+recorders read `MonadCommandIdx.getCommandIdx?` first and this ref only outside any command context. -/
+private builtin_initialize currentCommandRef : IO.Ref Nat ← IO.mkRef 0
+/-
+The per-command logs below are lists, newest first, read once in recording order (`List.toArray.reverse`): a global
+ref's value is multi-threaded and so never exclusive, and `Array.push` on it would copy the whole log at every record.
+-/
+/-- The declarations and dependencies submitted to `addDecl`, grouped by top-level command. -/
+private builtin_initialize declsByCommandRef : IO.Ref (List (Nat × Array Name × NameSet)) ← IO.mkRef []
+/-- Constants whose values were consulted without leaving a reference in the elaborated term. -/
+private builtin_initialize usedByCommandRef : IO.Ref (List (Nat × Name)) ← IO.mkRef []
+/-- The attributes whose handlers, which may run code outside core Lean (`AttributeImplCore.onlyCoreCode`), a top-level
+command ran. Such a handler may write state no command payload carries. -/
+private builtin_initialize foreignAttributesByCommandRef : IO.Ref (List (Nat × Name)) ← IO.mkRef []
+/-- The actions that clear the per-run logs of other modules (`registerRunLog`). -/
+private builtin_initialize runLogClearsRef : IO.Ref (Array (BaseIO Unit)) ← IO.mkRef #[]
+
+/-- Registers `clear`, which empties a per-run log another module keeps, for `startFrontendRun`. Only during
+initialization. -/
+def registerRunLog (clear : BaseIO Unit) : IO Unit := do
+  unless (← IO.initializing) do
+    throw (IO.userError "failed to register a per-run usage log, logs can only be registered during initialization")
+  runLogClearsRef.modify (·.push clear)
+
+/--
+Starts a `runFrontend` run and returns its number, which no earlier run got. With `record`, switches recording on
+(`enableUsageRecording`) and clears the per-run logs: the names `addDecl` and `recordUsedName` recorded, the
+per-command logs, and the logs other modules registered (`registerRunLog`). The names the resolver looked up
+(`resolvedNames`) are kept for the whole process. The logs are global, so a frontend that runs in-process during a run
+(an `#eval` calling `runFrontend`) clears or extends them; the run detects it by `lastFrontendRun` at its end.
+-/
+def startFrontendRun (record : Bool) : BaseIO Nat := do
+  let run ← frontendRunsRef.modifyGet fun n => (n + 1, n + 1)
+  if record then
+    enableUsageRecording
+    usedByChecksRef.set {}
+    currentCommandRef.set 0
+    declsByCommandRef.set []
+    usedByCommandRef.set []
+    foreignAttributesByCommandRef.set []
+    for clear in ← runLogClearsRef.get do clear
+  return run
+
+/-- The number of the last run started (`startFrontendRun`). -/
+def lastFrontendRun : BaseIO Nat :=
+  frontendRunsRef.get
+
+/-- Sets the command whose elaboration the frontend runs, for records made outside any command context. -/
+def setCurrentCommand (i : Nat) : BaseIO Unit := do
+  if (← usageRecordingRef.get) then currentCommandRef.set i
+
+/-- Monads that know the top-level command whose elaboration they run (`Core.Context.cmdIdx?`). -/
+class MonadCommandIdx (m : Type → Type) where
+  getCommandIdx? : m (Option Nat)
+
+instance (m n) [MonadLift m n] [MonadCommandIdx m] : MonadCommandIdx n where
+  getCommandIdx? := liftM (MonadCommandIdx.getCommandIdx? : m _)
+
+/-- The command a recorded use belongs to. -/
+def commandIdx [Monad m] [MonadLiftT IO m] [MonadCommandIdx m] : m Nat := do
+  match ← MonadCommandIdx.getCommandIdx? with
+  | some i => return i
+  | none => (currentCommandRef.get : IO Nat)
+
+/-- Records, when recording is on, that command `i` submitted the declarations `names` to `addDecl`, with the
+constants `used` of their types and values. -/
+def recordCommandDecls (i : Nat) (names : Array Name) (used : NameSet) : BaseIO Unit := do
+  if (← usageRecordingRef.get) then declsByCommandRef.modify ((i, names, used) :: ·)
+
+/-- Records, when recording is on, that command `i` consulted the value of `n` without leaving a reference to it. -/
+def recordUsedByCommandIdx (i : Nat) (n : Name) : BaseIO Unit := do
+  if (← usageRecordingRef.get) then usedByCommandRef.modify ((i, n) :: ·)
+
+/-- Records, when recording is on, that command `i` ran a handler of the attribute `attr` that may run code outside
+core Lean. -/
+def recordForeignAttributeIdx (i : Nat) (attr : Name) : BaseIO Unit := do
+  if (← usageRecordingRef.get) then foreignAttributesByCommandRef.modify ((i, attr) :: ·)
+
+/-- The records of `recordCommandDecls`, newest first. -/
+def declsByCommand : BaseIO (List (Nat × Array Name × NameSet)) :=
+  declsByCommandRef.get
+
+/-- The records of `recordUsedByCommandIdx`, newest first. -/
+def usedByCommand : BaseIO (List (Nat × Name)) :=
+  usedByCommandRef.get
+
+/-- The records of `recordForeignAttributeIdx`, newest first. -/
+def foreignAttributesByCommand : BaseIO (List (Nat × Name)) :=
+  foreignAttributesByCommandRef.get
 
 end Lean
