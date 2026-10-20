@@ -1,0 +1,9 @@
+noskip (some true), reason (some (declaration command 0: a change to logExt that no entry expresses))
+0: refused for #[logExt, logExt], entries #[]; refused
+1: refused for #[logExt, logExt], entries #[]; refused
+2: refused for #[logExt, logExt], entries #[]; refused
+3: refused for #[myParamExt, myParamExt], entries #[]; refused
+4: refused for #[scopeExt, scopeExt], entries #[]; refused
+5: refused for #[], entries #[Lean.Meta.Simp.simprocDeclExt.main]; replay matches [modifySide, setSide, onlySide, paramSide, scopeSide]
+6: refused for #[], entries #[]; replay matches [modifySide, setSide, onlySide, paramSide, scopeSide]
+7: refused for #[], entries #[]; replay matches [modifySide, setSide, onlySide, paramSide, scopeSide]

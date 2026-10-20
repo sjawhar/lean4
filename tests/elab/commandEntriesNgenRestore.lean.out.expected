@@ -1,0 +1,4 @@
+full run: [generated3, pm, generated7]; command 1 refusals #[]
+generator as before command 1: restored post.ngen true, constants [generated3, pm, generated7], pm value as in the full run true, errors []
+generator already ahead of post.ngen: the name generator before the kept command is (prefix _uniq, idx 107), not the one recorded before it (prefix _uniq, idx 3)
+N, command 2 sets the generator back: refusals #[], generator after it below the one before it true; command 3: full run [generated14], after keeping command 2 [generated14]

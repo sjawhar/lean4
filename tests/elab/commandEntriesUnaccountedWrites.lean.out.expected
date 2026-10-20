@@ -1,0 +1,12 @@
+noskip (some true), reason (some (declaration command 0: a change to mainLog that no entry expresses))
+0: refused for #[mainLog, mainLog], entries #[]; refused
+1: refused for #[myParamExt, myParamExt], entries #[]; refused
+2: refused for #[scopeExt, scopeExt], entries #[]; refused
+3: refused for #[mainLog, mainLog], entries #[]; refused
+4: refused for #[syncLog, syncLog], entries #[]; refused
+5: refused for #[syncLog, syncLog], entries #[]; refused
+6: refused for #[], entries #[asyncLog.main]; replay matches
+7: refused for #[asyncLog, asyncLog], entries #[]; refused
+8: refused for #[], entries #[asyncLog.checked, asyncLog.main]; replay matches
+9: refused for #[], entries #[branchLog.checked]; replay matches
+10: refused for #[], entries #[]; replay matches

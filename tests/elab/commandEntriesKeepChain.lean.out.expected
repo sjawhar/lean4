@@ -1,0 +1,136 @@
+chain: 19 commands, 17 kept, refused #[12, 14], 0 differences
+  command 12 refused: #[a change to the command state's scopes]
+  command 14 refused: #[a change to the command state's scopes]
+R4: 3 commands, 3 kept, refused #[], 0 differences
+R6: 3 commands, 3 kept, refused #[], 0 differences
+R7: 6 commands, 6 kept, refused #[], 0 differences
+secondRealizer: 5 commands, 5 kept, refused #[], 0 differences
+options: 5 commands, 5 kept, refused #[], 0 differences
+h2: 5 commands, 5 kept, refused #[], 0 differences
+header: 4 commands, 4 kept, refused #[], 0 differences
+kernel: 3 commands, 3 kept, refused #[], 0 differences
+nestedHelper: 3 commands, 3 kept, refused #[], 0 differences
+wfHelper: 2 commands, 2 kept, refused #[], 0 differences
+docHelper: 2 commands, 2 kept, refused #[], 0 differences
+tree: 3 commands, 3 kept, refused #[], 0 differences
+rose: 3 commands, 3 kept, refused #[], 0 differences
+matcher: 3 commands, 3 kept, refused #[], 0 differences
+inheritDoc: 3 commands, 3 kept, refused #[], 0 differences
+plain: [a]; sync: [b]; tagged: []
+bogus : False
+plain: [a]; sync: [b]; tagged: [c]
+plainUnchecked: 10 commands, 6 kept, refused #[0, 1, 4, 7], 0 differences
+  command 0 refused: #[a write to a non-persistent extension]
+  command 1 refused: #[a write to a non-persistent extension]
+  command 4 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give]
+  command 7 refused: #[the attribute ref_tag, whose handlers may run code outside core Lean]
+uncheckedOption: 3 commands, 2 kept, refused #[0], 0 differences
+  command 0 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give]
+ax1 : @Prop Prop
+op1 : Nat
+ax2.{u} : Sort v
+axiomFallback: 8 commands, 4 kept, refused #[0, 1, 3, 5], 0 differences
+  command 0 refused: #[a change to the command state's scopes]
+  command 1 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give]
+  command 3 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give]
+  command 5 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give]
+Bad : sorry
+syncFallback: 5 commands, 4 kept, refused #[0], 0 differences
+  command 0 refused: #[a change to the command state's scopes]
+ghost : True
+elabOnly: 5 commands, 3 kept, refused #[0, 1], 0 differences
+  command 0 refused: #[a change to the command state's scopes]
+  command 1 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give]
+ghost : True
+droppedCommit: 5 commands, 3 kept, refused #[0, 1], 0 differences
+  command 0 refused: #[a change to the command state's scopes]
+  command 1 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give]
+kernelOnly: 4 commands, 2 kept, refused #[0, 1], 0 differences
+  command 0 refused: #[a change to the command state's scopes]
+  command 1 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give]
+scopedCore: 16 commands, 13 kept, refused #[0, 2, 5], 0 differences
+  command 0 refused: #[a change to the command state's scopes]
+  command 2 refused: #[a change to the command state's scopes]
+  command 5 refused: #[a change to the command state's scopes]
+M.lean:5:0: warning: Definition `g` is a proposition; use `theorem` instead of `def`
+
+Note: This linter can be disabled with `set_option linter.defProp false`
+mainMerge: 6 commands, 6 kept, refused #[], 0 differences
+realizationRejected: 5 commands, 3 kept, refused #[0, 2], 0 differences
+  command 0 refused: #[a change to the command state's scopes]
+  command 2 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give]
+coreHelperAttrs: 5 commands, 5 kept, refused #[], 0 differences
+branchStates: 15 commands, 6 kept, refused #[1, 3, 4, 6, 8, 9, 10, 11, 12], 0 differences
+  command 1 refused: #[a change to the command state's scopes]
+  command 3 refused: #[the attribute scope_attr, whose handlers may run code outside core Lean]
+  command 4 refused: #[a change to the command state's scopes]
+  command 6 refused: #[the attribute log_main, whose handlers may run code outside core Lean]
+  command 8 refused: #[the attribute scope_attr, whose handlers may run code outside core Lean]
+  command 9 refused: #[the attribute scope_attr, whose handlers may run code outside core Lean]
+  command 10 refused: #[the attribute scope_attr, whose handlers may run code outside core Lean]
+  command 11 refused: #[a change to scopeExt that no entry expresses in the record of t5]
+  command 12 refused: #[a change to scopeExt that no entry expresses]
+M.lean:871:10: warning: Variable name `x` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _x
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+M.lean:893:10: warning: Variable name `x` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _x
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+doLogicTests: 150 commands, 107 kept, refused #[0, 1, 2, 3, 4, 15, 16, 17, 18, 29, 36, 37, 40, 41, 48, 49, 50, 51, 71, 72, 73, 76, 77, 78, 83, 84, 99, 100, 101, 102, 105, 106, 109, 110, 116, 120, 121, 128, 133, 139, 140, 147, 148], 0 differences
+  command 0 refused: #[a change to the command state's scopes]
+  command 1 refused: #[a change to the command state's scopes]
+  command 2 refused: #[a change to the command state's scopes]
+  command 3 refused: #[a change to the command state's scopes]
+  command 4 refused: #[a change to the command state's scopes]
+  command 15 refused: #[a change to the command state's scopes]
+  command 16 refused: #[a change to the command state's scopes]
+  command 17 refused: #[a change to the command state's scopes]
+  command 18 refused: #[a change to the command state's scopes]
+  command 29 refused: #[a change to the command state's scopes]
+  command 36 refused: #[a change to the command state's scopes]
+  command 37 refused: #[a change to the command state's scopes]
+  command 40 refused: #[a change to the command state's scopes]
+  command 41 refused: #[a change to the command state's scopes]
+  command 48 refused: #[a change to the command state's scopes]
+  command 49 refused: #[a change to the command state's scopes]
+  command 50 refused: #[a change to the command state's scopes]
+  command 51 refused: #[a change to the command state's scopes]
+  command 71 refused: #[a change to the command state's scopes]
+  command 72 refused: #[a change to the command state's scopes]
+  command 73 refused: #[a change to the command state's scopes]
+  command 76 refused: #[a change to the command state's scopes]
+  command 77 refused: #[a change to the command state's scopes]
+  command 78 refused: #[a change to the command state's scopes]
+  command 83 refused: #[a change to the command state's scopes]
+  command 84 refused: #[a change to the command state's scopes]
+  command 99 refused: #[a change to the command state's scopes]
+  command 100 refused: #[a change to the command state's scopes]
+  command 101 refused: #[a change to the command state's scopes]
+  command 102 refused: #[a change to the command state's scopes]
+  command 105 refused: #[a change to the command state's scopes]
+  command 106 refused: #[a change to the command state's scopes]
+  command 109 refused: #[a change to the command state's scopes]
+  command 110 refused: #[a change to the command state's scopes]
+  command 116 refused: #[a change to the command state's scopes]
+  command 120 refused: #[a change to the command state's scopes]
+  command 121 refused: #[a change to the command state's scopes]
+  command 128 refused: #[a change to the command state's scopes]
+  command 133 refused: #[a change to the command state's scopes]
+  command 139 refused: #[a change to the command state's scopes]
+  command 140 refused: #[a change to the command state's scopes]
+  command 147 refused: #[a change to the command state's scopes]
+  command 148 refused: #[a change to the command state's scopes]
+issue11211: 17 commands, 16 kept, refused #[1], 0 differences
+  command 1 refused: #[a change to the command state's scopes]
+chain with every realization record tampered: records in commands #[1, 4, 7, 10], keeps threw at #[1, 4, 7, 8, 10]
+secondRealizer with every realization record tampered: records in commands #[1], keeps threw at #[1]
+R7 with every realization record tampered: records in commands #[1, 3], keeps threw at #[1, 3]
+doc with command 0's docstring replaced: kept 3, docstrings differ at command 0: true
+corrupted theorem: threw, with the kernel's message: true
+corrupted definition: threw, with the kernel's message: true

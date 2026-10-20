@@ -1,0 +1,15 @@
+log: new prefix entries [b, c]
+log: unchanged, same state entries []
+log: unchanged, state changed stateOnly
+log: old log not a tail stateOnly
+key log: key overwritten entries [(f, h)]
+key log: map changed without a new key stateOnly
+key log: not a tail stateOnly
+key log: logged key missing from the map stateOnly
+NameMap: changed value entries [(x, 3)], removal stateOnly
+NameSet: addition entries [z], removal stateOnly
+PHashMap: changed value entries [x=3], removal stateOnly
+simprocDeclExt: builtin changed stateOnly
+cbvSimprocDeclExt: builtin changed stateOnly
+namespaces: added entries 1, non-public value stateOnly, imported part changed stateOnly, still in stage 1 stateOnly
+addedSince: tail [c, b], not a tail [c, b] (newPrefix? false)
