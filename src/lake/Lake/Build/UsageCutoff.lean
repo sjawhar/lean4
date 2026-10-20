@@ -215,22 +215,33 @@ def readOwnUsage (path : FilePath) (expected? : Option ModuleUsage.Digest := non
 /--
 The hashes of the files one usage-cutoff check (`Module.usageUpToDate`, `Module.writeUsekey`) has
 read, so that it reads each file once, and every `importUsage?` binding of the check is to the same bytes. A check
-never reuses another's: another workspace's build can rebuild a shared dependency between two checks, and nothing
-about a file short of its bytes shows that they did not change since (e.g., a write through a shared mapping can
-leave its status-change time as it was).
+never reuses another's: another workspace's build can rebuild a shared dependency between two checks. Across checks,
+a file's hash is reused only while its stamp shows its bytes unchanged (`BuildContext.fileDigests`).
 -/
 public abbrev ContentHashes := IO.Ref (Std.HashMap FilePath ModuleUsage.Digest)
 
 /--
 The hash of `file`'s current bytes (`Lean.ModuleUsage.fileDigest`, 128 bits), never read from a
 `.hash` file: an `.olean` rewritten behind Lake's back (e.g., by `lean -o`) keeps its old `.hash`,
-and a usage-cutoff decision must see the new bytes. Read at most once per check (`hashes`).
+and a usage-cutoff decision must see the new bytes. Read at most once per check (`hashes`), and taken from an
+earlier check of the build only if the file's stamp (`Lean.ModuleUsage.fileStamp`) is the one recorded when those
+bytes were read (`BuildContext.fileDigests`).
 -/
 def contentHash (hashes : ContentHashes) (file : FilePath) : JobM ModuleUsage.Digest := do
   if let some hash := (← hashes.get)[file]? then return hash
-  let hash ← ModuleUsage.fileDigest file
+  let hash ← stampedDigest
   hashes.modify (·.insert file hash)
   return hash
+where
+  stampedDigest : JobM ModuleUsage.Digest := do
+    let memo := (← getBuildContext).fileDigests
+    if let some stamp ← ModuleUsage.fileStamp file then
+      if let some (recorded, hash) ← memo.atomically (return (← get)[file]?) then
+        if recorded == stamp then return hash
+    let (hash, stamp?) ← ModuleUsage.fileDigestStamped file
+    if let some stamp := stamp? then
+      memo.atomically (modify (·.insert file (stamp, hash)))
+    return hash
 
 /--
 A hash of every artifact of every module-system module in an import closure, with its name.
