@@ -650,8 +650,9 @@ private def readdPlain (infos : NameMap ConstantInfo) (limits : ReaddLimits) (en
   (and otherwise the kernel environment must hold it already), the recorded states replayed into the branch's
   main-branch view, `commitConst` and `commitCheckEnv`;
 - `realization`: `Environment.readdRealizeConst` in the context `env` holds for `forConst`, whose `build` first merges
-  the cached results of the realizations it merged (`merges`, cached by their own records or an earlier command's
-  keep; a missing one is an error), as the full run's realization did, then adds its constants without a check (the
+  the cached results of the realizations it merged (`merges`, cached by their own records, an earlier command's keep
+  or an earlier command's elaboration; a missing one is an error), as the full run's realization did, then adds its
+  constants without a check (the
   merge's kernel check checks them) and replays the states (when the context's cache already holds the key, `build`
   does not run and the cached result is merged);
 - `merged`: the same, with the context's cache holding the key (an earlier command's keep put it there): the cached
@@ -680,6 +681,7 @@ private partial def readdAdded (regs : Registries) (infos : NameMap ConstantInfo
   | .realization forConst key consts states merges => do
     unless env.areRealizationsEnabledForConst forConst do
       throw <| IO.userError s!"reuse: no realization context for {forConst}, which {key}'s realization ran in"
+    unless merges.isEmpty do discard <| IO.wait env.checked
     let infos' ← consts.mapM (infoOf infos)
     let (env, ex) ← env.readdRealizeConst forConst key fun realizeEnv realizeOpts => do
       let mut realizeEnv := realizeEnv
@@ -699,6 +701,7 @@ private partial def readdAdded (regs : Registries) (infos : NameMap ConstantInfo
         {← (ex.toMessageData {}).toString}"
     return env
   | .merged forConst key _ => do
+    discard <| IO.wait env.checked
     let (env, ex) ← env.readdRealizeConst forConst key fun _ _ =>
       throw <| IO.userError s!"reuse: the realization {key} for {forConst} that the command merged is not cached"
     if let some ex := ex.get then
@@ -717,6 +720,11 @@ rebuilt from its record at its position. `infos` are the command's constants (it
 realized constants, from the previous `.olean`). The kernel checks every constant with `limits` (realized constants
 with none, as in a full run), and a rejection is a hard error carrying the kernel's message; so is a constant of
 `infos` the records do not re-add. Run `replayCommandEntries` (step 3) after.
+
+A `merged` record, and a `realization` record's `merges`, look up realizations that are cached already. An earlier
+command elaborated instead of kept may make them in its asynchronous branches, after this keep starts: each such lookup
+first waits for the kernel environment of the environment it is made in (`IO.wait env.checked`), to which those
+branches commit only after their realizations are cached.
 -/
 def readdCommandConstants (env : Environment) (ce : CommandEntries) (infos : NameMap ConstantInfo)
     (opts : Options) (limits : ReaddLimits := {}) : IO Environment := do
