@@ -42,6 +42,14 @@ def initializing : BaseIO Bool :=
   IO.initializing <||> importingRef.get
 
 /--
+Seals the core attributes (`Lean.sealCoreAttributesImpl`), once: the attributes and attribute builders registered so
+far are core Lean's. Called before code from outside the toolchain can register one: before modules are imported
+(`withImporting`) and before a plugin is loaded (`loadPlugin`).
+-/
+@[extern "lean_seal_core_attributes"]
+opaque sealCoreAttributes : IO Unit
+
+/--
 Execute `x` with "importing" flag turned on.
 When the "importing" flag is set to true, we allow user-extensions defined with
 the `initialize` command to update global references.
@@ -53,6 +61,7 @@ one execution thread accessing the global references.
 -/
 def withImporting (x : IO α) : IO α :=
   try
+    sealCoreAttributes
     importingRef.set true
     x
   finally

@@ -29,11 +29,6 @@ structure AttributeImplCore where
   name : Name
   descr : String
   applicationTime := AttributeApplicationTime.afterTypeChecking
-  /-- Whether `add` and `erase` run core Lean's code only, whichever module registers the attribute (as for the
-  attributes `registerSimpAttr` and `registerLabelAttr` make). The handlers of an attribute registered while a module is
-  imported (`initialize`) that does not set it may run that module's code, which may write state no command payload
-  carries: a command that runs them is not kept (`foreignAttributesByCommandRef`). -/
-  onlyCoreCode : Bool := false
   deriving Inhabited
 
 /-- You can tag attributes with the 'local' or 'scoped' kind.
@@ -71,21 +66,47 @@ structure AttributeImpl extends AttributeImplCore where
 
 builtin_initialize attributeMapRef : IO.Ref (Std.HashMap Name AttributeImpl) ← IO.mkRef {}
 
-/-- `attr` with `add` and `erase` recording that the running command ran them (`recordForeignAttribute`). -/
-private def recordingForeignRuns (attr : AttributeImpl) : AttributeImpl :=
+/--
+The attribute implementations whose handlers run core Lean's code only, by address, each kept alive so that its address
+is not reused: every attribute registered when the core attributes were sealed (`sealCoreAttributes`), every attribute
+a builder registered by then builds, and every attribute core's helpers register (`registerCoreAttribute`). Any other
+attribute's handlers may run code outside core Lean, which may write state no command payload carries: a command that
+runs them is not kept (`recordForeignAttribute`). Private, so that no other code adds to it.
+-/
+private builtin_initialize coreAttributesRef : IO.Ref (Std.HashMap USize AttributeImpl) ← IO.mkRef {}
+
+private unsafe def markCoreAttribute (attr : AttributeImpl) : BaseIO Unit :=
+  coreAttributesRef.modify (·.insert (ptrAddrUnsafe attr) attr)
+
+private unsafe def isCoreAttributeImpl (attr : AttributeImpl) : Bool :=
+  unsafeBaseIO do return (← coreAttributesRef.get).contains (ptrAddrUnsafe attr)
+
+/-- Whether `attr` runs core Lean's code only (`coreAttributesRef`). -/
+@[implemented_by isCoreAttributeImpl]
+private opaque isCoreAttribute (attr : AttributeImpl) : Bool
+
+/-- `attr` as code reads it to apply it: as registered if it runs core Lean's code only (`coreAttributesRef`), and
+otherwise with `add` and `erase` recording that the running command ran them (`recordForeignAttribute`). -/
+private def provenAttribute (attr : AttributeImpl) : AttributeImpl :=
+  if isCoreAttribute attr then attr else
   { attr with
     add := fun decl stx kind => do recordForeignAttribute attr.name; attr.add decl stx kind
     erase := fun decl => do recordForeignAttribute attr.name; attr.erase decl }
 
-/-- Low level attribute registration function. An attribute registered after the builtin initializers (by a module's
-`initialize`) records its handlers' runs unless it runs core code only (`onlyCoreCode`). -/
+/-- Low level attribute registration function. -/
 def registerBuiltinAttribute (attr : AttributeImpl) : IO Unit := do
   let m ← attributeMapRef.get
   if m.contains attr.name then throw (IO.userError s!"Invalid builtin attribute declaration: `{attr.name}` has already been used")
   unless (← initializing) do
     throw (IO.userError "Failed to register attribute: Attributes can only be registered during initialization")
-  let attr := if (← IO.initializing) || attr.onlyCoreCode then attr else recordingForeignRuns attr
   attributeMapRef.modify fun m => m.insert attr.name attr
+
+/-- Registers `attr`, whose handlers run core Lean's code only, as the attributes core's helpers make
+(`registerLabelAttr`, `mkSimpAttr`, simproc attributes) whichever module calls them. Private: reached through
+`import all` by those helpers only. -/
+private def registerCoreAttribute (attr : AttributeImpl) : IO Unit := do
+  registerBuiltinAttribute attr
+  unsafe markCoreAttribute attr
 
 /-!
   Helper methods for decoding the parameters of builtin attributes that are defined before `Lean.Parser`.
@@ -453,27 +474,41 @@ abbrev AttributeImplBuilderTable := Std.HashMap Name AttributeImplBuilder
 
 builtin_initialize attributeImplBuilderTableRef : IO.Ref AttributeImplBuilderTable ← IO.mkRef {}
 
-/-- Registers an attribute implementation builder. The attributes a builder registered after the builtin initializers
-(by a module's `initialize`) builds record their handlers' runs unless they run core code only (`onlyCoreCode`). -/
 def registerAttributeImplBuilder (builderId : Name) (builder : AttributeImplBuilder) : IO Unit := do
   let table ← attributeImplBuilderTableRef.get
   if table.contains builderId then throw (IO.userError s!"Attribute implementation builder `{builderId}` has already been declared")
-  let builder : AttributeImplBuilder ← if (← IO.initializing) then pure builder else
-    pure fun ref args => do
-      let attr ← builder ref args
-      return if attr.onlyCoreCode then attr else recordingForeignRuns attr
   attributeImplBuilderTableRef.modify fun table => table.insert builderId builder
+
+/-- The attribute builders registered when the core attributes were sealed, by id and address; `none` before. -/
+private builtin_initialize coreBuildersRef : IO.Ref (Option (Std.HashMap Name USize)) ← IO.mkRef none
+
+/-- `sealCoreAttributes`: once, marks the attributes registered so far as core's (`coreAttributesRef`) and records the
+builders registered so far as core's (`coreBuildersRef`). -/
+@[export lean_seal_core_attributes]
+private unsafe def sealCoreAttributesImpl : IO Unit := do
+  if (← coreBuildersRef.get).isSome then return
+  for (_, attr) in ← attributeMapRef.get do markCoreAttribute attr
+  coreBuildersRef.set <| some <|
+    (← attributeImplBuilderTableRef.get).fold (init := {}) fun m n b => m.insert n (ptrAddrUnsafe b)
+
+/-- Whether `builder` is the builder registered as `builderId` when the core attributes were sealed. -/
+private unsafe def isCoreBuilder (builderId : Name) (builder : AttributeImplBuilder) : BaseIO Bool := do
+  return (← coreBuildersRef.get).any (·[builderId]? == some (ptrAddrUnsafe builder))
 
 structure AttributeExtensionOLeanEntry where
   builderId : Name
   ref : Name
   args : List DataValue
 
+/-- The attribute the builder `e.builderId` builds from `e`; one a core builder builds runs core Lean's code only. -/
 def mkAttributeImplOfEntry (e : AttributeExtensionOLeanEntry) : IO AttributeImpl := do
   let table ← attributeImplBuilderTableRef.get
   match table[e.builderId]? with
   | none         => throw (IO.userError s!"Unknown attribute implementation builder `{e.builderId}`")
-  | some builder => IO.ofExcept <| builder e.ref e.args
+  | some builder =>
+    let attr ← IO.ofExcept <| builder e.ref e.args
+    if ← unsafe isCoreBuilder e.builderId builder then unsafe markCoreAttribute attr
+    return attr
 
 structure AttributeExtensionState where
   newEntries : List AttributeExtensionOLeanEntry := []
@@ -534,7 +569,7 @@ def getBuiltinAttributeNames : IO (List Name) :=
 def getBuiltinAttributeImpl (attrName : Name) : IO AttributeImpl := do
   let m ← attributeMapRef.get
   match m[attrName]? with
-  | some attr => pure attr
+  | some attr => pure (provenAttribute attr)
   | none      => throw (IO.userError s!"Unknown attribute `{attrName}`")
 
 def isAttribute (env : Environment) (attrName : Name) : Bool :=
@@ -547,7 +582,7 @@ def getAttributeNames (env : Environment) : List Name :=
 def getAttributeImpl (env : Environment) (attrName : Name) : Except String AttributeImpl :=
   let m := (attributeExtension.getState env).map
   match m[attrName]? with
-  | some attr => pure attr
+  | some attr => pure (provenAttribute attr)
   | none      => throw s!"Unknown attribute `{attrName}`"
 
 def registerAttributeOfBuilder (env : Environment) (builderId ref : Name) (args : List DataValue) : IO Environment := do
