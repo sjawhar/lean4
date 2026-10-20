@@ -39,8 +39,8 @@ entries (IR, LCNF base and mono code, impure signatures, spec info, dead-branch 
 representation caches: trivial-structure info, impure type, mono type, constructor layout) are `R1`: their
 entries for the module's own names are read by `ModuleUsage.entriesEnc`, so any writer, inside or outside the
 compiler, is covered by the declaration's digest (`ownDeclDigest`); importers resolve a name's compiled entries
-through its defining module, so an entry written for another module's name is not read, except IR names a module
-claims, which `tableDigest` covers. The specialization cache (`specCache`) is covered per key: the module
+through its defining module (`getModuleIdxFor?`), whose choice every compile records per name it resolves
+(`noteResolved`), and Lake rebuilds a module when a closure module changes what such a name resolves to. The specialization cache (`specCache`) is covered per key: the module
 records the keys it looked up and exports the keys it created, and Lake rebuilds it when the providers of a
 looked-up key in its closure change; only keys and specialization names are compared. In the pass manager and
 folder tables (`R5`), entries are in `tableDigest` with the installer's or folder's digest, state written
@@ -151,9 +151,9 @@ def classification : List (Name × UsageClass × String) := [
   (`Lean.exportAttr, .R1, "Own-declaration marker, in `attrsEnc`. The `export` handler rejects imported declarations (src/Lean/Attributes.lean:295-296), as does `ParametricAttribute.setParam` (:329-330); it has no other writer. `getParam?` of an imported name reads only its own module's entries (:313-318)."),
   (`Lean.IR.declMapExt, .R1,
     "Own-declaration IR code, read by `entriesEnc` for each own name, whoever wrote it. Importers resolve a \
-    name's IR through its defining module (`findExtEntry?` by module index), so an entry written for another \
-    module's name is not read, except a name the module claims (`extraConstNames`) that its own compile did not \
-    create (`compileCreatedNames`), whose list the module's `.olean` carries for `tableDigest` (`foreignClaims`)."),
+    name's IR through the module `getModuleIdxFor?` picks among the modules that list it (`findExtEntry?`), and \
+    record each name they resolve with the module and kinds it resolved to (`noteResolved`, `resolvedGroups`); \
+    Lake rebuilds them when a closure module whose provides changed gains, loses or changes such a name."),
   (Lean.mkPrivateNameCore `Lean.Compiler.LCNF.ToImpureType `Lean.Compiler.LCNF.impureTypeExt, .R1,
     "IR type of an inductive, written by `setImpureType` from `compileInductives` \
     (src/Lean/Compiler/LCNF/ToImpureType.lean). Not a function of the kernel data alone: \
@@ -419,7 +419,7 @@ def writers : List (Name × List (Name × Mechanism × String)) := [
     (`Lean.registerParametricAttribute, .ownDeclDigest, parametricAttrReason)]),
   (`Lean.IR.declMapExt, [
     (`Lean.IR.addDecl, .ownDeclDigest,
-      "Public (src/Lean/Compiler/IR/CompilerM.lean:197-198); an IR declaration of an own name is in `entriesEnc`, whoever added it. A declaration added for another module's name is not read by importers, which resolve a name's IR through its defining module (`findExtEntry?` by module index), except a name the module claims (`extraConstNames`) that its own compile did not create: `tableDigest` holds those (`foreignClaims`, case `cs_nested`)."),
+      "Public (src/Lean/Compiler/IR/CompilerM.lean:197-198); an IR declaration of an own name is in `entriesEnc`, whoever added it. A declaration added for another module's name lists it among the module's compiled names (`extraConstNames`), which its provides digest covers; an importer whose compile resolves the name records where it resolved (`noteResolved`), and Lake rebuilds it when the provider set changes there (cases `irdup_first`, `cs_nested`)."),
     (`Lean.IR.addDecls, .ownDeclDigest, "Called by `IR.compile` (src/Lean/Compiler/IR.lean:35), which `PassManager.run` calls."),
     (`Lean.IR.ToIR.addDecl, .ownDeclDigest,
       "Adds the dummy declaration of an extern (src/Lean/Compiler/IR/ToIR.lean:54-55,202); covered like `IR.addDecl`.")]),
@@ -571,8 +571,6 @@ def globals : List (Name × GlobalClass × String) := [
   (`Lean.specLookupsRef, .recording, "Private (src/Lean/Util/UsedByChecks.lean)."),
   (`Lean.compilerCodeRef, .recording, "Private (src/Lean/Util/UsedByChecks.lean); only ever set to `true`."),
   (`Lean.compileHintsRef, .recording, "Private (src/Lean/Util/UsedByChecks.lean); only ever added to."),
-  (`Lean.compiledNamesRef, .recording,
-    "Private (src/Lean/Util/UsedByChecks.lean); only added to, by the compiler through the export of the private `recordCompiledNames` (`PassManager.run`): per compile, the declarations it compiled and the names it created; `ModuleUsage.ownCreatedNames` counts only the names of compiles of the module's own constants as the module's own claims (cases `cs_nested`, `shadow`)."),
   (`Lean.extraModUsesByChecksRef, .recording, "Private (src/Lean/ExtraModUses.lean)."),
   (`Lean.Compiler.LCNF.baseTransparentDeclsExt, .moduleLocal,
     "`mkOrderedDeclSetExt` (src/Lean/Compiler/LCNF/PhaseExt.lean:26): non-persistent, initially empty."),
@@ -653,8 +651,8 @@ inductive DerivedClass where
   defines the base (`derivedReads`), and listed in the `tableDigest` of a module that defines it for another
   module's base. -/
   | derived
-  /-- The name of a declaration the compile creates (`compileCreatedNames`); it folds into its owner, and a claim of
-  it by a module whose compile did not create it is in that module's `tableDigest` (`foreignClaims`). -/
+  /-- The name of a declaration the compile creates; it folds into its owner, and the module lists it among its
+  compiled names, so an importer that resolves it records where it resolved (`noteResolved`). -/
   | compilerOnly
   /-- A name placed in the compiled code, so a compiled mention of the module that compiles it. -/
   | codeName
@@ -683,7 +681,7 @@ def derivedNames : List (String × DerivedClass × String) := [
   ("append _at_", .compilerOnly, "`Specialize.mkSpecDecl` names the specialization it creates."),
   ("append spec", .compilerOnly, "`Specialize.mkSpecDecl` names the specialization it creates."),
   ("appendIndexAfter <computed>", .compilerOnly,
-    "`LambdaLifting.mkAuxDeclName` (`_lam_N`, `_elam_N`, a fresh name: an existing one is skipped) and `mkSpecDecl` (`spec_N`). A kernel constant with such a name is in `tableDigest` (`compilerShapedConsts`), a claimed one in `foreignClaims`."),
+    "`LambdaLifting.mkAuxDeclName` (`_lam_N`, `_elam_N`, a fresh name: an existing one is skipped) and `mkSpecDecl` (`spec_N`). A module that gains a kernel constant or a compiled name of the same name changes its provides digest, so an importer that resolved the name is rebuilt if the name's winner or kinds change."),
   ("appendIndexAfter _boxed_const", .compilerOnly, "`ExplicitBoxing.mkCast` names the auxiliary declaration it creates."),
   ("appendIndexAfter _closed", .compilerOnly, "`ExtractClosed` names the closed term it extracts."),
   ("append spill", .codeName,
