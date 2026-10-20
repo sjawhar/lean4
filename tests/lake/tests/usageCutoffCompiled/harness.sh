@@ -1360,6 +1360,53 @@ collide_first_s1() { collide_b; }
 collide_after_s0() { collide_files A B; }
 collide_after_s1() { collide_b; }
 
+# The reverse: `K` defines the kernel constant `foo._redArg`, which `C` calls, and `A` gains `foo`, whose compile
+# creates the compiler-only name `foo._redArg`. A resolver that ranks a module's compiled names first for such a name
+# gives `C` `A`'s declaration whatever the import order; one that ranks by import order gives it `K`'s when `K` comes
+# first (`collide_rev`) and `A`'s when `A` does (`collide_rev_first`). `C` must be compiled again whenever a fresh
+# build resolves the name to another declaration.
+collide_rev_files() {
+  printf 'name = "test"\ndefaultTargets = ["T"]\n[[lean_lib]]\nname = "T"\n' > lakefile.toml
+  mkdir_t
+  printf 'def unrelated : Nat := 0\n@[noinline] def foo._redArg (_n : Nat) : UInt32 := 7\n' > T/K.lean
+  printf 'def other : Nat := 0\n' > T/A.lean
+  printf 'import T.%s\nimport T.%s\n@[noinline] def useIt (n : Nat) : UInt32 := foo._redArg n\n' "$1" "$2" > T/C.lean
+  printf 'import T.C\n' > T.lean
+}
+collide_rev_a() { printf 'def other : Nat := 0\ndef foo (n : Nat) (_h : Nat) : Nat := n + 1\n' > T/A.lean; }
+collide_rev_s0() { collide_rev_files K A; }
+collide_rev_s1() { collide_rev_a; }
+collide_rev_first_s0() { collide_rev_files A K; }
+collide_rev_first_s1() { collide_rev_a; }
+
+# A provider of a name that does not win stops providing it: `C` imports `A`, whose compile creates `foo._redArg`,
+# before `Z`, which also registers an IR declaration of that name and drops it in state 1. `A`'s declaration wins
+# either way, so `C` compiles to the same code and is replayed.
+collide_drop_loser_s0() {
+  irdup_files A Z
+  claim_z '' foo._redArg lean_nat_succ
+}
+collide_drop_loser_s1() { printf 'import Lean\ndef zdummy : Nat := 1\n' > T/Z.lean; }
+collide_drop_loser_c_check() { grep -qE 'Replayed T\.C( |$)' ../collide_drop_loser.1.log; }
+
+# `K` defines the kernel constant `foo.$1`, which `C` calls, and `Z` registers an IR declaration of that name in
+# state 1. `collide_shape`: `K` before `Z`, with `_cstage2`, a shape for which a resolver may rank compiled names first
+# and give `C` `Z`'s declaration where import order keeps `K`'s. `collide_shape_rev`: `Z` before `K`, with `_elam_1`,
+# a shape for which no resolver ranks compiled names first, so import order gives `C` `Z`'s declaration and ranking
+# kernel constants first keeps `K`'s.
+collide_shape_files() {
+  printf 'name = "test"\ndefaultTargets = ["T"]\n[[lean_lib]]\nname = "T"\n' > lakefile.toml
+  mkdir_t
+  printf 'def unrelated : Nat := 0\n@[noinline] def foo.%s (_n : Nat) : Nat := 7\n' "$1" > T/K.lean
+  printf 'import Lean\ndef zdummy : Nat := 1\n' > T/Z.lean
+  printf 'import T.%s\nimport T.%s\n@[noinline] def useIt (n : Nat) : Nat := foo.%s n\n' "$2" "$3" "$1" > T/C.lean
+  printf 'import T.C\n' > T.lean
+}
+collide_shape_s0() { collide_shape_files _cstage2 K Z; }
+collide_shape_s1() { claim_z '' foo._cstage2 lean_nat_succ; }
+collide_shape_rev_s0() { collide_shape_files _elam_1 Z K; }
+collide_shape_rev_s1() { claim_z '' foo._elam_1 lean_nat_succ; }
+
 # The same with a `_boxed` name, reached through an intermediate module: `C` imports `X`, which imports `B`
 # before `A`; `C` passes `foo` (unboxed parameters) as a closure, so its code names `foo._boxed`, and `B` gains
 # a kernel constant of that name.
@@ -2064,7 +2111,8 @@ dn_never_extract_s1() { dn_never_extract_a '@[never_extract] '; }
 all_cases="spec_transitive spec_link spec_type spec_precomp plugin_replay csimp_transitive csimp_late specialize_attr
   cov_projfn cov_projfn_rev cov_mlike cov_sparse cov_auxrec cov_sibmatch cov_sibmatch_rev cov_ctlmatch
   cov_sibinst cov_sibclass cov_sibmeta cov_ckind_rev cov_recarg_rev
-  collide_first collide_after hard_recording hard_moduleext hard_speclookups hard_compilercode rp_own
+  collide_first collide_after collide_rev collide_rev_first collide_drop_loser collide_shape collide_shape_rev
+  hard_recording hard_moduleext hard_speclookups hard_compilercode rp_own
   hard_usedbychecks hard_declconsts
   hard_extramod d2_down
   class_same class_cross nospec_type folder_cross reducible_cross binder_inline d2_folder

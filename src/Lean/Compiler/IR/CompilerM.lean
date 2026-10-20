@@ -145,7 +145,7 @@ def findEnvDecl (env : Environment) (declName : Name) : Option Decl :=
 @[export lean_ir_find_env_decl]
 private def findInterpDecl (env : Environment) (declName : Name) : Option Decl :=
   -- This function is never used in `leanir`, so no need for `findExtEntry?`
-  match env.getModuleIdxFor? declName with
+  noteResolved declName <| match env.getModuleIdxFor? declName with
   | some modIdx =>
     -- `meta import/import all` and additional server-mode IR
     findAtSorted? (declMapExt.getModuleIREntries env modIdx) declName <|>
@@ -163,7 +163,7 @@ private def findInterpDeclBoxed (env : Environment) (declName : Name) : Option D
   -- latter's module index would be `none` and we may do an expensive blocking wait on the
   -- environment extension state even if in this situation we definitely know that `declName'` is
   -- not a local declaration.
-  match env.getModuleIdxFor? declName with
+  noteResolved declName <| match env.getModuleIdxFor? declName with
   | some modIdx =>
     findAtSorted? (declMapExt.getModuleIREntries env modIdx) boxed <|>
     findAtSorted? (declMapExt.getModuleEntries env modIdx) boxed
@@ -171,7 +171,7 @@ private def findInterpDeclBoxed (env : Environment) (declName : Name) : Option D
 
 @[export lean_has_compile_error]
 private def hasCompileError (env : Environment) (constName : Name) : Bool :=
-  match env.getModuleIdxFor? constName with
+  noteResolved constName <| match env.getModuleIdxFor? constName with
   | some _ => false  -- Compile errors in imports would have stopped the build before this point
   -- TODO: do we need to store failures as a separate state? Not if we make sure to only ever
   -- evaluate constants previously called `compileDecl` on.

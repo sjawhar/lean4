@@ -461,4 +461,14 @@ extern "C" LEAN_EXPORT obj_res lean_usage_file_digest_stamped(b_obj_arg path) {
     lean_ctor_set(r, 1, stamp);
     return io_result_mk_ok(r);
 }
+
+// `BaseIO Unit`: the compiled function takes no world token and returns a boxed unit.
+extern "C" object * lean_usage_record_resolved(obj_arg n);
+
+/* `Lean.noteResolved`: records `n` (`Lean.recordResolvedName`) and returns `x`. */
+extern "C" LEAN_EXPORT obj_res lean_usage_note_resolved(b_obj_arg n, obj_arg x) {
+    lean_inc(n);
+    lean_dec(lean_usage_record_resolved(n));
+    return x;
+}
 }

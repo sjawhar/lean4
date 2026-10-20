@@ -42,13 +42,13 @@ match_text "Replayed Test.HU" produced.out
 # (sidecars are removed before being rewritten: under an artifact cache they are read-only links)
 printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 1\n' > Test/H.lean
 rm -f .lake/build/lib/lean/Test/HU.usage
-printf '{"version":10,"noskip":false,"moduleDigest":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","digested":[],"importedClosures":[],"importedDigests":[],"own":[],"used":[[[true],[]]],"extra":[],"specKeys":[],"specLookups":[]}' > .lake/build/lib/lean/Test/HU.usage
+printf '{"version":11,"noskip":false,"moduleDigest":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","providesDigest":"00000000000000000000000000000000","provides":[[],[]],"digested":[],"importedClosures":[],"importedDigests":[],"own":[],"used":[[[true],[]]],"resolved":[],"extra":[],"specKeys":[],"specLookups":[]}' > .lake/build/lib/lean/Test/HU.usage
 test_not_out "warning" build -v Test.HU
 match_text "Built Test.HU" produced.out
 # a name component that is neither a string nor a number is corrupt input: warned, then built
 printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 3\n' > Test/H.lean
 rm -f .lake/build/lib/lean/Test/HU.usekey
-printf '{"version":10,"usage":"00000000000000000000000000000000","local":"0000000000000000","olean":"00000000000000000000000000000000","modsys":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","extra":[[[true],"00000000000000000000000000000000","00000000000000000000000000000000"]]}' > .lake/build/lib/lean/Test/HU.usekey
+printf '{"version":11,"usage":"00000000000000000000000000000000","local":"0000000000000000","olean":"00000000000000000000000000000000","modsys":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","extra":[[[true],"00000000000000000000000000000000","00000000000000000000000000000000"]]}' > .lake/build/lib/lean/Test/HU.usekey
 test_out "expected a name component" build Test.HU
 match_text "Built Test.HU" produced.out
 # so is a sidecar that is not UTF-8

@@ -60,21 +60,27 @@ def recordSpecLookup (key : Expr) : BaseIO Unit := do
 def lookedUpSpecKeys : BaseIO (Array Expr) :=
   specLookupsRef.get
 
-/-- Per run of the compiler's pipeline in this process, the declarations it compiled and the declaration names it
-created (`recordCompiledNames`). -/
-private builtin_initialize compiledNamesRef : IO.Ref (Array (Array Name × Array Name)) ← IO.mkRef #[]
+/-- The names the compiler resolved to a defining module (`noteResolved`) while recording is on. -/
+private builtin_initialize resolvedNamesRef : IO.Ref NameHashSet ← IO.mkRef {}
 
-/-- Records that one run of the compiler's pipeline compiled `inputs` and produced the LCNF and IR declarations
-`names`, when recording is on. Private, reached by the compiler through its export, so that a module's code cannot
-make a name it adds (`IR.addDecl`) look like one its compile created. A run can compile declarations of an
-environment that is then discarded, so the reader decides which runs were for the module's own constants. -/
-@[export lean_usage_record_compiled_names]
-private def recordCompiledNames (inputs names : Array Name) : BaseIO Unit := do
-  if (← usageRecordingRef.get) then compiledNamesRef.modify (·.push (inputs, names))
+/-- Records `n` as resolved when recording is on. Private, reached through its export from `noteResolved`, so that a
+module's code can only add names. -/
+@[export lean_usage_record_resolved]
+private def recordResolvedName (n : Name) : BaseIO Unit := do
+  if (← usageRecordingRef.get) then resolvedNamesRef.modify (·.insert n)
 
-/-- The runs `recordCompiledNames` recorded. -/
-def compileCreatedNames : BaseIO (Array (Array Name × Array Name)) :=
-  compiledNamesRef.get
+/--
+Returns `x`, recording `n` as a name the compiler resolved to its defining module (`Environment.getModuleIdxFor?`):
+every call site of the compiler that picks a module's entries by that index wraps its result in `noteResolved`, hits
+and misses alike. Implemented in `src/library/usage_digest.cpp`, so that the recording, which no result depends on,
+cannot be optimized away.
+-/
+@[never_extract, extern "lean_usage_note_resolved"]
+def noteResolved {α : Type} (n : @& Name) (x : α) : α := x
+
+/-- The names recorded by `noteResolved` so far. -/
+def resolvedNames : BaseIO NameHashSet :=
+  resolvedNamesRef.get
 
 /-- See `recordCompilerCode`. -/
 private builtin_initialize compilerCodeRef : IO.Ref Bool ← IO.mkRef false
