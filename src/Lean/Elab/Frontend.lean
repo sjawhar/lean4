@@ -17,6 +17,8 @@ import Lean.Util.ProfilerServer
 import Lean.Util.CollectAxioms
 import Lean.Util.ModuleUsage
 import Lean.Util.UsedByChecks
+import Lean.Util.CommandEntries
+import Lean.Util.ModuleUsage.Reuse
 
 public section
 
@@ -289,7 +291,8 @@ def runFrontend
     (codegen : Environment → IO Unit := fun _ => pure ())
     : IO (Option Environment) := do
   let startTime := (← IO.monoNanosNow).toFloat / 1000000000
-  if oleanFileName?.isSome && usageFileName?.isSome then enableUsageRecording
+  -- the recording logs are global: a frontend this module runs in-process clears or extends them, which `run` detects
+  let run ← startFrontendRun (record := oleanFileName?.isSome && usageFileName?.isSome)
   let inputCtx := Parser.mkInputContext input fileName
   -- default `cmdlineSnapshots` to true (not done as default value for API back-compat reasons)
   -- except when full-snapshotting so that enough information for resumption is available
@@ -396,17 +399,21 @@ def runFrontend
     let recorded ← recordedDeclConsts
     -- the digests cover the exported axioms, so both take the stored ones
     let env := if usageFileName?.isSome then storeExportedAxioms env else env
-    let usage? := usageFileName?.map fun usageFileName =>
-      let nodes := ModuleUsage.ownNodes env (ModuleUsage.ownConsts env recorded)
+    let usage? ← usageFileName?.mapM fun usageFileName => do
+      let consts := ModuleUsage.ownConsts env recorded
+      let nodes := ModuleUsage.ownNodes env consts
       let own := ModuleUsage.localDigests env nodes
+      let stmt := ModuleUsage.computeStmt env (ModuleUsage.stmtState env) own consts
+      let recs ← ModuleUsage.moduleRecords env own stmt (sessionChanged := (← lastFrontendRun) != run)
       let provides := ModuleUsage.ownProvides env
       let indirect := ModuleUsage.ownIndirect env
-      (usageFileName, nodes, own, ModuleUsage.closureDigest env own provides, provides, indirect)
+      return (usageFileName, nodes, own, ModuleUsage.closureDigest env own provides, provides, indirect, stmt, recs)
     profileitIO ".olean serialization" finalOpts do
       let commandLints := collectCommandLints snaps none #[]
       let env ← Linter.recordLints inputCtx.fileMap env commandLints
-      let env := usage?.elim env fun (_, _, own, closure, provides, indirect) =>
-        ModuleUsage.setLocalDigests env own closure provides indirect
+      let env := usage?.elim env fun (_, _, own, closure, provides, indirect, stmt, recs) =>
+        let env := ModuleUsage.setLocalStmt (ModuleUsage.setLocalDigests env own closure provides indirect) stmt
+        setCommandEntries env recs.payloads
       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
     return usage?
 
@@ -434,10 +441,11 @@ def runFrontend
     Firefox.Profile.serve <| Json.compress <| toJson profile
 
   -- Last of the outputs: the usage data records every name resolved in writing the others.
-  if let some (usageFileName, nodes, own, closure, provides, indirect) := usage? then
+  if let some (usageFileName, nodes, own, closure, provides, indirect, stmt, recs) := usage? then
     let used := ModuleUsage.usedFromInfoTrees trees (← usedNames)
-    ModuleUsage.writeUsage env nodes own closure provides indirect used (← lookedUpSpecKeys)
-      (incrLoaded := incrLoadFileName?.isSome) usageFileName
+    ModuleUsage.writeUsage env nodes own closure provides indirect used (← lookedUpSpecKeys) stmt
+      (recs.commands.map toJson) (incrLoaded := incrLoadFileName?.isSome) usageFileName
+      (noskipReason? := recs.noskipReason?)
 
   -- no point in freeing the snapshot graph and all referenced data this close to process exit
   Runtime.forget snaps
