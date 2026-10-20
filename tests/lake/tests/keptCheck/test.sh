@@ -491,15 +491,9 @@ test_cmd grep -qx P.C t40.log
 seta t40 3
 LAKE_KEPT_CHECKER="$STUB" test_out 'Checked P.B' -d t40 build P
 no_match_text 'not asked' produced.out
-<<<<<<< HEAD
 # A checker without the usage cutoff is refused: its records decide which modules may be re-checked.
 # The refusal names the setting that turns the cutoff on, which is off when unset, and
 # `lake setup-file`, which the language server runs, says why too
-=======
-# A checker without the usage cutoff is refused: its records decide which modules may be re-checked. The refusal
-# names the setting that turns it on, which is off when unset; `lake setup-file`, which the language server runs,
-# says why too.
->>>>>>> f04a915db4 (test: lake: opt in to the usage cutoff)
 (unset LAKE_USAGE_CUTOFF; LAKE_KEPT_CHECKER="$STUB" test_err 'needs the usage cutoff (LAKE_USAGE_CUTOFF=1)' -d t40 build P)
 LAKE_USAGE_CUTOFF=false LAKE_KEPT_CHECKER="$STUB" test_err 'needs the usage cutoff' -d t40 build P
 LAKE_USAGE_CUTOFF=false LAKE_KEPT_CHECKER="$STUB" test_err 'needs the usage cutoff' -d t40 setup-file t40/P/C.lean
