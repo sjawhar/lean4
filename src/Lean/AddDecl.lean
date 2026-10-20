@@ -240,8 +240,17 @@ is true, exposes the declaration body, i.e. preserves the full representation in
 independently of `Environment.isExporting` and even for theorems.
 -/
 def addDecl (decl : Declaration) (forceExpose := false) : CoreM Unit := do
-  recordDeclConsts decl
+  let used? ← recordDeclConsts decl
+  if let some used := used? then
+    recordCommandDecls (← commandIdx) decl.getNames.toArray used
   addDeclCore decl forceExpose
+  if let some used := used? then
+    -- the kernel adds a nested inductive's auxiliary recursors, named after its first type, which `getNames` lacks
+    if let .inductDecl _ _ (t :: _) _ := decl then
+      if let some (.inductInfo v) := (← getEnv).find? t.name then
+        unless v.numNested == 0 do
+          let recs := (Array.range v.numNested).map fun i => (mkRecName t.name).appendIndexAfter (i + 1)
+          recordCommandDecls (← commandIdx) recs used
   discard <| decl.getTopLevelNames.mapM snapshotEnvLinterOptions
 
 def addAndCompile (decl : Declaration) (logCompileErrors : Bool := true)

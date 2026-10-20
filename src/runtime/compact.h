@@ -79,8 +79,11 @@ class LEAN_EXPORT object_compactor {
     object_offset insert_mpz(object * o);
     object_offset insert_closure(object * o);
 public:
+    /* `initial_size` bytes of buffer and `initial_buckets` max-sharing buckets to start with; both grow as needed.
+       The defaults suit whole modules. */
     object_compactor(void * base_addr = nullptr, std::vector<region_view> dep_regions = {},
-                     bool allow_closures = false);
+                     bool allow_closures = false, size_t initial_size = 1024*1024,
+                     size_t initial_buckets = 1024*1024);
     object_compactor(object_compactor const &) = delete;
     object_compactor(object_compactor &&) = delete;
     ~object_compactor();

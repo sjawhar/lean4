@@ -965,10 +965,15 @@ private def SynthInstanceCache.insertEntry (c : SynthInstanceCache) (key : Synth
     some <| entry :: (entries?.getD [] |>.filter fun e =>
       e.deps.options != entry.deps.options || e.deps.base != entry.deps.base)
 
-/-- Adds `entry` to the transient tier, and to the persistent tier if `persist` is set. -/
+/--
+Adds `entry` to the transient tier, and to the persistent tier if `persist` is set and usage recording is off. A
+recording run keeps commands from their payloads (`readdCommandConstants`), which do not carry the persistent tier, and
+a search served from that tier can produce terms that differ from the search it saves; so a recording run does not
+fill it, and a command elaborated after a kept one finds the tier as a full run left it: empty.
+-/
 private def insertCacheEntry (key : SynthInstanceCacheKey) (entry : SynthInstanceCacheEntry)
     (persist : Bool) : MetaM Unit := do
-  if persist then
+  if persist && !(← usageRecordingEnabled) then
     -- not `Meta.modifyEnv`, which would clear `Meta.Cache`
     modifyThe Core.State fun s =>
       { s with env := s.env.setSynthCache (s.env.synthCache.insertEntry key entry) }

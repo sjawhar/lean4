@@ -9,6 +9,7 @@ public import Lean.AddDecl
 public import Lean.Meta.AppBuilder
 import Lean.Structure
 import Lean.Meta.Transform
+public import Lean.Util.UsedByChecks
 public section
 namespace Lean.Meta
 /-!
@@ -200,7 +201,7 @@ partial def instantiateStructDefaultValueFn?
   let cinfo ← getConstInfo defaultFn
   let us ← levels?.getDM (mkFreshLevelMVarsFor cinfo)
   assert! us.length == cinfo.levelParams.length
-  let mut val ← liftMetaM <| instantiateValueLevelParams cinfo us
+  let mut val ← liftMetaM <| recordUsedByCommand defaultFn *> instantiateValueLevelParams cinfo us
   for param in params do
     let .lam _ t b _ := val | return none
     -- If no levels given, need to unify to solve for level mvars.
