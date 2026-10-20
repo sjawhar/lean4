@@ -78,8 +78,10 @@ example : use_dep% base = 2 := rfl
   let own := ModuleUsage.localDigests env (ModuleUsage.ownNodes env consts)
   let stmt := ModuleUsage.computeStmt env (ModuleUsage.stmtState env) own consts
   let obs ← ModuleUsage.commandObservations
-  let (recs, reason?) ← ModuleUsage.commandRecords env obs (own.filter (·.1 != `m)) stmt #[]
-  IO.println s!"local constant without a digest: {recs.size} records, refused: {reason?.getD "no"}"
+  let shown := match ← ModuleUsage.commandRecords env obs (own.filter (·.1 != `m)) stmt #[] with
+    | .ok recs => s!"{recs.size} records, refused: no"
+    | .error reason => s!"0 records, refused: {reason}"
+  IO.println s!"local constant without a digest: {shown}"
   let noFull ← modifyPrivateExt ModuleUsage.State env `Lean.ModuleUsage.ext fun s =>
     { s with importedModuleEntries := dropEntry `xd s.importedModuleEntries }
   expectError "imported constant without a full digest (command)" do

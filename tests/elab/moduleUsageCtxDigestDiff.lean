@@ -20,7 +20,7 @@ def check (env : Environment) (observations : Array CommandObservation) (label :
   let own := ModuleUsage.localDigests env (ModuleUsage.ownNodes env consts)
   let stmt := ModuleUsage.computeStmt env (ModuleUsage.stmtState env) own consts
   let obs := observations.qsort (·.i < ·.i)
-  let (recs, _) ← ModuleUsage.commandRecords env observations own stmt #[]
+  let recs ← IO.ofExcept (← ModuleUsage.commandRecords env obs own stmt #[])
   let mut bad := #[]
   let mut sizes := #[]
   for o in obs, r in recs do
