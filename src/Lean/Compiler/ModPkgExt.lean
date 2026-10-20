@@ -8,6 +8,7 @@ module
 prelude
 public import Lean.Environment
 import Lean.Compiler.NameMangling
+import Lean.Util.UsedByChecks
 
 set_option doc.verso true
 
@@ -62,7 +63,7 @@ For many constants, this is the full symbol. However, initializers have an addit
 -/
 @[export lean_get_symbol_stem]
 public def getSymbolStem (env : Environment) (declName : Name) : String :=
-  let pkg? :=
+  let pkg? := noteResolved declName <|
     match env.getModuleIdxFor? declName with
     | some idx => env.getModulePackageByIdx? idx
     | none => env.getModulePackage?

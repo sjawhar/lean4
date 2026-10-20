@@ -392,19 +392,19 @@ def runFrontend
   let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
   if let some oleanFileName := oleanFileName? then
     let recorded ← recordedDeclConsts
-    let claims ← ModuleUsage.ownClaimsDigest env
     let usage? := usageFileName?.map fun usageFileName =>
       let nodes := ModuleUsage.ownNodes env (ModuleUsage.ownConsts env recorded)
       let own := ModuleUsage.localDigests env nodes
-      (usageFileName, nodes, own, ModuleUsage.closureDigest env own claims)
+      (usageFileName, nodes, own, ModuleUsage.closureDigest env own, ModuleUsage.ownProvides env)
     profileitIO ".olean serialization" finalOpts do
       let commandLints := collectCommandLints snaps none #[]
       let env ← Linter.recordLints inputCtx.fileMap env commandLints
-      let env := usage?.elim env fun (_, _, own, closure) => ModuleUsage.setLocalDigests env own closure claims
+      let env := usage?.elim env fun (_, _, own, closure, provides) =>
+        ModuleUsage.setLocalDigests env own closure provides
       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
-    if let some (usageFileName, nodes, own, closure) := usage? then
+    if let some (usageFileName, nodes, own, closure, provides) := usage? then
       let used := ModuleUsage.usedFromInfoTrees trees (← usedNames)
-      ModuleUsage.writeUsage env nodes own closure used (← lookedUpSpecKeys)
+      ModuleUsage.writeUsage env nodes own closure provides used (← resolvedNames) (← lookedUpSpecKeys)
         (incrLoaded := incrLoadFileName?.isSome) usageFileName
 
   if let some ileanFileName := ileanFileName? then
