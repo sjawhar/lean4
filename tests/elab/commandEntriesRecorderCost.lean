@@ -1,6 +1,6 @@
 import Lean
 /-! Recording a module's command payloads (`recordCommandDelta`, once per command) costs in proportion to each
-command, not to the module elaborated before it (`decl2f-delta4-review.md` finding 2): over a module of 3,000
+command, not to the module elaborated before it: over a module of 3,000
 asynchronously elaborated theorems it allocates at most 1.5 times the theorem ratio more than over 190. A recorder
 that walks each theorem's whole branch map, which holds every constant declared before the theorem, allocates
 quadratically and exceeds the bound. -/

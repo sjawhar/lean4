@@ -1,6 +1,6 @@
 import Lean
 /-! The recorder records both views of every persistent extension, whatever mode it is registered with and whatever
-mode each write is called with (`decl2f-delta2-review.md` finding 5): an `addEntry (asyncMode := .sync)` on a
+mode each write is called with: an `addEntry (asyncMode := .sync)` on a
 `.mainOnly` and on a `.local` extension writes both views, an `addEntry (asyncMode := .local)` on a `.sync` extension
 the main-branch view alone, and each replays into exactly the views it reached; a default-mode `addEntry` on each
 is the control. A raw `toEnvExtension.modifyState (asyncMode := .sync)` on the `.mainOnly` extension beside an entry

@@ -1,7 +1,7 @@
 import Lean
 /-! An unaccounted write made inside `realizeConst` reaches the realizing command's recorded delta: merging the
 realization into the caller (`replayConsts`) applies each extension's `replay?` and carries the realization's count
-of unaccounted writes to that extension (`decl2f-delta2-review.md` finding 4). A command whose realization writes a
+of unaccounted writes to that extension. A command whose realization writes a
 `.sync` log extension through `toEnvExtension.modifyState`, beside an entry, which the extension's `replay?` copies,
 is refused; one whose realization only adds the entry replays, both views equal to the
 full run's. -/

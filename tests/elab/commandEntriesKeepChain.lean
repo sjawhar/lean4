@@ -1,5 +1,5 @@
 import Lean
-/-! The keep-in-order class test (`decl2f-delta4-review.md`): every command of a module is kept in order, each on the
+/-! The keep-in-order class test: every command of a module is kept in order, each on the
 previous keep's result, from the module's post-import environment with fresh realization caches, as a reuse run in a
 new process does; a command whose payload is refused is elaborated instead, as the frontend would. After each command
 (kept or refused) the chain is compared with the full run: the constants it added (names, level parameters, types and

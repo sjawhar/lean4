@@ -1,7 +1,7 @@
 import Lean
 /-! A declaration command that writes an extension through a sanctioned writer (`PersistentEnvExtension.addEntry` or
 `modifyState`, `ScopedEnvExtension.addLocalEntry`) called with a record other than the registered one is refused, and
-the module is `noskip` (`decl2f-delta2-review.md` finding 1): a record with another
+the module is `noskip`: a record with another
 `addEntryFn`; one with `stateDeltaSeesDirectWrites` set where the registered record leaves it unset; another
 extension's record over this extension's `EnvExtension`; a scoped record with another descriptor; and the registered
 record over an `EnvExtension` whose index was changed through a structure extending `EnvExtension` (its constructor

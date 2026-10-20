@@ -1,7 +1,7 @@
 import Lean
 /-! The public test-support function `CommandEntries.Testing.rollbackTo` writes extension states through the counted
 core, so a declaration command whose attribute uses it to install a changed state of a log extension is refused and
-the module is `noskip` (`decl2f-delta3-review.md` finding 5). Writing below the counters would leave
+the module is `noskip`. Writing below the counters would leave
 the payload empty and its replay would lose the change. The attribute builds a state with an extra derived element in
 a scratch environment and copies it into the real one. `d0` is the module's only declaration, so the module's
 `noskip` comes from it alone; the copy writes every extension, each counted, so the reason names the first extension
