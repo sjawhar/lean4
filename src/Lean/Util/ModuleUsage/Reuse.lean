@@ -67,18 +67,21 @@ def commandStateChanges (before after : Elab.Command.State) : Array Refusal := I
 
 /-- The command payloads of the observed commands (`observations`, in command order; `recordCommandDeltas`), each also
 refused for the command-state fields it changed (`commandStateChanges`), the attributes with handlers outside core
-Lean it ran (`foreignAttributesByCommand`) and the code it evaluated that its environment does not keep
-(`evaluatedByCommand`), as the `.olean` stores them (`CommandEntries.compact`), with the digest of their compacted
+Lean it ran (`foreignAttributesByCommand`), the code it evaluated that its environment does not keep
+(`evaluatedByCommand`) and the state imported modules' initializers created that it wrote
+(`foreignStateWritesByCommand`), as the `.olean` stores them (`CommandEntries.compact`), with the digest of their compacted
 bytes. -/
 def commandPayloads (observations : Array CommandObservation) : IO (Array (CommandEntries × Digest)) := do
   let foreign : Std.HashMap Nat (Array Refusal) := (← foreignAttributesByCommand).reverse.foldl (init := {})
     fun m (i, attr) => m.alter i fun rs => some ((rs.getD #[]).push (.foreignAttribute attr))
   let evaluated : Std.HashMap Nat (Array Name) := (← evaluatedByCommand).foldl (init := {})
     fun m (i, n) => m.alter i fun o => some ((o.getD #[]).push n)
+  let wroteForeign : Std.HashSet Nat := (← foreignStateWritesByCommand).foldl (·.insert ·) {}
   let deltas ← recordCommandDeltas (observations.map fun obs => (obs.before.env, obs.after.env, obs.i))
   (observations.zip deltas).mapM fun (obs, ce) => do
     let discarded := ((evaluated.getD obs.i #[]).find? (!obs.after.env.contains ·)).map Refusal.ranCode
-    let extra := commandStateChanges obs.before obs.after ++ foreign.getD obs.i #[] ++ discarded.toArray
+    let extra := commandStateChanges obs.before obs.after ++ foreign.getD obs.i #[] ++ discarded.toArray ++
+      if wroteForeign.contains obs.i then #[Refusal.foreignState] else #[]
     let (ce, bytes) ← CommandEntries.compact
       { ce with refusals := extra.foldl (fun rs r => if rs.contains r then rs else rs.push r) ce.refusals }
     return (ce, Digest.ofBytes bytes)
