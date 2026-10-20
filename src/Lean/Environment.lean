@@ -3302,8 +3302,10 @@ def displayStats (env : Environment) : IO Unit := do
     unless fmt.isNil do IO.println ("  " ++ toString (Format.nest 2 (extDescr.statsFn s.state)))
     IO.println ("  number of imported entries: " ++ toString (s.importedEntries.foldl (fun sum es => sum + es.size) 0))
 
+/-- `decision`: the constant is a `Bool` or a `Decidable` instance, whose code computes a value and runs no action. -/
 @[extern "lean_eval_const"]
-private unsafe opaque evalConstCore (α) (env : @& Environment) (opts : @& Options) (constName : @& Name) : Except String α
+private unsafe opaque evalConstCore (α) (env : @& Environment) (opts : @& Options) (constName : @& Name)
+  (decision : Bool) : Except String α
 
 set_option compiler.ignoreBorrowAnnotation true in
 @[extern "lean_eval_check_meta"]
@@ -3323,7 +3325,8 @@ such as in `#eval`.
 @[noinline] unsafe def evalConst (α) (env : @& Environment) (opts : @& Options) (constName : @& Name) (checkMeta := true) : Except String α := do
   if checkMeta then
     evalCheckMeta env constName
-  evalConstCore α env opts constName
+  let decision := (env.find? constName).any fun c => c.type.isConstOf ``Bool || c.type.getAppFn.isConstOf ``Decidable
+  evalConstCore α env opts constName decision
 
 private def throwUnexpectedType {α} (typeName : Name) (constName : Name) : ExceptT String Id α :=
   throw ("unexpected type at '" ++ toString constName ++ "', `" ++ toString typeName ++ "` expected")

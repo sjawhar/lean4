@@ -201,6 +201,12 @@ private builtin_initialize usedByCommandRef : IO.Ref (List (Nat × Name)) ← IO
 /-- The attributes whose handlers, which may run code outside core Lean (`AttributeImplCore.onlyCoreCode`), a top-level
 command ran. Such a handler may write state no command payload carries. -/
 private builtin_initialize foreignAttributesByCommandRef : IO.Ref (List (Nat × Name)) ← IO.mkRef []
+@[extern "lean_io_set_task_context"]
+private opaque setTaskContext (c : UInt32) : BaseIO Unit
+
+@[extern "lean_io_take_evaluated_consts"]
+private opaque takeEvaluatedConsts : BaseIO (Array (UInt32 × Name))
+
 /-- The actions that clear the per-run logs of other modules (`registerRunLog`). -/
 private builtin_initialize runLogClearsRef : IO.Ref (Array (BaseIO Unit)) ← IO.mkRef #[]
 
@@ -227,6 +233,7 @@ def startFrontendRun (record : Bool) : BaseIO Nat := do
     declsByCommandRef.set []
     usedByCommandRef.set []
     foreignAttributesByCommandRef.set []
+    discard takeEvaluatedConsts
     for clear in ← runLogClearsRef.get do clear
   return run
 
@@ -234,9 +241,13 @@ def startFrontendRun (record : Bool) : BaseIO Nat := do
 def lastFrontendRun : BaseIO Nat :=
   frontendRunsRef.get
 
-/-- Sets the command whose elaboration the frontend runs, for records made outside any command context. -/
+/-- Sets the command whose elaboration the frontend runs, for records made outside any command context, and, as the
+runtime's task context, for what this thread and the tasks it creates do: the constants they evaluate
+(`evaluatedByCommand`). -/
 def setCurrentCommand (i : Nat) : BaseIO Unit := do
-  if (← usageRecordingRef.get) then currentCommandRef.set i
+  if (← usageRecordingRef.get) then
+    currentCommandRef.set i
+    setTaskContext (i + 1).toUInt32
 
 /-- Monads that know the top-level command whose elaboration they run (`Core.Context.cmdIdx?`). -/
 class MonadCommandIdx (m : Type → Type) where
@@ -264,6 +275,12 @@ def recordUsedByCommandIdx (i : Nat) (n : Name) : BaseIO Unit := do
 core Lean. -/
 def recordForeignAttributeIdx (i : Nat) (attr : Name) : BaseIO Unit := do
   if (← usageRecordingRef.get) then foreignAttributesByCommandRef.modify ((i, attr) :: ·)
+
+/-- The constants code evaluated (`Environment.evalConst`) while recording, each with the command in whose task context
+(`setCurrentCommand`) it ran; a `Bool` or `Decidable` constant (a decision `native_decide`, `bv_decide` or `#guard`
+evaluates) runs no action and is left out. Takes them: a second call returns only those since. -/
+def evaluatedByCommand : BaseIO (Array (Nat × Name)) := do
+  return (← takeEvaluatedConsts).map fun (c, n) => (c.toNat - 1, n)
 
 /-- The records of `recordCommandDecls`, newest first. -/
 def declsByCommand : BaseIO (List (Nat × Array Name × NameSet)) :=

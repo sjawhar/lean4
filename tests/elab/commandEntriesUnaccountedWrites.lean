@@ -68,7 +68,8 @@ def mSource : String := "import X\n\
   @[local_add] def d7 : Nat := 0\n\
   @[local_modify] def d8 : Nat := 0\n\
   @[main_add] def d9 : Nat := 0\n\
-  theorem t10 : True := by\n  run_tac Lean.modifyEnv (branchLog.addEntry (asyncDecl := `t10) · `t10)\n  exact trivial\n"
+  elab \"add_t10\" : tactic => Lean.modifyEnv (branchLog.addEntry (asyncDecl := `t10) · `t10)\n\
+  theorem t10 : True := by\n  add_t10\n  exact trivial\n"
 
 /-- Every state of the test's own extensions a later command can read: the checked and the main-branch view of each,
 whatever its registered mode (a write in another mode reaches the other view). -/

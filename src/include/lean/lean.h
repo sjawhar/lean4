@@ -276,6 +276,8 @@ typedef struct {
     // If true, task will not be freed until finished
     uint8_t              m_keep_alive;
     uint8_t              m_deleted;
+    // The task context of the thread that created the task, in force while it runs (`lean_io_set_task_context`)
+    uint32_t             m_context;
 } lean_task_imp;
 
 /* Object of type `Task _`. The lifetime of a `lean_task` object can be represented as a state machine with atomic

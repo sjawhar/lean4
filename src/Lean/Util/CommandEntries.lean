@@ -77,6 +77,10 @@ inductive Refusal where
   /-- Entries recorded for `part` (an extension, a scoped stack or a command cache) that hold a value no `.olean` can
   store (a closure); the payload leaves them out. -/
   | uncompactable (part : Name) (at? : Option Name := none)
+  /-- Code the command evaluated that its environment does not keep (`decl`, `evaluatedByCommand`): code it compiled to
+  evaluate, as `#eval`, `run_cmd`, `run_meta`, `run_elab`, `run_tac` and `by_elab` do, whose effects on process state,
+  files or output no payload carries. -/
+  | ranCode (decl : Name)
   deriving Inhabited, BEq
 
 namespace Refusal
@@ -103,6 +107,7 @@ protected def toString : Refusal → String
   | unrelatedConstMap at? => s!"a constant map that does not extend the one before it{inRecord at?}"
   | commandState field => s!"a change to the command state's {field}"
   | uncompactable part at? => s!"entries for {part} that no .olean can store (a closure){inRecord at?}"
+  | ranCode decl => s!"code it evaluated and discarded ({decl})"
 
 instance : ToString Refusal := ⟨Refusal.toString⟩
 
