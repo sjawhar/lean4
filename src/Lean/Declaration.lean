@@ -529,4 +529,9 @@ end ConstantInfo
 def mkRecName (declName : Name) : Name :=
   Name.mkStr declName "rec"
 
+/-- The name of the `i`-th auxiliary recursor (from 1) the kernel adds for the nested occurrences of a mutual group of
+inductive types whose first type is `indName`. -/
+def mkNestedRecName (indName : Name) (i : Nat) : Name :=
+  (mkRecName indName).appendIndexAfter i
+
 end Lean

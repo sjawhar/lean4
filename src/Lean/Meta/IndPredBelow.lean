@@ -224,7 +224,7 @@ public def mkBelow (indName : Name) : MetaM Unit :=
     let minors := as.extract (recVal.numParams + recVal.numMotives)
     let motiveToIdx := motives.zipIdx.foldl (init := ∅) fun a (e, n) => a.insert e.fvarId! n
     let recNames := indVal.all.toArray.map (· ++ `rec) ++
-      (Array.range' 1 indVal.numNested).map (indVal.all.head! ++ `rec).appendIndexAfter
+      (Array.range' 1 indVal.numNested).map (mkNestedRecName indVal.all.head!)
     let belowNames := indVal.all.toArray.map (· ++ `below) ++
       (Array.range' 1 indVal.numNested).map (indVal.all.head! ++ `below).appendIndexAfter
     let brecOnNames := indVal.all.toArray.map (· ++ `brecOn) ++
