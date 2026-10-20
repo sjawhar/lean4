@@ -21,8 +21,9 @@ STUB="$PWD/stub.sh"
 mkdir -p work && cd work
 export LAKE_ARTIFACT_CACHE=false
 unset LAKE_KEPT_CHECKER LAKE_KEPT_EXCLUDE LAKE_KEPT_CHECKER_TIMEOUT STUB_MODE STUB_VERDICTS
-# The checker needs the usage cutoff, which is off by default: every case turns it on, and the
-# refusal cases unset it or turn it off
+# The checker needs the usage cutoff, which is off by default: every case turns it on, the refusal
+# cases unset it or turn it off, and t55, t55o and t56 turn it off for the builds that write the
+# outputs they test
 export LAKE_USAGE_CUTOFF=1
 
 OUT=.lake/build/lib/lean/P
@@ -668,6 +669,28 @@ test_cmd_fails grep -qx P.B t58.log
 LAKE_USAGE_CUTOFF=false LAKE_KEPT_CHECKER="$STUB" test_err 'needs the usage cutoff' -d t40 build P
 LAKE_USAGE_CUTOFF=false LAKE_KEPT_CHECKER="$STUB" test_err 'needs the usage cutoff' -d t40 setup-file t40/P/C.lean
 
+# Outputs a build without the cutoff wrote (its records are gone, and its trace has other local
+# inputs) are no candidate: the checker is not asked, and the build says why
+mkp t55
+test_run -d t55 build P
+LAKE_USAGE_CUTOFF=0 test_out 'Built P.B' -d t55 build P
+seta t55 2
+export STUB_LOG="$PWD/t55.log"
+LAKE_KEPT_CHECKER="$STUB" test_out 'not asked: its outputs were built without the usage cutoff' -d t55 build P
+match_text 'Built P.B' produced.out
+no_match_text 'Checked' produced.out
+test_exp ! -e t55.log
+
+# The message is for outputs whose local inputs differ in that setting alone: outputs a build without
+# the cutoff wrote whose options changed since compile without it (their own change says why)
+mkp t55o
+LAKE_USAGE_CUTOFF=0 test_run -d t55o build P
+sed_i 's/maxRecDepth = 700/maxRecDepth = 701/' t55o/lakefile.toml
+export STUB_LOG="$PWD/t55o.log"
+LAKE_KEPT_CHECKER="$STUB" test_not_out 'built without the usage cutoff' -d t55o build P
+match_text 'Built P.B' produced.out
+test_exp ! -e t55o.log
+
 # Interrupting Lake (`SIGINT` to its process group, as a terminal's Ctrl-C does) while the checker is
 # busy: the checker, in a session of its own, does not get the signal, but its standard input reaches
 # its end when Lake dies, and it stops (as the stub does in `mute-once`); it never held the workspace
@@ -714,6 +737,20 @@ test_cmd_fails grep -q 'waiting for another Lake process' t51nb.out
 
 # With the artifact cache
 export LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true
+
+# Outputs a build without the cutoff wrote, restored from the cache (their trace records no inputs),
+# are no candidate either, and the build says why
+export LAKE_CACHE_DIR="$PWD/cache56"
+mkp t56a
+LAKE_USAGE_CUTOFF=0 test_run -d t56a build P
+mkp t56
+LAKE_USAGE_CUTOFF=0 test_not_out 'Built P.B' -d t56 build P
+seta t56 2
+export STUB_LOG="$PWD/t56.log"
+LAKE_ARTIFACT_CACHE=false LAKE_KEPT_CHECKER="$STUB" \
+  test_out 'not asked: its outputs were built without the usage cutoff' -d t56 build P
+match_text 'Built P.B' produced.out
+test_exp ! -e t56.log
 
 # An accepted module's outputs are published for its new input, marked kept, and a second
 # checkout restores them with the marks
