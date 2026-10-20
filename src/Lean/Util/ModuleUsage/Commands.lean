@@ -391,10 +391,11 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
     quotSet := obs.before.usedQuotCtxts
     let before := obs.before.env.checked.get
     let after := obs.after.env.checked.get
-    let added : NameSet := match before.constants.sharedDiff? after.constants with
-      | some (changed, _) => changed.foldl (init := {}) fun (s : NameSet) (n, _) =>
-        if before.constants.contains n then s else s.insert n
-      | none => after.constants.foldStage2 (fun (s : NameSet) n _ =>
+    -- through the map of the module's own constants (`map₂`), when the imported part is unchanged
+    let added : NameSet := if SharedDiff.sameObject before.constants.map₁ after.constants.map₁ then
+        (PersistentHashMap.sharedDiff before.constants.map₂ after.constants.map₂).1.foldl (init := {})
+          fun (s : NameSet) (n, _) => if before.constants.contains n then s else s.insert n
+      else after.constants.foldStage2 (fun (s : NameSet) n _ =>
         if before.constants.contains n then s else s.insert n) {}
     let addedNames := added.toArray.qsort Name.quickLt
     let decls := addedNames.filter (!isAuxName env ·)
