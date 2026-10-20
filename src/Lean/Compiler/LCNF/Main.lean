@@ -136,11 +136,6 @@ private unsafe def isBuiltinCompilerUnsafe (manager : PassManager)
 @[implemented_by isBuiltinCompilerUnsafe]
 private opaque isBuiltinCompiler (manager : PassManager) (folders : SMap Name Simp.ConstantFold.Folder) : Bool
 
-set_option compiler.ignoreBorrowAnnotation true in
-/-- `Lean.recordCompiledNames`, private to its module so that only the compiler records the names it created. -/
-@[extern "lean_usage_record_compiled_names"]
-private opaque recordCompiledNames (inputs names : Array Name) : BaseIO Unit
-
 namespace PassManager
 
 partial def run (declNames : Array Name) (baseOpts : Options) : CompilerM Unit := withAtLeastMaxRecDepth 8192 do
@@ -158,8 +153,6 @@ partial def run (declNames : Array Name) (baseOpts : Options) : CompilerM Unit :
     -- the only place where that walk is guaranteed to succeed, so consumers rely on the persisted
     -- result. This could be postponed as well but the added complexity is likely not worth the
     -- slight gain in rebuild avoidance/parallelism.
-    -- Records no created names (`recordCompiledNames`), so the usage data counts any compiler-only name this
-    -- produces as a claim (`foreignClaims`), which only rebuilds more.
     compileInductives declNames
     return
 
@@ -236,10 +229,7 @@ partial def run (declNames : Array Name) (baseOpts : Options) : CompilerM Unit :
       -- or consider running clear? unclear
       profileitM Exception "compilation (IR)" (← getOptions) do
         let irDecls ← IR.toIR decls
-        let compiled ← IR.compile irDecls
-        -- The usage data counts a compiler-only name as the module's own only if a compile of its own constants
-        -- created it.
-        recordCompiledNames declNames (decls.map (·.name) ++ compiled.map (·.name))
+        discard <| IR.compile irDecls
 where
   runPassManagerPart (inPhase outPhase : Purity) (profilerName : String)
       (passes : Array Pass) (decls : Array (Decl inPhase)) (isCheckEnabled : Bool) :
