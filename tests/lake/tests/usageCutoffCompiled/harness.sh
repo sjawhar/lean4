@@ -453,21 +453,21 @@ red_order_s1() { order_x Z2 Z1; }
 
 # A specialization-cache miss that becomes a hit. `M` specializes `myMap k` itself; then `Y`, which `M` imports
 # but uses nothing of, starts specializing the same call, so a fresh `M` reuses `Y`'s specialization instead.
-# `M` is built again (`perkey_provider`). With a constant folder for `k` registered in `Z` (`d2_folder`), which
+# `M` is built again (`perkey_provider`). With a constant folder for `k` registered in `Z` (`perkey_provider_folder`), which
 # `Y` does not import and which is not meaning-preserving (it returns 42), the two specializations compute
 # different things as well.
-d2_files() {
+perkey_files() {
   lakefile_app; mkdir_t
   printf 'namespace T\n@[noinline] def k (n : Nat) : Nat := n + 1\n' > T/B.lean
   printf '@[specialize] def myMap (f : Nat → Nat) : List Nat → List Nat\n  | [] => []\n' >> T/B.lean
   printf '  | x :: xs => f x :: myMap f xs\nend T\n' >> T/B.lean
-  d2_y ''
+  perkey_y ''
   printf 'import T.B\n%simport T.Y\nnamespace T\ndef h : List Nat := myMap k [1, 2, 3]\nend T\n' "$1" > T/M.lean
   printf 'import T.M\ndef main : IO Unit := IO.println T.h\n' > Main.lean
 }
-d2_y() { printf 'import T.B\nnamespace T\ndef y0 : Nat := 0\n%send T\n' "$1" > T/Y.lean; }
-d2_folder_s0() {
-  d2_files $'import T.Z\n'
+perkey_y() { printf 'import T.B\nnamespace T\ndef y0 : Nat := 0\n%send T\n' "$1" > T/Y.lean; }
+perkey_provider_folder_s0() {
+  perkey_files $'import T.Z\n'
   cat > T/Z.lean <<'EOF'
 import Lean
 import T.B
@@ -478,44 +478,44 @@ def myFolder : Folder := fun args => do
 run_meta registerFolder ``T.k ``myFolder
 EOF
 }
-d2_folder_s1() { d2_y $'def y : List Nat := myMap k [0]\n'; }
+perkey_provider_folder_s1() { perkey_y $'def y : List Nat := myMap k [0]\n'; }
 
 # The compiler's passes and folders stay the built-in ones when `M` imports `Lean` (`flag_off_lean`) or a module
 # that only reads the folder table (`flag_off_reader`). State 1 adds a definition to the imported `Y` that `M`
 # does not use and that provides no key `M` looked up, so `M` is replayed.
-flag_off_lean_s0() { d2_files $'import Lean\n'; }
-flag_off_lean_s1() { d2_y $'def yUnused : Nat := 1\n'; }
+flag_off_lean_s0() { perkey_files $'import Lean\n'; }
+flag_off_lean_s1() { perkey_y $'def yUnused : Nat := 1\n'; }
 flag_off_lean_c_check() { grep -qE 'Replayed T\.M( |$)' ../flag_off_lean.1.log; }
 flag_off_reader_s0() {
-  d2_files $'import Lean\nimport T.R\n'
+  perkey_files $'import Lean\nimport T.R\n'
   printf 'import Lean\nopen Lean Lean.Compiler.LCNF.Simp.ConstantFold\nrun_meta do\n  let _ ← getFolders\n  pure ()\n' \
     > T/R.lean
 }
-flag_off_reader_s1() { d2_y $'def yUnused : Nat := 1\n'; }
+flag_off_reader_s1() { perkey_y $'def yUnused : Nat := 1\n'; }
 flag_off_reader_c_check() { grep -qE 'Replayed T\.M( |$)' ../flag_off_reader.1.log; }
 
 # `Main` inlines `M.g`, whose body calls the specialization `M` creates: `M` is built again, so `Main` is too and
 # calls `Y`'s, as a fresh build does.
-d2_down_s0() {
-  d2_files ''
+perkey_provider_inl_s0() {
+  perkey_files ''
   printf 'import T.B\nimport T.Y\nnamespace T\ndef g (xs : List Nat) : List Nat := myMap k xs\nend T\n' > T/M.lean
   printf 'import T.M\ndef main : IO Unit := IO.println (T.g [1, 2, 3])\n' > Main.lean
 }
-d2_down_s1() { d2_folder_s1; }
+perkey_provider_inl_s1() { perkey_provider_folder_s1; }
 
 # The same when `Main`'s source also changes in state 1.
-d2_down_rebuilt_s0() { d2_down_s0; }
-d2_down_rebuilt_s1() {
-  d2_down_s1
+perkey_provider_inl_edit_s0() { perkey_provider_inl_s0; }
+perkey_provider_inl_edit_s1() {
+  perkey_provider_inl_s1
   printf 'import T.M\ndef unused : Nat := 1\ndef main : IO Unit := IO.println (T.g [1, 2, 3])\n' > Main.lean
 }
 
 # Compiler passes and folders from other sources than an imported module's entries: `M` registers a folder
-# itself (`f3_own_folder`) or declares a `@[cpass]` itself (`f3_own_cpass`), or `Y`, imported but unused,
-# installs a folder (`f3_runtime_folder`) or a pass (`f3_runtime_cpass`) by writing the extension state
+# itself (`nonbuiltin_own_folder`) or declares a `@[cpass]` itself (`nonbuiltin_own_cpass`), or `Y`, imported but unused,
+# installs a folder (`nonbuiltin_ext_folder`) or a pass (`nonbuiltin_ext_cpass`) by writing the extension state
 # directly, with no entry, before it specializes the same call. Each time a fresh `M` differs from the kept
 # one, by behaviour or by which specialization it calls.
-f3_files() {
+nonbuiltin_files() {
   lakefile_app; mkdir_t
   printf 'namespace T\n@[noinline] def k (n : Nat) : Nat := n + 1\n' > T/B.lean
   printf '@[specialize] def myMap (f : Nat → Nat) : List Nat → List Nat\n  | [] => []\n' >> T/B.lean
@@ -523,8 +523,8 @@ f3_files() {
   printf 'import T.B\nnamespace T\ndef y0 : Nat := 0\nend T\n' > T/Y.lean
   printf 'import T.M\ndef main : IO Unit := IO.println T.h\n' > Main.lean
 }
-f3_own_folder_s0() {
-  f3_files
+nonbuiltin_own_folder_s0() {
+  nonbuiltin_files
   cat > T/Z.lean <<'EOF'
 import Lean
 open Lean.Compiler.LCNF.Simp.ConstantFold
@@ -544,9 +544,9 @@ def h : List Nat := myMap k [1, 2, 3]
 end T
 EOF
 }
-f3_own_folder_s1() { d2_folder_s1; }
-f3_own_cpass_s0() {
-  f3_files
+nonbuiltin_own_folder_s1() { perkey_provider_folder_s1; }
+nonbuiltin_own_cpass_s0() {
+  nonbuiltin_files
   cat > T/M.lean <<'EOF'
 import Lean
 import T.B
@@ -559,8 +559,8 @@ def h : List Nat := myMap k [1, 2, 3]
 end T
 EOF
 }
-f3_own_cpass_s1() { d2_folder_s1; }
-f3_y() {
+nonbuiltin_own_cpass_s1() { perkey_provider_folder_s1; }
+nonbuiltin_y() {
   cat > T/Y.lean <<EOF
 import Lean
 import T.B
@@ -577,18 +577,18 @@ $2
 end T
 EOF
 }
-f3_runtime_m() {
-  f3_files; f3_y '' ''
+nonbuiltin_ext_m() {
+  nonbuiltin_files; nonbuiltin_y '' ''
   printf 'import T.B\nimport T.Y\nnamespace T\ndef h : List Nat := myMap k [1, 2, 3]\nend T\n' > T/M.lean
 }
-f3_runtime_folder_s0() { f3_runtime_m; }
-f3_runtime_folder_s1() {
-  f3_y 'run_meta modifyEnv fun env => folderExt.modifyState env fun (es, m) => (es, m.insert ``T.k myFolder)' \
+nonbuiltin_ext_folder_s0() { nonbuiltin_ext_m; }
+nonbuiltin_ext_folder_s1() {
+  nonbuiltin_y 'run_meta modifyEnv fun env => folderExt.modifyState env fun (es, m) => (es, m.insert ``T.k myFolder)' \
     'def y : List Nat := myMap k [0]'
 }
-f3_runtime_cpass_s0() { f3_runtime_m; }
-f3_runtime_cpass_s1() {
-  f3_y $'run_meta do\n  let m ← PassInstaller.run (← getPassManager) myInstaller\n  modifyEnv fun env => passManagerExt.modifyState env fun (ns, _) => (ns, m)' \
+nonbuiltin_ext_cpass_s0() { nonbuiltin_ext_m; }
+nonbuiltin_ext_cpass_s1() {
+  nonbuiltin_y $'run_meta do\n  let m ← PassInstaller.run (← getPassManager) myInstaller\n  modifyEnv fun env => passManagerExt.modifyState env fun (ns, _) => (ns, m)' \
     'def y : List Nat := myMap k [0]'
 }
 
@@ -637,8 +637,8 @@ hk_ctl_s1() { printf 'namespace T\ndef f0 : Nat := 0\ndef other : Nat := 0\nend 
 
 # A specialization-cache entry written through the public `cacheSpec`, not by the specializer: `Y`, which `M`
 # uses nothing of, maps the key of `M`'s own specialization of `myMap k` to `evil`, which adds 100
-# (`f1_cachespec`). With the entry there from state 0, `M` hits it, so the hit is recorded and an edit to `evil`
-# rebuilds `M` (`f1_cachespec_hit`).
+# (`cachespec_added`). With the entry there from state 0, `M` hits it, so the hit is recorded and an edit to `evil`
+# rebuilds `M` (`cachespec_hit_edit`).
 cs_files() {
   lakefile_app; mkdir_t
   printf 'namespace T\n@[noinline] def k (n : Nat) : Nat := n + 1\n' > T/B.lean
@@ -652,10 +652,10 @@ cs_y() {
   printf '@[noinline] def evil (xs : List Nat) : List Nat := xs.map (· + %s)\nend T\n%s' "$1" "$2" >> T/Y.lean
 }
 cs_entry='run_meta Lean.Compiler.LCNF.Specialize.cacheSpec (mkApp (mkConst ``T.myMap) (mkConst ``T.k)) ``T.evil'
-f1_cachespec_s0() { cs_files; cs_y 100 ''; }
-f1_cachespec_s1() { cs_y 100 "$cs_entry"$'\n'; }
-f1_cachespec_hit_s0() { cs_files; cs_y 100 "$cs_entry"$'\n'; }
-f1_cachespec_hit_s1() { cs_y 200 "$cs_entry"$'\n'; }
+cachespec_added_s0() { cs_files; cs_y 100 ''; }
+cachespec_added_s1() { cs_y 100 "$cs_entry"$'\n'; }
+cachespec_hit_edit_s0() { cs_files; cs_y 100 "$cs_entry"$'\n'; }
+cachespec_hit_edit_s1() { cs_y 200 "$cs_entry"$'\n'; }
 
 # `A.f` keeps its LCNF body `g n + 1` but registers IR that adds 50. `Y`'s specialization of `run k` inlines
 # `f`'s body; `M`, where a local attribute stops specializing `f`, calls `f`'s IR. Once `Y` adds the same key, a
@@ -845,13 +845,13 @@ run_meta do
 }
 
 # Outside writes to the entries of `Y`'s specialization, which a fresh `M` reads when it reuses it: an
-# `@[extern]` attribute set on the specialization's name before it exists (`tl_pre_extern`, `tl2_pre_extern` with
+# `@[extern]` attribute set on the specialization's name before it exists (`pre_extern`, `pre_extern_app` with
 # the key `lcnf_override` uses). A kept `M` must match a fresh `M`, which reuses `Y`'s specialization and so reads
 # the written value.
-tl_y() { cat > T/Y.lean; }
-tl_pre_extern_s0() { wh_files; }
-tl_pre_extern_s1() {
-  tl_y <<'EOF'
+pre_extern_y() { cat > T/Y.lean; }
+pre_extern_s0() { wh_files; }
+pre_extern_s1() {
+  pre_extern_y <<'EOF'
 import Lean
 import T.B
 namespace T
@@ -869,9 +869,9 @@ def yb : Bool := anyP k2 [7]
 end T
 EOF
 }
-tl2_pre_extern_s0() { lo_files; lo_y '' ''; }
-tl2_pre_extern_s1() {
-  tl_y <<'EOF'
+pre_extern_app_s0() { lo_files; lo_y '' ''; }
+pre_extern_app_s1() {
+  pre_extern_y <<'EOF'
 import Lean
 import T.B
 namespace T
@@ -1198,67 +1198,67 @@ folder_removal_s1() { folder_z ''; }
 
 # Code the interpreter runs while `B` elaborates, defined in `A` and reached from `B` only through the
 # extension that registers it. State 1 changes the behaviour of `A`'s code, not what `B` names, so `B` has to
-# be elaborated again. `r4_main` adds the executable that prints `b`, or one that prints nothing.
-r4_main() {
+# be elaborated again. `interp_main` adds the executable that prints `b`, or one that prints nothing.
+interp_main() {
   lakefile_app; mkdir_t
   printf 'import T.B\ndef main : IO Unit := %s\n' "${1:-pure ()}" > Main.lean
 }
 
 # A simproc, tried first on `foo _` by `B`'s `simp`, logs a number and rewrites `foo n` to `n`.
-r4_simproc_a() {
+interp_simproc_a() {
   printf 'import Lean\nopen Lean Meta Simp\ndef foo (n : Nat) : Nat := n\nsimproc ↓ reduceFoo (foo _) := fun e => do\n  logInfo "simproc %s"\n  return .done { expr := e.appArg! }\n' "$1" > T/A.lean
 }
-r4_simproc_s0() {
-  r4_main; r4_simproc_a 10
+interp_simproc_s0() {
+  interp_main; interp_simproc_a 10
   printf 'import T.A\ntheorem t : foo 3 = 3 := by simp only [reduceFoo]\n' > T/B.lean
 }
-r4_simproc_s1() { r4_simproc_a 20; }
+interp_simproc_s1() { interp_simproc_a 20; }
 
 # A parser: `A` declares `##` left-associative and then right-associative, which parses `B`'s
 # `100 ## 20 ## 3` into another term.
-r4_parser_a() { printf 'infix%s:65 " ## " => Nat.sub\n' "$1" > T/A.lean; }
-r4_parser_s0() {
-  r4_main 'IO.println b'; r4_parser_a l
+interp_parser_a() { printf 'infix%s:65 " ## " => Nat.sub\n' "$1" > T/A.lean; }
+interp_parser_s0() {
+  interp_main 'IO.println b'; interp_parser_a l
   printf 'import T.A\n@[noinline] def b : Nat := 100 ## 20 ## 3\n' > T/B.lean
 }
-r4_parser_s1() { r4_parser_a r; }
+interp_parser_s1() { interp_parser_a r; }
 
 # A tactic that closes a goal with a number.
-r4_tactic_a() {
+interp_tactic_a() {
   printf 'import Lean\nopen Lean Elab Tactic\nelab "mynum" : tactic => do\n  let g ← getMainGoal\n  g.assign (mkNatLit %s)\n  replaceMainGoal []\n' "$1" > T/A.lean
 }
-r4_tactic_s0() {
-  r4_main 'IO.println b'; r4_tactic_a 10
+interp_tactic_s0() {
+  interp_main 'IO.println b'; interp_tactic_a 10
   printf 'import T.A\n@[noinline] def b : Nat := by mynum\n' > T/B.lean
 }
-r4_tactic_s1() { r4_tactic_a 20; }
+interp_tactic_s1() { interp_tactic_a 20; }
 
 # A term elaborator that returns a number.
-r4_elab_a() { printf 'import Lean\nopen Lean Elab Term\nelab "mynum" : term => return mkNatLit %s\n' "$1" > T/A.lean; }
-r4_elab_s0() {
-  r4_main 'IO.println b'; r4_elab_a 10
+interp_term_elab_a() { printf 'import Lean\nopen Lean Elab Term\nelab "mynum" : term => return mkNatLit %s\n' "$1" > T/A.lean; }
+interp_term_elab_s0() {
+  interp_main 'IO.println b'; interp_term_elab_a 10
   printf 'import T.A\n@[noinline] def b : Nat := mynum\n' > T/B.lean
 }
-r4_elab_s1() { r4_elab_a 20; }
+interp_term_elab_s1() { interp_term_elab_a 20; }
 
 # A delaborator for `foo` prints it as another name. A delaborator affects neither a kernel term nor compiled
 # code, so the only result of `B` to follow it is the message `#check` logs.
-r4_delab_a() {
+interp_delab_a() {
   printf 'import Lean\nopen Lean PrettyPrinter Delaborator SubExpr\ndef foo (n : Nat) : Nat := n\n@[delab app.foo] def delabFoo : Delab := do\n  guard <| (← getExpr).getAppNumArgs == 1\n  let x ← withAppArg delab\n  `(foo%s $x)\n' "$1" > T/A.lean
 }
-r4_delab_s0() {
-  r4_main; r4_delab_a 10
+interp_delab_s0() {
+  interp_main; interp_delab_a 10
   printf 'import T.A\n#check foo 3\n' > T/B.lean
 }
-r4_delab_s1() { r4_delab_a 20; }
+interp_delab_s1() { interp_delab_a 20; }
 
 # `B` runs `#eval` on a function of `A`, which changes what it computes; `B`'s message is the result.
-r4_eval_a() { printf 'def val (n : Nat) : Nat := n + %s\n' "$1" > T/A.lean; }
-r4_eval_s0() {
-  r4_main; r4_eval_a 10
+interp_eval_cmd_a() { printf 'def val (n : Nat) : Nat := n + %s\n' "$1" > T/A.lean; }
+interp_eval_cmd_s0() {
+  interp_main; interp_eval_cmd_a 10
   printf 'import T.A\n#eval val 1\n' > T/B.lean
 }
-r4_eval_s1() { r4_eval_a 20; }
+interp_eval_cmd_s1() { interp_eval_cmd_a 20; }
 
 # Binder names of an inlined or specialized body reach the importer's C file: a `fun` binder lifted to its own
 # function (`binder_fun`), the parameter of a join point that a local function used twice in tail position
@@ -1560,9 +1560,9 @@ hard_rejected() { grep -q 'attempt rejected' "../$1.1.log"; }
 hard_m() {
   printf 'import T.B\nimport T.Y\n%snamespace T\ndef h : List Nat := myMap k [1, 2, 3]\nend T\n%s' "${1:-}" "${2:-}" > T/M.lean
 }
-hard_recording_s0() { f3_files; f3_y "$(hard_try 'run_meta Lean.usageRecordingRef.set false')" ''; hard_m; }
+hard_recording_s0() { nonbuiltin_files; nonbuiltin_y "$(hard_try 'run_meta Lean.usageRecordingRef.set false')" ''; hard_m; }
 hard_recording_s1() {
-  f3_y "$(hard_try 'run_meta Lean.usageRecordingRef.set false')" 'def y : List Nat := myMap k [0]'
+  nonbuiltin_y "$(hard_try 'run_meta Lean.usageRecordingRef.set false')" 'def y : List Nat := myMap k [0]'
 }
 hard_recording_c_check() { hard_rejected hard_recording && grep -qE 'Built T\.M( |$)' ../hard_recording.1.log; }
 
@@ -1623,16 +1623,16 @@ hard_extramod_s1() { hard_extramod_a 20; }
 hard_extramod_c_check() { hard_rejected hard_extramod; }
 
 hard_moduleext_s0() {
-  f3_files; f3_y '' ''
+  nonbuiltin_files; nonbuiltin_y '' ''
   hard_m $'import Lean\n' "$(hard_try 'run_meta modifyEnv fun env => Lean.ModuleUsage.ext.modifyState (asyncMode := .mainOnly) env fun s => { s with importedModuleEntries := #[] }')"
 }
-hard_moduleext_s1() { f3_y '' 'def y : List Nat := myMap k [0]'; }
+hard_moduleext_s1() { nonbuiltin_y '' 'def y : List Nat := myMap k [0]'; }
 hard_moduleext_c_check() { hard_rejected hard_moduleext && grep -qE 'Built T\.M( |$)' ../hard_moduleext.1.log; }
 
 hard_speclookups_s0() {
-  f3_files; f3_y '' ''; hard_m $'import Lean\n' "$(hard_try 'run_meta Lean.specLookupsRef.set #[]')"
+  nonbuiltin_files; nonbuiltin_y '' ''; hard_m $'import Lean\n' "$(hard_try 'run_meta Lean.specLookupsRef.set #[]')"
 }
-hard_speclookups_s1() { f3_y '' 'def y : List Nat := myMap k [0]'; }
+hard_speclookups_s1() { nonbuiltin_y '' 'def y : List Nat := myMap k [0]'; }
 hard_speclookups_c_check() { hard_rejected hard_speclookups && grep -qE 'Built T\.M( |$)' ../hard_speclookups.1.log; }
 
 hard_compilercode_s0() { fold_env_s0; hard_try 'run_meta Lean.compilerCodeRef.set false' >> T/M.lean; }
@@ -1643,10 +1643,10 @@ hard_compilercode_c_check() { hard_rejected hard_compilercode && grep -qE 'Built
 # every lookup of that compile: `M`'s usage data then depends on every import, and a change to `Y` that `M` does not
 # use and that provides no key `M` looked up builds `M` again.
 rp_own_s0() {
-  f3_files; f3_y '' ''
+  nonbuiltin_files; nonbuiltin_y '' ''
   hard_m $'import Lean\nrun_meta Lean.modifyEnv fun env => Lean.reservedNamePredicatesExt.modifyState (log := .unlogged) env (·.push fun _ _ => false)\n'
 }
-rp_own_s1() { f3_y '' 'def yOther : Nat := 1'; }
+rp_own_s1() { nonbuiltin_y '' 'def yOther : Nat := 1'; }
 rp_own_c_check() { grep -qE 'Built T\.M( |$)' ../rp_own.1.log; }
 
 ## Tables a module writes through public functions.
@@ -1762,7 +1762,7 @@ cov_recarg_rev_s1() {
 ## Outside writes before the compile, compiler-only names that shadow constants, and the keys a module looked up.
 
 # A dead-branch summary written before the compile that produces `Y`'s specialization of `anyP k2`, which the
-# compile does not overwrite (`pre_summary`; `tl_pre_extern` does the same with an `@[extern]` attribute). A
+# compile does not overwrite (`pre_summary`; `pre_extern` does the same with an `@[extern]` attribute). A
 # fresh `M` reuses `Y`'s specialization and reads it.
 pre_y() {
   cat > T/Y.lean <<EOF
@@ -1855,40 +1855,40 @@ shadow2_s1() { sh_y "$sh_copy"; }
 # specialization of `myMap` at a lambda that `M` never specializes it at (`perkey_unrelated_spec`): `M` is
 # replayed. `Y` gains one at `k`, exactly the key `M` looked up and specialized itself (`perkey_provider`): `M`
 # is built, and, like everything else, matches the fresh build.
-perkey_unrelated_spec_s0() { d2_files ''; }
-perkey_unrelated_spec_s1() { d2_y $'def y : List Nat := myMap (· + 1) [0]\n'; }
+perkey_unrelated_spec_s0() { perkey_files ''; }
+perkey_unrelated_spec_s1() { perkey_y $'def y : List Nat := myMap (· + 1) [0]\n'; }
 perkey_unrelated_spec_c_check() { grep -qE 'Replayed T\.M( |$)' ../perkey_unrelated_spec.1.log; }
-perkey_provider_s0() { d2_files ''; }
-perkey_provider_s1() { d2_folder_s1; }
+perkey_provider_s0() { perkey_files ''; }
+perkey_provider_s1() { perkey_provider_folder_s1; }
 perkey_provider_c_check() { grep -qE 'Built T\.M( |$)' ../perkey_provider.1.log; }
 
 # Two entries of one provider, or two spellings of one key, decide which specialization a fresh `M` reuses; a
 # kept `M` must match the fresh build. `Y` provides entries for the key `M` looks up (`myMap k`): two for the same
-# key, whose order swaps in state 1 (`r3_order`: the last one wins), or one that is `mdata`-wrapped
-# (`r3_mdata_rev`: the entry is a different key from `M`'s, so state 1 stops `M` hitting it).
-r3_key='(mkApp (mkConst ``T.myMap) (mkConst ``T.k))'
+# key, whose order swaps in state 1 (`cachespec_order`: the last one wins), or one that is `mdata`-wrapped
+# (`cachespec_mdata_miss`: the entry is a different key from `M`'s, so state 1 stops `M` hitting it).
+cachespec_key='(mkApp (mkConst ``T.myMap) (mkConst ``T.k))'
 # `T.NAME (xs : List Nat) := xs.map (· + N)`
-r3_ev() { printf '@[noinline] def %s (xs : List Nat) : List Nat := xs.map (· + %s)\n' "$1" "$2"; }
+cachespec_target() { printf '@[noinline] def %s (xs : List Nat) : List Nat := xs.map (· + %s)\n' "$1" "$2"; }
 # `cacheSpec KEY T.NAME`
-r3_cs() { printf 'run_meta Lean.Compiler.LCNF.Specialize.cacheSpec %s ``T.%s\n' "$1" "$2"; }
+cachespec_cmd() { printf 'run_meta Lean.Compiler.LCNF.Specialize.cacheSpec %s ``T.%s\n' "$1" "$2"; }
 # `Y`: `$1` inside `namespace T`, `$2` at top level
-r3_y() {
+cachespec_entries_y() {
   { printf 'import Lean\nimport T.B\nopen Lean\nnamespace T\ndef y0 : Nat := 0\n'
     printf '%s\n' "$1"
     printf 'end T\n'
     printf '%s\n' "$2"; } > T/Y.lean
 }
-r3_ab() { r3_ev evA 100; r3_ev evB 200; }
-r3_order_s0() { cs_files; r3_y "$(r3_ab)" "$(r3_cs "$r3_key" evA; r3_cs "$r3_key" evB)"; }
-r3_order_s1() { r3_y "$(r3_ab)" "$(r3_cs "$r3_key" evB; r3_cs "$r3_key" evA)"; }
-r3_mdata_rev_s0() { cs_files; r3_y "$(r3_ev evil 100)" "$(r3_cs "$r3_key" evil)"; }
-r3_mdata_rev_s1() { r3_y "$(r3_ev evil 100)" "$(r3_cs "(mkMData {} $r3_key)" evil)"; }
+cachespec_two_targets() { cachespec_target evA 100; cachespec_target evB 200; }
+cachespec_order_s0() { cs_files; cachespec_entries_y "$(cachespec_two_targets)" "$(cachespec_cmd "$cachespec_key" evA; cachespec_cmd "$cachespec_key" evB)"; }
+cachespec_order_s1() { cachespec_entries_y "$(cachespec_two_targets)" "$(cachespec_cmd "$cachespec_key" evB; cachespec_cmd "$cachespec_key" evA)"; }
+cachespec_mdata_miss_s0() { cs_files; cachespec_entries_y "$(cachespec_target evil 100)" "$(cachespec_cmd "$cachespec_key" evil)"; }
+cachespec_mdata_miss_s1() { cachespec_entries_y "$(cachespec_target evil 100)" "$(cachespec_cmd "(mkMData {} $cachespec_key)" evil)"; }
 
 # Specialization keys that differ only in `mdata`, with no abuse of the public API: a borrowed-annotated function
 # type is `mdata` in an LCNF type, so the defeq aliases `F1` and `F2` give such keys. `Y` specializes `app1` at
 # `F2` (`@& Nat → Nat`) and `M` at `F1` (`Nat → Nat`), so `M` specializes itself. In state 1 `Y` specializes at
 # `F1`, so a fresh `M` reuses `Y`'s specialization, and a kept `M` must match it.
-r3_nat_s0() {
+mdata_key_borrow_s0() {
   lakefile_app; mkdir_t
   printf 'namespace T\n@[noinline] def k (n : Nat) : Nat := n + 1\nabbrev F1 := Nat → Nat\nabbrev F2 := (@& Nat) → Nat\n' > T/B.lean
   printf '@[specialize, noinline] def app1 {α : Type} (f : α → Nat) (a : α) : Nat := f a + 1\nend T\n' >> T/B.lean
@@ -1896,12 +1896,12 @@ r3_nat_s0() {
   printf 'import T.B\nimport T.Y\nnamespace T\ndef m : Nat := app1 (α := F1) (fun g => g 1) k\nend T\n' > T/M.lean
   printf 'import T.M\ndef main : IO Unit := IO.println (T.m + T.y)\n' > Main.lean
 }
-r3_nat_s1() { printf 'import T.B\nnamespace T\ndef y : Nat := app1 (α := F1) (fun g => g 1) k\nend T\n' > T/Y.lean; }
+mdata_key_borrow_s1() { printf 'import T.B\nnamespace T\ndef y : Nat := app1 (α := F1) (fun g => g 1) k\nend T\n' > T/Y.lean; }
 
-# As `r3_nat`, made observable: the key is `app3 (fun g => g 1) k` with `F1` or `F2` as the type of `g`, and `Z`
+# As `mdata_key_borrow`, made observable: the key is `app3 (fun g => g 1) k` with `F1` or `F2` as the type of `g`, and `Z`
 # (imported by `M` only) registers a folder that rewrites `k _` to 42 inside the specialized body, so `M`'s own
 # specialization computes 44 where `Y`'s computes 8.
-r3_natg_s0() {
+mdata_key_borrow_folder_s0() {
   lakefile_app; mkdir_t
   printf 'namespace T\n@[noinline] def k (n : Nat) : Nat := n + 1\nabbrev F1 := Nat → Nat\nabbrev F2 := (@& Nat) → Nat\n' > T/B.lean
   printf '@[specialize, noinline] def app3 (h : F1 → Nat) (f : Nat → Nat) (n : Nat) : Nat := f n + h (fun x => x + 1)\nend T\n' >> T/B.lean
@@ -1910,7 +1910,7 @@ r3_natg_s0() {
   printf 'import T.M\ndef main : IO Unit := IO.println (T.m)\n' > Main.lean
   printf 'import Lean\nimport T.B\nopen Lean.Compiler.LCNF.Simp.ConstantFold\ndef myFolder : Folder := fun args => do\n  let #[_] := args | return none\n  return some (.lit (.nat 42))\nrun_meta registerFolder ``T.k ``myFolder\n' > T/Z.lean
 }
-r3_natg_s1() { printf 'import T.B\nnamespace T\ndef y : Nat := app3 (fun (g : F1) => g 1) k 5\nend T\n' > T/Y.lean; }
+mdata_key_borrow_folder_s1() { printf 'import T.B\nnamespace T\ndef y : Nat := app3 (fun (g : F1) => g 1) k 5\nend T\n' > T/Y.lean; }
 
 # A `@&` annotation the compiler reads from a declaration that has no compiled code of its own, so that only the
 # declaration's type or value changes in state 1: the compiler eta-expands a projection (`borrow_proj`) or a
@@ -2114,24 +2114,24 @@ all_cases="spec_transitive spec_link spec_type spec_precomp plugin_replay csimp_
   collide_first collide_after collide_rev collide_rev_first collide_drop_loser collide_shape collide_shape_rev
   hard_recording hard_moduleext hard_speclookups hard_compilercode rp_own
   hard_usedbychecks hard_declconsts
-  hard_extramod d2_down
-  class_same class_cross nospec_type folder_cross reducible_cross binder_inline d2_folder
+  hard_extramod perkey_provider_inl
+  class_same class_cross nospec_type folder_cross reducible_cross binder_inline perkey_provider_folder
   local_inst_own erase_inst_own scoped_inst local_red_own2 local_red_own3 scoped_red_own
   table_order folder_order red_order
-  flag_off_lean flag_off_reader f3_own_folder f3_own_cpass f3_runtime_folder f3_runtime_cpass fold_env cpass_env
+  flag_off_lean flag_off_reader nonbuiltin_own_folder nonbuiltin_own_cpass nonbuiltin_ext_folder nonbuiltin_ext_cpass fold_env cpass_env
   hk_fail hk_opt hk_ctl
-  f1_cachespec f1_cachespec_hit premise_ir ir_count ir_count_nd lcnf_override d2_down_rebuilt
+  cachespec_added cachespec_hit_edit premise_ir ir_count ir_count_nd lcnf_override perkey_provider_inl_edit
   collide_boxed_trans irdup_first irdup_after claim_ns claim_nsb claim_nsb_priv negfail_scoped abi_mix abi_void
   abi_enum abi_monotype
-  wh_ctrl wh_summary wh_extern wh_implby wh_sig tl_pre_extern tl2_pre_extern
+  wh_ctrl wh_summary wh_extern wh_implby wh_sig pre_extern pre_extern_app
   ir_eval macro_eval init_eval
   inl_small inl_inline inl_instance spec_nested spec_derived spec_local spec_renumber
   implemented_by csimp extern export noncomputable partial_body unsafe_body boxed_version structure_eta
   instance_reducible reducible macro_inline_instance inline_instance specialize_args closed_extraction
   decl_map enum_repr noinline_attr aux_local struct_repr
-  outparam_pos folder_removal r4_simproc r4_parser r4_tactic r4_elab r4_delab r4_eval
+  outparam_pos folder_removal interp_simproc interp_parser interp_tactic interp_term_elab interp_delab interp_eval_cmd
   binder_fun binder_jp binder_param owner_macro owner_boxed owner_move binder_info_param binder_info_type
-  pre_summary ng ng_ctrl shadow shadow2 perkey_unrelated_spec perkey_provider r3_order r3_mdata_rev r3_nat r3_natg
+  pre_summary ng ng_ctrl shadow shadow2 perkey_unrelated_spec perkey_provider cachespec_order cachespec_mdata_miss mdata_key_borrow mdata_key_borrow_folder
   borrow_proj borrow_ctor borrow_alias tc_hint ba_implicit bi_inl bi_inl_rev bn_mi bi_down2 bn_alias
   cs_nested cs_nested_ctl cs_collide cs_collide_ctl cs_kern vd_mdata vd_mdata_type vd_sunfold vd_sunfold_bn
   vd_sunfold_new vd_sunfold_bare dn_unsafe_rec dn_noncomp dn_never_extract
