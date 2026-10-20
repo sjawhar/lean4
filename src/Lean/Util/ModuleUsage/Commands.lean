@@ -358,15 +358,18 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
   let digestsOf (i : Nat) (n : Name) : Except String UseDigests := do
     if !env.contains n then
       return .unattributed s!"command {i} uses `{n}`, which names no constant of this module or its imports"
+    -- a constant this module added is its own, even where an import compiled code under its name
+    if let some full := fullLocal[n]? then
+      let some (core, attrs) := stmtLocal[n]? |
+        throw s!"usage: command {i} uses `{n}`, a constant of this module without a statement digest"
+      return .digests full core attrs
     if let some m := env.getModuleIdxFor? n then
       return match ← importedConstDigests? env m n with
-        | some (full, core, attrs) => .digests full core attrs
-        | none => .untracked
-    let some full := fullLocal[n]? |
-      return .unattributed s!"command {i} uses `{n}`, a constant of this module the kernel environment does not hold"
-    let some (core, attrs) := stmtLocal[n]? |
-      throw s!"usage: command {i} uses `{n}`, a constant of this module without a statement digest"
-    return .digests full core attrs
+        | .digests full core attrs => .digests full core attrs
+        | .codeOnly => .unattributed s!"command {i} uses `{n}`, which `{env.header.modules[m.toNat]!.module}` \
+            compiled code for without defining it"
+        | .untracked => .untracked
+    return .unattributed s!"command {i} uses `{n}`, a constant of this module the kernel environment does not hold"
   let mut occurrences : Std.HashMap (Name × Digest) Nat := {}
   let payloadByIdx : Std.HashMap Nat (CommandEntries × Digest) :=
     payloads.foldl (fun m p => m.insert p.1.idx p) {}
