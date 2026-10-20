@@ -301,10 +301,9 @@ structure Environment where
   -/
   private extIdentities : Array (Option EnvExtensionIdentity) := #[]
   /--
-  How many declarations this kernel environment holds differently from what checking the elaborator's constants would
-  give: added without the kernel checking them (`addDeclWithoutChecking`), committed as another constant than the
-  elaborator committed or not at all (`AddConstAsyncResult.commitCheckEnv`, a dropped `addConstAsync`), or realized
-  and then rejected by the kernel at the realization's merge. The per-command recorder compares it across a command.
+  How many constants this kernel environment holds that the kernel did not check: added by `addDeclWithoutChecking`,
+  by `addDeclCore` without the check, and unsafe ones `replayConsts` adds. The per-command recorder compares it across a
+  command; it detects the other ways the kernel environment can differ from the elaborator's constants itself.
   -/
   private divergentAdds : Nat := 0
 deriving Nonempty
@@ -367,8 +366,8 @@ opaque addDeclCore (env : Environment) (maxHeartbeats : USize) (maxRecDepth : US
 @[extern "lean_add_decl_without_checking"]
 private opaque addDeclWithoutCheckingCore (env : Environment) (decl : @& Declaration) : Except Exception Environment
 
-private def countDivergentAdd (env : Environment) : Environment :=
-  { env with divergentAdds := env.divergentAdds + 1 }
+private def countDivergentAdd (env : Environment) (n : Nat := 1) : Environment :=
+  { env with divergentAdds := env.divergentAdds + n }
 
 /--
 Add declaration to kernel without type checking it. The addition is counted in the result's `divergentAdds`.
@@ -902,13 +901,9 @@ def unlockAsync (env : Environment) : Environment :=
 private opaque addDeclCheck (env : Environment) (maxHeartbeats : USize) (maxRecDepth : USize)
   (decl : @& Declaration) (cancelTk? : @& Option IO.CancelToken) : Except Kernel.Exception Environment
 
-@[extern "lean_elab_add_decl_without_checking"]
-private opaque addDeclWithoutChecking (env : Environment) (decl : @& Declaration) :
-  Except Kernel.Exception Environment
-
 /--
-Adds given declaration to the environment, type checking it unless `doCheck` is false; an unchecked addition is
-counted in the kernel environment's `divergentAdds`.
+Adds given declaration to the environment, type checking it unless `doCheck` is false
+(`Kernel.Environment.addDeclWithoutChecking`).
 
 This is a plumbing function for the implementation of `Lean.addDecl`, most users should use it
 instead.
@@ -923,8 +918,7 @@ def addDeclCore (env : Environment) (maxHeartbeats : USize) (maxRecDepth : USize
   let mut env ← if doCheck then
     addDeclCheck env maxHeartbeats maxRecDepth decl cancelTk?
   else
-    let env ← addDeclWithoutChecking env decl
-    pure { env with checked := env.checked.map (sync := true) (·.countDivergentAdd) }
+    pure { env with checked := .pure (← env.toKernelEnv.addDeclWithoutChecking decl) }
 
   -- Let the elaborator know about the new constants. This uses the same constant for both
   -- visibility scopes but the caller can still customize the public one on the main elaboration
@@ -1148,8 +1142,6 @@ structure PromiseCheckedResult where
   -/
   asyncEnv : Environment
   private checkedEnvPromise : IO.Promise Kernel.Environment
-  /-- The kernel environment the branch started from. -/
-  private start : Task Kernel.Environment
 
 def realizingStack (env : Environment) : List Name :=
   env.asyncCtx?.map (·.realizingStack) |>.getD []
@@ -1181,18 +1173,13 @@ def promiseChecked (env : Environment) : BaseIO PromiseCheckedResult := do
     -- Do not allow adding new constants
     asyncEnv := env.enterAsync `__reserved__Environment_promiseChecked
     checkedEnvPromise
-    start := env.checked
   }
 
-/-- Commits the kernel environment of the given environment back to the main branch. A constant map other than the
-branch's start (a constant added to the kernel environment alone, as the branch may not add constants) counts in
-`divergentAdds`. -/
+/-- Commits the kernel environment of the given environment back to the main branch. -/
 def PromiseCheckedResult.commitChecked (res : PromiseCheckedResult) (env : Environment) :
     BaseIO Unit :=
   assert! env.asyncCtx?.isSome
-  let kenv := env.toKernelEnv
-  res.checkedEnvPromise.resolve <|
-    if SharedDiff.sameObject kenv.constants res.start.get.constants then kenv else kenv.countDivergentAdd
+  res.checkedEnvPromise.resolve env.toKernelEnv
 
 /-- Data transmitted by `AddConstAsyncResult.commitConst`. -/
 private structure ConstPromiseVal where
@@ -1319,10 +1306,9 @@ def addConstAsync (env : Environment) (constName : Name) (kind : ConstantKind)
         «public»  := exportedAsyncConst?.map (env.asyncConstsMap.public.add ·)
           |>.getD env.asyncConstsMap.public
       }
-      -- a dropped commit leaves the elaborator's fallback constant without a kernel one
       checked := checkedEnvPromise.result?.bind (sync := true) fun
         | some kenv => .pure kenv
-        | none      => env.checked.map (sync := true) (·.countDivergentAdd)
+        | none      => env.checked
       allRealizations := allRealizationsPromise.result?.bind (sync := true) fun
         | some r => .pure r
         | none   => env.allRealizations }
@@ -1378,25 +1364,11 @@ def AddConstAsyncResult.commitConst (res : AddConstAsyncResult) (env : Environme
     nestedConsts := env.asyncConstsMap
   }
 
-/-- Whether `kenv` holds the constant `info` describes, as `info` (kind, level parameters, type and value): checking
-`info` again then gives the kernel's constant. -/
-private def kernelHolds (kenv : Kernel.Environment) (info : ConstantInfo) : Bool :=
-  match kenv.find? info.name with
-  | none => false
-  | some k => SharedDiff.sameObject k info || (ConstantKind.ofConstantInfo k == .ofConstantInfo info &&
-      k.levelParams == info.levelParams && k.type.equal info.type &&
-      match k.value? (allowOpaque := true), info.value? (allowOpaque := true) with
-      | some v, some w => v.equal w
-      | none, none => true
-      | _, _ => false)
-
 /--
 Assuming `Lean.addDecl` has been run for the constant to be added on the async environment branch,
 commits the full constant info from that call to the main environment, (asynchronously) waits for
 the final kernel environment resulting from the `addDecl` call, and commits it to the main branch as
-well, unblocking kernel additions there. All `commitConst` preconditions apply. A kernel environment that does not
-hold the committed constant as committed (`addDecl`'s fallback for a declaration the kernel rejected, or none) counts
-in `divergentAdds`.
+well, unblocking kernel additions there. All `commitConst` preconditions apply.
 -/
 def AddConstAsyncResult.commitCheckEnv (res : AddConstAsyncResult) (env : Environment) :
     IO Unit := do
@@ -1405,9 +1377,7 @@ def AddConstAsyncResult.commitCheckEnv (res : AddConstAsyncResult) (env : Enviro
   if !(← res.constPromise.isResolved) then
     res.commitConst env
   BaseIO.chainTask (sync := true) env.checked fun checked => do
-    let committed? := (← IO.wait res.constPromise.result?).map (·.privateConstInfo)
-    res.checkedEnvPromise.resolve <|
-      if committed?.all (kernelHolds checked) then checked else checked.countDivergentAdd
+    res.checkedEnvPromise.resolve checked
     BaseIO.chainTask (sync := true) env.allRealizations res.allRealizationsPromise.resolve
 
 /--
@@ -3319,7 +3289,13 @@ def replayConsts (dest : Environment) (oldEnv newEnv : Environment) (skipExistin
     checked := dest.checked.bind (sync := true) fun kenv =>
       oldEnv.checked.bind (sync := true) fun oldKEnv =>
         newEnv.checked.map fun newKEnv =>
-          replayKernel oldKEnv newKEnv exts newPrivateConsts kenv |>.toOption.getD kenv
+          -- the unsafe constants `replayKernel` adds unchecked count here, not in `replayKernel`, which realizations
+          -- share (both a full run and a keep merge them unchecked); a rejection leaves `kenv` without the constants
+          let unchecked := newPrivateConsts.filter fun c =>
+            c.constInfo.toConstantInfo.isUnsafe && !(skipExisting && (kenv.find? c.constInfo.name).isSome)
+          match replayKernel oldKEnv newKEnv exts newPrivateConsts kenv with
+          | .ok kenv' => kenv'.countDivergentAdd unchecked.length
+          | .error _ => kenv
     allRealizations := dest.allRealizations.map (sync := true) fun allRealizations =>
       newPrivateConsts.foldl (init := allRealizations) fun allRealizations c =>
         allRealizations.insert c.constInfo.name c
@@ -3522,8 +3498,7 @@ private def mergeRealizeConstResult (env : Environment) (res : RealizeConstResul
         | .ok kenv' => return kenv'
         | .error e => do
           exPromise.resolve e
-          -- the merged constants stay in the elaborator's maps without kernel ones
-          return kenv.countDivergentAdd)
+          return kenv)
     allRealizations := env.allRealizations.map (sync := true) fun allRealizations =>
       res.newConsts.private.foldl (init := allRealizations) fun allRealizations c =>
         allRealizations.insert c.constInfo.name c
