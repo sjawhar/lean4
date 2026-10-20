@@ -12,7 +12,8 @@ LAKEFILE="$PWD/lakefile.toml"
 STUB="$PWD/stub.sh"
 mkdir -p work && cd work
 unset LAKE_KEPT_CHECKER LAKE_KEPT_EXCLUDE LAKE_USAGE_CUTOFF
-export LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true
+# The cutoff is off by default; every case except the explicit cutoff-off control runs it on.
+export LAKE_USAGE_CUTOFF=1 LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true
 
 OUT=.lake/build/lib/lean/Test
 ALL="Test.B Test.C Test.D Test.E Test.G"
