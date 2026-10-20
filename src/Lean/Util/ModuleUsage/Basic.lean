@@ -32,6 +32,30 @@ a file it checks for usage cutoff is the one it recorded. -/
 @[extern "lean_usage_file_digest"]
 opaque fileDigest (path : @& System.FilePath) : IO Digest
 
+/-- What a file system records of a file, besides its bytes, that every write to it, truncation of it or replacement
+of its path changes: its device and inode, its size, and its modification and status-change times in seconds and
+nanoseconds. -/
+structure FileStamp where
+  dev : UInt64
+  ino : UInt64
+  size : UInt64
+  mtimeSec : UInt64
+  mtimeNsec : UInt64
+  ctimeSec : UInt64
+  ctimeNsec : UInt64
+  deriving BEq, Inhabited
+
+/-- The stamp of the file at `path` now, or `none` if it cannot be read (or on Windows). -/
+@[extern "lean_usage_file_stamp"]
+opaque fileStamp (path : @& System.FilePath) : IO (Option FileStamp)
+
+/-- `fileDigest`, with the stamp of the file the bytes were read from if it stands for them: the open file's stamp
+was the same before and after the read, and its status-change time lay more than two seconds in the past (longer
+than any file system's timestamp granularity), so that any later change to the file shows in its stamp. `none` if
+not (or on Windows). -/
+@[extern "lean_usage_file_digest_stamped"]
+opaque fileDigestStamped (path : @& System.FilePath) : IO (Digest × Option FileStamp)
+
 private def hex16 (v : UInt64) : String :=
   let s := String.ofList (Nat.toDigits 16 v.toNat); "".pushn '0' (16 - s.length) ++ s
 
