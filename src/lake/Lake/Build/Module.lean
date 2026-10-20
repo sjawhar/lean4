@@ -644,6 +644,14 @@ switches compiles each module again.
 @[inline] def usageCutoffEnabled [Functor m] [MonadLakeEnv m] : m Bool :=
   (·.usageCutoff) <$> getLakeEnv
 
+/-- The usage-cutoff setting as a local input of a module, the last (`ModulePreSetup.localTrace`). -/
+def usageCutoffTrace (enabled : Bool) : BuildTrace := pureTrace enabled "usage cutoff"
+
+/-- The hash of the module's local trace with the usage-cutoff setting `enabled` in place of its own. -/
+def ModulePreSetup.localHashWithCutoff (self : ModulePreSetup) (enabled : Bool) : Hash :=
+  let inputs := self.localTrace.inputs.pop.push (usageCutoffTrace enabled)
+  (inputs.foldl (·.mix ·) (BuildTrace.nil "local") : BuildTrace).hash
+
 /--
 Recursively build a module's dependencies, including:
 * Transitive local imports
@@ -713,12 +721,13 @@ def Module.recFetchPreSetup (mod : Module) : FetchM (Job ModulePreSetup) := ensu
     let extra := (← getLeanOptOverrides).find? mod.pkg.baseName |>.getD {}
     let leanOptions := mod.leanOptions ++ extra
     -- Every input of the module's trace except `depTrace` (the imports' `info.trace` and `extraDepJob`'s trace,
-    -- which `localTrace` mixes in separately).
+    -- which `localTrace` mixes in separately), the usage-cutoff setting last (`ModulePreSetup.localHashWithCutoff`
+    -- swaps it).
     let localInputs := libTraces ++ #[
       ← getLeanTrace, input.trace, traceOptions leanOptions "options",
       pureTrace input.header.isModule "isModule", pureTrace mod.name "Module.name",
       pureTrace mod.pkg.id? "Package.id?", pureTrace mod.leanArgs "Module.leanArgs",
-      pureTrace (← usageCutoffEnabled) "usage cutoff"]
+      usageCutoffTrace (← usageCutoffEnabled)]
     addTrace depTrace
     localInputs.forM addTrace
     let localTrace := localInputs.foldl (·.mix ·) ((BuildTrace.nil "local").mix extraDepJob.getTrace)
@@ -1678,9 +1687,10 @@ where
   trace describes (`Module.outputsMatchDescrs`, as for a skip), and the usage cutoff's verdict is
   `recheck`. That verdict is the rule for kept modules: when the machinery the module used while
   elaborating is unchanged, re-checking its proofs is enough; when it changed, or the records cannot
-  tell, the module compiles. Without the cutoff's verdict there is no candidate. A `module` file, a
-  module linked into a shared library (`precompileModules`), and a module excluded from kept checks
-  are never candidates, nor is any module of a `--no-build` build.
+  tell, the module compiles. Without the cutoff's verdict there is no candidate, nor are outputs whose
+  local inputs differ only in the cutoff's setting (a build without the cutoff wrote them): the build
+  says so. A `module` file, a module linked into a shared library (`precompileModules`), and a module
+  excluded from kept checks are never candidates, nor is any module of a `--no-build` build.
   -/
   keptCandidate? (presetup : ModulePreSetup) (savedTrace : SavedTrace)
     (decided? : Option (UsageVerdict × ModuleSetup))
@@ -1689,7 +1699,12 @@ where
       return none
     let .ok data := savedTrace | return none
     let some descrs := savedTrace.moduleOutputDescrs? | return none
-    unless data.localHash? == some presetup.localTrace.hash do return none
+    unless data.localHash? == some presetup.localTrace.hash do
+      -- an edited module's own change says why it compiles; a change of the setting alone does not
+      if data.localHash? == some (presetup.localHashWithCutoff false) then
+        logInfo "kept-module check: not asked: its outputs were built without the usage cutoff; \
+          compiling"
+      return none
     unless (← mod.outputsMatchDescrs presetup.isModule presetup.postponeCompile descrs) do return none
     match decided? with
     | some (.recheck, setup) => return some (data, descrs, setup)
