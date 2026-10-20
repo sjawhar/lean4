@@ -2357,9 +2357,7 @@ def mkModuleData (env : Environment) (level : OLeanLevel := .private)
       |>.qsort (lt := fun c₁ c₂ => c₁.name.quickCmp c₂.name == .lt)
   let constNames := constants.map (·.name)
   return { env.header with
-    -- All olean parts of a module carry the same IR (see `declMapExt`); the extra constants of
-    -- the remaining IR are listed by the `.ir` part.
-    extraConstNames := getIRExtraConstNames env (if env.header.isModule then .exported else .private)
+    extraConstNames := getIRExtraConstNames env level
     constNames, constants, entries
   }
 
