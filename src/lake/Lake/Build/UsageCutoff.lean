@@ -29,9 +29,9 @@ structure UsageSidecar where
   moduleDigest : ModuleUsage.Digest
   /-- A digest of the module's import closure (`Lean.ModuleUsage.closureDigest`). -/
   closure : ModuleUsage.Digest
-  /-- The imported modules whose `.olean` carried digests when Lean compiled the module
-  (`Lean.ModuleUsage.digestedModules`), sorted by `Name.quickLt`. -/
-  digested : Array Name
+  /-- The imported modules whose `.olean` carried digests when Lean compiled the module, each with the digest of the
+  names it provided to the resolver then (`Lean.ModuleUsage.digestedModules`), sorted by `Name.quickLt`. -/
+  digested : Array (Name × ModuleUsage.Digest)
   /-- Each direct import's `closure` as the compile imported it (`Lean.ModuleUsage.writeUsage`). -/
   importedClosures : NameMap ModuleUsage.Digest
   /-- Each `extra` module's `moduleDigest` as the compile imported it. -/
@@ -39,6 +39,14 @@ structure UsageSidecar where
   own : NameMap ModuleUsage.Digest
   used : Array (Name × Array (Name × ModuleUsage.Digest))
   extra : Array Name
+  /-- Every name the module used or the compiler resolved, grouped by the module the resolver mapped it to (`none`:
+  the module itself, or no module), each with the kinds under which that module provided it
+  (`Lean.ModuleUsage.resolvedGroups`). -/
+  resolved : Array (Option Name × Array (Name × UInt8))
+  /-- The digest of the names the module provides to the resolver (`Lean.ModuleUsage.providesDigestOf`). -/
+  providesDigest : ModuleUsage.Digest
+  /-- The module's kernel constants and compiled names, each sorted (`Lean.ModuleUsage.ownProvides`). -/
+  provides : Array Name × Array Name
   /-- The specialization-cache keys the module created, each with the specialization of its last entry for the
   key (`Lean.ModuleUsage.specKeysOf`). -/
   specKeys : Array (ModuleUsage.Digest × Name)
@@ -86,6 +94,22 @@ def nameDigestPairs (j : Json) : Except String (NameMap (ModuleUsage.Digest × M
     let #[n, a, b] ← e.getArr? | throw s!"expected a triple, got {e.compress}"
     return m.insert (← fromJson? (α := SidecarName) n).name (← fromJson? a, ← fromJson? b)
 
+/-- Reads a module's `provides`: a JSON pair of name arrays. -/
+def providesOfJson (j : Json) : Except String (Array Name × Array Name) := do
+  let #[k, e] ← j.getArr? | throw s!"expected a pair of name arrays, got {j.compress}"
+  let names (a : Json) := return (← fromJson? (α := Array SidecarName) a).map (·.name)
+  return (← names k, ← names e)
+
+/-- Reads a `.usage`'s `resolved` groups: `[module or null, [[name, kinds], ...]]`. -/
+def resolvedOfJson (j : Json) : Except String (Array (Option Name × Array (Name × UInt8))) := do
+  (← j.getArr?).mapM fun g => do
+    let #[m, ns] ← g.getArr? | throw s!"expected a pair, got {g.compress}"
+    let m? ← if m.isNull then pure none else some <$> (·.name) <$> fromJson? (α := SidecarName) m
+    let ns ← (← ns.getArr?).mapM fun e => do
+      let #[n, k] ← e.getArr? | throw s!"expected a pair, got {e.compress}"
+      return ((← fromJson? (α := SidecarName) n).name, (← fromJson? (α := Nat) k).toUInt8)
+    return (m?, ns)
+
 instance : FromJson UsageSidecar where
   fromJson? j := do
     let own ← j.getObjValAs? (Array (SidecarName × ModuleUsage.Digest)) "own"
@@ -96,7 +120,7 @@ instance : FromJson UsageSidecar where
       noskip := ← j.getObjValAs? Bool "noskip"
       moduleDigest := ← j.getObjValAs? ModuleUsage.Digest "moduleDigest"
       closure := ← j.getObjValAs? ModuleUsage.Digest "closure"
-      digested := (← j.getObjValAs? (Array SidecarName) "digested").map (·.name)
+      digested := (← j.getObjValAs? (Array (SidecarName × ModuleUsage.Digest)) "digested").map fun (n, d) => (n.name, d)
       importedClosures := (← j.getObjValAs? (Array (SidecarName × ModuleUsage.Digest)) "importedClosures").foldl
         (init := {}) fun m (n, d) => m.insert n.name d
       importedDigests := (← j.getObjValAs? (Array (SidecarName × ModuleUsage.Digest)) "importedDigests").foldl
@@ -104,6 +128,9 @@ instance : FromJson UsageSidecar where
       own := own.foldl (init := {}) fun m (n, d) => m.insert n.name d
       used := used.map fun (m, cs) => (m.name, cs.map fun (c, d) => (c.name, d))
       extra := extra.map (·.1.name)
+      resolved := ← resolvedOfJson (← j.getObjVal? "resolved")
+      providesDigest := ← j.getObjValAs? ModuleUsage.Digest "providesDigest"
+      provides := ← providesOfJson (← j.getObjVal? "provides")
       specKeys := specKeys.map fun (d, n) => (d, n.name)
       specLookups := ← j.getObjValAs? (Array (ModuleUsage.Digest × ModuleUsage.Digest)) "specLookups"
     }
@@ -114,12 +141,15 @@ structure UsageImport where
   moduleDigest : ModuleUsage.Digest
   closure : ModuleUsage.Digest
   own : NameMap ModuleUsage.Digest
+  providesDigest : ModuleUsage.Digest
+  provides : Array Name × Array Name
   specKeys : Array (ModuleUsage.Digest × Name)
   deriving TypeName
 
 /-- The `UsageImport` view of a module's own `.usage`. -/
 def UsageSidecar.toImport (u : UsageSidecar) : UsageImport :=
-  { moduleDigest := u.moduleDigest, closure := u.closure, own := u.own, specKeys := u.specKeys }
+  { moduleDigest := u.moduleDigest, closure := u.closure, own := u.own, providesDigest := u.providesDigest,
+    provides := u.provides, specKeys := u.specKeys }
 
 /-- Reads only the fields an importer checks (`importUsage?`). The fields it skips are not importer inputs; a
 sidecar that `UsageSidecar` would reject fails its own module's check, and the importer still binds the sidecar to
@@ -132,6 +162,8 @@ instance : FromJson UsageImport where
       moduleDigest := ← j.getObjValAs? ModuleUsage.Digest "moduleDigest"
       closure := ← j.getObjValAs? ModuleUsage.Digest "closure"
       own := own.foldl (init := {}) fun m (n, d) => m.insert n.name d
+      providesDigest := ← j.getObjValAs? ModuleUsage.Digest "providesDigest"
+      provides := ← providesOfJson (← j.getObjVal? "provides")
       specKeys := specKeys.map fun (d, n) => (d, n.name)
     }
 
@@ -335,8 +367,41 @@ the local trace instead.
 def UsageSidecar.coversClosure (usage : UsageSidecar) (importArts : NameMap ImportArtifacts) : Bool :=
   Id.run do
     for (m, _) in importArts do
-      unless usage.digested.binSearchContains m Name.quickLt do return false
+      unless (usage.digested.binSearch (m, default) (Name.quickLt ·.1 ·.1)).isSome do return false
     return true
+
+/--
+Whether every name the module used or the compiler resolved (`UsageSidecar.resolved`) still resolves to the same
+module, with the same kinds, as when Lean compiled it. Each workspace module of the closure whose provides digest
+(`UsageImport.providesDigest`, from a `.usage` that `importUsage?` binds to its current `.olean`) differs from the one
+the compile imported (`UsageSidecar.digested`) must still provide each name the resolver mapped to it with the
+recorded kinds, and none of the other names. A module whose provides digest is unchanged is not asked about any name.
+
+This decides without restating how the resolver ranks providers (`Environment.getModuleIdxFor?`), which differs
+between toolchains. It relies on one property, which every such resolver has: for a resolver that picks a winner
+among a name's providers (each a module with a kind, kernel constant or compiled name) by a fixed priority of the
+provider alone, here import order (pinned by `closureHash`) and kind, dropping a non-winner cannot change the winner.
+The resolvers: first provider in import order, kernel constants of a module before its compiled names
+(`src/Lean/Environment.lean:994-996`, filled by `finalizeImport`'s `insertIfNew` at :2697-2712); compiled names
+first for code-generator-shaped names, then import order (`Environment.lean:317-335` where a toolchain carries it);
+and the lowest module index among kernel and compiled providers (`Environment.lean:317-322` where a toolchain carries
+it). A gained provider, a lost winner or a winner that changed kinds fails the check. A module-system module's
+provides are pinned by `modsysHash`, a toolchain module's by the Lean githash.
+-/
+def UsageSidecar.resolvedUnchanged (usage : UsageSidecar) (hashes : ContentHashes)
+    (importArts : NameMap ImportArtifacts) : JobM Bool := do
+  for (m, arts) in importArts do
+    if arts.oleanServer?.isSome then continue
+    if (← findModule? m).isNone then continue
+    let some (_, recorded) := usage.digested.binSearch (m, default) (Name.quickLt ·.1 ·.1) | return false
+    let some (_, imp) ← importUsage? hashes importArts m | return false
+    if imp.providesDigest == recorded then continue
+    let (kernel, extra) := imp.provides
+    for (m?, ns) in usage.resolved do
+      let winner := m? == some m
+      for (n, k) in ns do
+        unless ModuleUsage.kindsIn kernel extra n == (if winner then k else 0) do return false
+  return true
 
 /--
 Writes the module's `.usekey` from the `.usage` Lean just wrote: the digest of the `.usage` bytes, the module's
@@ -386,9 +451,10 @@ from its current `.usage` (`UsekeySidecar.usage`) and `.olean`, its `.usage` cov
 `UsageSidecar.coversClosure`), its local inputs are unchanged, no module-system module in its closure changed
 (`modsysHash`), its closure is unchanged (`closureHash`), every constant it used from a workspace module has the
 same digest in that module's current `.usage` (one its key binds to its current `.olean`, `importUsage?`), every
-workspace `extra` module has the same `.olean` hash and `moduleDigest`, and every specialization-cache key it looked
-up has the same providers (`UsageSidecar.specProvidersUnchanged`). Every `.olean` hash is of the file's bytes
-(`contentHash`), never read from a `.hash` file.
+workspace `extra` module has the same `.olean` hash and `moduleDigest`, every name it used or the compiler resolved
+resolves as before (`UsageSidecar.resolvedUnchanged`), and every specialization-cache key it looked up has the same
+providers (`UsageSidecar.specProvidersUnchanged`). Every `.olean` hash is of the file's bytes (`contentHash`), never
+read from a `.hash` file.
 -/
 public def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
     (importArts : NameMap ImportArtifacts) : JobM Bool := do
@@ -412,4 +478,5 @@ public def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
     let some (olean, imp) ← importUsage? hashes importArts m | return false
     unless (← contentHash hashes olean) == oleanHash do return false
     unless imp.moduleDigest == digest do return false
+  unless (← usage.resolvedUnchanged hashes importArts) do return false
   usage.specProvidersUnchanged hashes importArts
