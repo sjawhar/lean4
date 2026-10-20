@@ -8,6 +8,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 #include <fcntl.h>
 #include <memory>
 #include <vector>
+#include <sys/stat.h>
 #if defined(LEAN_WINDOWS)
 #include <io.h>
 #else
@@ -316,45 +317,148 @@ extern "C" LEAN_EXPORT obj_res lean_usage_exprs_digest(uint8 mode, uint8 mdata, 
 #endif
 }
 
-/* The XXH3-128 hash of a file's bytes, read in fixed-size chunks; `hi` is its high 64 bits, so `Digest.hex`
-prints it as `xxhsum -H2` does. The file is opened as `lean_io_prim_handle_mk` opens it, so processes spawned
-meanwhile do not inherit the descriptor. */
-extern "C" LEAN_EXPORT obj_res lean_usage_file_digest(b_obj_arg path) {
+namespace {
+/* Opens `path` as `lean_io_prim_handle_mk` opens it, so processes spawned meanwhile do not inherit the descriptor;
+returns an IO error result or `nullptr` in `err`. */
+FILE * open_for_digest(b_obj_arg path, obj_res & err) {
+    err = nullptr;
     char const * fname = string_cstr(path);
     if (strlen(fname) != lean_string_size(path) - 1) {
-        return mk_embedded_nul_error(path);
+        err = mk_embedded_nul_error(path);
+        return nullptr;
     }
-    constexpr size_t chunk = 1 << 18;
-    std::unique_ptr<unsigned char[]> buf(new unsigned char[chunk]);  // not zero-filled: only bytes `fread` wrote are hashed
 #if defined(LEAN_WINDOWS)
     int fd = open(fname, O_RDONLY | O_BINARY | O_NOINHERIT);
 #else
     int fd = open(fname, O_RDONLY | O_CLOEXEC);
 #endif
     if (fd == -1) {
-        return io_result_mk_error(decode_io_error(errno, path));
+        err = io_result_mk_error(decode_io_error(errno, path));
+        return nullptr;
     }
     FILE * f = fdopen(fd, "rb");
     if (f == nullptr) {
-        int err = errno;
+        int e = errno;
         close(fd);
-        return io_result_mk_error(decode_io_error(err, path));
+        err = io_result_mk_error(decode_io_error(e, path));
     }
+    return f;
+}
+
+/* The XXH3-128 hash of the rest of `f`'s bytes, read in fixed-size chunks, as a `Digest` (`hi` is its high 64 bits,
+so `Digest.hex` prints it as `xxhsum -H2` does); `nullptr` with `errno` set if a read fails. Does not close `f`. */
+object * digest_stream(FILE * f) {
+    constexpr size_t chunk = 1 << 18;
+    std::unique_ptr<unsigned char[]> buf(new unsigned char[chunk]);  // not zero-filled: only bytes `fread` wrote are hashed
     XXH3_state_t state;
     XXH3_128bits_reset(&state);
     size_t n;
     while ((n = fread(buf.get(), 1, chunk, f)) > 0) {
         XXH3_128bits_update(&state, buf.get(), n);
     }
-    int err = ferror(f) ? errno : 0;
-    fclose(f);
-    if (err != 0) {
-        return io_result_mk_error(decode_io_error(err, path));
-    }
+    if (ferror(f)) return nullptr;
     XXH128_hash_t h = XXH3_128bits_digest(&state);
     object * r = lean_alloc_ctor(0, 0, 2 * sizeof(uint64_t));
     lean_ctor_set_uint64(r, 0, h.high64);
     lean_ctor_set_uint64(r, sizeof(uint64_t), h.low64);
+    return r;
+}
+
+#if !defined(LEAN_WINDOWS)
+/* The fields of a `stat` that every write, truncation, rename over the path, link, unlink or attribute change
+through the file system changes: the file (device, inode), its size, and its modification and status-change times
+(`Lean.ModuleUsage.FileStamp`). */
+constexpr unsigned stamp_fields = 7;
+void stamp_of(struct stat const & st, uint64_t (&s)[stamp_fields]) {
+#if defined(__APPLE__)
+    struct timespec const & mt = st.st_mtimespec;
+    struct timespec const & ct = st.st_ctimespec;
+#else
+    struct timespec const & mt = st.st_mtim;
+    struct timespec const & ct = st.st_ctim;
+#endif
+    s[0] = static_cast<uint64_t>(st.st_dev);
+    s[1] = static_cast<uint64_t>(st.st_ino);
+    s[2] = static_cast<uint64_t>(st.st_size);
+    s[3] = static_cast<uint64_t>(mt.tv_sec);
+    s[4] = static_cast<uint64_t>(mt.tv_nsec);
+    s[5] = static_cast<uint64_t>(ct.tv_sec);
+    s[6] = static_cast<uint64_t>(ct.tv_nsec);
+}
+
+object * mk_stamp(uint64_t const (&s)[stamp_fields]) {
+    object * r = lean_alloc_ctor(0, 0, stamp_fields * sizeof(uint64_t));
+    for (unsigned i = 0; i < stamp_fields; i++) lean_ctor_set_uint64(r, i * sizeof(uint64_t), s[i]);
+    return r;
+}
+
+/* How long before the moment it is read a file's status-change time must lie for its stamp to stand for its bytes:
+longer than any file system's timestamp granularity (FAT's is 2 s for modification times), so that every later
+change of the file sets a status-change time that differs from the recorded one. */
+constexpr int64_t stamp_settle_sec = 2;
+#endif
+}
+
+/* The XXH3-128 hash of a file's bytes (`Lean.ModuleUsage.fileDigest`). */
+extern "C" LEAN_EXPORT obj_res lean_usage_file_digest(b_obj_arg path) {
+    obj_res err;
+    FILE * f = open_for_digest(path, err);
+    if (f == nullptr) return err;
+    object * d = digest_stream(f);
+    int e = d == nullptr ? errno : 0;
+    fclose(f);
+    if (d == nullptr) return io_result_mk_error(decode_io_error(e, path));
+    return io_result_mk_ok(d);
+}
+
+/* `Lean.ModuleUsage.fileStamp`: the stamp of the file at `path` (following symbolic links, as `open` does). */
+extern "C" LEAN_EXPORT obj_res lean_usage_file_stamp(b_obj_arg path) {
+#if defined(LEAN_WINDOWS)
+    return io_result_mk_ok(mk_option_none());
+#else
+    char const * fname = string_cstr(path);
+    struct stat st;
+    if (strlen(fname) != lean_string_size(path) - 1 || stat(fname, &st) != 0) return io_result_mk_ok(mk_option_none());
+    uint64_t s[stamp_fields];
+    stamp_of(st, s);
+    return io_result_mk_ok(mk_option_some(mk_stamp(s)));
+#endif
+}
+
+/* `Lean.ModuleUsage.fileDigestStamped`: the file's digest, with the stamp of the file it read if the stamp stands for
+those bytes: the descriptor's stamp is the same before and after the read, and its status-change time lies at least
+`stamp_settle_sec` before the second `fstat`, so that no change in the same timestamp tick can follow unseen. */
+extern "C" LEAN_EXPORT obj_res lean_usage_file_digest_stamped(b_obj_arg path) {
+    obj_res err;
+    FILE * f = open_for_digest(path, err);
+    if (f == nullptr) return err;
+    object * stamp = mk_option_none();
+#if !defined(LEAN_WINDOWS)
+    struct stat st;
+    uint64_t before[stamp_fields];
+    bool have_before = fstat(fileno(f), &st) == 0;
+    if (have_before) stamp_of(st, before);
+#endif
+    object * d = digest_stream(f);
+    int e = d == nullptr ? errno : 0;
+#if !defined(LEAN_WINDOWS)
+    if (d != nullptr && have_before && fstat(fileno(f), &st) == 0) {
+        uint64_t after[stamp_fields];
+        stamp_of(st, after);
+        struct timespec now;
+        bool same = true;
+        for (unsigned i = 0; i < stamp_fields; i++) same = same && before[i] == after[i];
+        if (same && clock_gettime(CLOCK_REALTIME, &now) == 0 &&
+            static_cast<int64_t>(after[5]) + stamp_settle_sec < static_cast<int64_t>(now.tv_sec)) {
+            stamp = mk_option_some(mk_stamp(after));
+        }
+    }
+#endif
+    fclose(f);
+    if (d == nullptr) return io_result_mk_error(decode_io_error(e, path));
+    object * r = lean_alloc_ctor(0, 2, 0);
+    lean_ctor_set(r, 0, d);
+    lean_ctor_set(r, 1, stamp);
     return io_result_mk_ok(r);
 }
 }
