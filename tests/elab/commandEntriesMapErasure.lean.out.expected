@@ -1,0 +1,10 @@
+noskip (some true), reason (some (declaration command 0: the attribute map_add, whose handlers may run code outside core Lean))
+0: refused for #[], entries #[mapExt.checked, mapExt.main]
+1: refused for #[mapExt, mapExt], entries #[]
+2: refused for #[], entries #[tagAttr.main]
+3: refused for #[tagAttr, tagAttr], entries #[]
+4: refused for #[], entries #[_private.Lean.Namespace.0.Lean.namespacesExt.main, Lean.Meta.Simp.simprocDeclExt.main]
+5: refused for #[Lean.Meta.Simp.simprocDeclExt, Lean.Meta.Simp.simprocDeclExt], entries #[]
+6: refused for #[], entries #[_private.Lean.Namespace.0.Lean.namespacesExt.main]
+7: refused for #[_private.Lean.Namespace.0.Lean.namespacesExt, _private.Lean.Namespace.0.Lean.namespacesExt], entries #[]
+8: refused for #[], entries #[]

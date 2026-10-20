@@ -1,0 +1,34 @@
+Elab.Command.State classification: 13 fields, each covered
+Elab.Command.State cases: 13 fields, each covered
+M.lean:13:0: warning: a warning
+env (Lean.ModuleUsage.CommandStateField.env): payload #[Lean.aliasExtension.main]
+messages (Lean.ModuleUsage.CommandStateField.reset): a later command sees what the first does (messages=0) although the command before it leaves the field non-empty
+scopes (Lean.ModuleUsage.CommandStateField.refused): marker a change to the command state's scopes
+usedQuotCtxts (Lean.ModuleUsage.CommandStateField.replayed): post and ctx change
+nextMacroScope (Lean.ModuleUsage.CommandStateField.refused): marker a change to the command state's nextMacroScope
+maxRecDepth (Lean.ModuleUsage.CommandStateField.replayed): post and ctx change
+ngen (Lean.ModuleUsage.CommandStateField.replayed): post and ctx change
+auxDeclNGen (Lean.ModuleUsage.CommandStateField.replayed): post and ctx change
+infoState (Lean.ModuleUsage.CommandStateField.refused): marker a change to the command state's infoState
+traceState (Lean.ModuleUsage.CommandStateField.reset): a later command sees what the first does (traceState=0) although the command before it leaves the field non-empty
+snapshotTasks (Lean.ModuleUsage.CommandStateField.reset): a later command sees what the first does (snapshotTasks=0) although the command before it leaves the field non-empty
+codeQualityEntryTasks (Lean.ModuleUsage.CommandStateField.reset): a later command sees what the first does (codeQualityEntryTasks=0) although the command before it leaves the field non-empty
+prevLinterStates (Lean.ModuleUsage.CommandStateField.unread): later commands declare the same
+Elab.Command.Scope cases: 13 fields, each covered
+Elab.Command.Scope encoding: 13 fields, each covered
+every Scope field changes scopesEnc
+ScopedEnvExtension.State cases: 5 fields, each covered
+ScopedEnvExtension.StateStack cases: 4 fields, each covered
+ScopedEnvExtension.State encoding: 5 fields, each covered
+ScopedEnvExtension.StateStack encoding: 4 fields, each covered
+scoped state, changed alone, without an operation: none
+scoped activeScopes, a namespace activated without an operation: none
+scoped delimitsLocal, changed without an operation: none
+scoped scopeChanged, set without an operation: none
+scoped scopeChangedDecls, a declaration noted without an operation: none
+scoped stateStack, a level pushed without an operation: none
+scoped scopedEntries, changed without an operation: none
+scoped newEntries, an entry in front of the old log without an operation: none
+scoped ops, a push logged: ops 1
+scoped ops, a modify logged: none
+scoped ops, the old log not a tail: none

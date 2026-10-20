@@ -14,7 +14,8 @@ def a := p
 example : Nat.succ 0 = 1 := rfl
 #eval show CommandElabM Unit from do
   let env ← getEnv
-  let producer := (ModuleUsage.moduleUsed env {}).find? (·.1 == `UsageProducer) |>.map (·.2.map (·.1))
+  let used ← IO.ofExcept (ModuleUsage.moduleUsed env {})
+  let producer := used.find? (·.1 == `UsageProducer) |>.map (·.2.map (·.1))
   logInfo m!"{(← usedNames).contains ``Nat.succ} {producer}"
 #eval show CommandElabM Unit from do
   let env ← getEnv
