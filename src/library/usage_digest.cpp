@@ -462,6 +462,67 @@ extern "C" LEAN_EXPORT obj_res lean_usage_file_digest_stamped(b_obj_arg path) {
     return io_result_mk_ok(r);
 }
 
+/* `Lean.ModuleUsage.readFileStamped`: the file's bytes, with the stamp of the file they were read from if it stands
+for them, as `lean_usage_file_digest_stamped` decides it. */
+extern "C" LEAN_EXPORT obj_res lean_usage_read_file_stamped(b_obj_arg path) {
+    obj_res err;
+    FILE * f = open_for_digest(path, err);
+    if (f == nullptr) return err;
+    object * stamp = mk_option_none();
+    size_t expected = 0;
+#if !defined(LEAN_WINDOWS)
+    struct stat st;
+    uint64_t before[stamp_fields];
+    bool have_before = fstat(fileno(f), &st) == 0;
+    if (have_before) {
+        stamp_of(st, before);
+        expected = static_cast<size_t>(st.st_size);
+    }
+#endif
+    // One byte beyond the expected size, so that a file of that size is read to its end without growing the array.
+    object * bytes = lean_alloc_sarray(1, 0, expected + 1);
+    size_t size = 0;
+    for (;;) {
+        size_t cap = lean_sarray_capacity(bytes);
+        if (size == cap) {
+            object * grown = lean_alloc_sarray(1, size, 2 * cap);
+            memcpy(lean_sarray_cptr(grown), lean_sarray_cptr(bytes), size);
+            lean_dec(bytes);
+            bytes = grown;
+            cap *= 2;
+        }
+        size_t want = cap - size;
+        size_t got = fread(lean_sarray_cptr(bytes) + size, 1, want, f);
+        size += got;
+        if (got < want) break;
+    }
+    if (ferror(f)) {
+        int e = errno;
+        fclose(f);
+        lean_dec(bytes);
+        return io_result_mk_error(decode_io_error(e, path));
+    }
+    lean_sarray_set_size(bytes, size);
+#if !defined(LEAN_WINDOWS)
+    if (have_before && fstat(fileno(f), &st) == 0) {
+        uint64_t after[stamp_fields];
+        stamp_of(st, after);
+        struct timespec now;
+        bool same = true;
+        for (unsigned i = 0; i < stamp_fields; i++) same = same && before[i] == after[i];
+        if (same && clock_gettime(CLOCK_REALTIME, &now) == 0 &&
+            static_cast<int64_t>(after[5]) + stamp_settle_sec < static_cast<int64_t>(now.tv_sec)) {
+            stamp = mk_option_some(mk_stamp(after));
+        }
+    }
+#endif
+    fclose(f);
+    object * r = lean_alloc_ctor(0, 2, 0);
+    lean_ctor_set(r, 0, bytes);
+    lean_ctor_set(r, 1, stamp);
+    return io_result_mk_ok(r);
+}
+
 // `BaseIO Unit`: the compiled function takes no world token and returns a boxed unit.
 extern "C" object * lean_usage_record_resolved(obj_arg n);
 

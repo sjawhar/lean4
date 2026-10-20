@@ -103,11 +103,13 @@ public structure BuildContext extends BuildConfig, Context where
   cancelTk? : Option IO.CancelToken := none
   /--
   Parsed usage-cutoff sidecars, shared by every module job in this build, each with the digest
-  (`Lean.ModuleUsage.Digest.ofBytes`) of the contents it was parsed from. Another process may rewrite a
-  sidecar during the build (e.g., a build of another workspace that requires the same path dependency),
-  so a cached parse serves only a read of the same contents.
+  (`Lean.ModuleUsage.Digest.ofBytes`) of the contents it was parsed from and the stamp of the file those contents were
+  read from (`Lean.ModuleUsage.readFileStamped`), if it stands for them. Another process may rewrite a sidecar during
+  the build (e.g., a build of another workspace that requires the same path dependency), so a cached parse serves
+  only a read of the same contents, or a file whose current stamp is the recorded one.
   -/
-  sidecarCache : Std.Mutex (Std.HashMap FilePath (Lean.ModuleUsage.Digest × Dynamic))
+  sidecarCache : Std.Mutex
+    (Std.HashMap FilePath (Option Lean.ModuleUsage.FileStamp × Lean.ModuleUsage.Digest × Dynamic))
   /--
   The content hashes (`Lean.ModuleUsage.fileDigest`) that usage-cutoff checks computed in this build, each with the
   stamp of the file its bytes were read from (`Lean.ModuleUsage.fileDigestStamped`). A check reuses a hash only while
