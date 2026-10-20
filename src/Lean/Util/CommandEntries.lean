@@ -59,8 +59,9 @@ inductive Refusal where
   | unreplayable (ext : Name) (at? : Option Name := none)
   /-- A write to the non-persistent extension at this index, which is no command cache. -/
   | unrecorded (idx : Nat) (at? : Option Name := none)
-  /-- A declaration whose kernel constant checking the elaborator's would not give (`Kernel.Environment.divergentAdds`:
-  added unchecked, or rejected by the kernel). -/
+  /-- A kernel constant checking the elaborator's would not give: added unchecked (`Kernel.Environment.divergentAdds`),
+  or the constants the kernel gained not those the elaborator gained (`kernelMatchesElaborator`: rejected by the
+  kernel, never committed to it, or committed to it alone). -/
   | divergentKernelAdd
   /-- An attribute whose handlers may run code outside core Lean (`foreignAttributesByCommandRef`). -/
   | foreignAttribute (attr : Name)
@@ -399,6 +400,39 @@ private partial def attachMerges (after : Environment) : AddedConst → BaseIO A
   | .async n exportedKind? states nested => return .async n exportedKind? states (← nested.mapM (attachMerges after))
   | a => return a
 
+/-- Whether `kenv` holds the constant `info` describes as `info` does (kind, level parameters, type and value). -/
+private def kernelHolds (kenv : Kernel.Environment) (info : ConstantInfo) : Bool :=
+  match kenv.find? info.name with
+  | none => false
+  | some k => SharedDiff.sameObject k info || (ConstantKind.ofConstantInfo k == .ofConstantInfo info &&
+      k.levelParams == info.levelParams && k.type.equal info.type &&
+      match k.value? (allowOpaque := true), info.value? (allowOpaque := true) with
+      | some v, some w => v.equal w
+      | none, none => true
+      | _, _ => false)
+
+/-- The constants `cells` (the cells one constant map gained, each with the map after it) give the elaborator, with
+each asynchronous branch's own additions (`cellsSince` its map and the tail after it). -/
+private partial def elaboratorConsts (cells : List (AsyncConst × List AsyncConst)) : Array ConstantInfo := Id.run do
+  let mut out := #[]
+  for (c, tail) in cells do
+    out := out.push c.constInfo.toConstantInfo
+    if c.kenv?.isSome && c.realization?.isNone then
+      if let some own := cellsSince c.aconsts.get.revList tail then
+        out := out ++ elaboratorConsts (own.filter (·.1.constInfo.name != c.constInfo.name))
+  return out
+
+/-- Whether the kernel environment gained, from `before` to `after`, exactly the constants of `elabConsts` (what the
+elaborator gained, `elaboratorConsts`) that it did not hold before, each as the elaborator has it (`kernelHolds`), and
+lost none. The constants are diffed through the map of the module's own constants (`map₂`); a kernel constant map whose
+imported part changed is not compared and does not match. -/
+private def kernelMatchesElaborator (before after : Kernel.Environment) (elabConsts : Array ConstantInfo) : Bool :=
+  SharedDiff.sameObject before.constants.map₁ after.constants.map₁ &&
+    let (gained, lost) := PersistentHashMap.sharedDiff before.constants.map₂ after.constants.map₂
+    let (_, new) := elabConsts.foldl (init := ((∅ : NameSet), 0)) fun (seen, n) info =>
+      if (before.find? info.name).isSome || seen.contains info.name then (seen, n) else (seen.insert info.name, n + 1)
+    lost.isEmpty && elabConsts.all (kernelHolds after) && new == gained.size
+
 /-- One command's payload (`recordCommandDelta`) with the registries `regs`. -/
 private def recordCommandDeltaWith (regs : Registries) (before after : Environment) (idx : Nat) :
     BaseIO CommandEntries := do
@@ -413,6 +447,8 @@ private def recordCommandDeltaWith (regs : Registries) (before after : Environme
   match cellsSince after.asyncConstsMap.private.revList before.asyncConstsMap.private.revList with
   | none => refusals := refusals.push (.unrelatedConstMap none)
   | some cells =>
+    unless kernelMatchesElaborator before.checked.get after.checked.get (elaboratorConsts cells) do
+      refusals := refusals.push .divergentKernelAdd
     let (ctxs, rc) := addedContexts regs before after
     let (recs, r) := addedConsts regs w cells exportedKind
     added ← (mergeAtPositions recs ctxs).mapM (attachMerges after)
@@ -424,9 +460,9 @@ private def recordCommandDeltaWith (regs : Registries) (before after : Environme
 each asynchronous constant's branch additions and states, each realization's constants, states and the realizations
 it merged, each realization merged from the cache, and each realization context it registered with its options and
 states, in order (`CommandEntries.added`); and why it cannot be replayed (`CommandEntries.refusals`), including a
-declaration whose kernel constant checking the elaborator's would not give (`Kernel.Environment.divergentAdds`; a
-realization adds its constants unchecked in its own environment and is checked where it is merged, so only the
-command's own count). Takes time proportional to what the command changed, apart from the per-extension state reads.
+kernel constant checking the elaborator's would not give (`Refusal.divergentKernelAdd`; a realization adds its
+constants unchecked in its own environment and is checked where it is merged, so only the command's own count of
+unchecked additions). Takes time proportional to what the command changed, apart from the per-extension state reads.
 -/
 def recordCommandDelta (before after : Environment) (idx : Nat) : IO CommandEntries := do
   recordCommandDeltaWith (← Registries.get) before after idx

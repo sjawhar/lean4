@@ -34,12 +34,6 @@ extern "C" LEAN_EXPORT object * lean_elab_add_decl(object * env, size_t max_hear
         });
 }
 
-extern "C" LEAN_EXPORT object * lean_elab_add_decl_without_checking(object * env, object * decl) {
-    return catch_kernel_exceptions<elab_environment>([&]() {
-            return elab_environment(env).add(declaration(decl, true), false);
-        });
-}
-
 extern "C" obj_res lean_elab_environment_to_kernel_env(obj_arg);
 environment elab_environment::to_kernel_env() const {
     return environment(lean_elab_environment_to_kernel_env(to_obj_arg()));
