@@ -57,8 +57,9 @@ inductive Refusal where
   | notCarried (ext : Name) (at? : Option Name := none)
   /-- Entries for a persistent extension without `ofOLeanEntry?`, which cannot replay them. -/
   | unreplayable (ext : Name) (at? : Option Name := none)
-  /-- A write to the non-persistent extension at this index, which is no command cache. -/
-  | unrecorded (idx : Nat) (at? : Option Name := none)
+  /-- A write to the non-persistent extension `ext` (its registration's name, `EnvExtension.name`), which is no command
+  cache. -/
+  | unrecorded (ext : Name) (at? : Option Name := none)
   /-- A kernel constant checking the elaborator's would not give: added unchecked (`Kernel.Environment.divergentAdds`),
   or the constants the kernel gained not those the elaborator gained (`kernelMatchesElaborator`: rejected by the
   kernel, never committed to it, or committed to it alone). -/
@@ -88,7 +89,7 @@ namespace Refusal
 
 /-- The extension the refusal names, if any. -/
 def ext? : Refusal → Option Name
-  | inexpressible ext _ | notCarried ext _ | unreplayable ext _ | uncompactable ext _ => some ext
+  | inexpressible ext _ | notCarried ext _ | unreplayable ext _ | unrecorded ext _ | uncompactable ext _ => some ext
   | _ => none
 
 private def inRecord : Option Name → String
@@ -99,7 +100,7 @@ protected def toString : Refusal → String
   | inexpressible ext at? => s!"a change to {ext} that no entry expresses{inRecord at?}"
   | notCarried ext at? => s!"a change to {ext}, whose state payloads do not carry{inRecord at?}"
   | unreplayable ext at? => s!"entries for {ext}, which has no `ofOLeanEntry?` to replay them{inRecord at?}"
-  | unrecorded idx at? => s!"a write to extension {idx}, neither persistent nor a command cache{inRecord at?}"
+  | unrecorded ext at? => s!"a write to {ext}, neither persistent nor a command cache{inRecord at?}"
   | divergentKernelAdd => "a declaration whose kernel constant is not what checking the elaborator's would give"
   | foreignAttribute attr => s!"the attribute {attr}, whose handlers may run code outside core Lean"
   | partlyHeldRealization c => s!"the realization of {c}, part of which an earlier command added"
@@ -163,6 +164,8 @@ private structure Registries where
   cacheByName : Std.HashMap Name CommandCacheExtension
   /-- The indices of the persistent extensions and command caches; every other extension has no payload. -/
   recordedIdxs : Std.HashSet Nat
+  /-- Every extension's name, by index. -/
+  names : Array Name
 
 private def Registries.get : IO Registries := do
   let persistent ← persistentEnvExtensionsRef.get
@@ -172,7 +175,8 @@ private def Registries.get : IO Registries := do
     persistentByName := persistent.foldl (fun m e => m.insert e.name e) {}
     scopedByName := (← scopedEnvExtensionsRef.get).foldl (fun m e => m.insert e.ext.name e) {}
     cacheByName := caches.foldl (fun m e => m.insert e.name e) {}
-    recordedIdxs := caches.foldl (·.insert ·.ext.idx) (persistent.foldl (·.insert ·.toEnvExtension.idx) {}) }
+    recordedIdxs := caches.foldl (·.insert ·.ext.idx) (persistent.foldl (·.insert ·.toEnvExtension.idx) {})
+    names := (← EnvExtension.envExtensionsRef.get).map (·.name) }
 
 /-- What the change of `ext`'s state from `s₀` to `s₁` is: nothing when they are the same object, else the extension's
 `stateDelta?`, `stateOnly` without one. -/
@@ -261,7 +265,7 @@ private def viewStates (regs : Registries) (view : EnvExtension.View) (k₀ k₁
   for idx in [:n] do
     unless changed[idx]?.getD false do continue
     if regs.recordedIdxs.contains idx then continue
-    refused := refused.push (.unrecorded idx at?)
+    refused := refused.push (.unrecorded (regs.names[idx]?.getD .anonymous) at?)
   return (st, refused)
 
 /-- The cells of `l` in front of its tail `stop` (by cell identity), oldest first, each with the list after it. -/
