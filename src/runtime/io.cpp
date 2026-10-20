@@ -38,6 +38,8 @@ Authors: Leonardo de Moura, Sebastian Ullrich
 #include <iomanip>
 #include <thread>
 #include <string>
+#include <vector>
+#include <algorithm>
 #include <cstdlib>
 #include <cctype>
 #include <cmath>
@@ -1473,9 +1475,43 @@ extern "C" LEAN_EXPORT obj_res lean_io_current_dir() {
 // ST ref primitives
 
 
+/* Whether refs created on this thread are tagged (`m_other` 1 in their header): a write to a tagged ref notes the
+   writing task's context (`get_task_context`) in `g_tagged_ref_writes`. */
+LEAN_THREAD_VALUE(bool, g_tag_new_refs, false);
+static mutex * g_tagged_ref_writes_mutex = nullptr;
+static std::vector<uint32> * g_tagged_ref_writes = nullptr;
+
+/* setTagNewRefs (tag : Bool) : BaseIO Bool, the previous setting */
+extern "C" LEAN_EXPORT uint8 lean_io_set_tag_new_refs(uint8 tag) {
+    bool old = g_tag_new_refs;
+    g_tag_new_refs = tag != 0;
+    return old;
+}
+
+static void note_tagged_ref_write() {
+    uint32 ctx = get_task_context();
+    if (ctx == 0) return;
+    lock_guard<mutex> lock(*g_tagged_ref_writes_mutex);
+    if (std::find(g_tagged_ref_writes->begin(), g_tagged_ref_writes->end(), ctx) == g_tagged_ref_writes->end())
+        g_tagged_ref_writes->push_back(ctx);
+}
+
+/* takeTaggedRefWrites : BaseIO (Array UInt32): the task contexts that wrote a tagged ref since the last call, each
+   once */
+extern "C" LEAN_EXPORT obj_res lean_io_take_tagged_ref_writes() {
+    std::vector<uint32> ctxs;
+    {
+        lock_guard<mutex> lock(*g_tagged_ref_writes_mutex);
+        ctxs.swap(*g_tagged_ref_writes);
+    }
+    object * r = lean_alloc_array(0, ctxs.size());
+    for (uint32 c : ctxs) r = lean_array_push(r, lean_box_uint32(c));
+    return r;
+}
+
 extern "C" LEAN_EXPORT obj_res lean_st_mk_ref(obj_arg a) {
     lean_ref_object * o = (lean_ref_object*)lean_alloc_small_object(sizeof(lean_ref_object));
-    lean_set_st_header((lean_object*)o, LeanRef, 0);
+    lean_set_st_header((lean_object*)o, LeanRef, g_tag_new_refs ? 1 : 0);
     o->m_value = a;
     return (lean_object*)o;
 }
@@ -1558,6 +1594,8 @@ extern "C" LEAN_EXPORT obj_res lean_st_ref_take(b_obj_arg ref) {
 static_assert(sizeof(atomic<unsigned short>) == sizeof(unsigned short), "`atomic<unsigned short>` and `unsigned short` must have the same size"); // NOLINT
 
 extern "C" LEAN_EXPORT obj_res lean_st_ref_put(b_obj_arg ref, obj_arg a) {
+    if (LEAN_UNLIKELY(lean_ptr_other(ref) != 0))
+        note_tagged_ref_write();
     if (ref_maybe_mt(ref)) {
         /* We must mark `a` as multi-threaded if `ref` is marked as multi-threaded.
            Reason: our runtime relies on the fact that a single-threaded object
@@ -1577,6 +1615,8 @@ extern "C" LEAN_EXPORT obj_res lean_st_ref_put(b_obj_arg ref, obj_arg a) {
 }
 
 extern "C" LEAN_EXPORT obj_res lean_st_ref_swap(b_obj_arg ref, obj_arg a) {
+    if (LEAN_UNLIKELY(lean_ptr_other(ref) != 0))
+        note_tagged_ref_write();
     if (ref_maybe_mt(ref)) {
         /* See io_ref_write */
         mark_mt(a);
@@ -1721,6 +1761,8 @@ void initialize_io() {
     mark_persistent(g_stream_stderr);
     g_stream_stdin  = lean_stream_of_handle(io_wrap_handle(stdin));
     mark_persistent(g_stream_stdin);
+    g_tagged_ref_writes_mutex = new mutex();
+    g_tagged_ref_writes = new std::vector<uint32>();
 #if !defined(LEAN_WINDOWS) && !defined(LEAN_EMSCRIPTEN)
     // We want to handle SIGPIPE ourselves
     lean_always_assert(signal(SIGPIPE, SIG_IGN) != SIG_ERR);

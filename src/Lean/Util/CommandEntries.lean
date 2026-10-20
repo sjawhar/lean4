@@ -83,6 +83,9 @@ inductive Refusal where
   evaluate, as `#eval`, `run_cmd`, `run_meta`, `run_elab`, `run_tac` and `by_elab` do, whose effects on process state,
   files or output no payload carries. -/
   | ranCode (decl : Name)
+  /-- A write to state an imported module's initializer or a plugin created (an `IO.Ref`,
+  `foreignStateWritesByCommand`), which no payload carries. -/
+  | foreignState
   deriving Inhabited, BEq
 
 namespace Refusal
@@ -110,6 +113,7 @@ protected def toString : Refusal → String
   | commandState field => s!"a change to the command state's {field}"
   | uncompactable part at? => s!"entries for {part} that no .olean can store (a closure){inRecord at?}"
   | ranCode decl => s!"code it evaluated and discarded ({decl})"
+  | foreignState => "a write to state an imported module's initializer created"
 
 instance : ToString Refusal := ⟨Refusal.toString⟩
 

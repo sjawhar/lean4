@@ -206,6 +206,12 @@ private opaque setTaskContext (c : UInt32) : BaseIO Unit
 @[extern "lean_io_take_evaluated_consts"]
 private opaque takeEvaluatedConsts : BaseIO (Array (UInt32 × Name))
 
+@[extern "lean_io_set_tag_new_refs"]
+private opaque setTagNewRefs (tag : Bool) : BaseIO Bool
+
+@[extern "lean_io_take_tagged_ref_writes"]
+private opaque takeTaggedRefWrites : BaseIO (Array UInt32)
+
 /-- The actions that clear the per-run logs of other modules (`registerRunLog`). -/
 private builtin_initialize runLogClearsRef : IO.Ref (Array (BaseIO Unit)) ← IO.mkRef #[]
 
@@ -233,6 +239,7 @@ def startFrontendRun (record : Bool) : BaseIO Nat := do
     usedByCommandRef.set []
     foreignAttributesByCommandRef.set []
     discard takeEvaluatedConsts
+    discard takeTaggedRefWrites
     for clear in ← runLogClearsRef.get do clear
   return run
 
@@ -242,11 +249,24 @@ def lastFrontendRun : BaseIO Nat :=
 
 /-- Sets the command whose elaboration the frontend runs, for records made outside any command context, and, as the
 runtime's task context, for what this thread and the tasks it creates do: the constants they evaluate
-(`evaluatedByCommand`). -/
+(`evaluatedByCommand`) and the writes to state imported modules' initializers created
+(`foreignStateWritesByCommand`). -/
 def setCurrentCommand (i : Nat) : BaseIO Unit := do
   if (← usageRecordingRef.get) then
     currentCommandRef.set i
     setTaskContext (i + 1).toUInt32
+
+/-- Runs `x`, which runs code from outside core Lean that may create state (module initializers, a plugin's), with the
+references it creates tagged: while recording is on, the runtime notes which commands write them
+(`foreignStateWritesByCommand`). -/
+def withForeignStateTagged (x : IO α) : IO α := do
+  let old ← setTagNewRefs true
+  try x finally discard <| setTagNewRefs old
+
+/-- The commands that wrote a reference `withForeignStateTagged` tagged since the run started, each once: state no
+command payload carries. Takes them: a second call returns only those since. -/
+def foreignStateWritesByCommand : BaseIO (Array Nat) := do
+  return (← takeTaggedRefWrites).map fun c => c.toNat - 1
 
 /-- Monads that know the top-level command whose elaboration they run (`Core.Context.cmdIdx?`). -/
 class MonadCommandIdx (m : Type → Type) where
