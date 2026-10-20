@@ -479,7 +479,7 @@ def recordCommandDeltas (commands : Array (Environment × Environment × Nat)) :
 /-- Whether `a` compacts (`CompactedRegion.bytes`): it holds no closure. -/
 private def compacts (a : α) : IO Bool := do
   try
-    discard <| CompactedRegion.bytes `commandEntriesPart a
+    discard <| CompactedRegion.bytes a
     return true
   catch _ =>
     return false
@@ -526,7 +526,7 @@ a value no `.olean` can store (a closure) is left out and refused (`Refusal.unco
 whole is compacted once. -/
 def CommandEntries.compact (ce : CommandEntries) : IO (CommandEntries × ByteArray) := do
   try
-    return (ce, ← CompactedRegion.bytes `commandEntries ce)
+    return (ce, ← CompactedRegion.bytes ce)
   catch _ =>
     let (main, r₁) ← compactingStates ce.main none
     let (checked, r₂) ← compactingStates ce.checked none
@@ -538,7 +538,7 @@ def CommandEntries.compact (ce : CommandEntries) : IO (CommandEntries × ByteArr
       refused := refused ++ r
     let refusals := refused.foldl (init := #[]) fun rs r => if rs.contains r then rs else rs.push r
     let ce := { ce with main, checked, added, refusals }
-    return (ce, ← CompactedRegion.bytes `commandEntries ce)
+    return (ce, ← CompactedRegion.bytes ce)
 
 /-- Replaces the current module's command payload with `entries` before writing its `.olean`. -/
 def setCommandEntries (env : Environment) (entries : Array CommandEntries) : Environment :=

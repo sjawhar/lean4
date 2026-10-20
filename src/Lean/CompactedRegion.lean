@@ -96,11 +96,11 @@ public unsafe opaque CompactedRegion.save {α : Type} (fname : @& System.FilePat
     (allowClosures := false) : IO Compactor
 
 /--
-The contents of the file `CompactedRegion.save fname key data #[] none` writes, built without writing it. Fails like
-`save` on data it cannot compact (a closure).
+The bytes `data` compacts to, laid out at a fixed base address without the `.olean` header: the same value gives the
+same bytes in every process of one build. Fails like `save` on data it cannot compact (a closure).
 -/
 @[extern "lean_compacted_region_bytes"]
-public opaque CompactedRegion.bytes {α : Type} (key : @& Name) (data : @& α) : IO ByteArray
+public opaque CompactedRegion.bytes {α : Type} (data : @& α) : IO ByteArray
 
 /--
 Reads a compacted region from disk.
