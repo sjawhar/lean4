@@ -648,6 +648,18 @@ private def readdPlain (infos : NameMap ConstantInfo) (limits : ReaddLimits) (en
   if env.containsOnBranch n then return env
   addDeclChecked env (← IO.ofExcept (declOf infos (← infoOf infos n))) limits
 
+/-- Merges into `env` the cached result of the realization `key` for `forConst` (`Environment.readdRealizeConst`); a
+realization not cached and a merge the kernel rejects are errors. The caller first waits for the kernel environment of
+the command's environment (`readdCommandConstants`). -/
+private def mergeCachedRealization (env : Environment) (forConst key : Name) (replayExts : Bool) :
+    IO Environment := do
+  let (env, ex) ← env.readdRealizeConst forConst key (replayExts := replayExts) fun _ _ =>
+    throw <| IO.userError s!"reuse: the realization {key} for {forConst} that the command merged is not cached"
+  if let some ex := ex.get then
+    throw <| IO.userError s!"reuse: kernel rejected the realization {key} for {forConst}: \
+      {← (ex.toMessageData {}).toString}"
+  return env
+
 /-- Re-adds `a` to `env` as the full run added it, each part in recorded order:
 - `plain`: `readdPlain`;
 - `async`: `addConstAsync`, then in its branch what the branch added, the constant itself where the record lists it
@@ -659,8 +671,9 @@ private def readdPlain (infos : NameMap ConstantInfo) (limits : ReaddLimits) (en
   constants without a check (the
   merge's kernel check checks them) and replays the states (when the context's cache already holds the key, `build`
   does not run and the cached result is merged);
-- `merged`: the same, with the context's cache holding the key (an earlier command's keep put it there): the cached
-  result is merged, and a missing one is an error;
+- `merged`: the same, with the context's cache holding the key (an earlier command's keep or elaboration put it
+  there): the cached result is merged (`mergeCachedRealization`), and `env` must then hold the constants the record
+  lists;
 - `context`: the context rebuilt from its record (`env` with the recorded states replayed into both views, so that it
   holds the constants and contexts re-added before it) and registered with its options.
 -/
@@ -690,11 +703,7 @@ private partial def readdAdded (regs : Registries) (infos : NameMap ConstantInfo
     let (env, ex) ← env.readdRealizeConst forConst key fun realizeEnv realizeOpts => do
       let mut realizeEnv := realizeEnv
       for (forConst', key') in merges do
-        let (e, ex) ← realizeEnv.readdRealizeConst forConst' key' (replayExts := true) fun _ _ =>
-          throw <| IO.userError s!"the realization {key'} for {forConst'} that it merged is not cached"
-        if let some ex := ex.get then
-          throw <| IO.userError s!"merging {key'}: {← (ex.toMessageData {}).toString}"
-        realizeEnv := e
+        realizeEnv ← mergeCachedRealization realizeEnv forConst' key' (replayExts := true)
       for info in infos' do
         match realizeEnv.addDeclCore 0 0 (← IO.ofExcept (declOf infos info)) none (doCheck := false) with
         | .ok e => realizeEnv := e
@@ -704,13 +713,11 @@ private partial def readdAdded (regs : Registries) (infos : NameMap ConstantInfo
       throw <| IO.userError s!"reuse: kernel rejected the realization {key} for {forConst}: \
         {← (ex.toMessageData {}).toString}"
     return env
-  | .merged forConst key _ => do
+  | .merged forConst key consts => do
     discard <| IO.wait env.checked
-    let (env, ex) ← env.readdRealizeConst forConst key fun _ _ =>
-      throw <| IO.userError s!"reuse: the realization {key} for {forConst} that the command merged is not cached"
-    if let some ex := ex.get then
-      throw <| IO.userError s!"reuse: kernel rejected the realization {key} for {forConst}: \
-        {← (ex.toMessageData {}).toString}"
+    let env ← mergeCachedRealization env forConst key (replayExts := false)
+    if let some n := consts.find? (!env.containsOnBranch ·) then
+      throw <| IO.userError s!"reuse: merging the realization {key} for {forConst} did not add {n}"
     return env
   | .context forConst ctxOpts main checked => do
     let ctxEnv ← replayStates regs env #[(.checked, checked), (.main, main)] ctxOpts
