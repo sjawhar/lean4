@@ -10,6 +10,7 @@ public import Init.System.IO
 import Init.Data.String.TakeDrop
 import Init.Data.ToString.Macro
 import Lean.Util.UsedByChecks
+import Lean.ImportingFlag
 
 public section
 
@@ -94,6 +95,8 @@ should be linked and loaded separately.
 -/
 @[export lean_load_plugin]
 def loadPlugin (path : System.FilePath) (initFn? : Option String := none) : IO Unit := do
+  -- a plugin's attributes are not core's
+  sealCoreAttributes
   -- We never want to look up plugins using the system library search
   let path ← IO.FS.realPath path
   let name ← initFn?.getDM do

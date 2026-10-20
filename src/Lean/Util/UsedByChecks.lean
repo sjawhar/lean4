@@ -198,8 +198,8 @@ ref's value is multi-threaded and so never exclusive, and `Array.push` on it wou
 private builtin_initialize declsByCommandRef : IO.Ref (List (Nat × Array Name × NameSet)) ← IO.mkRef []
 /-- Constants whose values were consulted without leaving a reference in the elaborated term. -/
 private builtin_initialize usedByCommandRef : IO.Ref (List (Nat × Name)) ← IO.mkRef []
-/-- The attributes whose handlers, which may run code outside core Lean (`AttributeImplCore.onlyCoreCode`), a top-level
-command ran. Such a handler may write state no command payload carries. -/
+/-- The attributes whose handlers may run code outside core Lean (`Lean.provenAttribute`) that a top-level command
+ran. Such a handler may write state no command payload carries. -/
 private builtin_initialize foreignAttributesByCommandRef : IO.Ref (List (Nat × Name)) ← IO.mkRef []
 @[extern "lean_io_set_task_context"]
 private opaque setTaskContext (c : UInt32) : BaseIO Unit

@@ -7,6 +7,7 @@ module
 
 prelude
 public import Lean.DocString
+import all Lean.Attributes  -- for `registerCoreAttribute`
 public meta import Init.Data.String.Extra
 public meta import Init.Data.ToString.Name
 
@@ -52,12 +53,11 @@ def mkLabelExt (name : Name := by exact decl_name%) : IO LabelExtension :=
 /-- Helper function for `registerLabelAttr`. -/
 def mkLabelAttr (attrName : Name) (attrDescr : String) (ext : LabelExtension)
   (ref : Name := by exact decl_name%) : IO Unit :=
-registerBuiltinAttribute {
+registerCoreAttribute {
   ref   := ref
   name  := attrName
   descr := attrDescr
   applicationTime := AttributeApplicationTime.afterCompilation
-  onlyCoreCode := true
   add   := fun declName _ kind =>
     ext.add declName kind
   erase := fun declName => do

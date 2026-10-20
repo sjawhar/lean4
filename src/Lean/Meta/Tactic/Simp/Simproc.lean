@@ -8,6 +8,7 @@ module
 prelude
 public import Lean.Compiler.InitAttr
 public import Lean.Meta.Tactic.Simp.Types
+import all Lean.Attributes  -- for `registerCoreAttribute`
 
 public section
 
@@ -366,12 +367,11 @@ def addSimprocAttr (attrName : Name) (ext : SimprocExtension) (declName : Name) 
   discard <| go.run {} {}
 
 def mkSimprocAttr (attrName : Name) (attrDescr : String) (ext : SimprocExtension) (name : Name) : IO Unit := do
-  registerBuiltinAttribute {
+  registerCoreAttribute {
     ref   := name
     name  := attrName
     descr := attrDescr
     applicationTime := AttributeApplicationTime.afterCompilation
-    onlyCoreCode := true
     add   := addSimprocAttr attrName ext
     erase := eraseSimprocAttr ext
   }

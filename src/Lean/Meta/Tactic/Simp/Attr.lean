@@ -6,6 +6,7 @@ Authors: Leonardo de Moura
 module
 prelude
 public import Lean.Meta.Tactic.Simp.Simproc
+import all Lean.Attributes  -- for `registerCoreAttribute`
 public section
 namespace Lean.Meta
 open Simp
@@ -35,12 +36,11 @@ def addDeclToUnfold (ext : SimpExtension) (declName : Name) (post inv : Bool) (p
 
 def mkSimpAttr (attrName : Name) (attrDescr : String) (ext : SimpExtension)
     (ref : Name := by exact decl_name%) : IO Unit :=
-  registerBuiltinAttribute {
+  registerCoreAttribute {
     ref   := ref
     name  := attrName
     descr := attrDescr
     applicationTime := AttributeApplicationTime.afterCompilation
-    onlyCoreCode := true
     add   := fun declName stx attrKind => do
       if (← isSimproc declName <||> isBuiltinSimproc declName) then
         let simprocAttrName := simpAttrNameToSimprocAttrName attrName
