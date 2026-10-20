@@ -66,16 +66,20 @@ def commandStateChanges (before after : Elab.Command.State) : Array Refusal := I
   return refused
 
 /-- The command payloads of the observed commands (`recordCommandDeltas`), each also refused for the command-state
-fields it changed (`commandStateChanges`) and the attributes with handlers outside core Lean it ran
-(`foreignAttributesByCommand`), as the `.olean` stores them (`CommandEntries.compact`), with the digest of their
+fields it changed (`commandStateChanges`), the attributes with handlers outside core Lean it ran
+(`foreignAttributesByCommand`) and the code it evaluated that its environment does not keep (`evaluatedByCommand`), as
+the `.olean` stores them (`CommandEntries.compact`), with the digest of their
 compacted bytes. -/
 def commandPayloads (observations : Array CommandObservation) : IO (Array (CommandEntries × Digest)) := do
   let foreign : Std.HashMap Nat (Array Refusal) := (← foreignAttributesByCommand).reverse.foldl (init := {})
     fun m (i, attr) => m.alter i fun rs => some ((rs.getD #[]).push (.foreignAttribute attr))
+  let evaluated : Std.HashMap Nat (Array Name) := (← evaluatedByCommand).foldl (init := {})
+    fun m (i, n) => m.alter i fun o => some ((o.getD #[]).push n)
   let sorted := observations.qsort (·.i < ·.i)
   let deltas ← recordCommandDeltas (sorted.map fun obs => (obs.before.env, obs.after.env, obs.i))
   (sorted.zip deltas).mapM fun (obs, ce) => do
-    let extra := commandStateChanges obs.before obs.after ++ foreign.getD obs.i #[]
+    let discarded := ((evaluated.getD obs.i #[]).find? (!obs.after.env.contains ·)).map Refusal.ranCode
+    let extra := commandStateChanges obs.before obs.after ++ foreign.getD obs.i #[] ++ discarded.toArray
     let (ce, bytes) ← CommandEntries.compact
       { ce with refusals := extra.foldl (fun rs r => if rs.contains r then rs else rs.push r) ce.refusals }
     return (ce, Digest.ofBytes bytes)

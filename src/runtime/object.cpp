@@ -723,6 +723,17 @@ extern "C" LEAN_EXPORT void lean_mark_mt(object * o) {
 // Tasks
 
 LEAN_THREAD_PTR(lean_task_object, g_current_task_object);
+/* An opaque word that every task created on this thread inherits and that is in force while the task runs: code can
+   attribute what tasks do to what started them. 0 when unset. */
+LEAN_THREAD_VALUE(uint32, g_task_context, 0);
+
+uint32 get_task_context() { return g_task_context; }
+
+/* setTaskContext (c : UInt32) : BaseIO Unit */
+extern "C" LEAN_EXPORT obj_res lean_io_set_task_context(uint32 c) {
+    g_task_context = c;
+    return box(0);
+}
 
 static lean_task_imp * alloc_task_imp(obj_arg c, unsigned prio, bool keep_alive) {
     lean_task_imp * imp = (lean_task_imp*)lean_alloc_small_object(sizeof(lean_task_imp));
@@ -733,6 +744,7 @@ static lean_task_imp * alloc_task_imp(obj_arg c, unsigned prio, bool keep_alive)
     imp->m_canceled    = false;
     imp->m_keep_alive  = keep_alive;
     imp->m_deleted     = false;
+    imp->m_context     = g_task_context;
     return imp;
 }
 
@@ -888,6 +900,7 @@ class task_manager {
         object * v = nullptr;
         {
             scoped_current_task_object scope_cur_task(t);
+            flet<uint32> scope_context(g_task_context, imp->m_context);
             object * c = imp->m_closure;
             imp->m_closure = nullptr;
             lock.unlock();

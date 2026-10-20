@@ -43,33 +43,38 @@ unsafe def check (dir : System.FilePath) (label src : String) (probes : List Nam
 
 def header : String := "import Lean\nopen Lean Elab Command\n"
 
+/-- A command elaborator `name` running `body` (a `CommandElabM` block), defined and then run: unlike `run_cmd`, which
+compiles and discards its code, the elaborator stays in the environment, so the command running it is not refused for
+running discarded code. -/
+def cmd (name body : String) : String := s!"elab \"{name}\" : command => {body}{name}\n"
+
 unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   initSearchPath (← getBuildDir)
-  let push := "run_cmd modifyEnv Meta.simpExtension.pushScope\n"
+  let push := cmd "push_simp" "modifyEnv Meta.simpExtension.pushScope\n"
   check (dir / "macroOpen") "macro open" (header ++ "namespace Foo\ndef a : Nat := 0\nend Foo\n" ++
     "syntax \"open_def \" ident : command\n" ++
     "macro_rules | `(open_def $n) => return mkNullNode #[← `(open $(mkIdent `Foo):ident), ← `(def $n : Nat := 1)]\n" ++
     "open_def x\n") []
   check (dir / "activate") "activateScoped" (header ++
-    "run_cmd do\n  modifyEnv (Meta.simpExtension.activateScoped · `NeverOpened)\n" ++
-    "  elabCommand (← `(def $(mkIdent `activated) : Nat := 0))\n") []
+    cmd "activate_def" ("do\n  modifyEnv (Meta.simpExtension.activateScoped · `NeverOpened)\n" ++
+    "  elabCommand (← `(def $(mkIdent `activated) : Nat := 0))\n")) []
   check (dir / "delimits") "setDelimitsLocal" (header ++ push ++
-    "run_cmd do\n  modifyEnv (Meta.simpExtension.setDelimitsLocal · 1)\n" ++
-    "  elabCommand (← `(def $(mkIdent `delimited) : Nat := 0))\n") []
+    cmd "delimit_def" ("do\n  modifyEnv (Meta.simpExtension.setDelimitsLocal · 1)\n" ++
+    "  elabCommand (← `(def $(mkIdent `delimited) : Nat := 0))\n")) []
   check (dir / "pop") "popScope" (header ++ push ++
-    "run_cmd do\n  modifyEnv Meta.simpExtension.popScope\n" ++
-    "  elabCommand (← `(def $(mkIdent `popped) : Nat := 0))\n") []
+    cmd "pop_def" ("do\n  modifyEnv Meta.simpExtension.popScope\n" ++
+    "  elabCommand (← `(def $(mkIdent `popped) : Nat := 0))\n")) []
   check (dir / "push") "pushScope" (header ++
-    "run_cmd do\n  modifyEnv Meta.simpExtension.pushScope\n" ++
-    "  elabCommand (← `(def $(mkIdent `pushed) : Nat := 0))\n") []
+    cmd "push_def" ("do\n  modifyEnv Meta.simpExtension.pushScope\n" ++
+    "  elabCommand (← `(def $(mkIdent `pushed) : Nat := 0))\n")) []
   check (dir / "replace") "pop and push replace a level" (header ++ push ++
     "attribute [local simp] Nat.add_comm\n" ++
-    "run_cmd do\n  modifyEnv Meta.simpExtension.popScope\n  modifyEnv Meta.simpExtension.pushScope\n" ++
-    "  elabCommand (← `(def $(mkIdent `replaced) : Nat := 0))\n") [``Nat.add_comm]
+    cmd "replace_def" ("do\n  modifyEnv Meta.simpExtension.popScope\n  modifyEnv Meta.simpExtension.pushScope\n" ++
+    "  elabCommand (← `(def $(mkIdent `replaced) : Nat := 0))\n")) [``Nat.add_comm]
   check (dir / "replaceAdd") "pop and push replace a level, then a local entry" (header ++ push ++
     "attribute [local simp] Nat.add_comm\n" ++
-    "run_cmd do\n  modifyEnv Meta.simpExtension.popScope\n  modifyEnv Meta.simpExtension.pushScope\n" ++
-    "  elabCommand (← `(@[local simp] theorem $(mkIdent `t2) (n : Nat) : 0 + n = n := Nat.zero_add n))\n")
+    cmd "replace_thm" ("do\n  modifyEnv Meta.simpExtension.popScope\n  modifyEnv Meta.simpExtension.pushScope\n" ++
+    "  elabCommand (← `(@[local simp] theorem $(mkIdent `t2) (n : Nat) : 0 + n = n := Nat.zero_add n))\n"))
     [``Nat.add_comm, `t2]
   check (dir / "deep") "local entry on a level deeper than the command scope" (header ++ push ++
     "@[local simp] theorem t3 (n : Nat) : 0 + n = n := Nat.zero_add n\n") [`t3]

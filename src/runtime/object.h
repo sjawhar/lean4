@@ -476,6 +476,9 @@ inline obj_res st_ref_put(b_obj_arg r, obj_arg v) { return lean_st_ref_put(r, v)
 inline obj_res st_ref_take(b_obj_arg r) { return lean_st_ref_take(r); }
 inline obj_res st_ref_swap(b_obj_arg r, obj_arg v) { return lean_st_ref_swap(r, v); }
 
+/* The task context of the running thread (`lean_io_set_task_context`). */
+uint32 get_task_context();
+
 obj_res lean_promise_new();
 void lean_promise_resolve(obj_arg value, b_obj_arg promise);
 

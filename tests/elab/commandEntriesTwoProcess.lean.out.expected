@@ -1,0 +1,6 @@
+command 0: elaborated (refused: #[code it evaluated and discarded (_private.M.0._eval), a write to state an imported module's initializer created])
+command 1: elaborated (a target)
+command 1: c equals the full build's
+command 2: elaborated (a target)
+command 2: t equals the full build's
+

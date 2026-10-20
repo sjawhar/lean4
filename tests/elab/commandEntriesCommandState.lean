@@ -84,10 +84,15 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let d (s : Elab.Command.State) := ModuleUsage.ctxDigest s {} default
   IO.println s!"ctx depends on maxRecDepth: {d st != d { st with maxRecDepth := st.maxRecDepth + 1 }}, \
     on ngen: {d st != d { st with ngen := st.ngen.mkChild.2 }}"
-  -- a command does not see the messages or traces of the command before it (the frontend prints the info)
+  -- a command does not see the messages or traces of the command before it (the frontend prints the info); command
+  -- elaborators rather than `run_cmd`, whose discarded code refuses the command
   discard <| report (dir / "perCommand") "messages and traces are per command" (header ++
-    "run_cmd logWarning \"a warning\"\n\
-    set_option trace.debug true in run_cmd trace[debug] \"a trace\"\n\
-    run_cmd logInfo m!\"messages {(← get).messages.toList.length}, traces {(← get).traceState.traces.size}\"\n")
+    "elab \"warn_cmd\" : command => logWarning \"a warning\"\n\
+    elab \"trace_cmd\" : command => do trace[debug] \"a trace\"\n\
+    elab \"count_cmd\" : command => do\n  \
+      logInfo m!\"messages {(← get).messages.toList.length}, traces {(← get).traceState.traces.size}\"\n\
+    warn_cmd\n\
+    set_option trace.debug true in trace_cmd\n\
+    count_cmd\n")
 
 #eval main

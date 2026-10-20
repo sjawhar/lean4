@@ -38,6 +38,7 @@ functions, which have a (relatively) homogeneous ABI that we can use without run
 #endif
 #include "library/ir_interpreter.h"
 #include "runtime/flet.h"
+#include "runtime/thread.h"
 #include "runtime/apply.h"
 #include "runtime/interrupt.h"
 #include "runtime/io.h"
@@ -1195,7 +1196,37 @@ extern "C" LEAN_EXPORT uint32_t lean_eval_main(b_obj_arg env, b_obj_arg opts, b_
     return ret;
 }
 
-extern "C" LEAN_EXPORT object * lean_eval_const(object * env, object * opts, object * c) {
+/* The constants `lean_eval_const` evaluated while a task context was set (`get_task_context`), each with it, but for
+   decisions: a `Bool` or `Decidable` constant (`native_decide`, `bv_decide`, `#guard`) computes a value the elaborator
+   then records in the environment and runs no action. */
+static mutex * g_evaluated_mutex = nullptr;
+static std::vector<std::pair<uint32, object *>> * g_evaluated = nullptr;
+
+/* takeEvaluatedConsts : BaseIO (Array (UInt32 × Name)): the evaluations since the last call */
+extern "C" LEAN_EXPORT obj_res lean_io_take_evaluated_consts() {
+    std::vector<std::pair<uint32, object *>> evaluated;
+    {
+        lock_guard<mutex> lock(*g_evaluated_mutex);
+        evaluated.swap(*g_evaluated);
+    }
+    object * r = lean_alloc_array(0, evaluated.size());
+    for (auto const & e : evaluated) {
+        object * p = lean_alloc_ctor(0, 2, 0);
+        lean_ctor_set(p, 0, lean_box_uint32(e.first));
+        lean_ctor_set(p, 1, e.second);
+        r = lean_array_push(r, p);
+    }
+    return r;
+}
+
+extern "C" LEAN_EXPORT object * lean_eval_const(object * env, object * opts, object * c, uint8 decision) {
+    uint32 ctx = get_task_context();
+    if (ctx != 0 && !decision) {
+        lean_mark_mt(c);
+        lean_inc(c);
+        lock_guard<mutex> lock(*g_evaluated_mutex);
+        g_evaluated->push_back(std::make_pair(ctx, c));
+    }
     try {
         return mk_cnstr(1, run_boxed(TO_REF(elab_environment, env), TO_REF(options, opts), TO_REF(name, c), 0, 0)).steal();
     } catch (exception & ex) {
@@ -1242,6 +1273,8 @@ void initialize_ir_interpreter() {
     });
     ir::g_native_symbol_cache = new name_hash_map<ir::native_symbol_cache_entry>();
     ir::g_native_symbol_cache_mutex = new std::shared_mutex();
+    ir::g_evaluated_mutex = new mutex();
+    ir::g_evaluated = new std::vector<std::pair<uint32, object *>>();
 }
 
 void finalize_ir_interpreter() {

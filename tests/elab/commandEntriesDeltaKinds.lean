@@ -101,14 +101,16 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
     def g (n : Nat) : Nat := n\n\
     attribute [inline] g\n\
     @[cpass] meta def inst : Lean.Compiler.LCNF.PassInstaller := { phase := .base, install := pure }\n\
-    theorem at1 : True := by\n  run_tac Lean.modifyEnv (asyncExt.addEntry (asyncDecl := `at1) · 11)\n  exact trivial\n\
+    elab \"add_at1\" : tactic => Lean.modifyEnv (asyncExt.addEntry (asyncDecl := `at1) · 11)\n\
+    theorem at1 : True := by\n  add_at1\n  exact trivial\n\
     def ibImpl (n : Nat) : Nat := n\n\
     @[implemented_by ibImpl] def ib (n : Nat) : Nat := n\n\
     open Lean Meta in simproc keepSucc (Nat.succ _) := fun _ => return .continue\n\
     open Lean Meta Sym.Simp in cbv_simproc keepAdd (Nat.add _ _) := fun _ => return .rfl\n\
     def myFolder : Lean.Compiler.LCNF.Simp.ConstantFold.Folder := fun _ => return none\n\
-    run_cmd Lean.Elab.Command.liftCoreM <| \
-      Lean.Compiler.LCNF.Simp.ConstantFold.registerFolder ``Nat.pred ``myFolder\n"
+    elab \"reg_folder\" : command => Lean.Elab.Command.liftCoreM <| \
+      Lean.Compiler.LCNF.Simp.ConstantFold.registerFolder ``Nat.pred ``myFolder\n\
+    reg_folder\n"
   IO.FS.writeFile (dir / "M.lean") src
   enableInitializersExecution
   let some _ ← Elab.runFrontend src {} "M.lean" `M

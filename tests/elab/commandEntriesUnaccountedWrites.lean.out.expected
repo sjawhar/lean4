@@ -8,5 +8,6 @@ noskip (some true), reason (some (declaration command 0: a change to mainLog tha
 6: refused for #[], entries #[asyncLog.main]; replay matches
 7: refused for #[asyncLog, asyncLog], entries #[]; refused
 8: refused for #[], entries #[asyncLog.checked, asyncLog.main]; replay matches
-9: refused for #[], entries #[branchLog.checked]; replay matches
-10: refused for #[], entries #[]; replay matches
+9: refused for #[], entries #[]; replay matches
+10: refused for #[], entries #[branchLog.checked]; replay matches
+11: refused for #[], entries #[]; replay matches
