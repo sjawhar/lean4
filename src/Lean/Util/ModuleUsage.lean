@@ -19,6 +19,8 @@ import Lean.Compiler.LCNF.Passes
 import Lean.Compiler.LCNF.Simp.ConstantFold
 import Lean.ReducibilityAttrs
 import Lean.Meta.Instances
+import Lean.Meta.Tactic.Simp.Attr
+import Lean.Compiler.NoncomputableAttr
 import Lean.Class
 import Lean.Meta.UnificationHint
 import Lean.Compiler.MetaAttr
@@ -226,6 +228,7 @@ private builtin_initialize ext : PersistentEnvExtension (Name × Digest) (Name �
       let es := s.localDigests?.elim #[] fun (own, markers) => markers.entries ++ own
       { exported := #[], server := #[], «private» := es }
     asyncMode := .mainOnly
+    perCommand := .recorder
   }
 
 def state (env : Environment) : State := ext.getState (asyncMode := .mainOnly) env
@@ -262,6 +265,7 @@ private builtin_initialize providesExt :
     exportEntriesFnEx := fun _ s =>
       { exported := #[], server := #[], «private» := s.elim #[] fun (k, e) => #[k, e] }
     asyncMode := .mainOnly
+    perCommand := .recorder
   }
 
 /-- The kind bits (`kernelKind`, `extraKind`) with which `provides` (the arrays of `ownProvides`) lists `n`. -/
@@ -353,6 +357,110 @@ def setLocalDigests (env : Environment) (own : Array (Name × Digest)) (closure 
     ({ · with localDigests? := some (own, { closure, provides := providesDigestOf provides }) })
   providesExt.modifyState (asyncMode := .mainOnly) env fun _ => some provides
 
+/-- `c`'s statement digests `(core, attrs)`. `core` covers its level params and type, binders included, never
+its value. `attrs` covers what steers its users without changing the kernel constant: reducibility, instance
+membership and priority, `@[simp]` membership, `protected`, `private` and `noncomputable`. -/
+def stmtHash (env : Environment) (c : ConstantInfo) : Digest × Digest :=
+  let core := ({} : Enc).names c.levelParams |>.digest (exprDigest .namesInfos .eqv c.type) |>.finish
+  let simp := Meta.simpExtension.getState env
+  let prio := (Meta.instanceExtension.getState env).instanceNames.find? c.name |>.map (·.priority)
+  let attrs := reducibilityEnc {} (getReducibilityStatusCore env c.name)
+    |>.opt prio Enc.nat
+    |>.bool (simp.isLemma (.decl c.name) || simp.isLemma (.decl c.name (inv := true)) ||
+      simp.isDeclToUnfold c.name)
+    |>.bool (isProtected env c.name) |>.bool (isPrivateName c.name) |>.bool (isNoncomputable env c.name)
+    |>.finish
+  (core, attrs)
+
+/-- The kernel never unfolds a theorem, opaque or axiom, so a type mentioning one depends on its statement
+only. -/
+def isStmtOnly : ConstantInfo → Bool
+  | .thmInfo _ | .opaqueInfo _ | .axiomInfo _ => true
+  | _ => false
+
+structure StmtState where
+  /-- Per imported module: empty if its `.olean` carries no statement digests, otherwise a marker entry, then
+  `(core, attrs)` per kernel constant, sorted by name. -/
+  importedModuleEntries : Array (Array (Name × Digest × Digest)) := #[]
+  /-- The current module's statement digests, if `setLocalStmt` stored them for the `.olean` write. -/
+  localStmt? : Option (Array (Name × Digest × Digest)) := none
+instance : Inhabited StmtState := ⟨{}⟩
+
+def StmtState.findAt? (s : StmtState) (i : ModuleIdx) (c : Name) : Option (Digest × Digest) := do
+  let es ← s.importedModuleEntries[i.toNat]?
+  (·.2) <$> es.binSearch (c, default, default) (fun a b => Name.quickLt a.1 b.1) (lo := 1)
+
+def StmtState.find? (s : StmtState) (env : Environment) (c : Name) : Option (Digest × Digest) := do
+  s.findAt? (← env.getModuleIdxFor? c) c
+
+/-- Statement digests of the current module's kernel constants, sorted by name: per SCC, as `compute` does, each
+member's name and `stmtHash` core with the name of every constant its type mentions and, for a theorem, opaque
+or axiom, that constant's statement digest, for anything else its full digest (`own` for the current module's),
+since a definition's value decides what a type mentioning it means. `attrs` is `stmtHash`'s, per constant. -/
+def computeStmt (env : Environment) (s : StmtState) (own : Array (Name × Digest)) (consts := ownConsts env) :
+    Array (Name × Digest × Digest) := Id.run do
+  let full : Std.HashMap Name Digest := own.foldl (fun m (n, d) => m.insert n d) {}
+  let fs := state env
+  let byName : Std.HashMap Name (ConstantInfo × (Digest × Digest) × Array Name) :=
+    consts.foldl (init := {}) fun m (n, ci, _) =>
+      m.insert n (ci, stmtHash env ci, ci.type.getUsedConstantsAsSet.toArray.qsort Name.quickLt)
+  let stmtOnly (r : Name) : Bool := ((byName[r]?.map (·.1)) <|> env.find? r).any isStmtOnly
+  let sccs := SCC.scc (consts.map (·.1)).toList fun n =>
+    byName[n]!.2.2.toList.filter fun r => byName.contains r && stmtOnly r
+  let mut out : Std.HashMap Name Digest := {}
+  for scc in sccs do
+    let members := NameSet.ofList scc
+    let sorted := scc.toArray.qsort Name.quickLt
+    let mut e : Enc := ({} : Enc).nat sorted.size
+    for m in sorted do
+      let (_, (core, _), rs) := byName[m]!
+      let outside := rs.filter (!members.contains ·)
+      e := e.name m |>.digest core |>.nat outside.size
+      for r in outside do
+        let so := stmtOnly r
+        let d := if so then out[r]? <|> (s.find? env r).map (·.1) else full[r]? <|> fs.find? env r
+        e := e.name r |>.bool so |>.opt d Enc.digest
+    let d := e.finish
+    for m in scc do out := out.insert m d
+  return (consts.map fun (n, _) => (n, out[n]!, byName[n]!.2.1.2)).qsort fun a b => Name.quickLt a.1 b.1
+
+/-- Private, as `ext`. -/
+private builtin_initialize stmtExt : PersistentEnvExtension (Name × Digest × Digest) (Name × Digest × Digest) StmtState ←
+  registerPersistentEnvExtension {
+    mkInitial := pure {}
+    addImportedFn := fun es => pure { importedModuleEntries := es }
+    addEntryFn := fun s _ => s
+    -- Private level only, as `ext`.
+    exportEntriesFnEx := fun _ s =>
+      let es := s.localStmt?.elim #[] fun stmt => #[(.anonymous, default, default)] ++ stmt
+      { exported := #[], server := #[], «private» := es }
+    asyncMode := .mainOnly
+    perCommand := .recorder
+  }
+
+def stmtState (env : Environment) : StmtState := stmtExt.getState (asyncMode := .mainOnly) env
+
+/-- Stores `computeStmt`'s result for the extension to export. Without it, the `.olean` carries no statement
+digests. -/
+def setLocalStmt (env : Environment) (stmt : Array (Name × Digest × Digest)) : Environment :=
+  stmtExt.modifyState (asyncMode := .mainOnly) env ({ · with localStmt? := some stmt })
+
+/-- `(full, statement core, attrs)` digests of `c`, a kernel constant of imported module `i`. `none` when `i`
+carries no usage digests: a module compiled without `--usage` or by a toolchain without these extensions (stage 0
+compiles the stage-1 toolchain's own `Init`, `Std` and `Lean`; Lake pins those by the Lean githash in the module's
+trace) or a `module` imported without its private level (Lake compares those through `modsysHash`). A module that
+carries digests has both for each of its kernel constants, so a missing one is an error. -/
+def importedConstDigests? (env : Environment) (i : ModuleIdx) (c : Name) :
+    Except String (Option (Digest × Digest × Digest)) := do
+  let s := state env
+  unless s.hasEntries i do return none
+  let mod := env.header.modules[i.toNat]!.module
+  let some full := s.findAt? i c |
+    throw s!"usage: `{c}` from `{mod}` has no full digest in that module's usage entries"
+  let some (core, attrs) := (stmtState env).findAt? i c |
+    throw s!"usage: `{c}` from `{mod}` has no statement digest in that module's usage entries"
+  return some (full, core, attrs)
+
 /-- The imported constants the compiler reads by a name derived from `x` when it compiles a use of `x`: `x`'s derived
 constants (`derivedSuffixes`) and the prefixes whose attributes it reads with `x`'s (`internalPrefixes`). -/
 def derivedReads (env : Environment) (x : Name) : Array Name :=
@@ -362,20 +470,25 @@ def derivedReads (env : Environment) (x : Name) : Array Name :=
 /-- Per defining module, sorted: the node of every imported name that the current module's nodes refer to or
 that is in `extra`, and of every imported constant the compiler reads by a name derived from one of those or from
 a node (`derivedReads`), with its digest. Names without a digest (from a module whose `.olean` carries none) are
-left out. -/
+left out; a kernel constant of a module that carries digests has one (`ownNodes`), so a missing one is an error. -/
 def moduleUsed (env : Environment) (extra : NameSet) (nodes := ownNodes env (ownConsts env)) :
-    Array (Name × Array (Name × Digest)) :=
+    Except String (Array (Name × Array (Name × Digest))) := do
   let s := state env
   let used := extra.foldl (init := (∅ : NameSet)) fun u x => u.insert (s.ownerOf env x)
   let used := nodes.foldl (init := used) fun u n => n.refs.foldl (·.insert ·) u
   let sources := nodes.foldl (·.insert ·.name) (extra.foldl (·.insert ·) used)
   let used := sources.foldl (init := used) fun u x =>
     (derivedReads env x).foldl (fun u d => u.insert (s.ownerOf env d)) u
-  let byMod := used.foldl (init := (∅ : Std.HashMap Name (Array (Name × Digest)))) fun m c => Id.run do
-    let some i := env.getModuleIdxFor? c | return m
-    let some d := s.findAt? i c | return m
-    m.alter env.header.modules[i.toNat]!.module fun o => some ((o.getD #[]).push (c, d))
-  byMod.toArray.map (fun (k, v) => (k, v.qsort fun a b => Name.quickLt a.1 b.1))
+  let mut byMod : Std.HashMap Name (Array (Name × Digest)) := {}
+  for c in used do
+    let some i := env.getModuleIdxFor? c | continue
+    let mod := env.header.modules[i.toNat]!.module
+    let some d := s.findAt? i c |
+      if s.hasEntries i && env.contains c then
+        throw s!"usage: `{c}` from `{mod}` has no full digest in that module's usage entries"
+      continue
+    byMod := byMod.alter mod fun o => some ((o.getD #[]).push (c, d))
+  return byMod.toArray.map (fun (k, v) => (k, v.qsort fun a b => Name.quickLt a.1 b.1))
     |>.qsort fun a b => Name.quickLt a.1 b.1
 
 unsafe structure WalkState where
@@ -636,10 +749,14 @@ changes the kinds of any of those names; `resolvedAll` is set when the whole res
 (`allResolved`), so that Lake rebuilds the module when any closure module's provides changed. Call it after
 everything else the process writes: `resolvedNames` is read last here, after this function's own lookups. `noskip`
 is set when the run reused commands from an `--incr-load` snapshot, since reused commands never call `addDecl` in
-this process and `used` may miss constants they used. -/
+this process and `used` may miss constants they used, and when `noskipReason?` is set (the module's command records
+cannot be used), which is written as `noskipReason`. `stmt` is `computeStmt`'s result and `commands` the per-command
+records. `usedAttrs` holds, beside each kernel constant of a `used` entry, the attrs digest the defining module
+recorded for it (`importedConstDigests?`). -/
 def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Digest)) (closure : Digest)
     (provides : Array Name × Array Name) (used : NameSet) (lookups : Array Expr)
-    (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
+    (stmt : Array (Name × Digest × Digest)) (commands : Array Json) (incrLoaded : Bool) (path : System.FilePath)
+    (noskipReason? : Option String := none) : IO Unit := do
   let s := state env
   let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecks)
   let importedHint := (← compileHints).any fun n => (env.getModuleIdxFor? n).any s.hasEntries
@@ -653,15 +770,20 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
     Json.arr <| (ms.qsort Name.quickLt).toList.eraseDups.toArray.filterMap fun m => do
       return Json.arr #[nameToJson m, toJson (field (← s.importedDigests? (← env.getModuleIdx? m)))]
   let pair (n : Name) (d : Digest) := Json.arr #[nameToJson n, toJson d]
-  let usedJson := Json.arr ((moduleUsed env used nodes).map fun (m, cs) =>
-    Json.arr #[nameToJson m, Json.arr (cs.map fun (n, d) => pair n d)])
+  let usedByMod ← IO.ofExcept (moduleUsed env used nodes)
+  let usedAttrs ← IO.ofExcept <| usedByMod.mapM fun (m, cs) => do
+    let attrs ← cs.filterMapM fun (n, _) => do
+      let some i := env.getModuleIdxFor? n | return none
+      unless env.contains n do return none
+      return (← importedConstDigests? env i n).map fun (_, _, a) => (n, a)
+    return (m, attrs)
   let resolvedAll ← allResolved
   -- Every name whose resolution can reach an output: used, looked up, referred to by a node, or a prefix whose
   -- attributes the compiler reads with one of those (`internalPrefixes`). `resolvedGroups` looks up only these.
   let names : NameHashSet := (← resolvedNames).foldl (·.insert ·) {}
   let names := nodes.foldl (fun s n => n.refs.foldl (·.insert ·) s) (used.foldl (·.insert ·) names)
   let names := (names : Std.HashSet Name).fold (fun s x => (internalPrefixes x).foldl (·.insert ·) s) names
-  let j := Json.mkObj [("version", usageVersion), ("noskip", incrLoaded),
+  let fields : List (String × Json) := [("version", usageVersion), ("noskip", incrLoaded || noskipReason?.isSome),
     ("moduleDigest", toJson (moduleDigestOf own)),
     ("closure", toJson closure),
     ("providesDigest", toJson (providesDigestOf provides)),
@@ -670,13 +792,21 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
     ("importedClosures", imported (env.header.imports.map (·.module)) (·.2)),
     ("importedDigests", imported (extraMods.map (·.module)) (·.1)),
     ("own", Json.arr (own.map fun (n, d) => pair n d)),
-    ("used", usedJson),
+    ("used", Json.arr (usedByMod.map fun (m, cs) =>
+      Json.arr #[nameToJson m, Json.arr (cs.map fun (n, d) => pair n d)])),
     ("resolvedAll", resolvedAll),
     ("resolved", Json.arr ((resolvedGroups env names).map fun (m?, ns) =>
       Json.arr #[m?.elim Json.null nameToJson, Json.arr (ns.map fun (n, k) => Json.arr #[nameToJson n, toJson k.toNat])])),
+    ("usedAttrs", Json.arr (usedAttrs.map fun (m, cs) =>
+      Json.arr #[nameToJson m, Json.arr (cs.map fun (n, a) => pair n a)])),
     ("extra", Json.arr (extraMods.map fun u => Json.arr #[nameToJson u.module, u.isMeta])),
     ("specKeys", Json.arr ((ownSpecKeys env).map fun (d, n) => Json.arr #[toJson d, nameToJson n])),
-    ("specLookups", Json.arr ((specLookups env lookups).map fun (k, p) => Json.arr #[toJson k, toJson p]))]
-  IO.FS.writeFile path j.compress
+    ("specLookups", Json.arr ((specLookups env lookups).map fun (k, p) => Json.arr #[toJson k, toJson p])),
+    ("stmt", Json.arr (stmt.map fun (n, c, a) => Json.arr #[nameToJson n, toJson c, toJson a])),
+    ("commands", Json.arr commands)]
+  let fields := match noskipReason? with
+    | some reason => fields ++ [("noskipReason", toJson reason)]
+    | none => fields
+  IO.FS.writeFile path (Json.mkObj fields).compress
 
 end Lean.ModuleUsage

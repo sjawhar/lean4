@@ -141,7 +141,7 @@ inductive MDataMode where
 
 /-- `s` encoded so that two syntax trees encode alike exactly when `Syntax.structEq` holds: source information
 is left out, and an identifier's raw text is the bytes `Substring.Raw.beq` compares. -/
-private partial def syntaxEnc (e : Enc) : Syntax → Enc
+partial def syntaxEnc (e : Enc) : Syntax → Enc
   | .missing => e.u8 0
   | .node _ k args => args.foldl syntaxEnc (e.u8 1 |>.name k |>.nat args.size)
   | .atom _ v => e.u8 2 |>.str v
@@ -202,5 +202,21 @@ where
     | .anonymous, acc => acc
     | .str p s, acc => (go p acc).push (.str s)
     | .num p k, acc => (go p acc).push (.num k)
+
+/-- Inverse of `nameToJson`. -/
+def nameOfJson? (j : Json) : Except String Name := do
+  (← j.getArr?).foldlM (init := .anonymous) fun n c => match c with
+    | .str s => pure (.str n s)
+    | .num k => do
+      unless k.exponent == 0 && k.mantissa ≥ 0 do throw s!"expected a name component, got {c.compress}"
+      pure (.num n k.mantissa.toNat)
+    | _ => throw s!"expected a name component, got {c.compress}"
+
+/-- A `Name` (de)serialized as `nameToJson`. -/
+structure JName where
+  name : Name
+  deriving Inhabited, BEq
+instance : ToJson JName := ⟨(nameToJson ·.name)⟩
+instance : FromJson JName := ⟨fun j => JName.mk <$> nameOfJson? j⟩
 
 end Lean.ModuleUsage
