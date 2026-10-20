@@ -1,28 +1,37 @@
 import Lean
-/-! The keep-in-order class test: every command of a module is kept in order, each on the
-previous keep's result, from the module's post-import environment with fresh realization caches, as a reuse run in a
-new process does; a command whose payload is refused is elaborated instead, as the frontend would. After each command
-(kept or refused) the chain is compared with the full run: the constants it added (names, level parameters, types and
-values by `Expr.equal`), the entries since the module's start of every persistent extension and command cache in each
-view and in the per-declaration reads of each added constant in both asynchronous modes (a multiset of hashes of each
-entry's compacted bytes), each scoped stack's shape and exported entries, and the next command's messages and
-constants, elaborated on copies with fresh realization caches so that what it realizes there is not cached for its own
-keep (twice on the full run's: only what both agree on compares). Modules: the review's probes (realized constants and
-their contexts R4, R6, R7, a second requester of a realization, a context's options, matcher and header shapes, a
-realization a definition merged from the cache on the main branch, `mainMerge`), constants nested in a theorem's
-branch, nested inductives' auxiliary recursors, a matcher the same command creates, `@[inherit_doc]` of an
-asynchronously elaborated theorem, a module importing extensions of every mode written from theorems' branches and
-scopes, scoped and local `simp` entries in those shapes (`scopedCore`), and the suite's `doLogicTests.lean` and
-`issue11211.lean` (a realization that merged another one it requested, merged again inside a third). Refused: a raw
-write in a branch and a scoped `modifyState` on the main branch, writes to non-persistent extensions that are no
-command cache, an attribute registered outside core (those core's `register_simp_attr` and `register_label_attr`
-register are kept), and every kernel constant that checking the elaborator's would not give: added unchecked (by
-`addDeclCore`, by `debug.skipKernelTC`), `addDecl`'s fallback axioms, an elaborator constant the kernel never received
-(committed, or its commit dropped), a kernel constant the elaborator never received (through `promiseChecked`), a
-realization the kernel rejects when it is merged; `addDecl`'s synchronous fallback, which both hold, is kept. Every
-kept command must equal the full run.
+/-! The keep-in-order class test: every command of a module is kept in order, each on the previous keep's result and
+the chain's command state (a kept command restores its record's counters), from the module's post-import environment
+with fresh realization caches, as a reuse run in a new process does; a command whose payload is refused is elaborated
+instead, on the chain's state, as the frontend would. Before each command the chain clears its scoped stacks'
+operation logs, as the frontend does. After each command (kept or refused) the chain is compared with the full run:
+the constants it added (names, level parameters, types and values by `Expr.equal`); per persistent extension with a
+state delta, the entries since the module's start, and per recorded extension without one, its exported entries, in
+each view and in the per-declaration reads of each added constant in both asynchronous modes (a multiset of hashes of
+each entry's compacted bytes); per command cache, the entries since the module's start; per scoped extension, each
+level's active namespaces and whether it delimits local entries, its exported entries and, in each view, the
+operations the command applied as the recorder takes them (`ScopedEnvExtension.stackDelta`); and the next command's messages and constants, elaborated on copies with fresh realization caches so that
+what it realizes there is not cached for its own keep (twice on the full run's: only what both agree on compares). A
+level's state itself is not compared: a local entry shows in the operations that added it. Process state (an imported
+module's `IO.Ref`) is not compared either, as the full run in this process moved it already:
+`commandEntriesTwoProcess` keeps in a second process.
+Modules: the review's probes (realized constants and their contexts R4, R6, R7, a second requester of a realization, a
+context's options, matcher and header shapes, a realization a definition merged from the cache on the main branch,
+`mainMerge`), constants nested in a theorem's branch, nested inductives' auxiliary recursors, a matcher the same
+command creates, `@[inherit_doc]` of an asynchronously elaborated theorem, a module importing extensions of every mode
+written from theorems' branches and scopes, scoped and local `simp` entries in those shapes (`scopedCore`), the
+suite's `doLogicTests.lean` and `issue11211.lean` (a realization that merged another one it requested, merged again
+inside a third), and, without comparisons between commands (a reuse frontend keeps the next command while a refused
+one's tasks still run), a keep merging a realization a refused command's branch makes late. Refused: a raw write in a
+branch and a scoped `modifyState` on the main branch, writes to non-persistent extensions that are no command cache,
+an attribute registered outside core (those core's `register_simp_attr` and `register_label_attr` register are
+kept), code a command compiled and discarded (`#eval`, `run_meta`), and every kernel constant that checking the
+elaborator's would not give: added unchecked (by `addDeclCore`, by `debug.skipKernelTC`, by `replayConsts` for an
+unsafe constant), `addDecl`'s fallback axioms, an elaborator constant the kernel never received (committed, its commit
+dropped, or rejected by `replayConsts`), a kernel constant the elaborator never received (through `promiseChecked`), a
+realization the kernel rejects when it is merged. Every kept command must equal the full run in what is compared.
 Negative controls: realization records tampered so that their rebuild fails must make each keep that rebuilds one
-throw; a kept docstring replaced by another, the entry count unchanged, must differ; a constant corrupted so that the
+throw; a kept docstring replaced by another, the entry count unchanged, must differ; a scoped stack's operations
+dropped and an entry forged into an extension without a state delta must differ; a constant corrupted so that the
 kernel rejects it must make the keep throw with the kernel's message. -/
 open Lean Elab Command
 
@@ -60,12 +69,16 @@ unsafe def entryHash (memo : Memo) (e : α) : IO UInt64 := do
 unsafe def valuesOf (memo : Memo) (es : Array α) : IO String := do
   return toString ((← es.mapM (entryHash memo)).qsort (· < ·)).toList
 
-unsafe def deltaVal (memo : Memo) (e : ErasedExt) (s₀ s₁ : EnvExtensionState) : IO String :=
+/-- The entries `e`'s state delta gives from `s₀` to `s₁`; without a delta (or with a `stateOnly` one), the exported
+entries of a recorded extension stand for its state (`env`: the environment `s₁` is read from). -/
+unsafe def deltaVal (memo : Memo) (e : ErasedExt) (env : Environment) (s₀ s₁ : EnvExtensionState) : IO String := do
+  let exported : IO String :=
+    if e.perCommand == .recorded then valuesOf memo (e.exportEntriesFn env s₁).private else pure ""
   match e.stateDelta? with
-  | none => pure "no delta"
+  | none => return s!"no delta {← exported}"
   | some d => match d s₀ s₁ with
     | .entries es => valuesOf memo es
-    | .stateOnly => pure "stateOnly"
+    | .stateOnly => return s!"stateOnly {← exported}"
 
 /-- Constants structurally equal, binder names and annotations included (`Expr.equal`). -/
 def strictEq (c c' : ConstantInfo) : Bool :=
@@ -89,14 +102,26 @@ def constDiffs (what : String) (full chain : NameMap ConstantInfo) : Array Strin
 /-- Extensions the recording itself writes, which payloads never carry. -/
 def skipExt (e : ErasedExt) : Bool := e.perCommand == .recorder
 
-unsafe def stackShape (memo : Memo) (s : EnvExtensionState) : IO String := do
-  let st : ScopedEnvExtension.StateStack EnvExtensionEntry EnvExtensionEntry EnvExtensionState := unsafeCast s
-  return s!"{st.stateStack.map fun l => (l.activeScopes.toList, l.delimitsLocal)}/{← valuesOf memo st.newEntries.toArray}"
+/-- A scoped stack after a command (`s₁`): each level's active namespaces and whether it delimits local entries, its
+exported entries, and, with the stack before the command (`s₀?`, for the command's own views), the operations the
+command applied as the recorder takes them (`ScopedEnvExtension.stackDelta`, in order; `none` for a change no operation
+expresses). A per-declaration read of a realized constant reads its realization context's stack, which does not extend
+the command's. -/
+unsafe def stackShape (memo : Memo) (s₀? : Option EnvExtensionState) (s₁ : EnvExtensionState) : IO String := do
+  let st : ScopedEnvExtension.StateStack EnvExtensionEntry EnvExtensionEntry EnvExtensionState := unsafeCast s₁
+  let ops ← match s₀? with
+    | none => pure ""
+    | some s₀ => match ScopedEnvExtension.stackDelta (unsafeCast s₀ : ScopedEnvExtension.StateStack EnvExtensionEntry
+        EnvExtensionEntry EnvExtensionState) st with
+      | some ops => pure s!"/ops {(← ops.mapM (entryHash memo)).toList}"
+      | none => pure "/ops none"
+  return s!"{st.stateStack.map fun l => (l.activeScopes.toList, l.delimitsLocal)}/{← valuesOf memo st.newEntries.toArray}\
+    {ops}"
 
-/-- Everything the comparison reads after one command, counted from `start`, the module's post-import environment
-(`consts`: what the command added): each extension's and cache's state in both views, and its per-declaration read of
-each added constant in both asynchronous modes. -/
-unsafe def observe (memo : Memo) (scopedExts : NameSet) (start after : Environment) (consts : List Name) :
+/-- Everything the comparison reads after one command (from `before` to `after`), counted from `start`, the module's
+post-import environment (`consts`: what the command added): each extension's and cache's state in both views, and its
+per-declaration read of each added constant in both asynchronous modes. -/
+unsafe def observe (memo : Memo) (scopedExts : NameSet) (start before after : Environment) (consts : List Name) :
     IO (Array (String × String)) := do
   let mut out := #[]
   let declModes : List (String × EnvExtension.AsyncMode) := [("asyncEnv", .async .asyncEnv), ("mainEnv", .async .mainEnv)]
@@ -106,13 +131,13 @@ unsafe def observe (memo : Memo) (scopedExts : NameSet) (start after : Environme
     let isScoped := scopedExts.contains e.name
     for v in [EnvExtension.View.checked, .main] do
       let s₁ := (te.getStateIn after v).state
-      out := out.push (s!"{e.name}@{v}", ← if isScoped then stackShape memo s₁
-        else deltaVal memo e (te.getStateIn start v).state s₁)
+      out := out.push (s!"{e.name}@{v}", ← if isScoped then stackShape memo (some (te.getStateIn before v).state) s₁
+        else deltaVal memo e after (te.getStateIn start v).state s₁)
     for (ml, m) in declModes do
       for c in consts do
         let s₁ := (te.getState (asyncMode := m) (asyncDecl := c) after).state
-        out := out.push (s!"{e.name}@{c}@{ml}", ← if isScoped then stackShape memo s₁
-          else deltaVal memo e (te.getStateIn start .main).state s₁)
+        out := out.push (s!"{e.name}@{c}@{ml}", ← if isScoped then stackShape memo none s₁
+          else deltaVal memo e after (te.getStateIn start .main).state s₁)
   for cache in (← commandCacheExtensionsRef.get) do
     for v in [EnvExtension.View.checked, .main] do
       out := out.push (s!"cache {cache.name}@{v}", ← valuesOf memo
@@ -150,40 +175,55 @@ structure ChainResult where
   threw : Array Nat := #[]
   lines : Array String := #[]
 
-/-- Keeps every command of `src` in order, each payload first passed through `tamper`, and compares each with the full
-run (a refused command, elaborated again as the frontend would, too). -/
-unsafe def runChain (dir : System.FilePath) (src : String) (tamper : CommandEntries → CommandEntries := id) :
-    IO ChainResult := do
+/-- `st` after a kept command whose full run went from `before` to `after`: the counters it restores from its record's
+`post` (`CommandPost.ofStates`). -/
+def applyPost (st before after : Command.State) : IO Command.State := do
+  let post := ModuleUsage.CommandPost.ofStates before after
+  let g := post.auxDeclNGen
+  return { st with
+    ngen := ← IO.ofExcept (post.restoreNgen st.ngen)
+    auxDeclNGen := .ofRecord { namePrefix := g.namePrefix, idx := g.idx, parentIdxs := g.parentIdxs }
+    maxRecDepth := post.maxRecDepth
+    usedQuotCtxts := post.quotCtxts.foldl (·.insert ·) st.usedQuotCtxts }
+
+/-- Keeps every command of `src` in order, each payload first passed through `tamper`, on the chain's command state
+(a kept command restores its record's counters, `applyPost`; a refused one is elaborated again on the chain's state as
+the frontend would), and compares each with the full run. With `waits := false` the chain compares nothing between
+commands, so a refused command's asynchronous tasks may still run when the next command is kept, as in a reuse
+frontend, and compares the constants once at the end. -/
+unsafe def runChain (dir : System.FilePath) (src : String) (tamper : CommandEntries → CommandEntries := id)
+    (waits := true) : IO ChainResult := do
   let (obs, payloads) ← elabModule dir src
   let some o0 := obs[0]? | throw <| IO.userError "no commands"
   let scopedExts : NameSet := (← scopedEnvExtensionsRef.get).foldl (·.insert ·.ext.name) {}
   let memo : Memo := { path := dir / "entry.bin", hashes := ← IO.mkRef {} }
   let fresh := CommandEntries.Testing.freshRealizationCaches
-  let mut env ← fresh o0.before.env
+  let mut st : Command.State := { o0.before with env := ← fresh o0.before.env }
   let mut r : ChainResult := { commands := obs.size }
   for o in obs do
-    let some ce := payloads.find? (·.idx == o.i) | continue
+    let some ce := payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload for command {o.i}"
     let ce := tamper ce
-    let chainBefore := env
+    -- as the frontend does before each command: the stacks' logs then hold this command's operations
+    st := { st with env := ← clearScopedOps st.env }
+    let chainBefore := st.env
     let infos := newConsts o.before.env o.after.env
     let consts := infos.toList.map (·.1)
     if !ce.refusals.isEmpty then
-      env := (← elabOn src o.before env o.stx (asFrontend := true)).1.env
-      -- an unrecorded extension's index depends on how many extensions core registers
-      let shown := ce.refusals.map fun | .unrecorded .. => "a write to a non-persistent extension" | r => toString r
-      r := { r with refused := r.refused.push (o.i, shown) }
+      st := (← elabOn src st st.env o.stx (asFrontend := true)).1
+      r := { r with refused := r.refused.push (o.i, ce.refusals.map toString) }
     else
       try
-        env ← CommandEntries.Testing.keep env ce infos {}
+        st ← applyPost { st with env := ← CommandEntries.Testing.keep st.env ce infos {} } o.before o.after
         r := { r with kept := r.kept + 1 }
       catch e =>
         r := { r with threw := r.threw.push o.i, lines := r.lines.push s!"  command {o.i}: keep threw: {e}" }
         -- a failed keep leaves its realizations' failures in the caches it shares
-        env := (← elabOn src o.before (← fresh env) o.stx (asFrontend := true)).1.env
-    for d in constDiffs "constants" infos (newConsts chainBefore env) do
+        st := (← elabOn src st (← fresh chainBefore) o.stx (asFrontend := true)).1
+    unless waits do continue
+    for d in constDiffs "constants" infos (newConsts chainBefore st.env) do
       r := { r with lines := r.lines.push s!"  command {o.i}: {d}" }
-    let vf ← observe memo scopedExts o0.before.env o.after.env consts
-    let vk ← observe memo scopedExts o0.before.env env consts
+    let vf ← observe memo scopedExts o0.before.env o.before.env o.after.env consts
+    let vk ← observe memo scopedExts o0.before.env chainBefore st.env consts
     for ((l, a), (_, b)) in vf.zip vk do
       if a != b then r := { r with lines := r.lines.push s!"  command {o.i}: {l}: full {a}, chain {b}" }
     if let some next := obs.find? (·.i == o.i + 1) then
@@ -193,20 +233,25 @@ unsafe def runChain (dir : System.FilePath) (src : String) (tamper : CommandEntr
       let (sFull, mFull) ← elabOn src o.after fullEnv next.stx
       let fullEnv' ← fresh o.after.env
       let (sFull', mFull') ← elabOn src o.after fullEnv' next.stx
-      let chainEnv ← fresh env
-      let (sChain, mChain) ← elabOn src o.after chainEnv next.stx
+      let chainEnv ← fresh st.env
+      let (sChain, mChain) ← elabOn src st chainEnv next.stx
       unless mFull != mFull' || mFull == mChain do
         r := { r with lines := r.lines.push s!"  command {o.i}: next command's messages: full {mFull}, chain {mChain}" }
       let cFull := newConsts fullEnv sFull.env
       if (constDiffs "" cFull (newConsts fullEnv' sFull'.env)).isEmpty then
         for d in constDiffs "next command's constants" cFull (newConsts chainEnv sChain.env) do
           r := { r with lines := r.lines.push s!"  command {o.i}: {d}" }
+  unless waits do
+    if let some last := obs.back? then
+      for d in constDiffs "final constants" (newConsts o0.before.env last.after.env) (newConsts o0.before.env st.env) do
+        r := { r with lines := r.lines.push s!"  {d}" }
   return r
 
-/-- Keeps every command of `src` in order and prints how many were kept, each refused command's refusals, and every
-difference. -/
-unsafe def chain (dir : System.FilePath) (label src : String) : IO Unit := do
-  let r ← runChain dir src
+/-- Keeps every command of `src` in order (`runChain`) and prints how many were kept, each refused command's refusals,
+and every difference. -/
+unsafe def chain (dir : System.FilePath) (label src : String) (tamper : CommandEntries → CommandEntries := id)
+    (waits := true) : IO Unit := do
+  let r ← runChain dir src tamper waits
   IO.println s!"{label}: {r.commands} commands, {r.kept} kept, refused {r.refused.map (·.1)}, {r.lines.size} differences"
   for (i, rs) in r.refused do IO.println s!"  command {i} refused: {rs}"
   for l in r.lines do IO.println l
@@ -328,15 +373,101 @@ elab \"add_unchecked \" id:ident : command => liftTermElabM do
   | .error _ => throwError \"rejected\"
 "
 
+/-- Commands that install constants through `Environment.replayConsts`: one the kernel rejects there (it keeps the old
+kernel environment while the elaborator keeps the constant), and an unsafe one it adds unchecked. -/
+def dxSource : String := "import Lean
+open Lean Elab Command Meta
+
+/-- adds `id : False` unchecked to a copy, then `Environment.replayConsts` copies it back: the kernel rejects it there,
+and the elaborator keeps it -/
+elab \"add_via_replay \" id:ident : command => liftTermElabM do
+  let env ← getEnv
+  let decl : Declaration := .thmDecl { name := id.getId, levelParams := [], type := mkConst ``False, value := mkConst ``True.intro }
+  match env.addDeclCore 0 0 decl none (doCheck := false) with
+  | .ok env' => setEnv (← env.replayConsts env env')
+  | .error _ => throwError \"rejected\"
+
+/-- the same with an unsafe definition whose value has the wrong type: `replayConsts` adds unsafe constants unchecked -/
+elab \"add_unsafe_via_replay \" id:ident : command => liftTermElabM do
+  let env ← getEnv
+  let decl : Declaration :=
+    .defnDecl (mkDefinitionValEx id.getId [] (mkConst ``Nat) (mkStrLit \"not a Nat\") .opaque .unsafe [id.getId])
+  match env.addDeclCore 0 0 decl none (doCheck := false) with
+  | .ok env' => setEnv (← env.replayConsts env env')
+  | .error _ => throwError \"rejected\"
+"
+
+/-- Realizations requested from theorems' branches and commands: a keep of the command after a refused one may look up
+a realization the refused command's asynchronous branch has not made yet. -/
+def rxSource : String := "import Lean
+open Lean Meta Elab Command Term Tactic
+
+def mkR (n : Name) (v : Expr) : MetaM Unit :=
+  addDecl (.defnDecl (mkDefinitionValEx n [] (mkConst ``Nat) v .abbrev .safe [n]))
+
+/-- `f.r3 := 3` -/
+def r3 (f : Name) : MetaM Unit := realizeConst f (f ++ `r3) (mkR (f ++ `r3) (mkNatLit 3))
+/-- requests `r3`, then `f.r2 := f.r3` -/
+def r2 (f : Name) : MetaM Unit := realizeConst f (f ++ `r2) do r3 f; mkR (f ++ `r2) (mkConst (f ++ `r3))
+/-- requests `r2` (which requests `r3`) and `r3` again, then `f.r1 := f.r2` -/
+def r1 (f : Name) : MetaM Unit := realizeConst f (f ++ `r1) do r2 f; r3 f; mkR (f ++ `r1) (mkConst (f ++ `r2))
+/-- requests `r1`, then `f.r0 := f.r1` -/
+def r0 (f : Name) : MetaM Unit := realizeConst f (f ++ `r0) do r1 f; mkR (f ++ `r0) (mkConst (f ++ `r1))
+/-- in `f`'s context, requests `r2` for `g` -/
+def q1 (f g : Name) : MetaM Unit := realizeConst f (f ++ `q1) do r2 g; mkR (f ++ `q1) (mkConst (g ++ `r2))
+
+def byKey (k f : Name) : MetaM Unit :=
+  match k with
+  | `r0 => r0 f | `r1 => r1 f | `r2 => r2 f | `r3 => r3 f | _ => throwError \"unknown key {k}\"
+
+elab \"#real \" k:ident f:ident : command => liftTermElabM do
+  byKey k.getId (← realizeGlobalConstNoOverload f)
+elab \"real_tac \" k:ident f:ident : tactic => do
+  byKey k.getId (← realizeGlobalConstNoOverload f)
+elab \"#q1 \" f:ident g:ident : command => liftTermElabM do
+  q1 (← realizeGlobalConstNoOverload f) (← realizeGlobalConstNoOverload g)
+elab \"q1_tac \" f:ident g:ident : tactic => do
+  q1 (← realizeGlobalConstNoOverload f) (← realizeGlobalConstNoOverload g)
+
+initialize rSync : EnvExtension NameSet ← registerEnvExtension (pure {}) (asyncMode := .sync)
+/-- a write to a non-persistent extension: the command is refused (`unrecorded`) -/
+elab \"refuse_tac\" : tactic => modifyEnv fun env => rSync.modifyState env (·.insert `x)
+elab \"sleep_tac \" n:num : tactic => IO.sleep n.getNat.toUInt32
+"
+
+/-- NC2: command `i`'s scoped stack operations dropped. -/
+def dropScoped (i : Nat) (ce : CommandEntries) : CommandEntries :=
+  if ce.idx != i then ce else { ce with main := { ce.main with scopedOps := #[] } }
+
+/-- NC3: command `i` also adds a linter set (`Lean.Linter.linterSetsExt`, an extension without a state delta). -/
+unsafe def addLinterSet (i : Nat) (ce : CommandEntries) : CommandEntries :=
+  if ce.idx != i then ce else
+  let e : EnvExtensionEntry := unsafeCast ((`tamperedSet, ({} : NameSet).insert `linter.unusedVariables) : Name × NameSet)
+  { ce with main := { ce.main with entries := ce.main.entries.push (`Lean.Linter.linterSetsExt, #[e]) } }
+
+/-- `src` kept with `tamper`: whether the chain differs from the full run, and where first. -/
+unsafe def tamperedDiffers (dir : System.FilePath) (label src : String) (tamper : CommandEntries → CommandEntries) :
+    IO Unit := do
+  let r ← runChain dir src tamper
+  IO.println s!"{label}: differs {!r.lines.isEmpty}{(r.lines[0]?.map (s!", first at {·.trimAscii.takeWhile (· != ':')}")).getD ""}"
+
 unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   IO.FS.writeFile (dir / "X.lean") xSource
   runLean dir #["-o", "X.olean", "--usage=X.usage", "X.lean"]
   IO.FS.writeFile (dir / "X2.lean") x2Source
   runLean dir #["-o", "X2.olean", "--usage=X2.usage", "X2.lean"]
+  IO.FS.writeFile (dir / "DX.lean") dxSource
+  runLean dir #["-o", "DX.olean", "--usage=DX.usage", "DX.lean"]
+  IO.FS.writeFile (dir / "RX.lean") rxSource
+  runLean dir #["-o", "RX.olean", "--usage=RX.usage", "RX.lean"]
   initSearchPath (← getBuildDir) [dir]
   for (label, src) in modules do
     chain dir label src
   chain dir "branchStates" branchSource
+  chain dir "replayRejected" "import DX\nadd_via_replay bogus\ntheorem t : True := trivial\n"
+  chain dir "replayUnsafe" "import DX\nadd_unsafe_via_replay bad\ntheorem t : True := trivial\n"
+  -- the refused theorem's branch realizes `f.r1` only after its sleep: the next command's keep must wait for it
+  chain dir "R1 without waits" "import RX\ndef f : Nat := 0\ntheorem a : True := by refuse_tac; sleep_tac 3000; real_tac r1 f; trivial\n#real r1 f\ntheorem t : f.r1 = 3 := rfl\n" (waits := false)
   -- test files of the suite: realizations merged from the cache on the main branch, many keeps after them; a
   -- realization that merged another one it requested, merged again inside a third
   chain dir "doLogicTests" (← IO.FS.readFile "doLogicTests.lean")
@@ -344,6 +475,12 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   for label in ["chain", "secondRealizer", "R7"] do
     tamperedChain dir label (modules.lookup label).get!
   swappedDocChain dir "doc" "/-- doc of a -/\ndef a : Nat := 1\ntheorem t : True := trivial\n"
+  -- negative controls of the state comparison: a scoped level's local entry lost, an entry forged into an extension
+  -- without a state delta
+  tamperedDiffers dir "localSimp with command 1's scoped operations dropped"
+    "def x : Nat := 0\nattribute [local simp] x\ntheorem u : True := trivial\n" (dropScoped 1)
+  tamperedDiffers dir "plain with a linter set forged into command 0"
+    "theorem a : True := trivial\ntheorem b : True := trivial\n" (addLinterSet 0)
   corruptedKeep dir "corrupted theorem" "theorem a : 1 = 1 := rfl\ndef b : Nat := 1\n" 0 `a
   corruptedKeep dir "corrupted definition" "theorem a : 1 = 1 := rfl\ndef b : Nat := 1\n" 1 `b
 
