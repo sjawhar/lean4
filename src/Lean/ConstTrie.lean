@@ -259,7 +259,8 @@ public inductive ImportedConsts (α : Type) where
   Like `merged`, but with the entry and children computed on first access from the candidate
   subtrees sharing the prefix, one level at a time; the entry resolution rule is fixed at merge
   time (see `mergeModuleTreesLazy`). Thunk forcing is thread-safe and supported on persistent
-  objects, so lazy nodes are safe to share across elaboration threads.
+  objects, so lazy nodes are safe to share across elaboration threads. Force the thunks with
+  `forceShared` only.
   -/
   | lazy (key : Name) (entry : Thunk (Option (α × Nat)))
       (expanded : Thunk (Array (ImportedConsts α) × ByteArray))
@@ -276,6 +277,15 @@ public instance : Inhabited (ImportedConsts α) := ⟨.merged .anonymous none #[
 namespace ImportedConsts
 
 public def empty : ImportedConsts α := .merged .anonymous none #[] .empty
+
+/--
+`t.get`, except that the allocations computing `t`'s value are not counted as heartbeats of the
+current thread. A lazily merged node is shared by all threads of a process and computed by whichever
+thread needs it first, so counting that work would make the heartbeats of a computation, and with
+them whether it stays within a heartbeat limit, depend on what other threads happened to do before.
+-/
+@[extern "lean_imported_consts_force_shared"]
+public def forceShared (t : @& Thunk β) : β := t.get
 
 def key : ImportedConsts α → Name
   | .mod _ t     => t.key
@@ -305,9 +315,9 @@ partial def findValAux : ImportedConsts α → Array Name → Nat → Option α
   | .mod _ tr, path, i => tr.findAux path i
   | .lazy _ entry expanded, path, i =>
     if i == 0 then
-      entry.get.map (·.1)
+      (forceShared entry).map (·.1)
     else
-      let (cs, hs) := expanded.get
+      let (cs, hs) := forceShared expanded
       match findHashIdx? hs cs key path[i - 1]! with
       | some j => findValAux cs[j]! path (i - 1)
       | none   => none
@@ -329,9 +339,9 @@ partial def findModIdxAux : ImportedConsts α → Array Name → Nat → Option 
     | none   => none
   | .lazy _ entry expanded, path, i =>
     if i == 0 then
-      entry.get.map (·.2)
+      (forceShared entry).map (·.2)
     else
-      let (cs, hs) := expanded.get
+      let (cs, hs) := forceShared expanded
       match findHashIdx? hs cs key path[i - 1]! with
       | some j => findModIdxAux cs[j]! path (i - 1)
       | none   => none
@@ -353,9 +363,9 @@ partial def findEntryAux : ImportedConsts α → Array Name → Nat → Option (
     | none   => none
   | .lazy _ entry expanded, path, i =>
     if i == 0 then
-      entry.get
+      forceShared entry
     else
-      let (cs, hs) := expanded.get
+      let (cs, hs) := forceShared expanded
       match findHashIdx? hs cs key path[i - 1]! with
       | some j => findEntryAux cs[j]! path (i - 1)
       | none   => none
@@ -553,8 +563,8 @@ where
     | .cached _ t       => modifyChild n f t
     | .lazy k e exp =>
       -- force the node so the modification is not lost on re-expansion
-      let (cs, hs) := exp.get
-      modifyChild n f (.merged k e.get cs hs)
+      let (cs, hs) := forceShared exp
+      modifyChild n f (.merged k (forceShared e) cs hs)
     | .merged k e? cs hs =>
       match findHashIdx? hs cs key n with
       | some i => .merged k e? (cs.modify i f) hs
@@ -567,8 +577,8 @@ merges in the middle of compaction and compacting the thunk wrappers themselves.
 -/
 public partial def forceExpanded : ImportedConsts α → ImportedConsts α
   | .lazy k entry expanded =>
-    let (cs, hs) := expanded.get
-    .merged k entry.get (cs.map forceExpanded) hs
+    let (cs, hs) := forceShared expanded
+    .merged k (forceShared entry) (cs.map forceExpanded) hs
   | .merged k e? cs hs => .merged k e? (cs.map forceExpanded) hs
   -- caches cannot be compacted
   | .cached _ t        => forceExpanded t
@@ -585,9 +595,9 @@ public partial def foldlM [Monad m] (t : ImportedConsts α) (f : σ → Name →
     cs.foldlM (fun s c => c.foldlM f s) s
   | .lazy k entry expanded =>
     let mut s := init
-    if let some (v, _) := entry.get then
+    if let some (v, _) := forceShared entry then
       s ← f s k v
-    (expanded.get).1.foldlM (fun s c => c.foldlM f s) s
+    (forceShared expanded).1.foldlM (fun s c => c.foldlM f s) s
   | .cached _ t => t.foldlM f init
 
 public def foldl (t : ImportedConsts α) (f : σ → Name → α → σ) (init : σ) : σ :=
@@ -605,9 +615,9 @@ public partial def foldlEntriesM [Monad m] (t : ImportedConsts α)
     cs.foldlM (fun s c => c.foldlEntriesM f s) s
   | .lazy k entry expanded =>
     let mut s := init
-    if let some e := entry.get then
+    if let some e := forceShared entry then
       s ← f s k e
-    (expanded.get).1.foldlM (fun s c => c.foldlEntriesM f s) s
+    (forceShared expanded).1.foldlM (fun s c => c.foldlEntriesM f s) s
   | .cached _ t => t.foldlEntriesM f init
 
 public def forM [Monad m] (t : ImportedConsts α) (f : Name → α → m PUnit) : m PUnit :=

@@ -1041,12 +1041,18 @@ private builtin_initialize const2ModIdxCacheRef :
 @[noinline] private unsafe def const2ModIdxMemoUnsafe
     (consts : ImportedConsts ConstantInfo) (mk : Thunk (Std.HashMap Name ModuleIdx)) :
     Std.HashMap Name ModuleIdx := unsafeBaseIO do
-  for (root, m) in (← const2ModIdxCacheRef.get) do
-    if ptrEq root consts then
-      return m
-  let m := mk.get
-  const2ModIdxCacheRef.modify fun cached =>
-    if cached.any (ptrEq ·.1 consts) then cached else (consts, m) :: cached.take 3
+  -- The memo is shared by all threads, and which of them computes the map depends on scheduling, so
+  -- neither the computation nor the memo's upkeep counts as heartbeats of the calling thread (see
+  -- `ImportedConsts.forceShared`).
+  let heartbeats ← IO.getNumHeartbeats
+  let m ← match (← const2ModIdxCacheRef.get).find? (ptrEq ·.1 consts) with
+    | some (_, m) => pure m
+    | none =>
+      let m := ImportedConsts.forceShared mk
+      const2ModIdxCacheRef.modify fun cached =>
+        if cached.any (ptrEq ·.1 consts) then cached else (consts, m) :: cached.take 3
+      pure m
+  IO.setNumHeartbeats heartbeats
   return m
 
 @[implemented_by const2ModIdxMemoUnsafe]

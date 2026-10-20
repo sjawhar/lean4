@@ -5,6 +5,7 @@ Author: Sebastian Ullrich
 */
 #include <atomic>
 #include <lean/lean.h>
+#include "runtime/alloc.h"
 
 namespace lean {
 /*
@@ -38,6 +39,15 @@ table can share them) and publishes the new table via an atomic pointer; old tab
 the cache is freed as concurrent readers may still probe them, with total overhead below the final
 table's size thanks to geometric growth. Insertions racing with a swap go to the old table and are
 merely lost.
+
+Heartbeats count a thread's allocations, and heartbeat limits (`maxHeartbeats`) are deterministic
+only if a computation's heartbeats depend on that computation alone. Whether a lookup hits depends
+on what other threads looked up before, and a lazily merged node of a view (`ImportedConsts.lazy`)
+is computed by whichever thread needs it first. So a lookup costs no heartbeats, hit or miss: a miss
+restores the thread's heartbeat count after computing its result, and marks the result persistent
+even when the cache does not keep it, so that the caller gets a shared value either way and
+allocates the same afterwards; lazy nodes are forced through `lean_imported_consts_force_shared`,
+which does not count their computation either.
 */
 
 extern "C" void lean_mark_persistent_unshared(lean_object * o);
@@ -180,14 +190,19 @@ static inline __attribute__((always_inline)) lean_obj_res find_cached_in(cache &
             return e->m_val;
         }
     }
+    // not counted, see above
+    uint64_t heartbeats = get_num_heartbeats();
     lean_inc(root); lean_inc(n);
     lean_object * r = core(root, n);
-    if (empty == t->m_num_slots)
-        return r;
     // The value is handed to and `inc`ed by arbitrary reader threads; marking it persistent keeps
     // hits free of atomic RC and of coherence traffic on hot values. The unshared variant only
     // writes thread-owned counts, so it is race-free where plain `lean_mark_persistent` is not.
+    // A value the cache does not keep, as its window is full or an insertion race is lost, is
+    // marked too so that a miss returns what a hit would, and is leaked.
     lean_mark_persistent_unshared(r);
+    set_heartbeats(heartbeats);
+    if (empty == t->m_num_slots)
+        return r;
     // Pin the key, and the root unless it owns the cache; hits only compare them, so they need no
     // special marking.
     if (!owned)
@@ -240,6 +255,19 @@ extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_find_entry_cached(b_lea
 
 extern "C" LEAN_EXPORT lean_obj_res lean_imported_extra_consts_find_entry_cached(b_lean_obj_arg root, b_lean_obj_arg n) {
     return find_cached(root, n, lean_imported_extra_consts_find_entry_core);
+}
+
+/* ImportedConsts.forceShared (t : @& Thunk α) : α */
+extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_force_shared(b_lean_obj_arg t) {
+    lean_object * r = lean_to_thunk(t)->m_value;
+    if (!r) {
+        // not counted, see above
+        uint64_t heartbeats = get_num_heartbeats();
+        r = lean_thunk_get_core(t);
+        set_heartbeats(heartbeats);
+    }
+    lean_inc(r);
+    return r;
 }
 
 /* LookupCache.new : BaseIO LookupCache */
