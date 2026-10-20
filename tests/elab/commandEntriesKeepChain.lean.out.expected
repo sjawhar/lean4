@@ -20,10 +20,10 @@ plain: [a]; sync: [b]; tagged: []
 bogus : False
 plain: [a]; sync: [b]; tagged: [c]
 plainUnchecked: 10 commands, 6 kept, refused #[0, 1, 4, 7], 0 differences
-  command 0 refused: #[a write to a non-persistent extension]
-  command 1 refused: #[a write to a non-persistent extension]
+  command 0 refused: #[a write to plainExt, neither persistent nor a command cache]
+  command 1 refused: #[a write to plainSyncExt, neither persistent nor a command cache]
   command 4 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give]
-  command 7 refused: #[the attribute ref_tag, whose handlers may run code outside core Lean]
+  command 7 refused: #[the attribute ref_tag, whose handlers may run code outside core Lean, a write to state an imported module's initializer created]
 uncheckedOption: 3 commands, 2 kept, refused #[0], 0 differences
   command 0 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give]
 ax1 : @Prop Prop
@@ -31,23 +31,24 @@ op1 : Nat
 ax2.{u} : Sort v
 axiomFallback: 8 commands, 4 kept, refused #[0, 1, 3, 5], 0 differences
   command 0 refused: #[a change to the command state's scopes]
-  command 1 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give]
-  command 3 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give]
-  command 5 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give]
+  command 1 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give, code it evaluated and discarded (_private.M.0._eval)]
+  command 3 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give, code it evaluated and discarded (_private.M.0._eval)]
+  command 5 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give, code it evaluated and discarded (_private.M.0._eval)]
 Bad : sorry
-syncFallback: 5 commands, 4 kept, refused #[0], 0 differences
+syncFallback: 5 commands, 3 kept, refused #[0, 1], 0 differences
   command 0 refused: #[a change to the command state's scopes]
+  command 1 refused: #[code it evaluated and discarded (_private.M.0._eval)]
 ghost : True
 elabOnly: 5 commands, 3 kept, refused #[0, 1], 0 differences
   command 0 refused: #[a change to the command state's scopes]
-  command 1 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give]
+  command 1 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give, code it evaluated and discarded (_private.M.0._eval)]
 ghost : True
 droppedCommit: 5 commands, 3 kept, refused #[0, 1], 0 differences
   command 0 refused: #[a change to the command state's scopes]
-  command 1 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give]
+  command 1 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give, code it evaluated and discarded (_private.M.0._eval)]
 kernelOnly: 4 commands, 2 kept, refused #[0, 1], 0 differences
   command 0 refused: #[a change to the command state's scopes]
-  command 1 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give]
+  command 1 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give, code it evaluated and discarded (_private.M.0._eval)]
 scopedCore: 16 commands, 13 kept, refused #[0, 2, 5], 0 differences
   command 0 refused: #[a change to the command state's scopes]
   command 2 refused: #[a change to the command state's scopes]
@@ -58,7 +59,7 @@ Note: This linter can be disabled with `set_option linter.defProp false`
 mainMerge: 6 commands, 6 kept, refused #[], 0 differences
 realizationRejected: 5 commands, 3 kept, refused #[0, 2], 0 differences
   command 0 refused: #[a change to the command state's scopes]
-  command 2 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give]
+  command 2 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give, code it evaluated and discarded (_private.M.0._eval)]
 coreHelperAttrs: 5 commands, 5 kept, refused #[], 0 differences
 branchStates: 15 commands, 6 kept, refused #[1, 3, 4, 6, 8, 9, 10, 11, 12], 0 differences
   command 1 refused: #[a change to the command state's scopes]
@@ -70,6 +71,12 @@ branchStates: 15 commands, 6 kept, refused #[1, 3, 4, 6, 8, 9, 10, 11, 12], 0 di
   command 10 refused: #[the attribute scope_attr, whose handlers may run code outside core Lean]
   command 11 refused: #[a change to scopeExt that no entry expresses in the record of t5]
   command 12 refused: #[a change to scopeExt that no entry expresses]
+replayRejected: 3 commands, 2 kept, refused #[0], 0 differences
+  command 0 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give]
+replayUnsafe: 3 commands, 2 kept, refused #[0], 0 differences
+  command 0 refused: #[a declaration whose kernel constant is not what checking the elaborator's would give]
+R1 without waits: 5 commands, 4 kept, refused #[1], 0 differences
+  command 1 refused: #[a write to rSync, neither persistent nor a command cache, a write to rSync, neither persistent nor a command cache in the record of a]
 M.lean:871:10: warning: Variable name `x` is not explicitly referenced.
 
 Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
@@ -132,5 +139,7 @@ chain with every realization record tampered: records in commands #[1, 4, 7, 10]
 secondRealizer with every realization record tampered: records in commands #[1], keeps threw at #[1]
 R7 with every realization record tampered: records in commands #[1, 3], keeps threw at #[1, 3]
 doc with command 0's docstring replaced: kept 3, docstrings differ at command 0: true
+localSimp with command 1's scoped operations dropped: differs true, first at command 1
+plain with a linter set forged into command 0: differs true, first at command 0
 corrupted theorem: threw, with the kernel's message: true
 corrupted definition: threw, with the kernel's message: true
