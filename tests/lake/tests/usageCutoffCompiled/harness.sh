@@ -21,7 +21,8 @@ cd work
 # A case writes its state-0 files with `CASE_s0` and the files state 1 changes with `CASE_s1`, both in the
 # package directory.
 
-# Store the Lake cache in the test directory, never the system cache
+# Store the Lake cache in the test directory, never the system cache. The cutoff tree turns the cutoff on;
+# fresh controls set it off explicitly.
 export LAKE_CACHE_DIR=
 export LAKE_ARTIFACT_CACHE=false
 # The cutoff is off by default; the cutoff tree turns it on, the fresh tree off (each explicitly)
