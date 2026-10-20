@@ -89,6 +89,9 @@ def mkDeclExt (phase : Phase) (name : Name := by exact decl_name%) :
     mkInitial := pure {},
     addImportedFn := fun _ => pure {},
     addEntryFn := fun s decl => s.insert decl.name decl
+    ofOLeanEntry? := some fun _ entry => pure entry
+    stateDelta? := some <| StateDelta.ofPHashMap Name.quickLt fun _ decl => decl
+    stateDeltaSeesDirectWrites := true
     exportEntriesFnEx env s := Id.run do
       let all := sortedEntries s declLt
       let exported := all.filterMap fun decl => do
@@ -106,8 +109,12 @@ def mkDeclExt (phase : Phase) (name : Name := by exact decl_name%) :
 
 builtin_initialize baseExt : DeclExt .pure ← mkDeclExt .base
 builtin_initialize monoExt : DeclExt .pure ← mkDeclExt .mono
-builtin_initialize impureExt : EnvExtension (DeclExtState .impure) ←
-  registerEnvExtension (mkInitial := pure {}) (asyncMode := .sync) (replay? := some (replayFn .impure))
+builtin_initialize impureExt : EnvExtension (DeclExtState .impure) ← do
+  let ext ← registerEnvExtension (mkInitial := pure {}) (asyncMode := .sync)
+    (replay? := some (replayFn .impure))
+  registerCommandCacheExtension `Lean.Compiler.LCNF.impureExt ext
+    (fun before after => (PersistentHashMap.sharedDiff before after).1)
+    (fun state (n, decl) => state.insert n decl)
 
 
 abbrev SigExtState (pu : Purity) := AbstractDeclExtState pu Signature
@@ -133,6 +140,9 @@ def mkSigDeclExt (phase : Phase) (name : Name := by exact decl_name%) :
     mkInitial := pure {},
     addImportedFn := fun _ => pure {},
     addEntryFn := fun s sig => s.insert sig.name sig
+    ofOLeanEntry? := some fun _ entry => pure entry
+    stateDelta? := some <| StateDelta.ofPHashMap Name.quickLt fun _ sig => sig
+    stateDeltaSeesDirectWrites := true
     exportEntriesFnEx env s := Id.run do
       let all := sortedEntries s sigLt
       let exported := all.filterMap fun sig => do
@@ -217,7 +227,11 @@ def getLocalDecl? (declName : Name) : CompilerM (Option ((pu : Purity) × Decl p
   let some decl ← getLocalDeclAt? declName (← getPhase) | return none
   return some ⟨_, decl⟩
 
-builtin_initialize declOrderExt : EnvExtension (List Name × NameSet) ← mkOrderedDeclSetExt
+builtin_initialize declOrderExt : EnvExtension (List Name × NameSet) ← do
+  let ext ← mkOrderedDeclSetExt
+  registerCommandCacheExtension `Lean.Compiler.LCNF.declOrderExt ext
+    (fun before after => (List.addedSince after.1 before.1).toArray.reverse)
+    (fun state n => (n :: state.1, state.2.insert n))
 
 def recordFinalImpureDecl (env : Environment) (name : Name) : Environment :=
   declOrderExt.modifyState env fun s =>

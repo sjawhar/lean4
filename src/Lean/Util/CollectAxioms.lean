@@ -146,6 +146,8 @@ builtin_initialize exportedAxiomsExt :
       let entries := entries.qsort fun a b => Name.quickLt a.1 b.1
       .uniform entries
     asyncMode     := .mainOnly
+    -- computed for the export from the final environment
+    perCommand    := .notCarried
   }
 
 /-- Runs `exportedAxiomsExt`'s export for the current module and stores its entries (`storedExportedAxioms?`), which

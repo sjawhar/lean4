@@ -827,6 +827,12 @@ builtin_initialize folderExt : PersistentEnvExtension FolderOleanEntry FolderEnt
           folders := folders.insert declName folder
       return ([], folders.switch)
     addEntryFn := fun (entries, map) entry => (entry :: entries, map.insert entry.declName entry.folder)
+    ofOLeanEntry? := some fun _ entry =>
+      return { entry with folder := ← ImportM.runCoreM <| getFolder entry.folderDeclName }
+    stateDelta? := some fun s₀ s₁ =>
+      match StateDelta.ofLog s₀ s₁ with
+      | .entries es => .entries (es.map (·.toFolderOleanEntry))
+      | .stateOnly => .stateOnly
     exportEntriesFn := fun (entries, _) => entries.reverse.toArray.map (·.toFolderOleanEntry)
     asyncMode := .sync
     replay? := some fun oldState newState _ s =>

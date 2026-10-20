@@ -1086,8 +1086,17 @@ private structure MatcherKey where
   isPrivate : Bool
 deriving BEq, Hashable
 
-private builtin_initialize matcherExt : EnvExtension (PHashMap MatcherKey Name) ←
-  registerEnvExtension (pure {}) (asyncMode := .local)  -- mere cache, keep it local
+private builtin_initialize matcherExt : EnvExtension (PHashMap MatcherKey Name) ← do
+  let ext ← registerEnvExtension (pure {}) (asyncMode := .local)
+  registerCommandCacheExtension `Lean.Meta.Match.matcherExt ext
+    (fun before after => (PersistentHashMap.sharedDiff before after).1)
+    (fun state (k, n) => state.insert k n)
+
+/-- Serializable view of the matcher cache entries `after` has and `before` lacks, for per-command usage
+recording. -/
+def matcherCacheDelta (before after : Environment) : Array (Expr × Bool × Bool × Name) :=
+  (PersistentHashMap.sharedDiff (matcherExt.getState before) (matcherExt.getState after)).1.map
+    fun (k, n) => (k.value, k.compile, k.isPrivate, n)
 
 /-- Similar to `mkAuxDefinition`, but uses the cache `matcherExt`.
    It also returns an Boolean that indicates whether a new matcher function was added to the environment or not. -/

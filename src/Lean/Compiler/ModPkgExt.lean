@@ -16,6 +16,8 @@ namespace Lean
 /-- Persistent environment extension for storing a single serializable value per module. -/
 @[expose] public def ModuleEnvExtension (σ : Type) := PersistentEnvExtension σ σ σ
 
+/-- Registers a {name}`ModuleEnvExtension`. Its value is the module's own, set at the header or by a module-level
+command, which command payloads do not carry. -/
 public def registerModuleEnvExtension
   [Inhabited σ] (mkInitial : IO σ) (name : Name := by exact decl_name%)
 : IO (ModuleEnvExtension σ) :=
@@ -25,6 +27,7 @@ public def registerModuleEnvExtension
     addImportedFn   := fun _ _ => mkInitial
     addEntryFn      := fun s _ => s
     exportEntriesFn := fun s => #[s]
+    perCommand      := .notCarried
   }
 
 namespace ModuleEnvExtension
