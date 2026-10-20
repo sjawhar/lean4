@@ -4,8 +4,8 @@ source ../common.sh
 ./clean.sh
 
 # A module whose source and options are unchanged but whose imports changed is a kept candidate
-# when the usage cutoff (on by default) does not skip it and its records show the machinery it used
-# while elaborating unchanged (`Module.usageVerdict`): with `LAKE_KEPT_CHECKER` set, Lake asks that
+# when the usage cutoff does not skip it and its records show the machinery it used while
+# elaborating unchanged (`Module.usageVerdict`): with `LAKE_KEPT_CHECKER` set, Lake asks that
 # checker (here `stub.sh`) whether the module's existing `.olean` holds against its current
 # imports, and on a yes records the module as up to date without compiling it. `LAKE_KEPT_EXCLUDE`
 # makes Lake decide the modules it lists as if nothing had been kept for them.
@@ -21,6 +21,9 @@ STUB="$PWD/stub.sh"
 mkdir -p work && cd work
 export LAKE_ARTIFACT_CACHE=false
 unset LAKE_KEPT_CHECKER LAKE_KEPT_EXCLUDE LAKE_KEPT_CHECKER_TIMEOUT STUB_MODE STUB_VERDICTS LAKE_USAGE_CUTOFF
+# The checker needs the usage cutoff, which is off by default: every case turns it on, and the
+# refusal cases turn it off
+export LAKE_USAGE_CUTOFF=1
 
 OUT=.lake/build/lib/lean/P
 # mkp DIR [LIB_CONFIG] -- package `p`: `P.A` defines `A.v` and `A.w`, which `seta` changes; `P.B`
@@ -346,7 +349,7 @@ LAKE_KEPT_CHECKER="$STUB" test_out 'Checked P.B' -d t26 build P
 test_exp ! -e t26/.lake/build/ir/P/B.ltar
 test_exp t26/.lake/build/ir/P/B.setup.json -nt t26.mark
 
-# Without `LAKE_KEPT_CHECKER`, a stale module is compiled as it always was, and nothing is marked kept
+# Without `LAKE_KEPT_CHECKER`, a stale module is compiled, and nothing is marked kept
 mkp t27
 test_run -d t27 build P
 seta t27 2
@@ -429,7 +432,7 @@ LAKE_KEPT_CHECKER="$STUB" test_out 'Checked P.B' -d t34 build P
 printf 'P.B\n' > exclude34
 LAKE_KEPT_EXCLUDE="$PWD/exclude34" test_out 'Built P.B' -d t34 build P --old
 test_cmd_fails grep -q '"kf"' "t34/$OUT/B.trace"
-# ... with `--old --no-build`, an excluded kept module needs a build and nothing changes ...
+# ... with `--old --no-build`, an excluded kept module needs a build and no output changes ...
 mkp t34n
 test_run -d t34n build P
 seta t34n 2
@@ -489,7 +492,9 @@ seta t40 3
 LAKE_KEPT_CHECKER="$STUB" test_out 'Checked P.B' -d t40 build P
 no_match_text 'not asked' produced.out
 # A checker without the usage cutoff is refused: its records decide which modules may be re-checked.
+# The refusal names the setting that turns the cutoff on, which is off when unset, and
 # `lake setup-file`, which the language server runs, says why too
+(unset LAKE_USAGE_CUTOFF; LAKE_KEPT_CHECKER="$STUB" test_err 'needs the usage cutoff (LAKE_USAGE_CUTOFF=1)' -d t40 build P)
 LAKE_USAGE_CUTOFF=false LAKE_KEPT_CHECKER="$STUB" test_err 'needs the usage cutoff' -d t40 build P
 LAKE_USAGE_CUTOFF=false LAKE_KEPT_CHECKER="$STUB" test_err 'needs the usage cutoff' -d t40 setup-file t40/P/C.lean
 
@@ -780,7 +785,7 @@ test_exp "$(cat "t39/$OUT/B.olean.hash")" = "$(cat "t39x/$OUT/B.olean.hash")"
 test_exp "$(dephash "t39/$OUT/C.trace")" = "$(dephash "t39x/$OUT/C.trace")"
 
 # An excluded module whose input the cache maps to a kept archive (as `lake build -o` records it):
-# `--no-build` and `lake shake` only report that it needs a build, and change no file
+# `--no-build` and `lake shake` only report that it needs a build, and change no output
 export LAKE_CACHE_DIR="$PWD/cache53"
 mkp t53
 test_run -d t53 build P
