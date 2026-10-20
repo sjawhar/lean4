@@ -67,15 +67,18 @@ def commandStateChanges (before after : Elab.Command.State) : Array Refusal := I
 
 /-- The command payloads of the observed commands (`recordCommandDeltas`), each also refused for the command-state
 fields it changed (`commandStateChanges`) and the attributes with handlers outside core Lean it ran
-(`foreignAttributesByCommand`). -/
-def commandPayloads (observations : Array CommandObservation) : IO (Array CommandEntries) := do
+(`foreignAttributesByCommand`), as the `.olean` stores them (`CommandEntries.compact`), with the digest of their
+compacted bytes. -/
+def commandPayloads (observations : Array CommandObservation) : IO (Array (CommandEntries × Digest)) := do
   let foreign : Std.HashMap Nat (Array Refusal) := (← foreignAttributesByCommand).reverse.foldl (init := {})
     fun m (i, attr) => m.alter i fun rs => some ((rs.getD #[]).push (.foreignAttribute attr))
   let sorted := observations.qsort (·.i < ·.i)
   let deltas ← recordCommandDeltas (sorted.map fun obs => (obs.before.env, obs.after.env, obs.i))
-  return (sorted.zip deltas).map fun (obs, ce) =>
+  (sorted.zip deltas).mapM fun (obs, ce) => do
     let extra := commandStateChanges obs.before obs.after ++ foreign.getD obs.i #[]
-    { ce with refusals := extra.foldl (fun rs r => if rs.contains r then rs else rs.push r) ce.refusals }
+    let (ce, bytes) ← CommandEntries.compact
+      { ce with refusals := extra.foldl (fun rs r => if rs.contains r then rs else rs.push r) ce.refusals }
+    return (ce, Digest.ofBytes bytes)
 
 /-- What a module records for reuse: its command payloads, its `.usage` command records, and why it is `noskip`. -/
 structure ModuleRecords where
@@ -97,8 +100,9 @@ def moduleRecords (env : Environment) (own : Array (Name × Digest)) (stmt : Arr
   let moduleSystem? := guard env.header.isModule *> some "module-system"
   if nested then
     return { noskipReason? := moduleSystem? <|> some "command observations of a nested frontend" }
-  let payloads ← if env.header.isModule then pure #[] else commandPayloads observations
-  let (commands, unattributed?) ← commandRecords env observations own stmt payloads
+  let compacted ← if env.header.isModule then pure #[] else commandPayloads observations
+  let payloads := compacted.map (·.1)
+  let (commands, unattributed?) ← commandRecords env observations own stmt compacted
   let declIdxs := commands.foldl (init := ({} : Std.HashSet Nat)) fun s c => if c.isDecl then s.insert c.i else s
   return { payloads, commands,
            noskipReason? := moduleSystem? <|> unattributed? <|> commandEntriesNoskipReason? payloads declIdxs.contains }

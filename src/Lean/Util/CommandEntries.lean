@@ -7,6 +7,7 @@ module
 
 prelude
 public import Lean.ScopedEnvExtension
+import Lean.CompactedRegion
 import all Lean.Environment  -- for the per-view writes and counters, branches, realizations and their contexts
 
 public section
@@ -73,13 +74,16 @@ inductive Refusal where
   | unrelatedConstMap (at? : Option Name := none)
   /-- A change to the command state's field `field`, which payloads do not carry. -/
   | commandState (field : Name)
+  /-- Entries recorded for `part` (an extension, a scoped stack or a command cache) that hold a value no `.olean` can
+  store (a closure); the payload leaves them out. -/
+  | uncompactable (part : Name) (at? : Option Name := none)
   deriving Inhabited, BEq
 
 namespace Refusal
 
 /-- The extension the refusal names, if any. -/
 def ext? : Refusal → Option Name
-  | inexpressible ext _ | notCarried ext _ | unreplayable ext _ => some ext
+  | inexpressible ext _ | notCarried ext _ | unreplayable ext _ | uncompactable ext _ => some ext
   | _ => none
 
 private def inRecord : Option Name → String
@@ -98,6 +102,7 @@ protected def toString : Refusal → String
   | foreignRealizationContext c => s!"the realization of {c}, in a context the payload cannot provide"
   | unrelatedConstMap at? => s!"a constant map that does not extend the one before it{inRecord at?}"
   | commandState field => s!"a change to the command state's {field}"
+  | uncompactable part at? => s!"entries for {part} that no .olean can store (a closure){inRecord at?}"
 
 instance : ToString Refusal := ⟨Refusal.toString⟩
 
@@ -425,6 +430,70 @@ def recordCommandDelta (before after : Environment) (idx : Nat) : IO CommandEntr
 def recordCommandDeltas (commands : Array (Environment × Environment × Nat)) : IO (Array CommandEntries) := do
   let regs ← Registries.get
   commands.mapM fun (before, after, idx) => recordCommandDeltaWith regs before after idx
+
+/-- Whether `a` compacts (`CompactedRegion.bytes`): it holds no closure. -/
+private def compacts (a : α) : IO Bool := do
+  try
+    discard <| CompactedRegion.bytes `commandEntriesPart a
+    return true
+  catch _ =>
+    return false
+
+/-- `parts` without those that do not compact, each refused (`Refusal.uncompactable`, in the record of `at?`). -/
+private def compactingParts (parts : Array (Name × Array EnvExtensionEntry)) (at? : Option Name) :
+    IO (Array (Name × Array EnvExtensionEntry) × Array Refusal) := do
+  let mut kept := #[]
+  let mut refused := #[]
+  for (part, es) in parts do
+    if ← compacts es then kept := kept.push (part, es)
+    else refused := refused.push (.uncompactable part at?)
+  return (kept, refused)
+
+/-- `st` without its parts that do not compact (`compactingParts`). -/
+private def compactingStates (st : ViewStates) (at? : Option Name) : IO (ViewStates × Array Refusal) := do
+  let (entries, r₁) ← compactingParts st.entries at?
+  let (scopedOps, r₂) ← compactingParts st.scopedOps at?
+  let (caches, r₃) ← compactingParts st.caches at?
+  return ({ entries, scopedOps, caches }, r₁ ++ r₂ ++ r₃)
+
+/-- `a` with every state part that does not compact left out (`compactingStates`), in nested records too. -/
+private partial def compactingRecord : AddedConst → IO (AddedConst × Array Refusal)
+  | .async n k states nested => do
+    let (states, r) ← compactingStates states (some n)
+    let mut rs := r
+    let mut nested' := #[]
+    for a in nested do
+      let (a, r') ← compactingRecord a
+      nested' := nested'.push a
+      rs := rs ++ r'
+    return (.async n k states nested', rs)
+  | .realization forConst key consts states merges => do
+    let (states, r) ← compactingStates states (some key)
+    return (.realization forConst key consts states merges, r)
+  | .context forConst opts main checked => do
+    let (main, r₁) ← compactingStates main (some forConst)
+    let (checked, r₂) ← compactingStates checked (some forConst)
+    return (.context forConst opts main checked, r₁ ++ r₂)
+  | a => return (a, #[])
+
+/-- `ce` as an `.olean` stores it, with its compacted bytes (`CompactedRegion.bytes`): every recorded part that holds
+a value no `.olean` can store (a closure) is left out and refused (`Refusal.uncompactable`). A payload that compacts
+whole is compacted once. -/
+def CommandEntries.compact (ce : CommandEntries) : IO (CommandEntries × ByteArray) := do
+  try
+    return (ce, ← CompactedRegion.bytes `commandEntries ce)
+  catch _ =>
+    let (main, r₁) ← compactingStates ce.main none
+    let (checked, r₂) ← compactingStates ce.checked none
+    let mut refused := ce.refusals ++ r₁ ++ r₂
+    let mut added := #[]
+    for a in ce.added do
+      let (a, r) ← compactingRecord a
+      added := added.push a
+      refused := refused ++ r
+    let refusals := refused.foldl (init := #[]) fun rs r => if rs.contains r then rs else rs.push r
+    let ce := { ce with main, checked, added, refusals }
+    return (ce, ← CompactedRegion.bytes `commandEntries ce)
 
 /-- Replaces the current module's command payload with `entries` before writing its `.olean`. -/
 def setCommandEntries (env : Environment) (entries : Array CommandEntries) : Environment :=

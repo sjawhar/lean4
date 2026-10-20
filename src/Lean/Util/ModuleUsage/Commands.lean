@@ -10,7 +10,6 @@ public import Lean.Util.ModuleUsage
 public import Lean.Elab.Command
 public import Lean.Util.CommandEntries
 import Lean.Util.ValueSensitive
-import Lean.CompactedRegion
 import Lean.ExtraModUses
 import Lean.Compiler.Old
 import Lean.Meta.Match.Match
@@ -342,7 +341,7 @@ private partial def transientDeps (transient : Std.HashMap Name NameSet) (seen o
 constant (a declaration the kernel or the elaborator rejected referred to it; an IR-only name), or a constant of this
 module the kernel environment does not hold. The module is then `noskip`. -/
 def commandRecords (env : Environment) (observations : Array CommandObservation) (own : Array (Name × Digest))
-    (stmt : Array (Name × Digest × Digest)) (payloads : Array CommandEntries) :
+    (stmt : Array (Name × Digest × Digest)) (payloads : Array (CommandEntries × Digest)) :
     IO (Array CommandRecord × Option String) := do
   let declEntries := (← declsByCommand).toArray.reverse
   let explicitUses := (← usedByCommand).toArray.reverse
@@ -370,8 +369,8 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
       throw s!"usage: command {i} uses `{n}`, a constant of this module without a statement digest"
     return .digests full core attrs
   let mut occurrences : Std.HashMap (Name × Digest) Nat := {}
-  let payloadByIdx : Std.HashMap Nat CommandEntries :=
-    payloads.foldl (fun m p => m.insert p.idx p) {}
+  let payloadByIdx : Std.HashMap Nat (CommandEntries × Digest) :=
+    payloads.foldl (fun m p => m.insert p.1.idx p) {}
   -- per-command lookups, so that each command's record costs what the command added
   let usedByIdx : Std.HashMap Nat (Array NameSet) := declEntries.foldl (init := {})
     fun m (i, _, used) => m.alter i fun us => some ((us.getD #[]).push used)
@@ -482,9 +481,8 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
       post := CommandPost.ofStates obs.before obs.after
       caches := { matcher, auxLemma, eqnsInv, sparseCasesOn, structRes }
     }
-    if let some payload := payloadByIdx[obs.i]? then
-      let bytes ← CompactedRegion.bytes `commandEntries payload
-      entries := (({} : Enc).digest entries |>.digest (Digest.ofBytes bytes)).finish
+    if let some (payload, digest) := payloadByIdx[obs.i]? then
+      entries := (({} : Enc).digest entries |>.digest digest).finish
       -- a change no entry expresses (an erasure) is determined by the command's text and context
       unless payload.refusals.isEmpty do
         entries := (({} : Enc).digest entries |>.digest text |>.digest ctx).finish
