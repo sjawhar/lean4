@@ -345,8 +345,7 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
     IO (Except String (Array CommandRecord)) := do
   let declEntries := (← declsByCommand).toArray.reverse
   let explicitUses := (← usedByCommand).toArray.reverse
-  -- the set the log's records, inserted in recording order, make
-  let extras : Std.HashSet (Nat × ExtraModUse) := (← extraModUsesByCommand).reverse.foldl (·.insert ·) {}
+  let extras ← extraModUsesByCommand
   let fullLocal : Std.HashMap Name Digest := own.foldl (fun m (n, d) => m.insert n d) {}
   let stmtLocal : Std.HashMap Name (Digest × Digest) :=
     stmt.foldl (fun m (n, d, a) => m.insert n (d, a)) {}
