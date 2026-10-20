@@ -445,21 +445,31 @@ digests. -/
 def setLocalStmt (env : Environment) (stmt : Array (Name × Digest × Digest)) : Environment :=
   stmtExt.modifyState (asyncMode := .mainOnly) env ({ · with localStmt? := some stmt })
 
-/-- `(full, statement core, attrs)` digests of `c`, a kernel constant of imported module `i`. `none` when `i`
-carries no usage digests: a module compiled without `--usage` or by a toolchain without these extensions (stage 0
-compiles the stage-1 toolchain's own `Init`, `Std` and `Lean`; Lake pins those by the Lean githash in the module's
-trace) or a `module` imported without its private level (Lake compares those through `modsysHash`). A module that
-carries digests has both for each of its kernel constants, so a missing one is an error. -/
-def importedConstDigests? (env : Environment) (i : ModuleIdx) (c : Name) :
-    Except String (Option (Digest × Digest × Digest)) := do
+/-- What imported module `i`'s usage entries give for `c`, a name `Environment.getModuleIdxFor?` assigns to `i`
+(`importedConstDigests?`). -/
+inductive ImportedDigests where
+  /-- `i` carries no usage digests: a module compiled without `--usage` or by a toolchain without these extensions
+  (stage 0 compiles the stage-1 toolchain's own `Init`, `Std` and `Lean`; Lake pins those by the Lean githash in the
+  module's trace) or a `module` imported without its private level (Lake compares those through `modsysHash`) -/
+  | untracked
+  /-- `c` is one of `i`'s kernel constants, with its full, statement core and attrs digests -/
+  | digests (full core attrs : Digest)
+  /-- `c` is not one of `i`'s kernel constants (`providedKinds`): a name `i` only compiled code for (an
+  `extraConstNames` entry), which another module may define; `i` has no digest for it -/
+  | codeOnly
+
+/-- `ImportedDigests` of `c` for imported module `i`. A module that carries digests has all three for each of its
+kernel constants, so a missing one is an error. -/
+def importedConstDigests? (env : Environment) (i : ModuleIdx) (c : Name) : Except String ImportedDigests := do
   let s := state env
-  unless s.hasEntries i do return none
+  unless s.hasEntries i do return .untracked
+  if providedKinds env i c &&& kernelKind == 0 then return .codeOnly
   let mod := env.header.modules[i.toNat]!.module
   let some full := s.findAt? i c |
     throw s!"usage: `{c}` from `{mod}` has no full digest in that module's usage entries"
   let some (core, attrs) := (stmtState env).findAt? i c |
     throw s!"usage: `{c}` from `{mod}` has no statement digest in that module's usage entries"
-  return some (full, core, attrs)
+  return .digests full core attrs
 
 /-- The imported constants the compiler reads by a name derived from `x` when it compiles a use of `x`: `x`'s derived
 constants (`derivedSuffixes`) and the prefixes whose attributes it reads with `x`'s (`internalPrefixes`). -/
@@ -484,7 +494,8 @@ def moduleUsed (env : Environment) (extra : NameSet) (nodes := ownNodes env (own
     let some i := env.getModuleIdxFor? c | continue
     let mod := env.header.modules[i.toNat]!.module
     let some d := s.findAt? i c |
-      if s.hasEntries i && env.contains c then
+      -- a kernel constant of `i` has a digest; a name `i` only compiled code for has none
+      if s.hasEntries i && providedKinds env i c &&& kernelKind != 0 then
         throw s!"usage: `{c}` from `{mod}` has no full digest in that module's usage entries"
       continue
     byMod := byMod.alter mod fun o => some ((o.getD #[]).push (c, d))
@@ -775,7 +786,9 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
     let attrs ← cs.filterMapM fun (n, _) => do
       let some i := env.getModuleIdxFor? n | return none
       unless env.contains n do return none
-      return (← importedConstDigests? env i n).map fun (_, _, a) => (n, a)
+      return match ← importedConstDigests? env i n with
+        | .digests _ _ attrs => some (n, attrs)
+        | _ => none
     return (m, attrs)
   let resolvedAll ← allResolved
   -- Every name whose resolution can reach an output: used, looked up, referred to by a node, or a prefix whose
