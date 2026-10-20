@@ -65,19 +65,18 @@ def commandStateChanges (before after : Elab.Command.State) : Array Refusal := I
     refused := refused.push (.commandState `infoState)
   return refused
 
-/-- The command payloads of the observed commands (`recordCommandDeltas`), each also refused for the command-state
-fields it changed (`commandStateChanges`), the attributes with handlers outside core Lean it ran
-(`foreignAttributesByCommand`) and the code it evaluated that its environment does not keep (`evaluatedByCommand`), as
-the `.olean` stores them (`CommandEntries.compact`), with the digest of their
-compacted bytes. -/
+/-- The command payloads of the observed commands (`observations`, in command order; `recordCommandDeltas`), each also
+refused for the command-state fields it changed (`commandStateChanges`), the attributes with handlers outside core
+Lean it ran (`foreignAttributesByCommand`) and the code it evaluated that its environment does not keep
+(`evaluatedByCommand`), as the `.olean` stores them (`CommandEntries.compact`), with the digest of their compacted
+bytes. -/
 def commandPayloads (observations : Array CommandObservation) : IO (Array (CommandEntries × Digest)) := do
   let foreign : Std.HashMap Nat (Array Refusal) := (← foreignAttributesByCommand).reverse.foldl (init := {})
     fun m (i, attr) => m.alter i fun rs => some ((rs.getD #[]).push (.foreignAttribute attr))
   let evaluated : Std.HashMap Nat (Array Name) := (← evaluatedByCommand).foldl (init := {})
     fun m (i, n) => m.alter i fun o => some ((o.getD #[]).push n)
-  let sorted := observations.qsort (·.i < ·.i)
-  let deltas ← recordCommandDeltas (sorted.map fun obs => (obs.before.env, obs.after.env, obs.i))
-  (sorted.zip deltas).mapM fun (obs, ce) => do
+  let deltas ← recordCommandDeltas (observations.map fun obs => (obs.before.env, obs.after.env, obs.i))
+  (observations.zip deltas).mapM fun (obs, ce) => do
     let discarded := ((evaluated.getD obs.i #[]).find? (!obs.after.env.contains ·)).map Refusal.ranCode
     let extra := commandStateChanges obs.before obs.after ++ foreign.getD obs.i #[] ++ discarded.toArray
     let (ce, bytes) ← CommandEntries.compact
@@ -98,7 +97,7 @@ structure ModuleRecords where
 - a declaration command with a refusal: `noskip` (`commandEntriesNoskipReason?`). -/
 def moduleRecords (env : Environment) (own : Array (Name × Digest)) (stmt : Array (Name × Digest × Digest))
     (sessionChanged : Bool) : IO ModuleRecords := do
-  let observations ← commandObservations
+  let observations := (← commandObservations).qsort (·.i < ·.i)
   let nested := sessionChanged ||
     (observations.foldl (fun s o => s.insert o.i) ({} : Std.HashSet Nat)).size != observations.size
   let moduleSystem? := guard env.header.isModule *> some "module-system"
@@ -106,9 +105,11 @@ def moduleRecords (env : Environment) (own : Array (Name × Digest)) (stmt : Arr
     return { noskipReason? := moduleSystem? <|> some "command observations of a nested frontend" }
   let compacted ← if env.header.isModule then pure #[] else commandPayloads observations
   let payloads := compacted.map (·.1)
-  let (commands, unattributed?) ← commandRecords env observations own stmt compacted
-  let declIdxs := commands.foldl (init := ({} : Std.HashSet Nat)) fun s c => if c.isDecl then s.insert c.i else s
-  return { payloads, commands,
-           noskipReason? := moduleSystem? <|> unattributed? <|> commandEntriesNoskipReason? payloads declIdxs.contains }
+  match ← commandRecords env observations own stmt compacted with
+  | .error unattributed => return { payloads, noskipReason? := moduleSystem? <|> some unattributed }
+  | .ok commands =>
+    let declIdxs := commands.foldl (init := ({} : Std.HashSet Nat)) fun s c => if c.isDecl then s.insert c.i else s
+    return { payloads, commands,
+             noskipReason? := moduleSystem? <|> commandEntriesNoskipReason? payloads declIdxs.contains }
 
 end Lean.ModuleUsage

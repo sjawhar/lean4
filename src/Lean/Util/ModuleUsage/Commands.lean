@@ -337,12 +337,12 @@ private partial def transientDeps (transient : Std.HashMap Name NameSet) (seen o
       | some ds => transientDeps transient (seen.insert c) out (ds.toList ++ cs)
       | none => transientDeps transient (seen.insert c) (out.insert c) cs
 
-/-- The per-command records, or none and why, when a command used a name no digest stands for: one that names no
-constant (a declaration the kernel or the elaborator rejected referred to it; an IR-only name), or a constant of this
-module the kernel environment does not hold. The module is then `noskip`. -/
+/-- The per-command records of `observations` (in command order), or why there are none: a command used a name no
+digest stands for, one that names no constant (a declaration the kernel or the elaborator rejected referred to it; an
+IR-only name) or a constant of this module the kernel environment does not hold. The module is then `noskip`. -/
 def commandRecords (env : Environment) (observations : Array CommandObservation) (own : Array (Name × Digest))
     (stmt : Array (Name × Digest × Digest)) (payloads : Array (CommandEntries × Digest)) :
-    IO (Array CommandRecord × Option String) := do
+    IO (Except String (Array CommandRecord)) := do
   let declEntries := (← declsByCommand).toArray.reverse
   let explicitUses := (← usedByCommand).toArray.reverse
   -- the set the log's records, inserted in recording order, make
@@ -383,7 +383,7 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
   let mut quotSet : NameSet := {}
   let mut quotDigest : NameSetDigest := {}
   let mut out := #[]
-  for obs in observations.qsort (·.i < ·.i) do
+  for obs in observations do
     let (quotAdded, quotRemoved) := NameSet.sharedDiff quotSet obs.before.usedQuotCtxts
     quotDigest := quotRemoved.foldl (·.erase ·) (quotAdded.foldl (·.insert ·) quotDigest)
     quotSet := obs.before.usedQuotCtxts
@@ -438,7 +438,7 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
     for n in used do
       match ← IO.ofExcept (digestsOf obs.i n) with
       | .untracked => pure ()
-      | .unattributed reason => return (#[], some reason)
+      | .unattributed reason => return .error reason
       | .digests d core attrs =>
         if full.contains n then fullUses := fullUses.push (n, d, attrs)
         else stmtUses := stmtUses.push (n, core)
@@ -486,6 +486,6 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
       -- a change no entry expresses (an erasure) is determined by the command's text and context
       unless payload.refusals.isEmpty do
         entries := (({} : Enc).digest entries |>.digest text |>.digest ctx).finish
-  return (out, none)
+  return .ok out
 
 end Lean.ModuleUsage
