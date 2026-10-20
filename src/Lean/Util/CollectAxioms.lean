@@ -143,6 +143,8 @@ builtin_initialize exportedAxiomsExt :
       let entries := entries.qsort fun a b => Name.quickLt a.1 b.1
       .uniform entries
     asyncMode     := .mainOnly
+    -- computed for the export from the final environment
+    perCommand    := .notCarried
   }
 
 /-- Collect all axioms transitively used by a constant. -/

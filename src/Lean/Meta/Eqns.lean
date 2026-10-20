@@ -156,8 +156,15 @@ structure EqnsExtState where
   deriving Inhabited
 
 /-- A mapping from equational theorem to the declaration it was derived from.  -/
-builtin_initialize eqnsExt : EnvExtension EqnsExtState ←
-  registerEnvExtension (pure {}) (asyncMode := .local) (logWrites := true)
+builtin_initialize eqnsExt : EnvExtension EqnsExtState ← do
+  let ext ← registerEnvExtension (pure {}) (asyncMode := .local) (logWrites := true)
+  registerCommandCacheExtension `Lean.Meta.eqnsExt ext
+    (fun before after => (PersistentHashMap.sharedDiff before.mapInv after.mapInv).1)
+    (fun state (k, v) => { mapInv := state.mapInv.insert k v })
+
+/-- Equational-theorem cache entries `after` has and `before` lacks, for per-command usage recording. -/
+def eqnsCacheDelta (before after : Environment) : Array (Name × Name) :=
+  (PersistentHashMap.sharedDiff (eqnsExt.getState before).mapInv (eqnsExt.getState after).mapInv).1
 
 /--
 Runs `act` with the equation-affecting options restored to the values stored for `declName`

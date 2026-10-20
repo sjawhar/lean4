@@ -90,6 +90,10 @@ private builtin_initialize structureExt : PersistentEnvExtension StructureInfo S
   mkInitial       := pure ((), {})
   addImportedFn   := fun _ => pure ((), {})
   addEntryFn      := fun (_, s) e => ((), { s with map := s.map.insert e.structName e })
+  ofOLeanEntry?   := some fun _ entry => pure entry
+  stateDelta?     := some fun (_, s₀) (_, s₁) =>
+    StateDelta.ofPHashMap Name.quickLt (fun _ info => info) s₀.map s₁.map
+  stateDeltaSeesDirectWrites := true
   exportEntriesFn := fun (_, s) => s.map.toArray |>.map (·.snd) |>.qsort StructureInfo.lt
 }
 
@@ -426,8 +430,17 @@ structure StructureResolutionState where
 We use an environment extension to cache resolution orders.
 These are not expensive to compute, but worth caching, and we save olean storage space.
 -/
-builtin_initialize structureResolutionExt : EnvExtension StructureResolutionState ←
-  registerEnvExtension (pure {}) (asyncMode := .local) (logWrites := true)
+builtin_initialize structureResolutionExt : EnvExtension StructureResolutionState ← do
+  let ext ← registerEnvExtension (pure {}) (asyncMode := .local) (logWrites := true)  -- mere cache
+  registerCommandCacheExtension `Lean.structureResolutionExt ext
+    (fun before after => (PersistentHashMap.sharedDiff before.resolutions after.resolutions).1)
+    (fun state (k, v) => { resolutions := state.resolutions.insert k v })
+
+/-- Structure resolutions cached in `after` and not in `before` (or cached with a different value), for
+per-command usage recording. -/
+def structureResolutionCacheDelta (before after : Environment) : Array (Name × Array Name) :=
+  (PersistentHashMap.sharedDiff (structureResolutionExt.getState before).resolutions
+    (structureResolutionExt.getState after).resolutions).1
 
 /-- Gets the resolution order if it has already been cached. -/
 private def getStructureResolutionOrder? (env : Environment) (structName : Name) : Option (Array Name) :=

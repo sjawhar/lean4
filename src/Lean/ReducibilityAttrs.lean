@@ -55,6 +55,9 @@ builtin_initialize reducibilityCoreExt : PersistentEnvExtension (Name × Reducib
     mkInitial       := pure {}
     addImportedFn   := fun _ _ => pure {}
     addEntryFn      := fun (s : NameMap ReducibilityStatus) (p : Name × ReducibilityStatus) => s.insert p.1 p.2
+    ofOLeanEntry?  := some fun _ entry => pure entry
+    stateDelta?    := some StateDelta.ofNameMap
+    stateDeltaSeesDirectWrites := true
     exportEntriesFn := fun m =>
       let r : Array (Name × ReducibilityStatus) := m.foldl (fun a n p => a.push (n, p)) #[]
       r.qsort (fun a b => Name.quickLt a.1 b.1)

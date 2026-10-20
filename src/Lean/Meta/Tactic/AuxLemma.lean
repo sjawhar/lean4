@@ -26,8 +26,17 @@ structure AuxLemmas where
   lemmas : PHashMap AuxLemmaKey (Name × List Name) := {}
   deriving Inhabited
 
-builtin_initialize auxLemmasExt : EnvExtension AuxLemmas ←
-  registerEnvExtension (pure {}) (asyncMode := .local)  -- a mere cache, keep local
+builtin_initialize auxLemmasExt : EnvExtension AuxLemmas ← do
+  let ext ← registerEnvExtension (pure {}) (asyncMode := .local)
+  registerCommandCacheExtension `Lean.Meta.auxLemmasExt ext
+    (fun before after => (PersistentHashMap.sharedDiff before.lemmas after.lemmas).1)
+    (fun state (k, v) => { lemmas := state.lemmas.insert k v })
+
+/-- Serializable view of the auxiliary-lemma cache entries `after` has and `before` lacks, for per-command usage
+recording. -/
+def auxLemmaCacheDelta (before after : Environment) : Array (Expr × Bool × Bool × Name × List Name) :=
+  (PersistentHashMap.sharedDiff (auxLemmasExt.getState before).lemmas (auxLemmasExt.getState after).lemmas).1.map
+    fun (k, n, ls) => (k.type, k.isPrivate, k.defeq, n, ls)
 
 /--
   Helper method for creating auxiliary lemmas in the environment.

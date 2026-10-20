@@ -74,8 +74,11 @@ structure StoredTrace where
   messages : Array Message
   deriving Inhabited
 
-private meta initialize storedTracesExt : EnvExtension (NameMap StoredTrace) ←
-  registerEnvExtension (pure {})
+private meta initialize storedTracesExt : EnvExtension (NameMap StoredTrace) ← do
+  let ext ← registerEnvExtension (pure {})
+  registerCommandCacheExtension `Lean.storedTracesExt ext
+    (fun before after => (NameMap.sharedDiff before after).1)
+    (fun state (n, trace) => state.insert n trace)
 
 /-- Returns the trace stored under the declaration `declName`, if any. -/
 meta def findStoredTrace? (env : Environment) (declName : Name) : Option StoredTrace :=
