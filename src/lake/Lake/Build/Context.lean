@@ -108,6 +108,13 @@ public structure BuildContext extends BuildConfig, Context where
   so a cached parse serves only a read of the same contents.
   -/
   sidecarCache : Std.Mutex (Std.HashMap FilePath (Lean.ModuleUsage.Digest × Dynamic))
+  /--
+  The content hashes (`Lean.ModuleUsage.fileDigest`) that usage-cutoff checks computed in this build, each with the
+  stamp of the file its bytes were read from (`Lean.ModuleUsage.fileDigestStamped`). A check reuses a hash only while
+  the file's current stamp is the recorded one; any write, truncation or replacement of the file through the file
+  system changes its stamp, so a check never takes a hash for bytes other than the file's current ones.
+  -/
+  fileDigests : Std.Mutex (Std.HashMap FilePath (Lean.ModuleUsage.FileStamp × Lean.ModuleUsage.Digest))
 
 /-- A transformer to equip a monad with a `BuildContext`. -/
 public abbrev BuildT := ReaderT BuildContext
