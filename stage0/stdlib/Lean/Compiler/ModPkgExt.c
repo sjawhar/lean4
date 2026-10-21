@@ -1,6 +1,6 @@
 // Lean compiler output
 // Module: Lean.Compiler.ModPkgExt
-// Imports: public import Lean.Environment import Lean.Compiler.NameMangling
+// Imports: public import Lean.Environment import Lean.Compiler.NameMangling import Lean.Util.UsedByChecks
 #include <lean/lean.h>
 #if defined(__clang__)
 #pragma clang diagnostic ignored "-Wunused-parameter"
@@ -30,6 +30,7 @@ lean_object* l___private_Lean_Environment_0__Lean_EnvExtension_panicUnloggedWrit
 lean_object* l_Lean_Name_mkStr4(lean_object*, lean_object*, lean_object*, lean_object*);
 lean_object* l_Lean_Name_mkStr1(lean_object*);
 lean_object* l_Lean_PersistentEnvExtension_getState___redArg(lean_object*, lean_object*, lean_object*, lean_object*, lean_object*, uint8_t);
+lean_object* lean_usage_note_resolved(lean_object*, lean_object*);
 lean_object* l_Lean_mkPackageSymbolPrefix(lean_object*);
 lean_object* l_Lean_Name_mangle(lean_object*, lean_object*);
 lean_object* l_Lean_Environment_getModuleIdxFor_x3f(lean_object*, lean_object*);
@@ -841,45 +842,47 @@ return v___x_300_;
 LEAN_EXPORT lean_object* lean_get_symbol_stem(lean_object* v_env_301_, lean_object* v_declName_302_){
 _start:
 {
-lean_object* v___y_304_; lean_object* v___x_307_; 
-v___x_307_ = l_Lean_Environment_getModuleIdxFor_x3f(v_env_301_, v_declName_302_);
-if (lean_obj_tag(v___x_307_) == 0)
+lean_object* v___y_304_; lean_object* v___x_308_; 
+v___x_308_ = l_Lean_Environment_getModuleIdxFor_x3f(v_env_301_, v_declName_302_);
+if (lean_obj_tag(v___x_308_) == 0)
 {
-lean_object* v___x_308_; lean_object* v_toEnvExtension_309_; lean_object* v_asyncMode_310_; lean_object* v___x_311_; lean_object* v___x_312_; uint8_t v___x_313_; lean_object* v___x_314_; 
-v___x_308_ = l___private_Lean_Compiler_ModPkgExt_0__Lean_modPkgExt;
-v_toEnvExtension_309_ = lean_ctor_get(v___x_308_, 0);
-v_asyncMode_310_ = lean_ctor_get(v_toEnvExtension_309_, 2);
-v___x_311_ = lean_box(0);
+lean_object* v___x_309_; lean_object* v_toEnvExtension_310_; lean_object* v_asyncMode_311_; lean_object* v___x_312_; lean_object* v___x_313_; uint8_t v___x_314_; lean_object* v___x_315_; 
+v___x_309_ = l___private_Lean_Compiler_ModPkgExt_0__Lean_modPkgExt;
+v_toEnvExtension_310_ = lean_ctor_get(v___x_309_, 0);
+v_asyncMode_311_ = lean_ctor_get(v_toEnvExtension_310_, 2);
 v___x_312_ = lean_box(0);
-v___x_313_ = 0;
-v___x_314_ = l_Lean_PersistentEnvExtension_getState___redArg(v___x_311_, v___x_308_, v_env_301_, v_asyncMode_310_, v___x_312_, v___x_313_);
-v___y_304_ = v___x_314_;
+v___x_313_ = lean_box(0);
+v___x_314_ = 0;
+v___x_315_ = l_Lean_PersistentEnvExtension_getState___redArg(v___x_312_, v___x_309_, v_env_301_, v_asyncMode_311_, v___x_313_, v___x_314_);
+v___y_304_ = v___x_315_;
 goto v___jp_303_;
 }
 else
 {
-lean_object* v_val_315_; lean_object* v___x_316_; 
-v_val_315_ = lean_ctor_get(v___x_307_, 0);
-lean_inc(v_val_315_);
-lean_dec_ref_known(v___x_307_, 1);
-v___x_316_ = l_Lean_Environment_getModulePackageByIdx_x3f(v_env_301_, v_val_315_);
-lean_dec(v_val_315_);
+lean_object* v_val_316_; lean_object* v___x_317_; 
+v_val_316_ = lean_ctor_get(v___x_308_, 0);
+lean_inc(v_val_316_);
+lean_dec_ref_known(v___x_308_, 1);
+v___x_317_ = l_Lean_Environment_getModulePackageByIdx_x3f(v_env_301_, v_val_316_);
+lean_dec(v_val_316_);
 lean_dec_ref(v_env_301_);
-v___y_304_ = v___x_316_;
+v___y_304_ = v___x_317_;
 goto v___jp_303_;
 }
 v___jp_303_:
 {
-lean_object* v___x_305_; lean_object* v___x_306_; 
-v___x_305_ = l_Lean_mkPackageSymbolPrefix(v___y_304_);
-lean_dec(v___y_304_);
-v___x_306_ = l_Lean_Name_mangle(v_declName_302_, v___x_305_);
-return v___x_306_;
+lean_object* v_pkg_x3f_305_; lean_object* v___x_306_; lean_object* v___x_307_; 
+v_pkg_x3f_305_ = lean_usage_note_resolved(v_declName_302_, v___y_304_);
+v___x_306_ = l_Lean_mkPackageSymbolPrefix(v_pkg_x3f_305_);
+lean_dec(v_pkg_x3f_305_);
+v___x_307_ = l_Lean_Name_mangle(v_declName_302_, v___x_306_);
+return v___x_307_;
 }
 }
 }
 lean_object* runtime_initialize_Lean_Environment(uint8_t builtin);
 lean_object* runtime_initialize_Lean_Compiler_NameMangling(uint8_t builtin);
+lean_object* runtime_initialize_Lean_Util_UsedByChecks(uint8_t builtin);
 void lean_initialize_runtime_module();
 static bool _G_runtime_initialized = false;
 LEAN_EXPORT lean_object* runtime_initialize_Lean_Compiler_ModPkgExt(uint8_t builtin) {
@@ -891,6 +894,9 @@ res = runtime_initialize_Lean_Environment(builtin);
 if (lean_io_result_is_error(res)) return res;
 lean_dec_ref(res);
 res = runtime_initialize_Lean_Compiler_NameMangling(builtin);
+if (lean_io_result_is_error(res)) return res;
+lean_dec_ref(res);
+res = runtime_initialize_Lean_Util_UsedByChecks(builtin);
 if (lean_io_result_is_error(res)) return res;
 lean_dec_ref(res);
 res = l___private_Lean_Compiler_ModPkgExt_0__Lean_initFn_00___x40_Lean_Compiler_ModPkgExt_2096304058____hygCtx___hyg_2_();
@@ -911,6 +917,7 @@ return lean_io_result_mk_ok(lean_box(0));
 }
 lean_object* initialize_Lean_Environment(uint8_t builtin);
 lean_object* initialize_Lean_Compiler_NameMangling(uint8_t builtin);
+lean_object* initialize_Lean_Util_UsedByChecks(uint8_t builtin);
 static bool _G_initialized = false;
 LEAN_EXPORT lean_object* initialize_Lean_Compiler_ModPkgExt(uint8_t builtin) {
 lean_object * res;
@@ -920,6 +927,9 @@ res = initialize_Lean_Environment(builtin);
 if (lean_io_result_is_error(res)) return res;
 lean_dec_ref(res);
 res = initialize_Lean_Compiler_NameMangling(builtin);
+if (lean_io_result_is_error(res)) return res;
+lean_dec_ref(res);
+res = initialize_Lean_Util_UsedByChecks(builtin);
 if (lean_io_result_is_error(res)) return res;
 lean_dec_ref(res);
 res = runtime_initialize_Lean_Compiler_ModPkgExt(builtin);
