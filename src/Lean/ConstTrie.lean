@@ -265,7 +265,7 @@ public inductive ImportedConsts (α : Type) where
   | lazy (key : Name) (entry : Thunk (Option (α × Nat)))
       (expanded : Thunk (Array (ImportedConsts α) × ByteArray))
   /--
-  The root of a view, owning the cache used by `findConstEntryCached?` and `findExtraEntryCached?`;
+  The root of a view, owning the cache used by `findConstEntryCached?` and `findModIdxCached?`;
   see `withCache`. Views without a cache, including ones whose cache was emptied by `dropCache`,
   are cached in a process-global table instead, which keeps them alive. The C++ cache identifies
   this constructor by its index, so it must stay the fourth one.
@@ -423,6 +423,60 @@ public def findExtraModIdxCached? (t : ImportedConsts Unit) (n : Name) : Option 
   match t.findExtraEntryCached? n with
   | some (_, modIdx) => some modIdx
   | none             => none
+
+/--
+Like `findModIdxAux`, but only finds a first module before `bound`: nothing below a subtree of a
+single module at or after `bound` is visited.
+-/
+partial def findModIdxBelowAux (bound : Nat) : ImportedConsts α → Array Name → Nat → Option Nat
+  | .mod modIdx tr, path, i =>
+    if modIdx < bound && (tr.findAux path i).isSome then some modIdx else none
+  | .lazy _ entry expanded, path, i =>
+    if i == 0 then
+      match forceShared entry with
+      | some (_, modIdx) => if modIdx < bound then some modIdx else none
+      | none             => none
+    else
+      let (cs, hs) := forceShared expanded
+      match findHashIdx? hs cs key path[i - 1]! with
+      | some j => findModIdxBelowAux bound cs[j]! path (i - 1)
+      | none   => none
+  | .cached _ t, path, i => findModIdxBelowAux bound t path i
+  | .merged _ e? cs hs, path, i =>
+    if i == 0 then
+      match e? with
+      | some (_, modIdx) => if modIdx < bound then some modIdx else none
+      | none             => none
+    else
+      match findHashIdx? hs cs key path[i - 1]! with
+      | some j => findModIdxBelowAux bound cs[j]! path (i - 1)
+      | none   => none
+
+/--
+The index of the first module that has `n` as a constant or as an extra constant, given the
+constants view's entry for `n` and the view of the extra constants. This is the index stock Lean's
+`const2ModIdx` gives: it inserts each module's constants and then its extra constants, in module
+order, and keeps the first insertion of each name.
+-/
+@[export lean_imported_consts_mod_idx_core]
+def modIdxCore (entry : Option (ConstantInfo × Nat)) (extras : ImportedConsts Unit) (n : Name) :
+    Option Nat :=
+  let path := prefixesOf n
+  match entry with
+  | some (_, i) =>
+    match extras.findModIdxBelowAux i path path.size with
+    | some j => some j
+    | none   => some i
+  | none => extras.findModIdxAux path path.size
+
+/--
+`modIdxCore` for `n`, with the entry of the constants view `consts`, memoized in the entry for `n`
+of the cache that `findConstEntryCached?` uses for `consts`, so that a repeated lookup costs a
+single probe. Implemented in C++ (`src/library/const_cache.cpp`).
+-/
+@[extern "lean_imported_consts_find_mod_idx_cached"]
+public opaque findModIdxCached? (consts : @& ImportedConsts ConstantInfo)
+    (extras : @& ImportedConsts Unit) (n : @& Name) : Option Nat
 
 /--
 Empties the process-global lookup cache used for views without a `cached` root, e.g. after
