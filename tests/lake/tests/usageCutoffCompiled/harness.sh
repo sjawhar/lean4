@@ -68,7 +68,7 @@ run_case() {
   if ! (cd "$cut" && "${c}_s0" && env "${env[@]}" "$LAKE" build -v > ../$n.0.log 2>&1); then
     cat "cut/$n.0.log"
     echo "FAILURE: $n: state 0 does not build"
-    return 1
+    return 2
   fi
   (cd "$cut" && "${c}_s1")
   rc=0
@@ -1557,6 +1557,125 @@ td_claim_s1() { td_claim_mod Y X._sunfold lean_nat_succ; td_claim_mod Z X._sunfo
 td_inst_s0() { td_files 'instance instA : Inhabited Nat := ⟨5⟩'; }
 td_inst_s1() { td_claim_mod Z instA lean_nat_succ; }
 
+# Used kernel constants whose `ConstantInfo` the import takes from a module other than the one the resolver answers.
+# `kern_body`: `Z` claims `foo` with an IR-only declaration and `D` imports `Z` then `A`, so `foo` resolves to `Z`
+# while the kernel's `foo` is `A`'s; `E` proves `foo 1 = 2` by `rfl` and state 1 changes `A`'s body, so a fresh `E`
+# fails. `kern_body_after` is the control: `D` imports `A` then `Z`, and `foo` resolves to `A`. `kern_codegen`: `K`
+# defines the code-generator-shaped name `foo._redArg` and `Z`, imported after `K`, claims it; a resolver that looks
+# such names up among compiled names first answers `Z`. State 1 changes `K`'s body.
+kern_body_a() { printf 'def foo (n : Nat) : Nat := n + %s\n' "$1" > T/A.lean; }
+kern_body_files() {
+  lakefile_app; mkdir_t
+  kern_body_a 1
+  claim_z '' foo lean_nat_succ
+  printf 'import T.%s\nimport T.%s\ndef dd : Nat := 0\n' "$1" "$2" > T/D.lean
+  printf 'import T.D\ntheorem t : foo 1 = 2 := rfl\ndef e : Nat := 0\n' > T/E.lean
+  printf 'import T.E\ndef main : IO Unit := IO.println e\n' > Main.lean
+}
+kern_body_s0() { kern_body_files Z A; }
+kern_body_s1() { kern_body_a 2; }
+kern_body_after_s0() { kern_body_files A Z; }
+kern_body_after_s1() { kern_body_a 2; }
+kern_codegen_k() { printf 'def foo._redArg (n : Nat) : Nat := n + %s\n' "$1" > T/K.lean; }
+kern_codegen_s0() {
+  lakefile_app; mkdir_t
+  kern_codegen_k 1
+  claim_z '' foo._redArg lean_nat_succ
+  printf 'import T.K\nimport T.Z\ndef dd : Nat := 0\n' > T/D.lean
+  printf 'import T.D\ntheorem t : foo._redArg 1 = 2 := rfl\ndef e : Nat := 0\n' > T/E.lean
+  printf 'import T.E\ndef main : IO Unit := IO.println e\n' > Main.lean
+}
+kern_codegen_s1() { kern_codegen_k 2; }
+
+# A theorem `tA` two modules declare with the same statement. `E` reduces `Acc.rec` on `tA` in the kernel, which
+# unfolds the copy the import keeps: a proof by `Acc.intro` reduces, one from the axiom `wfR` is stuck. A later copy
+# replaces the kept one when it subsumes it (`subsumesInfo`): a theorem replaces a theorem or an axiom, an axiom never
+# replaces a theorem. The resolver answers the first declarer. `kern_thm_dup`: `D` imports `P` (from `wfR`) then `Q`
+# (by `Acc.intro`), the import keeps `Q`'s copy, and state 1 gives `Q` the proof from `wfR`, so a fresh `E` fails.
+# `kern_thm_dup_after`: `D` imports `Q` (from `wfR`) then `P` (by `Acc.intro`), the import keeps `P`'s copy, and state
+# 1 changes `Q`'s. `kern_thm_flip`: `P`'s `tA` is the proof by `Acc.intro` and `Q`'s, imported after it, an axiom, so
+# the import keeps `P`'s copy; state 1 makes `Q`'s `tA` the proof from `wfR`, which the import then keeps, and `Q`'s
+# names do not change.
+kern_thm_intro='theorem tA : Acc R 0 := Acc.intro 0 (fun _ h => h.elim)'
+kern_thm_axiom='theorem tA : Acc R 0 := wfR.apply 0'
+kern_thm_mod() { printf 'import T.B\n%s\ndef %sdummy : Nat := 0\n' "$2" "${1,,}" > T/$1.lean; }
+# `D` imports `$1` with `tA` declared by `$3`, then `$2` with `$4`.
+kern_thm_files() {
+  lakefile_app; mkdir_t
+  printf 'def R : Nat → Nat → Prop := fun _ _ => False\naxiom wfR : WellFounded R\n' > T/B.lean
+  kern_thm_mod $1 "$3"
+  kern_thm_mod $2 "$4"
+  printf 'import T.%s\nimport T.%s\ndef dd : Nat := 0\n' "$1" "$2" > T/D.lean
+  printf '%s\n' 'import T.D' \
+    'theorem a : (Acc.rec (motive := fun _ _ => Nat) (fun _ _ _ => 5) tA : Nat) = 5 := by decide +kernel' \
+    'def e : Nat := 0' > T/E.lean
+  printf 'import T.E\ndef main : IO Unit := IO.println e\n' > Main.lean
+}
+kern_thm_dup_s0() { kern_thm_files P Q "$kern_thm_axiom" "$kern_thm_intro"; }
+kern_thm_dup_s1() { kern_thm_mod Q "$kern_thm_axiom"; }
+kern_thm_dup_after_s0() { kern_thm_files Q P "$kern_thm_axiom" "$kern_thm_intro"; }
+kern_thm_dup_after_s1() { kern_thm_mod Q "$kern_thm_intro"; }
+kern_thm_flip_s0() { kern_thm_files P Q "$kern_thm_intro" 'axiom tA : Acc R 0'; }
+kern_thm_flip_s1() { kern_thm_mod Q "$kern_thm_axiom"; }
+# `kern_thm_trans`: `E` reaches `tA` only through `F`'s `g`. `F` imports `P` alone, so `F`'s digest of `g` covers
+# `P`'s copy; `D` imports `F` then `Q`, so in `E`'s import `Q`'s copy replaces `P`'s. State 1 gives `Q` the proof
+# from `wfR`, so a fresh `E` fails, and `Q`'s names do not change.
+kern_thm_trans_s0() {
+  kern_thm_files F Q "$kern_thm_intro" "$kern_thm_intro"
+  kern_thm_mod P "$kern_thm_intro"
+  printf 'import T.P\nnoncomputable def g : Nat := Acc.rec (motive := fun _ _ => Nat) (fun _ _ _ => 5) tA\n' > T/F.lean
+  printf 'import T.D\ntheorem a : g = 5 := by decide +kernel\ndef e : Nat := 0\n' > T/E.lean
+}
+kern_thm_trans_s1() { kern_thm_mod Q "$kern_thm_axiom"; }
+# `kern_thm_third`: as `kern_thm_trans`, but `Q`'s copy stays and `W`, which `D` imports last and which declared no
+# `tA`, gains the proof from `wfR`, so the import keeps `W`'s copy.
+kern_thm_third_s0() {
+  kern_thm_trans_s0
+  printf 'import T.B\ndef wdummy : Nat := 0\n' > T/W.lean
+  printf 'import T.F\nimport T.Q\nimport T.W\ndef dd : Nat := 0\n' > T/D.lean
+}
+kern_thm_third_s1() { kern_thm_mod W "$kern_thm_axiom"; }
+# `dup_new_trans`: as `kern_thm_trans`, but `Q` declares no `tA` in state 0 and gains the proof from `wfR` in state 1,
+# so a fresh `E` fails (a known gap, as `dup_new`).
+dup_new_trans_s0() {
+  kern_thm_trans_s0
+  printf 'import T.B\ndef qdummy : Nat := 0\n' > T/Q.lean
+}
+dup_new_trans_s1() { kern_thm_mod Q "$kern_thm_axiom"; }
+
+# A name a second closure module starts to declare: `D` imports `R` and `K` and uses nothing of either; in state 1 `K`
+# adds `t`, which `R` defines, so a fresh `D` fails at import (`dup_new`, a known gap; `dup_new_trans` is the same gap
+# where the new copy replaces the kept one). With a theorem of the same statement the import merges the copies and a
+# fresh `D` builds (`dup_new_thm`). The package is a library only.
+dup_files() {
+  printf 'name = "test"\ndefaultTargets = ["T"]\n[[lean_lib]]\nname = "T"\n' > lakefile.toml
+  mkdir_t
+  printf '%s\n' "$1" > T/R.lean
+  printf 'def other : Nat := 0\n' > T/K.lean
+  printf 'import T.R\nimport T.K\ndef d : Nat := 0\n' > T/D.lean
+  printf 'import T.D\ndef e : Nat := d\n' > T.lean
+}
+dup_new_s0() { dup_files 'def t : Nat := 1'; }
+dup_new_s1() { printf 'def other : Nat := 0\ndef t : Nat := 2\n' > T/K.lean; }
+dup_new_thm_s0() { dup_files 'theorem t : True := trivial'; }
+dup_new_thm_s1() { printf 'def other : Nat := 0\ntheorem t : True := trivial\n' > T/K.lean; }
+# `kern_thm_conflict`: `R` and `K` declare the theorem `t` with one statement, and `D` imports both and uses nothing of
+# either. State 1 changes the statement of `K`'s `t` and keeps its names, so a fresh `D` fails at import.
+kern_thm_conflict_s0() {
+  dup_files 'theorem t : True := trivial'
+  printf 'def other : Nat := 0\ntheorem t : True := trivial\n' > T/K.lean
+}
+kern_thm_conflict_s1() { printf 'def other : Nat := 0\ntheorem t : True ∧ True := ⟨trivial, trivial⟩\n' > T/K.lean; }
+# `kern_thm_all`: as `kern_thm_conflict`, but `K`'s `t` changes only its `all`, which the import compares
+# (`subsumesInfo`), and `K`'s names do not change.
+kern_thm_all_k() {
+  printf '%s\n' 'import Lean' 'def other : Nat := 0' 'open Lean in' \
+    "run_meta addDecl (.thmDecl { name := \`t, levelParams := [], type := mkConst \`\`True, value := mkConst \`\`True.intro, all := [\`$1] })" \
+    > T/K.lean
+}
+kern_thm_all_s0() { dup_files 'theorem t : True := trivial'; kern_thm_all_k t; }
+kern_thm_all_s1() { kern_thm_all_k u; }
+
 # A claim of a name `A`'s compile created inside another specialization: `A`'s specialization of `h` created inside
 # its specialization of `g` is `h._at_.g._at_.useIt.spec_0.spec_0`; `Z` defines `useIt.spec_0`, a reading of that
 # name's creator, and claims the name (`cs_nested`; `cs_nested_ctl` without the definition). `C` specializes `h` at
@@ -2186,6 +2305,8 @@ all_cases="spec_transitive spec_link spec_type spec_precomp plugin_replay csimp_
   cov_sibinst cov_sibclass cov_sibmeta cov_ckind_rev cov_recarg_rev
   collide_first collide_after collide_rev collide_rev_first collide_drop_loser collide_shape collide_shape_rev
   elab_claim elab_claim_after elab_claim_ms inst_claim inst_claim_after td_claim td_inst
+  kern_body kern_body_after kern_codegen kern_thm_dup kern_thm_dup_after kern_thm_flip kern_thm_trans
+  kern_thm_conflict kern_thm_all kern_thm_third dup_new dup_new_trans dup_new_thm
   hard_recording hard_moduleext hard_speclookups hard_compilercode rp_own
   hard_usedbychecks hard_declconsts
   hard_extramod perkey_provider_inl
@@ -2212,6 +2333,12 @@ all_cases="spec_transitive spec_link spec_type spec_precomp plugin_replay csimp_
   spec_transitive:cache"
 # `spec_transitive:cache`: the state the cutoff build of `spec_transitive` leaves behind, after another build and
 # in a fresh tree that shares its artifact cache.
+# Known gaps: `all_cases` entries the cutoff gets wrong (a `:cache` variant is its own entry). Their difference from a
+# fresh build is reported, not counted; a pass, or a state 0 that does not build, is a failure.
+known_gaps=" dup_new dup_new_trans "
+for g in $known_gaps; do
+  case " $(echo $all_cases) " in *" $g "*) ;; *) echo "FAILURE: known gap $g is not in all_cases"; exit 1 ;; esac
+done
 cases=${CASES:-}
 if [ -z "$cases" ]; then
   i=0
@@ -2223,10 +2350,21 @@ fi
 failed=()
 # `NAME:cache` runs a case with the artifact cache (see `run_case`).
 for c in $cases; do
+  rc=0
   case $c in
-    *:cache) run_case "${c%:cache}" cache || failed+=("$c") ;;
-    *) run_case $c || failed+=($c) ;;
+    *:cache) run_case "${c%:cache}" cache || rc=$? ;;
+    *) run_case $c || rc=$? ;;
   esac
+  if [[ $known_gaps == *" $c "* ]] && [ $rc != 2 ]; then
+    if [ $rc = 0 ]; then
+      echo "FAILURE: $c: known gap now matches a fresh build; remove it from known_gaps"
+      failed+=("$c")
+    else
+      echo "KNOWN GAP: $c differs from a fresh build"
+    fi
+  elif [ $rc != 0 ]; then
+    failed+=("$c")
+  fi
 done
 if [ ${#failed[@]} -gt 0 ]; then
   echo "FAILURE: cases differing from a fresh build: ${failed[*]}"

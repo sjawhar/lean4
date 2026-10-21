@@ -1850,6 +1850,29 @@ def registerEnvExtension {σ : Type} (mkInitial : IO σ)
 
 private def mkInitialExtensionStates : IO (Array EnvExtensionState) := EnvExtension.mkInitialExtStates
 
+/-- For each imported kernel constant whose declarers are not just the module `const2ModIdx` maps it to, the modules
+that declare it, in import order: several modules declare it and the import keeps a copy chosen from all of theirs
+(`subsumesInfo`), or an earlier module provides the name as a compiled declaration only. Set once by
+`finalizeImport`. -/
+private builtin_initialize kernelDeclarersExt : EnvExtension (Std.HashMap Name (Array ModuleIdx)) ←
+  registerEnvExtension (pure {}) (asyncMode := .local)
+
+/-- The modules that declare the imported kernel constant `declName`, in import order, when that is not just
+`resolved`, the caller's `getModuleIdxFor? declName`: the `ConstantInfo` that `find?` and the kernel read is one of
+their copies, chosen from all of them. -/
+def Environment.getKernelDeclarersIfOther? (env : Environment) (declName : Name) (_resolved : Option ModuleIdx) :
+    Option (Array ModuleIdx) :=
+  -- safety: `kernelDeclarersExt` is private and its state is of type `σ`; it is fixed at import, so its reads need no
+  -- dependency recording
+  (unsafe kernelDeclarersExt.getStateImpl env.base.private.extensions)[declName]?
+
+/-- The imported kernel constants that several modules declare, each with those modules in import order: the import
+keeps a copy chosen from all of theirs. -/
+def Environment.getImportedKernelDuplicates (env : Environment) : Array (Name × Array ModuleIdx) :=
+  -- safety: as in `getKernelDeclarersIfOther?`
+  (unsafe kernelDeclarersExt.getStateImpl env.base.private.extensions).fold (init := #[]) fun ds n ks =>
+    if ks.size ≥ 2 then ds.push (n, ks) else ds
+
 def mkEmptyEnvironment (trustLevel : UInt32 := 0) : IO Environment := do
   let initializing ← IO.initializing
   if initializing then throw (IO.userError "environment objects cannot be created during initialization")
@@ -2699,9 +2722,12 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
   let mut const2ModIdx : Std.HashMap Name ModuleIdx := Std.HashMap.emptyWithCapacity (capacity := numPrivateConsts + numExtraConsts)
   let mut privateConstantMap : Std.HashMap Name ConstantInfo := Std.HashMap.emptyWithCapacity (capacity := numPrivateConsts)
   let mut publicConstantMap : Std.HashMap Name ConstantInfo := Std.HashMap.emptyWithCapacity (capacity := numPublicConsts)
+  let mut kernelDeclarers : Std.HashMap Name (Array ModuleIdx) := {}
   for h : modIdx in *...moduleData.size do
     let data := moduleData[modIdx]
     for cname in data.constNames, cinfo in data.constants do
+      let (claimed, const2ModIdx') := const2ModIdx.containsThenInsertIfNew cname modIdx
+      const2ModIdx := const2ModIdx'
       match privateConstantMap.getThenInsertIfNew? cname cinfo with
       | (cinfoPrev?, constantMap') =>
         privateConstantMap := constantMap'
@@ -2711,7 +2737,13 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
             privateConstantMap := privateConstantMap.insert cname cinfo
           else if !subsumesInfo privateConstantMap cinfoPrev cinfo then
             throwAlreadyImported s const2ModIdx modIdx cname
-      const2ModIdx := const2ModIdx.insertIfNew cname modIdx
+          -- without an entry, the first provider is the first declarer
+          kernelDeclarers := kernelDeclarers.alter cname fun
+            | some ks => some (ks.push modIdx)
+            | none => some #[const2ModIdx[cname]!, modIdx]
+        else if claimed then
+          -- an earlier module provides the name as a compiled declaration only
+          kernelDeclarers := kernelDeclarers.insert cname #[modIdx]
     if let some data := irData[modIdx]? then
       for cname in data.extraConstNames do
         const2ModIdx := const2ModIdx.insertIfNew cname modIdx
@@ -2729,6 +2761,8 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
             -- no need to check for duplicates again, `privateConstMap` should be a superset
 
   let exts ← mkInitialExtensionStates
+  -- safety: as in `modifyState`
+  let exts := unsafe kernelDeclarersExt.setStateImpl exts kernelDeclarers
   let privateConstants : ConstMap := SMap.fromHashMap privateConstantMap false
   let privateBase : Kernel.Environment := {
     const2ModIdx, constants := privateConstants

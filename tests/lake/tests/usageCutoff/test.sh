@@ -335,6 +335,16 @@ printf 'def y := 1\ndef y2 := 2\n' > Test/BY.lean
 lake_out build -v Test.BV
 match_text "Built Test.BY" produced.out
 match_text "Replayed Test.BV" produced.out
+# a theorem two closure modules declare: the import keeps one copy, and the importer depends on both. A change to the
+# provides of the declarer the resolver does not answer, which keeps its copy, replays the importer
+printf 'theorem qt : True := trivial\n' > Test/QR.lean
+printf 'def qk := 0\ntheorem qt : True := trivial\n' > Test/QK.lean
+printf 'import Test.QR\nimport Test.QK\ndef qd := 0\n' > Test/QD.lean
+test_run build Test.QD
+printf 'def qk := 0\ntheorem qt : True := trivial\ndef qk2 := 1\n' > Test/QK.lean
+lake_out build -v Test.QD
+match_text "Built Test.QK" produced.out
+match_text "Replayed Test.QD" produced.out
 # compiled code can call a specialization another module created (the specialization cache), a name no kernel
 # term mentions: when that module drops it, the importer compiles again, as from scratch
 printf '@[specialize] def specMap (f : Nat → Nat) : List Nat → List Nat\n  | [] => []\n  | x :: xs => f x :: specMap f xs\n' > Test/SpB.lean
