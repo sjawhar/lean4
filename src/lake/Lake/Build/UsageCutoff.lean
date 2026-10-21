@@ -39,10 +39,12 @@ structure UsageSidecar where
   own : NameMap ModuleUsage.Digest
   used : Array (Name × Array (Name × ModuleUsage.Digest))
   extra : Array Name
-  /-- Every name the module used or the compiler resolved, grouped by the module the resolver mapped it to (`none`:
-  the module itself, or no module), each with the kinds under which that module provided it
-  (`Lean.ModuleUsage.resolvedGroups`). -/
+  /-- Every name whose defining module the module's compile looked up, used or referred to, grouped by the module the
+  resolver mapped it to (`none`: the module itself, or no module), each with the kinds under which that module
+  provided it (`Lean.ModuleUsage.resolvedGroups`). -/
   resolved : Array (Option Name × Array (Name × UInt8))
+  /-- Whether the compile read the resolver's whole map (`Lean.allResolved`). -/
+  resolvedAll : Bool
   /-- The digest of the names the module provides to the resolver (`Lean.ModuleUsage.providesDigestOf`). -/
   providesDigest : ModuleUsage.Digest
   /-- The module's kernel constants and compiled names, each sorted (`Lean.ModuleUsage.ownProvides`). -/
@@ -129,6 +131,7 @@ instance : FromJson UsageSidecar where
       used := used.map fun (m, cs) => (m.name, cs.map fun (c, d) => (c.name, d))
       extra := extra.map (·.1.name)
       resolved := ← resolvedOfJson (← j.getObjVal? "resolved")
+      resolvedAll := ← j.getObjValAs? Bool "resolvedAll"
       providesDigest := ← j.getObjValAs? ModuleUsage.Digest "providesDigest"
       provides := ← providesOfJson (← j.getObjVal? "provides")
       specKeys := specKeys.map fun (d, n) => (d, n.name)
@@ -387,22 +390,24 @@ def UsageSidecar.coversClosure (usage : UsageSidecar) (importArts : NameMap Impo
     return true
 
 /--
-Whether every name the module used or the compiler resolved (`UsageSidecar.resolved`) still resolves to the same
-module, with the same kinds, as when Lean compiled it. Each workspace module of the closure whose provides digest
-(`UsageImport.providesDigest`, from a `.usage` that `importUsage?` binds to its current `.olean`) differs from the one
-the compile imported (`UsageSidecar.digested`) must still provide each name the resolver mapped to it with the
-recorded kinds, and none of the other names. A module whose provides digest is unchanged is not asked about any name.
+Whether every name whose defining module the compile looked up, used or referred to (`UsageSidecar.resolved`) still
+resolves to the same module, with the same kinds, as when Lean compiled it. Each workspace module of the closure whose
+provides digest (`UsageImport.providesDigest`, from a `.usage` that `importUsage?` binds to its current `.olean`)
+differs from the one the compile imported (`UsageSidecar.digested`) must still provide each name the resolver mapped
+to it with the recorded kinds, and none of the other names. A module whose provides digest is unchanged is not asked
+about any name. If the compile read the resolver's whole map (`UsageSidecar.resolvedAll`), no such module may exist.
 
 This decides without restating how the resolver ranks providers (`Environment.getModuleIdxFor?`), which differs
 between toolchains. It relies on one property, which every such resolver has: for a resolver that picks a winner
 among a name's providers (each a module with a kind, kernel constant or compiled name) by a fixed priority of the
 provider alone, here import order (pinned by `closureHash`) and kind, dropping a non-winner cannot change the winner.
-The resolvers: first provider in import order, kernel constants of a module before its compiled names
-(`src/Lean/Environment.lean:994-996`, filled by `finalizeImport`'s `insertIfNew` at :2697-2712); compiled names
-first for code-generator-shaped names, then import order (`Environment.lean:317-335` where a toolchain carries it);
-and the lowest module index among kernel and compiled providers (`Environment.lean:317-322` where a toolchain carries
-it). A gained provider, a lost winner or a winner that changed kinds fails the check. A module-system module's
-provides are pinned by `modsysHash`, a toolchain module's by the Lean githash.
+The resolvers: first provider in import order, kernel constants of a module before its compiled names (this
+branch's `src/Lean/Environment.lean:999-1001`, filled by `finalizeImport`'s `insertIfNew` at :2702-2717); compiled
+names first for code-generator-shaped names, then import order (`isCodegenName` and `getModuleIdxFor?` in
+434ce3c398:src/Lean/Environment.lean:317-335); and the lowest module index among kernel and compiled providers
+(`getModuleIdxFor?` in 4693098fec:src/Lean/Environment.lean:317-322). A gained provider, a lost
+winner or a winner that changed kinds fails the check. A module-system module's provides are pinned by `modsysHash`,
+a toolchain module's by the Lean githash.
 -/
 def UsageSidecar.resolvedUnchanged (usage : UsageSidecar) (hashes : ContentHashes)
     (importArts : NameMap ImportArtifacts) : JobM Bool := do
@@ -412,6 +417,7 @@ def UsageSidecar.resolvedUnchanged (usage : UsageSidecar) (hashes : ContentHashe
     let some (_, recorded) := usage.digested.binSearch (m, default) (Name.quickLt ·.1 ·.1) | return false
     let some (_, imp) ← importUsage? hashes importArts m | return false
     if imp.providesDigest == recorded then continue
+    if usage.resolvedAll then return false
     let (kernel, extra) := imp.provides
     for (m?, ns) in usage.resolved do
       let winner := m? == some m
@@ -467,10 +473,10 @@ from its current `.usage` (`UsekeySidecar.usage`) and `.olean`, its `.usage` cov
 `UsageSidecar.coversClosure`), its local inputs are unchanged, no module-system module in its closure changed
 (`modsysHash`), its closure is unchanged (`closureHash`), every constant it used from a workspace module has the
 same digest in that module's current `.usage` (one its key binds to its current `.olean`, `importUsage?`), every
-workspace `extra` module has the same `.olean` hash and `moduleDigest`, every name it used or the compiler resolved
-resolves as before (`UsageSidecar.resolvedUnchanged`), and every specialization-cache key it looked up has the same
-providers (`UsageSidecar.specProvidersUnchanged`). Every `.olean` hash is of the file's bytes (`contentHash`), never
-read from a `.hash` file.
+workspace `extra` module has the same `.olean` hash and `moduleDigest`, every name whose defining module it looked up,
+used or referred to resolves as before (`UsageSidecar.resolvedUnchanged`), and every specialization-cache key it
+looked up has the same providers (`UsageSidecar.specProvidersUnchanged`). Every `.olean` hash is of the file's bytes
+(`contentHash`), never read from a `.hash` file.
 -/
 public def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
     (importArts : NameMap ImportArtifacts) : JobM Bool := do

@@ -285,6 +285,7 @@ def runFrontend
     (incrLoadFileName? : Option System.FilePath := none)
     (incrHeaderSaveFileName? : Option System.FilePath := none)
     (usageFileName? : Option System.FilePath := none)
+    (codegen : Environment → IO Unit := fun _ => pure ())
     : IO (Option Environment) := do
   let startTime := (← IO.monoNanosNow).toFloat / 1000000000
   if oleanFileName?.isSome && usageFileName?.isSome then enableUsageRecording
@@ -390,23 +391,20 @@ def runFrontend
     return none
 
   let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
-  if let some oleanFileName := oleanFileName? then
+  let usage? ← oleanFileName?.bindM fun oleanFileName => do
     let recorded ← recordedDeclConsts
     let usage? := usageFileName?.map fun usageFileName =>
       let nodes := ModuleUsage.ownNodes env (ModuleUsage.ownConsts env recorded)
       let own := ModuleUsage.localDigests env nodes
-      (usageFileName, nodes, own, ModuleUsage.closureDigest env own, ModuleUsage.ownProvides env)
+      let provides := ModuleUsage.ownProvides env
+      (usageFileName, nodes, own, ModuleUsage.closureDigest env own provides, provides)
     profileitIO ".olean serialization" finalOpts do
       let commandLints := collectCommandLints snaps none #[]
       let env ← Linter.recordLints inputCtx.fileMap env commandLints
       let env := usage?.elim env fun (_, _, own, closure, provides) =>
         ModuleUsage.setLocalDigests env own closure provides
       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
-    if let some (usageFileName, nodes, own, closure, provides) := usage? then
-      let used := ModuleUsage.usedFromInfoTrees trees (← usedNames)
-      let resolved : NameHashSet := (← resolvedNames).foldl (·.insert ·) {}
-      ModuleUsage.writeUsage env nodes own closure provides used resolved (← lookedUpSpecKeys)
-        (incrLoaded := incrLoadFileName?.isSome) usageFileName
+    return usage?
 
   if let some ileanFileName := ileanFileName? then
     let references := Lean.Server.findModuleRefs inputCtx.fileMap trees (localVars := false)
@@ -420,6 +418,8 @@ def runFrontend
     }
     IO.FS.writeFile ileanFileName $ Json.compress $ toJson ilean
 
+  codegen env
+
   if let some out := trace.profiler.output.get? opts then
     let traceStates := snaps.getAll.map (·.traces)
     let profile ← Firefox.Profile.export mainModuleName.toString startTime traceStates opts
@@ -428,6 +428,12 @@ def runFrontend
     let traceStates := snaps.getAll.map (·.traces)
     let profile ← Firefox.Profile.export mainModuleName.toString startTime traceStates opts
     Firefox.Profile.serve <| Json.compress <| toJson profile
+
+  -- Last of the outputs: the usage data records every name resolved in writing the others.
+  if let some (usageFileName, nodes, own, closure, provides) := usage? then
+    let used := ModuleUsage.usedFromInfoTrees trees (← usedNames)
+    ModuleUsage.writeUsage env nodes own closure provides used (← lookedUpSpecKeys)
+      (incrLoaded := incrLoadFileName?.isSome) usageFileName
 
   -- no point in freeing the snapshot graph and all referenced data this close to process exit
   Runtime.forget snaps
