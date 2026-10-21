@@ -544,16 +544,9 @@ def shellMain (args : List String) (opts : ShellOptions) : IO UInt32 := do
           throw e
     else
       pure `_stdin
-  let env? ← Elab.runFrontend contents opts.leanOpts fileName mainModuleName
-    opts.trustLevel opts.oleanFileName? opts.ileanFileName? opts.jsonOutput opts.errorOnKinds
-    #[] opts.printStats setup?
-    (incrSaveFileName? := opts.incrSaveFileName?)
-    (incrLoadFileName? := opts.incrLoadFileName?)
-    (incrHeaderSaveFileName? := opts.incrHeaderSaveFileName?)
-    (usageFileName? := opts.usageFileName?)
-  if let some env := env? then
-    if opts.run then
-      return ← runMain env opts.leanOpts args
+  -- Runs inside `runFrontend`, before the usage data, which records the names emission resolves.
+  let codegen (env : Environment) : IO Unit := do
+    if opts.run then return
     if let some c := opts.cFileName? then
       writeFileAtomically c fun out => do
         profileitIO "C code generation" opts.leanOpts do
@@ -564,6 +557,17 @@ def shellMain (args : List String) (opts : ShellOptions) : IO UInt32 := do
       initLLVM
       profileitIO "LLVM code generation" opts.leanOpts do
         emitLLVM env mainModuleName bc
+  let env? ← Elab.runFrontend contents opts.leanOpts fileName mainModuleName
+    opts.trustLevel opts.oleanFileName? opts.ileanFileName? opts.jsonOutput opts.errorOnKinds
+    #[] opts.printStats setup?
+    (incrSaveFileName? := opts.incrSaveFileName?)
+    (incrLoadFileName? := opts.incrLoadFileName?)
+    (incrHeaderSaveFileName? := opts.incrHeaderSaveFileName?)
+    (usageFileName? := opts.usageFileName?)
+    (codegen := codegen)
+  if let some env := env? then
+    if opts.run then
+      return ← runMain env opts.leanOpts args
   displayCumulativeProfilingTimes
   if Internal.hasAddressSanitizer () then
     return if env?.isSome then 0 else 1
