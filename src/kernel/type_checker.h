@@ -120,6 +120,8 @@ private:
     optional<expr> reduce_pow(expr const & e);
     optional<expr> reduce_shiftLeft(expr const & e);
     optional<expr> reduce_nat(expr const & e);
+    optional<expr> reduce_nat_inst(expr const & e);
+    optional<expr> reduce_dec_lit(expr const & e);
 public:
     type_checker(environment const & env, local_ctx const & lctx, diagnostics * diag = nullptr, definition_safety ds = definition_safety::safe);
     type_checker(environment const & env, diagnostics * diag = nullptr, definition_safety ds = definition_safety::safe):type_checker(env, local_ctx(), diag, ds) {}
