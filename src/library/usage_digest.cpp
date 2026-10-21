@@ -7,6 +7,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 #include <cstring>
 #include <fcntl.h>
 #include <memory>
+#include <unordered_set>
 #include <vector>
 #include <sys/stat.h>
 #if defined(LEAN_WINDOWS)
@@ -16,6 +17,8 @@ Released under Apache 2.0 license as described in the file LICENSE.
 #endif
 #include "runtime/io.h"
 #include "runtime/object_ref.h"
+#include "runtime/thread.h"
+#include "util/name.h"
 #include "kernel/expr.h"
 #define XXH_INLINE_ALL
 #include "library/xxhash.h"
@@ -523,13 +526,45 @@ extern "C" LEAN_EXPORT obj_res lean_usage_read_file_stamped(b_obj_arg path) {
     return io_result_mk_ok(r);
 }
 
-// `BaseIO Unit`: the compiled function takes no world token and returns a boxed unit.
-extern "C" object * lean_usage_record_resolved(obj_arg n);
+/* The names whose defining module was looked up while usage recording is on (`Lean.noteResolved`). Each thread keeps
+the names it has seen, so a repeated lookup costs one probe of a set only that thread touches; a name's first sighting
+in a thread goes to the process-wide set, which keeps it marked multi-threaded. */
+typedef std::unordered_set<name, name_hash_fn, name_eq_fn> resolved_set;
+static atomic<bool> g_resolved_on(false);
+static atomic<bool> g_all_resolved(false);
+static mutex g_resolved_mutex;
+// Never freed, like the runtime's other process-wide name tables: no destructor runs on Lean objects at exit.
+static resolved_set * g_resolved = new resolved_set();
+MK_THREAD_LOCAL_GET_DEF(resolved_set, get_seen_resolved);
 
-/* `Lean.noteResolved`: records `n` (`Lean.recordResolvedName`) and returns `x`. */
+extern "C" LEAN_EXPORT obj_res lean_usage_enable_resolved() {
+    g_resolved_on.store(true);
+    return box(0);
+}
+
 extern "C" LEAN_EXPORT obj_res lean_usage_note_resolved(b_obj_arg n, obj_arg x) {
-    lean_inc(n);
-    lean_dec(lean_usage_record_resolved(n));
+    if (!atomic_load_explicit(&g_resolved_on, memory_order_relaxed)) return x;
+    resolved_set & seen = get_seen_resolved();
+    name const & k = TO_REF(name, n);
+    if (!seen.insert(k).second) return x;
+    lock_guard<mutex> lock(g_resolved_mutex);
+    if (g_resolved->insert(k).second) lean_mark_mt(n);
     return x;
+}
+
+extern "C" LEAN_EXPORT obj_res lean_usage_note_all_resolved(obj_arg x) {
+    if (atomic_load_explicit(&g_resolved_on, memory_order_relaxed)) g_all_resolved.store(true);
+    return x;
+}
+
+extern "C" LEAN_EXPORT obj_res lean_usage_resolved_names() {
+    lock_guard<mutex> lock(g_resolved_mutex);
+    object * r = lean_alloc_array(0, g_resolved->size());
+    for (name const & n : *g_resolved) r = lean_array_push(r, n.to_obj_arg());
+    return r;
+}
+
+extern "C" LEAN_EXPORT uint8 lean_usage_all_resolved() {
+    return g_all_resolved.load();
 }
 }

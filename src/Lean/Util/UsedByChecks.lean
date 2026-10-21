@@ -26,9 +26,14 @@ private builtin_initialize usedByChecksRef : IO.Ref NameSet ← IO.mkRef {}
 /-- The keys looked up in the specialization cache while recording is on (`recordSpecLookup`). -/
 private builtin_initialize specLookupsRef : IO.Ref (Array Expr) ← IO.mkRef #[]
 
+/-- Switches on the recording of resolved names (`noteResolved`), in `src/library/usage_digest.cpp`. -/
+@[extern "lean_usage_enable_resolved"]
+private opaque enableResolvedRecording : BaseIO Unit
+
 /-- Switches usage recording on for the rest of the process. -/
-def enableUsageRecording : BaseIO Unit :=
+def enableUsageRecording : BaseIO Unit := do
   usageRecordingRef.set true
+  enableResolvedRecording
 
 /-- Whether usage recording is on. -/
 def usageRecordingEnabled : BaseIO Bool :=
@@ -60,27 +65,27 @@ def recordSpecLookup (key : Expr) : BaseIO Unit := do
 def lookedUpSpecKeys : BaseIO (Array Expr) :=
   specLookupsRef.get
 
-/-- The names the compiler resolved to a defining module (`noteResolved`) while recording is on. -/
-private builtin_initialize resolvedNamesRef : IO.Ref NameHashSet ← IO.mkRef {}
-
-/-- Records `n` as resolved when recording is on. Private, reached through its export from `noteResolved`, so that a
-module's code can only add names. -/
-@[export lean_usage_record_resolved]
-private def recordResolvedName (n : Name) : BaseIO Unit := do
-  if (← usageRecordingRef.get) then resolvedNamesRef.modify (·.insert n)
-
 /--
-Returns `x`, recording `n` as a name the compiler resolved to its defining module (`Environment.getModuleIdxFor?`):
-every call site of the compiler that picks a module's entries by that index wraps its result in `noteResolved`, hits
-and misses alike. Implemented in `src/library/usage_digest.cpp`, so that the recording, which no result depends on,
-cannot be optimized away.
+Returns `x`, recording `n` when usage recording is on as a name whose defining module was looked up
+(`Environment.getModuleIdxFor?`, which wraps its answer in it), hits and misses alike. The names are kept in
+`src/library/usage_digest.cpp`, where code can only add to them; the recording, which no result depends on, cannot be
+optimized away.
 -/
 @[never_extract, extern "lean_usage_note_resolved"]
 def noteResolved {α : Type} (n : @& Name) (x : α) : α := x
 
-/-- The names recorded by `noteResolved` so far. -/
-def resolvedNames : BaseIO NameHashSet :=
-  resolvedNamesRef.get
+/-- Returns `x`, recording when usage recording is on that the defining module of every name was read at once
+(`Environment.const2ModIdx`). -/
+@[never_extract, extern "lean_usage_note_all_resolved"]
+def noteAllResolved {α : Type} (x : α) : α := x
+
+/-- The names recorded by `noteResolved` so far, in no particular order. -/
+@[extern "lean_usage_resolved_names"]
+opaque resolvedNames : BaseIO (Array Name)
+
+/-- Whether `noteAllResolved` recorded a read. -/
+@[extern "lean_usage_all_resolved"]
+opaque allResolved : BaseIO Bool
 
 /-- See `recordCompilerCode`. -/
 private builtin_initialize compilerCodeRef : IO.Ref Bool ← IO.mkRef false
