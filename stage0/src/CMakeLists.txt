@@ -10,7 +10,7 @@ project(LEAN CXX C)
 set(LEAN_VERSION_MAJOR 4)
 set(LEAN_VERSION_MINOR 36)
 set(LEAN_VERSION_PATCH 0)
-set(LEAN_VERSION_IS_RELEASE 0 CACHE STRING "") # This number is 1 in the release revision, and 0 otherwise.
+set(LEAN_VERSION_IS_RELEASE 1 CACHE STRING "") # This number is 1 in the release revision, and 0 otherwise.
 set(LEAN_SPECIAL_VERSION_DESC "" CACHE STRING "Additional version description like 'nightly-2018-03-11'")
 set(LEAN_VERSION_STRING "${LEAN_VERSION_MAJOR}.${LEAN_VERSION_MINOR}.${LEAN_VERSION_PATCH}")
 if(LEAN_SPECIAL_VERSION_DESC)
@@ -1197,6 +1197,8 @@ install(
   PATTERN "*.trace" EXCLUDE
   PATTERN "*.rsp" EXCLUDE
   PATTERN "*.filelist" EXCLUDE
+  PATTERN "*.usage" EXCLUDE
+  PATTERN "*.usekey" EXCLUDE
 )
 
 # symlink source into expected installation location for go-to-definition, if file system allows it
