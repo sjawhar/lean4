@@ -67,7 +67,7 @@ extern lean_object* l_Lean_instInhabitedSynthNormMemoSlot_default;
 lean_object* lean_st_ref_take(lean_object*);
 lean_object* l_Lean_PersistentArray_push___redArg(lean_object*, lean_object*);
 lean_object* lean_st_ref_put(lean_object*, lean_object*);
-lean_object* lean_thunk_get_own(lean_object*);
+lean_object* lean_imported_consts_force_shared(lean_object*);
 lean_object* l_Lean_Name_str___override(lean_object*, lean_object*);
 lean_object* l_Lean_Name_num___override(lean_object*, lean_object*);
 lean_object* l_Lean_registerTraceClass(lean_object*, uint8_t, lean_object*);
@@ -7861,7 +7861,7 @@ lean_inc_ref(v_entry_2203_);
 v_expanded_2204_ = lean_ctor_get(v_t_2169_, 2);
 lean_inc_ref(v_expanded_2204_);
 lean_dec_ref_known(v_t_2169_, 3);
-v___x_2228_ = lean_thunk_get_own(v_entry_2203_);
+v___x_2228_ = lean_imported_consts_force_shared(v_entry_2203_);
 lean_dec_ref(v_entry_2203_);
 if (lean_obj_tag(v___x_2228_) == 1)
 {
@@ -7927,7 +7927,7 @@ goto v___jp_2205_;
 v___jp_2205_:
 {
 lean_object* v___x_2210_; lean_object* v_fst_2211_; lean_object* v___x_2213_; uint8_t v_isShared_2214_; uint8_t v_isSharedCheck_2226_; 
-v___x_2210_ = lean_thunk_get_own(v_expanded_2204_);
+v___x_2210_ = lean_imported_consts_force_shared(v_expanded_2204_);
 lean_dec_ref(v_expanded_2204_);
 v_fst_2211_ = lean_ctor_get(v___x_2210_, 0);
 v_isSharedCheck_2226_ = !lean_is_exclusive(v___x_2210_);

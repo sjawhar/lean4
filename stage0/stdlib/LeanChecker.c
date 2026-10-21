@@ -65,7 +65,7 @@ lean_object* l_Lean_OLeanLevel_adjustFileName(lean_object*, uint8_t);
 lean_object* l_Lean_Environment_constants(lean_object*);
 size_t lean_usize_of_nat(lean_object*);
 uint8_t lean_usize_dec_eq(size_t, size_t);
-lean_object* lean_thunk_get_own(lean_object*);
+lean_object* lean_imported_consts_force_shared(lean_object*);
 lean_object* l_Lean_withImportModules___redArg(lean_object*, lean_object*, lean_object*, uint32_t);
 lean_object* lean_io_as_task(lean_object*, lean_object*);
 extern lean_object* l_Lean_searchPathRef;
@@ -1149,7 +1149,7 @@ lean_inc_ref(v_entry_264_);
 v_expanded_265_ = lean_ctor_get(v_t_245_, 2);
 lean_inc_ref(v_expanded_265_);
 lean_dec_ref_known(v_t_245_, 3);
-v___x_276_ = lean_thunk_get_own(v_entry_264_);
+v___x_276_ = lean_imported_consts_force_shared(v_entry_264_);
 lean_dec_ref(v_entry_264_);
 if (lean_obj_tag(v___x_276_) == 1)
 {
@@ -1174,7 +1174,7 @@ goto v___jp_266_;
 v___jp_266_:
 {
 lean_object* v___x_268_; lean_object* v_fst_269_; lean_object* v___x_270_; lean_object* v___x_271_; uint8_t v___x_272_; 
-v___x_268_ = lean_thunk_get_own(v_expanded_265_);
+v___x_268_ = lean_imported_consts_force_shared(v_expanded_265_);
 lean_dec_ref(v_expanded_265_);
 v_fst_269_ = lean_ctor_get(v___x_268_, 0);
 lean_inc(v_fst_269_);

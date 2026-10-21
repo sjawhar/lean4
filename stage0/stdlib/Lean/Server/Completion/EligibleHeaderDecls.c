@@ -49,7 +49,7 @@ lean_object* lean_io_basemutex_unlock(lean_object*);
 uint8_t lean_usize_dec_eq(size_t, size_t);
 lean_object* lean_array_uget_borrowed(lean_object*, size_t);
 size_t lean_usize_add(size_t, size_t);
-lean_object* lean_thunk_get_own(lean_object*);
+lean_object* lean_imported_consts_force_shared(lean_object*);
 uint8_t l_Lean_Meta_allowCompletion(lean_object*, lean_object*);
 uint8_t l_Lean_ConstantInfo_isCtor(lean_object*);
 uint8_t l_Lean_ConstantInfo_isInductive(lean_object*);
@@ -3312,7 +3312,7 @@ lean_inc_ref(v_entry_1119_);
 v_expanded_1120_ = lean_ctor_get(v_t_1079_, 2);
 lean_inc_ref(v_expanded_1120_);
 lean_dec_ref_known(v_t_1079_, 3);
-v___x_1147_ = lean_thunk_get_own(v_entry_1119_);
+v___x_1147_ = lean_imported_consts_force_shared(v_entry_1119_);
 lean_dec_ref(v_entry_1119_);
 if (lean_obj_tag(v___x_1147_) == 1)
 {
@@ -3387,7 +3387,7 @@ goto v___jp_1121_;
 v___jp_1121_:
 {
 lean_object* v___x_1129_; lean_object* v_fst_1130_; lean_object* v___x_1132_; uint8_t v_isShared_1133_; uint8_t v_isSharedCheck_1145_; 
-v___x_1129_ = lean_thunk_get_own(v_expanded_1120_);
+v___x_1129_ = lean_imported_consts_force_shared(v_expanded_1120_);
 lean_dec_ref(v_expanded_1120_);
 v_fst_1130_ = lean_ctor_get(v___x_1129_, 0);
 v_isSharedCheck_1145_ = !lean_is_exclusive(v___x_1129_);

@@ -84,7 +84,7 @@ extern lean_object* l_Lean_Options_empty;
 lean_object* l_Lean_MessageData_ofConstName(lean_object*, uint8_t);
 lean_object* l_Lean_MessageData_note(lean_object*);
 uint8_t l_Lean_isPrivateName(lean_object*);
-lean_object* lean_thunk_get_own(lean_object*);
+lean_object* lean_imported_consts_force_shared(lean_object*);
 lean_object* l_Lean_ResolveName_resolveGlobalName(lean_object*, lean_object*, lean_object*, lean_object*, lean_object*);
 extern lean_object* l_Lean_maxRecDepthErrorMessage;
 lean_object* l_Lean_MessageData_ofFormat(lean_object*);
@@ -1627,7 +1627,7 @@ lean_inc_ref(v_entry_216_);
 v_expanded_217_ = lean_ctor_get(v_t_172_, 2);
 lean_inc_ref(v_expanded_217_);
 lean_dec_ref_known(v_t_172_, 3);
-v___x_246_ = lean_thunk_get_own(v_entry_216_);
+v___x_246_ = lean_imported_consts_force_shared(v_entry_216_);
 lean_dec_ref(v_entry_216_);
 if (lean_obj_tag(v___x_246_) == 1)
 {
@@ -1708,7 +1708,7 @@ goto v___jp_218_;
 v___jp_218_:
 {
 lean_object* v___x_228_; lean_object* v_fst_229_; lean_object* v___x_231_; uint8_t v_isShared_232_; uint8_t v_isSharedCheck_244_; 
-v___x_228_ = lean_thunk_get_own(v_expanded_217_);
+v___x_228_ = lean_imported_consts_force_shared(v_expanded_217_);
 lean_dec_ref(v_expanded_217_);
 v_fst_229_ = lean_ctor_get(v___x_228_, 0);
 v_isSharedCheck_244_ = !lean_is_exclusive(v___x_228_);

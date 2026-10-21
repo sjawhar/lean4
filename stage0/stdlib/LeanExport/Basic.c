@@ -101,7 +101,7 @@ uint8_t l_Lean_ConstantInfo_isUnsafe(lean_object*);
 lean_object* lean_array_fget_borrowed(lean_object*, lean_object*);
 uint8_t lean_string_dec_eq(lean_object*, lean_object*);
 lean_object* l_Lean_Environment_constants(lean_object*);
-lean_object* lean_thunk_get_own(lean_object*);
+lean_object* lean_imported_consts_force_shared(lean_object*);
 extern lean_object* l_Lean_githash;
 extern lean_object* l_Lean_versionString;
 lean_object* l_Lean_ConstMap_toList(lean_object*);
@@ -2959,7 +2959,7 @@ lean_inc_ref(v_entry_740_);
 v_expanded_741_ = lean_ctor_get(v_t_703_, 2);
 lean_inc_ref(v_expanded_741_);
 lean_dec_ref_known(v_t_703_, 3);
-v___x_766_ = lean_thunk_get_own(v_entry_740_);
+v___x_766_ = lean_imported_consts_force_shared(v_entry_740_);
 lean_dec_ref(v_entry_740_);
 if (lean_obj_tag(v___x_766_) == 1)
 {
@@ -3027,7 +3027,7 @@ goto v___jp_742_;
 v___jp_742_:
 {
 lean_object* v___x_747_; lean_object* v_fst_748_; lean_object* v___x_750_; uint8_t v_isShared_751_; uint8_t v_isSharedCheck_764_; 
-v___x_747_ = lean_thunk_get_own(v_expanded_741_);
+v___x_747_ = lean_imported_consts_force_shared(v_expanded_741_);
 lean_dec_ref(v_expanded_741_);
 v_fst_748_ = lean_ctor_get(v___x_747_, 0);
 v_isSharedCheck_764_ = !lean_is_exclusive(v___x_747_);
