@@ -26,6 +26,8 @@ import Init.Data.Slice
 import Init.Data.String.TakeDrop
 import Init.Data.Range.Polymorphic.Iterators
 import Init.While
+-- public: `getModuleIdxFor?` may be inlined at its callers
+public import Lean.Util.UsedByChecks
 
 public section
 
@@ -240,7 +242,7 @@ structure Environment where
   the field `constants`. These auxiliary constants are invisible to the Lean kernel and elaborator.
   Only the code generator uses them.
   -/
-  const2ModIdx            : Std.HashMap Name ModuleIdx
+  private const2ModIdx    : Std.HashMap Name ModuleIdx
   /--
   Environment extensions. It also includes user-defined extensions.
   -/
@@ -875,9 +877,10 @@ def addDeclCore (env : Environment) (maxHeartbeats : USize) (maxRecDepth : USize
 def constants (env : Environment) : ConstMap :=
   env.toKernelEnv.constants
 
-@[inherit_doc Kernel.Environment.const2ModIdx]
+/-- The whole of `Kernel.Environment.const2ModIdx`. A read records that the defining module of every imported name
+was read (`noteAllResolved`); single lookups go through `getModuleIdxFor?`. -/
 def const2ModIdx (env : Environment) : Std.HashMap Name ModuleIdx :=
-  env.toKernelEnv.const2ModIdx
+  noteAllResolved env.toKernelEnv.const2ModIdx
 
 -- only needed for the lakefile.lean cache
 @[export lake_environment_add]
@@ -991,9 +994,11 @@ system, this is any definition. -/
 def hasExposedBody (env : Environment) (n : Name) : Bool :=
   env.setExporting true |>.find? n |>.any (·.hasValue)
 
+/-- The module that defines `declName`, a kernel constant or a compiled name of the module, or `none` for the
+current module or no module. Every answer is recorded for the usage data (`noteResolved`). -/
 def getModuleIdxFor? (env : Environment) (declName : Name) : Option ModuleIdx :=
   -- async constants are always from the current module
-  env.base.get env |>.const2ModIdx[declName]?
+  noteResolved declName (env.base.get env |>.const2ModIdx[declName]?)
 
 def isImportedConst (env : Environment) (declName : Name) : Bool :=
   env.getModuleIdxFor? declName |>.isSome
