@@ -39,8 +39,8 @@ entries (IR, LCNF base and mono code, impure signatures, spec info, dead-branch 
 representation caches: trivial-structure info, impure type, mono type, constructor layout) are `R1`: their
 entries for the module's own names are read by `ModuleUsage.entriesEnc`, so any writer, inside or outside the
 compiler, is covered by the declaration's digest (`ownDeclDigest`); importers resolve a name's compiled entries
-through its defining module (`getModuleIdxFor?`), whose choice every compile records per name it resolves
-(`noteResolved`), and Lake rebuilds a module when a closure module changes what such a name resolves to. The specialization cache (`specCache`) is covered per key: the module
+through its defining module (`getModuleIdxFor?`), which records every name it is asked about (`noteResolved`), and
+Lake rebuilds a module when a closure module changes what such a name resolves to. The specialization cache (`specCache`) is covered per key: the module
 records the keys it looked up and exports the keys it created, and Lake rebuilds it when the providers of a
 looked-up key in its closure change; only keys and specialization names are compared. In the pass manager and
 folder tables (`R5`), entries are in `tableDigest` with the installer's or folder's digest, state written
@@ -151,9 +151,10 @@ def classification : List (Name × UsageClass × String) := [
   (`Lean.exportAttr, .R1, "Own-declaration marker, in `attrsEnc`. The `export` handler rejects imported declarations (src/Lean/Attributes.lean:295-296), as does `ParametricAttribute.setParam` (:329-330); it has no other writer. `getParam?` of an imported name reads only its own module's entries (:313-318)."),
   (`Lean.IR.declMapExt, .R1,
     "Own-declaration IR code, read by `entriesEnc` for each own name, whoever wrote it. Importers resolve a \
-    name's IR through the module `getModuleIdxFor?` picks among the modules that list it (`findExtEntry?`), and \
-    record each name they resolve with the module and kinds it resolved to (`noteResolved`, `resolvedGroups`); \
-    Lake rebuilds them when a closure module whose provides changed gains, loses or changes such a name."),
+    name's IR through the module `getModuleIdxFor?` picks among the modules that list it (`findExtEntry?`), which \
+    records each name it is asked about (`noteResolved`); the usage data lists each with the module and kinds it \
+    resolved to (`resolvedGroups`), and Lake rebuilds them when a closure module whose provides changed gains, \
+    loses or changes such a name."),
   (Lean.mkPrivateNameCore `Lean.Compiler.LCNF.ToImpureType `Lean.Compiler.LCNF.impureTypeExt, .R1,
     "IR type of an inductive, written by `setImpureType` from `compileInductives` \
     (src/Lean/Compiler/LCNF/ToImpureType.lean). Not a function of the kernel data alone: \
@@ -419,7 +420,7 @@ def writers : List (Name × List (Name × Mechanism × String)) := [
     (`Lean.registerParametricAttribute, .ownDeclDigest, parametricAttrReason)]),
   (`Lean.IR.declMapExt, [
     (`Lean.IR.addDecl, .ownDeclDigest,
-      "Public (src/Lean/Compiler/IR/CompilerM.lean:197-198); an IR declaration of an own name is in `entriesEnc`, whoever added it. A declaration added for another module's name lists it among the module's compiled names (`extraConstNames`), which its provides digest covers; an importer whose compile resolves the name records where it resolved (`noteResolved`), and Lake rebuilds it when the provider set changes there (cases `irdup_first`, `cs_nested`)."),
+      "Public (src/Lean/Compiler/IR/CompilerM.lean:197-198); an IR declaration of an own name is in `entriesEnc`, whoever added it. A declaration added for another module's name lists it among the module's compiled names (`extraConstNames`), which its provides digest covers; `getModuleIdxFor?` records each name an importer's compile resolves (`noteResolved`), and Lake rebuilds it when the provider set changes there (cases `irdup_first`, `cs_nested`)."),
     (`Lean.IR.addDecls, .ownDeclDigest, "Called by `IR.compile` (src/Lean/Compiler/IR.lean:35), which `PassManager.run` calls."),
     (`Lean.IR.ToIR.addDecl, .ownDeclDigest,
       "Adds the dummy declaration of an extern (src/Lean/Compiler/IR/ToIR.lean:54-55,202); covered like `IR.addDecl`.")]),
@@ -652,7 +653,7 @@ inductive DerivedClass where
   module's base. -/
   | derived
   /-- The name of a declaration the compile creates; it folds into its owner, and the module lists it among its
-  compiled names, so an importer that resolves it records where it resolved (`noteResolved`). -/
+  compiled names, so an importer that resolves it records where it resolved (`noteResolved` in `getModuleIdxFor?`). -/
   | compilerOnly
   /-- A name placed in the compiled code, so a compiled mention of the module that compiles it. -/
   | codeName
