@@ -404,7 +404,8 @@ def runFrontend
       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
     if let some (usageFileName, nodes, own, closure, provides) := usage? then
       let used := ModuleUsage.usedFromInfoTrees trees (← usedNames)
-      ModuleUsage.writeUsage env nodes own closure provides used (← resolvedNames) (← lookedUpSpecKeys)
+      let resolved : NameHashSet := (← resolvedNames).foldl (·.insert ·) {}
+      ModuleUsage.writeUsage env nodes own closure provides used resolved (← lookedUpSpecKeys)
         (incrLoaded := incrLoadFileName?.isSome) usageFileName
 
   if let some ileanFileName := ileanFileName? then
