@@ -1,4 +1,5 @@
-import Lean.ConstTrie
+module
+import all Lean.ConstTrie  -- for `ImportedConsts.findEntry?`, which reads module indices
 
 /-!
 Lookups in constant prefix trees whose nodes have at least `2^16 - 1` children, which need wide
@@ -28,8 +29,8 @@ def merged : ImportedConsts Unit :=
   ImportedConsts.mergeModuleTreesLazy #[(0, ConstTrie.ofNames part₁),
     (1, ConstTrie.ofNames (part₂.push `b0))]
 
-#guard part₁.all fun n => merged.findModIdx? n == some 0
-#guard part₂.all fun n => merged.findModIdx? n == some 1
+#guard part₁.all fun n => (merged.findEntry? n).map (·.2) == some 0
+#guard part₂.all fun n => (merged.findEntry? n).map (·.2) == some 1
 #guard (merged.find? `missing).isNone
 
 /-- Narrow nodes keep working alongside wide ones. -/
