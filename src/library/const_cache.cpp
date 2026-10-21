@@ -12,9 +12,9 @@ namespace lean {
 Caches for imported-constant lookups.
 
 The imported-constants views of an environment are immutable per import set, so lookup results
-(including misses) can be cached. Each view created by `finalizeImport` owns a cache via its
-`ImportedConsts.cached` root, which is freed together with the view; lookups in other views, such as
-ones loaded from header snapshots or modified for testing, use a process-global cache.
+(including misses) can be cached. Each view created by `finalizeImport` owns a cache via the
+`ImportedNode.cached` node at its root, which is freed together with the view; lookups in other
+views, such as ones loaded from header snapshots or modified for testing, use a process-global cache.
 
 Slots hold immutable entries behind a single atomic pointer each, so lookups are lock-free; races
 merely lose an insertion. Entries pin their key and value with references that are never dropped,
@@ -40,7 +40,7 @@ the cache is freed as concurrent readers may still probe them, with total overhe
 table's size thanks to geometric growth. Insertions racing with a swap go to the old table and are
 merely lost.
 
-An entry of the constants view also memoizes `findModIdxCached?`'s result for its key: the index of
+An entry of the constants view also memoizes `modIdxCached?`'s result for its key: the index of
 the first module having the name as a constant or as an extra constant, which needs a walk of the
 extra constants view too. The first such lookup computes it and publishes it with the extra
 constants view it was computed for; the entry's other fields stay immutable. A repeated lookup thus
@@ -48,7 +48,7 @@ costs one probe, as a constant lookup does.
 
 Heartbeats count a thread's allocations, and heartbeat limits (`maxHeartbeats`) are deterministic
 only if a computation's heartbeats depend on that computation alone. Whether a lookup hits depends
-on what other threads looked up before, and a lazily merged node of a view (`ImportedConsts.lazy`)
+on what other threads looked up before, and a lazily merged node of a view (`ImportedNode.lazy`)
 is computed by whichever thread needs it first. So a lookup costs no heartbeats, hit or miss: a miss
 restores the thread's heartbeat count after computing its result, and marks the result persistent
 even when the cache does not keep it, so that the caller gets a shared value either way and
@@ -62,7 +62,7 @@ extern "C" lean_object * lean_imported_consts_mod_idx_core(lean_obj_arg entry, l
     lean_obj_arg n);
 
 namespace {
-/* `findModIdxCached?`'s result for an entry's key. */
+/* `modIdxCached?`'s result for an entry's key. */
 struct mod_memo {
     // the extra constants view the result was computed with
     lean_object * m_extras;
@@ -78,7 +78,7 @@ struct entry {
     lean_object * m_key;
     // the cached `Option` result object
     lean_object * m_val;
-    // set once by the first `findModIdxCached?` of the key
+    // set once by the first `modIdxCached?` of the key
     std::atomic<mod_memo *> m_mod;
     // next entry inserted into the same cache, for freeing
     entry * m_next;
@@ -88,7 +88,7 @@ constexpr size_t global_initial_num_slots = 1 << 18;
 constexpr size_t view_initial_num_slots = 1 << 16;
 constexpr size_t max_num_slots = 1 << 26;
 constexpr size_t probe_window = 8;
-// constructor index of `ImportedConsts.cached`
+// constructor index of `ImportedNode.cached`; an `ImportedConsts` view is its root node at runtime
 constexpr unsigned cached_tag = 3;
 
 struct table {
@@ -287,7 +287,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_find_entry_cached(b_lea
     return find_cached(root, n, lean_imported_consts_find_entry_core, &e);
 }
 
-/* ImportedConsts.findModIdxCached? (consts : @& ImportedConsts ConstantInfo)
+/* ImportedConsts.modIdxCached? (consts : @& ImportedConsts ConstantInfo)
      (extras : @& ImportedConsts Unit) (n : @& Name) : Option Nat */
 extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_find_mod_idx_cached(b_lean_obj_arg consts,
         b_lean_obj_arg extras, b_lean_obj_arg n) {

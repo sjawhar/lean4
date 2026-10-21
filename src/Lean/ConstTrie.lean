@@ -242,18 +242,18 @@ public opaque LookupCache.numLive : BaseIO Nat
 -- `Thunk` fields have no `sizeOf` theorems
 set_option genSizeOfSpec false in
 /--
-Merged view of the per-module constant prefix trees of all imported modules. Node keys and lookup
-work like in `ConstTrie`; subtrees whose prefix occurs in only a single module are borrowed
-directly from that module's (usually region-resident) tree.
+A node of an `ImportedConsts` view. Node keys and lookup work like in `ConstTrie`; subtrees whose
+prefix occurs in only a single module are borrowed directly from that module's (usually
+region-resident) tree.
 -/
-public inductive ImportedConsts (α : Type) where
+inductive ImportedNode (α : Type) where
   /-- A subtree containing entries of only a single module: the module's own tree. -/
   | mod (modIdx : Nat) (tree : ConstTrie α)
   /--
   A node whose prefix occurs in several modules, allocated at import time. `entry?` holds the value
   together with the index of the first module declaring it.
   -/
-  | merged (key : Name) (entry? : Option (α × Nat)) (children : Array (ImportedConsts α))
+  | merged (key : Name) (entry? : Option (α × Nat)) (children : Array (ImportedNode α))
       (childIndex : ByteArray)
   /--
   Like `merged`, but with the entry and children computed on first access from the candidate
@@ -263,20 +263,33 @@ public inductive ImportedConsts (α : Type) where
   `forceShared` only.
   -/
   | lazy (key : Name) (entry : Thunk (Option (α × Nat)))
-      (expanded : Thunk (Array (ImportedConsts α) × ByteArray))
+      (expanded : Thunk (Array (ImportedNode α) × ByteArray))
   /--
-  The root of a view, owning the cache used by `findConstEntryCached?` and `findModIdxCached?`;
-  see `withCache`. Views without a cache, including ones whose cache was emptied by `dropCache`,
-  are cached in a process-global table instead, which keeps them alive. The C++ cache identifies
-  this constructor by its index, so it must stay the fourth one.
+  The root of a view, owning the cache used by `findEntryCached?` and `modIdxCached?`; see
+  `withCache`. Views without a cache, including ones whose cache was emptied by `dropCache`, are
+  cached in a process-global table instead, which keeps them alive. The C++ cache identifies this
+  constructor by its index, so it must stay the fourth one.
   -/
-  | cached (cache : Option LookupCache) (tree : ImportedConsts α)
+  | cached (cache : Option LookupCache) (tree : ImportedNode α)
 
-public instance : Inhabited (ImportedConsts α) := ⟨.merged .anonymous none #[] .empty⟩
+instance : Inhabited (ImportedNode α) := ⟨.merged .anonymous none #[] .empty⟩
+
+/--
+Merged view of the per-module constant prefix trees of all imported modules. For each name, the
+view also stores the index of the first module declaring it. Its nodes and every function reading
+that index are private, so that code outside the environment learns the module of an imported name
+only through `Kernel.Environment.getModuleIdxFor?`. A view is represented by its root node at
+runtime, as the structure has a single field; `src/library/const_cache.cpp` relies on that.
+-/
+public structure ImportedConsts (α : Type) where
+  private mk ::
+  private root : ImportedNode α
 
 namespace ImportedConsts
 
-public def empty : ImportedConsts α := .merged .anonymous none #[] .empty
+public def empty : ImportedConsts α := ⟨default⟩
+
+public instance : Inhabited (ImportedConsts α) := ⟨empty⟩
 
 /--
 `t.get`, except that the allocations computing `t`'s value are not counted as heartbeats of the
@@ -287,20 +300,24 @@ them whether it stays within a heartbeat limit, depend on what other threads hap
 @[extern "lean_imported_consts_force_shared"]
 public def forceShared (t : @& Thunk β) : β := t.get
 
-def key : ImportedConsts α → Name
+def key : ImportedNode α → Name
   | .mod _ t     => t.key
   | .merged k .. => k
   | .lazy k ..   => k
-  | .cached _ t  => t.key
+  | .cached _ t  => key t
 
-/-- Creates a `merged` node, computing the child index; `children` must be sorted by key hash. -/
+/--
+Creates a view consisting of a `merged` node, computing the child index; `children` must be sorted
+by key hash.
+-/
 public def mkMerged (key : Name) (entry? : Option (α × Nat))
     (children : Array (ImportedConsts α)) : ImportedConsts α :=
-  .merged key entry? children (buildChildIndex children ImportedConsts.key)
+  let children := children.map (·.root)
+  ⟨.merged key entry? children (buildChildIndex children ImportedConsts.key)⟩
 
 /-- Wraps `t` in a `cached` root with a fresh lookup cache, freed together with the result. -/
 public def withCache (t : ImportedConsts α) : BaseIO (ImportedConsts α) := do
-  return .cached (some (← LookupCache.new)) t
+  return ⟨.cached (some (← LookupCache.new)) t.root⟩
 
 /--
 Empties the cache field of a `cached` root in place, so that the view can be compacted; lookups
@@ -311,7 +328,7 @@ it.
 public opaque dropCache (t : @& ImportedConsts α) : BaseIO Unit
 
 /-- Walks from `t`, the node for `path[i]` (or the root for `i = path.size`), to `path[0]`. -/
-partial def findValAux : ImportedConsts α → Array Name → Nat → Option α
+partial def findValAux : ImportedNode α → Array Name → Nat → Option α
   | .mod _ tr, path, i => tr.findAux path i
   | .lazy _ entry expanded, path, i =>
     if i == 0 then
@@ -332,7 +349,7 @@ partial def findValAux : ImportedConsts α → Array Name → Nat → Option α
       | some j => findValAux cs[j]! path (i - 1)
       | none   => none
 
-partial def findModIdxAux : ImportedConsts α → Array Name → Nat → Option Nat
+partial def findModIdxAux : ImportedNode α → Array Name → Nat → Option Nat
   | .mod modIdx tr, path, i =>
     match tr.findAux path i with
     | some _ => some modIdx
@@ -356,7 +373,7 @@ partial def findModIdxAux : ImportedConsts α → Array Name → Nat → Option 
       | some j => findModIdxAux cs[j]! path (i - 1)
       | none   => none
 
-partial def findEntryAux : ImportedConsts α → Array Name → Nat → Option (α × Nat)
+partial def findEntryAux : ImportedNode α → Array Name → Nat → Option (α × Nat)
   | .mod modIdx tr, path, i =>
     match tr.findAux path i with
     | some v => some (v, modIdx)
@@ -379,9 +396,9 @@ partial def findEntryAux : ImportedConsts α → Array Name → Nat → Option (
       | none   => none
 
 /-- Finds the value for `n` together with the index of the first module declaring it. -/
-public def findEntry? (t : ImportedConsts α) (n : Name) : Option (α × Nat) :=
+def findEntry? (t : ImportedConsts α) (n : Name) : Option (α × Nat) :=
   let path := prefixesOf n
-  t.findEntryAux path path.size
+  findEntryAux t.root path path.size
 
 @[export lean_imported_consts_find_entry_core]
 def findEntryCore (t : ImportedConsts ConstantInfo) (n : Name) :
@@ -395,28 +412,21 @@ Implemented in C++ (`src/library/const_cache.cpp`) where cache hits can avoid re
 on the view and key.
 -/
 @[extern "lean_imported_consts_find_entry_cached"]
-public opaque findConstEntryCached? (t : @& ImportedConsts ConstantInfo) (n : @& Name) :
-    Option (ConstantInfo × Nat)
-
-@[inherit_doc findConstEntryCached?, inline]
-public def findConstCached? (t : ImportedConsts ConstantInfo) (n : Name) : Option ConstantInfo :=
-  match t.findConstEntryCached? n with
-  | some (c, _) => some c
-  | none        => none
-
-/--
-`findConstEntryCached?`, under the private name that the module index lookups move to; the stage0
-compiler needs its native implementation before code can call it.
--/
-@[extern "lean_imported_consts_find_entry_cached"]
 opaque findEntryCached? (t : @& ImportedConsts ConstantInfo) (n : @& Name) :
     Option (ConstantInfo × Nat)
+
+/-- `find?` for the constants view, memoized like `findEntryCached?`. -/
+@[inline]
+public def findConstCached? (t : ImportedConsts ConstantInfo) (n : Name) : Option ConstantInfo :=
+  match t.findEntryCached? n with
+  | some (c, _) => some c
+  | none        => none
 
 /--
 Like `findModIdxAux`, but only finds a first module before `bound`: nothing below a subtree of a
 single module at or after `bound` is visited.
 -/
-partial def findModIdxBelowAux (bound : Nat) : ImportedConsts α → Array Name → Nat → Option Nat
+partial def findModIdxBelowAux (bound : Nat) : ImportedNode α → Array Name → Nat → Option Nat
   | .mod modIdx tr, path, i =>
     if modIdx < bound && (tr.findAux path i).isSome then some modIdx else none
   | .lazy _ entry expanded, path, i =>
@@ -452,23 +462,15 @@ def modIdxCore (entry : Option (ConstantInfo × Nat)) (extras : ImportedConsts U
   let path := prefixesOf n
   match entry with
   | some (_, i) =>
-    match extras.findModIdxBelowAux i path path.size with
+    match findModIdxBelowAux i extras.root path path.size with
     | some j => some j
     | none   => some i
-  | none => extras.findModIdxAux path path.size
+  | none => findModIdxAux extras.root path path.size
 
 /--
 `modIdxCore` for `n`, with the entry of the constants view `consts`, memoized in the entry for `n`
-of the cache that `findConstEntryCached?` uses for `consts`, so that a repeated lookup costs a
-single probe. Implemented in C++ (`src/library/const_cache.cpp`).
--/
-@[extern "lean_imported_consts_find_mod_idx_cached"]
-public opaque findModIdxCached? (consts : @& ImportedConsts ConstantInfo)
-    (extras : @& ImportedConsts Unit) (n : @& Name) : Option Nat
-
-/--
-`findModIdxCached?`, under the private name that the module index lookups move to; the stage0
-compiler needs its native implementation before code can call it.
+of the cache that `findEntryCached?` uses for `consts`, so that a repeated lookup costs a single
+probe. Implemented in C++ (`src/library/const_cache.cpp`).
 -/
 @[extern "lean_imported_consts_find_mod_idx_cached"]
 opaque modIdxCached? (consts : @& ImportedConsts ConstantInfo)
@@ -484,17 +486,13 @@ public opaque resetCache : IO Unit
 
 public def find? (t : ImportedConsts α) (n : Name) : Option α :=
   let path := prefixesOf n
-  t.findValAux path path.size
-
-public def findModIdx? (t : ImportedConsts α) (n : Name) : Option Nat :=
-  let path := prefixesOf n
-  t.findModIdxAux path path.size
+  findValAux t.root path path.size
 
 public def contains (t : ImportedConsts α) (n : Name) : Bool :=
   t.find? n |>.isSome
 
 /-- A constant name declared by more than one module; see `collectDuplicates`. -/
-public structure Duplicate (α : Type) where
+structure Duplicate (α : Type) where
   name : Name
   /-- The declared values with their module indices, in module order. -/
   entries : Array (α × Nat)
@@ -564,13 +562,13 @@ walked. `covered` optionally gives each module a bitmask of covering direct impo
 whose modules share a mask bit are skipped, as their pairs are conflict-checked already (see
 `checkImportConflicts`).
 -/
-public def collectDuplicates (trees : Array (Nat × ConstTrie α))
+def collectDuplicates (trees : Array (Nat × ConstTrie α))
     (covered : Array UInt64 := #[]) : Array (Duplicate α) :=
   if trees.size < 2 then #[]
   else collectDupsAux covered .anonymous trees #[]
 
 partial def mergeLazy (resolve : Array (α × Nat) → Option (α × Nat)) (key : Name)
-    (cands : Array (Nat × ConstTrie α)) : ImportedConsts α :=
+    (cands : Array (Nat × ConstTrie α)) : ImportedNode α :=
   if cands.size == 1 then
     let (i, t) := cands[0]!
     .mod i t
@@ -579,7 +577,7 @@ partial def mergeLazy (resolve : Array (α × Nat) → Option (α × Nat)) (key 
       (Thunk.mk fun _ => resolve <| cands.filterMap fun (i, t) => t.val?.map ((·, i)))
       (Thunk.mk fun _ => expandLazy cands)
 where
-  expandLazy (cands : Array (Nat × ConstTrie α)) : Array (ImportedConsts α) × ByteArray :=
+  expandLazy (cands : Array (Nat × ConstTrie α)) : Array (ImportedNode α) × ByteArray :=
     -- single-module children are borrowed as they are
     let children := foldChildGroups cands #[] (fun cs i c => cs.push (.mod i c))
       (fun cs g => cs.push (mergeLazy resolve g[0]!.2.key g))
@@ -594,21 +592,17 @@ declarations must have been ruled out beforehand, e.g. using `collectDuplicates`
 -/
 public def mergeModuleTreesLazy (trees : Array (Nat × ConstTrie α))
     (resolve : Array (α × Nat) → Option (α × Nat) := (·[0]?)) : ImportedConsts α :=
-  mergeLazy resolve .anonymous trees
+  ⟨mergeLazy resolve .anonymous trees⟩
 
-/--
-Replaces the node for `n` using `f`. `n` must be a prefix shared by several modules, such as a
-`Duplicate` name; single-module subtrees are never modified.
--/
-public partial def modifyAt (t : ImportedConsts α) (n : Name)
-    (f : ImportedConsts α → ImportedConsts α) : ImportedConsts α :=
+partial def modifyAtAux (t : ImportedNode α) (n : Name) (f : ImportedNode α → ImportedNode α) :
+    ImportedNode α :=
   match n with
   | .anonymous   => f t
-  | n@(.str p _) => t.modifyAt p (modifyChild n f)
-  | n@(.num p _) => t.modifyAt p (modifyChild n f)
+  | n@(.str p _) => modifyAtAux t p (modifyChild n f)
+  | n@(.num p _) => modifyAtAux t p (modifyChild n f)
 where
-  @[inline] modifyChild (n : Name) (f : ImportedConsts α → ImportedConsts α) :
-      ImportedConsts α → ImportedConsts α
+  @[inline] modifyChild (n : Name) (f : ImportedNode α → ImportedNode α) :
+      ImportedNode α → ImportedNode α
     | t@(.mod ..)       => t
     | .cached _ t       => modifyChild n f t
     | .lazy k e exp =>
@@ -621,20 +615,31 @@ where
       | none   => .merged k e? cs hs
 
 /--
+Replaces the subview for `n` using `f`. `n` must be a prefix shared by several modules, such as a
+`Duplicate` name; single-module subtrees are never modified.
+-/
+public def modifyAt (t : ImportedConsts α) (n : Name)
+    (f : ImportedConsts α → ImportedConsts α) : ImportedConsts α :=
+  ⟨modifyAtAux t.root n fun node => (f ⟨node⟩).root⟩
+
+partial def forceExpandedAux : ImportedNode α → ImportedNode α
+  | .lazy k entry expanded =>
+    let (cs, hs) := forceShared expanded
+    .merged k (forceShared entry) (cs.map forceExpandedAux) hs
+  | .merged k e? cs hs => .merged k e? (cs.map forceExpandedAux) hs
+  -- caches cannot be compacted
+  | .cached _ t        => forceExpandedAux t
+  | t                  => t
+
+/--
 Recursively forces all lazily merged nodes into `merged` nodes. Compacting an environment, such
 as for `--incr-header-save`, forces the thunks anyway; doing so eagerly instead avoids running
 merges in the middle of compaction and compacting the thunk wrappers themselves.
 -/
-public partial def forceExpanded : ImportedConsts α → ImportedConsts α
-  | .lazy k entry expanded =>
-    let (cs, hs) := forceShared expanded
-    .merged k (forceShared entry) (cs.map forceExpanded) hs
-  | .merged k e? cs hs => .merged k e? (cs.map forceExpanded) hs
-  -- caches cannot be compacted
-  | .cached _ t        => forceExpanded t
-  | t                  => t
+public def forceExpanded (t : ImportedConsts α) : ImportedConsts α :=
+  ⟨forceExpandedAux t.root⟩
 
-public partial def foldlM [Monad m] (t : ImportedConsts α) (f : σ → Name → α → m σ) (init : σ) :
+partial def foldlMAux [Monad m] (t : ImportedNode α) (f : σ → Name → α → m σ) (init : σ) :
     m σ := do
   match t with
   | .mod _ tr => tr.foldlM f init
@@ -642,33 +647,40 @@ public partial def foldlM [Monad m] (t : ImportedConsts α) (f : σ → Name →
     let mut s := init
     if let some (v, _) := e? then
       s ← f s k v
-    cs.foldlM (fun s c => c.foldlM f s) s
+    cs.foldlM (fun s c => foldlMAux c f s) s
   | .lazy k entry expanded =>
     let mut s := init
     if let some (v, _) := forceShared entry then
       s ← f s k v
-    (forceShared expanded).1.foldlM (fun s c => c.foldlM f s) s
-  | .cached _ t => t.foldlM f init
+    (forceShared expanded).1.foldlM (fun s c => foldlMAux c f s) s
+  | .cached _ t => foldlMAux t f init
+
+public def foldlM [Monad m] (t : ImportedConsts α) (f : σ → Name → α → m σ) (init : σ) : m σ :=
+  foldlMAux t.root f init
 
 public def foldl (t : ImportedConsts α) (f : σ → Name → α → σ) (init : σ) : σ :=
   t.foldlM (m := Id) f init
 
-/-- Like `foldlM`, but also passing the index of the first module declaring each name. -/
-public partial def foldlEntriesM [Monad m] (t : ImportedConsts α)
-    (f : σ → Name → α × Nat → m σ) (init : σ) : m σ := do
+partial def foldlEntriesMAux [Monad m] (t : ImportedNode α) (f : σ → Name → α × Nat → m σ)
+    (init : σ) : m σ := do
   match t with
   | .mod modIdx tr => tr.foldlM (fun s n v => f s n (v, modIdx)) init
   | .merged k e? cs _ =>
     let mut s := init
     if let some e := e? then
       s ← f s k e
-    cs.foldlM (fun s c => c.foldlEntriesM f s) s
+    cs.foldlM (fun s c => foldlEntriesMAux c f s) s
   | .lazy k entry expanded =>
     let mut s := init
     if let some e := forceShared entry then
       s ← f s k e
-    (forceShared expanded).1.foldlM (fun s c => c.foldlEntriesM f s) s
-  | .cached _ t => t.foldlEntriesM f init
+    (forceShared expanded).1.foldlM (fun s c => foldlEntriesMAux c f s) s
+  | .cached _ t => foldlEntriesMAux t f init
+
+/-- Like `foldlM`, but also passing the index of the first module declaring each name. -/
+def foldlEntriesM [Monad m] (t : ImportedConsts α) (f : σ → Name → α × Nat → m σ) (init : σ) :
+    m σ :=
+  foldlEntriesMAux t.root f init
 
 public def forM [Monad m] (t : ImportedConsts α) (f : Name → α → m PUnit) : m PUnit :=
   t.foldlM (fun _ n v => f n v) ⟨⟩

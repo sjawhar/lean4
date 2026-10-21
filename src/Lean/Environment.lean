@@ -27,6 +27,7 @@ import Init.Data.Slice
 import Init.Data.String.TakeDrop
 import Init.Data.Range.Polymorphic.Iterators
 import Init.While
+import all Lean.ConstTrie  -- for the module indices of the imported-constants views
 
 public section
 
@@ -318,7 +319,7 @@ several imported modules declare, as a constant or as an auxiliary constant, bel
 of them in module order.
 -/
 def getModuleIdxFor? (env : Environment) (declName : Name) : Option ModuleIdx :=
-  env.allImportedConsts.findModIdxCached? env.importedExtraConsts declName
+  env.allImportedConsts.modIdxCached? env.importedExtraConsts declName
 
 @[export lean_environment_mark_quot_init]
 private def markQuotInit (env : Environment) : Environment :=
