@@ -1484,6 +1484,79 @@ claim_nsb_s1() { claim_z 'def NS : Nat := 0' NS.foo._boxed lean_nat_pred; }
 claim_nsb_priv_s0() { claim_boxed_files; }
 claim_nsb_priv_s1() { claim_z 'private def NS.foo : Nat := 0' NS.foo._boxed lean_nat_pred; }
 
+# A name the elaborator resolves to its defining module without it occurring in any term: reducibility
+# (`getReducibilityStatusCore`). `U` defines the reducible `ru := 7`, `W` the reducible `wv := ru`, and `C` proves
+# `wv = 7` by `with_reducible rfl`, which unfolds `ru` only while `ru` reads as reducible. No term of `C` mentions
+# `ru`. In state 1 `Z` claims the name `ru` with an IR declaration. `elab_claim`: `C` imports `Z` then `W`, so `ru`
+# resolves to `Z`, reads as semireducible, and `C` fails; `elab_claim_after`: `W` then `Z`, `C` still holds.
+elab_claim_files() {
+  lakefile_app; mkdir_t
+  printf '@[reducible] def ru : Nat := 7\n' > T/U.lean
+  printf 'import T.U\n@[reducible] def wv : Nat := ru\n' > T/W.lean
+  printf 'import Lean\ndef zdummy : Nat := 1\n' > T/Z.lean
+  printf 'import T.%s\nimport T.%s\ntheorem t : wv = 7 := by with_reducible rfl\ndef c : Nat := 0\n' "$1" "$2" > T/C.lean
+  printf 'import T.C\ndef main : IO Unit := IO.println c\n' > Main.lean
+}
+elab_claim_s0() { elab_claim_files Z W; }
+elab_claim_s1() { claim_z '' ru lean_nat_succ; }
+elab_claim_after_s0() { elab_claim_files W Z; }
+elab_claim_after_s1() { claim_z '' ru lean_nat_succ; }
+
+# `elab_claim` with `U` and `W` `module` files: `Z`, which is not one, still claims `ru` for `C`.
+elab_claim_ms_s0() {
+  elab_claim_files Z W
+  printf 'module\n\n@[expose] public section\n@[reducible] def ru : Nat := 7\n' > T/U.lean
+  printf 'module\n\npublic import T.U\n@[expose] public section\n@[reducible] def wv : Nat := ru\n' > T/W.lean
+}
+elab_claim_ms_s1() { claim_z '' ru lean_nat_succ; }
+
+# An instance another module declares for a declaration it does not define, whose name a sibling module then claims.
+# `W` defines `foo : Inhabited Nat`, `X` makes it an instance, and `M` takes `default : Nat` through it; `foo` is
+# `@[inline]`, so `M`'s code inlines `W`'s `foo` while `foo` resolves to `W`. In state 1 `Z` claims `foo` with an IR
+# declaration: `inst_claim` imports `Z` before `X`, so `foo` resolves to `Z` for the stock and lowest-index resolvers;
+# `inst_claim_after` imports it after.
+inst_claim_files() {
+  lakefile_app; mkdir_t
+  printf '@[inline, instance_reducible] def foo : Inhabited Nat := ⟨7⟩\n' > T/W.lean
+  printf 'import T.W\nattribute [instance] foo\ndef xdummy : Nat := 1\n' > T/X.lean
+  printf 'import Lean\ndef zdummy : Nat := 1\n' > T/Z.lean
+  printf 'import T.%s\nimport T.%s\n@[noinline] def g : Nat := default\n' "$1" "$2" > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println g\n' > Main.lean
+}
+inst_claim_s0() { inst_claim_files Z X; }
+inst_claim_s1() { claim_z '' foo lean_nat_succ; }
+inst_claim_after_s0() { inst_claim_files X Z; }
+inst_claim_after_s1() { claim_z '' foo lean_nat_succ; }
+
+# A module's cross-module table digest when modules it does not import claim names of its own declarations. `A`
+# defines `X._sunfold` for a base `X` that no module defines, so its `tableDigest` lists the constant with its digest
+# (`foreignDerivedConsts`); in state 1 `Y` and `Z` claim `X._sunfold` with different IR declarations (`td_claim`).
+# In `td_inst`, `Z` claims the name of `A`'s instance `instA`, which `A`'s `tableDigest` leaves out as one of its own
+# declarations. `P` imports `Y`, `Z`, `A`, `R` imports `Z`, `Y`, `A` and `Q` imports `A`, `Y`, `Z`, so in `P`, `R` and
+# `Q` the claimed name resolves to `Y`, `Z` and `A` in `td_claim` and to `Z`, `Z` and `A` in `td_inst`; `A`'s table
+# digest must be the same in all three, and `P`, `Q` and `R` what a clean build makes.
+td_files() {
+  lakefile_app; mkdir_t
+  printf '%s\n' "$1" 'def adummy : Nat := 1' > T/A.lean
+  printf 'import Lean\ndef ydummy : Nat := 1\n' > T/Y.lean
+  printf 'import Lean\ndef zdummy : Nat := 1\n' > T/Z.lean
+  printf 'import T.Y\nimport T.Z\nimport T.A\ndef p : Nat := 0\n' > T/P.lean
+  printf 'import T.Z\nimport T.Y\nimport T.A\ndef r : Nat := 0\n' > T/R.lean
+  printf 'import T.A\nimport T.Y\nimport T.Z\ndef q : Nat := 0\n' > T/Q.lean
+  printf 'import T.P\nimport T.Q\nimport T.R\ndef main : IO Unit := IO.println (p + q + r)\n' > Main.lean
+}
+# `$1` claims `$2` with an `@[extern "$3"]` IR declaration.
+td_claim_mod() {
+  printf '%s\n' 'import Lean' "def ${1,,}dummy : Nat := 1" 'open Lean IR in' \
+    "run_cmd Lean.Elab.Command.liftCoreM <| IR.addDecl <| (.extern \`$2" \
+    '  #[{ x := ⟨1⟩, borrow := false, ty := .object }] .object' \
+    "  { entries := [.standard \`all \"$3\"] })" > T/$1.lean
+}
+td_claim_s0() { td_files 'def X._sunfold : Nat := 3'; }
+td_claim_s1() { td_claim_mod Y X._sunfold lean_nat_succ; td_claim_mod Z X._sunfold lean_nat_pred; }
+td_inst_s0() { td_files 'instance instA : Inhabited Nat := ⟨5⟩'; }
+td_inst_s1() { td_claim_mod Z instA lean_nat_succ; }
+
 # A claim of a name `A`'s compile created inside another specialization: `A`'s specialization of `h` created inside
 # its specialization of `g` is `h._at_.g._at_.useIt.spec_0.spec_0`; `Z` defines `useIt.spec_0`, a reading of that
 # name's creator, and claims the name (`cs_nested`; `cs_nested_ctl` without the definition). `C` specializes `h` at
@@ -2112,6 +2185,7 @@ all_cases="spec_transitive spec_link spec_type spec_precomp plugin_replay csimp_
   cov_projfn cov_projfn_rev cov_mlike cov_sparse cov_auxrec cov_sibmatch cov_sibmatch_rev cov_ctlmatch
   cov_sibinst cov_sibclass cov_sibmeta cov_ckind_rev cov_recarg_rev
   collide_first collide_after collide_rev collide_rev_first collide_drop_loser collide_shape collide_shape_rev
+  elab_claim elab_claim_after elab_claim_ms inst_claim inst_claim_after td_claim td_inst
   hard_recording hard_moduleext hard_speclookups hard_compilercode rp_own
   hard_usedbychecks hard_declconsts
   hard_extramod perkey_provider_inl
