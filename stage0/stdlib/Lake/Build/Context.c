@@ -1,6 +1,6 @@
 // Lean compiler output
 // Module: Lake.Build.Context
-// Imports: public import Lake.Config.Cache public import Lake.Config.Context public import Lake.Build.Job.Basic
+// Imports: public import Lake.Config.Cache public import Lake.Config.Context public import Lake.Build.Job.Basic public import Std.Sync.Mutex public import Lean.Util.ModuleUsage
 #include <lean/lean.h>
 #if defined(__clang__)
 #pragma clang diagnostic ignored "-Wunused-parameter"
@@ -700,6 +700,8 @@ return v___x_258_;
 lean_object* runtime_initialize_Lake_Config_Cache(uint8_t builtin);
 lean_object* runtime_initialize_Lake_Config_Context(uint8_t builtin);
 lean_object* runtime_initialize_Lake_Build_Job_Basic(uint8_t builtin);
+lean_object* runtime_initialize_Std_Sync_Mutex(uint8_t builtin);
+lean_object* runtime_initialize_Lean_Util_ModuleUsage(uint8_t builtin);
 void lean_initialize();
 static bool _G_runtime_initialized = false;
 LEAN_EXPORT lean_object* runtime_initialize_Lake_Build_Context(uint8_t builtin) {
@@ -716,6 +718,12 @@ lean_dec_ref(res);
 res = runtime_initialize_Lake_Build_Job_Basic(builtin);
 if (lean_io_result_is_error(res)) return res;
 lean_dec_ref(res);
+res = runtime_initialize_Std_Sync_Mutex(builtin);
+if (lean_io_result_is_error(res)) return res;
+lean_dec_ref(res);
+res = runtime_initialize_Lean_Util_ModuleUsage(builtin);
+if (lean_io_result_is_error(res)) return res;
+lean_dec_ref(res);
 return lean_io_result_mk_ok(lean_box(0));
 }
 static bool _G_meta_initialized = false;
@@ -728,6 +736,8 @@ return lean_io_result_mk_ok(lean_box(0));
 lean_object* initialize_Lake_Config_Cache(uint8_t builtin);
 lean_object* initialize_Lake_Config_Context(uint8_t builtin);
 lean_object* initialize_Lake_Build_Job_Basic(uint8_t builtin);
+lean_object* initialize_Std_Sync_Mutex(uint8_t builtin);
+lean_object* initialize_Lean_Util_ModuleUsage(uint8_t builtin);
 static bool _G_initialized = false;
 LEAN_EXPORT lean_object* initialize_Lake_Build_Context(uint8_t builtin) {
 lean_object * res;
@@ -740,6 +750,12 @@ res = initialize_Lake_Config_Context(builtin);
 if (lean_io_result_is_error(res)) return res;
 lean_dec_ref(res);
 res = initialize_Lake_Build_Job_Basic(builtin);
+if (lean_io_result_is_error(res)) return res;
+lean_dec_ref(res);
+res = initialize_Std_Sync_Mutex(builtin);
+if (lean_io_result_is_error(res)) return res;
+lean_dec_ref(res);
+res = initialize_Lean_Util_ModuleUsage(builtin);
 if (lean_io_result_is_error(res)) return res;
 lean_dec_ref(res);
 res = runtime_initialize_Lake_Build_Context(builtin);
