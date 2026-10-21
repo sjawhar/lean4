@@ -333,7 +333,7 @@ calls `addEntry`, `modifyState`, `setState`, `insert`, `tag`, `setTag`, `setPara
 `setValue` or `add` on the table, and the public wrappers of those. Functions that only forward to another row's
 function are listed when they are public API. Attribute handlers have no constant of their own: they are named by
 the registration function that creates them, or by the function they call. The low-level
-`PersistentEnvExtension.addEntry`/`setState`/`modifyState` (src/Lean/Environment.lean:2005,2024,2029) write any
+`PersistentEnvExtension.addEntry`/`setState`/`modifyState` (src/Lean/Environment.lean) write any
 table and are not repeated per table: a write through them is covered because the digest code reads the table, not
 the writer, which holds for every table classified `R1`, `R1R5` or `R5` (they must be listed in
 `ModuleUsage.digestedOwnTables` / `digestedCrossTables`, checked in the `#eval` below). Every table of a class that
