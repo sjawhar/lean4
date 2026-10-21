@@ -7,13 +7,15 @@ module
 
 prelude
 public import Lean.Util.ModuleUsage.Commands
+import all Lean.Util.CommandEntries  -- for `KeepPermit.mk`
 
 public section
 
 /-!
 What a module records for reusing its commands in a later build: which command-state changes a payload carries
 (`commandStateFields`), each command's payload with its refusals (`commandPayloads`), and the module's payloads,
-records and `noskip` reason (`moduleRecords`).
+records and `noskip` reason (`moduleRecords`); and what lets a later build keep them: the module's recorded name
+resolutions holding where they are kept (`keepPermit`).
 -/
 
 namespace Lean.ModuleUsage
@@ -114,5 +116,53 @@ def moduleRecords (env : Environment) (own : Array (Name × Digest)) (stmt : Arr
     let declIdxs := commands.foldl (init := ({} : Std.HashSet Nat)) fun s c => if c.isDecl then s.insert c.i else s
     return { payloads, commands,
              noskipReason? := moduleSystem? <|> commandEntriesNoskipReason? payloads declIdxs.contains }
+
+/-- The name resolutions a module's compile recorded: its `.usage` file's `resolved`, `resolvedAll` and `digested`
+(`writeUsage`). -/
+structure ResolutionRecord where
+  /-- Each name whose defining module the compile looked up, used or referred to, grouped by the module the resolver
+  mapped it to (`none`: the module itself, or no module), with the kinds under which that module provided it
+  (`resolvedGroups`). -/
+  resolved : Array (Option Name × Array (Name × UInt8))
+  /-- Whether the compile read the resolver's whole map (`allResolved`). -/
+  all : Bool
+  /-- Each imported module with digests, with the digest of the names it provides (`digestedModules`). -/
+  digested : Array (Name × Digest)
+
+/-- The resolutions a `.usage` file records. -/
+def ResolutionRecord.ofUsage (j : Json) : Except String ResolutionRecord := do
+  let resolved ← (← j.getObjValAs? (Array (Json × Array (JName × Nat))) "resolved").mapM fun (m, ns) => do
+    let m? ← match m with
+      | .null => pure none
+      | m => some <$> nameOfJson? m
+    return (m?, ns.map fun (n, k) => (n.name, k.toUInt8))
+  let digested := (← j.getObjValAs? (Array (JName × Digest)) "digested").map fun (m, d) => (m.name, d)
+  return { resolved, all := ← j.getObjValAs? Bool "resolvedAll", digested }
+
+/-- The resolutions the `.usage` file at `path` records. -/
+def ResolutionRecord.read (path : System.FilePath) : IO ResolutionRecord := do
+  IO.ofExcept <| ResolutionRecord.ofUsage (← IO.ofExcept <| Json.parse (← IO.FS.readFile path))
+
+/-- A keep permit for `env`'s imports (`KeepPermit`) if every resolution `r` records holds in `env`: each recorded name
+resolves to the same module (`Environment.getModuleIdxFor?`), which provides it with the same kinds (`providedKinds`),
+and, where the compile read the resolver's whole map, every imported module with digests provides the same names
+(`digestedModules`). This is the check Lake makes before it skips a module (`UsageSidecar.resolvedUnchanged`), asked of
+`env`'s resolver directly. Otherwise none of the module's commands is kept: the error, `resolution changed`, names
+the first difference. -/
+def keepPermit (env : Environment) (r : ResolutionRecord) : Except String KeepPermit := do
+  let describe (m? : Option Name) (k : UInt8) : String :=
+    m?.elim "the module itself or no module" fun m => s!"`{m}` (kinds {k})"
+  for (m?, ns) in r.resolved do
+    for (n, k) in ns do
+      let i? := env.getModuleIdxFor? n
+      let now? := i?.map (env.header.moduleNames[·.toNat]!)
+      let k' := i?.elim 0 (providedKinds env · n)
+      unless now? == m? && k' == k do
+        throw s!"resolution changed: `{n}` resolved to {describe m? k} when the module was compiled, and resolves \
+          to {describe now? k'} here"
+  if r.all && digestedModules env != r.digested then
+    throw "resolution changed: the compile read the defining module of every name, and the imported modules' \
+      provides differ here"
+  return KeepPermit.mk env.header.moduleNames
 
 end Lean.ModuleUsage

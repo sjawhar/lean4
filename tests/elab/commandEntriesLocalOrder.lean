@@ -49,8 +49,9 @@ unsafe def check (dir : System.FilePath) (label : String) (ext : Name) (src : St
   IO.println s!"{label}: command {i} {kind}, refused for {ext} {(ce.refusals.filterMap (·.ext?)).contains ext}, entries \
     {(ce.checked.entries ++ ce.main.entries).any (·.1 == ext)}, scoped ops {ce.main.scopedOps.any (·.1 == ext)}, \
     noskip {(r.usage.getObjValAs? Bool "noskip").toOption}"
+  let permit ← IO.ofExcept <| ModuleUsage.keepPermit o.before.env (← IO.ofExcept <| ModuleUsage.ResolutionRecord.ofUsage r.usage)
   let replayed? ← try
-      pure (some (← replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}))
+      pure (some (← replayCommandEntries permit (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}))
     catch _ => pure none
   match replayed?, probe? with
   | none, _ => IO.println "  replay refused"

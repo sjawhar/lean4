@@ -111,8 +111,9 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   for o in obs do
     let some ce := payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"
     let ce := { ce with refusals := ce.refusals.filter (!· matches .foreignAttribute _) }
+    let permit ← IO.ofExcept <| ModuleUsage.keepPermit o.before.env (← IO.ofExcept <| ModuleUsage.ResolutionRecord.ofUsage usage)
     let replay ← try
-        let env ← replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}
+        let env ← replayCommandEntries permit (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}
         let full := view exts o.after.env
         let got := view exts env
         pure (if full == got then "replay matches" else s!"replay differs:\n    full     {full}\n    replayed {got}")

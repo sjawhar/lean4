@@ -17,11 +17,12 @@ def runLean (dir : System.FilePath) (args : Array String) : IO String := do
 def twoProcSource : String := "import Lean
 /-! `lean --run TwoProc.lean DIR M.lean M.olean TARGET...`: a reuse run in a process of its own, after `lean -o M.olean
 M.lean` ran the full build in another. It processes `M.lean`'s header (DIR on the search path, initializers run, so
-every imported `initialize` starts afresh as in a new build), then takes each command in order: a command whose payload
-in `M.olean` has no refusals and whose index is not a TARGET is kept (`CommandEntries.Testing.keep`, its constants the
-`M.olean` constants its records name); any other command is elaborated, as a reuse run elaborates a refused or edited
-command. For each TARGET it prints the constants the command added whose type or value differs from `M.olean`'s (or
-that `M.olean` lacks), and the messages of every elaborated command. -/
+every imported `initialize` starts afresh as in a new build), takes a keep permit from the resolutions `M.usage`
+records, then takes each command in order: a command whose payload in `M.olean` has no refusals and whose index is not a
+TARGET is kept (`CommandEntries.Testing.keep`, its constants the `M.olean` constants its records name); any other
+command is elaborated, as a reuse run elaborates a refused or edited command. For each TARGET it prints the constants
+the command added whose type or value differs from `M.olean`'s (or that `M.olean` lacks), and the messages of every
+elaborated command. -/
 open Lean Elab Command
 
 partial def recordNames : AddedConst → Array Name
@@ -53,6 +54,8 @@ unsafe def main (args : List String) : IO UInt32 := do
   let inputCtx := Parser.mkInputContext src file
   let (header, parserState, messages) ← Parser.parseHeader inputCtx
   let (env, messages) ← processHeader header {} messages inputCtx
+  let usage := (System.FilePath.mk olean).withExtension \"usage\"
+  let permit ← IO.ofExcept <| ModuleUsage.keepPermit env (← ModuleUsage.ResolutionRecord.read usage)
   let mut st := Command.mkState env messages {}
   st := { st with scopes := st.scopes.map fun sc => { sc with opts := Elab.async.set sc.opts false } }
   let mut ps := parserState
@@ -69,7 +72,7 @@ unsafe def main (args : List String) : IO UInt32 := do
       if ce.refusals.isEmpty && !targets.contains i then
         let infos := (ce.added.flatMap recordNames).foldl (init := {}) fun (m : NameMap ConstantInfo) n =>
           match full.find? n with | some c => m.insert n c | none => m
-        let env ← CommandEntries.Testing.keep st.env ce infos {}
+        let env ← CommandEntries.Testing.keep permit st.env ce infos {}
         st := { st with env }
         IO.println s!\"command {i}: kept\"
       else

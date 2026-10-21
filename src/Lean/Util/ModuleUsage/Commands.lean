@@ -155,7 +155,10 @@ instance : FromJson CommandCachesRecord := ⟨fun j => return {
   structRes := (← j.getObjValAs? (Array (JName × Array JName)) "structRes").map
     fun (s, o) => (s.name, o.map (·.name)) }⟩
 
-/-- One top-level command's record in `.usage` (`commands`). -/
+/-- One top-level command's record in `.usage` (`commands`). It lists the constants the command used and no name
+resolution of its own, while a command can depend on the module the resolver picks for a name that occurs in none of
+its terms (the reducibility of a constant a tactic unfolds): a command may be kept only in a build where every name
+resolution the module recorded holds (`keepPermit`, the check Lake's `UsageSidecar.resolvedUnchanged` makes). -/
 structure CommandRecord where
   i : Nat
   key : CommandKey
