@@ -130,7 +130,10 @@ structure ModuleData where
   is free; see `ConstTrie`.
   -/
   constTrie       : ConstTrie ConstantInfo := default
-  /-- Prefix tree over `extraConstNames`, set by `saveModuleData(Parts)`. -/
+  /--
+  Prefix tree over `extraConstNames`, set by `saveModuleData(Parts)`; empty in the `.olean` parts of
+  a `module`, whose importers build it when they lack the module's IR parts (see `writeModule`).
+  -/
   extraConstTrie  : ConstTrie Unit := default
   deriving Inhabited
 
@@ -1509,7 +1512,6 @@ def dropImportedLookupCaches (env : Environment) : BaseIO Unit := do
   for kenv in [env.checked.get, env.base.private, env.base.public] do
     kenv.constants.map₁.dropCache
     kenv.allImportedConsts.dropCache
-    kenv.importedExtraConsts.dropCache
 
 def getModuleIdx? (env : Environment) (moduleName : Name) : Option ModuleIdx :=
   env.header.moduleName2Idx[moduleName]?
@@ -2239,25 +2241,28 @@ unsafe def registerPersistentEnvExtensionUnsafe {α β σ : Type} [Inhabited σ]
 opaque registerPersistentEnvExtension {α β σ : Type} [Inhabited σ] (descr : PersistentEnvExtensionDescr α β σ) : IO (PersistentEnvExtension α β σ)
 
 /--
-Fills the `ModuleData` prefix tree fields from the corresponding arrays. Done centrally just before
-saving so that no `ModuleData` producer can leave them inconsistent.
+Fills the `ModuleData` prefix tree fields from the corresponding arrays, the one over the extra
+constants only if `extraTrie`. Done centrally just before saving so that no `ModuleData` producer
+can leave them inconsistent.
 -/
-private def ModuleData.setupTries (data : ModuleData) : ModuleData :=
+private def ModuleData.setupTries (data : ModuleData) (extraTrie : Bool) : ModuleData :=
   { data with
     constTrie      := .ofArrays data.constNames data.constants
-    extraConstTrie := .ofNames data.extraConstNames }
+    extraConstTrie := if extraTrie then .ofNames data.extraConstNames else default }
 
 /--
 Stores each given module data in the respective file name. Objects shared with prior parts are not
 duplicated. Thus the data cannot be loaded with individual `readModuleData` calls but must loaded by
 passing (a prefix of) the file names to `readModuleDataParts`. `mod` is used to determine an
-arbitrary but deterministic base address for `mmap`.
+arbitrary but deterministic base address for `mmap`. Unless `extraTries`, the parts carry no prefix
+tree over their extra constants.
 -/
-def saveModuleDataParts (mod : Name) (parts : Array (System.FilePath × ModuleData)) : IO Unit := do
+def saveModuleDataParts (mod : Name) (parts : Array (System.FilePath × ModuleData))
+    (extraTries := true) : IO Unit := do
   /- The tries must be added to all parts before the first save: the chained compactor tracks
      already-compacted objects by address, so objects reachable from earlier parts must stay alive
      until the last save lest reused addresses alias stale compactor entries. -/
-  let parts := parts.map fun (fname, data) => (fname, data.setupTries)
+  let parts := parts.map fun (fname, data) => (fname, data.setupTries extraTries)
   let mut cs : Option Compactor := none
   for h : i in [:parts.size] do
     let (fname, data) := parts[i]
@@ -2278,7 +2283,7 @@ def readModuleDataParts (fnames : Array System.FilePath) :
   return result
 
 def saveModuleData (fname : System.FilePath) (mod : Name) (data : ModuleData) : IO Unit := do
-  let _ ← unsafe CompactedRegion.save fname mod data.setupTries #[] none
+  let _ ← unsafe CompactedRegion.save fname mod (data.setupTries (extraTrie := true)) #[] none
 
 def readModuleData (fname : @& System.FilePath) : IO (ModuleData × CompactedRegion) :=
   unsafe CompactedRegion.read fname #[]
@@ -2386,7 +2391,11 @@ def writeModule (env : Environment) (fname : System.FilePath) (writeIR := true) 
     let extEntries ← computeExtEntries env
     let mkPart (level : OLeanLevel) :=
       return (level.adjustFileName fname, (← mkModuleData env level extEntries))
-    saveModuleDataParts env.mainModule #[
+    -- Importers take the extra constants of a `module` from its IR parts; one that lacks them
+    -- builds the prefix tree from the part's `extraConstNames` (see `ImportedModule.irData?`). A
+    -- stored tree would lie between a part's constant tree and its root object, which every import
+    -- reads, and so cost a page fault per imported module.
+    saveModuleDataParts env.mainModule (extraTries := false) #[
       (← mkPart .exported),
       (← mkPart .server),
       (← mkPart .private)]
@@ -2550,7 +2559,10 @@ The module data that should be used for accessing IR for interpretation (lean) o
 (leanir; loadIRSig = true). -/
 private def ImportedModule.irData? (self : ImportedModule) (loadIRSig : Bool := false) : Option ModuleData :=
   if self.irParts.isEmpty || !self.mainModule?.any (·.isModule) then
-    self.mainModule?
+    -- the `.olean` parts of a `module` carry no prefix tree over their extra constants (see
+    -- `writeModule`)
+    self.mainModule?.map fun data =>
+      if data.isModule then { data with extraConstTrie := .ofNames data.extraConstNames } else data
   else
     -- leanir: for `import all` modules, use `.ir`; otherwise prefer `.ir.sig`
     if !loadIRSig || self.importAll then
@@ -2932,7 +2944,8 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
     if leakEnv then pure t else ImportedConsts.withCache t
   let privImported ← withCache <|
     ImportedConsts.mergeModuleTreesLazy privTrees (resolveImportedEntry privFind?)
-  let importedExtraConsts ← withCache <|
+  -- no cache of its own: `getModuleIdxFor?` memoizes its lookups in the constants view's cache
+  let importedExtraConsts :=
     ImportedConsts.mergeModuleTreesLazy <| irData.mapIdx fun modIdx data => (modIdx, data.extraConstTrie)
   let mut publicTrees := #[]
   if isModule then
