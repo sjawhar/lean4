@@ -509,6 +509,13 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_o
         ) {
             return io_result_mk_error((sstream() << "failed to read file '" << olean_fn << "', incompatible header").str());
         }
+        size_t version_len = strnlen(header.lean_version, sizeof(header.lean_version));
+        if (version_len < olean_format_tag_len
+            || memcmp(header.lean_version + version_len - olean_format_tag_len, olean_format_tag, olean_format_tag_len) != 0) {
+            return io_result_mk_error((sstream() << "failed to read file '" << olean_fn << "', it was written by Lean "
+                << std::string(header.lean_version, version_len)
+                << " without per-module constant prefix trees; rebuild it with this version").str());
+        }
         char * base_addr = reinterpret_cast<char *>(header.base_addr);
 
         char * buffer = nullptr;

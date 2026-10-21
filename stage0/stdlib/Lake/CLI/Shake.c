@@ -144,7 +144,7 @@ lean_object* l_String_Slice_Pattern_ForwardSliceSearcher_buildTable(lean_object*
 uint8_t l_Lean_isExtraRevModUse(lean_object*, lean_object*);
 lean_object* lean_nat_to_int(lean_object*);
 lean_object* l_Std_HashMap_instInhabited___redArg();
-lean_object* lean_thunk_get_own(lean_object*);
+lean_object* lean_imported_consts_force_shared(lean_object*);
 lean_object* l_instOrdBool___lam__0___boxed(lean_object*, lean_object*);
 lean_object* lean_string_length(lean_object*);
 lean_object* l_String_compare___boxed(lean_object*, lean_object*);
@@ -5611,7 +5611,7 @@ lean_inc_ref(v_entry_1756_);
 v_expanded_1757_ = lean_ctor_get(v_t_1729_, 2);
 lean_inc_ref(v_expanded_1757_);
 lean_dec_ref_known(v_t_1729_, 3);
-v___x_1778_ = lean_thunk_get_own(v_entry_1756_);
+v___x_1778_ = lean_imported_consts_force_shared(v_entry_1756_);
 lean_dec_ref(v_entry_1756_);
 if (lean_obj_tag(v___x_1778_) == 1)
 {
@@ -5657,7 +5657,7 @@ goto v___jp_1758_;
 v___jp_1758_:
 {
 lean_object* v___x_1761_; lean_object* v_fst_1762_; lean_object* v___x_1764_; uint8_t v_isShared_1765_; uint8_t v_isSharedCheck_1776_; 
-v___x_1761_ = lean_thunk_get_own(v_expanded_1757_);
+v___x_1761_ = lean_imported_consts_force_shared(v_expanded_1757_);
 lean_dec_ref(v_expanded_1757_);
 v_fst_1762_ = lean_ctor_get(v___x_1761_, 0);
 v_isSharedCheck_1776_ = !lean_is_exclusive(v___x_1761_);

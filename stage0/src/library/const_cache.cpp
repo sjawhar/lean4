@@ -5,6 +5,7 @@ Author: Sebastian Ullrich
 */
 #include <atomic>
 #include <lean/lean.h>
+#include "runtime/alloc.h"
 
 namespace lean {
 /*
@@ -38,13 +39,37 @@ table can share them) and publishes the new table via an atomic pointer; old tab
 the cache is freed as concurrent readers may still probe them, with total overhead below the final
 table's size thanks to geometric growth. Insertions racing with a swap go to the old table and are
 merely lost.
+
+An entry of the constants view also memoizes `findModIdxCached?`'s result for its key: the index of
+the first module having the name as a constant or as an extra constant, which needs a walk of the
+extra constants view too. The first such lookup computes it and publishes it with the extra
+constants view it was computed for; the entry's other fields stay immutable. A repeated lookup thus
+costs one probe, as a constant lookup does.
+
+Heartbeats count a thread's allocations, and heartbeat limits (`maxHeartbeats`) are deterministic
+only if a computation's heartbeats depend on that computation alone. Whether a lookup hits depends
+on what other threads looked up before, and a lazily merged node of a view (`ImportedConsts.lazy`)
+is computed by whichever thread needs it first. So a lookup costs no heartbeats, hit or miss: a miss
+restores the thread's heartbeat count after computing its result, and marks the result persistent
+even when the cache does not keep it, so that the caller gets a shared value either way and
+allocates the same afterwards; lazy nodes are forced through `lean_imported_consts_force_shared`,
+which does not count their computation either.
 */
 
 extern "C" void lean_mark_persistent_unshared(lean_object * o);
 extern "C" lean_object * lean_imported_consts_find_entry_core(lean_obj_arg root, lean_obj_arg n);
-extern "C" lean_object * lean_imported_extra_consts_find_entry_core(lean_obj_arg root, lean_obj_arg n);
+extern "C" lean_object * lean_imported_consts_mod_idx_core(lean_obj_arg entry, lean_obj_arg extras,
+    lean_obj_arg n);
 
 namespace {
+/* `findModIdxCached?`'s result for an entry's key. */
+struct mod_memo {
+    // the extra constants view the result was computed with
+    lean_object * m_extras;
+    // the persistent `Option Nat` result
+    lean_object * m_val;
+};
+
 struct entry {
     // `entry_hash(m_root, m_key)`; migration must not touch keys, which may point into regions
     // freed since by `Environment.freeRegions`
@@ -53,6 +78,8 @@ struct entry {
     lean_object * m_key;
     // the cached `Option` result object
     lean_object * m_val;
+    // set once by the first `findModIdxCached?` of the key
+    std::atomic<mod_memo *> m_mod;
     // next entry inserted into the same cache, for freeing
     entry * m_next;
 };
@@ -133,6 +160,7 @@ void cache_finalize(void * p) {
     entry * e = c->m_entries.load(std::memory_order_acquire);
     while (e) {
         entry * next = e->m_next;
+        delete e->m_mod.load(std::memory_order_acquire);
         delete e;
         e = next;
     }
@@ -157,11 +185,14 @@ lean_external_class * get_cache_class() {
 }
 }
 
-/* Specialized per `owned` and inlined into `find_cached`: a shared out-of-line copy measurably slows
-   down the hot path. */
+/* Looks `n` up in the view `root` through the cache `c`, computing a miss with `core`: returns the
+   entry, with a reference for the caller, and sets `*e_out` to the cache entry holding it, or to null
+   if the cache does not keep it. Specialized per `owned` and inlined into `find_cached`: a shared
+   out-of-line copy measurably slows down the hot path. */
 template <bool owned>
 static inline __attribute__((always_inline)) lean_obj_res find_cached_in(cache & c,
-        b_lean_obj_arg root, b_lean_obj_arg n, lean_object * (*core)(lean_obj_arg, lean_obj_arg)) {
+        b_lean_obj_arg root, b_lean_obj_arg n, lean_object * (*core)(lean_obj_arg, lean_obj_arg),
+        entry ** e_out) {
     table * t = c.m_table.load(std::memory_order_acquire);
     uint64_t h = entry_hash(root, n);
     size_t slot = static_cast<size_t>(h) & (t->m_num_slots - 1);
@@ -177,23 +208,30 @@ static inline __attribute__((always_inline)) lean_obj_res find_cached_in(cache &
         if (e->m_root == root && lean_name_eq(e->m_key, n)) {
             // the value is pinned by the entry and persistent or multi-threaded
             lean_inc(e->m_val);
+            *e_out = e;
             return e->m_val;
         }
     }
+    // not counted, see above
+    uint64_t heartbeats = get_num_heartbeats();
     lean_inc(root); lean_inc(n);
     lean_object * r = core(root, n);
-    if (empty == t->m_num_slots)
-        return r;
     // The value is handed to and `inc`ed by arbitrary reader threads; marking it persistent keeps
     // hits free of atomic RC and of coherence traffic on hot values. The unshared variant only
     // writes thread-owned counts, so it is race-free where plain `lean_mark_persistent` is not.
+    // A value the cache does not keep, as its window is full or an insertion race is lost, is
+    // marked too so that a miss returns what a hit would, and is leaked.
     lean_mark_persistent_unshared(r);
+    set_heartbeats(heartbeats);
+    *e_out = nullptr;
+    if (empty == t->m_num_slots)
+        return r;
     // Pin the key, and the root unless it owns the cache; hits only compare them, so they need no
     // special marking.
     if (!owned)
         lean_inc(root);
     lean_inc(n);
-    entry * ne = new entry{h, root, n, r, nullptr};
+    entry * ne = new entry{h, root, n, r, nullptr, nullptr};
     entry * expected = nullptr;
     if (!t->m_slots[empty].compare_exchange_strong(expected, ne, std::memory_order_release,
             std::memory_order_relaxed)) {
@@ -212,6 +250,7 @@ static inline __attribute__((always_inline)) lean_obj_res find_cached_in(cache &
                     std::memory_order_relaxed));
     }
     lean_inc(r);
+    *e_out = ne;
     if (2 * (t->m_num_entries.fetch_add(1, std::memory_order_relaxed) + 1) >= t->m_num_slots)
         grow(c, t);
     return r;
@@ -222,24 +261,92 @@ static lean_object * cache_field(b_lean_obj_arg root) {
     return __atomic_load_n(lean_ctor_obj_cptr(root), __ATOMIC_RELAXED);
 }
 
-static lean_obj_res find_cached(b_lean_obj_arg root, b_lean_obj_arg n,
-        lean_object * (*core)(lean_obj_arg, lean_obj_arg)) {
+/* The cache of a `cached` root, or null if `root` has none (or `dropCache` emptied it). */
+static cache * own_cache(b_lean_obj_arg root) {
     if (lean_ptr_tag(root) == cached_tag) {
         lean_object * opt = cache_field(root);
-        if (!lean_is_scalar(opt)) {
-            cache * c = static_cast<cache *>(lean_get_external_data(lean_ctor_get(opt, 0)));
-            return find_cached_in<true>(*c, root, n, core);
-        }
+        if (!lean_is_scalar(opt))
+            return static_cast<cache *>(lean_get_external_data(lean_ctor_get(opt, 0)));
     }
-    return find_cached_in<false>(g_global_cache, root, n, core);
+    return nullptr;
+}
+
+static bool has_own_cache(b_lean_obj_arg root) {
+    return own_cache(root) != nullptr;
+}
+
+static lean_obj_res find_cached(b_lean_obj_arg root, b_lean_obj_arg n,
+        lean_object * (*core)(lean_obj_arg, lean_obj_arg), entry ** e_out) {
+    if (cache * c = own_cache(root))
+        return find_cached_in<true>(*c, root, n, core, e_out);
+    return find_cached_in<false>(g_global_cache, root, n, core, e_out);
 }
 
 extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_find_entry_cached(b_lean_obj_arg root, b_lean_obj_arg n) {
-    return find_cached(root, n, lean_imported_consts_find_entry_core);
+    entry * e;
+    return find_cached(root, n, lean_imported_consts_find_entry_core, &e);
 }
 
+extern "C" lean_object * lean_imported_extra_consts_find_entry_core(lean_obj_arg root, lean_obj_arg n);
+
 extern "C" LEAN_EXPORT lean_obj_res lean_imported_extra_consts_find_entry_cached(b_lean_obj_arg root, b_lean_obj_arg n) {
-    return find_cached(root, n, lean_imported_extra_consts_find_entry_core);
+    entry * e;
+    return find_cached(root, n, lean_imported_extra_consts_find_entry_core, &e);
+}
+
+/* ImportedConsts.findModIdxCached? (consts : @& ImportedConsts ConstantInfo)
+     (extras : @& ImportedConsts Unit) (n : @& Name) : Option Nat */
+extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_find_mod_idx_cached(b_lean_obj_arg consts,
+        b_lean_obj_arg extras, b_lean_obj_arg n) {
+    entry * e;
+    lean_object * val = find_cached(consts, n, lean_imported_consts_find_entry_core, &e);
+    if (e) {
+        mod_memo * m = e->m_mod.load(std::memory_order_acquire);
+        if (m && m->m_extras == extras) {
+            lean_dec(val);
+            // pinned by the memo and persistent
+            lean_inc(m->m_val);
+            return m->m_val;
+        }
+    }
+    // not counted, see above
+    uint64_t heartbeats = get_num_heartbeats();
+    lean_inc(extras); lean_inc(n);
+    lean_object * r = lean_imported_consts_mod_idx_core(val, extras, n);
+    // marked and leaked like an entry's value, also when not memoized
+    lean_mark_persistent_unshared(r);
+    if (e && !e->m_mod.load(std::memory_order_relaxed)) {
+        // Like the roots of its entries, the global cache pins the extra constants view, so that
+        // its address cannot be reused by another view; a view's own cache is freed with the
+        // environment that holds both views.
+        bool pin = !has_own_cache(consts);
+        if (pin)
+            lean_inc(extras);
+        mod_memo * nm = new mod_memo{extras, r};
+        mod_memo * expected = nullptr;
+        // a concurrent lookup may have memoized the same result already
+        if (!e->m_mod.compare_exchange_strong(expected, nm, std::memory_order_release,
+                std::memory_order_relaxed)) {
+            if (pin)
+                lean_dec(extras);
+            delete nm;
+        }
+    }
+    set_heartbeats(heartbeats);
+    return r;
+}
+
+/* ImportedConsts.forceShared (t : @& Thunk α) : α */
+extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_force_shared(b_lean_obj_arg t) {
+    lean_object * r = lean_to_thunk(t)->m_value;
+    if (!r) {
+        // not counted, see above
+        uint64_t heartbeats = get_num_heartbeats();
+        r = lean_thunk_get_core(t);
+        set_heartbeats(heartbeats);
+    }
+    lean_inc(r);
+    return r;
 }
 
 /* LookupCache.new : BaseIO LookupCache */

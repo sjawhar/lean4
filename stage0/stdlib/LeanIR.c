@@ -134,7 +134,7 @@ uint8_t l_Lean_MessageLog_hasErrors(lean_object*);
 lean_object* l_System_FilePath_addExtension(lean_object*, lean_object*);
 lean_object* l_Lean_Environment_mainModule(lean_object*);
 lean_object* l_Lean_Name_append(lean_object*, lean_object*);
-lean_object* l_Lean_saveModuleDataParts(lean_object*, lean_object*);
+lean_object* l_Lean_saveModuleDataParts(lean_object*, lean_object*, uint8_t);
 lean_object* lean_io_prim_handle_mk(lean_object*, uint8_t);
 lean_object* l_Lean_Core_getMaxHeartbeats(lean_object*);
 uint16_t l_Lean_OptionFlags_ofOptions(lean_object*);
@@ -11218,7 +11218,7 @@ v___x_3076_ = lean_unsigned_to_nat(2u);
 v___x_3077_ = lean_mk_empty_array_with_capacity(v___x_3076_);
 v___x_3078_ = lean_array_push(v___x_3077_, v___x_3073_);
 v___x_3079_ = lean_array_push(v___x_3078_, v___x_3075_);
-v___x_3080_ = l_Lean_saveModuleDataParts(v___x_3071_, v___x_3079_);
+v___x_3080_ = l_Lean_saveModuleDataParts(v___x_3071_, v___x_3079_, v___x_3023_);
 lean_dec(v___x_3071_);
 if (lean_obj_tag(v___x_3080_) == 0)
 {
