@@ -12,7 +12,6 @@ public import Lean.Compiler.Specialize
 public import Lean.Compiler.LCNF.Types
 import Init.Omega
 import Lean.Runtime
-public import Lean.Util.UsedByChecks  -- public: `findExtEntry?` is inlined at its callers
 
 public section
 
@@ -1253,7 +1252,7 @@ with avoiding unnecessary task blocks.
 @[inline] def findExtEntry? [Inhabited σ] (env : Environment) (ext : PersistentEnvExtension α β σ) (declName : Name)
     (findAtSorted? : Array α → Name → Option α')
     (findInState? : σ → Name → Option α') : Option α' :=
-  noteResolved declName <| (env.getModuleIdxFor? declName).bind (fun modIdx =>
+  (env.getModuleIdxFor? declName).bind (fun modIdx =>
     -- non-meta defs with leanir
     findAtSorted? (ext.getModuleIREntries env modIdx) declName <|>
     -- meta defs with leanir and all defs without leanir
