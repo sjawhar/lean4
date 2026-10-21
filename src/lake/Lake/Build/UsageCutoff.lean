@@ -402,12 +402,14 @@ between toolchains. It relies on one property, which every such resolver has: fo
 among a name's providers (each a module with a kind, kernel constant or compiled name) by a fixed priority of the
 provider alone, here import order (pinned by `closureHash`) and kind, dropping a non-winner cannot change the winner.
 The resolvers: first provider in import order, kernel constants of a module before its compiled names (this
-branch's `src/Lean/Environment.lean:999-1001`, filled by `finalizeImport`'s `insertIfNew` at :2702-2717); compiled
-names first for code-generator-shaped names, then import order (`isCodegenName` and `getModuleIdxFor?` in
-434ce3c398:src/Lean/Environment.lean:317-335); and the lowest module index among kernel and compiled providers
-(`getModuleIdxFor?` in 4693098fec:src/Lean/Environment.lean:317-322). A gained provider, a lost
-winner or a winner that changed kinds fails the check. A module-system module's provides are pinned by `modsysHash`,
-a toolchain module's by the Lean githash.
+branch's `getModuleIdxFor?`, whose `const2ModIdx` `finalizeImport` fills first provider first); compiled names first
+for code-generator-shaped names, then import order (`isCodegenName` and `getModuleIdxFor?` at 434ce3c398); and the
+lowest module index among kernel and compiled providers (`getModuleIdxFor?` at 4693098fec). A gained provider, a lost
+winner or a winner that changed kinds fails the check. A non-winner may still provide a name as a kernel constant
+alone if the compile depended on its copy (`used` lists the name under it, as `moduleUsed` lists each kernel
+declarer, and `usageUpToDate` checks that copy's digest): the module provided the name then as a kernel constant,
+possibly also as a compiled name, and keeping or dropping a non-winner's provider cannot change the winner. A
+module-system module's provides are pinned by `modsysHash`, a toolchain module's by the Lean githash.
 -/
 def UsageSidecar.resolvedUnchanged (usage : UsageSidecar) (hashes : ContentHashes)
     (importArts : NameMap ImportArtifacts) : JobM Bool := do
@@ -419,10 +421,15 @@ def UsageSidecar.resolvedUnchanged (usage : UsageSidecar) (hashes : ContentHashe
     if imp.providesDigest == recorded then continue
     if usage.resolvedAll then return false
     let (kernel, extra) := imp.provides
+    let declared := (usage.used.binSearch (m, #[]) (Name.quickLt ·.1 ·.1)).elim #[] (·.2)
     for (m?, ns) in usage.resolved do
       let winner := m? == some m
       for (n, k) in ns do
-        unless ModuleUsage.kindsIn kernel extra n == (if winner then k else 0) do return false
+        let now := ModuleUsage.kindsIn kernel extra n
+        if now == (if winner then k else 0) then continue
+        unless !winner && now == ModuleUsage.kernelKind &&
+            (declared.binSearch (n, default) (Name.quickLt ·.1 ·.1)).isSome do
+          return false
   return true
 
 /--
