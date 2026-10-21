@@ -45,8 +45,9 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let payloads := CommandEntries.ofModuleData md
   let some ce₀ := payloads.find? (·.idx == 0) | throw <| IO.userError "no payload 0"
   let some ce₁ := payloads.find? (·.idx == 1) | throw <| IO.userError "no payload 1"
+  let permit ← IO.ofExcept <| ModuleUsage.keepPermit o₀.before.env (← ModuleUsage.ResolutionRecord.read (dir / "M.usage"))
   try
-    let env ← replayCommandEntries (← CommandEntries.Testing.rollbackTo o₀.before.env o₀.after.env) ce₀ {}
+    let env ← replayCommandEntries permit (← CommandEntries.Testing.rollbackTo o₀.before.env o₀.after.env) ce₀ {}
     IO.println s!"command 0 (@[pre_tag] def d): replayed: state has d.later {(state env).contains `d.later} \
       (full run: {(state o₀.after.env).contains `d.later})"
   catch e =>

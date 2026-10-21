@@ -592,9 +592,27 @@ private def replayStates (regs : Registries) (env : Environment) (parts : Array 
       env := cache.replayIn env view es
   return env
 
+/-- Evidence that a module's commands may be kept into an environment that imports `imports`: every name resolution
+the module's compile recorded holds there (`ModuleUsage.keepPermit`, its only maker). A command's records list the
+constants it used, but no name resolution of its own, and a command can depend on the module the resolver picks for a
+name that occurs in none of its terms (the reducibility of a constant its tactic unfolds, a compiled name): so a
+command is kept only into an environment where all of the module's recorded resolutions hold, and
+`readdCommandConstants` and `replayCommandEntries` take a permit for its imports. -/
+structure KeepPermit where
+  private mk ::
+  /-- The imported modules (`EnvironmentHeader.moduleNames`) of the environment the resolutions were checked in. -/
+  imports : Array Name
+
+/-- Throws unless `permit` was checked in an environment with `env`'s imports. -/
+private def KeepPermit.check (permit : KeepPermit) (env : Environment) : IO Unit := do
+  unless permit.imports == env.header.moduleNames do
+    throw <| IO.userError "reuse: the keep permit was checked in an environment with other imports"
+
 /-- Plan §1.4 step 3: replays a command payload's change of both views into `env`, the environment after
-`readdCommandConstants`. Throws on a payload with refusals. -/
-def replayCommandEntries (env : Environment) (ce : CommandEntries) (opts : Options) : IO Environment := do
+`readdCommandConstants`. Throws on a payload with refusals, or a `permit` for other imports. -/
+def replayCommandEntries (permit : KeepPermit) (env : Environment) (ce : CommandEntries) (opts : Options) :
+    IO Environment := do
+  permit.check env
   unless ce.refusals.isEmpty do
     throw <| IO.userError s!"command {ce.idx} is not replayable ({ce.refusals}); it must be elaborated again"
   replayStates (← Registries.get) env #[(.checked, ce.checked), (.main, ce.main)] opts
@@ -734,15 +752,16 @@ asynchronously with their branches, or through their realizations, and each real
 rebuilt from its record at its position. `infos` are the command's constants (its declarations, auxiliaries and
 realized constants, from the previous `.olean`). The kernel checks every constant with `limits` (realized constants
 with none, as in a full run), and a rejection is a hard error carrying the kernel's message; so is a constant of
-`infos` the records do not re-add. Run `replayCommandEntries` (step 3) after.
+`infos` the records do not re-add, and a `permit` for other imports. Run `replayCommandEntries` (step 3) after.
 
 A `merged` record, and a `realization` record's `merges`, look up realizations that are cached already. An earlier
 command elaborated instead of kept may make them in its asynchronous branches, after this keep starts: each such lookup
 first waits for the kernel environment of the environment it is made in (`IO.wait env.checked`), to which those
 branches commit only after their realizations are cached.
 -/
-def readdCommandConstants (env : Environment) (ce : CommandEntries) (infos : NameMap ConstantInfo)
-    (opts : Options) (limits : ReaddLimits := {}) : IO Environment := do
+def readdCommandConstants (permit : KeepPermit) (env : Environment) (ce : CommandEntries)
+    (infos : NameMap ConstantInfo) (opts : Options) (limits : ReaddLimits := {}) : IO Environment := do
+  permit.check env
   let regs ← Registries.get
   let env ← ce.added.foldlM (readdAdded regs infos opts limits) env
   let kenv := env.toKernelEnv
@@ -771,9 +790,9 @@ def rollbackTo (source target : Environment) : IO Environment := do
   return target
 
 /-- Test support: plan §1.4 steps 1 and 3 for one command (`readdCommandConstants`, `replayCommandEntries`). -/
-def keep (env : Environment) (ce : CommandEntries) (infos : NameMap ConstantInfo) (opts : Options)
-    (limits : ReaddLimits := {}) : IO Environment := do
-  replayCommandEntries (← readdCommandConstants env ce infos opts limits) ce opts
+def keep (permit : KeepPermit) (env : Environment) (ce : CommandEntries) (infos : NameMap ConstantInfo)
+    (opts : Options) (limits : ReaddLimits := {}) : IO Environment := do
+  replayCommandEntries permit (← readdCommandConstants permit env ce infos opts limits) ce opts
 
 /-- Test support: `env` with fresh realization caches (the import context's and every local one's), as a new process
 would start: a keep onto it re-adds every realization instead of finding the full run's results. -/

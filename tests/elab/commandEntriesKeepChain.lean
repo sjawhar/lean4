@@ -154,6 +154,10 @@ def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
   unless out.exitCode = 0 do
     throw <| IO.userError s!"lean {args} failed ({out.exitCode}):\n{out.stdout}\n{out.stderr}"
 
+/-- A keep permit for `env`'s imports from the resolutions `M.usage` records (`ModuleUsage.keepPermit`). -/
+def permitFor (dir : System.FilePath) (env : Environment) : IO KeepPermit := do
+  IO.ofExcept <| ModuleUsage.keepPermit env (← ModuleUsage.ResolutionRecord.read (dir / "M.usage"))
+
 /-- Elaborates `src` as `lean -o --usage` does; its command observations and payloads. -/
 unsafe def elabModule (dir : System.FilePath) (src : String) :
     IO (Array ModuleUsage.CommandObservation × Array CommandEntries) := do
@@ -195,6 +199,7 @@ unsafe def runChain (dir : System.FilePath) (src : String) (tamper : CommandEntr
     (waits := true) : IO ChainResult := do
   let (obs, payloads) ← elabModule dir src
   let some o0 := obs[0]? | throw <| IO.userError "no commands"
+  let permit ← permitFor dir o0.before.env
   let scopedExts : NameSet := (← scopedEnvExtensionsRef.get).foldl (·.insert ·.ext.name) {}
   let memo : Memo := { path := dir / "entry.bin", hashes := ← IO.mkRef {} }
   let fresh := CommandEntries.Testing.freshRealizationCaches
@@ -213,7 +218,7 @@ unsafe def runChain (dir : System.FilePath) (src : String) (tamper : CommandEntr
       r := { r with refused := r.refused.push (o.i, ce.refusals.map toString) }
     else
       try
-        st ← applyPost { st with env := ← CommandEntries.Testing.keep st.env ce infos {} } o.before o.after
+        st ← applyPost { st with env := ← CommandEntries.Testing.keep permit st.env ce infos {} } o.before o.after
         r := { r with kept := r.kept + 1 }
       catch e =>
         r := { r with threw := r.threw.push o.i, lines := r.lines.push s!"  command {o.i}: keep threw: {e}" }
@@ -307,8 +312,9 @@ unsafe def corruptedKeep (dir : System.FilePath) (label src : String) (i : Nat) 
     | .thmInfo v => .thmInfo { v with value := mkConst ``True.intro }
     | .defnInfo v => .defnInfo { v with value := mkConst ``True.intro }
     | info => info
+  let permit ← permitFor dir o.before.env
   let r ← try
-      discard <| CommandEntries.Testing.keep (← CommandEntries.Testing.freshRealizationCaches o.before.env) ce
+      discard <| CommandEntries.Testing.keep permit (← CommandEntries.Testing.freshRealizationCaches o.before.env) ce
         (infos.insert n bad) {}
       pure "kept"
     catch e => pure s!"threw, with the kernel's message: {decide ((e.toString.splitOn "(kernel)").length > 1)}"

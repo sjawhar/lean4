@@ -38,8 +38,9 @@ unsafe def report (dir : System.FilePath) (label src : String) : IO Run := do
     let some ce := r.payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"
     let kind := (r.records[o.i]?.bind fun c => (c.getObjValAs? String "kind").toOption).getD "?"
     let markers := ce.refusals.filterMap fun | .commandState field => some field | _ => none
+    let permit ← IO.ofExcept <| ModuleUsage.keepPermit o.before.env (← IO.ofExcept <| ModuleUsage.ResolutionRecord.ofUsage r.usage)
     let replay ← try
-        discard <| replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}
+        discard <| replayCommandEntries permit (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}
         pure "replayed"
       catch _ => pure "refused"
     IO.println s!"{o.i} {kind}: command-state markers {markers}, {replay}"

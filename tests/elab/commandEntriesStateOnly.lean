@@ -37,12 +37,13 @@ def source (erased : Name) : String :=
 
 def unfolds (env : Environment) (n : Name) : Bool := (Meta.simpExtension.getState env).isDeclToUnfold n
 
-unsafe def replayed (obs : Array ModuleUsage.CommandObservation) (payloads : Array CommandEntries) (i : Nat)
-    (n : Name) : IO String := do
+unsafe def replayed (obs : Array ModuleUsage.CommandObservation) (payloads : Array CommandEntries) (usage : Json)
+    (i : Nat) (n : Name) : IO String := do
   let some o := obs.find? (·.i == i) | throw <| IO.userError s!"no observation {i}"
   let some ce := payloads.find? (·.idx == i) | throw <| IO.userError s!"no payload {i}"
+  let permit ← IO.ofExcept <| ModuleUsage.keepPermit o.before.env (← IO.ofExcept <| ModuleUsage.ResolutionRecord.ofUsage usage)
   try
-    let env ← replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}
+    let env ← replayCommandEntries permit (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}
     return s!"replayed: {n} unfolds {unfolds env n} (full run: {unfolds o.after.env n})"
   catch e =>
     return s!"refused: {e}"
@@ -62,10 +63,10 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   -- commands: 0 victim, 1 keep, 2 other, 3 attribute [-simp] victim, 4 … in theorem t1, 5 @[erase_probe] def d, 6 t2,
   -- 7 @[raw_erase] def d2
   let (obs, payloads, usage) ← elabM dir (source `victim)
-  IO.println s!"command 3 (attribute [-simp] victim): {← replayed obs payloads 3 `victim}"
-  IO.println s!"command 4 (attribute [-simp] keep in theorem t1): {← replayed obs payloads 4 `keep}"
-  IO.println s!"command 5 (@[erase_probe] def d): {← replayed obs payloads 5 `keep}"
-  IO.println s!"command 7 (@[raw_erase] def d2): {← replayed obs payloads 7 `other}"
+  IO.println s!"command 3 (attribute [-simp] victim): {← replayed obs payloads usage 3 `victim}"
+  IO.println s!"command 4 (attribute [-simp] keep in theorem t1): {← replayed obs payloads usage 4 `keep}"
+  IO.println s!"command 5 (@[erase_probe] def d): {← replayed obs payloads usage 5 `keep}"
+  IO.println s!"command 7 (@[raw_erase] def d2): {← replayed obs payloads usage 7 `other}"
   IO.println s!"noskip: {(usage.getObjValAs? Bool "noskip").toOption}, \
     reason: {(usage.getObjValAs? String "noskipReason").toOption}"
   IO.FS.createDirAll (dir / "v2")

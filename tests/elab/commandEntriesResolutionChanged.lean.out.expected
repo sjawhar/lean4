@@ -1,0 +1,6 @@
+Z claims nothing:
+command 0: kept
+command 1: kept
+Z claims `ru`:
+C elaborates afresh: false
+module refused: resolution changed: `ru` resolved to `U` (kinds 1) when the module was compiled, and resolves to `Z` (kinds 2) here

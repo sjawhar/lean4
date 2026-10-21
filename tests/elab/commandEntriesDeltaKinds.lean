@@ -128,8 +128,9 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
     let shown := CommandEntries.Testing.shownEntries ce watched.contains
     -- as when a kept command is replayed: its constants are present, every extension is in its before-state
     let base ← CommandEntries.Testing.rollbackTo o.before.env o.after.env
+    let permit ← IO.ofExcept <| ModuleUsage.keepPermit o.before.env (← ModuleUsage.ResolutionRecord.read (dir / "M.usage"))
     let replayed? : Option Environment ← try
-        pure (some (← replayCommandEntries base ce {}))
+        pure (some (← replayCommandEntries permit base ce {}))
       catch _ => pure none
     match replayed? with
     | none =>

@@ -80,13 +80,14 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
     observations.foldl (fun m obs => m.insert obs.i obs.after.env) {}
   let mut replayed ← CommandEntries.Testing.rollbackTo baseEnv expectedEnv
   replayed := replayed.setMainModule `M
+  let permit ← IO.ofExcept <| ModuleUsage.keepPermit baseEnv (← ModuleUsage.ResolutionRecord.read (dir / "M.usage"))
   let mut elaborated := #[]
   for entry in entries do
     if entry.refusals.isEmpty then
-      replayed ← replayCommandEntries replayed entry {}
+      replayed ← replayCommandEntries permit replayed entry {}
     else
       let refused ← try
-          discard <| replayCommandEntries replayed entry {}; pure false
+          discard <| replayCommandEntries permit replayed entry {}; pure false
         catch _ => pure true
       unless refused do
         throw <| IO.userError s!"refused payload {entry.idx} was replayed"

@@ -33,8 +33,9 @@ unsafe def check (dir : System.FilePath) (label src : String) (probes : List Nam
     let some ce := payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"
     let kind := (cmds[o.i]?.bind fun c => (c.getObjValAs? String "kind").toOption).getD "?"
     let simpRefused := (ce.refusals.filterMap (·.ext?)).contains Meta.simpExtension.ext.name
+    let permit ← IO.ofExcept <| ModuleUsage.keepPermit o.before.env (← IO.ofExcept <| ModuleUsage.ResolutionRecord.ofUsage usage)
     let replay ← try
-        let env ← replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}
+        let env ← replayCommandEntries permit (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}
         let full := simpView o.after.env probes
         let got := simpView env probes
         pure (if full == got then s!"replay matches: {full}" else s!"replay differs: full {full}, replayed {got}")

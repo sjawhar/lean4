@@ -82,8 +82,9 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let watched := [`logExt, `myParamExt, `scopeExt, `Lean.Meta.Simp.simprocDeclExt, `Lean.Compiler.LCNF.monoTypeExt]
   for o in obs do
     let some ce := payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"
+    let permit ← IO.ofExcept <| ModuleUsage.keepPermit o.before.env (← IO.ofExcept <| ModuleUsage.ResolutionRecord.ofUsage usage)
     let replay ← try
-        let env ← replayCommandEntries (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}
+        let env ← replayCommandEntries permit (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}
         pure (if view env == view o.after.env then s!"replay matches {view env}"
           else s!"replay differs: full {view o.after.env}, replayed {view env}")
       catch _ => pure "refused"
