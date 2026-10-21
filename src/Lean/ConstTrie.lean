@@ -405,6 +405,14 @@ public def findConstCached? (t : ImportedConsts ConstantInfo) (n : Name) : Optio
   | none        => none
 
 /--
+`findConstEntryCached?`, under the private name that the module index lookups move to; the stage0
+compiler needs its native implementation before code can call it.
+-/
+@[extern "lean_imported_consts_find_entry_cached"]
+opaque findEntryCached? (t : @& ImportedConsts ConstantInfo) (n : @& Name) :
+    Option (ConstantInfo × Nat)
+
+/--
 Like `findModIdxAux`, but only finds a first module before `bound`: nothing below a subtree of a
 single module at or after `bound` is visited.
 -/
@@ -456,6 +464,14 @@ single probe. Implemented in C++ (`src/library/const_cache.cpp`).
 -/
 @[extern "lean_imported_consts_find_mod_idx_cached"]
 public opaque findModIdxCached? (consts : @& ImportedConsts ConstantInfo)
+    (extras : @& ImportedConsts Unit) (n : @& Name) : Option Nat
+
+/--
+`findModIdxCached?`, under the private name that the module index lookups move to; the stage0
+compiler needs its native implementation before code can call it.
+-/
+@[extern "lean_imported_consts_find_mod_idx_cached"]
+opaque modIdxCached? (consts : @& ImportedConsts ConstantInfo)
     (extras : @& ImportedConsts Unit) (n : @& Name) : Option Nat
 
 /--
