@@ -404,26 +404,6 @@ public def findConstCached? (t : ImportedConsts ConstantInfo) (n : Name) : Optio
   | some (c, _) => some c
   | none        => none
 
-@[inherit_doc findConstEntryCached?, inline]
-public def findConstModIdxCached? (t : ImportedConsts ConstantInfo) (n : Name) : Option Nat :=
-  match t.findConstEntryCached? n with
-  | some (_, modIdx) => some modIdx
-  | none             => none
-
-@[export lean_imported_extra_consts_find_entry_core]
-def findExtraEntryCore (t : ImportedConsts Unit) (n : Name) : Option (Unit × Nat) :=
-  t.findEntry? n
-
-@[inherit_doc findConstEntryCached?, extern "lean_imported_extra_consts_find_entry_cached"]
-public opaque findExtraEntryCached? (t : @& ImportedConsts Unit) (n : @& Name) :
-    Option (Unit × Nat)
-
-@[inherit_doc findConstEntryCached?, inline]
-public def findExtraModIdxCached? (t : ImportedConsts Unit) (n : Name) : Option Nat :=
-  match t.findExtraEntryCached? n with
-  | some (_, modIdx) => some modIdx
-  | none             => none
-
 /--
 Like `findModIdxAux`, but only finds a first module before `bound`: nothing below a subtree of a
 single module at or after `bound` is visited.

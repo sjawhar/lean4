@@ -318,11 +318,7 @@ several imported modules declare, as a constant or as an auxiliary constant, bel
 of them in module order.
 -/
 def getModuleIdxFor? (env : Environment) (declName : Name) : Option ModuleIdx :=
-  match env.allImportedConsts.findConstModIdxCached? declName,
-      env.importedExtraConsts.findExtraModIdxCached? declName with
-  | some i, some j => some (Nat.min i j)
-  | some i, none   => some i
-  | none,   j?     => j?
+  env.allImportedConsts.findModIdxCached? env.importedExtraConsts declName
 
 @[export lean_environment_mark_quot_init]
 private def markQuotInit (env : Environment) : Environment :=
