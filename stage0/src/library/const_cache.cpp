@@ -287,13 +287,6 @@ extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_find_entry_cached(b_lea
     return find_cached(root, n, lean_imported_consts_find_entry_core, &e);
 }
 
-extern "C" lean_object * lean_imported_extra_consts_find_entry_core(lean_obj_arg root, lean_obj_arg n);
-
-extern "C" LEAN_EXPORT lean_obj_res lean_imported_extra_consts_find_entry_cached(b_lean_obj_arg root, b_lean_obj_arg n) {
-    entry * e;
-    return find_cached(root, n, lean_imported_extra_consts_find_entry_core, &e);
-}
-
 /* ImportedConsts.findModIdxCached? (consts : @& ImportedConsts ConstantInfo)
      (extras : @& ImportedConsts Unit) (n : @& Name) : Option Nat */
 extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_find_mod_idx_cached(b_lean_obj_arg consts,
