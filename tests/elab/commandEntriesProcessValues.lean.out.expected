@@ -1,0 +1,21 @@
+the process values recorded:
+E: values #[env:FOO]
+Pl: values #[]
+FOO=1 as when E was compiled:
+E: command 0: kept
+E: command 1: kept
+FOO=2:
+E: module refused: the process value env:FOO is not what it was when the module was compiled
+FOO unset:
+E: module refused: the process value env:FOO is not what it was when the module was compiled
+E compiled with FOO unset, then FOO=1:
+E: module refused: the process value env:FOO is not what it was when the module was compiled
+a file of the toolchain read:
+Tc: command 0: kept
+Tc: command 1: kept
+a path under the toolchain that resolves outside it, and a relative path:
+Es: noreuse reason: declaration command 0: an effect outside the command: it reads TOOLCHAIN/bin/../..
+Rel: noreuse reason: declaration command 0: an effect outside the command: it reads X.lean
+BAR read by an imported module's initializer, BAR=1 as when IV was compiled, then BAR=2:
+IV: command 0: kept
+IV: module refused: the process value env:BAR is not what it was when the module was compiled

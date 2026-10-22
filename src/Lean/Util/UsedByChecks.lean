@@ -8,6 +8,9 @@ public import Lean.Data.NameMap.Basic
 public import Lean.Declaration
 public import Init.System.IO
 import Lean.Util.FoldConsts
+import Lean.Util.Path
+import Init.Data.String.TakeDrop
+import Init.Data.ToString.Macro
 public section
 namespace Lean
 
@@ -220,10 +223,36 @@ on (`withCommandContext`), in that command's asynchronous work too. -/
 opaque getTaskContext : BaseIO UInt32
 
 @[extern "lean_io_set_effect_recording"]
-private opaque setEffectRecording (on : Bool) : BaseIO Unit
+private opaque setEffectRecording (on : Bool) (pinned : @& Array String) (root : @& String) : BaseIO Unit
 
 @[extern "lean_io_take_effects"]
 private opaque takeEffects : BaseIO (Array (UInt32 × String))
+
+/-- The process values read in any context since recording was switched on (`startFrontendRun`), sorted by key: each
+environment variable (`env:NAME`), the running executable's path (`appPath`), the working directory
+(`workingDirectory`), and the toolchain directories (`toolchain`) when a command read a file in them, which the runtime
+then does not note as an effect; each with the value first read (`none`: absent) and whether a later read saw another
+value. Takes them. -/
+@[extern "lean_io_take_value_reads"]
+opaque takeValueReads : BaseIO (Array (String × Option String × Bool))
+
+/-- The value of the process value `key` (`takeValueReads`) in this process now, `none` if absent or unreadable;
+throws for an unknown key. -/
+def currentValue? (key : String) : IO (Option String) := do
+  if let some name := key.dropPrefix? "env:" then return ← IO.getEnv name.copy
+  let read : Option (IO System.FilePath) := match key with
+    | "appPath" => some IO.appPath
+    | "workingDirectory" => some IO.currentDir
+    | "toolchain" => some getBuildDir
+    | _ => none
+  let some read := read | throw <| IO.userError s!"unknown process value {key}"
+  try return some (toString (← read)) catch _ => return none
+
+/-- The directories under the running Lean's root that the Lean githash pins (its executables, headers and library),
+whose files a command reads without an effect: the root is recorded as the value `toolchain` instead. -/
+def pinnedToolchainDirs : IO (String × Array String) := do
+  let root ← getBuildDir
+  return (toString root, #[toString (root / "bin"), toString (root / "include"), toString (← getLibDir root)])
 
 /-- The actions that clear the per-run logs of other modules (`registerRunLog`). -/
 private builtin_initialize runLogClearsRef : IO.Ref (Array (BaseIO Unit)) ← mkAccountedRef #[]
@@ -237,21 +266,24 @@ def registerRunLog (clear : BaseIO Unit) : IO Unit := do
 
 /--
 Starts a `runFrontend` run and returns its number, which no earlier run got. With `record`, switches recording on
-(`enableUsageRecording`) with the runtime's effect notes (`effectsByCommand`), and clears the per-run logs: the names
-`addDecl` and `recordUsedName` recorded, the per-command logs, the effect notes, and the logs other modules registered
-(`registerRunLog`). The names the resolver looked up (`resolvedNames`) are kept for the whole process. The logs are
+(`enableUsageRecording`) with the runtime's effect notes and value reads (`effectsByCommand`, `takeValueReads`;
+`pinnedToolchainDirs`), and clears the per-run logs: the names `addDecl` and `recordUsedName` recorded, the per-command
+logs, the effect notes, the value reads, and the logs other modules registered (`registerRunLog`). The names the
+resolver looked up (`resolvedNames`) are kept for the whole process. The logs are
 global, so a frontend that runs in-process during a run (an `#eval` calling `runFrontend`) clears or extends them; the
 run detects it by `lastFrontendRun` at its end.
 -/
 def startFrontendRun (record : Bool) : BaseIO Nat := do
   let run ← frontendRunsRef.modifyGet fun n => (n + 1, n + 1)
   if record then
+    -- before recording starts: reading the executable's path here is no read of the run's
+    let (root, pinned) ← (pinnedToolchainDirs.toBaseIO : BaseIO _) <&> (·.toOption.getD ("", #[]))
     enableUsageRecording
     usedByChecksRef.set {}
     declsByCommandRef.set []
     usedByCommandRef.set []
     foreignAttributesByCommandRef.set []
-    setEffectRecording true
+    setEffectRecording true pinned root
     for clear in ← runLogClearsRef.get do clear
   return run
 
@@ -293,10 +325,9 @@ def recordForeignAttribute (attr : Name) : BaseIO Unit := do
 /-- The effects on state outside a command that the runtime noted for each command since the run started (none
 outside any command): a write to a reference another command, or code outside any command, created; the resolution of
 a promise, or the cancellation of a task, another command created; each use of process-wide state through the
-runtime's primitives (a file or directory the command did not create, a file handle it did not open, among them the
-standard streams, a file it created and left in place, the process environment, the working directory, the running
-executable's path, a child process, the runtime's settings). No payload carries them. Takes
-them: a second call returns only those since. -/
+runtime's primitives (a file or directory the command did not create, outside the toolchain's; a file handle it did
+not open, among them the standard streams; a file it created and left in place; a child process; the runtime's
+settings). No payload carries them. Takes them: a second call returns only those since. -/
 def effectsByCommand : BaseIO (Array (Nat × String)) := do
   return (← takeEffects).map fun (c, what) => (c.toNat - 1, what)
 

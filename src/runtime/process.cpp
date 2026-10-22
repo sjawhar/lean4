@@ -65,10 +65,9 @@ lean_object * wrap_win_handle(HANDLE h) {
 }
 
 extern "C" LEAN_EXPORT obj_res lean_io_process_get_current_dir() {
-    if (uint32 ctx = effect_context())
-        note_effect(ctx, "reads the working directory");
     char path[MAX_PATH];
     DWORD sz = GetCurrentDirectory(MAX_PATH, path);
+    note_value_read("workingDirectory", sz != 0 ? std::string(path, sz).c_str() : nullptr);
     if (sz != 0) {
         return io_result_mk_ok(lean_mk_string_from_bytes(path, sz));
     } else {
@@ -322,10 +321,10 @@ void finalize_process() {}
 #else
 
 extern "C" LEAN_EXPORT obj_res lean_io_process_get_current_dir() {
-    if (uint32 ctx = effect_context())
-        note_effect(ctx, "reads the working directory");
     char path[PATH_MAX];
-    if (getcwd(path, PATH_MAX)) {
+    char * cwd = getcwd(path, PATH_MAX);
+    note_value_read("workingDirectory", cwd);
+    if (cwd) {
         return io_result_mk_ok(mk_string(path));
     } else {
         return io_result_mk_error(decode_io_error(errno, nullptr));

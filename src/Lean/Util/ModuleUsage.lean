@@ -760,6 +760,10 @@ def untrackedImports (env : Environment) : IO (Array (Name × Digest)) := do
     out := out.push (m, ← fileDigest olean)
   return out.qsort (Name.quickLt ·.1 ·.1)
 
+/-- The digest of a process value (`takeValueReads`) as `.usage` records it (`values`), `none` for an absent one. -/
+def valueDigest? (v? : Option String) : Option Digest :=
+  v?.map fun v => (({} : Enc).str v).finish
+
 /-- The format version of the `.usage` sidecar and of Lake's `.usekey`; Lake reads a sidecar of any other
 version as absent. -/
 def usageVersion : Nat := 12
@@ -784,10 +788,13 @@ this process and `used` may miss constants they used.
 The fields for keeping the module's commands one by one (`ModuleUsage.keepPermit`): `module`, the module's name; `olean`,
 the digest of the `.olean` written beside it (`oleanDigest`, `fileDigest`), which holds the command payloads;
 `githash`, the Lean that wrote both; `untracked`, the imports without digests outside the toolchain with their `.olean`
-digests (`untrackedImports`); `stmt`, `computeStmt`'s result; `commands`, the per-command records; `usedAttrs`, beside
-each kernel constant of a `used` entry, the attrs digest the defining module recorded for it (`importedConstDigests?`);
-and `noreuse`, set when no command may be kept (`noreuseReason?`, written as `noreuseReason`). `noreuse` decides nothing
-about skipping the module whole. -/
+digests (`untrackedImports`); `values`, each process value the run read (`takeValueReads`, taken before this
+function's own lookups, such as `untrackedImports`' of the toolchain's path) with the digest of its value
+(`valueDigest?`), which a keep requires unchanged; `stmt`, `computeStmt`'s result; `commands`, the
+per-command records; `usedAttrs`, beside each kernel constant of a `used` entry, the attrs digest the defining module
+recorded for it (`importedConstDigests?`); and `noreuse`, set when no command may be kept (`noreuseReason?`, or a
+process value that changed during the run; written as `noreuseReason`). `noreuse` decides nothing about skipping the
+module whole. -/
 def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Digest)) (closure : Digest)
     (provides : Array Name × Array Name) (used : NameSet) (lookups : Array Expr)
     (stmt : Array (Name × Digest × Digest)) (commands : Array Json) (incrLoaded : Bool) (path : System.FilePath)
@@ -820,7 +827,10 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
   let names : NameHashSet := (← resolvedNames).foldl (·.insert ·) {}
   let names := nodes.foldl (fun s n => n.refs.foldl (·.insert ·) s) (used.foldl (·.insert ·) names)
   let names := (names : Std.HashSet Name).fold (fun s x => (internalPrefixes x).foldl (·.insert ·) s) names
+  let values ← takeValueReads
   let untracked ← untrackedImports env
+  let noreuseReason? := noreuseReason? <|> values.findSome? fun (k, _, changed) =>
+    guard changed *> some s!"the process value {k} changed while the module was compiled"
   let fields : List (String × Json) := [("version", usageVersion), ("noskip", incrLoaded),
     ("moduleDigest", toJson (moduleDigestOf own)),
     ("closure", toJson closure),
@@ -844,6 +854,7 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
     ("olean", toJson oleanDigest),
     ("githash", toJson Lean.githash),
     ("untracked", Json.arr (untracked.map fun (m, d) => pair m d)),
+    ("values", Json.arr (values.map fun (k, v?, _) => Json.arr #[toJson k, toJson (valueDigest? v?)])),
     ("stmt", Json.arr (stmt.map fun (n, c, a) => Json.arr #[nameToJson n, toJson c, toJson a])),
     ("commands", Json.arr commands),
     ("noreuse", noreuseReason?.isSome)]
