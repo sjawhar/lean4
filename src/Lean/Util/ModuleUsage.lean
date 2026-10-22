@@ -731,6 +731,157 @@ def resolvedGroups (env : Environment) (names : NameHashSet) : Array (Option Nam
     | some x, some y => Name.quickLt x y
     | _, _ => false
 
+/-- A name's identity in a module's `.resolved` sidecar (`encodeResolved`): the digest of its canonical encoding
+(`Enc.name`). Lean's writer and Lake's check (`ResolvedTable.providerUnchanged`) both call it. -/
+def resolvedId (n : Name) : Digest := (({} : Enc).name n).finish
+
+/-- Each distinct name of `provides`, a module's `ownProvides` (each array sorted by `Name.quickLt`), with its
+`resolvedId` and the nonzero kinds under which `provides` lists it (`kindsIn`). -/
+def providedIds (provides : Array Name × Array Name) : Array (Digest × UInt8) := Id.run do
+  let (kernel, extra) := provides
+  let mut out := Array.emptyWithCapacity (kernel.size + extra.size)
+  for i in [0:kernel.size] do
+    let n := kernel[i]!
+    unless i > 0 && kernel[i - 1]! == n do
+      out := out.push (resolvedId n, kindsIn kernel extra n)
+  for i in [0:extra.size] do
+    let n := extra[i]!
+    unless (i > 0 && extra[i - 1]! == n) || kernel.binSearchContains n Name.quickLt do
+      out := out.push (resolvedId n, extraKind)
+  return out
+
+/-- The bytes of a module's `.resolved` sidecar, from its `resolvedGroups`: the groups (`Enc.array`), each its module
+(`Enc.opt`, `Enc.name`) and its entries (`Enc.array`), each its name's `resolvedId` (`Enc.digest`) and its kinds
+(`Enc.u8`). Read by `ResolvedTable.decode?`. -/
+def encodeResolved (groups : Array (Option Name × Array (Name × UInt8))) : ByteArray :=
+  (({} : Enc).array groups fun e (m?, ns) =>
+    e.opt m? Enc.name |>.array ns fun e (n, k) => e.digest (resolvedId n) |>.u8 k).buf
+
+/-- A module's `.resolved` sidecar as Lake reads it (`ResolvedTable.decode?`): its `resolvedGroups`, each name by its
+`resolvedId`. -/
+structure ResolvedTable where
+  /-- Each group's module (`none`: the module itself, or no module), in sidecar order. -/
+  modules : Array (Option Name)
+  /-- Per group, how many of its entries have nonzero kinds. -/
+  provided : Array Nat
+  /-- Each entry's name identity, with the index of its group in `modules` and its kinds. -/
+  entries : Std.HashMap Digest (Nat × UInt8)
+
+namespace ResolvedTable
+
+/-- A position in the bytes `decode?` reads. -/
+private abbrev DecM := StateT Nat (Except String)
+
+private def u8 (b : ByteArray) : DecM UInt8 := do
+  let i ← get
+  unless i < b.size do throw "truncated"
+  set (i + 1)
+  return b[i]!
+
+/-- `Enc.u64`: little-endian. -/
+private def u64 (b : ByteArray) : DecM UInt64 := do
+  let i ← get
+  unless i + 8 ≤ b.size do throw "truncated"
+  set (i + 8)
+  let mut v : UInt64 := 0
+  for k in [0:8] do
+    v := v ||| (b[i + k]!.toUInt64 <<< (8 * k).toUInt64)
+  return v
+
+private def str (b : ByteArray) : DecM String := do
+  let n := (← u64 b).toNat
+  let i ← get
+  unless i + n ≤ b.size do throw "truncated"
+  set (i + n)
+  match String.fromUTF8? (b.extract i (i + n)) with
+  | some s => return s
+  | none => throw "a string is not UTF-8"
+
+/-- `Enc.nat`: the decimal digits `toString` writes. -/
+private def nat (b : ByteArray) : DecM Nat := do
+  let s ← str b
+  match s.toNat? with
+  | some n => if toString n == s then return n else throw s!"expected a natural number, got {s}"
+  | none => throw s!"expected a natural number, got {s}"
+
+private def name (b : ByteArray) : DecM Name := do
+  let mut n := Name.anonymous
+  for _ in [0:(← nat b)] do
+    match ← u8 b with
+    | 1 => n := .str n (← str b)
+    | 2 => n := .num n (← nat b)
+    | t => throw s!"unknown name component tag {t}"
+  return n
+
+private def decodeM (bytes : ByteArray) : DecM ResolvedTable := do
+  let mut modules := #[]
+  let mut provided := #[]
+  let mut entries : Std.HashMap Digest (Nat × UInt8) := {}
+  let mut seen : Std.HashSet (Option Name) := {}
+  for _ in [0:(← nat bytes)] do
+    let m? ← match ← u8 bytes with
+      | 0 => pure none
+      | 1 => some <$> name bytes
+      | t => throw s!"unknown option tag {t}"
+    if seen.contains m? then throw s!"two groups of the module {m?}"
+    seen := seen.insert m?
+    let g := modules.size
+    let mut live := 0
+    for _ in [0:(← nat bytes)] do
+      let d : Digest := ⟨← u64 bytes, ← u64 bytes⟩
+      let k ← u8 bytes
+      if entries.contains d then throw s!"two entries of the identity {d.hex}"
+      entries := entries.insert d (g, k)
+      if k != 0 then live := live + 1
+    modules := modules.push m?
+    provided := provided.push live
+  unless (← get) == bytes.size do throw "trailing bytes"
+  return { modules, provided, entries }
+
+/-- Reads the bytes `encodeResolved` writes. Fails on any other bytes, and if two groups have one module or two entries
+one identity, which `resolvedGroups` never writes: each name is in one group. -/
+def decode? (bytes : ByteArray) : Except String ResolvedTable :=
+  (decodeM bytes).run' 0
+
+/--
+Whether module `m`, whose provides changed to `provides` (its `ownProvides`), still resolves every name of the table as
+the compile saw it: each name recorded under `m` is provided by `m` with the recorded kinds, and each name recorded
+under another module or under none is not provided by `m`, except as a kernel constant alone when the compile depended
+on `m`'s copy (`declared`: the names `used` lists under `m`). Lean recorded each name `n` once (`resolvedGroups`),
+under the module `g` the resolver mapped it to, with the kinds `k` under which `g` provided it.
+
+This is the check `∀ (n, g, k) recorded, kindsIn m n = if g = m then k else 0 ∨ (g ≠ m ∧ kindsIn m n = kernelKind ∧
+n ∈ declared)`, inverted so that it walks `m`'s names instead of every recorded one. Let `P` be the distinct names `m`
+provides under nonzero kinds (`providedIds`); every other name has `kindsIn m n = 0`. The walk fails on an `n ∈ P`
+recorded under another group (the check demands `kindsIn m n = 0` there) unless `n` is provided as a kernel constant
+alone and is in `declared`, or recorded under `m` with `k ≠ kindsIn m n`, which also covers an entry of `m` with
+`k = 0`; otherwise it counts the entries of `m` matched. The names of `P` are distinct and each identity is one entry,
+so the matched entries are distinct, all of `m` with `k ≠ 0`, and `found = provided[m]` holds exactly when every
+entry of `m` with `k ≠ 0` has its name in `P` with kinds `k`. Together these are the check: an entry of another group
+must have its name outside `P` or be exempt, an entry of `m` with `k = 0` must have its name outside `P`, and an entry
+of `m` with `k ≠ 0` inside it with kinds `k`.
+
+Names are compared by `resolvedId`, a 128-bit truncated SHA-256 of the injective `Enc.name`: the construction of every
+other usage digest (a declaration's digest, `moduleDigest`, `providesDigest`), so two names share an identity only
+through a collision that would hide a change behind any of those as well. Two recorded names sharing one fail
+`decode?`.
+-/
+def providerUnchanged (t : ResolvedTable) (m : Name) (provides : Array Name × Array Name) (declared : Array Name) :
+    Bool := Id.run do
+  let g? := t.modules.findIdx? (· == some m)
+  let declaredIds : Std.HashSet Digest := declared.foldl (·.insert <| resolvedId ·) {}
+  let mut found := 0
+  for (d, k) in providedIds provides do
+    if let some (g, k') := t.entries[d]? then
+      if some g == g? then
+        unless k' == k do return false
+        found := found + 1
+      else
+        unless k == kernelKind && declaredIds.contains d do return false
+  return found == g?.elim 0 (t.provided[·]!)
+
+end ResolvedTable
+
 set_option compiler.ignoreBorrowAnnotation true in
 /-- `Compiler.LCNF.Specialize.specCacheEntries`, private to its module so that only the usage data reads the cache
 without recording a lookup. -/
@@ -784,9 +935,9 @@ private def specLookups (env : Environment) (lookups : Array Expr) : Array (Dige
       some (m, specKeysOf (specCacheEntries env (some i)))
     else none
 
-/-- The format version of the `.usage` sidecar and of Lake's `.usekey`; Lake reads a sidecar of any other
-version as absent. -/
-def usageVersion : Nat := 13
+/-- The format version of the `.usage` sidecar, of its `.resolved` sidecar and of Lake's `.usekey`; Lake reads a
+sidecar of any other version as absent. -/
+def usageVersion : Nat := 14
 
 /-- `own` is `localDigests env nodes`, `closure` the module's `closureDigest`, `provides` its `ownProvides` and
 `indirect` its `ownIndirect`, as `setLocalDigests` stored them; `used` holds the imported names recorded while
@@ -798,14 +949,15 @@ inside a compile, `compileHints`), every imported module with digests is one. `i
 import's `closureDigest` and `importedDigests` each extra module's `moduleDigest`, as this compile imported them from
 their `.olean` files: Lake writes a `.usekey` only if those are still what the modules' `.usage` files say when it
 writes it, so the key describes what the compile read. `digested` records each imported module's provides digest, and
-`resolved` the module and kinds every name of `used`, of the nodes' references and of `resolvedNames` resolves to
-(`resolvedGroups`), so that Lake rebuilds the module when a closure module whose provides changed gains, loses or
-changes the kinds of any of those names, or gives one of them a non-local attribute (`indirect`, which makes a fresh
-compile record that module as an extra use); `resolvedAll` is set when the whole resolver map was read
-(`allResolved`), so that Lake rebuilds the module when any closure module's provides changed. Call it after
-everything else the process writes: `resolvedNames` is read last here, after this function's own lookups. `noskip`
-is set when the run reused commands from an `--incr-load` snapshot, since reused commands never call `addDecl` in
-this process and `used` may miss constants they used. -/
+the `.resolved` sidecar written next to `path` (`path` with the extension `resolved`, `encodeResolved`) the module and
+kinds every name of `used`, of the nodes' references and of `resolvedNames` resolves to (`resolvedGroups`), so that
+Lake rebuilds the module when a closure module whose provides changed gains, loses or changes the kinds of any of those
+names, or gives one of them a non-local attribute (`indirect`, which makes a fresh compile record that module as an
+extra use); the `.usage` records the digest of its bytes (`resolvedDigest`, `Digest.ofBytes`). `resolvedAll` is set
+when the whole resolver map was read (`allResolved`), so that Lake rebuilds the module when any closure module's
+provides changed. Call it after everything else the process writes: `resolvedNames` is read last here, after this
+function's own lookups. `noskip` is set when the run reused commands from an `--incr-load` snapshot, since reused
+commands never call `addDecl` in this process and `used` may miss constants they used. -/
 def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Digest)) (closure : Digest)
     (provides : Array Name × Array Name) (indirect : Array Name) (used : NameSet) (lookups : Array Expr)
     (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
@@ -834,6 +986,8 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
   let names := nodes.foldl (fun s n => n.refs.foldl (·.insert ·) s) (used.foldl (·.insert ·) names)
   let names := env.getImportedKernelDuplicates.foldl (·.insert ·.1) names
   let names := (names : Std.HashSet Name).fold addInternalPrefixes names
+  let resolved := encodeResolved (resolvedGroups env names)
+  IO.FS.writeBinFile (path.withExtension "resolved") resolved
   let j := Json.mkObj [("version", usageVersion), ("noskip", incrLoaded),
     ("moduleDigest", toJson (moduleDigestOf own)),
     ("closure", toJson closure),
@@ -846,8 +1000,7 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
     ("own", Json.arr (own.map fun (n, d) => pair n d)),
     ("used", usedJson),
     ("resolvedAll", resolvedAll),
-    ("resolved", Json.arr ((resolvedGroups env names).map fun (m?, ns) =>
-      Json.arr #[m?.elim Json.null nameToJson, Json.arr (ns.map fun (n, k) => Json.arr #[nameToJson n, toJson k.toNat])])),
+    ("resolvedDigest", toJson (Digest.ofBytes resolved)),
     ("extra", Json.arr (extraMods.map fun u => Json.arr #[nameToJson u.module, u.isMeta])),
     ("specKeys", Json.arr ((ownSpecKeys env).map fun (d, n) => Json.arr #[toJson d, nameToJson n])),
     ("specLookups", Json.arr ((specLookups env lookups).map fun (k, p) => Json.arr #[toJson k, toJson p]))]

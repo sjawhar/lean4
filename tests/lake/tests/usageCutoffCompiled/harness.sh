@@ -52,7 +52,9 @@ build_outputs() { (cd "$1" && find . \( -name '*.olean*' -o -name '*.ilean' -o -
 
 # Builds case `$1` both ways and compares. With `$2 = cache`, both cutoff-on builds use an artifact cache
 # shared with a second state-1 tree (`work/cut/CASE_cache.shared`), which is built from it and compared too;
-# the state-1 tree is built a second time, and both builds are observed (`cut/CASE_cache.obs`, `.obs2`).
+# the state-1 tree is built a second time, and both builds are observed (`cut/CASE_cache.obs`, `.obs2`). A case
+# that defines `CASE_drop` has it run in the cutoff tree after the state-0 build, to remove outputs, and state 0
+# built again from the cache (`cut/CASE_cache.0r.log`), so that the state-1 build checks modules restored from it.
 # After the other comparisons the cutoff tree's outputs are compared with a clean cutoff-on build of the same
 # sources at the same path (see the end of `run_case`).
 run_case() {
@@ -69,6 +71,13 @@ run_case() {
     cat "cut/$n.0.log"
     echo "FAILURE: $n: state 0 does not build"
     return 2
+  fi
+  if [ "$mode" = cache ] && declare -F "${c}_drop" > /dev/null; then
+    if ! (cd "$cut" && "${c}_drop" && env "${env[@]}" "$LAKE" build -v > ../$n.0r.log 2>&1); then
+      cat "cut/$n.0r.log"
+      echo "FAILURE: $n: state 0 does not build from the cache"
+      return 1
+    fi
   fi
   (cd "$cut" && "${c}_s1")
   rc=0
@@ -2474,6 +2483,25 @@ dn_never_extract_s0() {
 }
 dn_never_extract_s1() { dn_never_extract_a '@[never_extract] '; }
 
+# A closure provider's provides change after the dependent module was restored from the shared cache: `A` gains a
+# declaration `M` does not use, so `M`'s check reads the `.resolved` sidecar it restored with its `.usage`
+# (`provides_restore:cache`, whose state 0 is built again from the cache into an empty build directory), finds every
+# recorded name resolved as before, and replays `M`. Without the sidecar `M` would build.
+provides_restore_s0() {
+  printf 'name = "test"\ndefaultTargets = ["T"]\n[[lean_lib]]\nname = "T"\n' > lakefile.toml
+  mkdir_t
+  printf 'def a : Nat := 1\n' > T/A.lean
+  printf 'import T.A\ndef m : Nat := a + 1\n' > T/M.lean
+  printf 'import T.M\n' > T.lean
+}
+provides_restore_drop() { rm -rf .lake/build; }
+provides_restore_s1() { printf 'def a : Nat := 1\ndef a2 : Nat := 2\n' > T/A.lean; }
+provides_restore_c_check() {
+  grep -qE 'Reused T\.M( |$)' ../provides_restore_cache.0r.log &&
+    grep -qE 'Built T\.A( |$)' ../provides_restore_cache.1.log &&
+    grep -qE 'Replayed T\.M( |$)' ../provides_restore_cache.1.log
+}
+
 all_cases="spec_transitive spec_link spec_type spec_precomp plugin_replay csimp_transitive csimp_late specialize_attr
   cov_projfn cov_projfn_rev cov_mlike cov_sparse cov_auxrec cov_sibmatch cov_sibmatch_rev cov_ctlmatch
   cov_sibinst cov_sibclass cov_sibmeta cov_ckind_rev cov_recarg_rev
@@ -2506,7 +2534,7 @@ all_cases="spec_transitive spec_link spec_type spec_precomp plugin_replay csimp_
   borrow_proj borrow_ctor borrow_alias tc_hint ba_implicit bi_inl bi_inl_rev bn_mi bi_down2 bn_alias
   cs_nested cs_nested_ctl cs_collide cs_collide_ctl cs_kern td_hint vd_mdata vd_mdata_type vd_sunfold vd_sunfold_bn
   vd_sunfold_new vd_sunfold_bare dn_unsafe_rec dn_noncomp dn_never_extract
-  spec_transitive:cache"
+  spec_transitive:cache provides_restore:cache"
 # `spec_transitive:cache`: the state the cutoff build of `spec_transitive` leaves behind, after another build and
 # in a fresh tree that shares its artifact cache.
 cases=${CASES:-}
