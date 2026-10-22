@@ -423,7 +423,7 @@ where
                   let prom ← IO.Promise.new
                   let cancelTk ← IO.CancelToken.new
                   parseCmd oldCmd newParserState oldProcSuccess.cmdState prom (sync := true)
-                    cancelTk [] ctx
+                    cancelTk [] 0 ctx
                   return .finished none {
                     diagnostics := .empty
                     metaSnap := .finished newStx {
@@ -543,7 +543,7 @@ where
       }
       let prom ← IO.Promise.new
       let cancelTk ← IO.CancelToken.new
-      parseCmd none parserState cmdState prom (sync := true) cancelTk [] ctx
+      parseCmd none parserState cmdState prom (sync := true) cancelTk [] 0 ctx
       return {
         diagnostics := .empty
         metaSnap := .finished stx {
@@ -556,9 +556,11 @@ where
         }
       }
 
+  /-- `cmdIdx` is `revCmds.length`, the index of the command parsed next. -/
   parseCmd (old? : Option CommandParsedSnapshot) (parserState : Parser.ModuleParserState)
       (cmdState : Command.State) (prom : IO.Promise CommandParsedSnapshot) (sync : Bool)
-      (parseCancelTk : IO.CancelToken) (revCmds : List Syntax) : LeanProcessingM Unit := do
+      (parseCancelTk : IO.CancelToken) (revCmds : List Syntax) (cmdIdx : Nat) :
+      LeanProcessingM Unit := do
     let ctx ← read
 
     let unchanged old newParserState : BaseIO Unit :=
@@ -575,7 +577,7 @@ where
           -- elaboration reuse
           BaseIO.chainTask (sync := true) oldNext.task fun oldNext => do
             parseCmd oldNext newParserState oldResult.cmdState newProm sync cancelTk
-              (old.stx :: revCmds) ctx
+              (old.stx :: revCmds) (cmdIdx + 1) ctx
         prom.resolve <| { old with nextCmdSnap? := some {
           stx? := none
           reportingRange := .some ⟨newParserState.pos, ctx.endPos⟩
@@ -680,7 +682,7 @@ where
           reportSnap := { stx? := none, reportingRange := initRange?, task := reportPromise.result!, cancelTk? := none }
         }
       }
-      let (cmdState, info) ← doElab stx revCmds cmdState beginPos
+      let (cmdState, info) ← doElab stx revCmds cmdIdx cmdState beginPos
         { old? := old?.map fun old => ⟨old.stx, old.elabSnap.elabSnap⟩, new := elabPromise }
         elabCmdCancelTk ctx
 
@@ -751,14 +753,14 @@ where
           }
       if let some next := next? then
         -- We're definitely off the fast-forwarding path now
-        parseCmd none parserState cmdState next (sync := false) elabCmdCancelTk (stx :: revCmds) ctx
+        parseCmd none parserState cmdState next (sync := false) elabCmdCancelTk (stx :: revCmds)
+          (cmdIdx + 1) ctx
 
-  doElab (stx : Syntax) (revCmds : List Syntax) (cmdState : Command.State) (beginPos : String.Pos.Raw)
-      (snap : SnapshotBundle DynamicSnapshot) (cancelTk : IO.CancelToken) :
+  doElab (stx : Syntax) (revCmds : List Syntax) (cmdIdx : Nat) (cmdState : Command.State)
+      (beginPos : String.Pos.Raw) (snap : SnapshotBundle DynamicSnapshot) (cancelTk : IO.CancelToken) :
       LeanProcessingM (Command.State × Task Elab.InfoState) := do
     let ctx ← read
     let recording ← usageRecordingEnabled
-    let cmdIdx := revCmds.length
     -- what the elaboration and its tasks do is attributed to the command; promises the frontend created for the
     -- command's snapshots are resolved outside it
     let (cmdState, info) ← withCommandContext cmdIdx do
@@ -814,7 +816,7 @@ def processCommands (inputCtx : Parser.InputContext) (parserState : Parser.Modul
     BaseIO (Task CommandParsedSnapshot) := do
   let prom ← IO.Promise.new
   let cancelTk ← IO.CancelToken.new
-  process.parseCmd (old?.map (·.2)) parserState commandState prom (sync := true) cancelTk []
+  process.parseCmd (old?.map (·.2)) parserState commandState prom (sync := true) cancelTk [] 0
     |>.run (old?.map (·.1))
     |>.run { inputCtx with }
   return prom.result!
