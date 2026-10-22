@@ -1442,17 +1442,18 @@ checked (`checkUsageIndexEntry`).
 
 A lookup that found any candidate logs one verbose line: `usage index: restored <name> (...)` or
 `usage index: no match (...)`, where `(...)` counts the candidates, those whose `.usage` the pre-filter read
-(`parsed`) and those that reached the check (`fully checked`), with the time the pre-filter took apart from reading
-views, the views this lookup added (`UsageView`) and the time it took to read them, and the importees the checks
-bound (`ContentHashes.imports`) that the module's same-tree check had not, with the time the checks took.
+(`parsed`) and those that reached the check (`fully checked`), with the wall and current-thread CPU time the
+pre-filter took apart from reading views, the views this lookup added (`UsageView`) and their wall and CPU read
+times, and the importees the checks bound (`ContentHashes.imports`) that the module's same-tree check had not, with
+their wall and CPU check times.
 -/
 def Module.lookupUsageIndex (mod : Module) (presetup : ModulePreSetup) (importArts : NameMap ImportArtifacts)
     (hashes : ContentHashes) (kept : Bool) (accept : String → ModuleOutputArtifacts → JobM (Option α)) :
     JobM (Option α) := do
   let candidates ← (← getLakeCache).usageCandidates mod.pkg.cacheScope presetup.localTrace.hash
   if candidates.isEmpty then return none
-  -- The views this lookup added, and the nanoseconds it took to read them
-  let views ← IO.mkRef ((0, 0) : Nat × Nat)
+  -- The views this lookup added, with wall and current-thread CPU nanoseconds spent reading them
+  let views ← IO.mkRef ((0, 0, 0) : Nat × Nat × Nat)
   let boundBefore := (← hashes.imports.get).size
   -- An importee as the module's decision bound it, if it did, else as the build's view of it
   let importee? (m : Name) : JobM (Option (Option ModuleUsage.Digest × UsageImport)) := do
@@ -1461,10 +1462,12 @@ def Module.lookupUsageIndex (mod : Module) (presetup : ModulePreSetup) (importAr
       if (importArts.find? m).any (·.oleanServer?.isSome) then return some (none, imp)
       return some ((← hashes.files.get)[olean]?, imp)
     let start ← IO.monoNanosNow
+    let cpuStart ← IO.threadCpuNanosNow
     let (view, read) ← usageView? importArts m
     if read then
       let stop ← IO.monoNanosNow
-      views.modify fun (n, ns) => (n + 1, ns + (stop - start))
+      let cpuStop ← IO.threadCpuNanosNow
+      views.modify fun (n, ns, cpuNs) => (n + 1, ns + (stop - start), cpuNs + (cpuStop - cpuStart))
     return view
   -- The candidate's outputs, files and its key's `.olean` hash if it passes the pre-filter, and whether its `.usage`
   -- was read
@@ -1485,26 +1488,33 @@ def Module.lookupUsageIndex (mod : Module) (presetup : ModulePreSetup) (importAr
     | .usage => return (none, true)
     | .passed keyOlean =>
       return (some (arts, {usekey := usekey.path, usage := usage.path, olean := arts.olean.path}, keyOlean), true)
-  let stats (parsed checked prefilterNs checkNs : Nat) : JobM String := do
-    let (viewsRead, viewsNs) ← views.get
+  let stats (parsed checked prefilterNs prefilterCpuNs checkNs checkCpuNs : Nat) : JobM String := do
+    let (viewsRead, viewsNs, viewsCpuNs) ← views.get
     let bound := (← hashes.imports.get).size - boundBefore
     return s!"{candidates.size} candidates, {parsed} parsed, {checked} fully checked; \
-      prefilter {(prefilterNs - viewsNs) / 1000} µs; {viewsRead} views read in {viewsNs / 1000} µs; \
-      {bound} importees bound in {checkNs / 1000} µs"
+      prefilter {(prefilterNs - viewsNs) / 1000} µs ({(prefilterCpuNs - viewsCpuNs) / 1000} CPU µs); \
+      {viewsRead} views read in {viewsNs / 1000} µs ({viewsCpuNs / 1000} CPU µs); \
+      {bound} importees bound in {checkNs / 1000} µs ({checkCpuNs / 1000} CPU µs)"
   let mut parsed := 0
   let mut checked := 0
   let mut prefilterNs := 0
+  let mut prefilterCpuNs := 0
   let mut checkNs := 0
+  let mut checkCpuNs := 0
   -- Kept outputs that passed, in the order they passed, offered once no compile has been taken
   let mut keptPassed : Array (String × ModuleOutputArtifacts) := #[]
   for file in candidates do
     let start ← IO.monoNanosNow
+    let cpuStart ← IO.threadCpuNanosNow
     let (passed?, read) ← prefilter file
     let filtered ← IO.monoNanosNow
+    let cpuFiltered ← IO.threadCpuNanosNow
     prefilterNs := prefilterNs + (filtered - start)
+    prefilterCpuNs := prefilterCpuNs + (cpuFiltered - cpuStart)
     if read then parsed := parsed + 1
     let some (arts, files, keyOlean) := passed? | continue
     checked := checked + 1
+    let checkCpuStart ← IO.threadCpuNanosNow
     let verdict ← id do
       try
         mod.usageVerdict presetup importArts hashes files
@@ -1517,19 +1527,23 @@ def Module.lookupUsageIndex (mod : Module) (presetup : ModulePreSetup) (importAr
       if let some hash := (← hashes.files.get)[arts.olean.path]? then
         if hash != keyOlean then discard <| checkUsageIndexEntry arts.olean
     checkNs := checkNs + ((← IO.monoNanosNow) - filtered)
+    checkCpuNs := checkCpuNs + ((← IO.threadCpuNanosNow) - checkCpuStart)
     unless verdict matches .upToDate do continue
     let name := file.fileStem.getD file.toString
     if arts.keptFrom?.isSome then
       keptPassed := keptPassed.push (name, arts)
       continue
     if let some result ← accept name arts then
-      logVerbose s!"usage index: restored {name} ({← stats parsed checked prefilterNs checkNs})"
+      logVerbose s!"usage index: restored {name} \
+        ({← stats parsed checked prefilterNs prefilterCpuNs checkNs checkCpuNs})"
       return some result
   for (name, arts) in keptPassed do
     if let some result ← accept name arts then
-      logVerbose s!"usage index: restored {name} ({← stats parsed checked prefilterNs checkNs})"
+      logVerbose s!"usage index: restored {name} \
+        ({← stats parsed checked prefilterNs prefilterCpuNs checkNs checkCpuNs})"
       return some result
-  logVerbose s!"usage index: no match ({← stats parsed checked prefilterNs checkNs})"
+  logVerbose s!"usage index: no match \
+    ({← stats parsed checked prefilterNs prefilterCpuNs checkNs checkCpuNs})"
   return none
 
 /--
