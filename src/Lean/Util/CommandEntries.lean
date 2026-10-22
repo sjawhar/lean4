@@ -104,8 +104,9 @@ inductive Refusal where
   | uncompactable (part : Name) (at? : Option Name := none)
   /-- An effect on state outside the command that the runtime noted (`effectsByCommand`): a write to a reference it did
   not create, the resolution of a promise or the cancellation of a task it did not create, or a use of process-wide
-  state (files, the environment, the working directory, the running executable's path, child processes, the standard
-  streams, the runtime's settings), which no payload carries. -/
+  state (files outside the toolchain's, child processes, the standard streams, the runtime's settings), which no payload
+  carries. Reads of the environment, the working directory and the executable's path are no effects: the module records
+  their values (`takeValueReads`), which a keep requires unchanged (`ModuleUsage.keepPermit`). -/
   | effect (what : String)
   deriving Inhabited, BEq
 

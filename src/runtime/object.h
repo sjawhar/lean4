@@ -491,6 +491,12 @@ inline void note_effect_here(char const * what) {
 /* Notes `what` and who created `t` for task context `ctx` (not 0) when `t`, a task or a promise's task, is another
    context's. */
 void note_task_owner(uint32 ctx, lean_task_object * t, char const * what);
+/* While effects are noted, records in any context that the running code read the process value `key` (an
+   environment variable `env:NAME`, `appPath`, `workingDirectory`), which is `value`, or absent for `nullptr`
+   (`lean_io_take_value_reads`). */
+void note_value_read(std::string const & key, char const * value);
+/* For the effect context, about to read the file or directory `p` (`lean_io_take_effects`). */
+void note_path_read(char const * p);
 
 obj_res lean_promise_new();
 void lean_promise_resolve(obj_arg value, b_obj_arg promise);

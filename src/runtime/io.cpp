@@ -43,6 +43,8 @@ Authors: Leonardo de Moura, Sebastian Ullrich
 #include <atomic>
 #include <unordered_map>
 #include <unordered_set>
+#include <map>
+#include <cerrno>
 #include <cstdlib>
 #include <cctype>
 #include <cmath>
@@ -442,7 +444,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_mk(b_obj_arg filename, uint8 
         return mk_embedded_nul_error(filename);
     }
     switch (mode) {
-    case 0: note_path_use("reads", fname); break;
+    case 0: note_path_read(fname); break;
     case 3: note_path_use("writes", fname); break;
     default: note_path_create("writes", fname, false); break;
     }
@@ -1058,9 +1060,8 @@ extern "C" LEAN_EXPORT obj_res lean_io_getenv(b_obj_arg env_var) {
         return mk_option_none();
     }
 #else
-    if (uint32 ctx = effect_context())
-        note_effect(ctx, std::string("reads the environment variable ") + env_var_str);
     char * val = std::getenv(env_var_str);
+    note_value_read(std::string("env:") + env_var_str, val);
     if (val) {
         return mk_option_some(mk_string(val));
     } else {
@@ -1071,7 +1072,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_getenv(b_obj_arg env_var) {
 
 extern "C" LEAN_EXPORT obj_res lean_io_realpath(obj_arg filename) {
     const char* fname = string_cstr(filename);
-    note_path_use("reads", fname);
+    note_path_read(fname);
     if (strlen(fname) != lean_string_size(filename) - 1) {
         obj_res res = mk_embedded_nul_error(filename);
         dec_ref(filename);
@@ -1134,7 +1135,7 @@ constant readDir : @& FilePath → IO (Array DirEntry)
 */
 extern "C" LEAN_EXPORT obj_res lean_io_read_dir(b_obj_arg dirname) {
     const char* dirname_ptr = string_cstr(dirname);
-    note_path_use("reads", dirname_ptr);
+    note_path_read(dirname_ptr);
     if (strlen(dirname_ptr) != lean_string_size(dirname) - 1) {
         return mk_embedded_nul_error(dirname);
     }
@@ -1205,7 +1206,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_metadata(b_obj_arg filename) {
     if (strlen(fname) != lean_string_size(filename) - 1) {
         return mk_embedded_nul_error(filename);
     }
-    note_path_use("reads", fname);
+    note_path_read(fname);
     uv_fs_t req;
     int ret = uv_fs_stat(NULL, &req, fname, NULL);
     if (ret < 0) {
@@ -1226,7 +1227,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_symlink_metadata(b_obj_arg filename) {
     if (strlen(fname) != lean_string_size(filename) - 1) {
         return mk_embedded_nul_error(filename);
     }
-    note_path_use("reads", fname);
+    note_path_read(fname);
     uv_fs_t req;
     int ret = uv_fs_lstat(NULL, &req, fname, NULL);
     if (ret < 0) {
@@ -1249,7 +1250,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_is_same_file(b_obj_arg p1, b_obj_arg p2) 
         if (strlen(fname) != lean_string_size(ps[i]) - 1) {
             return mk_embedded_nul_error(ps[i]);
         }
-        note_path_use("reads", fname);
+        note_path_read(fname);
         uv_fs_t req;
         int ret = uv_fs_stat(NULL, &req, fname, NULL);
         if (ret < 0) {
@@ -1460,9 +1461,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_remove_file(b_obj_arg filename) {
     }
 }
 
-extern "C" LEAN_EXPORT obj_res lean_io_app_path() {
-    if (uint32 ctx = effect_context())
-        note_effect(ctx, "reads the path of the running executable");
+static obj_res app_path_core() {
 #if defined(LEAN_WINDOWS)
     HMODULE hModule = GetModuleHandle(NULL);
     char path[MAX_PATH];
@@ -1517,11 +1516,16 @@ extern "C" LEAN_EXPORT obj_res lean_io_app_path() {
 #endif
 }
 
+extern "C" LEAN_EXPORT obj_res lean_io_app_path() {
+    obj_res r = app_path_core();
+    if (lean_io_result_is_ok(r)) note_value_read("appPath", lean_string_cstr(lean_io_result_get_value(r)));
+    return r;
+}
+
 extern "C" LEAN_EXPORT obj_res lean_io_current_dir() {
-    if (uint32 ctx = effect_context())
-        note_effect(ctx, "reads the working directory");
     char buffer[PATH_MAX];
     char * cwd = getcwd(buffer, sizeof(buffer));
+    note_value_read("workingDirectory", cwd);
     if (cwd) {
         return io_result_mk_ok(mk_string(cwd));
     } else {
@@ -1538,11 +1542,17 @@ Effect notes. While on (`lean_io_set_effect_recording`), the runtime notes, per 
 any command), each effect that context has on state outside it: a write to a reference another context created
 (`m_context`), the resolution or cancellation of a task or promise another context created, and each use of
 process-wide state through the runtime's primitives: a file or directory it did not create, a file handle it did not
-open (the standard streams among them), a file it created and left in place, the process environment, the working
-directory, the running executable's path, a child process, the runtime's settings (maximum heartbeats and memory, exit
-on panic, thread stack size, debug tags). Not noted: values any two runs may differ in (clocks, heartbeat counts,
-random bytes, process and thread ids), which a kept command's result takes from the run that recorded it, and the
-runtime's debugging output (`dbg_trace`). `lean_io_take_effects` returns the notes.
+open (the standard streams among them), a file it created and left in place, a child process, the runtime's settings
+(maximum heartbeats and memory, exit on panic, thread stack size, debug tags).
+
+Not effects: reads of the toolchain's own files (`in_pinned_dirs`), which the Lean githash pins, recorded as a read of
+the value `toolchain` (the pinned directories' root); values any two runs may differ in (clocks, heartbeat counts,
+random bytes, process and thread ids), which a kept command's result takes from the run that recorded it; and the
+runtime's debugging output (`dbg_trace`).
+
+Value reads: in every context, the first value of each environment variable, of the running executable's path and of
+the working directory read, and whether a later read saw another one (`lean_io_take_value_reads`). A later build
+compares them with its own (`Lean.ModuleUsage.keepPermit`).
 */
 static std::atomic<bool> g_effects_on(false);
 
@@ -1552,10 +1562,20 @@ struct context_effects {
     std::unordered_set<std::string> created;
     std::unordered_set<std::string> dirs;
 };
+struct value_read {
+    bool present;
+    std::string value;
+    // a later read saw another value
+    bool changed;
+};
 static mutex * g_effects_mutex = nullptr;
 static std::unordered_map<uint32, context_effects> * g_effects = nullptr;
 // the file handles opened while effects are noted, with the context that opened them
 static std::unordered_map<FILE *, uint32> * g_handle_contexts = nullptr;
+static std::map<std::string, value_read> * g_value_reads = nullptr;
+// the toolchain directories whose files the Lean githash pins, resolved, each ending in `/`, and their root as given
+static std::vector<std::string> * g_pinned_dirs = nullptr;
+static std::string * g_pinned_root = nullptr;
 static constexpr size_t max_effect_notes = 8;
 
 uint32 effect_context() {
@@ -1564,6 +1584,21 @@ uint32 effect_context() {
 
 std::string describe_context(uint32 ctx) {
     return ctx == 0 ? std::string("no command") : "command " + std::to_string(ctx - 1);
+}
+
+static void note_value_read_core(std::string const & key, char const * value) {
+    auto it = g_value_reads->find(key);
+    if (it == g_value_reads->end()) {
+        g_value_reads->emplace(key, value_read{value != nullptr, value ? value : "", false});
+    } else if (it->second.present != (value != nullptr) || (value && it->second.value != value)) {
+        it->second.changed = true;
+    }
+}
+
+void note_value_read(std::string const & key, char const * value) {
+    if (!g_effects_on.load(std::memory_order_relaxed)) return;
+    lock_guard<mutex> lock(*g_effects_mutex);
+    note_value_read_core(key, value);
 }
 
 static void note_effect_core(context_effects & e, std::string const & what) {
@@ -1596,6 +1631,50 @@ static void note_path_use(char const * what, char const * p) {
     lock_guard<mutex> lock(*g_effects_mutex);
     context_effects & e = (*g_effects)[ctx];
     if (!created_by(e, p)) note_effect_core(e, std::string(what) + " " + p);
+}
+
+/* Whether the absolute path `p`, with its symbolic links resolved (its parent's, if it does not exist), is one of the
+   pinned directories or lies in one. A relative path is not: it resolves against the working directory. */
+static bool in_pinned_dirs(char const * p, std::vector<std::string> const & dirs) {
+#if defined(LEAN_WINDOWS)
+    return false;
+#else
+    if (dirs.empty() || p[0] != '/') return false;
+    char buf[PATH_MAX];
+    std::string r;
+    if (realpath(p, buf)) {
+        r = buf;
+    } else {
+        if (errno != ENOENT) return false;
+        std::string s(p);
+        size_t slash = s.find_last_of('/');
+        std::string name = s.substr(slash + 1);
+        if (name.empty() || name == "." || name == "..") return false;
+        if (!realpath(slash == 0 ? "/" : s.substr(0, slash).c_str(), buf)) return false;
+        r = std::string(buf) + "/" + name;
+    }
+    r += '/';
+    for (std::string const & d : dirs)
+        if (r.compare(0, d.size(), d) == 0) return true;
+    return false;
+#endif
+}
+
+void note_path_read(char const * p) {
+    uint32 ctx = effect_context();
+    if (ctx == 0) return;
+    std::vector<std::string> dirs;
+    {
+        lock_guard<mutex> lock(*g_effects_mutex);
+        if (created_by((*g_effects)[ctx], p)) return;
+        dirs = *g_pinned_dirs;
+    }
+    bool pinned = in_pinned_dirs(p, dirs);
+    lock_guard<mutex> lock(*g_effects_mutex);
+    if (pinned)
+        note_value_read_core("toolchain", g_pinned_root->c_str());
+    else
+        note_effect_core((*g_effects)[ctx], std::string("reads ") + p);
 }
 
 /* For the effect context, about to create `p` (a file, or a directory if `dir`): records it as the context's if it does
@@ -1664,11 +1743,22 @@ static void forget_handle(FILE * fp) {
     g_handle_contexts->erase(fp);
 }
 
-/* setEffectRecording (on : Bool) : BaseIO Unit; switching it on forgets earlier notes */
-extern "C" LEAN_EXPORT obj_res lean_io_set_effect_recording(uint8 on) {
+/* setEffectRecording (on : Bool) (pinned : @& Array String) (root : @& String) : BaseIO Unit; switching it on forgets
+   earlier notes and value reads, and pins the directories `pinned` (`in_pinned_dirs`), recorded as `root` when read */
+extern "C" LEAN_EXPORT obj_res lean_io_set_effect_recording(uint8 on, b_obj_arg pinned, b_obj_arg root) {
     if (on) {
+        std::vector<std::string> dirs;
+#if !defined(LEAN_WINDOWS)
+        for (size_t i = 0; i < lean_array_size(pinned); i++) {
+            char buf[PATH_MAX];
+            if (realpath(string_cstr(lean_array_get_core(pinned, i)), buf)) dirs.push_back(std::string(buf) + "/");
+        }
+#endif
         lock_guard<mutex> lock(*g_effects_mutex);
         g_effects->clear();
+        g_value_reads->clear();
+        *g_pinned_dirs = std::move(dirs);
+        *g_pinned_root = string_cstr(root);
     }
     g_effects_on.store(on != 0);
     return box(0);
@@ -1693,6 +1783,27 @@ extern "C" LEAN_EXPORT obj_res lean_io_take_effects() {
         object * p = lean_alloc_ctor(0, 2, 0);
         lean_ctor_set(p, 0, lean_box_uint32(ctx));
         lean_ctor_set(p, 1, mk_string(w));
+        r = lean_array_push(r, p);
+    }
+    return r;
+}
+
+/* takeValueReads : BaseIO (Array (String × Option String × Bool)): the value reads since recording was switched on,
+   sorted by key, each with its first value and whether a later read saw another; clears them */
+extern "C" LEAN_EXPORT obj_res lean_io_take_value_reads() {
+    std::map<std::string, value_read> reads;
+    {
+        lock_guard<mutex> lock(*g_effects_mutex);
+        reads.swap(*g_value_reads);
+    }
+    object * r = lean_alloc_array(0, reads.size());
+    for (auto const & [key, v] : reads) {
+        object * rest = lean_alloc_ctor(0, 2, 0);
+        lean_ctor_set(rest, 0, v.present ? mk_option_some(mk_string(v.value)) : mk_option_none());
+        lean_ctor_set(rest, 1, lean_box(v.changed));
+        object * p = lean_alloc_ctor(0, 2, 0);
+        lean_ctor_set(p, 0, mk_string(key));
+        lean_ctor_set(p, 1, rest);
         r = lean_array_push(r, p);
     }
     return r;
@@ -1972,6 +2083,9 @@ void initialize_io() {
     g_effects_mutex = new mutex();
     g_effects = new std::unordered_map<uint32, context_effects>();
     g_handle_contexts = new std::unordered_map<FILE *, uint32>();
+    g_value_reads = new std::map<std::string, value_read>();
+    g_pinned_dirs = new std::vector<std::string>();
+    g_pinned_root = new std::string();
 #if !defined(LEAN_WINDOWS) && !defined(LEAN_EMSCRIPTEN)
     // We want to handle SIGPIPE ourselves
     lean_always_assert(signal(SIGPIPE, SIG_IGN) != SIG_ERR);

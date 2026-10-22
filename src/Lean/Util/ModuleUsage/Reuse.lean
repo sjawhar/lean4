@@ -133,6 +133,8 @@ structure KeepRecord where
   resolved : Array (Option Name × Array (Name × UInt8))
   resolvedAll : Bool
   specLookups : Array (Digest × Digest)
+  /-- The process values the compile read, with their digests (`writeUsage`'s `values`). -/
+  values : Array (String × Option Digest)
   noreuse : Bool
 
 /-- The `KeepRecord` a `.usage` holds. -/
@@ -150,6 +152,7 @@ def KeepRecord.ofUsage (j : Json) : Except String KeepRecord := do
     resolved := ← resolvedOfJson (← j.getObjVal? "resolved")
     resolvedAll := ← j.getObjValAs? Bool "resolvedAll"
     specLookups := ← j.getObjValAs? (Array (Digest × Digest)) "specLookups"
+    values := ← j.getObjValAs? (Array (String × Option Digest)) "values"
     noreuse := ← j.getObjValAs? Bool "noreuse" }
 
 /-- The module `n` resolves to in `env` (`Environment.getModuleIdxFor?`), without recording the lookup (`noteResolved`):
@@ -203,6 +206,17 @@ private def closureChanged? (env : Environment) (r : KeepRecord) : IO (Option St
     return some "the providers of a specialization-cache key the module looked up changed"
   return none
 
+/-- The reason a process value the module's compile read (`values`) differs in this process, if one does: a command
+may have read it, as an environment variable, the working directory, the executable's path, or a file of the
+toolchain at the recorded root. -/
+private def valuesChanged? (r : KeepRecord) : IO (Option String) := do
+  for (k, d?) in r.values do
+    let now? ← try valueDigest? <$> currentValue? k
+      catch _ => return some s!"the compile read the process value {k}, which this Lean does not read"
+    unless now? == d? do
+      return some s!"the process value {k} is not what it was when the module was compiled"
+  return none
+
 /-- `keepPermit`, with the `noreuse` check only if `checkNoreuse`. -/
 private def keepPermitCore (env : Environment) (module : Name) (olean usage : System.FilePath)
     (checkNoreuse : Bool) : IO (Except String KeepPermit) := do
@@ -213,6 +227,7 @@ private def keepPermitCore (env : Environment) (module : Name) (olean usage : Sy
   if checkNoreuse && r.noreuse then return .error "the module's commands cannot be kept (`noreuse`)"
   unless (← fileDigest olean) == r.olean do return .error "the `.usage` was not written with this `.olean`"
   if let some reason ← closureChanged? env r then return .error reason
+  if let some reason ← valuesChanged? r then return .error reason
   let (data, _) ← readModuleData olean
   return .ok { module, data, payloads := CommandEntries.ofModuleData data, imports := env.header.moduleData }
 
@@ -231,6 +246,9 @@ skips the module (`Module.usageUpToDate`), asked of `env` directly:
   the resolver's whole map, every import with digests provides the same names (`UsageSidecar.resolvedUnchanged`); these
   lookups are not recorded (`moduleIdxUnrecorded?`);
 - every specialization-cache key the compile looked up has the same providers (`UsageSidecar.specProvidersUnchanged`).
+Then every process value the compile read (an environment variable, the working directory, the executable's path, the
+toolchain root of a toolchain file a command read) is the same in this process (`valuesChanged?`), which Lake's checks
+do not cover.
 The module's own inputs, and what each command used (its record's uses), are its caller's to check. -/
 def keepPermit (env : Environment) (module : Name) (olean usage : System.FilePath) :
     IO (Except String KeepPermit) :=

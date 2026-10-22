@@ -4,9 +4,10 @@ payload carries and a later command may read: a write to an `IO.Ref` it did not 
 initializer created, also on a worker thread or held in an extension's initial state; one core created, such as
 `IO.stdGenRef`; one another command created), the resolution of a promise and the cancellation of a task another
 command created, and a use of process-wide state through the runtime's primitives (a file it did not create, or one it
-created and left in place, the process environment, the working directory, a child process; the runtime's settings,
-which only compiled code can change, in `usagePluginAttribute`). Reading a reference, writing one the command itself creates, output its
-elaboration captures, and a temporary file it creates and removes are not effects. -/
+created and left in place, a child process; the runtime's settings, which only compiled code can change, in
+`usagePluginAttribute`). Reading a reference, writing one the command itself creates, output its elaboration captures,
+a temporary file it creates and removes, and reading the environment or the working directory (whose values the module
+records, `commandEntriesProcessValues`) are not effects. -/
 open Lean
 
 def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
