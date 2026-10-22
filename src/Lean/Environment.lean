@@ -2201,6 +2201,14 @@ set_option compiler.ignoreBorrowAnnotation true in
 @[extern "lean_get_ir_extra_const_names"]
 private opaque getIRExtraConstNames (env : Environment) (level : OLeanLevel) (includeDecls := false) : Array Name
 
+/-- The entries of `ext` that the current module's `.olean` files export at each level (`writeModule`). -/
+def PersistentEnvExtension.exportedEntries {α β σ : Type} [Inhabited σ] (ext : PersistentEnvExtension α β σ)
+    (env : Environment) : OLeanEntries (Array α) :=
+  let asyncMode := match ext.toEnvExtension.asyncMode with
+    | .async _ => .sync
+    | m => m
+  ext.exportEntriesFn env (ext.getState (asyncMode := asyncMode) env)
+
 /--
 Compute extension entries for all levels at once by calling `exportEntriesFn` once per extension.
 Returns an `OLeanEntries` of arrays mapping extension names to their exported data.
@@ -2208,13 +2216,7 @@ Returns an `OLeanEntries` of arrays mapping extension names to their exported da
 private def computeExtEntries (env : Environment) :
     IO (OLeanEntries (Array (Name × Array EnvExtensionEntry))) := do
   let pExts ← persistentEnvExtensionsRef.get
-  let allEntries := pExts.map fun pExt =>
-    let asyncMode := match pExt.toEnvExtension.asyncMode with
-      | .async _ => .sync
-      | m => m
-    let state := pExt.getState (asyncMode := asyncMode) env
-    let oe := pExt.exportEntriesFn env state
-    (pExt.name, oe)
+  let allEntries := pExts.map fun pExt => (pExt.name, pExt.exportedEntries env)
   let filterNonEmpty (level : OLeanLevel) :=
     allEntries.filterMap fun (name, oe) => do
       let ents := oe.get level
