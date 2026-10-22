@@ -389,13 +389,129 @@ def UsageSidecar.coversClosure (usage : UsageSidecar) (importArts : NameMap Impo
       unless (usage.digested.binSearch (m, default) (Name.quickLt ·.1 ·.1)).isSome do return false
     return true
 
+/-- A copy of the module name `n` that shares no object with it, for a name read from a compacted region that is freed
+later. A module name has only string components (`modToFilePath`). -/
+def copyName : Name → Name
+  | .str p s => .str (copyName p) s.toSlice.copy
+  | .num p k => .num (copyName p) k
+  | .anonymous => .anonymous
+
+/-- Frees `regions`, then returns `a`, which must not refer into them. Taking `a` makes callers compute it first. -/
+@[noinline] def freeRegionsThen (regions : Array CompactedRegion) (a : α) : IO α := do
+  for r in regions do unsafe CompactedRegion.free r
+  return a
+
+/--
+The kernel constant names of the module whose `.olean` parts `load` reads, as name hashes (`Name.hash` of
+`ModuleData.constNames` of the last part, the private level), and its direct imports, or `none`, with a warning, if
+the parts cannot be read.
+-/
+def readKernelProvides (load : IO (Array (Lean.ModuleData × CompactedRegion))) :
+    JobM (Option (Array UInt64 × Array Name)) := do
+  match (← go.toBaseIO) with
+  | .ok r => return some r
+  | .error e =>
+    logWarning s!"usage cutoff: {e}"
+    return none
+where
+  go : IO (Array UInt64 × Array Name) := do
+    let parts ← load
+    -- built by `push` into new arrays: `Array.map` of an empty array returns that array, which is in a region
+    let names := parts.back?.elim #[] (·.1.constNames)
+    let hashes := names.foldl (·.push ·.hash) (Array.mkEmpty names.size)
+    let imports := (parts[0]?.elim #[] (·.1.imports)).foldl (·.push <| copyName ·.module) #[]
+    freeRegionsThen (parts.map (·.2)) (hashes, imports)
+
+/--
+Whether no closure module whose provides changed (`changed`, each with its current `.usage`) declares a kernel
+constant that another module of the compile declares too, unless the compile depended on that module's copy (`used`
+lists the name under it, as `Lean.ModuleUsage.moduleUsed` lists every declarer of each duplicate the import saw). For
+such a name a fresh compile fails at the import (`throwAlreadyImported`) or at the module's own declaration, or keeps
+a copy the compile did not depend on (`subsumesInfo`). The other declarers are every other workspace module of the
+closure (`importArts`), the compiled module itself (`UsageSidecar.provides`) and every toolchain module a fresh
+compile imports: those its direct imports and the workspace modules' (their `ModuleInput.imports`) name outside the
+workspace, and their imports (`ModuleData.imports`), transitively, as a non-`module` file imports every module its
+imports reach. Lean finds such a module's `.olean` in the workspace's library directories (`getLeanPath`, which Lake
+passes as `LEAN_PATH`) and then its own (`Lean.initSearchPath`), and reads its parts as an import does
+(`Lean.readModuleDataPartsOfFile`). A non-`module` file's kernel constants come from its current `.usage`, which its
+`.usekey` binds to its `.olean`; a `module` file's and a toolchain module's from the private part of their `.olean`,
+pinned by `modsysHash` and by the Lean githash. A module that starts to declare a name has changed provides unless it
+is a toolchain module, a `module` file or the compiled module, so every new duplicate has a declarer this checks.
+
+Names are compared by `Name.hash`, so a hash collision only rebuilds. The `.olean` reads assume the data layout of
+the Lean that Lake was built with, so with another Lean, or if a read fails, the check fails. Kernel constants are
+indexed once per build, workspace modules' per module state (`BuildContext.kernelProviders`).
+-/
+def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetup) (hashes : ContentHashes)
+    (importArts : NameMap ImportArtifacts) (changed : Array (Name × UsageImport)) : JobM Bool := do
+  unless (← getLeanInstall).githash == Lean.githash do return false
+  let outside (r : Array Name) (i : ModuleImport) := if i.module?.isNone then r.push i.module else r
+  let mut toolchain := presetup.directImports.foldl outside #[]
+  -- each workspace module of the closure with the digest of its state and, for a non-`module` file, its kernel
+  -- constants (a `module` file's are read from its `.olean` parts)
+  let mut closure : Array (Name × ModuleUsage.Digest × Option (Array Name)) := #[]
+  for (m, arts) in importArts do
+    let some mod ← findModule? m | continue
+    toolchain := (← (← mod.input.fetch).await).imports.foldl outside toolchain
+    if arts.oleanServer?.isSome then
+      if arts.oleanPrivate?.isNone then return false
+      let mut e : ModuleUsage.Enc := {}
+      for p in arts.oleanParts false do
+        e := e.digest (← contentHash hashes p)
+      closure := closure.push (m, e.finish, none)
+    else
+      let some (_, imp) ← importUsage? hashes importArts m | return false
+      closure := closure.push (m, imp.providesDigest, some imp.provides.1)
+  let kp := (← getBuildContext).kernelProviders
+  for (m, d, kernel?) in closure do
+    if ← kp.atomically (return (← get).indexed.contains (m, d)) then continue
+    let hs ← match kernel? with
+      | some kernel => pure (kernel.map (·.hash))
+      | none =>
+        let some (hs, _) ← readKernelProvides <|
+          readModuleDataParts ((importArts.find? m).elim #[] (·.oleanParts false)) | return false
+        pure hs
+    kp.atomically do
+      unless (← get).indexed.contains (m, d) do
+        modify fun s => { s.index m d hs with indexed := s.indexed.insert (m, d) }
+  let searchPath := (← getLeanPath) ++ [← getLeanLibDir]
+  let mut current : NameMap ModuleUsage.Digest := closure.foldl (fun c (m, d, _) => c.insert m d) {}
+  while h : 0 < toolchain.size do
+    let m := toolchain.back
+    toolchain := toolchain.pop
+    if current.contains m || importArts.contains m then continue
+    current := current.insert m default
+    let imports? ← match ← kp.atomically (return (← get).toolchain.find? m) with
+      | some imports? => pure imports?
+      | none =>
+        let read? ← match ← Lean.SearchPath.findWithExt searchPath "olean" m with
+          | some olean => readKernelProvides (readModuleDataPartsOfFile olean)
+          | none => pure none
+        kp.atomically do
+          unless (← get).toolchain.contains m do
+            modify fun s => { (read?.elim s (s.index m default ·.1)) with
+              toolchain := s.toolchain.insert m (read?.map (·.2)) }
+        pure (read?.map (·.2))
+    let some imports := imports? | return false
+    toolchain := toolchain ++ imports
+  let byHash ← kp.atomically (return (← get).byHash)
+  for (m, imp) in changed do
+    let declared := (usage.used.binSearch (m, #[]) (Name.quickLt ·.1 ·.1)).elim #[] (·.2)
+    for n in imp.provides.1 do
+      if (declared.binSearch (n, default) (Name.quickLt ·.1 ·.1)).isSome then continue
+      if usage.provides.1.binSearchContains n Name.quickLt ||
+          (byHash.findD n.hash #[]).any fun (k, d) => k != m && current.find? k == some d then
+        return false
+  return true
+
 /--
 Whether every name whose defining module the compile looked up, used or referred to (`UsageSidecar.resolved`) still
-resolves to the same module, with the same kinds, as when Lean compiled it. Each workspace module of the closure whose
-provides digest (`UsageImport.providesDigest`, from a `.usage` that `importUsage?` binds to its current `.olean`)
-differs from the one the compile imported (`UsageSidecar.digested`) must still provide each name the resolver mapped
-to it with the recorded kinds, and none of the other names. A module whose provides digest is unchanged is not asked
-about any name. If the compile read the resolver's whole map (`UsageSidecar.resolvedAll`), no such module may exist.
+resolves to the same module, with the same kinds, as when Lean compiled it, and no closure module gained a kernel
+constant another declares (`UsageSidecar.kernelDisjoint`). Each workspace module of the closure whose provides digest
+(`UsageImport.providesDigest`, from a `.usage` that `importUsage?` binds to its current `.olean`) differs from the one
+the compile imported (`UsageSidecar.digested`) must still provide each name the resolver mapped to it with the
+recorded kinds, and none of the other names. A module whose provides digest is unchanged is not asked about any name.
+If the compile read the resolver's whole map (`UsageSidecar.resolvedAll`), no such module may exist.
 
 This decides without restating how the resolver ranks providers (`Environment.getModuleIdxFor?`), which differs
 between toolchains. It relies on one property, which every such resolver has: for a resolver that picks a winner
@@ -411,8 +527,9 @@ declarer, and `usageUpToDate` checks that copy's digest): the module provided th
 possibly also as a compiled name, and keeping or dropping a non-winner's provider cannot change the winner. A
 module-system module's provides are pinned by `modsysHash`, a toolchain module's by the Lean githash.
 -/
-def UsageSidecar.resolvedUnchanged (usage : UsageSidecar) (hashes : ContentHashes)
+def UsageSidecar.resolvedUnchanged (usage : UsageSidecar) (presetup : ModulePreSetup) (hashes : ContentHashes)
     (importArts : NameMap ImportArtifacts) : JobM Bool := do
+  let mut changed := #[]
   for (m, arts) in importArts do
     if arts.oleanServer?.isSome then continue
     if (← findModule? m).isNone then continue
@@ -430,7 +547,9 @@ def UsageSidecar.resolvedUnchanged (usage : UsageSidecar) (hashes : ContentHashe
         unless !winner && now == ModuleUsage.kernelKind &&
             (declared.binSearch (n, default) (Name.quickLt ·.1 ·.1)).isSome do
           return false
-  return true
+    changed := changed.push (m, imp)
+  if changed.isEmpty then return true
+  usage.kernelDisjoint presetup hashes importArts changed
 
 /--
 Writes the module's `.usekey` from the `.usage` Lean just wrote: the digest of the `.usage` bytes, the module's
@@ -507,5 +626,5 @@ public def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
     let some (olean, imp) ← importUsage? hashes importArts m | return false
     unless (← contentHash hashes olean) == oleanHash do return false
     unless imp.moduleDigest == digest do return false
-  unless (← usage.resolvedUnchanged hashes importArts) do return false
+  unless (← usage.resolvedUnchanged presetup hashes importArts) do return false
   usage.specProvidersUnchanged hashes importArts

@@ -2468,10 +2468,11 @@ abbrev ImportStateM := StateRefT ImportState IO
 @[inline] nonrec def ImportStateM.run (x : ImportStateM α) (s : ImportState := default) : IO (α × ImportState) :=
   x.run s
 
-private def readModuleDataPartsOfMod (mod : Name) : IO (Array (ModuleData × CompactedRegion)) := do
-  let mFile ← findOLean mod
-  unless (← mFile.pathExists) do
-    throw <| IO.userError s!"object file '{mFile}' of module {mod} does not exist"
+/--
+Loads every `.olean` part of the module whose `.olean` is `mFile`, as an import does: for a `module` file, also its
+`.olean.server` and `.olean.private`.
+-/
+def readModuleDataPartsOfFile (mFile : System.FilePath) : IO (Array (ModuleData × CompactedRegion)) := do
   let main ← unsafe CompactedRegion.read (α := ModuleData) mFile #[]
   if !main.1.isModule then
     return #[main]
@@ -2482,6 +2483,12 @@ private def readModuleDataPartsOfMod (mod : Name) : IO (Array (ModuleData × Com
   let pFile := OLeanLevel.private.adjustFileName mFile
   let priv ← unsafe CompactedRegion.read (α := ModuleData) pFile #[main.2, server.2]
   return #[main, server, priv]
+
+private def readModuleDataPartsOfMod (mod : Name) : IO (Array (ModuleData × CompactedRegion)) := do
+  let mFile ← findOLean mod
+  unless (← mFile.pathExists) do
+    throw <| IO.userError s!"object file '{mFile}' of module {mod} does not exist"
+  readModuleDataPartsOfFile mFile
 
 private def readIRPartsOfMod (mod : Name) : IO (Array (ModuleData × CompactedRegion)) := do
   let mFile ← findOLean mod
