@@ -2,9 +2,10 @@ import Lean
 /-! A command is refused (`Refusal.effect`) for every effect on state outside it that the runtime notes, which no
 payload carries and a later command may read: a write to an `IO.Ref` it did not create (one an imported module's
 initializer created, also on a worker thread or held in an extension's initial state; one core created, such as
-`IO.stdGenRef`; one another command created), the resolution of a promise another command created, and a use of
-process-wide state through the runtime's primitives (a file it did not create, or one it created and left in place,
-the process environment, the working directory, a child process). Reading a reference, writing one the command itself creates, output its
+`IO.stdGenRef`; one another command created), the resolution of a promise and the cancellation of a task another
+command created, and a use of process-wide state through the runtime's primitives (a file it did not create, or one it
+created and left in place, the process environment, the working directory, a child process; the runtime's settings,
+which only compiled code can change, in `usagePluginAttribute`). Reading a reference, writing one the command itself creates, output its
 elaboration captures, and a temporary file it creates and removes are not effects. -/
 open Lean
 
@@ -65,6 +66,14 @@ elab \"make_promise\" : command => do
 elab \"resolve_promise\" : command => do
   if let some p := promiseExt.getState (← getEnv) then p.resolve 1
 
+/-- a task a command keeps in an extension's state, for a later command to cancel -/
+initialize taskExt : EnvExtension (Option (Task Unit)) ← registerEnvExtension (pure none)
+elab \"make_task\" : command => do
+  let t ← IO.asTask (prio := .dedicated) (IO.sleep 2000)
+  modifyEnv (taskExt.setState · (some (t.map fun _ => ())))
+elab \"cancel_task\" : command => do
+  if let some t := taskExt.getState (← getEnv) then IO.cancel t
+
 /-- process-wide state -/
 elab \"write_file\" s:str : command => IO.FS.writeFile s.getString \"x\"
 elab \"read_file\" s:str : command => discard <| IO.FS.readFile s.getString
@@ -91,6 +100,8 @@ def s := seed_term
 def r := rand_term
 make_promise
 resolve_promise
+make_task
+cancel_task
 write_file \"written.txt\"
 read_file \"X.lean\"
 temp_file

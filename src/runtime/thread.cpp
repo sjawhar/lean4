@@ -20,6 +20,7 @@ Author: Leonardo de Moura
 #include "runtime/alloc.h"
 #include "runtime/stack_overflow.h"
 #include "runtime/sstream.h"
+#include "runtime/object.h"
 
 #ifndef LEAN_DEFAULT_THREAD_STACK_SIZE
 #ifdef LEAN_EMSCRIPTEN
@@ -147,6 +148,7 @@ void lthread::join() { m_imp->join(); }
 
 /* setThreadStackSize (sz : USize) : BaseIO Unit */
 extern "C" LEAN_EXPORT lean_obj_res lean_internal_set_thread_stack_size(size_t sz) {
+    note_effect_here("sets the runtime's thread stack size");
     lthread::set_thread_stack_size(sz);
     return lean_box(0);
 }

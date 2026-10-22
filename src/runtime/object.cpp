@@ -120,6 +120,7 @@ extern "C" LEAN_EXPORT void lean_set_exit_on_panic(bool flag) {
 
 /* setExitOnPanic (exit : Bool) : BaseIO Unit */
 extern "C" LEAN_EXPORT obj_res lean_internal_set_exit_on_panic(uint8 exit) {
+    note_effect_here("sets whether the runtime exits on a panic");
     g_exit_on_panic = exit;
     return box(0);
 }
@@ -1352,8 +1353,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_promise_new() {
     return o;
 }
 
-/* Notes an effect when task context `ctx` acts on `t`, a task or a promise's task another context created. */
-static void note_task_owner(uint32 ctx, lean_task_object * t, char const * what) {
+void note_task_owner(uint32 ctx, lean_task_object * t, char const * what) {
     lean_task_imp * imp = t->m_imp;
     if (imp == nullptr) return;
     uint32 owner = imp->m_context;
