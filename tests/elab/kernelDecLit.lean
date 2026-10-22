@@ -6,7 +6,8 @@ equality (`Nat.decEq`, `instDecidableEqNat`, `Nat.decLe`, `Nat.decLt`, `instDeci
 `instDecidableEqBitVec`) when both arguments reduce to numerals (`type_checker::reduce_dec_lit`). The kernel returns
 `true`/`false` at once instead of unfolding the instance chain down to `Nat.beq`/`Nat.ble`. The tests check that the
 kernel's decision equals the one `Meta.whnf` reaches by unfolding the definitions, that terms whose arguments are not
-numerals get no decision, and that a closed decided term compared with an open one is still compared structurally.
+numerals get no decision, that a closed decided term compared with an open one is still compared structurally, and
+that two closed decided terms are compared by their instances' arguments.
 -/
 open Lean Meta Elab Term Command
 
@@ -98,6 +99,27 @@ theorem openVsDecided (x : BitVec 64) : ev x = decide (K = 0x3f000000#64) := rfl
 set_option maxHeartbeats 2000 in
 theorem openVsDecidedBEq (x : BitVec 64) : evb x = (K == 0x3f000000#64) := rfl
 
+/-! Two closed `decide` terms whose instances' arguments are equal only after unfolding (`pick (500 + 1)` and
+`pick 501`, as when `of_decide_eq_true` applies a fact proven at `i + 1` to a statement written with the numeral): the
+kernel compares the arguments, as without the rule, instead of deciding both sides and so evaluating `pick`. No kernel
+counter reaches the threshold. -/
+
+def bigList : List Nat := List.range 2000
+def pick (n : Nat) : Nat := bigList.getD n 0
+
+set_option diagnostics true in
+set_option diagnostics.threshold 100 in
+#guard_msgs in
+theorem decArgsNat (h : decide (pick (500 + 1) = 500 + 1) = true) : pick 501 = 501 :=
+  of_decide_eq_true h
+
+set_option diagnostics true in
+set_option diagnostics.threshold 100 in
+#guard_msgs in
+theorem decArgsBitVec (h : decide (BitVec.ofNat 32 (pick (500 + 1)) = BitVec.ofNat 32 (500 + 1)) = true) :
+    BitVec.ofNat 32 (pick 501) = BitVec.ofNat 32 501 :=
+  of_decide_eq_true h
+
 /-! Through the type checker: `decide +kernel` proofs and their failures. -/
 
 theorem bv_ne : (0xf00000#64) ≠ 0x110000#64 := by decide +kernel
@@ -150,3 +172,27 @@ trace: [diag] Diagnostics
 -/
 #guard_msgs (drop info, trace) in
 theorem bv_ne_diag : (0xf00000#64) ≠ 0x110000#64 := by decide +kernel
+
+/-! The same for an equality: `decide +kernel`'s proof `Eq.refl true : decide p = true` makes the kernel compare `true`
+with the closed `decide p`, which it decides without unfolding the instance chain (23 kernel unfolds before). -/
+
+set_option diagnostics true in
+set_option diagnostics.threshold 0 in
+/--
+trace: [diag] Diagnostics
+  [reduction] unfolded reducible declarations (max: 3, num: 1):
+    [reduction] DecidableEq ↦ 3
+  [type_class] used instances (max: 1, num: 1):
+    [type_class] instDecidableEqBitVec ↦ 1
+  [def_eq] heuristic for solving `f a =?= f b` (max: 1, num: 1):
+    [def_eq] decide ↦ 1
+  [kernel] unfolded declarations (max: 3, num: 5):
+    [kernel] instOfNatNat ↦ 3
+    [kernel] OfNat.ofNat ↦ 3
+    [kernel] DecidableEq ↦ 1
+    [kernel] BitVec.ofNat ↦ 1
+    [kernel] Fin.Internal.ofNat ↦ 1
+  use `set_option diagnostics.threshold <num>` to control threshold for reporting counters
+-/
+#guard_msgs (drop info, trace) in
+theorem bv_eq_diag : (0xf00000#64) = 0xf00000#64 := by decide +kernel
