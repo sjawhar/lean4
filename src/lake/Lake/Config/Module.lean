@@ -105,6 +105,9 @@ public abbrev pkg (self : Module) : Package :=
 @[inline] public def usageFile (self : Module) : FilePath :=
   self.leanLibPath "usage"
 
+@[inline] public def resolvedFile (self : Module) : FilePath :=
+  self.leanLibPath "resolved"
+
 @[inline] public def usekeyFile (self : Module) : FilePath :=
   self.leanLibPath "usekey"
 
