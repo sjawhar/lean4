@@ -43,10 +43,10 @@ def cases : List (String × Array Name × Array Name × Array Name) := [
 #eval show IO Unit from do
   let .ok t := ResolvedTable.decode? (encodeResolved groups) | throw (IO.userError "decode failed")
   for (label, k, e, used) in cases do
-    let inv := t.providerUnchanged `M (k, e) used
+    let inv := t.providerUnchanged `M (providedIds (k, e)) used
     IO.println s!"{label}: {inv} {if inv == direct groups `M (k, e) used then "agrees" else "DIFFERS"}"
   -- a module with no group: unchanged unless it provides a recorded name
-  IO.println s!"P unrelated: {t.providerUnchanged `P (#[`q], #[]) #[]} P gains a: {t.providerUnchanged `P (#[`a], #[]) #[]}"
+  IO.println s!"P unrelated: {t.providerUnchanged `P (providedIds (#[`q], #[])) #[]} P gains a: {t.providerUnchanged `P (providedIds (#[`a], #[])) #[]}"
   let b := encodeResolved groups
   let bad (bs : ByteArray) := match ResolvedTable.decode? bs with | .ok _ => "accepted" | .error e => e
   IO.println s!"truncated: {bad (b.extract 0 (b.size - 1))}"

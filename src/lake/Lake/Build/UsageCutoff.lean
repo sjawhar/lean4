@@ -144,13 +144,17 @@ structure UsageImport where
   providesDigest : ModuleUsage.Digest
   provides : Array Name × Array Name
   indirect : Array Name
+  /-- `Lean.ModuleUsage.providedIds provides`, computed when a dependent's `UsageSidecar.resolvedUnchanged` first
+  asks about the module, at most once per parse: every importer shares the parse the build's sidecar cache keeps. -/
+  providedIds : Thunk (Array (ModuleUsage.Digest × UInt8))
   specKeys : Array (ModuleUsage.Digest × Name)
   deriving TypeName
 
 /-- The `UsageImport` view of a module's own `.usage`. -/
 def UsageSidecar.toImport (u : UsageSidecar) : UsageImport :=
   { moduleDigest := u.moduleDigest, closure := u.closure, own := u.own, providesDigest := u.providesDigest,
-    provides := u.provides, indirect := u.indirect, specKeys := u.specKeys }
+    provides := u.provides, indirect := u.indirect, providedIds := .mk fun _ => ModuleUsage.providedIds u.provides,
+    specKeys := u.specKeys }
 
 /-- Reads only the fields an importer checks (`importUsage?`). The fields it skips are not importer inputs; a
 sidecar that `UsageSidecar` would reject fails its own module's check, and the importer still binds the sidecar to
@@ -159,13 +163,15 @@ instance : FromJson UsageImport where
   fromJson? j := do
     let own ← j.getObjValAs? (Array (SidecarName × ModuleUsage.Digest)) "own"
     let specKeys ← j.getObjValAs? (Array (ModuleUsage.Digest × SidecarName)) "specKeys"
+    let provides ← providesOfJson (← j.getObjVal? "provides")
     return {
       moduleDigest := ← j.getObjValAs? ModuleUsage.Digest "moduleDigest"
       closure := ← j.getObjValAs? ModuleUsage.Digest "closure"
       own := own.foldl (init := {}) fun m (n, d) => m.insert n.name d
       providesDigest := ← j.getObjValAs? ModuleUsage.Digest "providesDigest"
-      provides := ← providesOfJson (← j.getObjVal? "provides")
+      provides
       indirect := ← namesOfJson (← j.getObjVal? "indirect")
+      providedIds := .mk fun _ => ModuleUsage.providedIds provides
       specKeys := specKeys.map fun (d, n) => (d, n.name)
     }
 
@@ -560,7 +566,7 @@ def UsageSidecar.resolvedUnchanged (usage : UsageSidecar) (presetup : ModulePreS
       table? ← readResolvedSidecar usage resolvedFile
     let some table := table? | return false
     let declared := (usage.used.binSearch (m, #[]) (Name.quickLt ·.1 ·.1)).elim #[] (·.2.map (·.1))
-    unless table.providerUnchanged m imp.provides declared do return false
+    unless table.providerUnchanged m imp.providedIds.get declared do return false
     if imp.indirect.any (table.entries.contains <| ModuleUsage.resolvedId ·) then return false
     changed := changed.push (m, imp)
   if changed.isEmpty then return true
