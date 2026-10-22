@@ -230,7 +230,8 @@ Reads a usage-cutoff sidecar. Returns `none` if it does not exist, has another f
 (`parseUsageSidecar`), or its bytes do not have the digest `expected?` (the `.usage` a `.usekey` was written
 from). If it exists but is not valid, logs a warning and returns `none`, so the module builds normally. Reuses
 the build's parse of the same contents (`BuildContext.sidecarCache`), without reading the file while its stamp is the
-one recorded with that parse.
+one recorded with that parse. It parses outside the cache lock; a parse with a different digest replaces an older
+entry because a sidecar rebuilt during the build must be read as its new contents.
 -/
 def readUsageSidecar (α : Type) [FromJson α] [TypeName α] (path : FilePath)
     (expected? : Option ModuleUsage.Digest := none) : JobM (Option α) := do
@@ -239,14 +240,14 @@ def readUsageSidecar (α : Type) [FromJson α] [TypeName α] (path : FilePath)
     let some value := cached.get? α | error s!"{path}: cached sidecar has the wrong type"
     return some value
   let some (bytes, digest, stamp?) ← readSidecarBytes? path expected? | return none
+  let some value ← parseUsageSidecar α path bytes | return none
   (← getBuildContext).sidecarCache.atomically do
     let entries ← getThe (Std.HashMap FilePath SidecarEntry)
     if let some (_, parsedFrom, cached) := entries.get? path then
       if parsedFrom == digest then
-        let some value := cached.get? α | error s!"{path}: cached sidecar has the wrong type"
+        let some winner := cached.get? α | error s!"{path}: cached sidecar has the wrong type"
         modifyThe (Std.HashMap FilePath SidecarEntry) (·.insert path (stamp?, digest, cached))
-        return some value
-    let some value ← parseUsageSidecar α path bytes | return none
+        return some winner
     modifyThe (Std.HashMap FilePath SidecarEntry) (·.insert path (stamp?, digest, Dynamic.mk value))
     return some value
 
