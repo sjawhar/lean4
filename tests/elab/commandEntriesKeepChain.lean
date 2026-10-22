@@ -1,6 +1,7 @@
 import Lean
 /-! The keep-in-order class test: every command of a module is kept in order, each on the previous keep's result and
-the chain's command state (a kept command restores its record's counters), from the module's post-import environment
+the chain's command state (a kept command restores its record's counters and the persistent tier of the type class
+resolution cache), from the module's post-import environment
 with fresh realization caches, as a reuse run in a new process does; a command whose payload is refused is elaborated
 instead, on the chain's state, as the frontend would. Before each command the chain clears its scoped stacks'
 operation logs, as the frontend does. After each command (kept or refused) the chain is compared with the full run:
@@ -16,7 +17,8 @@ module's `IO.Ref`) is not compared either, as the full run in this process moved
 `commandEntriesTwoProcess` keeps in a second process.
 Modules: the review's probes (realized constants and their contexts R4, R6, R7, a second requester of a realization, a
 context's options, matcher and header shapes, a realization a definition merged from the cache on the main branch,
-`mainMerge`), constants nested in a theorem's branch, nested inductives' auxiliary recursors, a matcher the same
+`mainMerge`), a command that fits its heartbeats only through the tier a kept one filled, constants nested in a
+theorem's branch, nested inductives' auxiliary recursors, a matcher the same
 command creates, `@[inherit_doc]` of an asynchronously elaborated theorem, a module importing extensions of every mode
 written from theorems' branches and scopes, scoped and local `simp` entries in those shapes (`scopedCore`), the
 suite's `doLogicTests.lean` and `issue11211.lean` (a realization that merged another one it requested, merged again
@@ -24,15 +26,15 @@ inside a third), and, without comparisons between commands (a reuse frontend kee
 one's tasks still run), a keep merging a realization a refused command's branch makes late. Refused: a raw write in a
 branch and a scoped `modifyState` on the main branch, writes to non-persistent extensions that are no command cache,
 an attribute registered outside core (those core's `register_simp_attr` and `register_label_attr` register are
-kept), code a command compiled and discarded (`#eval`, `run_meta`), and every kernel constant that checking the
+kept), a write to a reference no command created (`Refusal.effect`), and every kernel constant that checking the
 elaborator's would not give: added unchecked (by `addDeclCore`, by `debug.skipKernelTC`, by `replayConsts` for an
 unsafe constant), `addDecl`'s fallback axioms, an elaborator constant the kernel never received (committed, its commit
 dropped, or rejected by `replayConsts`), a kernel constant the elaborator never received (through `promiseChecked`), a
 realization the kernel rejects when it is merged. Every kept command must equal the full run in what is compared.
 Negative controls: realization records tampered so that their rebuild fails must make each keep that rebuilds one
 throw; a kept docstring replaced by another, the entry count unchanged, must differ; a scoped stack's operations
-dropped and an entry forged into an extension without a state delta must differ; a constant corrupted so that the
-kernel rejects it must make the keep throw with the kernel's message. -/
+dropped, an entry forged into an extension without a state delta, and the tier entries a kept command added dropped must
+differ; a constant corrupted so that the kernel rejects it must make the keep throw with the kernel's message. -/
 open Lean Elab Command
 
 def newConsts (before after : Environment) : NameMap ConstantInfo :=
@@ -154,21 +156,21 @@ def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
   unless out.exitCode = 0 do
     throw <| IO.userError s!"lean {args} failed ({out.exitCode}):\n{out.stdout}\n{out.stderr}"
 
-/-- A keep permit for `env`'s imports from the resolutions `M.usage` records (`ModuleUsage.keepPermit`). -/
+/-- The keep permit for `M`'s payloads in `env` (`ModuleUsage.Testing.keepPermit`). -/
 def permitFor (dir : System.FilePath) (env : Environment) : IO KeepPermit := do
-  IO.ofExcept <| ModuleUsage.keepPermit env (← ModuleUsage.ResolutionRecord.read (dir / "M.usage"))
+  IO.ofExcept (← ModuleUsage.Testing.keepPermit env `M (dir / "M.olean") (dir / "M.usage"))
 
 /-- Elaborates `src` as `lean -o --usage` does; its command observations and payloads. -/
 unsafe def elabModule (dir : System.FilePath) (src : String) :
-    IO (Array ModuleUsage.CommandObservation × Array CommandEntries) := do
+    IO (Array ModuleUsage.CommandObservation × KeepPermit) := do
   IO.FS.writeFile (dir / "M.lean") src
   enableInitializersExecution
   discard <| startFrontendRun (record := true)
   let some _ ← Elab.runFrontend src {} "M.lean" `M (oleanFileName? := some (dir / "M.olean")) (usageFileName? := some (dir / "M.usage")) |
     throw <| IO.userError "elaboration failed"
   let obs := (← ModuleUsage.commandObservations).qsort (·.i < ·.i)
-  let (md, _) ← readModuleData (dir / "M.olean")
-  return (obs, CommandEntries.ofModuleData md)
+  let some o0 := obs[0]? | throw <| IO.userError "no commands"
+  return (obs, ← permitFor dir o0.before.env)
 
 /-- What a chain of keeps did: how many were kept, the refused commands with their refusals, the throwing commands,
 every difference. -/
@@ -197,9 +199,10 @@ commands, so a refused command's asynchronous tasks may still run when the next 
 frontend, and compares the constants once at the end. -/
 unsafe def runChain (dir : System.FilePath) (src : String) (tamper : CommandEntries → CommandEntries := id)
     (waits := true) : IO ChainResult := do
-  let (obs, payloads) ← elabModule dir src
+  let (obs, permit) ← elabModule dir src
   let some o0 := obs[0]? | throw <| IO.userError "no commands"
-  let permit ← permitFor dir o0.before.env
+  let permit := CommandEntries.Testing.substitutePayloads permit (·.map tamper)
+  let payloads := permit.payloads
   let scopedExts : NameSet := (← scopedEnvExtensionsRef.get).foldl (·.insert ·.ext.name) {}
   let memo : Memo := { path := dir / "entry.bin", hashes := ← IO.mkRef {} }
   let fresh := CommandEntries.Testing.freshRealizationCaches
@@ -207,7 +210,6 @@ unsafe def runChain (dir : System.FilePath) (src : String) (tamper : CommandEntr
   let mut r : ChainResult := { commands := obs.size }
   for o in obs do
     let some ce := payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload for command {o.i}"
-    let ce := tamper ce
     -- as the frontend does before each command: the stacks' logs then hold this command's operations
     st := { st with env := ← clearScopedOps st.env }
     let chainBefore := st.env
@@ -279,8 +281,8 @@ def breakRealizations (ce : CommandEntries) : CommandEntries :=
 
 /-- `src` kept with every realization record tampered: the commands with such a record, and those whose keep threw. -/
 unsafe def tamperedChain (dir : System.FilePath) (label src : String) : IO Unit := do
-  let (_, payloads) ← elabModule dir src
-  let withRecords := payloads.filterMap fun ce => if ce.added.any hasRealization then some ce.idx else none
+  let (_, permit) ← elabModule dir src
+  let withRecords := permit.payloads.filterMap fun ce => if ce.added.any hasRealization then some ce.idx else none
   let r ← runChain dir src breakRealizations
   IO.println s!"{label} with every realization record tampered: records in commands {withRecords}, \
     keeps threw at {r.threw}"
@@ -303,16 +305,15 @@ unsafe def swappedDocChain (dir : System.FilePath) (label src : String) : IO Uni
 
 /-- Command `i` of `src` kept with constant `n`'s value replaced by `True.intro`. -/
 unsafe def corruptedKeep (dir : System.FilePath) (label src : String) (i : Nat) (n : Name) : IO Unit := do
-  let (obs, payloads) ← elabModule dir src
+  let (obs, permit) ← elabModule dir src
   let some o := obs.find? (·.i == i) | throw <| IO.userError s!"{label}: no command {i}"
-  let some ce := payloads.find? (·.idx == i) | throw <| IO.userError s!"{label}: no payload {i}"
+  let some ce := permit.payloads.find? (·.idx == i) | throw <| IO.userError s!"{label}: no payload {i}"
   let infos := newConsts o.before.env o.after.env
   let some info := infos.find? n | throw <| IO.userError s!"{label}: no {n}"
   let bad : ConstantInfo := match info with
     | .thmInfo v => .thmInfo { v with value := mkConst ``True.intro }
     | .defnInfo v => .defnInfo { v with value := mkConst ``True.intro }
     | info => info
-  let permit ← permitFor dir o.before.env
   let r ← try
       discard <| CommandEntries.Testing.keep permit (← CommandEntries.Testing.freshRealizationCaches o.before.env) ce
         (infos.insert n bad) {}
@@ -441,6 +442,15 @@ elab \"refuse_tac\" : tactic => modifyEnv fun env => rSync.modifyState env (·.i
 elab \"sleep_tac \" n:num : tactic => IO.sleep n.getNat.toUInt32
 "
 
+/-- Command 4 fits its heartbeats only through the persistent tier of the type class resolution cache command 3 filled. -/
+def synthTierSource : String := "class D (n : Nat) where\n  x : Nat := n\ninstance d0 : D 0 := {}\n\
+  instance ds {n : Nat} [D n] : D (n+1) := {}\ndef a : Nat := (inferInstance : D 40).x\n\
+  set_option synthInstance.maxHeartbeats 1 in\ndef b : Nat := (inferInstance : D 40).x\n"
+
+/-- Command `i`'s additions to the persistent tier dropped. -/
+def dropTierEntries (i : Nat) (ce : CommandEntries) : CommandEntries :=
+  if ce.idx != i then ce else { ce with counters := { ce.counters with synthTierSet := #[] } }
+
 /-- NC2: command `i`'s scoped stack operations dropped. -/
 def dropScoped (i : Nat) (ce : CommandEntries) : CommandEntries :=
   if ce.idx != i then ce else { ce with main := { ce.main with scopedOps := #[] } }
@@ -470,6 +480,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   for (label, src) in modules do
     chain dir label src
   chain dir "branchStates" branchSource
+  chain dir "synthTier" synthTierSource
   chain dir "replayRejected" "import DX\nadd_via_replay bogus\ntheorem t : True := trivial\n"
   chain dir "replayUnsafe" "import DX\nadd_unsafe_via_replay bad\ntheorem t : True := trivial\n"
   -- the refused theorem's branch realizes `f.r1` only after its sleep: the next command's keep must wait for it
@@ -487,6 +498,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
     "def x : Nat := 0\nattribute [local simp] x\ntheorem u : True := trivial\n" (dropScoped 1)
   tamperedDiffers dir "plain with a linter set forged into command 0"
     "theorem a : True := trivial\ntheorem b : True := trivial\n" (addLinterSet 0)
+  tamperedDiffers dir "synthTier with command 3's tier entries dropped" synthTierSource (dropTierEntries 3)
   corruptedKeep dir "corrupted theorem" "theorem a : 1 = 1 := rfl\ndef b : Nat := 1\n" 0 `a
   corruptedKeep dir "corrupted definition" "theorem a : 1 = 1 := rfl\ndef b : Nat := 1\n" 1 `b
 

@@ -47,15 +47,15 @@ unsafe def main (args : List String) : IO UInt32 := do
   let targets := targets.map String.toNat!
   initSearchPath (← findSysroot) [dir]
   enableInitializersExecution
-  let (md, _) ← readModuleData olean
-  let payloads := CommandEntries.ofModuleData md
-  let full : NameMap ConstantInfo := (md.constNames.zip md.constants).foldl (fun m (n, c) => m.insert n c) {}
   let src ← IO.FS.readFile file
   let inputCtx := Parser.mkInputContext src file
   let (header, parserState, messages) ← Parser.parseHeader inputCtx
-  let (env, messages) ← processHeader header {} messages inputCtx
+  let (env, messages) ← processHeader header {} messages inputCtx (mainModule := `M)
   let usage := (System.FilePath.mk olean).withExtension \"usage\"
-  let permit ← IO.ofExcept <| ModuleUsage.keepPermit env (← ModuleUsage.ResolutionRecord.read usage)
+  let permit ← IO.ofExcept (← ModuleUsage.keepPermit env `M olean usage)
+  let payloads := permit.payloads
+  let md := permit.data
+  let full : NameMap ConstantInfo := (md.constNames.zip md.constants).foldl (fun m (n, c) => m.insert n c) {}
   let mut st := Command.mkState env messages {}
   st := { st with scopes := st.scopes.map fun sc => { sc with opts := Elab.async.set sc.opts false } }
   let mut ps := parserState

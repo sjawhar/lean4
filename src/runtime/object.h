@@ -478,6 +478,12 @@ inline obj_res st_ref_swap(b_obj_arg r, obj_arg v) { return lean_st_ref_swap(r, 
 
 /* The task context of the running thread (`lean_io_set_task_context`). */
 uint32 get_task_context();
+/* The task context of the running thread while effects are noted (`lean_io_set_effect_recording`), else 0. */
+uint32 effect_context();
+/* Notes for task context `ctx` (not 0) that it caused `what`, an effect on state outside it (`lean_io_take_effects`). */
+void note_effect(uint32 ctx, std::string const & what);
+/* `"command N"` for task context `ctx` (`N = ctx - 1`), `"no command"` for 0: who created an object. */
+std::string describe_context(uint32 ctx);
 
 obj_res lean_promise_new();
 void lean_promise_resolve(obj_arg value, b_obj_arg promise);

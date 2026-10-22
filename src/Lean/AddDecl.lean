@@ -242,7 +242,7 @@ independently of `Environment.isExporting` and even for theorems.
 def addDecl (decl : Declaration) (forceExpose := false) : CoreM Unit := do
   let used? ← recordDeclConsts decl
   if let some used := used? then
-    recordCommandDecls (← commandIdx) decl.getNames.toArray used
+    recordCommandDecls decl.getNames.toArray used
   addDeclCore decl forceExpose
   if let some used := used? then
     -- the kernel adds a nested inductive's auxiliary recursors, named after its first type, which `getNames` lacks
@@ -250,7 +250,7 @@ def addDecl (decl : Declaration) (forceExpose := false) : CoreM Unit := do
       if let some (.inductInfo v) := (← getEnv).find? t.name then
         unless v.numNested == 0 do
           let recs := (Array.range' 1 v.numNested).map (mkNestedRecName t.name)
-          recordCommandDecls (← commandIdx) recs used
+          recordCommandDecls recs used
   discard <| decl.getTopLevelNames.mapM snapshotEnvLinterOptions
 
 def addAndCompile (decl : Declaration) (logCompileErrors : Bool := true)

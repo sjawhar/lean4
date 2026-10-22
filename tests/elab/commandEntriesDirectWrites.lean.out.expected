@@ -1,4 +1,4 @@
-noskip (some true), reason (some (declaration command 0: a change to logExt that no entry expresses))
+noreuse (some true), reason (some (declaration command 0: a change to logExt that no entry expresses))
 0: refused for #[logExt, logExt], entries #[]; refused
 1: refused for #[logExt, logExt], entries #[]; refused
 2: refused for #[logExt, logExt], entries #[]; refused

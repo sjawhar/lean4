@@ -10,6 +10,7 @@ open Lean
 structure Run where
   src : String
   obs : Array ModuleUsage.CommandObservation
+  permit : KeepPermit
   payloads : Array CommandEntries
   usage : Json
 
@@ -20,10 +21,11 @@ unsafe def elabM (dir : System.FilePath) (src : String) : IO Run := do
   let some _ ← Elab.runFrontend src {} "M.lean" `M (oleanFileName? := some (dir / "M.olean")) (usageFileName? := some (dir / "M.usage")) |
     throw <| IO.userError s!"elaboration failed:\n{src}"
   let obs := (← ModuleUsage.commandObservations).qsort (·.i < ·.i)
-  let (md, _) ← readModuleData (dir / "M.olean")
-  let payloads := CommandEntries.ofModuleData md
+  let some first := obs[0]? | throw <| IO.userError "no commands"
+  let permit ← IO.ofExcept (← ModuleUsage.Testing.keepPermit first.before.env `M (dir / "M.olean") (dir / "M.usage"))
+  let payloads := permit.payloads
   let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
-  return { src, obs, payloads, usage }
+  return { src, obs, permit, payloads, usage }
 
 /-- Elaborates the commands after `i` on top of `env`, from command `i`'s before-state. -/
 def continueFrom (r : Run) (i : Nat) (env : Environment) : IO Elab.Command.State := do
@@ -48,10 +50,9 @@ unsafe def check (dir : System.FilePath) (label : String) (ext : Name) (src : St
     fun c => (c.getObjValAs? String "kind").toOption).getD "?"
   IO.println s!"{label}: command {i} {kind}, refused for {ext} {(ce.refusals.filterMap (·.ext?)).contains ext}, entries \
     {(ce.checked.entries ++ ce.main.entries).any (·.1 == ext)}, scoped ops {ce.main.scopedOps.any (·.1 == ext)}, \
-    noskip {(r.usage.getObjValAs? Bool "noskip").toOption}"
-  let permit ← IO.ofExcept <| ModuleUsage.keepPermit o.before.env (← IO.ofExcept <| ModuleUsage.ResolutionRecord.ofUsage r.usage)
+    noreuse {(r.usage.getObjValAs? Bool "noreuse").toOption}"
   let replayed? ← try
-      pure (some (← replayCommandEntries permit (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}))
+      pure (some (← replayCommandEntries r.permit (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}))
     catch _ => pure none
   match replayed?, probe? with
   | none, _ => IO.println "  replay refused"

@@ -1,8 +1,8 @@
-macro rules: command 3 decl, refused for Lean.Elab.macroAttribute false, entries false, scoped ops true, noskip (some false)
+macro rules: command 3 decl, refused for Lean.Elab.macroAttribute false, entries false, scoped ops true, noreuse (some false)
   y: full run OfNat.ofNat.{0} Nat 2 (instOfNatNat 2), after replay OfNat.ofNat.{0} Nat 2 (instOfNatNat 2)
-instances: command 3 decl, refused for Lean.Meta.instanceExtension false, entries false, scoped ops true, noskip (some false)
+instances: command 3 decl, refused for Lean.Meta.instanceExtension false, entries false, scoped ops true, noreuse (some false)
   y: full run C.v i2, after replay C.v i2
-simp lemmas: command 4 decl, refused for Lean.Meta.simpExtension false, entries false, scoped ops true, noskip (some false)
+simp lemmas: command 4 decl, refused for Lean.Meta.simpExtension false, entries false, scoped ops true, noreuse (some false)
   replay accepted
-notations: command 2 decl, refused for Lean.Parser.parserExtension false, entries false, scoped ops true, noskip (some false)
+notations: command 2 decl, refused for Lean.Parser.parserExtension false, entries false, scoped ops true, noreuse (some false)
   replay accepted

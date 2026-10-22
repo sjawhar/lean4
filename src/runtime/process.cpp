@@ -65,6 +65,8 @@ lean_object * wrap_win_handle(HANDLE h) {
 }
 
 extern "C" LEAN_EXPORT obj_res lean_io_process_get_current_dir() {
+    if (uint32 ctx = effect_context())
+        note_effect(ctx, "reads the working directory");
     char path[MAX_PATH];
     DWORD sz = GetCurrentDirectory(MAX_PATH, path);
     if (sz != 0) {
@@ -75,6 +77,8 @@ extern "C" LEAN_EXPORT obj_res lean_io_process_get_current_dir() {
 }
 
 extern "C" LEAN_EXPORT obj_res lean_io_process_set_current_dir(b_obj_arg path) {
+    if (uint32 ctx = effect_context())
+        note_effect(ctx, std::string("changes the working directory to ") + string_cstr(path));
     if (SetCurrentDirectory(string_cstr(path))) {
         return io_result_mk_ok(box(0));
     } else {
@@ -318,6 +322,8 @@ void finalize_process() {}
 #else
 
 extern "C" LEAN_EXPORT obj_res lean_io_process_get_current_dir() {
+    if (uint32 ctx = effect_context())
+        note_effect(ctx, "reads the working directory");
     char path[PATH_MAX];
     if (getcwd(path, PATH_MAX)) {
         return io_result_mk_ok(mk_string(path));
@@ -327,6 +333,8 @@ extern "C" LEAN_EXPORT obj_res lean_io_process_get_current_dir() {
 }
 
 extern "C" LEAN_EXPORT obj_res lean_io_process_set_current_dir(b_obj_arg path) {
+    if (uint32 ctx = effect_context())
+        note_effect(ctx, std::string("changes the working directory to ") + string_cstr(path));
     if (!chdir(string_cstr(path))) {
         return io_result_mk_ok(box(0));
     } else {
@@ -695,6 +703,9 @@ extern "C" lean_object* lean_mk_io_error_other_error(uint32_t, lean_object*);
 
 extern "C" LEAN_EXPORT obj_res lean_io_process_spawn(obj_arg args_) {
     object_ref args(args_);
+    // a child process acts on state no task context accounts for
+    if (uint32 ctx = effect_context())
+        note_effect(ctx, std::string("spawns the process ") + string_cstr(cnstr_get(args.raw(), 1)));
     object_ref stdio_cfg = cnstr_get_ref(args, 0);
     stdio stdin_mode  = static_cast<stdio>(cnstr_get_uint8(stdio_cfg.raw(), 0));
     stdio stdout_mode = static_cast<stdio>(cnstr_get_uint8(stdio_cfg.raw(), 1));

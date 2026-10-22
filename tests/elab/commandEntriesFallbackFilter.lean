@@ -2,7 +2,7 @@ import Lean
 /-! An extension with no typed state delta whose exporter keeps only keys that are constants: a declaration
 attribute inserts `d.later` (command 0) before `def d.later` declares it (command 1), so the entry shows up in
 the export one command after the state change. Its state change refuses command 0's payload (`replayCommandEntries`
-throws on it), and the module is declined (`noskip`); nothing is recorded for
+throws on it), and no command of the module is kept (`noreuse`); nothing is recorded for
 command 1, whose state did not change. -/
 open Lean
 
@@ -41,11 +41,11 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let some o₀ := obs[0]? | throw <| IO.userError "no observation 0"
   let some o₁ := obs[1]? | throw <| IO.userError "no observation 1"
   IO.println s!"full run: export after command 0 {exportOf o₀.after.env}, after command 1 {exportOf o₁.after.env}"
-  let (md, _) ← readModuleData (dir / "M.olean")
-  let payloads := CommandEntries.ofModuleData md
+  let some first := obs[0]? | throw <| IO.userError "no commands"
+  let permit ← IO.ofExcept (← ModuleUsage.Testing.keepPermit first.before.env `M (dir / "M.olean") (dir / "M.usage"))
+  let payloads := permit.payloads
   let some ce₀ := payloads.find? (·.idx == 0) | throw <| IO.userError "no payload 0"
   let some ce₁ := payloads.find? (·.idx == 1) | throw <| IO.userError "no payload 1"
-  let permit ← IO.ofExcept <| ModuleUsage.keepPermit o₀.before.env (← ModuleUsage.ResolutionRecord.read (dir / "M.usage"))
   try
     let env ← replayCommandEntries permit (← CommandEntries.Testing.rollbackTo o₀.before.env o₀.after.env) ce₀ {}
     IO.println s!"command 0 (@[pre_tag] def d): replayed: state has d.later {(state env).contains `d.later} \
@@ -54,7 +54,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
     IO.println s!"command 0 (@[pre_tag] def d): refused: {e}"
   IO.println s!"command 1 (def d.later): preExt payload {preEntries ce₁}"
   let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
-  IO.println s!"noskip: {(usage.getObjValAs? Bool "noskip").toOption}, \
-    reason: {(usage.getObjValAs? String "noskipReason").toOption}"
+  IO.println s!"noreuse: {(usage.getObjValAs? Bool "noreuse").toOption}, \
+    reason: {(usage.getObjValAs? String "noreuseReason").toOption}"
 
 #eval main

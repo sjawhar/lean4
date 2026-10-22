@@ -471,6 +471,20 @@ def _root_.Lean.Environment.setSynthCache (env : Environment) (c : SynthInstance
   let c : PersistentSynthInstanceCache := { gen := env.trackedGen, entries := c }
   { env with synthCacheRaw? := some (unsafe unsafeCast c) }
 
+/-- The persistent tier as stored: the `Environment.trackedGen` its entries were recorded at and the entries, also
+when that is not the environment's (`synthCache` then gives none); `none` when unset. -/
+def _root_.Lean.Environment.storedSynthCache? (env : Environment) : Option (Nat × SynthInstanceCache) :=
+  env.synthCacheRaw?.map fun (v : NonScalar) =>
+    -- safety: only `setSynthCache` and `setStoredSynthCache` store a value
+    let c : PersistentSynthInstanceCache := unsafe unsafeCast v
+    (c.gen, c.entries)
+
+/-- Replaces the stored persistent tier (`storedSynthCache?`). -/
+def _root_.Lean.Environment.setStoredSynthCache (env : Environment) (c? : Option (Nat × SynthInstanceCache)) :
+    Environment :=
+  { env with synthCacheRaw? := c?.map fun (gen, entries) =>
+    unsafe unsafeCast ({ gen, entries } : PersistentSynthInstanceCache) }
+
 /--
 The free-variable normalization of a local instance context (see `Lean.Meta.SynthNorm`): every free
 variable reachable from the local instances, transitively through their types, by canonical
@@ -2835,8 +2849,6 @@ def realizeValue [BEq α] [Hashable α] [TypeName α] [TypeName β] (forConst : 
     fileName := coreCtx.fileName, fileMap := coreCtx.fileMap
     -- heartbeat limits inside `realizeAndReport` should be measured from this point on
     initHeartbeats := (← IO.getNumHeartbeats)
-    -- uses recorded by the realization belong to the command that requested it first
-    cmdIdx? := coreCtx.cmdIdx?
   }
   let res ← env.realizeValue forConst key (realizeAndReport (.mk <$> realize) coreCtx)
   let some res := res.get? RealizeValueResult | unreachable!
@@ -2931,8 +2943,6 @@ def realizeConst (forConst : Name) (constName : Name) (realize : MetaM Unit) :
       fileName := coreCtx.fileName, fileMap := coreCtx.fileMap
       -- heartbeat limits inside `realizeAndReport` should be measured from this point on
       initHeartbeats := (← IO.getNumHeartbeats)
-      -- uses and declarations recorded by the realization belong to the command that requested it first
-      cmdIdx? := coreCtx.cmdIdx?
     }
     let (env, exTask, dyn) ← env.realizeConst forConst constName (realizeAndReport coreCtx)
     -- Realizations cannot be cancelled as their result is shared across elaboration runs

@@ -254,7 +254,12 @@ typedef struct {
 typedef struct {
     lean_object   m_header;
     lean_object * m_value;
+    /* The task context in force when the reference was created (`lean_io_set_task_context`), or
+       `LEAN_REF_ACCOUNTED` for a reference whose writes the effect notes skip (`lean_io_mark_ref_accounted`). */
+    uint32_t      m_context;
 } lean_ref_object;
+
+#define LEAN_REF_ACCOUNTED 0xFFFFFFFFu
 
 typedef struct {
     lean_object            m_header;
@@ -276,7 +281,8 @@ typedef struct {
     // If true, task will not be freed until finished
     uint8_t              m_keep_alive;
     uint8_t              m_deleted;
-    // The task context of the thread that created the task, in force while it runs (`lean_io_set_task_context`)
+    // The task context of the thread that created the task, in force while it runs (`lean_io_set_task_context`). For a
+    // promise's task, the context that created the promise, or `LEAN_REF_ACCOUNTED` (`lean_io_mark_promise_accounted`).
     uint32_t             m_context;
 } lean_task_imp;
 

@@ -407,11 +407,12 @@ def runFrontend
       let recs ← ModuleUsage.moduleRecords env own stmt (sessionChanged := (← lastFrontendRun) != run)
       let provides := ModuleUsage.ownProvides env
       let indirect := ModuleUsage.ownIndirect env
-      return (usageFileName, nodes, own, ModuleUsage.closureDigest env own provides, provides, indirect, stmt, recs)
+      return (usageFileName, oleanFileName, nodes, own, ModuleUsage.closureDigest env own provides, provides, indirect,
+        stmt, recs)
     profileitIO ".olean serialization" finalOpts do
       let commandLints := collectCommandLints snaps none #[]
       let env ← Linter.recordLints inputCtx.fileMap env commandLints
-      let env := usage?.elim env fun (_, _, own, closure, provides, indirect, stmt, recs) =>
+      let env := usage?.elim env fun (_, _, _, own, closure, provides, indirect, stmt, recs) =>
         let env := ModuleUsage.setLocalStmt (ModuleUsage.setLocalDigests env own closure provides indirect) stmt
         setCommandEntries env recs.payloads
       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
@@ -441,11 +442,11 @@ def runFrontend
     Firefox.Profile.serve <| Json.compress <| toJson profile
 
   -- Last of the outputs: the usage data records every name resolved in writing the others.
-  if let some (usageFileName, nodes, own, closure, provides, indirect, stmt, recs) := usage? then
+  if let some (usageFileName, oleanFileName, nodes, own, closure, provides, indirect, stmt, recs) := usage? then
     let used := ModuleUsage.usedFromInfoTrees trees (← usedNames)
     ModuleUsage.writeUsage env nodes own closure provides indirect used (← lookedUpSpecKeys) stmt
       (recs.commands.map toJson) (incrLoaded := incrLoadFileName?.isSome) usageFileName
-      (noskipReason? := recs.noskipReason?)
+      (← ModuleUsage.fileDigest oleanFileName) (noreuseReason? := recs.noreuseReason?)
 
   -- no point in freeing the snapshot graph and all referenced data this close to process exit
   Runtime.forget snaps

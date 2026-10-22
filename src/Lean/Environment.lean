@@ -1084,7 +1084,8 @@ private def insertRealizationContext (env : Environment) (c : Name) (ctxEnv : En
     -- safety: `RealizationContext` is private
     env := unsafe unsafeCast ctxEnv
     opts
-    realizeMapRef := (← IO.mkRef {}) } }
+    -- a command's realizations are in its payload's records, wherever the context was registered
+    realizeMapRef := (← mkAccountedRef {}) } }
 
 /--
 Allows `realizeConst` calls for the given declaration in all derived environment branches.
@@ -3183,7 +3184,8 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
     -- safety: `RealizationContext` is private
     env := unsafe unsafeCast env
     opts
-    realizeMapRef := (← IO.mkRef {})
+    -- a command's realizations are in its payload's records
+    realizeMapRef := (← mkAccountedRef {})
   } }
 
 /--
@@ -3272,10 +3274,8 @@ def displayStats (env : Environment) : IO Unit := do
     unless fmt.isNil do IO.println ("  " ++ toString (Format.nest 2 (extDescr.statsFn s.state)))
     IO.println ("  number of imported entries: " ++ toString (s.importedEntries.foldl (fun sum es => sum + es.size) 0))
 
-/-- `decision`: the constant is a `Bool` or a `Decidable` instance, whose code computes a value and runs no action. -/
 @[extern "lean_eval_const"]
-private unsafe opaque evalConstCore (α) (env : @& Environment) (opts : @& Options) (constName : @& Name)
-  (decision : Bool) : Except String α
+private unsafe opaque evalConstCore (α) (env : @& Environment) (opts : @& Options) (constName : @& Name) : Except String α
 
 set_option compiler.ignoreBorrowAnnotation true in
 @[extern "lean_eval_check_meta"]
@@ -3295,8 +3295,7 @@ such as in `#eval`.
 @[noinline] unsafe def evalConst (α) (env : @& Environment) (opts : @& Options) (constName : @& Name) (checkMeta := true) : Except String α := do
   if checkMeta then
     evalCheckMeta env constName
-  let decision := (env.find? constName).any fun c => c.type.isConstOf ``Bool || c.type.getAppFn.isConstOf ``Decidable
-  evalConstCore α env opts constName decision
+  evalConstCore α env opts constName
 
 private def throwUnexpectedType {α} (typeName : Name) (constName : Name) : ExceptT String Id α :=
   throw ("unexpected type at '" ++ toString constName ++ "', `" ++ toString typeName ++ "` expected")

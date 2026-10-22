@@ -55,8 +55,9 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let some fullEnv ← Elab.runFrontend mSource (Options.empty.setBool `linter.deprecated.syntax false) "M.lean" `M (oleanFileName? := some (dir / "M.olean")) (usageFileName? := some (dir / "M.usage")) |
     throw <| IO.userError "full elaboration failed"
   let obs := (← ModuleUsage.commandObservations).qsort (·.i < ·.i)
-  let (md, _) ← readModuleData (dir / "M.olean")
-  let payloads := CommandEntries.ofModuleData md
+  let some first := obs[0]? | throw <| IO.userError "no commands"
+  let permit ← IO.ofExcept (← ModuleUsage.Testing.keepPermit first.before.env `M (dir / "M.olean") (dir / "M.usage"))
+  let payloads := permit.payloads
   let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
   let records := (usage.getObjValAs? (Array Json) "commands").toOption.getD #[]
   -- commands: 0 `open`, 1 and 2 `fresh_axiom`, 3 `theorem pm`
@@ -64,7 +65,6 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let some ce := payloads.find? (·.idx == 1) | throw <| IO.userError "no payload 1"
   let post := (records[1]?.bind fun r => (r.getObjVal? "post").toOption).getD .null
   IO.println s!"full run: {localNames fullEnv}; command 1 refusals {ce.refusals}"
-  let permit ← IO.ofExcept <| ModuleUsage.keepPermit kept.before.env (← IO.ofExcept <| ModuleUsage.ResolutionRecord.ofUsage usage)
   let replayed ← replayCommandEntries permit (← CommandEntries.Testing.rollbackTo kept.before.env kept.after.env) ce {}
   let ctx : Command.Context := { fileName := "M.lean", fileMap := mSource.toFileMap, snap? := none, cancelTk? := none }
   let fullValue := (fullEnv.find? `pm).bind (·.value? (allowOpaque := true))
@@ -95,15 +95,15 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let some nEnv ← Elab.runFrontend nSource (Options.empty.setBool `linter.deprecated.syntax false) "N.lean" `N (oleanFileName? := some (dir / "N.olean")) (usageFileName? := some (dir / "N.usage")) |
     throw <| IO.userError "full elaboration of N failed"
   let obs := (← ModuleUsage.commandObservations).qsort (·.i < ·.i)
-  let (md, _) ← readModuleData (dir / "N.olean")
-  let payloads := CommandEntries.ofModuleData md
+  let some first := obs[0]? | throw <| IO.userError "no commands"
+  let permit ← IO.ofExcept (← ModuleUsage.Testing.keepPermit first.before.env `N (dir / "N.olean") (dir / "N.usage"))
+  let payloads := permit.payloads
   let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "N.usage"))
   let records := (usage.getObjValAs? (Array Json) "commands").toOption.getD #[]
   let some kept := obs.find? (·.i == 2) | throw <| IO.userError "no observation 2 in N"
   let some next := obs.find? (·.i == 3) | throw <| IO.userError "no observation 3 in N"
   let some ce := payloads.find? (·.idx == 2) | throw <| IO.userError "no payload 2 in N"
   let post := (records[2]?.bind fun r => (r.getObjVal? "post").toOption).getD .null
-  let permit ← IO.ofExcept <| ModuleUsage.keepPermit kept.before.env (← IO.ofExcept <| ModuleUsage.ResolutionRecord.ofUsage usage)
   let replayed ← replayCommandEntries permit (← CommandEntries.Testing.rollbackTo kept.before.env kept.after.env) ce {}
   let ngen ← IO.ofExcept (restored post kept.before.ngen)
   let ctx : Command.Context := { fileName := "N.lean", fileMap := nSource.toFileMap, snap? := none, cancelTk? := none }

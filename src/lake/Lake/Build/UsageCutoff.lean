@@ -76,67 +76,40 @@ structure UsekeySidecar where
   extra : NameMap (ModuleUsage.Digest × ModuleUsage.Digest)
   deriving TypeName
 
-/--
-A name in a usage sidecar, as `Lean.ModuleUsage.nameToJson` writes it: the JSON array of its
-components, root first, each a string or a number. Unlike `toJson Name`, this round-trips
-macro-scoped names.
--/
-structure SidecarName where
-  name : Name
-
-instance : FromJson SidecarName where
-  fromJson? j := do
-    let n ← (← j.getArr?).foldlM (init := Name.anonymous) fun p c => do
-      match c with
-      | .str s => return Name.mkStr p s
-      | .num _ => return Name.mkNum p (← fromJson? c)
-      | _ => throw s!"expected a name component, got {c.compress}"
-    return ⟨n⟩
-
 /-- Reads a JSON array of `[name, digest, digest]` triples into a map. -/
 def nameDigestPairs (j : Json) : Except String (NameMap (ModuleUsage.Digest × ModuleUsage.Digest)) := do
   (← j.getArr?).foldlM (init := {}) fun m e => do
     let #[n, a, b] ← e.getArr? | throw s!"expected a triple, got {e.compress}"
-    return m.insert (← fromJson? (α := SidecarName) n).name (← fromJson? a, ← fromJson? b)
+    return m.insert (← fromJson? (α := ModuleUsage.JName) n).name (← fromJson? a, ← fromJson? b)
 
 /-- Reads a JSON array of names. -/
 def namesOfJson (j : Json) : Except String (Array Name) :=
-  return (← fromJson? (α := Array SidecarName) j).map (·.name)
+  return (← fromJson? (α := Array ModuleUsage.JName) j).map (·.name)
 
 /-- Reads a module's `provides`: a JSON pair of name arrays. -/
 def providesOfJson (j : Json) : Except String (Array Name × Array Name) := do
   let #[k, e] ← j.getArr? | throw s!"expected a pair of name arrays, got {j.compress}"
   return (← namesOfJson k, ← namesOfJson e)
 
-/-- Reads a `.usage`'s `resolved` groups: `[module or null, [[name, kinds], ...]]`. -/
-def resolvedOfJson (j : Json) : Except String (Array (Option Name × Array (Name × UInt8))) := do
-  (← j.getArr?).mapM fun g => do
-    let #[m, ns] ← g.getArr? | throw s!"expected a pair, got {g.compress}"
-    let m? ← if m.isNull then pure none else some <$> (·.name) <$> fromJson? (α := SidecarName) m
-    let ns ← (← ns.getArr?).mapM fun e => do
-      let #[n, k] ← e.getArr? | throw s!"expected a pair, got {e.compress}"
-      return ((← fromJson? (α := SidecarName) n).name, (← fromJson? (α := Nat) k).toUInt8)
-    return (m?, ns)
-
 instance : FromJson UsageSidecar where
   fromJson? j := do
-    let own ← j.getObjValAs? (Array (SidecarName × ModuleUsage.Digest)) "own"
-    let used ← j.getObjValAs? (Array (SidecarName × Array (SidecarName × ModuleUsage.Digest))) "used"
-    let extra ← j.getObjValAs? (Array (SidecarName × Bool)) "extra"
-    let specKeys ← j.getObjValAs? (Array (ModuleUsage.Digest × SidecarName)) "specKeys"
+    let own ← j.getObjValAs? (Array (ModuleUsage.JName × ModuleUsage.Digest)) "own"
+    let used ← j.getObjValAs? (Array (ModuleUsage.JName × Array (ModuleUsage.JName × ModuleUsage.Digest))) "used"
+    let extra ← j.getObjValAs? (Array (ModuleUsage.JName × Bool)) "extra"
+    let specKeys ← j.getObjValAs? (Array (ModuleUsage.Digest × ModuleUsage.JName)) "specKeys"
     return {
       noskip := ← j.getObjValAs? Bool "noskip"
       moduleDigest := ← j.getObjValAs? ModuleUsage.Digest "moduleDigest"
       closure := ← j.getObjValAs? ModuleUsage.Digest "closure"
-      digested := (← j.getObjValAs? (Array (SidecarName × ModuleUsage.Digest)) "digested").map fun (n, d) => (n.name, d)
-      importedClosures := (← j.getObjValAs? (Array (SidecarName × ModuleUsage.Digest)) "importedClosures").foldl
+      digested := (← j.getObjValAs? (Array (ModuleUsage.JName × ModuleUsage.Digest)) "digested").map fun (n, d) => (n.name, d)
+      importedClosures := (← j.getObjValAs? (Array (ModuleUsage.JName × ModuleUsage.Digest)) "importedClosures").foldl
         (init := {}) fun m (n, d) => m.insert n.name d
-      importedDigests := (← j.getObjValAs? (Array (SidecarName × ModuleUsage.Digest)) "importedDigests").foldl
+      importedDigests := (← j.getObjValAs? (Array (ModuleUsage.JName × ModuleUsage.Digest)) "importedDigests").foldl
         (init := {}) fun m (n, d) => m.insert n.name d
       own := own.foldl (init := {}) fun m (n, d) => m.insert n.name d
       used := used.map fun (m, cs) => (m.name, cs.map fun (c, d) => (c.name, d))
       extra := extra.map (·.1.name)
-      resolved := ← resolvedOfJson (← j.getObjVal? "resolved")
+      resolved := ← ModuleUsage.resolvedOfJson (← j.getObjVal? "resolved")
       resolvedAll := ← j.getObjValAs? Bool "resolvedAll"
       providesDigest := ← j.getObjValAs? ModuleUsage.Digest "providesDigest"
       provides := ← providesOfJson (← j.getObjVal? "provides")
@@ -167,8 +140,8 @@ sidecar that `UsageSidecar` would reject fails its own module's check, and the i
 the `.olean` through the `.usekey`. -/
 instance : FromJson UsageImport where
   fromJson? j := do
-    let own ← j.getObjValAs? (Array (SidecarName × ModuleUsage.Digest)) "own"
-    let specKeys ← j.getObjValAs? (Array (ModuleUsage.Digest × SidecarName)) "specKeys"
+    let own ← j.getObjValAs? (Array (ModuleUsage.JName × ModuleUsage.Digest)) "own"
+    let specKeys ← j.getObjValAs? (Array (ModuleUsage.Digest × ModuleUsage.JName)) "specKeys"
     return {
       moduleDigest := ← j.getObjValAs? ModuleUsage.Digest "moduleDigest"
       closure := ← j.getObjValAs? ModuleUsage.Digest "closure"

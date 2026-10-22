@@ -1,0 +1,16 @@
+same imported module names: true
+C in E1: granted
+C in E2: refused: resolution changed: `ru` resolved to `U` (kinds 1) when the module was compiled, and resolves to `Z` (kinds 2) here
+E1's permit for C, keeping C's t into E1: kept (t in the result: true)
+E1's permit for C, keeping C's t into E2: keep threw: reuse: the keep permit was checked in an environment with other imports
+C2 in E2: granted
+E2's permit for C2, keeping C's t into E2 as C2: keep threw: reuse: command 0's payload is not one the keep permit holds
+E2's permit for C2, keeping C's t into E2: keep threw: reuse: the keep permit was checked in an environment with other imports
+C2's .usage for C: refused: the `.usage` is of `C2`, not `C`
+C2 in E1, an environment of C: refused: the environment is of `C`, not `C2`
+C3 in E1: granted
+C3 in E2: refused: resolution changed: the compile read the defining module of every name, and the imported modules' provides differ here
+names recorded as resolved by keepPermit: 0, whole map read: false
+C's .usage with another .olean: refused: the `.usage` was not written with this `.olean`
+C4: granted
+C4 with V changed: refused: `V`, which carries no usage digests, is not the `.olean` the module was compiled against

@@ -1,4 +1,4 @@
-noskip (some true), reason (some (declaration command 0: a change to mainLog that no entry expresses))
+noreuse (some true), reason (some (declaration command 0: a change to mainLog that no entry expresses))
 0: refused for #[mainLog, mainLog], entries #[]; refused
 1: refused for #[myParamExt, myParamExt], entries #[]; refused
 2: refused for #[scopeExt, scopeExt], entries #[]; refused

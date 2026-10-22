@@ -121,4 +121,4 @@ def loadPlugin (path : System.FilePath) (initFn? : Option String := none) : IO U
   -/
   -- Marked so that state the initializers set up for every later environment is recorded where it is set up
   -- (`Lean.registerReservedNamePredicate`).
-  withPluginLoading <| withForeignStateTagged (unsafe sym.runAsInit)
+  withPluginLoading (unsafe sym.runAsInit)

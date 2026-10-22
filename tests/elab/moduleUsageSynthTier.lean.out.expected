@@ -1,0 +1,2 @@
+lean #[-o, TD.olean, TD.lean]: exit 0
+lean #[-o, TD.olean, --usage=TD.usage, TD.lean]: exit 0

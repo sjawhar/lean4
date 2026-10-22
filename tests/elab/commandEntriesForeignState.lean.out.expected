@@ -1,8 +1,0 @@
-command 0: refusals #[]
-command 1: refusals #[a write to state an imported module's initializer created]
-command 2: refusals #[a write to state an imported module's initializer created]
-command 3: refusals #[a write to state an imported module's initializer created]
-command 4: refusals #[]
-command 5: refusals #[]
-command 6: refusals #[]
-command 7: refusals #[]

@@ -40,6 +40,9 @@ Authors: Leonardo de Moura, Sebastian Ullrich
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <atomic>
+#include <unordered_map>
+#include <unordered_set>
 #include <cstdlib>
 #include <cctype>
 #include <cmath>
@@ -95,7 +98,11 @@ static obj_res mk_file_not_found_error(b_obj_arg fname) {
 
 static lean_external_class * g_io_handle_external_class = nullptr;
 
+static void forget_handle(FILE * fp);
+static void note_handle_open(FILE * fp);
+
 static void io_handle_finalizer(void * h) {
+    forget_handle(static_cast<FILE *>(h));
     // There is no sensible way to handle errors here; in particular, we should
     // not panic as finalizing a handle that already is in an invalid state
     // (broken pipe etc.) should work and not terminate the process. The same
@@ -106,7 +113,9 @@ static void io_handle_finalizer(void * h) {
 static void io_handle_foreach(void * /* mod */, b_obj_arg /* fn */) {
 }
 
+// Every handle Lean code gets is made here, so a context owns the handles it opens, also a child process's pipes.
 lean_object * io_wrap_handle(FILE *hfile) {
+    note_handle_open(hfile);
     return lean_alloc_external(g_io_handle_external_class, hfile);
 }
 
@@ -161,6 +170,15 @@ extern "C" LEAN_EXPORT obj_res lean_get_set_stderr(obj_arg h) {
 static FILE * io_get_handle(lean_object * hfile) {
     return static_cast<FILE *>(lean_get_external_data(hfile));
 }
+
+// effect notes (`lean_io_take_effects`)
+static void note_path_use(char const * what, char const * p);
+static void note_path_create(char const * what, char const * p, bool dir);
+static void note_path_created(char const * p, bool dir);
+static void note_path_remove(char const * what, char const * p);
+static void note_handle_use(FILE * fp);
+static void note_handle_open(FILE * fp);
+static void forget_handle(FILE * fp);
 
 /* Translates a CRT `errno` value into the corresponding libuv error code.
    (`uv_translate_sys_error` is unsuitable for this: on Windows it expects Win32 system error
@@ -392,6 +410,7 @@ extern "C" LEAN_EXPORT obj_res lean_chmod (b_obj_arg filename, uint32_t mode) {
     if (strlen(fname) != lean_string_size(filename) - 1) {
         return mk_embedded_nul_error(filename);
     }
+    note_path_use("changes the permissions of", fname);
     if (!chmod(fname, mode)) {
         return io_result_mk_ok(box(0));
     } else {
@@ -421,6 +440,11 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_mk(b_obj_arg filename, uint8 
     const char* fname = string_cstr(filename);
     if (strlen(fname) != lean_string_size(filename) - 1) {
         return mk_embedded_nul_error(filename);
+    }
+    switch (mode) {
+    case 0: note_path_use("reads", fname); break;
+    case 3: note_path_use("writes", fname); break;
+    default: note_path_create("writes", fname, false); break;
     }
     int fd = open(fname, flags, 0666);
     if (fd == -1) {
@@ -507,6 +531,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_set_inheritable(b_obj_arg h, 
 /* Handle.lock : (@& Handle) → (exclusive : Bool) → IO Unit */
 extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_lock(b_obj_arg h, uint8_t x) {
     FILE * fp = io_get_handle(h);
+    note_handle_use(fp);
     if (!flock(fileno(fp), x ? LOCK_EX : LOCK_SH)) {
         return io_result_mk_ok(box(0));
     } else {
@@ -517,6 +542,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_lock(b_obj_arg h, uint8_t x) 
 /* Handle.tryLock : (@& Handle) → (exclusive : Bool) → IO Bool */
 extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_try_lock(b_obj_arg h, uint8_t x) {
     FILE * fp = io_get_handle(h);
+    note_handle_use(fp);
     if (!flock(fileno(fp), (x ? LOCK_EX : LOCK_SH) | LOCK_NB)) {
         return io_result_mk_ok(box(1));
     } else {
@@ -531,6 +557,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_try_lock(b_obj_arg h, uint8_t
 /* Handle.unlock : (@& Handle) → IO Unit */
 extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_unlock(b_obj_arg h) {
     FILE * fp = io_get_handle(h);
+    note_handle_use(fp);
     if (!flock(fileno(fp), LOCK_UN)) {
         return io_result_mk_ok(box(0));
     } else {
@@ -581,6 +608,7 @@ extern "C" LEAN_EXPORT uint8_t lean_io_prim_handle_is_tty(b_obj_arg h) {
 /* Handle.flush : (@& Handle) → IO Unit */
 extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_flush(b_obj_arg h) {
     FILE * fp = io_get_handle(h);
+    note_handle_use(fp);
     if (!std::fflush(fp)) {
         return io_result_mk_ok(box(0));
     } else {
@@ -591,6 +619,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_flush(b_obj_arg h) {
 /* Handle.rewind : (@& Handle) → IO Unit */
 extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_rewind(b_obj_arg h) {
     FILE * fp = io_get_handle(h);
+    note_handle_use(fp);
     if (!std::fseek(fp, 0, SEEK_SET)) {
         return io_result_mk_ok(box(0));
     } else {
@@ -601,6 +630,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_rewind(b_obj_arg h) {
 /* Handle.truncate : (@& Handle) → IO Unit */
 extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_truncate(b_obj_arg h) {
     FILE * fp = io_get_handle(h);
+    note_handle_use(fp);
 #ifdef LEAN_WINDOWS
     if (!_chsize_s(_fileno(fp), _ftelli64(fp))) {
 #else
@@ -615,6 +645,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_truncate(b_obj_arg h) {
 /* Handle.read : (@& Handle) → USize → IO ByteArray */
 extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_read(b_obj_arg h, usize nbytes) {
     FILE * fp = io_get_handle(h);
+    note_handle_use(fp);
     if (lean_alloc_sarray_would_overflow(1, nbytes)) {
         return io_result_mk_error(decode_io_error(ENOMEM, NULL));
     }
@@ -640,6 +671,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_read(b_obj_arg h, usize nbyte
 /* Handle.write : (@& Handle) → (@& ByteArray) → IO Unit */
 extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_write(b_obj_arg h, b_obj_arg buf) {
     FILE * fp = io_get_handle(h);
+    note_handle_use(fp);
     usize n = lean_sarray_size(buf);
     usize m = std::fwrite(lean_sarray_cptr(buf), 1, n, fp);
     if (m == n) {
@@ -666,6 +698,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_write(b_obj_arg h, b_obj_arg 
 /* Handle.getLine : (@& Handle) → IO Unit */
 extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_get_line(b_obj_arg h) {
     FILE * fp = io_get_handle(h);
+    note_handle_use(fp);
 
     std::string result;
     int c; // Note: int, not char, required to handle EOF
@@ -692,6 +725,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_get_line(b_obj_arg h) {
 /* Handle.putStr : (@& Handle) → (@& String) → IO Unit */
 extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_put_str(b_obj_arg h, b_obj_arg s) {
     FILE * fp = io_get_handle(h);
+    note_handle_use(fp);
     usize n = lean_string_size(s) - 1; // - 1 to ignore the terminal NULL byte.
     usize m = std::fwrite(lean_string_cstr(s), 1, n, fp);
     if (m == n) {
@@ -1024,6 +1058,8 @@ extern "C" LEAN_EXPORT obj_res lean_io_getenv(b_obj_arg env_var) {
         return mk_option_none();
     }
 #else
+    if (uint32 ctx = effect_context())
+        note_effect(ctx, std::string("reads the environment variable ") + env_var_str);
     char * val = std::getenv(env_var_str);
     if (val) {
         return mk_option_some(mk_string(val));
@@ -1035,6 +1071,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_getenv(b_obj_arg env_var) {
 
 extern "C" LEAN_EXPORT obj_res lean_io_realpath(obj_arg filename) {
     const char* fname = string_cstr(filename);
+    note_path_use("reads", fname);
     if (strlen(fname) != lean_string_size(filename) - 1) {
         obj_res res = mk_embedded_nul_error(filename);
         dec_ref(filename);
@@ -1097,6 +1134,7 @@ constant readDir : @& FilePath → IO (Array DirEntry)
 */
 extern "C" LEAN_EXPORT obj_res lean_io_read_dir(b_obj_arg dirname) {
     const char* dirname_ptr = string_cstr(dirname);
+    note_path_use("reads", dirname_ptr);
     if (strlen(dirname_ptr) != lean_string_size(dirname) - 1) {
         return mk_embedded_nul_error(dirname);
     }
@@ -1167,6 +1205,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_metadata(b_obj_arg filename) {
     if (strlen(fname) != lean_string_size(filename) - 1) {
         return mk_embedded_nul_error(filename);
     }
+    note_path_use("reads", fname);
     uv_fs_t req;
     int ret = uv_fs_stat(NULL, &req, fname, NULL);
     if (ret < 0) {
@@ -1187,6 +1226,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_symlink_metadata(b_obj_arg filename) {
     if (strlen(fname) != lean_string_size(filename) - 1) {
         return mk_embedded_nul_error(filename);
     }
+    note_path_use("reads", fname);
     uv_fs_t req;
     int ret = uv_fs_lstat(NULL, &req, fname, NULL);
     if (ret < 0) {
@@ -1209,6 +1249,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_is_same_file(b_obj_arg p1, b_obj_arg p2) 
         if (strlen(fname) != lean_string_size(ps[i]) - 1) {
             return mk_embedded_nul_error(ps[i]);
         }
+        note_path_use("reads", fname);
         uv_fs_t req;
         int ret = uv_fs_stat(NULL, &req, fname, NULL);
         if (ret < 0) {
@@ -1226,6 +1267,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_create_dir(b_obj_arg p) {
     if (strlen(str) != lean_string_size(p) - 1) {
         return mk_embedded_nul_error(p);
     }
+    note_path_create("creates", str, true);
 #ifdef LEAN_WINDOWS
     if (mkdir(str) == 0) {
 #else
@@ -1242,6 +1284,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_remove_dir(b_obj_arg p) {
     if (strlen(str) != lean_string_size(p) - 1) {
         return mk_embedded_nul_error(p);
     }
+    note_path_remove("removes", str);
     if (rmdir(str) == 0) {
         return io_result_mk_ok(box(0));
     } else {
@@ -1257,6 +1300,12 @@ extern "C" LEAN_EXPORT obj_res lean_io_rename(b_obj_arg from, b_obj_arg to) {
     const char* to_str = string_cstr(to);
     if (strlen(to_str) != lean_string_size(to) - 1) {
         return mk_embedded_nul_error(to);
+    }
+    {
+        struct stat st;
+        bool dir = stat(from_str, &st) == 0 && S_ISDIR(st.st_mode);
+        note_path_create("replaces", to_str, dir);
+        note_path_remove("renames", from_str);
     }
 #ifdef LEAN_WINDOWS
     // Note: On windows, std::rename gives an error if the `to` file already exists,
@@ -1290,6 +1339,8 @@ extern "C" LEAN_EXPORT obj_res lean_io_hard_link(b_obj_arg orig, b_obj_arg link)
     if (strlen(link_str) != lean_string_size(link) - 1) {
         return mk_embedded_nul_error(link);
     }
+    note_path_use("links", orig_str);
+    note_path_create("creates", link_str, false);
     uv_fs_t req;
     int ret = uv_fs_link(NULL, &req, orig_str, link_str, NULL);
     uv_fs_req_cleanup(&req);
@@ -1340,6 +1391,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_create_tempfile(lean_object * /* w */) {
         return io_result_mk_error(decode_uv_error(ret, nullptr));
     } else {
         FILE* handle = fdopen(req.result, "r+");
+        note_path_created(req.path, false);
         object_ref pair = mk_cnstr(0, io_wrap_handle(handle), mk_string(req.path));
         uv_fs_req_cleanup(&req);
         return lean_io_result_mk_ok(pair.steal());
@@ -1385,6 +1437,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_create_tempdir(lean_object * /* w */) {
         // If mkdtemp throws an error we cannot rely on path to contain a proper file name.
         return io_result_mk_error(decode_uv_error(ret, nullptr));
     } else {
+        note_path_created(req.path, true);
         obj_res res = lean_io_result_mk_ok(mk_string(req.path));
         uv_fs_req_cleanup(&req);
         return res;
@@ -1396,6 +1449,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_remove_file(b_obj_arg filename) {
     if (strlen(fname) != lean_string_size(filename) - 1) {
         return mk_embedded_nul_error(filename);
     }
+    note_path_remove("removes", fname);
     uv_fs_t req;
     int ret = uv_fs_unlink(NULL, &req, fname, NULL);
     uv_fs_req_cleanup(&req);
@@ -1407,6 +1461,8 @@ extern "C" LEAN_EXPORT obj_res lean_io_remove_file(b_obj_arg filename) {
 }
 
 extern "C" LEAN_EXPORT obj_res lean_io_app_path() {
+    if (uint32 ctx = effect_context())
+        note_effect(ctx, "reads the path of the running executable");
 #if defined(LEAN_WINDOWS)
     HMODULE hModule = GetModuleHandle(NULL);
     char path[MAX_PATH];
@@ -1462,6 +1518,8 @@ extern "C" LEAN_EXPORT obj_res lean_io_app_path() {
 }
 
 extern "C" LEAN_EXPORT obj_res lean_io_current_dir() {
+    if (uint32 ctx = effect_context())
+        note_effect(ctx, "reads the working directory");
     char buffer[PATH_MAX];
     char * cwd = getcwd(buffer, sizeof(buffer));
     if (cwd) {
@@ -1475,44 +1533,190 @@ extern "C" LEAN_EXPORT obj_res lean_io_current_dir() {
 // ST ref primitives
 
 
-/* Whether refs created on this thread are tagged (`m_other` 1 in their header): a write to a tagged ref notes the
-   writing task's context (`get_task_context`) in `g_tagged_ref_writes`. */
-LEAN_THREAD_VALUE(bool, g_tag_new_refs, false);
-static mutex * g_tagged_ref_writes_mutex = nullptr;
-static std::vector<uint32> * g_tagged_ref_writes = nullptr;
+/*
+Effect notes. While on (`lean_io_set_effect_recording`), the runtime notes, per task context other than 0 (code outside
+any command), each effect that context has on state outside it: a write to a reference another context created
+(`m_context`), the resolution of a promise another context created, and each use of process-wide state through the
+runtime's primitives: a file or directory it did not create, a file handle it did not open (the standard streams among
+them), a file it created and left in place, the process environment, the working directory, the running executable's
+path, a child process. Not noted: values any two runs may differ in (clocks, heartbeats, random bytes, process and
+thread ids), which a kept command's result takes from the run that recorded it, and the runtime's debugging output
+(`dbg_trace`). `lean_io_take_effects` returns the notes.
+*/
+static std::atomic<bool> g_effects_on(false);
 
-/* setTagNewRefs (tag : Bool) : BaseIO Bool, the previous setting */
-extern "C" LEAN_EXPORT uint8 lean_io_set_tag_new_refs(uint8 tag) {
-    bool old = g_tag_new_refs;
-    g_tag_new_refs = tag != 0;
-    return old;
+struct context_effects {
+    std::vector<std::string> notes;
+    // paths the context created and did not remove; `dirs` are the directories among them
+    std::unordered_set<std::string> created;
+    std::unordered_set<std::string> dirs;
+};
+static mutex * g_effects_mutex = nullptr;
+static std::unordered_map<uint32, context_effects> * g_effects = nullptr;
+// the file handles opened while effects are noted, with the context that opened them
+static std::unordered_map<FILE *, uint32> * g_handle_contexts = nullptr;
+static constexpr size_t max_effect_notes = 8;
+
+uint32 effect_context() {
+    return g_effects_on.load(std::memory_order_relaxed) ? get_task_context() : 0;
 }
 
-static void note_tagged_ref_write() {
-    uint32 ctx = get_task_context();
+std::string describe_context(uint32 ctx) {
+    return ctx == 0 ? std::string("no command") : "command " + std::to_string(ctx - 1);
+}
+
+static void note_effect_core(context_effects & e, std::string const & what) {
+    if (e.notes.size() < max_effect_notes && std::find(e.notes.begin(), e.notes.end(), what) == e.notes.end())
+        e.notes.push_back(what);
+}
+
+void note_effect(uint32 ctx, std::string const & what) {
+    lock_guard<mutex> lock(*g_effects_mutex);
+    note_effect_core((*g_effects)[ctx], what);
+}
+
+static bool path_exists(char const * p) {
+    struct stat st;
+    return stat(p, &st) == 0;
+}
+
+/* Whether `p` is a path `e`'s context created, or lies in a directory it created. */
+static bool created_by(context_effects const & e, std::string const & p) {
+    if (e.created.count(p)) return true;
+    for (std::string const & d : e.dirs)
+        if (p.size() > d.size() && p.compare(0, d.size(), d) == 0 && p[d.size()] == '/') return true;
+    return false;
+}
+
+/* For the effect context, notes `what p` unless `p` lies in what it created. */
+static void note_path_use(char const * what, char const * p) {
+    uint32 ctx = effect_context();
     if (ctx == 0) return;
-    lock_guard<mutex> lock(*g_tagged_ref_writes_mutex);
-    if (std::find(g_tagged_ref_writes->begin(), g_tagged_ref_writes->end(), ctx) == g_tagged_ref_writes->end())
-        g_tagged_ref_writes->push_back(ctx);
+    lock_guard<mutex> lock(*g_effects_mutex);
+    context_effects & e = (*g_effects)[ctx];
+    if (!created_by(e, p)) note_effect_core(e, std::string(what) + " " + p);
 }
 
-/* takeTaggedRefWrites : BaseIO (Array UInt32): the task contexts that wrote a tagged ref since the last call, each
-   once */
-extern "C" LEAN_EXPORT obj_res lean_io_take_tagged_ref_writes() {
-    std::vector<uint32> ctxs;
-    {
-        lock_guard<mutex> lock(*g_tagged_ref_writes_mutex);
-        ctxs.swap(*g_tagged_ref_writes);
+/* For the effect context, about to create `p` (a file, or a directory if `dir`): records it as the context's if it does
+   not exist yet or lies in what the context created, else notes `what p`. */
+static void note_path_create(char const * what, char const * p, bool dir) {
+    uint32 ctx = effect_context();
+    if (ctx == 0) return;
+    lock_guard<mutex> lock(*g_effects_mutex);
+    context_effects & e = (*g_effects)[ctx];
+    if (created_by(e, p) || !path_exists(p)) {
+        e.created.insert(p);
+        if (dir) e.dirs.insert(p);
+    } else {
+        note_effect_core(e, std::string(what) + " " + p);
     }
-    object * r = lean_alloc_array(0, ctxs.size());
-    for (uint32 c : ctxs) r = lean_array_push(r, lean_box_uint32(c));
+}
+
+/* For the effect context, about to remove `p`: forgets it if the context created it, else notes `what p`. */
+static void note_path_remove(char const * what, char const * p) {
+    uint32 ctx = effect_context();
+    if (ctx == 0) return;
+    lock_guard<mutex> lock(*g_effects_mutex);
+    context_effects & e = (*g_effects)[ctx];
+    if (created_by(e, p)) {
+        e.created.erase(p);
+        e.dirs.erase(p);
+    } else {
+        note_effect_core(e, std::string(what) + " " + p);
+    }
+}
+
+/* For the effect context, about to use handle `fp`: notes it unless the context opened it. */
+static void note_handle_use(FILE * fp) {
+    uint32 ctx = effect_context();
+    if (ctx == 0) return;
+    lock_guard<mutex> lock(*g_effects_mutex);
+    auto it = g_handle_contexts->find(fp);
+    if (it != g_handle_contexts->end() && it->second == ctx) return;
+    char const * what = fp == stdout ? "writes to the standard output" : fp == stderr ? "writes to the standard error"
+        : fp == stdin ? "reads the standard input" : "uses a file handle another context opened";
+    note_effect_core((*g_effects)[ctx], what);
+}
+
+/* For the effect context, records `p` (a directory if `dir`), which it just created, as its own. */
+static void note_path_created(char const * p, bool dir) {
+    uint32 ctx = effect_context();
+    if (ctx == 0) return;
+    lock_guard<mutex> lock(*g_effects_mutex);
+    context_effects & e = (*g_effects)[ctx];
+    e.created.insert(p);
+    if (dir) e.dirs.insert(p);
+}
+
+/* Records that the effect context opened `fp`. */
+static void note_handle_open(FILE * fp) {
+    uint32 ctx = effect_context();
+    if (ctx == 0) return;
+    lock_guard<mutex> lock(*g_effects_mutex);
+    (*g_handle_contexts)[fp] = ctx;
+}
+
+/* Forgets `fp`, which is being closed. */
+static void forget_handle(FILE * fp) {
+    if (!g_effects_mutex) return;
+    lock_guard<mutex> lock(*g_effects_mutex);
+    g_handle_contexts->erase(fp);
+}
+
+/* setEffectRecording (on : Bool) : BaseIO Unit; switching it on forgets earlier notes */
+extern "C" LEAN_EXPORT obj_res lean_io_set_effect_recording(uint8 on) {
+    if (on) {
+        lock_guard<mutex> lock(*g_effects_mutex);
+        g_effects->clear();
+    }
+    g_effects_on.store(on != 0);
+    return box(0);
+}
+
+/* takeEffects : BaseIO (Array (UInt32 × String)): the notes since the last call, with each path a context created and
+   did not remove */
+extern "C" LEAN_EXPORT obj_res lean_io_take_effects() {
+    std::unordered_map<uint32, context_effects> effects;
+    {
+        lock_guard<mutex> lock(*g_effects_mutex);
+        effects.swap(*g_effects);
+    }
+    std::vector<std::pair<uint32, std::string>> notes;
+    for (auto & [ctx, e] : effects) {
+        for (std::string const & p : e.created) note_effect_core(e, "leaves " + p + ", which it created");
+        for (std::string const & w : e.notes) notes.push_back(std::make_pair(ctx, w));
+    }
+    std::sort(notes.begin(), notes.end());
+    object * r = lean_alloc_array(0, notes.size());
+    for (auto const & [ctx, w] : notes) {
+        object * p = lean_alloc_ctor(0, 2, 0);
+        lean_ctor_set(p, 0, lean_box_uint32(ctx));
+        lean_ctor_set(p, 1, mk_string(w));
+        r = lean_array_push(r, p);
+    }
     return r;
+}
+
+/* markRefAccounted (r : @& IO.Ref α) : BaseIO Unit: writes to `r` are noted for no context */
+extern "C" LEAN_EXPORT obj_res lean_io_mark_ref_accounted(b_obj_arg ref) {
+    lean_to_ref(ref)->m_context = LEAN_REF_ACCOUNTED;
+    return box(0);
+}
+
+/* For the effect context, about to write `ref`: notes it unless the context created it or it is accounted. */
+static inline void note_ref_write(b_obj_arg ref) {
+    if (LEAN_LIKELY(!g_effects_on.load(std::memory_order_relaxed))) return;
+    uint32 ctx = get_task_context();
+    uint32 owner = lean_to_ref(ref)->m_context;
+    if (ctx != 0 && owner != ctx && owner != LEAN_REF_ACCOUNTED)
+        note_effect(ctx, "writes a reference " + describe_context(owner) + " created");
 }
 
 extern "C" LEAN_EXPORT obj_res lean_st_mk_ref(obj_arg a) {
     lean_ref_object * o = (lean_ref_object*)lean_alloc_small_object(sizeof(lean_ref_object));
-    lean_set_st_header((lean_object*)o, LeanRef, g_tag_new_refs ? 1 : 0);
+    lean_set_st_header((lean_object*)o, LeanRef, 0);
     o->m_value = a;
+    o->m_context = get_task_context();
     return (lean_object*)o;
 }
 
@@ -1574,6 +1778,7 @@ extern "C" LEAN_EXPORT obj_res lean_st_ref_get(b_obj_arg ref) {
 }
 
 extern "C" LEAN_EXPORT obj_res lean_st_ref_take(b_obj_arg ref) {
+    note_ref_write(ref);
     if (ref_maybe_mt(ref)) {
         atomic<object *> * val_addr = mt_ref_val_addr(ref);
         unsigned spins = 0;
@@ -1594,8 +1799,7 @@ extern "C" LEAN_EXPORT obj_res lean_st_ref_take(b_obj_arg ref) {
 static_assert(sizeof(atomic<unsigned short>) == sizeof(unsigned short), "`atomic<unsigned short>` and `unsigned short` must have the same size"); // NOLINT
 
 extern "C" LEAN_EXPORT obj_res lean_st_ref_put(b_obj_arg ref, obj_arg a) {
-    if (LEAN_UNLIKELY(lean_ptr_other(ref) != 0))
-        note_tagged_ref_write();
+    note_ref_write(ref);
     if (ref_maybe_mt(ref)) {
         /* We must mark `a` as multi-threaded if `ref` is marked as multi-threaded.
            Reason: our runtime relies on the fact that a single-threaded object
@@ -1615,8 +1819,7 @@ extern "C" LEAN_EXPORT obj_res lean_st_ref_put(b_obj_arg ref, obj_arg a) {
 }
 
 extern "C" LEAN_EXPORT obj_res lean_st_ref_swap(b_obj_arg ref, obj_arg a) {
-    if (LEAN_UNLIKELY(lean_ptr_other(ref) != 0))
-        note_tagged_ref_write();
+    note_ref_write(ref);
     if (ref_maybe_mt(ref)) {
         /* See io_ref_write */
         mark_mt(a);
@@ -1761,8 +1964,9 @@ void initialize_io() {
     mark_persistent(g_stream_stderr);
     g_stream_stdin  = lean_stream_of_handle(io_wrap_handle(stdin));
     mark_persistent(g_stream_stdin);
-    g_tagged_ref_writes_mutex = new mutex();
-    g_tagged_ref_writes = new std::vector<uint32>();
+    g_effects_mutex = new mutex();
+    g_effects = new std::unordered_map<uint32, context_effects>();
+    g_handle_contexts = new std::unordered_map<FILE *, uint32>();
 #if !defined(LEAN_WINDOWS) && !defined(LEAN_EMSCRIPTEN)
     // We want to handle SIGPIPE ourselves
     lean_always_assert(signal(SIGPIPE, SIG_IGN) != SIG_ERR);

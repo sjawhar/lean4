@@ -6,7 +6,10 @@ before `W`, claims the name `ru` with an IR declaration, `ru` resolves to `Z` an
 longer elaborates; `t`'s uses (`wv`) are unchanged, and only the module's recorded resolutions (`resolved` in
 `C.usage`) show the change. The reuse run (`reuseSource`, a process of its own) asks for a keep permit
 (`ModuleUsage.keepPermit`) before it keeps any command: granted while `Z` claims nothing, refused with
-`resolution changed` once it claims `ru`. -/
+`resolution changed` once it claims `ru`. The same holds for the specialization cache (Lake's
+`UsageSidecar.specProvidersUnchanged`): `SM`'s `g` specializes `applyTwice` and finds no specialization of it; a
+`SM.usage` that records other providers for that key is refused, and once `SZ`, which `SM` imports, provides one under
+the key, `SM`'s permit is refused, by the check Lake makes first (`closureHash`). -/
 open Lean
 
 def runLean (dir : System.FilePath) (args : Array String) : IO (UInt32 × String) := do
@@ -31,19 +34,20 @@ partial def recordNames : AddedConst → Array Name
   | .context .. => #[]
 
 unsafe def main (args : List String) : IO UInt32 := do
-  let [dir, file, olean, usage] := args | throw <| IO.userError \"usage: Reuse DIR C.lean C.olean C.usage\"
+  let [dir, file, olean, usage] := args | throw <| IO.userError \"usage: Reuse DIR M.lean M.olean M.usage\"
+  let some m := (System.FilePath.mk file).fileStem | throw <| IO.userError s!\"no module name in {file}\"
   initSearchPath (← findSysroot) [dir]
   enableInitializersExecution
-  let (md, _) ← readModuleData olean
-  let payloads := CommandEntries.ofModuleData md
-  let full : NameMap ConstantInfo := (md.constNames.zip md.constants).foldl (fun m (n, c) => m.insert n c) {}
   let src ← IO.FS.readFile file
   let inputCtx := Parser.mkInputContext src file
   let (header, parserState, messages) ← Parser.parseHeader inputCtx
-  let (env, messages) ← processHeader header {} messages inputCtx
-  let permit ← match ModuleUsage.keepPermit env (← ModuleUsage.ResolutionRecord.read usage) with
+  let (env, messages) ← processHeader header {} messages inputCtx (mainModule := m.toName)
+  let permit ← match ← ModuleUsage.keepPermit env m.toName olean usage with
     | .ok permit => pure permit
     | .error reason => IO.println s!\"module refused: {reason}\"; return 0
+  let payloads := permit.payloads
+  let md := permit.data
+  let full : NameMap ConstantInfo := (md.constNames.zip md.constants).foldl (fun m (n, c) => m.insert n c) {}
   let mut st := Command.mkState env messages {}
   st := { st with scopes := st.scopes.map fun sc => { sc with opts := Elab.async.set sc.opts false } }
   let mut ps := parserState
@@ -93,4 +97,23 @@ def zSource (claim : Bool) : String :=
   compile dir "Z"
   IO.println "Z claims `ru`:"
   IO.println s!"C elaborates afresh: {(← runLean dir #["C.lean"]).1 == 0}"
+  IO.print (← runLean dir reuse).2
+  IO.FS.writeFile (dir / "SA.lean") "@[specialize] def applyTwice (f : Nat → Nat) (x : Nat) : Nat := f (f x)\n"
+  IO.FS.writeFile (dir / "SZ.lean") "def zz : Nat := 0\n"
+  IO.FS.writeFile (dir / "SM.lean") "import SZ\nimport SA\ndef g (x : Nat) : Nat := applyTwice (· + 1) x\n"
+  for m in ["SA", "SZ", "SM"] do compile dir m
+  let reuse := #["--run", "Reuse.lean", dir.toString, "SM.lean", "SM.olean", "SM.usage"]
+  IO.println "SZ provides no specialization:"
+  IO.print (← runLean dir reuse).2
+  let usage ← IO.FS.readFile (dir / "SM.usage")
+  let j ← IO.ofExcept <| Json.parse usage
+  let lookups : Array (String × String) ← IO.ofExcept <| j.getObjValAs? (Array (String × String)) "specLookups"
+  IO.println s!"SM.usage recording other providers for the {lookups.size} key(s) g looked up:"
+  let other := lookups.map fun (p : String × String) => (p.1, "".pushn '0' 32)
+  IO.FS.writeFile (dir / "SM.usage") (j.setObjVal! "specLookups" (toJson other)).compress
+  IO.print (← runLean dir reuse).2
+  IO.FS.writeFile (dir / "SM.usage") usage
+  IO.FS.writeFile (dir / "SZ.lean") "import SA\ndef zz : Nat := 0\ndef h (x : Nat) : Nat := applyTwice (· + 1) x\n"
+  compile dir "SZ"
+  IO.println "SZ provides the specialization SM's g looked up:"
   IO.print (← runLean dir reuse).2

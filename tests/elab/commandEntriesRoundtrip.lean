@@ -37,8 +37,9 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let observations ← ModuleUsage.commandObservations
   let some first := observations[0]? | throw <| IO.userError "missing first command observation"
   let baseEnv := first.before.env
-  let (md, region) ← readModuleData (dir / "M.olean")
-  let entries := CommandEntries.ofModuleData md
+  let permit ← IO.ofExcept (← ModuleUsage.Testing.keepPermit baseEnv `M (dir / "M.olean") (dir / "M.usage"))
+  let entries := permit.payloads
+  let md := permit.data
   -- extensions the recorder does not record (`PersistentEnvExtension.perCommand`)
   let excluded : NameSet := (← persistentEnvExtensionsRef.get).foldl (init := {}) fun s ext =>
     if ext.perCommand == .recorded then s else s.insert ext.name
@@ -80,7 +81,6 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
     observations.foldl (fun m obs => m.insert obs.i obs.after.env) {}
   let mut replayed ← CommandEntries.Testing.rollbackTo baseEnv expectedEnv
   replayed := replayed.setMainModule `M
-  let permit ← IO.ofExcept <| ModuleUsage.keepPermit baseEnv (← ModuleUsage.ResolutionRecord.read (dir / "M.usage"))
   let mut elaborated := #[]
   for entry in entries do
     if entry.refusals.isEmpty then
@@ -183,6 +183,6 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   unless identical do
     throw <| IO.userError s!"extension mismatches: {mismatches}; scoped: {scopedMismatches}; \
       caches: {cacheMismatches}"
-  Runtime.forget region
+  Runtime.forget permit
 
 #eval main

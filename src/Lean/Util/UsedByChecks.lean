@@ -18,14 +18,26 @@ code that a module runs while it is elaborated cannot clear or switch off what i
 run that finds another run started after it (`lastFrontendRun`) does not take the logs as its own.
 -/
 
+/-- Marks `r` as accounted: the runtime's effect notes skip writes to it (`effectsByCommand`). Only for references
+whose state across commands a command payload carries or no command's result depends on: the usage recorders' own
+logs, and the caches whose writes the payloads record. -/
+@[extern "lean_io_mark_ref_accounted"]
+opaque markRefAccounted {α : Type} (r : @& IO.Ref α) : BaseIO Unit
+
+/-- `IO.mkRef a`, marked accounted (`markRefAccounted`). -/
+def mkAccountedRef {α : Type} (a : α) : BaseIO (IO.Ref α) := do
+  let r ← IO.mkRef a
+  markRefAccounted r
+  return r
+
 /-- Whether this process records usage: switched on by `runFrontend` when it will write an `.olean` and its
 `.usage` (`--usage`), never off. Off in the language server, which writes neither. -/
-private builtin_initialize usageRecordingRef : IO.Ref Bool ← IO.mkRef false
+private builtin_initialize usageRecordingRef : IO.Ref Bool ← mkAccountedRef false
 /-- Constants of every declaration given to `addDecl` in this process, including those elaborated in an
 environment that is then discarded (`example`, `#eval`, `#guard`), and the names `recordUsedName` adds. -/
-private builtin_initialize usedByChecksRef : IO.Ref NameSet ← IO.mkRef {}
+private builtin_initialize usedByChecksRef : IO.Ref NameSet ← mkAccountedRef {}
 /-- The keys looked up in the specialization cache while recording is on (`recordSpecLookup`). -/
-private builtin_initialize specLookupsRef : IO.Ref (Array Expr) ← IO.mkRef #[]
+private builtin_initialize specLookupsRef : IO.Ref (Array Expr) ← mkAccountedRef #[]
 
 /-- Switches on the recording of resolved names (`noteResolved`), in `src/library/usage_digest.cpp`. -/
 @[extern "lean_usage_enable_resolved"]
@@ -89,7 +101,7 @@ opaque resolvedNames : BaseIO (Array Name)
 opaque allResolved : BaseIO Bool
 
 /-- See `recordCompilerCode`. -/
-private builtin_initialize compilerCodeRef : IO.Ref Bool ← IO.mkRef false
+private builtin_initialize compilerCodeRef : IO.Ref Bool ← mkAccountedRef false
 
 /--
 Records that a compile in this process ran code or read state the module's used names do not cover: passes or
@@ -131,7 +143,7 @@ def recordIfCompiling (opts : Options) : BaseIO Unit := do
   if opts.get inCompileOption false then recordCompilerCode
 
 /-- The unification hints that matched inside a compile in this process (`recordHintsIfCompiling`). -/
-private builtin_initialize compileHintsRef : IO.Ref NameSet ← IO.mkRef {}
+private builtin_initialize compileHintsRef : IO.Ref NameSet ← mkAccountedRef {}
 
 /-- Records `hints`, the unification hints that match a query, if `opts` are a compile's (`inCompileOption`). A hint
 from an imported module with digests makes every such module an extra use of the module (`ModuleUsage.writeUsage`):
@@ -152,7 +164,7 @@ structure DeclConsts where
 
 /-- Per name, the `DeclConsts` of the last axiom, definition, theorem or opaque given to `addDecl` under that
 name, so that `ModuleUsage.refs` does not walk a kept constant's type and value again. -/
-private builtin_initialize declConstsRef : IO.Ref (NameMap DeclConsts) ← IO.mkRef {}
+private builtin_initialize declConstsRef : IO.Ref (NameMap DeclConsts) ← mkAccountedRef {}
 
 /-- `(name, type, value?)` of each constant `decl` adds as given: those of axioms, definitions, theorems and
 opaques. `none` for inductive and quotient declarations. -/
@@ -186,35 +198,36 @@ def recordedDeclConsts : BaseIO (NameMap DeclConsts) :=
   declConstsRef.get
 
 /-- The number of `runFrontend` runs started in this process (`startFrontendRun`). -/
-private builtin_initialize frontendRunsRef : IO.Ref Nat ← IO.mkRef 0
-/-- The index of the command whose elaboration the frontend is currently running. Async elaboration outlives it:
-recorders read `MonadCommandIdx.getCommandIdx?` first and this ref only outside any command context. -/
-private builtin_initialize currentCommandRef : IO.Ref Nat ← IO.mkRef 0
+private builtin_initialize frontendRunsRef : IO.Ref Nat ← mkAccountedRef 0
 /-
 The per-command logs below are lists, newest first, read once in recording order (`List.toArray.reverse`): a global
 ref's value is multi-threaded and so never exclusive, and `Array.push` on it would copy the whole log at every record.
 -/
 /-- The declarations and dependencies submitted to `addDecl`, grouped by top-level command. -/
-private builtin_initialize declsByCommandRef : IO.Ref (List (Nat × Array Name × NameSet)) ← IO.mkRef []
+private builtin_initialize declsByCommandRef : IO.Ref (List (Nat × Array Name × NameSet)) ← mkAccountedRef []
 /-- Constants whose values were consulted without leaving a reference in the elaborated term. -/
-private builtin_initialize usedByCommandRef : IO.Ref (List (Nat × Name)) ← IO.mkRef []
+private builtin_initialize usedByCommandRef : IO.Ref (List (Nat × Name)) ← mkAccountedRef []
 /-- The attributes whose handlers may run code outside core Lean (`Lean.provenAttribute`) that a top-level command
 ran. Such a handler may write state no command payload carries. -/
-private builtin_initialize foreignAttributesByCommandRef : IO.Ref (List (Nat × Name)) ← IO.mkRef []
+private builtin_initialize foreignAttributesByCommandRef : IO.Ref (List (Nat × Name)) ← mkAccountedRef []
+
 @[extern "lean_io_set_task_context"]
 private opaque setTaskContext (c : UInt32) : BaseIO Unit
 
-@[extern "lean_io_take_evaluated_consts"]
-private opaque takeEvaluatedConsts : BaseIO (Array (UInt32 × Name))
+/-- The runtime's task context of the running code: a word every task inherits from the thread that creates it, in
+force while the task runs. `0` outside any command; `i + 1` while the frontend elaborates command `i` with recording
+on (`withCommandContext`), in that command's asynchronous work too. -/
+@[extern "lean_io_get_task_context"]
+opaque getTaskContext : BaseIO UInt32
 
-@[extern "lean_io_set_tag_new_refs"]
-private opaque setTagNewRefs (tag : Bool) : BaseIO Bool
+@[extern "lean_io_set_effect_recording"]
+private opaque setEffectRecording (on : Bool) : BaseIO Unit
 
-@[extern "lean_io_take_tagged_ref_writes"]
-private opaque takeTaggedRefWrites : BaseIO (Array UInt32)
+@[extern "lean_io_take_effects"]
+private opaque takeEffects : BaseIO (Array (UInt32 × String))
 
 /-- The actions that clear the per-run logs of other modules (`registerRunLog`). -/
-private builtin_initialize runLogClearsRef : IO.Ref (Array (BaseIO Unit)) ← IO.mkRef #[]
+private builtin_initialize runLogClearsRef : IO.Ref (Array (BaseIO Unit)) ← mkAccountedRef #[]
 
 /-- Registers `clear`, which empties a per-run log another module keeps, for `startFrontendRun`. Only during
 initialization. -/
@@ -225,22 +238,21 @@ def registerRunLog (clear : BaseIO Unit) : IO Unit := do
 
 /--
 Starts a `runFrontend` run and returns its number, which no earlier run got. With `record`, switches recording on
-(`enableUsageRecording`) and clears the per-run logs: the names `addDecl` and `recordUsedName` recorded, the
-per-command logs, and the logs other modules registered (`registerRunLog`). The names the resolver looked up
-(`resolvedNames`) are kept for the whole process. The logs are global, so a frontend that runs in-process during a run
-(an `#eval` calling `runFrontend`) clears or extends them; the run detects it by `lastFrontendRun` at its end.
+(`enableUsageRecording`) with the runtime's effect notes (`effectsByCommand`), and clears the per-run logs: the names
+`addDecl` and `recordUsedName` recorded, the per-command logs, the effect notes, and the logs other modules registered
+(`registerRunLog`). The names the resolver looked up (`resolvedNames`) are kept for the whole process. The logs are
+global, so a frontend that runs in-process during a run (an `#eval` calling `runFrontend`) clears or extends them; the
+run detects it by `lastFrontendRun` at its end.
 -/
 def startFrontendRun (record : Bool) : BaseIO Nat := do
   let run ← frontendRunsRef.modifyGet fun n => (n + 1, n + 1)
   if record then
     enableUsageRecording
     usedByChecksRef.set {}
-    currentCommandRef.set 0
     declsByCommandRef.set []
     usedByCommandRef.set []
     foreignAttributesByCommandRef.set []
-    discard takeEvaluatedConsts
-    discard takeTaggedRefWrites
+    setEffectRecording true
     for clear in ← runLogClearsRef.get do clear
   return run
 
@@ -248,69 +260,55 @@ def startFrontendRun (record : Bool) : BaseIO Nat := do
 def lastFrontendRun : BaseIO Nat :=
   frontendRunsRef.get
 
-/-- Sets the command whose elaboration the frontend runs, for records made outside any command context, and, as the
-runtime's task context, for what this thread and the tasks it creates do: the constants they evaluate
-(`evaluatedByCommand`) and the writes to state imported modules' initializers created
-(`foreignStateWritesByCommand`). -/
-def setCurrentCommand (i : Nat) : BaseIO Unit := do
+/-- Runs `act`, the elaboration of command `i`, with the task context `i + 1` while recording is on (`getTaskContext`),
+restoring the previous context after: what `act` and the tasks it creates record is attributed to command `i`. -/
+def withCommandContext [Monad m] [MonadFinally m] [MonadLiftT BaseIO m] (i : Nat) (act : m α) : m α := do
+  unless (← (usageRecordingRef.get : BaseIO Bool)) do return ← act
+  let old ← (getTaskContext : BaseIO UInt32)
+  (setTaskContext (i + 1).toUInt32 : BaseIO Unit)
+  try act finally (setTaskContext old : BaseIO Unit)
+
+/-- The command whose elaboration the running code belongs to (`withCommandContext`), `none` outside any. -/
+def commandIdx? : BaseIO (Option Nat) := do
+  let c ← getTaskContext
+  return if c == 0 then none else some (c.toNat - 1)
+
+/-- Records, when recording is on and inside a command (`commandIdx?`), that it submitted the declarations `names` to
+`addDecl`, with the constants `used` of their types and values. -/
+def recordCommandDecls (names : Array Name) (used : NameSet) : BaseIO Unit := do
   if (← usageRecordingRef.get) then
-    currentCommandRef.set i
-    setTaskContext (i + 1).toUInt32
+    if let some i ← commandIdx? then declsByCommandRef.modify ((i, names, used) :: ·)
 
-/-- Runs `x`, which runs code from outside core Lean that may create state (module initializers, a plugin's), with the
-references it creates tagged: while recording is on, the runtime notes which commands write them
-(`foreignStateWritesByCommand`). -/
-def withForeignStateTagged (x : IO α) : IO α := do
-  let old ← setTagNewRefs true
-  try x finally discard <| setTagNewRefs old
+/-- Records, when recording is on and inside a command (`commandIdx?`), that it consulted the value of `n` without
+leaving a reference to it. -/
+def recordUsedByCommand (n : Name) : BaseIO Unit := do
+  if (← usageRecordingRef.get) then
+    if let some i ← commandIdx? then usedByCommandRef.modify ((i, n) :: ·)
 
-/-- The commands that wrote a reference `withForeignStateTagged` tagged since the run started, each once: state no
-command payload carries. Takes them: a second call returns only those since. -/
-def foreignStateWritesByCommand : BaseIO (Array Nat) := do
-  return (← takeTaggedRefWrites).map fun c => c.toNat - 1
+/-- Records, when recording is on and inside a command (`commandIdx?`), that it ran a handler of the attribute `attr`
+that may run code outside core Lean. -/
+def recordForeignAttribute (attr : Name) : BaseIO Unit := do
+  if (← usageRecordingRef.get) then
+    if let some i ← commandIdx? then foreignAttributesByCommandRef.modify ((i, attr) :: ·)
 
-/-- Monads that know the top-level command whose elaboration they run (`Core.Context.cmdIdx?`). -/
-class MonadCommandIdx (m : Type → Type) where
-  getCommandIdx? : m (Option Nat)
-
-instance (m n) [MonadLift m n] [MonadCommandIdx m] : MonadCommandIdx n where
-  getCommandIdx? := liftM (MonadCommandIdx.getCommandIdx? : m _)
-
-/-- The command a recorded use belongs to. -/
-def commandIdx [Monad m] [MonadLiftT IO m] [MonadCommandIdx m] : m Nat := do
-  match ← MonadCommandIdx.getCommandIdx? with
-  | some i => return i
-  | none => (currentCommandRef.get : IO Nat)
-
-/-- Records, when recording is on, that command `i` submitted the declarations `names` to `addDecl`, with the
-constants `used` of their types and values. -/
-def recordCommandDecls (i : Nat) (names : Array Name) (used : NameSet) : BaseIO Unit := do
-  if (← usageRecordingRef.get) then declsByCommandRef.modify ((i, names, used) :: ·)
-
-/-- Records, when recording is on, that command `i` consulted the value of `n` without leaving a reference to it. -/
-def recordUsedByCommandIdx (i : Nat) (n : Name) : BaseIO Unit := do
-  if (← usageRecordingRef.get) then usedByCommandRef.modify ((i, n) :: ·)
-
-/-- Records, when recording is on, that command `i` ran a handler of the attribute `attr` that may run code outside
-core Lean. -/
-def recordForeignAttributeIdx (i : Nat) (attr : Name) : BaseIO Unit := do
-  if (← usageRecordingRef.get) then foreignAttributesByCommandRef.modify ((i, attr) :: ·)
-
-/-- The constants code evaluated (`Environment.evalConst`) while recording, each with the command in whose task context
-(`setCurrentCommand`) it ran; a `Bool` or `Decidable` constant (a decision `native_decide`, `bv_decide` or `#guard`
-evaluates) runs no action and is left out. Takes them: a second call returns only those since. -/
-def evaluatedByCommand : BaseIO (Array (Nat × Name)) := do
-  return (← takeEvaluatedConsts).map fun (c, n) => (c.toNat - 1, n)
+/-- The effects on state outside a command that the runtime noted for each command since the run started (none
+outside any command): a write to a reference another command, or code outside any command, created; the resolution of
+a promise another command created; each use of process-wide state through the runtime's primitives (a file or
+directory the command did not create, a file handle it did not open, among them the standard streams, a file it created
+and left in place, the process environment, the working directory, the running executable's path, a child process). No payload carries them. Takes
+them: a second call returns only those since. -/
+def effectsByCommand : BaseIO (Array (Nat × String)) := do
+  return (← takeEffects).map fun (c, what) => (c.toNat - 1, what)
 
 /-- The records of `recordCommandDecls`, newest first. -/
 def declsByCommand : BaseIO (List (Nat × Array Name × NameSet)) :=
   declsByCommandRef.get
 
-/-- The records of `recordUsedByCommandIdx`, newest first. -/
+/-- The records of `recordUsedByCommand`, newest first. -/
 def usedByCommand : BaseIO (List (Nat × Name)) :=
   usedByCommandRef.get
 
-/-- The records of `recordForeignAttributeIdx`, newest first. -/
+/-- The records of `recordForeignAttribute`, newest first. -/
 def foreignAttributesByCommand : BaseIO (List (Nat × Name)) :=
   foreignAttributesByCommandRef.get
 

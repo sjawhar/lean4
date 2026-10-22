@@ -11,7 +11,7 @@ public import Lean.ResolveName
 public import Lean.Language.Basic
 import Init.While
 import Lean.Compiler.NoncomputableAttr
-public import Lean.Util.UsedByChecks  -- public: `MonadCommandIdx CoreM`
+import Lean.Util.UsedByChecks
 
 public section
 
@@ -348,8 +348,6 @@ structure Context.Cold where
   maxHeartbeats  : Nat := getMaxHeartbeats options
   quotContext    : Name := .anonymous
   currMacroScope : MacroScope := firstFrontendMacroScope
-  /-- Index of the top-level command whose elaboration created this context. -/
-  cmdIdx?        : Option Nat := none
   /-- If set, used to cancel elaboration from outside when results are not needed anymore. -/
   cancelTk?      : Option IO.CancelToken := none
   /-- Cache of `Lean.inheritedTraceOptions`. -/
@@ -409,9 +407,6 @@ instance : MonadRef CoreM where
 instance : MonadEnv CoreM where
   getEnv := return (← get).env
   modifyEnv f := modify fun s => { s with env := f s.env, cache := {} }
-
-instance : MonadCommandIdx CoreM where
-  getCommandIdx? := return (← read).cmdIdx?
 
 instance : MonadOptions CoreM where
   getOptions := return checkedOptions (← read)
@@ -1139,14 +1134,6 @@ private def mapErrorImp (x : CoreM α) (f : MessageData → MessageData) : CoreM
 /-- Execute `x`. If it throws an error, indent and prepend `msg` to it.  -/
 @[inline] protected def Core.prependError [MonadControlT CoreM m] [Monad m] (msg : MessageData) (x : m α) : m α := do
   Core.mapError x fun e => m!"{msg}{indentD e}"
-
-/-- Records that the running command consulted the value of `n` without leaving a reference to it in its terms. -/
-def recordUsedByCommand (n : Name) : CoreM Unit := do
-  if (← usageRecordingEnabled) then recordUsedByCommandIdx (← commandIdx) n
-
-/-- Records that the running command ran a handler of the attribute `attr` that may run code outside core Lean. -/
-def recordForeignAttribute (attr : Name) : CoreM Unit := do
-  if (← usageRecordingEnabled) then recordForeignAttributeIdx (← commandIdx) attr
 
 builtin_initialize
   registerTraceClass `Elab.async

@@ -1,7 +1,7 @@
 import Lean
 /-! A declaration command that writes an extension through a sanctioned writer (`PersistentEnvExtension.addEntry` or
 `modifyState`, `ScopedEnvExtension.addLocalEntry`) called with a record other than the registered one is refused, and
-the module is `noskip`: a record with another
+the module is `noreuse`: a record with another
 `addEntryFn`; one with `stateDeltaSeesDirectWrites` set where the registered record leaves it unset; another
 extension's record over this extension's `EnvExtension`; a scoped record with another descriptor; and the registered
 record over an `EnvExtension` whose index was changed through a structure extending `EnvExtension` (its constructor
@@ -77,16 +77,19 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let some _ ← Elab.runFrontend mSource {} "M.lean" `M (oleanFileName? := some (dir / "M.olean")) (usageFileName? := some (dir / "M.usage")) |
     throw <| IO.userError "elaboration of M failed"
   let obs := (← ModuleUsage.commandObservations).qsort (·.i < ·.i)
-  let (md, _) ← readModuleData (dir / "M.olean")
-  let payloads := CommandEntries.ofModuleData md
+  -- the test's attributes are registered by an imported module, so a command that runs one is refused for it
+  -- (`Refusal.foreignAttribute`); the replay drops that refusal to check the records themselves
+  let some first := obs[0]? | throw <| IO.userError "no commands"
+  let permit := CommandEntries.Testing.substitutePayloads
+    (← IO.ofExcept (← ModuleUsage.Testing.keepPermit first.before.env `M (dir / "M.olean") (dir / "M.usage")))
+    (·.map fun ce => { ce with refusals := ce.refusals.filter (!· matches .foreignAttribute _) })
+  let payloads := permit.payloads
   let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
-  IO.println s!"noskip {(usage.getObjValAs? Bool "noskip").toOption}, \
-    reason {(usage.getObjValAs? String "noskipReason").toOption}"
+  IO.println s!"noreuse {(usage.getObjValAs? Bool "noreuse").toOption}, \
+    reason {(usage.getObjValAs? String "noreuseReason").toOption}"
   let names := [`logExt, `otherExt, `scopeExt]
   for o in obs do
     let some ce := payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"
-    let ce := { ce with refusals := ce.refusals.filter (!· matches .foreignAttribute _) }
-    let permit ← IO.ofExcept <| ModuleUsage.keepPermit o.before.env (← IO.ofExcept <| ModuleUsage.ResolutionRecord.ofUsage usage)
     let replay ← try
         let env ← replayCommandEntries permit (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}
         let full ← view o.after.env

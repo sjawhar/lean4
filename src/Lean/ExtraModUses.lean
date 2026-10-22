@@ -93,11 +93,11 @@ public def copyExtraModUses (src dest : Environment) : Environment := Id.run do
 whose environment is then discarded (`example`, `#check`, `#eval`, `#synth`, `#reduce`), which
 `getLocalExtraModUses` loses. Private: it grows only through `recordExtraModUseCore`, and only the start of a run
 clears it (`startFrontendRun`). -/
-builtin_initialize extraModUsesByChecksRef : IO.Ref (Std.HashSet ExtraModUse) ← IO.mkRef {}
+builtin_initialize extraModUsesByChecksRef : IO.Ref (Std.HashSet ExtraModUse) ← mkAccountedRef {}
 
 /-- Every extra module use with the command that requested it, before environment-level deduplication. Private, as
 `extraModUsesByChecksRef`. -/
-builtin_initialize extraModUsesByCmdRef : IO.Ref (Std.HashSet (Nat × ExtraModUse)) ← IO.mkRef {}
+builtin_initialize extraModUsesByCmdRef : IO.Ref (Std.HashSet (Nat × ExtraModUse)) ← mkAccountedRef {}
 
 builtin_initialize registerRunLog do
   extraModUsesByChecksRef.set {}
@@ -111,13 +111,13 @@ public def extraModUsesByChecks : BaseIO (Std.HashSet ExtraModUse) :=
 public def extraModUsesByCommand : BaseIO (Std.HashSet (Nat × ExtraModUse)) :=
   extraModUsesByCmdRef.get
 
-def recordExtraModUseCore [MonadLiftT IO m] [MonadCommandIdx m] (mod : Name) (isMeta : Bool)
-    (hint : Name := .anonymous) : m Unit := do
+def recordExtraModUseCore [MonadLiftT IO m] (mod : Name) (isMeta : Bool) (hint : Name := .anonymous) :
+    m Unit := do
   let entry := { module := mod, isExported := (← getEnv).isExporting, isMeta }
   let recording ← (usageRecordingEnabled : IO Bool)
   if recording then
-    let idx ← commandIdx
-    (extraModUsesByCmdRef.modify (·.insert (idx, entry)) : IO Unit)
+    if let some idx ← (commandIdx? : IO _) then
+      (extraModUsesByCmdRef.modify (·.insert (idx, entry)) : IO Unit)
   if !(extraModUses.getState (asyncMode := .local) (← getEnv)).contains entry then
     trace[extraModUses] "recording {if entry.isExported then "public" else "private"} \
       {if isMeta then "meta" else "regular"} extra mod use {mod}\
@@ -133,8 +133,7 @@ the visibility level.
 NOTE: Directly recording a module name does not trigger including indirect dependencies recorded via
 `recordIndirectModUse`, prefer `recordExtraModUseFromDecl` instead.
 -/
-public def recordExtraModUse [MonadLiftT IO m] [MonadCommandIdx m] (modName : Name) (isMeta : Bool) :
-    m Unit := do
+public def recordExtraModUse [MonadLiftT IO m] (modName : Name) (isMeta : Bool) : m Unit := do
   if modName != (← getEnv).mainModule then
     recordExtraModUseCore modName isMeta
 
@@ -143,8 +142,7 @@ Records the module of the given declaration as an additional import dependency f
 module, using `Environment.isExporting` as the visibility level. If the declaration itself is
 already `meta`, the module dependency is recorded as a non-`meta` dependency.
 -/
-public def recordExtraModUseFromDecl [MonadLiftT IO m] [MonadCommandIdx m] (declName : Name)
-    (isMeta : Bool) : m Unit := do
+public def recordExtraModUseFromDecl [MonadLiftT IO m] (declName : Name) (isMeta : Bool) : m Unit := do
   let env ← getEnv
   if let some mod := env.getModuleIdxFor? declName |>.bind (env.header.modules[·]?) then
     -- If the declaration itself is already `meta`, no need to mark the import.

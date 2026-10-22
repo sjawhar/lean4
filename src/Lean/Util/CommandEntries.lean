@@ -7,6 +7,7 @@ module
 
 prelude
 public import Lean.ScopedEnvExtension
+public import Lean.Meta.Basic
 import Lean.CompactedRegion
 import all Lean.Environment  -- for the per-view writes and counters, branches, realizations and their contexts
 
@@ -23,6 +24,27 @@ structure ViewStates where
   scopedOps : Array (Name × Array EnvExtensionEntry) := #[]
   caches : Array (Name × Array EnvExtensionEntry) := #[]
   deriving Nonempty
+
+/-- What an environment's validation counters and the persistent tier of its type class resolution cache became since
+an earlier environment of its branch: the counters (`Environment.trackedGen` and the generations of the tracked
+extensions in the main-branch view, `constGen`, `recordingConstGen`, `declChangeLog`) as they are after, the constants'
+generations added (`constAddedGens`), and the change of the stored tier (`Environment.storedSynthCache?`). A tier entry
+is valid where these counters say so, so a keep sets them as the full run left them (`applyCounters`): a command
+elaborated after a kept one then finds the tier and validates its entries as in the full run. -/
+structure CountersDelta where
+  trackedGen : Nat := 0
+  extGens : Array Nat := #[]
+  constGen : Nat := 0
+  recordingConstGen : Nat := 0
+  declChangeLog : DeclChangeLog := {}
+  constAddedGens : Array (Name × Nat) := #[]
+  /-- The stored tier's generation after, `none` for no tier. -/
+  synthTierGen? : Option Nat := none
+  /-- The stored tier's bindings added or changed. -/
+  synthTierSet : Array (Meta.SynthInstanceCacheKey × List Meta.SynthInstanceCacheEntry) := #[]
+  /-- The stored tier's keys removed. -/
+  synthTierErased : Array Meta.SynthInstanceCacheKey := #[]
+  deriving Inhabited
 
 /-- What a command added on its main branch, or an asynchronous constant's branch added, in order: everything a keep
 re-adds (`readdCommandConstants`). -/
@@ -43,8 +65,9 @@ inductive AddedConst where
   run's does. The merge's extension writes are in the enclosing states. -/
   | merged (forConst key : Name) (consts : Array Name)
   /-- The realization context of `forConst` the command registered (`enableRealizationsForConst`), with the options it
-  was registered with and its environment's states in both views relative to the command's before-environment. -/
-  | context (forConst : Name) (opts : Options) (main checked : ViewStates)
+  was registered with, its environment's states in both views relative to the command's before-environment, and its
+  counters and persistent tier (`CountersDelta`). -/
+  | context (forConst : Name) (opts : Options) (main checked : ViewStates) (counters : CountersDelta)
   deriving Inhabited
 
 /-- Why a command's payload is not replayed: a keep elaborates the command again instead. `at?` is the asynchronous
@@ -60,10 +83,10 @@ inductive Refusal where
   /-- A write to the non-persistent extension `ext` (its registration's name, `EnvExtension.name`), which is no command
   cache. -/
   | unrecorded (ext : Name) (at? : Option Name := none)
-  /-- A kernel constant checking the elaborator's would not give: added unchecked (`Kernel.Environment.divergentAdds`),
-  or the constants the kernel gained not those the elaborator gained (`kernelMatchesElaborator`: rejected by the
-  kernel, never committed to it, or committed to it alone). -/
-  | divergentKernelAdd
+  /-- A kernel constant checking the elaborator's would not give: added unchecked (`unchecked`,
+  `Kernel.Environment.divergentAdds`), or the constants the kernel gained not those the elaborator gained (`unchecked`
+  false, `kernelMatchesElaborator`: rejected by the kernel, never committed to it, or committed to it alone). -/
+  | divergentKernelAdd (unchecked : Bool)
   /-- An attribute whose handlers may run code outside core Lean (`foreignAttributesByCommandRef`). -/
   | foreignAttribute (attr : Name)
   /-- A realization whose constants the before-environment holds only part of. -/
@@ -79,13 +102,11 @@ inductive Refusal where
   /-- Entries recorded for `part` (an extension, a scoped stack or a command cache) that hold a value no `.olean` can
   store (a closure); the payload leaves them out. -/
   | uncompactable (part : Name) (at? : Option Name := none)
-  /-- Code the command evaluated that its environment does not keep (`decl`, `evaluatedByCommand`): code it compiled to
-  evaluate, as `#eval`, `run_cmd`, `run_meta`, `run_elab`, `run_tac` and `by_elab` do, whose effects on process state,
-  files or output no payload carries. -/
-  | ranCode (decl : Name)
-  /-- A write to state an imported module's initializer or a plugin created (an `IO.Ref`,
-  `foreignStateWritesByCommand`), which no payload carries. -/
-  | foreignState
+  /-- An effect on state outside the command that the runtime noted (`effectsByCommand`): a write to a reference it did
+  not create, the resolution of a promise it did not create, or a use of process-wide state (files, the environment,
+  the working directory, the running executable's path, child processes, the standard streams), which no payload
+  carries. -/
+  | effect (what : String)
   deriving Inhabited, BEq
 
 namespace Refusal
@@ -104,7 +125,8 @@ protected def toString : Refusal → String
   | notCarried ext at? => s!"a change to {ext}, whose state payloads do not carry{inRecord at?}"
   | unreplayable ext at? => s!"entries for {ext}, which has no `ofOLeanEntry?` to replay them{inRecord at?}"
   | unrecorded ext at? => s!"a write to {ext}, neither persistent nor a command cache{inRecord at?}"
-  | divergentKernelAdd => "a declaration whose kernel constant is not what checking the elaborator's would give"
+  | divergentKernelAdd true => "a declaration the kernel added without checking it"
+  | divergentKernelAdd false => "a declaration whose kernel constant is not what checking the elaborator's would give"
   | foreignAttribute attr => s!"the attribute {attr}, whose handlers may run code outside core Lean"
   | partlyHeldRealization c => s!"the realization of {c}, part of which an earlier command added"
   | realizedWithoutRealization c => s!"{c}, marked as realized outside a realization"
@@ -112,10 +134,13 @@ protected def toString : Refusal → String
   | unrelatedConstMap at? => s!"a constant map that does not extend the one before it{inRecord at?}"
   | commandState field => s!"a change to the command state's {field}"
   | uncompactable part at? => s!"entries for {part} that no .olean can store (a closure){inRecord at?}"
-  | ranCode decl => s!"code it evaluated and discarded ({decl})"
-  | foreignState => "a write to state an imported module's initializer created"
+  | effect what => s!"an effect outside the command: it {what}"
 
 instance : ToString Refusal := ⟨Refusal.toString⟩
+
+/-- `rs` with each refusal of `new` it lacks appended, in order. -/
+def addNew (rs new : Array Refusal) : Array Refusal :=
+  new.foldl (fun rs r => if rs.contains r then rs else rs.push r) rs
 
 end Refusal
 
@@ -129,6 +154,8 @@ structure CommandEntries where
   /-- What the command added on its main branch and the realization contexts it registered, in order
   (`readdCommandConstants`). -/
   added : Array AddedConst := #[]
+  /-- The counters and persistent tier across the command (`CountersDelta`). -/
+  counters : CountersDelta := {}
   /-- Why the payload is not replayed: empty for a payload a keep replays. -/
   refusals : Array Refusal := #[]
   deriving Nonempty
@@ -369,6 +396,34 @@ private partial def addedConsts (regs : Registries) (w : Walk) (cells : List (As
     | _, none => out := out.push (k, .plain name)
   return (out, refused)
 
+/-- The change of `before`'s counters and persistent tier to `after`'s (`CountersDelta`), `none` if `after`'s
+declaration log does not extend `before`'s or `after` lacks a constant generation `before` has. -/
+private def countersDelta (before after : Environment) : Option CountersDelta := do
+  let (constAddedGens, removed) := PersistentHashMap.sharedDiff before.constAddedGens after.constAddedGens
+  unless removed.isEmpty do none
+  discard <| List.newPrefix? after.declChangeLog.entries before.declChangeLog.entries
+  let (synthTierGen?, synthTierSet, synthTierErased) := match after.storedSynthCache? with
+    | none => (none, #[], #[])
+    | some (gen, entries) =>
+      let (set, erased) := PersistentHashMap.sharedDiff ((before.storedSynthCache?.map (·.2)).getD {}) entries
+      (some gen, set, erased)
+  return { trackedGen := after.trackedGen, extGens := after.base.private.extGens, constGen := after.constGen,
+           recordingConstGen := after.recordingConstGen, declChangeLog := after.declChangeLog, constAddedGens,
+           synthTierGen?, synthTierSet, synthTierErased }
+
+/-- `env`, an environment whose counters and tier were what `c` started from, with them as `c` leaves them. -/
+private def applyCounters (env : Environment) (c : CountersDelta) : Environment :=
+  let env := { env with
+    base.private.trackedGen := c.trackedGen
+    base.private.extGens := c.extGens
+    constGen := c.constGen
+    recordingConstGen := c.recordingConstGen
+    declChangeLog := c.declChangeLog
+    constAddedGens := c.constAddedGens.foldl (fun m (n, g) => m.insert n g) env.constAddedGens }
+  env.setStoredSynthCache <| c.synthTierGen?.map fun gen =>
+    let entries := (env.storedSynthCache?.map (·.2)).getD {}
+    (gen, c.synthTierErased.foldl (·.erase ·) (c.synthTierSet.foldl (fun m (k, v) => m.insert k v) entries))
+
 /-- The realization contexts the command registered on the main branch, in registration order, each as a `context`
 record with its position among the command's main-branch constants (how many of them its environment held). -/
 private def addedContexts (regs : Registries) (before after : Environment) :
@@ -381,8 +436,10 @@ private def addedContexts (regs : Registries) (before after : Environment) :
     let (main, r₁) := viewStates regs .main before.base.private ctxEnv.base.private (at? := c)
     let (checked, r₂) := viewStates regs .checked before.checked.get ctxEnv.checked.get (at? := c)
     refused := refused ++ r₁ ++ r₂
+    let counters? := countersDelta before ctxEnv
+    if counters?.isNone then refused := refused.push (.inexpressible `Lean.Environment.declChangeLog c)
     ctxs := ctxs.push (ctxEnv.asyncConstsMap.private.size - n₀, ctxEnv.localRealizationCtxMap.size,
-      .context c ctx.opts main checked)
+      .context c ctx.opts main checked (counters?.getD {}))
   -- a context's environment holds the contexts registered before it: their count orders them
   let sorted := ctxs.qsort fun (p₁, o₁, _) (p₂, o₂, _) => p₁ < p₂ || (p₁ == p₂ && o₁ < o₂)
   return (sorted.map fun (p, _, a) => (p, a), refused)
@@ -432,11 +489,11 @@ private partial def elaboratorConsts (cells : List (AsyncConst × List AsyncCons
 
 /-- Whether the kernel environment gained, from `before` to `after`, exactly the constants of `elabConsts` (what the
 elaborator gained, `elaboratorConsts`) that it did not hold before, each as the elaborator has it (`kernelHolds`), and
-lost none. The constants are diffed through the map of the module's own constants (`map₂`); a kernel constant map whose
-imported part changed is not compared and does not match. -/
+lost none (`SMap.sharedDiff?`); a kernel constant map whose imported part changed does not match. -/
 private def kernelMatchesElaborator (before after : Kernel.Environment) (elabConsts : Array ConstantInfo) : Bool :=
-  SharedDiff.sameObject before.constants.map₁ after.constants.map₁ &&
-    let (gained, lost) := PersistentHashMap.sharedDiff before.constants.map₂ after.constants.map₂
+  match before.constants.sharedDiff? after.constants with
+  | none => false
+  | some (gained, lost) =>
     let (_, new) := elabConsts.foldl (init := ((∅ : NameSet), 0)) fun (seen, n) info =>
       if (before.find? info.name).isSome || seen.contains info.name then (seen, n) else (seen.insert info.name, n + 1)
     lost.isEmpty && elabConsts.all (kernelHolds after) && new == gained.size
@@ -448,7 +505,7 @@ private def recordCommandDeltaWith (regs : Registries) (before after : Environme
   let (checked, r₂) := viewStates regs .checked before.checked.get after.checked.get
   let mut refusals := r₁ ++ r₂
   if before.checked.get.divergentAdds != after.checked.get.divergentAdds then
-    refusals := refusals.push .divergentKernelAdd
+    refusals := refusals.push (.divergentKernelAdd (unchecked := true))
   let w : Walk := { after, before := before.base.private, beforeKernel := before.checked.get }
   let exportedKind (c : AsyncConst) := (after.asyncConstsMap.public.find? c.constInfo.name).map (·.constInfo.kind)
   let mut added := #[]
@@ -456,13 +513,14 @@ private def recordCommandDeltaWith (regs : Registries) (before after : Environme
   | none => refusals := refusals.push (.unrelatedConstMap none)
   | some cells =>
     unless kernelMatchesElaborator before.checked.get after.checked.get (elaboratorConsts cells) do
-      refusals := refusals.push .divergentKernelAdd
+      refusals := refusals.push (.divergentKernelAdd (unchecked := false))
     let (ctxs, rc) := addedContexts regs before after
     let (recs, r) := addedConsts regs w cells exportedKind
     added ← (mergeAtPositions recs ctxs).mapM (attachMerges after)
     refusals := refusals ++ rc ++ r
-  let distinct := refusals.foldl (init := #[]) fun rs r => if rs.contains r then rs else rs.push r
-  return { idx, main, checked, added, refusals := distinct }
+  let counters? := countersDelta before after
+  if counters?.isNone then refusals := refusals.push (.inexpressible `Lean.Environment.declChangeLog)
+  return { idx, main, checked, added, counters := counters?.getD {}, refusals := Refusal.addNew #[] refusals }
 
 /-- One command's payload: the change of each view (`viewStates`); what the command added on its main branch, with
 each asynchronous constant's branch additions and states, each realization's constants, states and the realizations
@@ -519,10 +577,10 @@ private partial def compactingRecord : AddedConst → IO (AddedConst × Array Re
   | .realization forConst key consts states merges => do
     let (states, r) ← compactingStates states (some key)
     return (.realization forConst key consts states merges, r)
-  | .context forConst opts main checked => do
+  | .context forConst opts main checked counters => do
     let (main, r₁) ← compactingStates main (some forConst)
     let (checked, r₂) ← compactingStates checked (some forConst)
-    return (.context forConst opts main checked, r₁ ++ r₂)
+    return (.context forConst opts main checked counters, r₁ ++ r₂)
   | a => return (a, #[])
 
 /-- `ce` as an `.olean` stores it, with its compacted bytes (`CompactedRegion.bytes`): every recorded part that holds
@@ -540,17 +598,16 @@ def CommandEntries.compact (ce : CommandEntries) : IO (CommandEntries × ByteArr
       let (a, r) ← compactingRecord a
       added := added.push a
       refused := refused ++ r
-    let refusals := refused.foldl (init := #[]) fun rs r => if rs.contains r then rs else rs.push r
-    let ce := { ce with main, checked, added, refusals }
+    let ce := { ce with main, checked, added, refusals := Refusal.addNew #[] refused }
     return (ce, ← CompactedRegion.bytes ce)
 
 /-- Replaces the current module's command payload with `entries` before writing its `.olean`. -/
 def setCommandEntries (env : Environment) (entries : Array CommandEntries) : Environment :=
   commandEntriesExt.modifyState env fun _ => entries
 
-/-- Why the module's command payloads cannot be replayed: a declaration command (`isDecl` of its index) has a refusal.
-A non-declaration command with one is elaborated again rather than replayed, so it does not prevent reuse. -/
-def commandEntriesNoskipReason? (entries : Array CommandEntries) (isDecl : Nat → Bool) : Option String :=
+/-- Why none of the module's commands may be kept: a declaration command (`isDecl` of its index) has a refusal. A
+non-declaration command with one is elaborated again rather than replayed, so it does not prevent reuse. -/
+def commandEntriesNoreuseReason? (entries : Array CommandEntries) (isDecl : Nat → Bool) : Option String :=
   entries.findSome? fun ce =>
     if isDecl ce.idx then ce.refusals[0]?.map (s!"declaration command {ce.idx}: {·}") else none
 
@@ -592,30 +649,45 @@ private def replayStates (regs : Registries) (env : Environment) (parts : Array 
       env := cache.replayIn env view es
   return env
 
-/-- Evidence that a module's commands may be kept into an environment that imports `imports`: every name resolution
-the module's compile recorded holds there (`ModuleUsage.keepPermit`, its only maker). A command's records list the
-constants it used, but no name resolution of its own, and a command can depend on the module the resolver picks for a
-name that occurs in none of its terms (the reducibility of a constant its tactic unfolds, a compiled name): so a
-command is kept only into an environment where all of the module's recorded resolutions hold, and
-`readdCommandConstants` and `replayCommandEntries` take a permit for its imports. -/
+/-- Evidence that a module's command payloads may be kept into one environment: the module's `.olean` and `.usage`
+belong together, and every check on the module's import closure that Lake makes before it skips the module holds in
+that environment (`ModuleUsage.keepPermit`, its only maker). The permit holds the payloads it was checked for, and a keep
+takes only those, into an environment with that module as its main module and the imports it was checked against (the
+same imported module data, compared by identity). A command's records list the constants it used, but no name
+resolution of its own, and a command can depend on the module the resolver picks for a name that occurs in none of its
+terms (the reducibility of a constant its tactic unfolds, a compiled name); so a command is kept only where all of the
+module's recorded resolutions hold. -/
 structure KeepPermit where
   private mk ::
-  /-- The imported modules (`EnvironmentHeader.moduleNames`) of the environment the resolutions were checked in. -/
-  imports : Array Name
+  /-- The module the payloads are of. -/
+  module : Name
+  /-- The module's `.olean` data, read by `ModuleUsage.keepPermit`. -/
+  data : ModuleData
+  /-- The module's command payloads (`CommandEntries.ofModuleData data`), the only ones a keep with the permit takes. -/
+  payloads : Array CommandEntries
+  /-- The imported module data of the environment the permit was checked in (`EnvironmentHeader.moduleData`). -/
+  private imports : Array ModuleData
 
-/-- Throws unless `permit` was checked in an environment with `env`'s imports. -/
-private def KeepPermit.check (permit : KeepPermit) (env : Environment) : IO Unit := do
-  unless permit.imports == env.header.moduleNames do
+/-- Throws unless `permit` holds the payload `ce` and was checked in an environment with `env`'s main module and imports.
+-/
+private def KeepPermit.check (permit : KeepPermit) (env : Environment) (ce : CommandEntries) : IO Unit := do
+  unless SharedDiff.sameObject permit.imports env.header.moduleData do
     throw <| IO.userError "reuse: the keep permit was checked in an environment with other imports"
+  unless env.mainModule == permit.module do
+    throw <| IO.userError s!"reuse: the keep permit is for {permit.module}, not {env.mainModule}"
+  unless permit.payloads.any (SharedDiff.sameObject · ce) do
+    throw <| IO.userError s!"reuse: command {ce.idx}'s payload is not one the keep permit holds"
 
 /-- Plan §1.4 step 3: replays a command payload's change of both views into `env`, the environment after
-`readdCommandConstants`. Throws on a payload with refusals, or a `permit` for other imports. -/
+`readdCommandConstants`, and sets its counters and persistent tier as the command left them (`applyCounters`). Throws on
+a payload with refusals, or one `permit` does not hold for `env` (`KeepPermit`). -/
 def replayCommandEntries (permit : KeepPermit) (env : Environment) (ce : CommandEntries) (opts : Options) :
     IO Environment := do
-  permit.check env
+  permit.check env ce
   unless ce.refusals.isEmpty do
     throw <| IO.userError s!"command {ce.idx} is not replayable ({ce.refusals}); it must be elaborated again"
-  replayStates (← Registries.get) env #[(.checked, ce.checked), (.main, ce.main)] opts
+  let env ← replayStates (← Registries.get) env #[(.checked, ce.checked), (.main, ce.main)] opts
+  return applyCounters env ce.counters
 
 /-- The kernel's limits while a keep re-checks constants (`Environment.addDeclCore`); `0` is unlimited. -/
 structure ReaddLimits where
@@ -741,9 +813,9 @@ private partial def readdAdded (regs : Registries) (infos : NameMap ConstantInfo
     if let some n := consts.find? (!env.containsOnBranch ·) then
       throw <| IO.userError s!"reuse: merging the realization {key} for {forConst} did not add {n}"
     return env
-  | .context forConst ctxOpts main checked => do
+  | .context forConst ctxOpts main checked counters => do
     let ctxEnv ← replayStates regs env #[(.checked, checked), (.main, main)] ctxOpts
-    env.registerRealizationContext forConst ctxEnv ctxOpts
+    env.registerRealizationContext forConst (applyCounters ctxEnv counters) ctxOpts
 
 /--
 Plan §1.4 step 1 for a kept command: re-adds what the command added (`CommandEntries.added`) to `env`, its
@@ -752,7 +824,8 @@ asynchronously with their branches, or through their realizations, and each real
 rebuilt from its record at its position. `infos` are the command's constants (its declarations, auxiliaries and
 realized constants, from the previous `.olean`). The kernel checks every constant with `limits` (realized constants
 with none, as in a full run), and a rejection is a hard error carrying the kernel's message; so is a constant of
-`infos` the records do not re-add, and a `permit` for other imports. Run `replayCommandEntries` (step 3) after.
+`infos` the records do not re-add, and a payload `permit` does not hold for `env` (`KeepPermit`). Run
+`replayCommandEntries` (step 3) after.
 
 A `merged` record, and a `realization` record's `merges`, look up realizations that are cached already. An earlier
 command elaborated instead of kept may make them in its asynchronous branches, after this keep starts: each such lookup
@@ -761,7 +834,7 @@ branches commit only after their realizations are cached.
 -/
 def readdCommandConstants (permit : KeepPermit) (env : Environment) (ce : CommandEntries)
     (infos : NameMap ConstantInfo) (opts : Options) (limits : ReaddLimits := {}) : IO Environment := do
-  permit.check env
+  permit.check env ce
   let regs ← Registries.get
   let env ← ce.added.foldlM (readdAdded regs infos opts limits) env
   let kenv := env.toKernelEnv
@@ -798,11 +871,15 @@ def keep (permit : KeepPermit) (env : Environment) (ce : CommandEntries) (infos 
 would start: a keep onto it re-adds every realization instead of finding the full run's results. -/
 def freshRealizationCaches (env : Environment) : BaseIO Environment := do
   let importRealizationCtx? ← env.importRealizationCtx?.mapM fun ctx => return { ctx with
-    realizeMapRef := ← IO.mkRef {} }
+    realizeMapRef := ← mkAccountedRef {} }
   let mut localRealizationCtxMap : NameMap RealizationContext := {}
   for (c, ctx) in env.localRealizationCtxMap do
-    localRealizationCtxMap := localRealizationCtxMap.insert c { ctx with realizeMapRef := ← IO.mkRef {} }
+    localRealizationCtxMap := localRealizationCtxMap.insert c { ctx with realizeMapRef := ← mkAccountedRef {} }
   return { env with importRealizationCtx?, localRealizationCtxMap }
+
+/-- Test support: `permit` holding `f` of its payloads, so that a test can keep payloads it changed. -/
+def substitutePayloads (permit : KeepPermit) (f : Array CommandEntries → Array CommandEntries) : KeepPermit :=
+  { permit with payloads := f permit.payloads }
 
 /-- Test support: `ext.view` for each extension `keep` accepts among `ce`'s entries in both views and its scoped stack
 operations (main view). -/

@@ -1,10 +1,10 @@
 import Lean
 /-! A declaration command that removes a binding from an extension whose state delta diffs a map (a map declaration
 extension, a tag attribute, a hash-map state, the namespace set) refuses its payload for the extension: no entry
-expresses a removal, so the module is declined (`noskip`). The
+expresses a removal, so no command of the module is kept (`noreuse`). The
 removals are direct state writes, which these deltas see without the direct-write counter. The attributes are
 registered by an imported module, so each command that runs one is also refused for it (`Refusal.foreignAttribute`),
-and the module's `noskip` reason names the first such command; the per-command lines show each extension's refusal. -/
+and the module's `noreuse` reason names the first such command; the per-command lines show each extension's refusal. -/
 open Lean
 
 def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
@@ -53,11 +53,12 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let some _ ← Elab.runFrontend mSource {} "M.lean" `M (oleanFileName? := some (dir / "M.olean")) (usageFileName? := some (dir / "M.usage")) |
     throw <| IO.userError "elaboration of M failed"
   let obs := (← ModuleUsage.commandObservations).qsort (·.i < ·.i)
-  let (md, _) ← readModuleData (dir / "M.olean")
-  let payloads := CommandEntries.ofModuleData md
+  let some first := obs[0]? | throw <| IO.userError "no commands"
+  let permit ← IO.ofExcept (← ModuleUsage.Testing.keepPermit first.before.env `M (dir / "M.olean") (dir / "M.usage"))
+  let payloads := permit.payloads
   let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
-  IO.println s!"noskip {(usage.getObjValAs? Bool "noskip").toOption}, \
-    reason {(usage.getObjValAs? String "noskipReason").toOption}"
+  IO.println s!"noreuse {(usage.getObjValAs? Bool "noreuse").toOption}, \
+    reason {(usage.getObjValAs? String "noreuseReason").toOption}"
   let watched := [`mapExt, `tagAttr, `Lean.Meta.Simp.simprocDeclExt, .num `_private.Lean.Namespace 0 ++ `Lean.namespacesExt]
   for o in obs do
     let some ce := payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"

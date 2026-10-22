@@ -1,4 +1,4 @@
-== a macro sets an option next to a def: noskip (some true), reason (some (declaration command 4: a change to the command state's scopes))
+== a macro sets an option next to a def: noreuse (some true), reason (some (declaration command 4: a change to the command state's scopes))
 0 other: command-state markers #[scopes], refused
 1 other: command-state markers #[scopes], refused
 2 decl: command-state markers #[], replayed
@@ -6,21 +6,21 @@
 4 decl: command-state markers #[scopes], refused
 5 decl: command-state markers #[], replayed
 6 other: command-state markers #[], replayed
-== a macro adds a variable next to a def: noskip (some true), reason (some (declaration command 3: a change to the command state's scopes))
+== a macro adds a variable next to a def: noreuse (some true), reason (some (declaration command 3: a change to the command state's scopes))
 0 other: command-state markers #[scopes], refused
 1 decl: command-state markers #[], replayed
 2 other: command-state markers #[], replayed
 3 decl: command-state markers #[scopes], refused
 4 decl: command-state markers #[], replayed
 5 other: command-state markers #[], replayed
-== a macro declares a universe next to a def: noskip (some true), reason (some (declaration command 3: a change to the command state's scopes))
+== a macro declares a universe next to a def: noreuse (some true), reason (some (declaration command 3: a change to the command state's scopes))
 0 other: command-state markers #[scopes], refused
 1 decl: command-state markers #[], replayed
 2 other: command-state markers #[], replayed
 3 decl: command-state markers #[scopes], refused
 4 decl: command-state markers #[], replayed
 5 other: command-state markers #[], replayed
-== scopes the command restores: noskip (some false), reason none
+== scopes the command restores: noreuse (some false), reason none
 0 other: command-state markers #[scopes], refused
 1 decl: command-state markers #[], replayed
 2 decl: command-state markers #[], replayed
@@ -39,7 +39,7 @@ ctx depends on maxRecDepth: true, on ngen: true
 M.lean:7:0: warning: a warning
 [debug] a trace
 messages 0, traces 0
-== messages and traces are per command: noskip (some false), reason none
+== messages and traces are per command: noreuse (some false), reason none
 0 other: command-state markers #[scopes], refused
 1 decl: command-state markers #[], replayed
 2 decl: command-state markers #[], replayed
