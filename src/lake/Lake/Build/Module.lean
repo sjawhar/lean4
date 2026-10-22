@@ -644,14 +644,6 @@ switches compiles each module again.
 @[inline] def usageCutoffEnabled [Functor m] [MonadLakeEnv m] : m Bool :=
   (·.usageCutoff) <$> getLakeEnv
 
-/-- The usage-cutoff setting as a local input of a module, the last (`ModulePreSetup.localTrace`). -/
-def usageCutoffTrace (enabled : Bool) : BuildTrace := pureTrace enabled "usage cutoff"
-
-/-- The hash of the module's local trace with the usage-cutoff setting `enabled` in place of its own. -/
-def ModulePreSetup.localHashWithCutoff (self : ModulePreSetup) (enabled : Bool) : Hash :=
-  let inputs := self.localTrace.inputs.pop.push (usageCutoffTrace enabled)
-  (inputs.foldl (·.mix ·) (BuildTrace.nil "local") : BuildTrace).hash
-
 /--
 Recursively build a module's dependencies, including:
 * Transitive local imports
@@ -721,13 +713,12 @@ def Module.recFetchPreSetup (mod : Module) : FetchM (Job ModulePreSetup) := ensu
     let extra := (← getLeanOptOverrides).find? mod.pkg.baseName |>.getD {}
     let leanOptions := mod.leanOptions ++ extra
     -- Every input of the module's trace except `depTrace` (the imports' `info.trace` and `extraDepJob`'s trace,
-    -- which `localTrace` mixes in separately), the usage-cutoff setting last (`ModulePreSetup.localHashWithCutoff`
-    -- swaps it).
+    -- which `localTrace` mixes in separately).
     let localInputs := libTraces ++ #[
       ← getLeanTrace, input.trace, traceOptions leanOptions "options",
       pureTrace input.header.isModule "isModule", pureTrace mod.name "Module.name",
       pureTrace mod.pkg.id? "Package.id?", pureTrace mod.leanArgs "Module.leanArgs",
-      usageCutoffTrace (← usageCutoffEnabled)]
+      pureTrace (← usageCutoffEnabled) "usage cutoff"]
     addTrace depTrace
     localInputs.forM addTrace
     let localTrace := localInputs.foldl (·.mix ·) ((BuildTrace.nil "local").mix extraDepJob.getTrace)
@@ -804,6 +795,7 @@ public def Module.clearOutputArtifacts (mod : Module) : IO PUnit := do
     removeFileIfExists mod.cFile
     removeFileIfExists mod.bcFile
     removeFileIfExists mod.usageFile
+    removeFileIfExists mod.resolvedFile
     removeFileIfExists mod.usekeyFile
   catch e =>
     error s!"failed to remove output artifacts: {e}"
@@ -831,6 +823,7 @@ public def Module.clearOutputHashes (mod : Module) : IO PUnit := do
     clearFileHash mod.cFile
     clearFileHash mod.bcFile
     clearFileHash mod.usageFile
+    clearFileHash mod.resolvedFile
     clearFileHash mod.usekeyFile
   catch e =>
     error s!"failed to remove output hashes: {e}"
@@ -870,15 +863,16 @@ keep skipping.
 -/
 def ModuleOutputDescrs.resolveSidecars
   (descrs : ModuleOutputDescrs) (service? : Option CacheServiceName) (scope? : Option CacheServiceScope)
-: JobM (Option Artifact × Option Artifact) := do
+: JobM (Option Artifact × Option Artifact × Option Artifact) := do
   let usage? ← descrs.usage?.mapM (resolveArtifact · service? scope?)
+  let resolved? ← descrs.resolved?.mapM (resolveArtifact · service? scope?)
   let usekey? ← descrs.usekey?.mapM (resolveArtifact · service? scope?)
-  return (usage?, usekey?)
+  return (usage?, resolved?, usekey?)
 
 def ModuleOutputDescrs.resolve
   (descrs : ModuleOutputDescrs) (service? : Option CacheServiceName) (scope? : Option CacheServiceScope)
 : JobM ModuleOutputArtifacts := do
-  let (usage?, usekey?) ← descrs.resolveSidecars service? scope?
+  let (usage?, resolved?, usekey?) ← descrs.resolveSidecars service? scope?
   let arts : ModuleOutputArtifacts := {
     isModule := descrs.isModule
     olean := ← resolve descrs.olean
@@ -889,8 +883,7 @@ def ModuleOutputDescrs.resolve
     ilean := ← resolve descrs.ilean
     c? := ← descrs.c?.mapM resolve
     ltar? := ← descrs.ltar?.mapM resolve
-    usage?, usekey?
-    keptFrom? := descrs.keptFrom?
+    usage?, resolved?, usekey?
   }
   if Lean.Internal.hasLLVMBackend () then
     let some descr := descrs.bc?
@@ -910,26 +903,16 @@ instance : ResolveOutputs ModuleOutputArtifacts := ⟨resolveModuleOutputArtifac
 
 inductive ModuleOutputs
 /-- Only the archive, and the entry's sidecars, which the archive does not include. -/
-| ltar (art : Artifact) (usage? usekey? : Option Artifact)
+| ltar (art : Artifact) (usage? resolved? usekey? : Option Artifact)
 | arts (arts : ModuleOutputArtifacts)
 
 instance : Coe ModuleOutputArtifacts ModuleOutputs := ⟨.arts⟩
 
-/--
-Resolves a module's cached outputs: the archive alone (a string, or `{"l": <archive>, "kf": <hash>}`
-for kept outputs, as `lake build -o` records them), or the outputs' descriptions.
--/
 def resolveModuleOutputs (out : CacheOutput) : JobM ModuleOutputs := do
-  let archive? := match out.data with
-    | .str descr => some descr
-    | data => if (data.getObjVal? "o").isOk then none else
-      match data.getObjVal? "l" with
-      | .ok (.str descr) => some descr
-      | _ => none
-  if let some descr := archive? then
+  if let .str descr := out.data then
     match ArtifactDescr.ofFilePath? descr with
     | .ok descr =>
-      return .ltar (← resolveArtifact descr out.service? out.scope?) none none
+      return .ltar (← resolveArtifact descr out.service? out.scope?) none none none
     | .error e =>
       error s!"ill-formed module archive output:\n{out.data.render.pretty 80 2}\n{e}"
   else
@@ -940,8 +923,8 @@ def resolveModuleOutputs (out : CacheOutput) : JobM ModuleOutputs := do
           descrs.resolve out.service? out.scope?
         catch e =>
           dropLogFrom e
-          let (usage?, usekey?) ← descrs.resolveSidecars out.service? out.scope?
-          return .ltar (← resolveArtifact descr out.service? out.scope?) usage? usekey?
+          let (usage?, resolved?, usekey?) ← descrs.resolveSidecars out.service? out.scope?
+          return .ltar (← resolveArtifact descr out.service? out.scope?) usage? resolved? usekey?
       else
         descrs.resolve out.service? out.scope?
     | .error e => error s!"ill-formed module outputs:\n{out.data.render.pretty 80 2}\n{e}"
@@ -949,12 +932,14 @@ def resolveModuleOutputs (out : CacheOutput) : JobM ModuleOutputs := do
 instance : ResolveOutputs ModuleOutputs := ⟨resolveModuleOutputs⟩
 
 /--
-Saves the module's usage-cutoff sidecars (`.usage`, `.usekey`), where they exist, to the local Lake cache as they
-are: no trace describes them, but the `.usekey` binds the `.usage` (its digest) and the `.olean` (its hash), and Lake
-checks both wherever it reads them.
+Saves the module's usage-cutoff sidecars (`.usage`, `.resolved`, `.usekey`), where they exist, to the local Lake cache
+as they are: no trace describes them, but the `.usekey` binds the `.usage` (its digest), which binds the `.resolved`
+(its digest), and the `.olean` (its hash), and Lake checks each wherever it reads them.
 -/
-def Module.cacheUsageSidecars (mod : Module) (useLocalFile : Bool) : JobM (Option Artifact × Option Artifact) :=
-  return (← cacheIfExists mod.usageFile "usage", ← cacheIfExists mod.usekeyFile "usekey")
+def Module.cacheUsageSidecars (mod : Module) (useLocalFile : Bool) :
+    JobM (Option Artifact × Option Artifact × Option Artifact) :=
+  return (← cacheIfExists mod.usageFile "usage", ← cacheIfExists mod.resolvedFile "resolved",
+    ← cacheIfExists mod.usekeyFile "usekey")
 where
   cacheIfExists file ext : JobM (Option Artifact) := do
     if (← file.pathExists) then
@@ -966,7 +951,7 @@ where
 def Module.cacheOutputArtifacts
   (mod : Module)  (isModule : Bool) (useLocalFile : Bool) (postponesCompile : Bool)
 : JobM ModuleOutputArtifacts := do
-  let (usage?, usekey?) ← mod.cacheUsageSidecars useLocalFile
+  let (usage?, resolved?, usekey?) ← mod.cacheUsageSidecars useLocalFile
   return {
     isModule
     olean := ← cache mod.oleanFile "olean"
@@ -978,7 +963,7 @@ def Module.cacheOutputArtifacts
     c? := ← cacheIf? (!(isModule && postponesCompile)) mod.cFile "c"
     bc? := ← cacheIf? (Lean.Internal.hasLLVMBackend ()) mod.bcFile "bc"
     ltar? := ← cacheIf? (← mod.ltarFile.pathExists) mod.ltarFile "ltar"
-    usage?, usekey?
+    usage?, resolved?, usekey?
   }
 where
   @[inline] cache file ext := do
@@ -1014,7 +999,7 @@ def Module.recacheOutputArtifacts?
     | none =>
       removeFileIfExists mod.ltarFile
       return some none
-  let (usage?, usekey?) ← mod.cacheUsageSidecars useLocalFile
+  let (usage?, resolved?, usekey?) ← mod.cacheUsageSidecars useLocalFile
   let arts? : Option ModuleOutputArtifacts := do
     return {
       isModule
@@ -1027,8 +1012,7 @@ def Module.recacheOutputArtifacts?
       c? := ← c?
       bc? := ← bc?
       ltar? := ← ltar?
-      usage?, usekey?
-      keptFrom? := descrs.keptFrom?
+      usage?, resolved?, usekey?
     }
   return arts?
 where
@@ -1064,6 +1048,7 @@ def Module.restoreAllArtifacts (mod : Module) (cached : ModuleOutputArtifacts) :
     bc? := ← restoreSome mod.bcFile cached.bc?
     ltar? := ← restoreSome mod.ltarFile cached.ltar?
     usage? := ← restoreSome mod.usageFile cached.usage?
+    resolved? := ← restoreSome mod.resolvedFile cached.resolved?
     usekey? := ← restoreSome mod.usekeyFile cached.usekey?
   }
 where
@@ -1225,13 +1210,11 @@ def SavedTrace.moduleOutputDescrs? (self : SavedTrace) : Option ModuleOutputDesc
   (ModuleOutputDescrs.fromJson? outputs).toOption
 
 /--
-The outputs the saved trace describes (`descrs`) that are not in the build directory with the bytes recorded for
-them, hashed as the cache hashes a module output (`computeBinFileHash`), each with the description recorded for it
-(`none` if `descrs` describes no such output). With `sidecars`, the usage-cutoff sidecars (`.usage`, `.usekey`)
-count as outputs too. Empty if every output matches.
+Whether every output the saved trace describes (`descrs`) is in the build directory with the bytes recorded for
+it, hashed as the cache hashes a module output (`computeBinFileHash`).
 -/
-def Module.outputMismatches (mod : Module) (isModule postponesCompile : Bool) (descrs : ModuleOutputDescrs)
-    (sidecars := false) : JobM (Array (FilePath × Option ArtifactDescr)) := do
+def Module.outputsMatchDescrs (mod : Module) (isModule postponesCompile : Bool) (descrs : ModuleOutputDescrs) :
+    JobM Bool := do
   let required : Array (Bool × FilePath × Option ArtifactDescr) := #[
     (true, mod.oleanFile, some descrs.olean),
     (isModule, mod.oleanServerFile, descrs.oleanServer?),
@@ -1240,30 +1223,21 @@ def Module.outputMismatches (mod : Module) (isModule postponesCompile : Bool) (d
     (isModule && !postponesCompile, mod.irFile, descrs.ir?),
     (true, mod.ileanFile, some descrs.ilean),
     (!(isModule && postponesCompile), mod.cFile, descrs.c?),
-    (Lean.Internal.hasLLVMBackend (), mod.bcFile, descrs.bc?),
-    (sidecars, mod.usageFile, descrs.usage?),
-    (sidecars, mod.usekeyFile, descrs.usekey?)]
-  let mut mismatches := #[]
+    (Lean.Internal.hasLLVMBackend (), mod.bcFile, descrs.bc?)]
   for (c, file, descr?) in required do
     unless c do continue
-    match descr? with
-    | none => mismatches := mismatches.push (file, none)
-    | some descr =>
-      match (← (computeBinFileHash file).toBaseIO) with
-      | .ok hash => unless hash == descr.hash do mismatches := mismatches.push (file, some descr)
-      | .error _ => mismatches := mismatches.push (file, some descr)
-  return mismatches
+    let some descr := descr? | return false
+    let .ok hash ← (computeBinFileHash file).toBaseIO | return false
+    unless hash == descr.hash do return false
+  return true
 
 /--
 Keeps the module's outputs for a build that does not compile it, if each is still what the saved trace describes
 (`descrs?`): with `cacheWith? = some useLocalFile`, saves them to the cache, checking each while saving
-(`recacheOutputArtifacts?`); otherwise checks their bytes (`outputMismatches`). Either way the outputs keep the
-lineage the trace records (`ModuleOutputDescrs.keptFrom?`), so kept outputs stay kept wherever they are recorded
-next (a trace, a cache mapping, an `-o` entry). Returns `none` if the trace records no outputs or any output differs,
-so that the caller builds. Every path that keeps outputs it then vouches for under a new input hash, or caches, goes
-through here: an up-to-date replay that caches its outputs, a usage skip (`Module.skipOrBuild`), and a kept-module
-check's accept (`acceptKept`). (Outputs restored from the usage index, which come from the cache, are checked as
-they are restored, `Module.restoreFromUsageIndex?`.)
+(`recacheOutputArtifacts?`); otherwise checks their bytes (`outputsMatchDescrs`). Returns `none` if the trace
+records no outputs or any output differs, so that the caller builds. Every path that keeps outputs it then vouches
+for under a new input hash, or caches, goes through here: an up-to-date replay that caches its outputs, and a usage
+skip (`Module.skipOrBuild`).
 -/
 def Module.keepOutputs? (mod : Module) (isModule postponesCompile : Bool) (descrs? : Option ModuleOutputDescrs)
     (cacheWith? : Option Bool) : JobM (Option ModuleOutputArtifacts) := do
@@ -1271,21 +1245,8 @@ def Module.keepOutputs? (mod : Module) (isModule postponesCompile : Bool) (descr
   match cacheWith? with
   | some useLocalFile => mod.recacheOutputArtifacts? isModule useLocalFile postponesCompile descrs
   | none =>
-    unless (← mod.outputMismatches isModule postponesCompile descrs).isEmpty do return none
-    return some {(← mod.computeArtifacts isModule postponesCompile) with keptFrom? := descrs.keptFrom?}
-
-/-- The `keptFrom?` recorded with a saved trace's module outputs. -/
-def SavedTrace.keptFrom? (self : SavedTrace) : Option Hash :=
-  self.moduleOutputDescrs?.bind (·.keptFrom?)
-
-/--
-Gives `arts` the `keptFrom?` that the module's trace file records: outputs described again from the
-build directory lack it, while the trace written for them (by a compile, a kept-module check, or a
-restore) records it.
--/
-def Module.withSavedKeptFrom (mod : Module) (arts : ModuleOutputArtifacts) : JobM ModuleOutputArtifacts := do
-  if arts.keptFrom?.isSome then return arts
-  return {arts with keptFrom? := (← readTraceFile mod.traceFile).keptFrom?}
+    unless (← mod.outputsMatchDescrs isModule postponesCompile descrs) do return none
+    return some (← mod.computeArtifacts isModule postponesCompile)
 
 def Module.packLtar
   (self : Module) (arts : ModuleOutputArtifacts)
@@ -1361,7 +1322,6 @@ def Module.recBuildLtar (self : Module) : FetchM (Job FilePath) := do
 public def Module.ltarFacetConfig : ModuleFacetConfig ltarFacet :=
   mkFacetJobConfig recBuildLtar
 
-
 /--
 Fails, discarding the module's outputs, if its source changed since `recFetchInput` read it: the input
 hash covers the source as read then, while `lean` reads it again and a usage skip keeps old outputs.
@@ -1379,16 +1339,11 @@ def Module.checkSourceUnchanged (mod : Module) (presetup : ModulePreSetup) : Job
 /--
 Compiles the module. `setup?` is its `ModuleSetup` if the caller already computed it
 (`Module.skipOrBuild`); otherwise it is computed here. Only with usage cutoff enabled does Lean
-record usage (`--usage`: digests in the `.olean`, the `.usage`) and Lake write the `.usekey`. The `modsysHash` the
-key compares with the closure's after the compile is taken from `hashes?`, the module's decision before the compile
-(`Module.skipOrBuild`), if given: the files it hashed were read before the compile, which makes the comparison
-stricter (`usekeyBefore`).
+record usage (`--usage`: digests in the `.olean`, the `.usage`) and Lake write the `.usekey`.
 -/
 def Module.buildLean
   (mod : Module) (presetup : ModulePreSetup) (setup? : Option ModuleSetup := none)
-  (hashes? : Option ContentHashes := none)
-: JobM ModuleOutputArtifacts := do
-  buildAction (← getTrace) mod.traceFile (localHash? := some presetup.localTrace.hash) do
+: JobM ModuleOutputArtifacts := do buildAction (← getTrace) mod.traceFile do
   let usage ← usageCutoffEnabled
   let args := mod.weakLeanArgs ++ mod.leanArgs
   let args := if usage then args.push s!"--usage={mod.usageFile}" else args
@@ -1397,295 +1352,49 @@ def Module.buildLean
   let outputPaths := mod.mkArtifacts presetup.srcFile presetup.isModule
   mod.clearOutputArtifacts
   mod.clearOutputHashes
-  let before? ← if usage then some <$> usekeyBefore setup.importArts hashes? else pure none
+  let modsysBefore? ← if usage then some <$> modsysHash (← IO.mkRef {}) setup.importArts else pure none
   compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile outputPaths args
     (← getLeanPath) (← getLean)
   mod.checkSourceUnchanged presetup
   let arts ← mod.computeArtifacts setup.isModule presetup.postponeCompile
-  if let some (modsysBefore, untrustedBefore?) := before? then
-    mod.writeUsekey presetup setup.importArts modsysBefore untrustedBefore?
+  if let some modsysBefore := modsysBefore? then mod.writeUsekey presetup setup.importArts modsysBefore
   return arts
 
 /--
-Reads a usage-index file (`Cache.writeUsageIndex`): the module outputs it records, or `none` if it cannot be read
-or parsed (e.g., another process removed it).
--/
-def readUsageIndexEntry? (file : FilePath) : BaseIO (Option ModuleOutputDescrs) := do
-  let .ok contents ← (IO.FS.readFile file).toBaseIO | return none
-  let .ok (out : CacheOutput) := Json.parse contents >>= fromJson? | return none
-  return (ModuleOutputDescrs.fromJson? out.data).toOption
-
-/--
-Whether the cache entry `art` still has the bytes its name records (`computeBinFileHash`). If not, it changed in
-place: it is moved into the cache's quarantine directory, with a warning, so that no build restores it again.
--/
-def checkUsageIndexEntry (art : Artifact) : JobM Bool := do
-  if let .ok hash ← (computeBinFileHash art.path).toBaseIO then
-    if hash == art.hash then return true
-  logWarning s!"usage index: {art.path}: its bytes are not those its name records; {← quarantineEntry art}"
-  return false
-
-/--
-Looks in the usage index (`Cache.usageCandidates`) for a compile of the module, with its local inputs
-(`ModulePreSetup.localTrace`), whose outputs pass the usage cutoff's check against the module's current imports
-(`importArts`). Each candidate, most recently written first, is resolved against the local cache only (no artifact is
-downloaded), pre-filtered (`usagePrefilter`), and decided by the cutoff's own check (`Module.usageVerdict`) on its
-cache files, which reads them in `hashes`, the module's decision. A candidate that passes goes to `accept`, with its
-name (the hash of its `.usekey`) and its outputs in the cache; the first one `accept` takes ends the lookup. A
-candidate whose outputs a kept-module check accepted (`ModuleOutputDescrs.keptFrom?`) is offered only if no compile
-passes: a compile of the same `.olean` passes whenever the kept outputs do, and a kept key makes the module's
-importers distrust its `.usage` (`importUsage?`). A candidate that cannot be read or resolved, that is a
-module-system file's (`m`), that names no `.usage` or `.usekey`, or, unless `kept`, whose outputs were kept, is
-skipped, and so is one whose cached files cannot be read during its check (e.g., another process removed an entry
-after the resolve). A candidate whose check found its `.olean` is not the one its key records has that cache entry
-checked (`checkUsageIndexEntry`).
-
-A lookup that found any candidate logs one verbose line: `usage index: restored <name> (...) at rank <r>` or
-`usage index: no match (...)`, where `(...)` counts the candidates, those whose usage record the pre-filter read (its
-compact record or its `.usage`, `readCandidateUsage?`; `parsed`) and those that reached the check (`fully checked`),
-with the wall and current-thread CPU time the pre-filter took apart from reading views, the views this lookup added
-(`UsageView`) and their wall and CPU read times, and the importees the checks bound (`ContentHashes.imports`) that the
-module's same-tree check had not, with their wall and CPU check times; `<r>` is the restored candidate's position
-among the candidates, most recent first (from 1), which shows how many of them a lookup needs.
--/
-def Module.lookupUsageIndex (mod : Module) (presetup : ModulePreSetup) (importArts : NameMap ImportArtifacts)
-    (hashes : ContentHashes) (kept : Bool) (accept : String → ModuleOutputArtifacts → JobM (Option α)) :
-    JobM (Option α) := do
-  let candidates ← (← getLakeCache).usageCandidates mod.pkg.cacheScope presetup.localTrace.hash
-  if candidates.isEmpty then return none
-  -- The views this lookup added, with wall and current-thread CPU nanoseconds spent reading them
-  let views ← IO.mkRef ((0, 0, 0) : Nat × Nat × Nat)
-  let boundBefore := (← hashes.imports.get).size
-  -- An importee as the module's decision bound it, if it did, else as the build's view of it
-  let importee? (m : Name) : JobM (Option (Option ModuleUsage.Digest × UsageImport)) := do
-    if let some bound := (← hashes.imports.get).find? m then
-      let some (olean, imp) := bound | return none
-      if (importArts.find? m).any (·.oleanServer?.isSome) then return some (none, imp)
-      return some ((← hashes.files.get)[olean]?, imp)
-    let start ← IO.monoNanosNow
-    let cpuStart ← IO.threadCpuNanosNow
-    let (view, read) ← usageView? importArts m
-    if read then
-      let stop ← IO.monoNanosNow
-      let cpuStop ← IO.threadCpuNanosNow
-      views.modify fun (n, ns, cpuNs) => (n + 1, ns + (stop - start), cpuNs + (cpuStop - cpuStart))
-    return view
-  -- The candidate's outputs, files and its key's `.olean` hash if it passes the pre-filter, and whether its usage
-  -- record was read
-  let prefilter (file : FilePath) :
-      JobM (Option (ModuleOutputArtifacts × UsageFiles × ModuleUsage.Digest) × Bool) := do
-    let some descrs ← readUsageIndexEntry? file | return (none, false)
-    if descrs.isModule || (!kept && descrs.keptFrom?.isSome) then return (none, false)
-    let arts? : Option ModuleOutputArtifacts ← id do
-      try
-        return some (← descrs.resolve none none)
-      catch e =>
-        dropLogFrom e
-        return none
-    let some arts := arts? | return (none, false)
-    let (some usage, some usekey) := (arts.usage?, arts.usekey?) | return (none, false)
-    match (← usagePrefilter presetup importArts hashes importee? usekey.path usage.path
-        (Cache.usageIndexCompactFile file)) with
-    | .key => return (none, false)
-    | .usage => return (none, true)
-    | .passed keyOlean =>
-      return (some (arts, {usekey := usekey.path, usage := usage.path, olean := arts.olean.path}, keyOlean), true)
-  let stats (parsed checked prefilterNs prefilterCpuNs checkNs checkCpuNs : Nat) : JobM String := do
-    let (viewsRead, viewsNs, viewsCpuNs) ← views.get
-    let bound := (← hashes.imports.get).size - boundBefore
-    return s!"{candidates.size} candidates, {parsed} parsed, {checked} fully checked; \
-      prefilter {(prefilterNs - viewsNs) / 1000} µs ({(prefilterCpuNs - viewsCpuNs) / 1000} CPU µs); \
-      {viewsRead} views read in {viewsNs / 1000} µs ({viewsCpuNs / 1000} CPU µs); \
-      {bound} importees bound in {checkNs / 1000} µs ({checkCpuNs / 1000} CPU µs)"
-  let mut parsed := 0
-  let mut checked := 0
-  let mut prefilterNs := 0
-  let mut prefilterCpuNs := 0
-  let mut checkNs := 0
-  let mut checkCpuNs := 0
-  -- Kept outputs that passed, in the order they passed, offered once no compile has been taken
-  let mut keptPassed : Array (String × ModuleOutputArtifacts × Nat) := #[]
-  let mut rank := 0
-  for file in candidates do
-    rank := rank + 1
-    let start ← IO.monoNanosNow
-    let cpuStart ← IO.threadCpuNanosNow
-    let (passed?, read) ← prefilter file
-    let filtered ← IO.monoNanosNow
-    let cpuFiltered ← IO.threadCpuNanosNow
-    prefilterNs := prefilterNs + (filtered - start)
-    prefilterCpuNs := prefilterCpuNs + (cpuFiltered - cpuStart)
-    if read then parsed := parsed + 1
-    let some (arts, files, keyOlean) := passed? | continue
-    checked := checked + 1
-    let checkCpuStart ← IO.threadCpuNanosNow
-    let verdict ← id do
-      try
-        mod.usageVerdict presetup importArts hashes files
-      catch e =>
-        let log ← takeLogFrom e
-        logVerbose <| log.entries.foldl (s!"{·}\n- {·.message}")
-          s!"usage index: could not read the cached files of {file.fileStem.getD file.toString}:"
-        return .compile "its cached files could not be read"
-    unless verdict matches .upToDate do
-      if let some hash := (← hashes.files.get)[arts.olean.path]? then
-        if hash != keyOlean then discard <| checkUsageIndexEntry arts.olean
-    checkNs := checkNs + ((← IO.monoNanosNow) - filtered)
-    checkCpuNs := checkCpuNs + ((← IO.threadCpuNanosNow) - checkCpuStart)
-    unless verdict matches .upToDate do continue
-    let name := file.fileStem.getD file.toString
-    if arts.keptFrom?.isSome then
-      keptPassed := keptPassed.push (name, arts, rank)
-      continue
-    if let some result ← accept name arts then
-      logVerbose s!"usage index: restored {name} \
-        ({← stats parsed checked prefilterNs prefilterCpuNs checkNs checkCpuNs}) at rank {rank}"
-      return some result
-  for (name, arts, keptRank) in keptPassed do
-    if let some result ← accept name arts then
-      logVerbose s!"usage index: restored {name} \
-        ({← stats parsed checked prefilterNs prefilterCpuNs checkNs checkCpuNs}) at rank {keptRank}"
-      return some result
-  logVerbose s!"usage index: no match \
-    ({← stats parsed checked prefilterNs prefilterCpuNs checkNs checkCpuNs})"
-  return none
-
-/--
-Restores the outputs of a compile of the module that the usage index offers (`Module.lookupUsageIndex`), when its
-build missed the cache by input hash, instead of compiling it: a candidate that passes the usage cutoff's check
-against the module's current imports (`importArts`, in `hashes`, the module's decision), the most recent compile
-before any kept outputs, replaces the module's outputs and trace, if every file restored, sidecars included, has the
-bytes its description records. A file that does not has its cache entry checked (`checkUsageIndexEntry`), and the
-next candidate is taken, as it is when the restore fails (e.g., an entry was pruned meanwhile). If its check passed and
-the restore then fails, the module's own outputs are already gone, so the module is compiled even if a kept-module
-check could have accepted them. Outputs a kept-module check accepted keep that lineage
-(`ModuleOutputDescrs.keptFrom?`); a module excluded from kept checks takes none of them. Fails, as a usage skip does,
-if the module's source changed during the build (`Module.checkSourceUnchanged`). Writes the module's trace with
-`depTrace`, as a restore from the cache by input hash does, and returns the outputs, which are in the cache; the
-caller records them under the module's input hash.
--/
-def Module.restoreFromUsageIndex? (mod : Module) (presetup : ModulePreSetup) (depTrace : BuildTrace)
-    (importArts : NameMap ImportArtifacts) (hashes : ContentHashes) : JobM (Option ModuleOutputArtifacts) := do
-  let kept := !(← getBuildContext).keptExclude.contains mod.name
-  mod.lookupUsageIndex presetup importArts hashes kept fun name cached => do
-    -- The trace goes first, so that no outputs that are not the ones it describes are ever next to it
-    removeFileIfExists mod.traceFile
-    mod.clearOutputArtifacts
-    mod.clearOutputHashes
-    let restored? : Option ModuleOutputArtifacts ← id do
-      try
-        return some (← mod.restoreAllArtifacts cached)
-      catch e =>
-        let log ← takeLogFrom e
-        logVerbose <| log.entries.foldl (s!"{·}\n- {·.message}") s!"usage index: could not restore {name}:"
-        mod.clearOutputArtifacts
-        mod.clearOutputHashes
-        return none
-    let some arts := restored? | return none
-    let mismatches ← mod.outputMismatches presetup.isModule presetup.postponeCompile arts.descrs (sidecars := true)
-    unless mismatches.isEmpty do
-      let cache ← getLakeCache
-      for (_, descr?) in mismatches do
-        if let some descr := descr? then
-          discard <| checkUsageIndexEntry {descr, path := cache.artifactDir / descr.relPath, mtime := 0}
-      mod.clearOutputArtifacts
-      mod.clearOutputHashes
-      return none
-    mod.checkSourceUnchanged presetup
-    updateAction .reuse
-    writeFetchTrace mod.traceFile depTrace.hash
-      (toJson {arts.descrs with usage? := none, usekey? := none, ltar? := none}) (some presetup.localTrace.hash)
-    return some arts
-
-/--
-Whether usage cutoff can apply to the module: cutoff is enabled, and the module is neither a module-system file nor
-part of a `precompileModules` library. Such a module's compiles are recorded in the usage index
-(`Module.indexUsage`), and a build that misses the cache by input hash looks them up.
--/
-def Module.usageIndexApplies (mod : Module) (presetup : ModulePreSetup) : JobM Bool := do
-  if presetup.isModule || mod.shouldPrecompile then return false
-  usageCutoffEnabled
-
-/--
-Whether usage cutoff applies to the module: it can (`Module.usageIndexApplies`), and its artifacts exist.
+Whether usage cutoff applies to the module: cutoff is enabled, the module is neither a
+module-system file nor part of a `precompileModules` library, and its artifacts exist.
 -/
 def Module.usageCutoffApplies (mod : Module) (presetup : ModulePreSetup) : JobM Bool := do
-  unless (← mod.usageIndexApplies presetup) do return false
+  if presetup.isModule || mod.shouldPrecompile then return false
+  unless (← usageCutoffEnabled) do return false
   mod.checkArtifactsExist presetup.isModule presetup.postponeCompile
 
 /--
-Records the module's outputs, `arts`, which are in the cache, in the usage index (`Cache.writeUsageIndex`) if a
-lookup can read them: they name a `.usekey`, the build restores artifacts (`restore`), as a lookup requires, and usage
-cutoff can apply to the module. The entry has no archive. With it goes the compact record of its `.usage` that the
-pre-filter reads (`compactUsage?`), unless the index has a usable one already (`hasCompactUsage`: it decodes and was
-made from the `.usage` the key names). The entry is named by its `.usekey`, which names the `.usage`, so a usable
-record never needs to change; one that is not usable is never read, and is written again here.
--/
-def Module.indexUsage (mod : Module) (presetup : ModulePreSetup) (arts : ModuleOutputArtifacts) (restore : Bool) :
-    JobM Unit := do
-  unless restore do return
-  let some usekey := arts.usekey? | return
-  unless (← mod.usageIndexApplies presetup) do return
-  let cache ← getLakeCache
-  let compact := Cache.usageIndexCompactFile <|
-    cache.usageIndexFile mod.pkg.cacheScope presetup.localTrace.hash usekey.hash
-  let compact? ← id do
-    if (← hasCompactUsage compact usekey.path) then return none
-    let some usage := arts.usage? | return none
-    compactUsage? usage.path
-  cache.writeUsageIndex mod.pkg.cacheScope presetup.localTrace.hash usekey.hash
-    (toJson {arts.descrs with ltar? := none}) compact?
-
-/--
 Skips compiling a module whose trace is stale if usage cutoff applies to it
-(`Module.usageCutoffApplies`), its verdict (`Module.usageVerdict`) is `upToDate`, and its outputs are still what
-the saved trace describes (`Module.keepOutputs?`): replays its saved log and rewrites its trace with `depTrace`,
-which vouches for those outputs under the new input hash. Otherwise, with a writable cache that restores artifacts
-(`cacheWith? = some true`), restores a compile of the module the usage index offers that passes the same check
-(`Module.restoreFromUsageIndex?`), if usage cutoff can apply to the module (`Module.usageIndexApplies`): its build
-directory need not hold outputs. Otherwise, builds it with `compile`, passing the verdict
-and the module setup the check computed, if the cutoff applies, and what the module's decision read
-(`ContentHashes`). With `cacheWith? = some useLocalFile`, the outputs
-it returns are in the cache: kept ones were checked while saving them (`recacheOutputArtifacts?`), as were outputs
-`compile` reports it kept and cached (a kept-module check's accept), restored ones come from it, and built ones are
-saved after the build.
+(`Module.usageCutoffApplies`), nothing it used changed meaning (`Module.usageUpToDate`), and its outputs are
+still what the saved trace describes (`Module.keepOutputs?`): replays its saved log and rewrites its trace with
+`depTrace`, which vouches for those outputs under the new input hash. Otherwise, builds it, reusing the module setup
+the check computed. With `cacheWith? = some useLocalFile`, the outputs it returns are in the cache: kept ones were
+checked while saving them (`recacheOutputArtifacts?`), built ones are saved after the build.
 -/
 def Module.skipOrBuild (mod : Module) (presetup : ModulePreSetup) (savedTrace : SavedTrace)
-    (depTrace : BuildTrace) (cacheWith? : Option Bool := none)
-    (compile : Option (UsageVerdict × ModuleSetup) → ContentHashes → JobM (ModuleOutputArtifacts × Bool) :=
-      fun d? hashes => return (← mod.buildLean presetup (d?.map (·.2)) hashes, false)) :
-    JobM ModuleOutputArtifacts := do
-  let hashes ← ContentHashes.new
-  let build (decided? : Option (UsageVerdict × ModuleSetup)) : JobM ModuleOutputArtifacts := do
-    let (arts, cached) ← compile decided? hashes
+    (depTrace : BuildTrace) (cacheWith? : Option Bool := none) : JobM ModuleOutputArtifacts := do
+  let build (setup? : Option ModuleSetup) : JobM ModuleOutputArtifacts := do
+    let arts ← mod.buildLean presetup setup?
     match cacheWith? with
-    | some useLocalFile =>
-      if cached then return arts
-      mod.cacheOutputArtifacts presetup.isModule useLocalFile presetup.postponeCompile
+    | some useLocalFile => mod.cacheOutputArtifacts presetup.isModule useLocalFile presetup.postponeCompile
     | none => return arts
-  let indexed := cacheWith? == some true && (← mod.usageIndexApplies presetup)
-  let lookupOrBuild (decided : UsageVerdict × ModuleSetup) : JobM ModuleOutputArtifacts := do
-    if indexed then
-      if let some arts ← mod.restoreFromUsageIndex? presetup depTrace decided.2.importArts hashes then
-        return arts
-    build (some decided)
-  -- Without a verdict of its own, the lookup's setup still goes to the compile
-  let noVerdict (reason : String) : JobM ModuleOutputArtifacts := do
-    if indexed then lookupOrBuild (.compile reason, ← mkModuleSetup mod presetup) else build none
-  let .ok data := savedTrace | noVerdict "it has no trace"
-  unless (← mod.usageCutoffApplies presetup) do return ← noVerdict "its outputs are missing"
+  let .ok data := savedTrace | build none
+  unless (← mod.usageCutoffApplies presetup) do return ← build none
   let setup ← mkModuleSetup mod presetup
-  let verdict ← mod.usageVerdict presetup setup.importArts hashes
-  unless verdict matches .upToDate do return ← lookupOrBuild (verdict, setup)
+  unless (← mod.usageUpToDate presetup setup.importArts) do return ← build setup
   let some arts ← mod.keepOutputs? presetup.isModule presetup.postponeCompile savedTrace.moduleOutputDescrs?
-      cacheWith?
-    | lookupOrBuild (.compile "its outputs are not what its trace describes", setup)
+      cacheWith? | build setup
   mod.checkSourceUnchanged presetup
   updateAction .replay
   data.log.replay
   unless (← getNoBuild) do
     writeBuildTrace mod.traceFile depTrace (data.outputs?.getD .null) data.log
-      (some presetup.localTrace.hash)
     removeFileIfExists (mod.traceFile.addExtension "nobuild")
   return arts
 
@@ -1723,50 +1432,31 @@ def Module.recBuildElabArts (mod : Module) : FetchM (Job ModuleOutputArtifacts) 
 where
   fetchFromCache? presetup savedTrace restoreAll : JobM ModuleFetchState := do
     let inputHash := (← getTrace).hash
-    -- A module excluded from kept checks takes no kept outputs from the cache, and under `--no-build`
-    -- it unpacks no archive to find out what it holds: it just needs a build, and no output changes
-    if (← isKeptExcluded) then
-      if let some out ← cachedOutputs? inputHash then
-        if (out.getObjVal? "kf").isOk || ((← getNoBuild) && !(out.getObjVal? "o").isOk) then
-          return .incomplete savedTrace none
     let some ltarOrArts ← getArtifacts? inputHash savedTrace mod.pkg
       | return .incomplete savedTrace none
     match (ltarOrArts : ModuleOutputs) with
-    | .ltar ltar usage? usekey? =>
+    | .ltar ltar usage? resolved? usekey? =>
       updateAction .unpack
-      -- The archive's outputs, and its trace, replace the module's: the `.hash` files of the old
-      -- outputs go too, or they would describe the new ones (`fetchFileHash` trusts them)
       mod.clearOutputArtifacts
-      mod.clearOutputHashes
-      removeFileIfExists mod.traceFile
       mod.unpackLtar ltar.path inputHash
       -- The archive ships no sidecars, so the entry's go to the build directory, from which the entry
       -- below is rewritten.
       if let some art := usage? then discard <| restoreArtifact mod.usageFile art
+      if let some art := resolved? then discard <| restoreArtifact mod.resolvedFile art
       if let some art := usekey? then discard <| restoreArtifact mod.usekeyFile art
       -- Note: This branch implies that only the ltar output is (validly) cached.
       -- Thus, we use only the new trace unpacked from the ltar to resolve further artifacts.
       let savedTrace ← readTraceFile mod.traceFile
-      -- An excluded module takes no kept outputs from an archive either. The unpacked trace says
-      -- whether they are kept: a mapping that names the archive alone does not
-      if (← isKeptExcluded) && savedTrace.keptFrom?.isSome then
-        mod.clearOutputArtifacts
-        mod.clearOutputHashes
-        removeFileIfExists mod.traceFile
-        return .incomplete .missing none
       let arts? ← getArtifactsUsingTrace? inputHash savedTrace mod.pkg
       if let some (arts : ModuleOutputArtifacts) := arts? then
         -- On initial unpack from cache ensure all artifacts uniformly
         -- end up in the build directory and, if writable, the cache
         let arts ← mod.restoreAllArtifacts {arts with ltar? := some ltar}
         if (← mod.pkg.isArtifactCacheWritable) then
-          let keptFrom? := arts.keptFrom?
           let arts ← mod.cacheOutputArtifacts presetup.isModule restoreAll presetup.postponeCompile
-          let arts := {arts with keptFrom?}
           -- Note: Cache service metadata is not preserved on an output update because it would
           -- result in downloading module outputs that are not available on the remote.
           (← getLakeCache).writeOutputs mod.pkg.cacheScope inputHash arts.descrs (overwrite := true)
-          mod.indexUsage presetup arts restoreAll
           return .complete arts
         else
           return .complete arts
@@ -1778,8 +1468,8 @@ where
         mod.clearOutputArtifacts
         -- The sidecars stay out of the trace, which `.ltar` archives include: a `.usekey` records
         -- an input hash, and an archive depends only on outputs.
-        writeFetchTrace mod.traceFile inputHash (toJson {arts.descrs with usage? := none, usekey? := none})
-          (some presetup.localTrace.hash)
+        writeFetchTrace mod.traceFile inputHash
+          (toJson {arts.descrs with usage? := none, resolved? := none, usekey? := none})
       let arts ←
         if restoreAll then
           mod.restoreAllArtifacts arts
@@ -1794,11 +1484,7 @@ where
     let depTrace ← getTrace
     have : GetMTime Module := ⟨(·.getMTime presetup.isModule presetup.postponeCompile)⟩
     have : CheckExists Module := ⟨(·.checkExists presetup.isModule presetup.postponeCompile)⟩
-    let (savedTrace, setAside) ← reviewKept (← readTraceFile mod.traceFile)
-    -- Under `--no-build` (and `lake shake`), a set-aside module keeps its files and only reports
-    -- that it needs a build: neither `--old`'s modification-time check nor the cache restores it.
-    if setAside && (← getNoBuild) then
-      return ← mod.buildLean presetup
+    let savedTrace ← readTraceFile mod.traceFile
     if (← mod.pkg.isArtifactCacheWritable) then
       let restore ← mod.pkg.restoreAllArtifacts
       match (← fetchFromCache? presetup savedTrace restore) with
@@ -1823,8 +1509,7 @@ where
             else
               discard <| mod.buildLean presetup
         else
-          cached? := some (← mod.skipOrBuild presetup savedTrace depTrace (cacheWith? := some restore)
-            (compile := checkOrBuild presetup savedTrace (some restore)))
+          cached? := some (← mod.skipOrBuild presetup savedTrace depTrace (cacheWith? := some restore))
         if status.isCacheable then
           let arts ← id do
             if let some arts := cached? then return arts
@@ -1834,30 +1519,23 @@ where
                 return arts
               discard <| mod.buildLean presetup
             mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile
-          let arts ← mod.withSavedKeptFrom arts
-          -- An archive from the cache describes the mapping's outputs, which accepted ones are not.
-          let arts :=
-            if arts.keptFrom?.isSome then arts else {arts with ltar? := arts.ltar? <|> ltar?}
-          -- The supersede rule (`Cache.writeOutputsCore`): accepted outputs never replace a mapping.
+          let arts := {arts with ltar? := arts.ltar? <|> ltar?}
           (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs
-          mod.indexUsage presetup arts restore
           return arts
         else
           let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
-          mod.withSavedKeptFrom {arts with ltar? := arts.ltar? <|> ltar?}
+          return {arts with ltar? := arts.ltar? <|> ltar?}
     else
       let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
       if status.isUpToDate then
-        if (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) then
-          let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
-          return {arts with keptFrom? := savedTrace.keptFrom?}
-        -- As above: restore on a hash match and rebuild on a mtime match.
-        if status == .hashUpToDate then
-          unless (← unpackLocalLtar depTrace.hash) do
+        unless (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) do
+          -- As above: restore on a hash match and rebuild on a mtime match.
+          if status == .hashUpToDate then
+            unless (← unpackLocalLtar depTrace.hash) do
+              discard <| mod.buildLean presetup
+          else
             discard <| mod.buildLean presetup
-        else
-          discard <| mod.buildLean presetup
-        mod.withSavedKeptFrom (← mod.computeArtifacts presetup.isModule presetup.postponeCompile)
+        mod.computeArtifacts presetup.isModule presetup.postponeCompile
       else
         if (← mod.pkg.isArtifactCacheReadable) then
           match (← fetchFromCache? presetup savedTrace true) with
@@ -1866,142 +1544,11 @@ where
           | .incomplete savedTrace ltar? =>
             if (← savedTrace.replayIfUpToDate (oldTrace := presetup.srcMTime) mod depTrace) then
               let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
-              mod.withSavedKeptFrom {arts with ltar? := arts.ltar? <|> ltar?}
+              return {arts with ltar? := arts.ltar? <|> ltar?}
             else
-              mod.skipOrBuild presetup savedTrace depTrace (compile := checkOrBuild presetup savedTrace none)
+              mod.skipOrBuild presetup savedTrace depTrace
         else
-          mod.skipOrBuild presetup savedTrace depTrace (compile := checkOrBuild presetup savedTrace none)
-  isKeptExcluded : JobM Bool :=
-    return (← getBuildContext).keptExclude.contains mod.name
-  /-
-  A saved trace of outputs that a kept-module check accepted is set aside, together with those
-  outputs (so that no mode of the build replays them, `--old` included), and the module is decided
-  again: when the module is excluded from kept checks, or when the cache maps the same input to
-  anything but accepted outputs, in any of the forms Lake writes or installs: outputs compiled from
-  source, which replace the kept ones, or an archive (the `-o` and `lake cache add`/`get` form),
-  whose own trace then decides the module's lineage when it is unpacked. Returns whether it set the
-  trace aside; a `--no-build` build changes no output, and the module just needs a build.
-  -/
-  reviewKept (savedTrace : SavedTrace) : JobM (SavedTrace × Bool) := do
-    unless savedTrace.keptFrom?.isSome do return (savedTrace, false)
-    if (← isKeptExcluded) then return ← setAside
-    let .ok data := savedTrace | return (savedTrace, false)
-    unless data.depHash == (← getTrace).hash && (← mod.pkg.isArtifactCacheReadable) do
-      return (savedTrace, false)
-    let some out ← cachedOutputs? data.depHash | return (savedTrace, false)
-    if (out.getObjVal? "kf").isOk then return (savedTrace, false)
-    setAside
-  setAside : JobM (SavedTrace × Bool) := do
-    unless (← getNoBuild) do
-      mod.clearOutputArtifacts
-      mod.clearOutputHashes
-      removeFileIfExists mod.traceFile
-    return (.missing, true)
-  cachedOutputs? (inputHash : Hash) : JobM (Option Json) := do
-    try
-      return (← (← getLakeCache).readOutputs? mod.pkg.cacheScope inputHash).map (·.data)
-    catch e =>
-      dropLogFrom e
-      return none
-  /-
-  Compiles the module (with its `ModuleSetup`, if the caller computed it), unless its existing
-  outputs are a kept candidate (`keptCandidate?`) and the kept-module checker accepts them for the
-  module's current imports. `Module.skipOrBuild` calls it for a module the usage cutoff does not skip,
-  with the module's verdict when the cutoff applies, and what the module's decision read (`hashes`), which the
-  compile takes its `modsysHash` from. With `cacheWith?`, accepted outputs are saved to
-  the cache as a skip saves its outputs (`Module.keepOutputs?`). Returns the outputs and whether
-  they were kept and cached.
-  -/
-  checkOrBuild (presetup : ModulePreSetup) (savedTrace : SavedTrace) (cacheWith? : Option Bool)
-    (decided? : Option (UsageVerdict × ModuleSetup)) (hashes : ContentHashes)
-  : JobM (ModuleOutputArtifacts × Bool) := do
-    if let some checker := (← getBuildContext).keptChecker? then
-      if let some (data, descrs, setup) ← keptCandidate? presetup savedTrace decided? then
-        let cwd ← IO.currentDir
-        let abs (f : FilePath) := if f.isAbsolute then f else cwd / f
-        match (← checker.check mod.name (abs mod.oleanFile) (abs presetup.srcFile) (toJson setup)) with
-        | .accepted hash =>
-          if hash != descrs.olean.hash then
-            logInfo s!"kept-module check: the checker read an .olean with hash {hash}, \
-              not {descrs.olean.hash} as recorded in the module's trace; compiling"
-          else if let some arts ← acceptKept presetup setup data descrs cacheWith? then
-            return (arts, cacheWith?.isSome)
-          else
-            logInfo "kept-module check: the module's outputs changed while the checker checked them; \
-              compiling"
-        | .rejected reason =>
-          logInfo s!"kept-module check: {reason}; compiling"
-    return (← mod.buildLean presetup (decided?.map (·.2)) hashes, false)
-  /-
-  The saved trace, its output descriptions and the module's setup if the module's existing outputs
-  may be kept for its current input: they were produced from the same local inputs
-  (`ModulePreSetup.localTrace`), so only the module's imports differ, the files are the ones the
-  trace describes (`Module.outputMismatches`, as for a skip), and the usage cutoff's verdict is
-  `recheck`. That verdict is the rule for kept modules: when the machinery the module used while
-  elaborating is unchanged, re-checking its proofs is enough; when it changed, or the records cannot
-  tell, the module compiles. Without the cutoff's verdict there is no candidate, nor are outputs whose
-  local inputs differ only in the cutoff's setting (a build without the cutoff wrote them): the build
-  says so. A `module` file, a module linked into a shared library (`precompileModules`), and a module
-  excluded from kept checks are never candidates, nor is any module of a `--no-build` build.
-  -/
-  keptCandidate? (presetup : ModulePreSetup) (savedTrace : SavedTrace)
-    (decided? : Option (UsageVerdict × ModuleSetup))
-  : JobM (Option (BuildMetadata × ModuleOutputDescrs × ModuleSetup)) := do
-    if (← getNoBuild) || presetup.isModule || mod.shouldPrecompile || (← isKeptExcluded) then
-      return none
-    let .ok data := savedTrace | return none
-    let some descrs := savedTrace.moduleOutputDescrs? | return none
-    unless data.localHash? == some presetup.localTrace.hash do
-      -- an edited module's own change says why it compiles; a change of the setting alone does not
-      if data.localHash? == some (presetup.localHashWithCutoff false) then
-        logInfo "kept-module check: not asked: its outputs were built without the usage cutoff; \
-          compiling"
-      return none
-    unless (← mod.outputMismatches presetup.isModule presetup.postponeCompile descrs).isEmpty do return none
-    match decided? with
-    | some (.recheck, setup) => return some (data, descrs, setup)
-    | some (.compile reason, _) =>
-      logInfo s!"kept-module check: not asked: {reason}; compiling"
-      return none
-    | _ => return none
-  /-
-  Records the module's existing outputs, which the kept-module checker accepted, as the outputs of
-  its current input, if they still are what the trace describes: they go through the skip path's
-  check (`Module.keepOutputs?`, which with `cacheWith?` also saves them to the cache), as the
-  checker may have taken minutes. Returns `none` if they are not (the caller compiles). Their
-  `.hash` files are rewritten from the trace's descriptions. The module's `.ltar` was packed with
-  the previous trace, so it is removed. Its usage key is marked kept (`UsekeySidecar.kept`) before
-  the outputs are saved: the `.usage` describes its constants as Lean compiled them, and a constant
-  they mention may mean something new now, so its importers, here or after a restore from the cache,
-  must not trust its digests (`importUsage?`). A key that cannot be read is removed instead.
-  -/
-  acceptKept (presetup : ModulePreSetup) (setup : ModuleSetup) (data : BuildMetadata)
-    (descrs : ModuleOutputDescrs) (cacheWith? : Option Bool)
-  : JobM (Option ModuleOutputArtifacts) := do
-    writeFileHash mod.oleanFile descrs.olean.hash
-    writeFileHash mod.ileanFile descrs.ilean.hash
-    if let some c := descrs.c? then writeFileHash mod.cFile c.hash
-    if let some bc := descrs.bc? then writeFileHash mod.bcFile bc.hash
-    removeFileIfExists mod.ltarFile
-    clearFileHash mod.ltarFile
-    let key? ← (IO.FS.readFile mod.usekeyFile).toBaseIO
-    -- under an artifact cache the key is a read-only link: it is replaced, never written through
-    removeFileIfExists mod.usekeyFile
-    clearFileHash mod.usekeyFile
-    if let .ok contents := key? then
-      if let .ok key@(.obj _) := Json.parse contents then
-        IO.FS.writeFile mod.usekeyFile (key.setObjVal! "kept" true).compress
-    match (← mod.keepOutputs? presetup.isModule presetup.postponeCompile (some descrs) cacheWith?) with
-    | none =>
-      mod.clearOutputHashes
-      return none
-    | some arts =>
-      some <$> buildAction (← getTrace) mod.traceFile (action := .check)
-          (localHash? := some presetup.localTrace.hash) do
-        data.log.replay
-        createParentDirs mod.setupFile
-        IO.FS.writeFile mod.setupFile (toJson setup).pretty
-        return {arts with keptFrom? := descrs.keptFrom? <|> some data.depHash}
+          mod.skipOrBuild presetup savedTrace depTrace
   -- Unpacks the module's own `.ltar` (stamped with `inputHash`) into the build directory and
   -- returns whether it did. The archive carries its own trace, which vouches only for the archive,
   -- so it must still have the hash recorded when it was packed; if it does not, or none is
@@ -2118,23 +1665,16 @@ where
           arts.olean.trace |>.mix oleanServer.trace |>.mix oleanPrivate.trace
     else
       return allArtsTrace.mix arts.olean.trace
-  /-
-  Records the module's archive in the `-o` outputs file. The entry of a module whose outputs a
-  kept-module check accepted also carries their lineage (`{"l": <archive>, "kf": <hash>}`), so
-  that a cache installing the file applies the supersede rule to it (`Cache.writeOutputsCore`).
-  -/
   trackOutputsIfEnabled arts : JobM ModuleOutputArtifacts := do
     if let some ref ← Internal.getOutputsRef? mod.pkg then
       let inputHash := (← getTrace).hash
-      let (arts, ltar) ← id do
-        if let some ltar := arts.ltar? then pure (arts, ltar) else
+      if let some ltar := arts.ltar? then
+        ref.insert inputHash ltar.descr (mod.platformIndependent.getD false)
+        return arts
+      else
         let ltar ← mod.packLtar arts
-        pure ({arts with ltar? := some ltar}, ltar)
-      let entry := match arts.keptFrom? with
-        | some hash => Json.mkObj [("l", toJson ltar.descr), ("kf", toJson hash)]
-        | none => toJson ltar.descr
-      ref.insert inputHash entry (mod.platformIndependent.getD false)
-      return arts
+        ref.insert inputHash ltar.descr (mod.platformIndependent.getD false)
+        return {arts with ltar? := some ltar}
     return arts
 
 /-- The `ModuleFacetConfig` for the builtin `irArtsFacet`. -/
