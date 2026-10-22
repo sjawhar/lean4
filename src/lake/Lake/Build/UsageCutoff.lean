@@ -39,10 +39,10 @@ structure UsageSidecar where
   own : NameMap ModuleUsage.Digest
   used : Array (Name × Array (Name × ModuleUsage.Digest))
   extra : Array Name
-  /-- Every name whose defining module the module's compile looked up, used or referred to, grouped by the module the
-  resolver mapped it to (`none`: the module itself, or no module), each with the kinds under which that module
-  provided it (`Lean.ModuleUsage.resolvedGroups`). -/
-  resolved : Array (Option Name × Array (Name × UInt8))
+  /-- The digest of the bytes of the module's `.resolved` sidecar (`Lean.ModuleUsage.encodeResolved`), which records
+  every name whose defining module the compile looked up, used or referred to, grouped by the module the resolver
+  mapped it to, each with the kinds under which that module provided it (`readResolvedSidecar`). -/
+  resolvedDigest : ModuleUsage.Digest
   /-- Whether the compile read the resolver's whole map (`Lean.allResolved`). -/
   resolvedAll : Bool
   /-- The digest of the names the module provides to the resolver and of `indirect`
@@ -108,16 +108,6 @@ def providesOfJson (j : Json) : Except String (Array Name × Array Name) := do
   let #[k, e] ← j.getArr? | throw s!"expected a pair of name arrays, got {j.compress}"
   return (← namesOfJson k, ← namesOfJson e)
 
-/-- Reads a `.usage`'s `resolved` groups: `[module or null, [[name, kinds], ...]]`. -/
-def resolvedOfJson (j : Json) : Except String (Array (Option Name × Array (Name × UInt8))) := do
-  (← j.getArr?).mapM fun g => do
-    let #[m, ns] ← g.getArr? | throw s!"expected a pair, got {g.compress}"
-    let m? ← if m.isNull then pure none else some <$> (·.name) <$> fromJson? (α := SidecarName) m
-    let ns ← (← ns.getArr?).mapM fun e => do
-      let #[n, k] ← e.getArr? | throw s!"expected a pair, got {e.compress}"
-      return ((← fromJson? (α := SidecarName) n).name, (← fromJson? (α := Nat) k).toUInt8)
-    return (m?, ns)
-
 instance : FromJson UsageSidecar where
   fromJson? j := do
     let own ← j.getObjValAs? (Array (SidecarName × ModuleUsage.Digest)) "own"
@@ -136,7 +126,7 @@ instance : FromJson UsageSidecar where
       own := own.foldl (init := {}) fun m (n, d) => m.insert n.name d
       used := used.map fun (m, cs) => (m.name, cs.map fun (c, d) => (c.name, d))
       extra := extra.map (·.1.name)
-      resolved := ← resolvedOfJson (← j.getObjVal? "resolved")
+      resolvedDigest := ← j.getObjValAs? ModuleUsage.Digest "resolvedDigest"
       resolvedAll := ← j.getObjValAs? Bool "resolvedAll"
       providesDigest := ← j.getObjValAs? ModuleUsage.Digest "providesDigest"
       provides := ← providesOfJson (← j.getObjVal? "provides")
@@ -514,17 +504,32 @@ def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetu
   return true
 
 /--
-Whether every name whose defining module the compile looked up, used or referred to (`UsageSidecar.resolved`) still
-resolves to the same module, with the same kinds, as when Lean compiled it, no closure module gained a kernel
-constant another declares (`UsageSidecar.kernelDisjoint`), and no closure module that changed gives one of those names
-a non-local attribute. Each workspace module of the closure whose provides digest (`UsageImport.providesDigest`, from
-a `.usage` that `importUsage?` binds to its current `.olean`) differs from the one the compile imported
-(`UsageSidecar.digested`) must still provide each name the resolver mapped to it with the recorded kinds, and none of
-the other names, and none of those names may be in its `indirect`: a fresh compile that records an extra module use of
-such a name (`Lean.recordExtraModUseFromDecl`, which looks the name up first) also records that module. A module the
-compile recorded as an extra use is not asked: its `.olean` is pinned (`UsekeySidecar.extra`), so its provides digest
-is unchanged. A module whose provides digest is unchanged is not asked about any name. If the compile read the
-resolver's whole map (`UsageSidecar.resolvedAll`), no such module may exist.
+The module's `.resolved` sidecar at `file` (Lean writes it next to its `.usage`, `Lean.ModuleUsage.encodeResolved`), if
+its bytes have the digest the `.usage` records (`UsageSidecar.resolvedDigest`, `Lean.ModuleUsage.Digest.ofBytes`) and
+decode (`Lean.ModuleUsage.ResolvedTable.decode?`): `none` if it is missing, has other bytes or does not decode. Fails if
+it exists but cannot be read. Only a check that needs the recorded names reads it (`UsageSidecar.resolvedUnchanged`).
+-/
+def readResolvedSidecar (usage : UsageSidecar) (file : FilePath) : IO (Option ModuleUsage.ResolvedTable) := do
+  match (← IO.FS.readBinFile file |>.toBaseIO) with
+  | .ok bytes =>
+    if ModuleUsage.Digest.ofBytes bytes != usage.resolvedDigest then return none
+    return (ModuleUsage.ResolvedTable.decode? bytes).toOption
+  | .error (.noFileOrDirectory ..) => return none
+  | .error e => throw e
+
+/--
+Whether every name whose defining module the compile looked up, used or referred to (the module's `.resolved` sidecar
+at `resolvedFile`, `readResolvedSidecar`) still resolves to the same module, with the same kinds, as when Lean compiled
+it, no closure module gained a kernel constant another declares (`UsageSidecar.kernelDisjoint`), and no closure module
+that changed gives one of those names a non-local attribute. Each workspace module of the closure whose provides
+digest (`UsageImport.providesDigest`, from a `.usage` that `importUsage?` binds to its current `.olean`) differs from
+the one the compile imported (`UsageSidecar.digested`) must still provide each name the resolver mapped to it with the
+recorded kinds, and none of the other names (`Lean.ModuleUsage.ResolvedTable.providerUnchanged`), and none of those
+names may be in its `indirect`: a fresh compile that records an extra module use of such a name
+(`Lean.recordExtraModUseFromDecl`, which looks the name up first) also records that module. A module the compile
+recorded as an extra use is not asked: its `.olean` is pinned (`UsekeySidecar.extra`), so its provides digest is
+unchanged. A module whose provides digest is unchanged is not asked about any name, and the sidecar is read only once
+one is not. If the compile read the resolver's whole map (`UsageSidecar.resolvedAll`), no such module may exist.
 
 This decides without restating how the resolver ranks providers (`Environment.getModuleIdxFor?`), which differs
 between toolchains. It relies on one property, which every such resolver has: for a resolver that picks a winner
@@ -540,9 +545,10 @@ declarer, and `usageUpToDate` checks that copy's digest): the module provided th
 possibly also as a compiled name, and keeping or dropping a non-winner's provider cannot change the winner. A
 module-system module's provides are pinned by `modsysHash`, a toolchain module's by the Lean githash.
 -/
-def UsageSidecar.resolvedUnchanged (usage : UsageSidecar) (presetup : ModulePreSetup) (hashes : ContentHashes)
-    (importArts : NameMap ImportArtifacts) : JobM Bool := do
+def UsageSidecar.resolvedUnchanged (usage : UsageSidecar) (presetup : ModulePreSetup) (resolvedFile : FilePath)
+    (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) : JobM Bool := do
   let mut changed := #[]
+  let mut table? : Option ModuleUsage.ResolvedTable := none
   for (m, arts) in importArts do
     if arts.oleanServer?.isSome then continue
     if (← findModule? m).isNone then continue
@@ -550,19 +556,12 @@ def UsageSidecar.resolvedUnchanged (usage : UsageSidecar) (presetup : ModulePreS
     let some (_, imp) ← importUsage? hashes importArts m | return false
     if imp.providesDigest == recorded then continue
     if usage.resolvedAll then return false
-    let (kernel, extra) := imp.provides
-    let declared := (usage.used.binSearch (m, #[]) (Name.quickLt ·.1 ·.1)).elim #[] (·.2)
-    for (m?, ns) in usage.resolved do
-      let winner := m? == some m
-      for (n, k) in ns do
-        let now := ModuleUsage.kindsIn kernel extra n
-        if now == (if winner then k else 0) then continue
-        unless !winner && now == ModuleUsage.kernelKind &&
-            (declared.binSearch (n, default) (Name.quickLt ·.1 ·.1)).isSome do
-          return false
-    for n in imp.indirect do
-      if usage.resolved.any fun (_, ns) => (ns.binSearch (n, 0) (Name.quickLt ·.1 ·.1)).isSome then
-        return false
+    if table?.isNone then
+      table? ← readResolvedSidecar usage resolvedFile
+    let some table := table? | return false
+    let declared := (usage.used.binSearch (m, #[]) (Name.quickLt ·.1 ·.1)).elim #[] (·.2.map (·.1))
+    unless table.providerUnchanged m imp.provides declared do return false
+    if imp.indirect.any (table.entries.contains <| ModuleUsage.resolvedId ·) then return false
     changed := changed.push (m, imp)
   if changed.isEmpty then return true
   usage.kernelDisjoint presetup hashes importArts changed
@@ -642,5 +641,5 @@ public def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
     let some (olean, imp) ← importUsage? hashes importArts m | return false
     unless (← contentHash hashes olean) == oleanHash do return false
     unless imp.moduleDigest == digest do return false
-  unless (← usage.resolvedUnchanged presetup hashes importArts) do return false
+  unless (← usage.resolvedUnchanged presetup mod.resolvedFile hashes importArts) do return false
   usage.specProvidersUnchanged hashes importArts

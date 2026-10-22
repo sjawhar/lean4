@@ -19,6 +19,7 @@ printf 'import Test.Syn\nmacro_rules | `(mk2) => `(2)\n' > Test/Rules.lean
 printf 'import Test.Rules\nexample : (mk2 : Nat) = 2 := rfl\n' > Test/Ex.lean
 test_run build Test.B Test.C Test.D Test.HU Test.Ex
 test_exp -f .lake/build/lib/lean/Test/B.usage
+test_exp -f .lake/build/lib/lean/Test/B.resolved
 test_cmd_out '[["Test","A"],[[["a"],"' cat .lake/build/lib/lean/Test/B.usage
 # `lean -o` records usage only when asked (`--usage`)
 "$LAKE" env lean Test/A.lean -o Test/Direct.olean
@@ -42,13 +43,13 @@ match_text "Replayed Test.HU" produced.out
 # (sidecars are removed before being rewritten: under an artifact cache they are read-only links)
 printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 1\n' > Test/H.lean
 rm -f .lake/build/lib/lean/Test/HU.usage
-printf '{"version":13,"noskip":false,"moduleDigest":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","providesDigest":"00000000000000000000000000000000","provides":[[],[]],"indirect":[],"digested":[],"importedClosures":[],"importedDigests":[],"own":[],"used":[[[true],[]]],"resolvedAll":false,"resolved":[],"extra":[],"specKeys":[],"specLookups":[]}' > .lake/build/lib/lean/Test/HU.usage
+printf '{"version":14,"noskip":false,"moduleDigest":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","providesDigest":"00000000000000000000000000000000","provides":[[],[]],"indirect":[],"digested":[],"importedClosures":[],"importedDigests":[],"own":[],"used":[[[true],[]]],"resolvedAll":false,"resolvedDigest":"00000000000000000000000000000000","extra":[],"specKeys":[],"specLookups":[]}' > .lake/build/lib/lean/Test/HU.usage
 test_not_out "warning" build -v Test.HU
 match_text "Built Test.HU" produced.out
 # a name component that is neither a string nor a number is corrupt input: warned, then built
 printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 3\n' > Test/H.lean
 rm -f .lake/build/lib/lean/Test/HU.usekey
-printf '{"version":13,"usage":"00000000000000000000000000000000","local":"0000000000000000","olean":"00000000000000000000000000000000","modsys":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","extra":[[[true],"00000000000000000000000000000000","00000000000000000000000000000000"]]}' > .lake/build/lib/lean/Test/HU.usekey
+printf '{"version":14,"usage":"00000000000000000000000000000000","local":"0000000000000000","olean":"00000000000000000000000000000000","modsys":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","extra":[[[true],"00000000000000000000000000000000","00000000000000000000000000000000"]]}' > .lake/build/lib/lean/Test/HU.usekey
 test_out "expected a name component" build Test.HU
 match_text "Built Test.HU" produced.out
 # so is a sidecar that is not UTF-8
@@ -96,6 +97,7 @@ test_out "Built Test.B" build Test.B
 printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 4\n' > Test/A.lean
 LAKE_USAGE_CUTOFF=0 test_out "Built Test.B" build Test.B
 test_exp ! -f .lake/build/lib/lean/Test/B.usage
+test_exp ! -f .lake/build/lib/lean/Test/B.resolved
 test_exp ! -f .lake/build/lib/lean/Test/B.usekey
 printf '%s\n' 'import Lean' 'import Test.B' 'open Lean Elab Command' '#eval show CommandElabM Unit from do' \
   '  logInfo m!"{((← getEnv).getModuleIdx? `Test.B).map (ModuleUsage.state (← getEnv)).hasEntries}"' \
@@ -225,6 +227,7 @@ printf 'import Test.A\ndef b : Bool := a\n' > Test/B.lean
 test_err "Test.B" build Test.B
 test_exp ! -f .lake/build/lib/lean/Test/B.usekey
 test_exp ! -f .lake/build/lib/lean/Test/B.usage
+test_exp ! -f .lake/build/lib/lean/Test/B.resolved
 # module-system files in a non-module file's closure: K imports U's exported level, which carries no
 # digests, so an edit to U's private body must still rebuild the non-module importer (here N's proof
 # becomes false). N still has a key: it loads its whole closure at the private level, with digests
@@ -468,6 +471,7 @@ cd ../cache2
 cp ../cache1/Test/*.lean Test/
 test_not_out "Built" build -v Test.B Test.C Test.D
 test_exp -f .lake/build/lib/lean/Test/B.usage
+test_exp -f .lake/build/lib/lean/Test/B.resolved
 test_exp -f .lake/build/lib/lean/Test/B.usekey
 # an unrelated edit no tree has seen: B misses the cache by input hash and is skipped
 printf 'def a := 1\ntheorem ta : a = 1 := sorry\ndef unrelated := 3\n' > Test/A.lean
@@ -549,6 +553,21 @@ printf 'def x := 1\ndef x2 := 2\n' > cache9/Test/X.lean
 printf 'def x := 1\ndef x2 := 3\n' > cache9/Test/X.lean
 (cd cache9 && test_out "Replayed Test.C" build -v Test.C)
 test_exp -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" u)"
+# the same for a pruned `.resolved`: a miss, after which the rewritten entry names one again
+mkdir -p cache21/Test cache22/Test
+for d in cache21 cache22; do cp lakefile.toml $d/; done
+printf 'def x := 21\n' > cache21/Test/X.lean
+printf 'def pb := 21\n' > cache21/Test/B.lean
+printf 'import Test.B\nimport Test.X\ndef pc := pb + x\n' > cache21/Test/C.lean
+(cd cache21 && test_run build Test.C)
+entry="$LAKE_CACHE_DIR/outputs/test/$(depHash cache21/.lake/build/lib/lean/Test/B.trace).json"
+resolved=$(entryArt "$entry" v)
+test_exp -n "$resolved"
+rm "$LAKE_CACHE_DIR/artifacts/$resolved"
+cp cache21/Test/*.lean cache22/Test/
+(cd cache22 && test_out "Built Test.B" build -v Test.C)
+test_exp -f cache22/.lake/build/lib/lean/Test/B.resolved
+test_exp -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" v)"
 # B's entry from a `-o` build in a fresh dir $1 (B and X valued $2), naming an archive (`l`): `-o` packs the
 # archive after the build writes the entry, so the entry gets its `l` by hand, from the `-o` map. Sets `entry`,
 # and copies the sources to a second fresh dir $1b.
@@ -574,6 +593,7 @@ ltarEntry cache10 10
 rm "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" u)"
 (cd cache10b && test_out "Built Test.B" build -v Test.C)
 test_exp -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" u)"
+test_exp -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" v)"
 test_exp -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" k)"
 # with its `.c` pruned too, so that only the archive resolves: still a miss
 ltarEntry cache11 11
@@ -587,8 +607,10 @@ ltarEntry cache17 17
 rm "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" c)"
 (cd cache17b && test_out "Unpacked Test.B" build -v Test.C)
 test_exp -f cache17b/.lake/build/lib/lean/Test/B.usage
+test_exp -f cache17b/.lake/build/lib/lean/Test/B.resolved
 test_exp -f cache17b/.lake/build/lib/lean/Test/B.usekey
 test_exp -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" u)"
+test_exp -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" v)"
 test_exp -f "$LAKE_CACHE_DIR/artifacts/$(entryArt "$entry" k)"
 # a pruned `.usekey` with an archive: also a miss
 ltarEntry cache20 20
@@ -648,5 +670,6 @@ printf 'def sa := 1\ndef unrelated := 4\n' > cache12/Test/SA.lean
 match_text "Built Test.SB" default.log
 no_match_text "Replayed Test.SB" default.log
 test_exp ! -f cache12/.lake/build/lib/lean/Test/SB.usage
+test_exp ! -f cache12/.lake/build/lib/lean/Test/SB.resolved
 
 rm -f produced.out
