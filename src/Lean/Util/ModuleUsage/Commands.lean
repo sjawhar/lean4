@@ -300,7 +300,7 @@ structure CommandObservation where
 
 /-- The observed commands, newest first (a list, like the per-command logs of `Lean.Util.UsedByChecks`). Private, as
 those logs; cleared at the start of a run (`startFrontendRun`). -/
-private builtin_initialize commandObservationsRef : IO.Ref (List CommandObservation) ← IO.mkRef []
+private builtin_initialize commandObservationsRef : IO.Ref (List CommandObservation) ← mkAccountedRef []
 
 builtin_initialize registerRunLog (commandObservationsRef.set [])
 
@@ -342,7 +342,8 @@ private partial def transientDeps (transient : Std.HashMap Name NameSet) (seen o
 
 /-- The per-command records of `observations` (in command order), or why there are none: a command used a name no
 digest stands for, one that names no constant (a declaration the kernel or the elaborator rejected referred to it; an
-IR-only name) or a constant of this module the kernel environment does not hold. The module is then `noskip`. -/
+IR-only name) or a constant of this module the kernel environment does not hold. None of the module's commands may
+then be kept (`noreuse`). -/
 def commandRecords (env : Environment) (observations : Array CommandObservation) (own : Array (Name × Digest))
     (stmt : Array (Name × Digest × Digest)) (payloads : Array (CommandEntries × Digest)) :
     IO (Except String (Array CommandRecord)) := do
@@ -394,11 +395,10 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
     quotSet := obs.before.usedQuotCtxts
     let before := obs.before.env.checked.get
     let after := obs.after.env.checked.get
-    -- through the map of the module's own constants (`map₂`), when the imported part is unchanged
-    let added : NameSet := if SharedDiff.sameObject before.constants.map₁ after.constants.map₁ then
-        (PersistentHashMap.sharedDiff before.constants.map₂ after.constants.map₂).1.foldl (init := {})
-          fun (s : NameSet) (n, _) => if before.constants.contains n then s else s.insert n
-      else after.constants.foldStage2 (fun (s : NameSet) n _ =>
+    let added : NameSet := match before.constants.sharedDiff? after.constants with
+      | some (changed, _) => changed.foldl (init := {}) fun (s : NameSet) (n, _) =>
+        if before.constants.contains n then s else s.insert n
+      | none => after.constants.foldStage2 (fun (s : NameSet) n _ =>
         if before.constants.contains n then s else s.insert n) {}
     let addedNames := added.toArray.qsort Name.quickLt
     let decls := addedNames.filter (!isAuxName env ·)

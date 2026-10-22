@@ -1,6 +1,6 @@
 import Lean
-/-! A command that uses a name no `.usage` digest stands for writes its module's `.usage` as `noskip` with no command
-records; `lean -o --usage` succeeds as it does without usage recording. Such a name names no constant: a declaration the
+/-! A command that uses a name no `.usage` digest stands for writes its module's `.usage` as `noreuse` with no command
+records (the module skip, `noskip`, is unchanged); `lean -o --usage` succeeds as it does without usage recording. Such a name names no constant: a declaration the
 kernel rejected referred to it (an absent constant in a type or, through `addDecl`'s asynchronous check, in a value; a
 `_nested` auxiliary; an IR-only name of an import), or a `mutual` block that failed before `addDecl` mentioned it. Or it
 is a constant the elaborator holds and the kernel never received. The constants the kernel and `addDecl` create without
@@ -19,8 +19,8 @@ def compile (dir : System.FilePath) (name src : String) : IO (Option Json) := do
     return none
   let j ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / s!"{name}.usage"))
   let cmds ← IO.ofExcept <| j.getObjValAs? (Array Json) "commands"
-  let reason := (j.getObjValAs? String "noskipReason").toOption.getD "none"
-  IO.println s!"{name}: noskip {← IO.ofExcept <| j.getObjValAs? Bool "noskip"}, {cmds.size} command records, \
+  let reason := (j.getObjValAs? String "noreuseReason").toOption.getD "none"
+  IO.println s!"{name}: noskip {← IO.ofExcept <| j.getObjValAs? Bool "noskip"}, noreuse {← IO.ofExcept <| j.getObjValAs? Bool "noreuse"}, {cmds.size} command records, \
     reason: {reason}"
   return some j
 

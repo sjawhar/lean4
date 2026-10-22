@@ -338,6 +338,8 @@ object_offset object_compactor::insert_ref(object * o) {
     size_t sz = sizeof(lean_ref_object);
     object * r = copy_object(o, sz);
     lean_to_ref(r)->m_value = c;
+    // a stored reference is state its importers did not create
+    lean_to_ref(r)->m_context = 0;
     // must NOT be max-shared
     return save(o, r);
 }

@@ -4,7 +4,7 @@ declaration attribute that edits the simp state through the scoped extension's u
 refused for the extension (`Refusal.inexpressible`), and `replayCommandEntries` refuses that payload instead of replaying it
 without the change. An erasure (`attribute [-simp] x`) is a `ScopedEnvExtension.modifyState` (`Op.modify`), which
 `ScopedEnvExtension.stackDelta` does not express, so it is refused too. A declaration command with such a change
-declines the module (`noskip`). An erasure inside `attribute [-simp] x in theorem …` is undone on the main branch by
+makes the module `noreuse`. An erasure inside `attribute [-simp] x in theorem …` is undone on the main branch by
 the command's own scope, but the theorem's asynchronous branch forked inside that scope and keeps it, and no stack
 operation expresses an erasure, so that command is refused too (a refusal in the theorem's record). The commands after
 an erasure see which lemma it erased in their context digest (`ctx`). -/
@@ -18,17 +18,17 @@ def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
 /-- Elaborates `src` as module `M` in `dir` as `lean -o --usage` does; returns the command observations, the payloads
 written to `M.olean` and `M.usage`. -/
 unsafe def elabM (dir : System.FilePath) (src : String) :
-    IO (Array ModuleUsage.CommandObservation × Array CommandEntries × Json) := do
+    IO (Array ModuleUsage.CommandObservation × KeepPermit × Json) := do
   IO.FS.writeFile (dir / "M.lean") src
   enableInitializersExecution
   let some _ ← Elab.runFrontend src {} (dir / "M.lean").toString `M
       (oleanFileName? := some (dir / "M.olean")) (usageFileName? := some (dir / "M.usage")) |
     throw <| IO.userError "elaboration of M failed"
   let obs := (← ModuleUsage.commandObservations).qsort (·.i < ·.i)
-  let (md, _) ← readModuleData (dir / "M.olean")
-  let payloads := CommandEntries.ofModuleData md
+  let some first := obs[0]? | throw <| IO.userError "no commands"
+  let permit ← IO.ofExcept (← ModuleUsage.Testing.keepPermit first.before.env `M (dir / "M.olean") (dir / "M.usage"))
   let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
-  return (obs, payloads, usage)
+  return (obs, permit, usage)
 
 def source (erased : Name) : String :=
   s!"import X\n@[simp] def victim : Nat := 1\n@[simp] def keep : Nat := 2\n@[simp] def other : Nat := 3\n\
@@ -37,11 +37,10 @@ def source (erased : Name) : String :=
 
 def unfolds (env : Environment) (n : Name) : Bool := (Meta.simpExtension.getState env).isDeclToUnfold n
 
-unsafe def replayed (obs : Array ModuleUsage.CommandObservation) (payloads : Array CommandEntries) (usage : Json)
-    (i : Nat) (n : Name) : IO String := do
+unsafe def replayed (obs : Array ModuleUsage.CommandObservation) (permit : KeepPermit) (i : Nat) (n : Name) :
+    IO String := do
   let some o := obs.find? (·.i == i) | throw <| IO.userError s!"no observation {i}"
-  let some ce := payloads.find? (·.idx == i) | throw <| IO.userError s!"no payload {i}"
-  let permit ← IO.ofExcept <| ModuleUsage.keepPermit o.before.env (← IO.ofExcept <| ModuleUsage.ResolutionRecord.ofUsage usage)
+  let some ce := permit.payloads.find? (·.idx == i) | throw <| IO.userError s!"no payload {i}"
   try
     let env ← replayCommandEntries permit (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}
     return s!"replayed: {n} unfolds {unfolds env n} (full run: {unfolds o.after.env n})"
@@ -62,13 +61,13 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   initSearchPath (← getBuildDir) [dir]
   -- commands: 0 victim, 1 keep, 2 other, 3 attribute [-simp] victim, 4 … in theorem t1, 5 @[erase_probe] def d, 6 t2,
   -- 7 @[raw_erase] def d2
-  let (obs, payloads, usage) ← elabM dir (source `victim)
-  IO.println s!"command 3 (attribute [-simp] victim): {← replayed obs payloads usage 3 `victim}"
-  IO.println s!"command 4 (attribute [-simp] keep in theorem t1): {← replayed obs payloads usage 4 `keep}"
-  IO.println s!"command 5 (@[erase_probe] def d): {← replayed obs payloads usage 5 `keep}"
-  IO.println s!"command 7 (@[raw_erase] def d2): {← replayed obs payloads usage 7 `other}"
-  IO.println s!"noskip: {(usage.getObjValAs? Bool "noskip").toOption}, \
-    reason: {(usage.getObjValAs? String "noskipReason").toOption}"
+  let (obs, permit, usage) ← elabM dir (source `victim)
+  IO.println s!"command 3 (attribute [-simp] victim): {← replayed obs permit 3 `victim}"
+  IO.println s!"command 4 (attribute [-simp] keep in theorem t1): {← replayed obs permit 4 `keep}"
+  IO.println s!"command 5 (@[erase_probe] def d): {← replayed obs permit 5 `keep}"
+  IO.println s!"command 7 (@[raw_erase] def d2): {← replayed obs permit 7 `other}"
+  IO.println s!"noreuse: {(usage.getObjValAs? Bool "noreuse").toOption}, \
+    reason: {(usage.getObjValAs? String "noreuseReason").toOption}"
   IO.FS.createDirAll (dir / "v2")
   let (_, _, usage₂) ← elabM (dir / "v2") (source `other)
   let c₁ := ctxs usage

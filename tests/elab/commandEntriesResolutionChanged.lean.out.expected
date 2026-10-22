@@ -4,3 +4,9 @@ command 1: kept
 Z claims `ru`:
 C elaborates afresh: false
 module refused: resolution changed: `ru` resolved to `U` (kinds 1) when the module was compiled, and resolves to `Z` (kinds 2) here
+SZ provides no specialization:
+command 0: kept
+SM.usage recording other providers for the 1 key(s) g looked up:
+module refused: the providers of a specialization-cache key the module looked up changed
+SZ provides the specialization SM's g looked up:
+module refused: the closure of `SZ` is not what the module was compiled against

@@ -55,8 +55,6 @@ structure Context where
   quotContext?   : Option Name := none
   currMacroScope : MacroScope := firstFrontendMacroScope
   ref            : Syntax := Syntax.missing
-  /-- Index of the top-level command being elaborated. -/
-  cmdIdx?        : Option Nat := none
   /--
   Snapshot for incremental reuse and reporting of command elaboration. Currently only used for
   (mutual) defs and contained tactics, in which case the `DynamicSnapshot` is a
@@ -233,9 +231,6 @@ instance : MonadEnv CommandElabM where
 instance : MonadOptions CommandElabM where
   getOptions := do pure (← get).scopes.head!.opts
 
-instance : MonadCommandIdx CommandElabM where
-  getCommandIdx? := return (← read).cmdIdx?
-
 protected def getRef : CommandElabM Syntax :=
   return (← read).ref
 
@@ -291,7 +286,6 @@ private def runCore (x : CoreM α) : CommandElabM α := do
     initHeartbeats     := heartbeats
     quotContext        := (← MonadQuotation.getMainModule)
     currMacroScope     := ctx.currMacroScope
-    cmdIdx?            := ctx.cmdIdx?
     options            := scope.opts
     cancelTk?          := ctx.cancelTk?
     suppressElabErrors := ctx.suppressElabErrors }
@@ -1130,7 +1124,6 @@ private def liftCommandElabMCore (cmd : CommandElabM α) (throwOnError : Bool) :
       currMacroScope := ctx.currMacroScope
       ref := ctx.ref
       snap? := none
-      cmdIdx? := ctx.cmdIdx?
       cancelTk? := ctx.cancelTk?
       suppressElabErrors := ctx.suppressElabErrors
     } |>.run {

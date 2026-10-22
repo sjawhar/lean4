@@ -1,5 +1,5 @@
 0: refusals #[]
-1: refusals #[the attribute fp_tag, whose handlers may run code outside core Lean, a write to state an imported module's initializer created]
-2: refusals #[the attribute fp_tag, whose handlers may run code outside core Lean, a write to state an imported module's initializer created]
+1: refusals #[the attribute fp_tag, whose handlers may run code outside core Lean, an effect outside the command: it writes a reference no command created]
+2: refusals #[the attribute fp_tag, whose handlers may run code outside core Lean, an effect outside the command: it writes a reference no command created]
 3: refusals #[]
 4: refusals #[]

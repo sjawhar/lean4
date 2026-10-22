@@ -1,4 +1,4 @@
-noskip (some true), reason (some (declaration command 0: the attribute map_add, whose handlers may run code outside core Lean))
+noreuse (some true), reason (some (declaration command 0: the attribute map_add, whose handlers may run code outside core Lean))
 0: refused for #[], entries #[mapExt.checked, mapExt.main]
 1: refused for #[mapExt, mapExt], entries #[]
 2: refused for #[], entries #[tagAttr.main]

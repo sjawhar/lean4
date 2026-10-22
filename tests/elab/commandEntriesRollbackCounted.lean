@@ -1,10 +1,10 @@
 import Lean
 /-! The public test-support function `CommandEntries.Testing.rollbackTo` writes extension states through the counted
 core, so a declaration command whose attribute uses it to install a changed state of a log extension is refused and
-the module is `noskip`. Writing below the counters would leave
+the module is `noreuse`. Writing below the counters would leave
 the payload empty and its replay would lose the change. The attribute builds a state with an extra derived element in
 a scratch environment and copies it into the real one. `d0` is the module's only declaration, so the module's
-`noskip` comes from it alone; the copy writes every extension, each counted, so the reason names the first extension
+`noreuse` comes from it alone; the copy writes every extension, each counted, so the reason names the first extension
 in registration order, and the test checks that `logExt` is among the extensions the command is refused for. -/
 open Lean
 
@@ -43,14 +43,14 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let some _ ← Elab.runFrontend mSource {} "M.lean" `M (oleanFileName? := some (dir / "M.olean")) (usageFileName? := some (dir / "M.usage")) |
     throw <| IO.userError "elaboration of M failed"
   let obs := (← ModuleUsage.commandObservations).qsort (·.i < ·.i)
-  let (md, _) ← readModuleData (dir / "M.olean")
-  let payloads := CommandEntries.ofModuleData md
+  let some first := obs[0]? | throw <| IO.userError "no commands"
+  let permit ← IO.ofExcept (← ModuleUsage.Testing.keepPermit first.before.env `M (dir / "M.olean") (dir / "M.usage"))
+  let payloads := permit.payloads
   let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
-  let reason := (usage.getObjValAs? String "noskipReason").toOption
-  IO.println s!"module noskip {(usage.getObjValAs? Bool "noskip").toOption}, reason {reason}"
+  let reason := (usage.getObjValAs? String "noreuseReason").toOption
+  IO.println s!"module noreuse {(usage.getObjValAs? Bool "noreuse").toOption}, reason {reason}"
   for o in obs do
     let some ce := payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"
-    let permit ← IO.ofExcept <| ModuleUsage.keepPermit o.before.env (← IO.ofExcept <| ModuleUsage.ResolutionRecord.ofUsage usage)
     let replay ← try
         let env ← replayCommandEntries permit (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}
         let full ← view o.after.env

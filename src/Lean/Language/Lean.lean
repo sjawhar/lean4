@@ -758,45 +758,46 @@ where
       LeanProcessingM (Command.State × Task Elab.InfoState) := do
     let ctx ← read
     let recording ← usageRecordingEnabled
-    let cmdIdx? := if recording then some revCmds.length else none
-    if let some cmdIdx := cmdIdx? then
-      setCurrentCommand cmdIdx
-    -- each command's scoped-stack operations are logged afresh (`StateStack.ops`)
-    let cmdState := { cmdState with env := ← clearScopedOps cmdState.env }
-    let cmdStateBefore := cmdState
-    let scope := cmdState.scopes.head!
-    -- reset per-command state
-    let cmdStateRef ← IO.mkRef { cmdState with
-      messages := .empty, traceState := {}, snapshotTasks := #[], codeQualityEntryTasks := #[] }
-    let cmdCtx : Elab.Command.Context := { ctx with
-      cmdPos       := beginPos
-      snap?        := if internal.cmdlineSnapshots.get scope.opts then none else snap
-      cancelTk?    := some cancelTk
-      cmdIdx?
-    }
-    let act : Elab.Command.CommandElabM Unit := do
-      let _ ← getResetInfoTrees
-      Elab.Command.elabCommandTopLevel stx
-      if Parser.isTerminalCommand stx then
-        Elab.Command.runModuleLintersAsync revCmds.reverse.toArray
-    let (output, _) ←
-      IO.FS.withIsolatedStreams (isolateStderr := Core.stderrAsMessages.get scope.opts) do
-        EIO.toBaseIO do
-          withLoggingExceptions act cmdCtx cmdStateRef
-    let cmdState ← cmdStateRef.get
-    let mut messages := cmdState.messages
-    if !output.isEmpty then
-      messages := messages.add {
-        fileName := ctx.fileName
-        severity := MessageSeverity.information
-        pos      := ctx.fileMap.toPosition beginPos
-        data     := output
+    let cmdIdx := revCmds.length
+    -- what the elaboration and its tasks do is attributed to the command; promises the frontend created for the
+    -- command's snapshots are resolved outside it
+    let (cmdState, info) ← withCommandContext cmdIdx do
+      -- each command's scoped-stack operations are logged afresh (`StateStack.ops`)
+      let cmdState := { cmdState with env := ← clearScopedOps cmdState.env }
+      let cmdStateBefore := cmdState
+      let scope := cmdState.scopes.head!
+      -- reset per-command state
+      let cmdStateRef ← IO.mkRef { cmdState with
+        messages := .empty, traceState := {}, snapshotTasks := #[], codeQualityEntryTasks := #[] }
+      let cmdCtx : Elab.Command.Context := { ctx with
+        cmdPos       := beginPos
+        snap?        := if internal.cmdlineSnapshots.get scope.opts then none else snap
+        cancelTk?    := some cancelTk
       }
-    let cmdState : Command.State := { cmdState with messages }
-    -- the info trees with their lazy parts substituted: the snapshot reports them and the recorder reads them
-    let info := cmdState.infoState.substituteLazy
-    if let some cmdIdx := cmdIdx? then
-      ModuleUsage.recordCommandObservation cmdIdx stx cmdStateBefore cmdState info
+      let act : Elab.Command.CommandElabM Unit := do
+        let _ ← getResetInfoTrees
+        Elab.Command.elabCommandTopLevel stx
+        if Parser.isTerminalCommand stx then
+          Elab.Command.runModuleLintersAsync revCmds.reverse.toArray
+      let (output, _) ←
+        IO.FS.withIsolatedStreams (isolateStderr := Core.stderrAsMessages.get scope.opts) do
+          EIO.toBaseIO do
+            withLoggingExceptions act cmdCtx cmdStateRef
+      let cmdState ← cmdStateRef.get
+      let mut messages := cmdState.messages
+      if !output.isEmpty then
+        messages := messages.add {
+          fileName := ctx.fileName
+          severity := MessageSeverity.information
+          pos      := ctx.fileMap.toPosition beginPos
+          data     := output
+        }
+      let cmdState : Command.State := { cmdState with messages }
+      -- the info trees with their lazy parts substituted: the snapshot reports them and the recorder reads them
+      let info := cmdState.infoState.substituteLazy
+      if recording then
+        ModuleUsage.recordCommandObservation cmdIdx stx cmdStateBefore cmdState info
+      return (cmdState, info)
     -- definitely resolve eventually
     snap.new.resolve <| .ofTyped { diagnostics := .empty : SnapshotLeaf }
 

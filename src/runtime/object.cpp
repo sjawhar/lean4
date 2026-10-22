@@ -735,6 +735,11 @@ extern "C" LEAN_EXPORT obj_res lean_io_set_task_context(uint32 c) {
     return box(0);
 }
 
+/* getTaskContext : BaseIO UInt32 */
+extern "C" LEAN_EXPORT uint32 lean_io_get_task_context() {
+    return g_task_context;
+}
+
 static lean_task_imp * alloc_task_imp(obj_arg c, unsigned prio, bool keep_alive) {
     lean_task_imp * imp = (lean_task_imp*)lean_alloc_small_object(sizeof(lean_task_imp));
     imp->m_closure     = c;
@@ -1347,8 +1352,26 @@ extern "C" LEAN_EXPORT obj_res lean_io_promise_new() {
     return o;
 }
 
+/* Notes an effect when task context `ctx` acts on `t`, a task or a promise's task another context created. */
+static void note_task_owner(uint32 ctx, lean_task_object * t, char const * what) {
+    lean_task_imp * imp = t->m_imp;
+    if (imp == nullptr) return;
+    uint32 owner = imp->m_context;
+    if (owner != ctx && owner != LEAN_REF_ACCOUNTED)
+        note_effect(ctx, std::string(what) + " " + describe_context(owner) + " created");
+}
+
 extern "C" LEAN_EXPORT obj_res lean_io_promise_resolve(obj_arg value, b_obj_arg promise) {
+    if (uint32 ctx = effect_context())
+        note_task_owner(ctx, lean_to_promise(promise)->m_result, "resolves a promise");
     lean_promise_resolve(value, promise);
+    return box(0);
+}
+
+/* markPromiseAccounted (p : @& IO.Promise α) : BaseIO Unit: resolving `p` is noted for no context */
+extern "C" LEAN_EXPORT obj_res lean_io_mark_promise_accounted(b_obj_arg promise) {
+    if (lean_task_imp * imp = lean_to_promise(promise)->m_result->m_imp)
+        imp->m_context = LEAN_REF_ACCOUNTED;
     return box(0);
 }
 

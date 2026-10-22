@@ -4,8 +4,8 @@ component covers `@[simp]` membership and instance priority, which the full dige
 folds in the full digest of a definition the type mentions (its value decides what the type means) and the
 statement digest of a theorem it mentions (its proof does not). A `.usage` written by `lean -o --usage` has
 the current `usageVersion`, `stmt`, `usedAttrs` (the importee's attrs digest of each used constant) and `commands`; a module that adds
-entries to an extension whose `.olean` entries cannot be converted back for replay is `noskip`, with the
-extension named in `noskipReason`. -/
+entries to an extension whose `.olean` entries cannot be converted back for replay is `noreuse`, with the
+extension named in `noreuseReason`. -/
 open Lean Elab Command
 theorem t : 1 = 1 := rfl
 theorem t' : 1 = 1 := by rfl
@@ -51,8 +51,8 @@ def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
   let xsUsed := usedAttrsX.find? (named `xs) |>.bind (at? · 1)
   -- an extension whose `.olean` entries (`Name`) differ from its state entries (`Name × Nat`) and that has no
   -- conversion back cannot be replayed, so the module is declined with the extension's name
-  let declined := (m.getObjValAs? Bool "noskip").toOption == some true &&
-    (m.getObjValAs? String "noskipReason").toOption ==
+  let declined := (m.getObjValAs? Bool "noreuse").toOption == some true &&
+    (m.getObjValAs? String "noreuseReason").toOption ==
       some "declaration command 2: entries for unreplayableExt, which has no `ofOLeanEntry?` to replay them"
   IO.println s!"{(m.getObjValAs? Nat "version").toOption == some ModuleUsage.usageVersion} {(arr m "stmt").any (named `m2)} \
     {xsAttrs.isSome && xsUsed == xsAttrs} {usedAttrsX.any (named `xd)} \

@@ -8,14 +8,17 @@ module
 prelude
 public import Lean.Util.ModuleUsage.Commands
 import all Lean.Util.CommandEntries  -- for `KeepPermit.mk`
+import all Lean.Environment  -- for the resolver's map, read without recording
+import Lean.Util.Path
 
 public section
 
 /-!
 What a module records for reusing its commands in a later build: which command-state changes a payload carries
 (`commandStateFields`), each command's payload with its refusals (`commandPayloads`), and the module's payloads,
-records and `noskip` reason (`moduleRecords`); and what lets a later build keep them: the module's recorded name
-resolutions holding where they are kept (`keepPermit`).
+records and `noreuse` reason (`moduleRecords`); and what lets a later build keep them: a permit bound to the environment
+the module's `.olean` and `.usage` are checked in, where every check Lake makes before it skips the module holds
+(`keepPermit`).
 -/
 
 namespace Lean.ModuleUsage
@@ -69,37 +72,33 @@ def commandStateChanges (before after : Elab.Command.State) : Array Refusal := I
 
 /-- The command payloads of the observed commands (`observations`, in command order; `recordCommandDeltas`), each also
 refused for the command-state fields it changed (`commandStateChanges`), the attributes with handlers outside core
-Lean it ran (`foreignAttributesByCommand`), the code it evaluated that its environment does not keep
-(`evaluatedByCommand`) and the state imported modules' initializers created that it wrote
-(`foreignStateWritesByCommand`), as the `.olean` stores them (`CommandEntries.compact`), with the digest of their compacted
-bytes. -/
+Lean it ran (`foreignAttributesByCommand`) and the effects on state outside it the runtime noted (`effectsByCommand`),
+as the `.olean` stores them (`CommandEntries.compact`), with the digest of their compacted bytes. -/
 def commandPayloads (observations : Array CommandObservation) : IO (Array (CommandEntries × Digest)) := do
-  let foreign : Std.HashMap Nat (Array Refusal) := (← foreignAttributesByCommand).reverse.foldl (init := {})
-    fun m (i, attr) => m.alter i fun rs => some ((rs.getD #[]).push (.foreignAttribute attr))
-  let evaluated : Std.HashMap Nat (Array Name) := (← evaluatedByCommand).foldl (init := {})
-    fun m (i, n) => m.alter i fun o => some ((o.getD #[]).push n)
-  let wroteForeign : Std.HashSet Nat := (← foreignStateWritesByCommand).foldl (·.insert ·) {}
+  let byCommand (records : Array (Nat × Refusal)) : Std.HashMap Nat (Array Refusal) :=
+    records.foldl (init := {}) fun m (i, r) => m.alter i fun rs => some ((rs.getD #[]).push r)
+  let foreign := byCommand <| (← foreignAttributesByCommand).reverse.toArray.map fun (i, attr) =>
+    (i, .foreignAttribute attr)
+  let effects := byCommand <| (← effectsByCommand).map fun (i, what) => (i, .effect what)
   let deltas ← recordCommandDeltas (observations.map fun obs => (obs.before.env, obs.after.env, obs.i))
   (observations.zip deltas).mapM fun (obs, ce) => do
-    let discarded := ((evaluated.getD obs.i #[]).find? (!obs.after.env.contains ·)).map Refusal.ranCode
-    let extra := commandStateChanges obs.before obs.after ++ foreign.getD obs.i #[] ++ discarded.toArray ++
-      if wroteForeign.contains obs.i then #[Refusal.foreignState] else #[]
-    let (ce, bytes) ← CommandEntries.compact
-      { ce with refusals := extra.foldl (fun rs r => if rs.contains r then rs else rs.push r) ce.refusals }
+    let extra := commandStateChanges obs.before obs.after ++ foreign.getD obs.i #[] ++ effects.getD obs.i #[]
+    let (ce, bytes) ← CommandEntries.compact { ce with refusals := Refusal.addNew ce.refusals extra }
     return (ce, Digest.ofBytes bytes)
 
-/-- What a module records for reuse: its command payloads, its `.usage` command records, and why it is `noskip`. -/
+/-- What a module records for reusing its commands: its command payloads, its `.usage` command records, and why none of
+its commands may be kept (`noreuseReason?`). That decides nothing about skipping the module whole (`noskip`). -/
 structure ModuleRecords where
   payloads : Array CommandEntries := #[]
   commands : Array CommandRecord := #[]
-  noskipReason? : Option String := none
+  noreuseReason? : Option String := none
 
-/-- The module's payloads, records and `noskip` reason, from the observations (`commandObservationsRef`):
+/-- The module's payloads, records and `noreuse` reason, from the observations (`commandObservationsRef`):
 - a frontend the module ran in-process (`sessionChanged`: another run started, `startFrontendRun`; or a repeated
   command index: `Lean.Elab.process` recorded from index 0 again) leaves observations that are not the module's: none;
-- a module-system file is never partially re-elaborated: no payloads, `noskip`;
-- a command that used a name no digest stands for: no records, `noskip` (`commandRecords`);
-- a declaration command with a refusal: `noskip` (`commandEntriesNoskipReason?`). -/
+- a module-system file is never partially re-elaborated: no payloads, `noreuse`;
+- a command that used a name no digest stands for: no records, `noreuse` (`commandRecords`);
+- a declaration command with a refusal: `noreuse` (`commandEntriesNoreuseReason?`). -/
 def moduleRecords (env : Environment) (own : Array (Name × Digest)) (stmt : Array (Name × Digest × Digest))
     (sessionChanged : Bool) : IO ModuleRecords := do
   let observations := (← commandObservations).qsort (·.i < ·.i)
@@ -107,62 +106,144 @@ def moduleRecords (env : Environment) (own : Array (Name × Digest)) (stmt : Arr
     (observations.foldl (fun s o => s.insert o.i) ({} : Std.HashSet Nat)).size != observations.size
   let moduleSystem? := guard env.header.isModule *> some "module-system"
   if nested then
-    return { noskipReason? := moduleSystem? <|> some "command observations of a nested frontend" }
+    return { noreuseReason? := moduleSystem? <|> some "command observations of a nested frontend" }
   let compacted ← if env.header.isModule then pure #[] else commandPayloads observations
   let payloads := compacted.map (·.1)
   match ← commandRecords env observations own stmt compacted with
-  | .error unattributed => return { payloads, noskipReason? := moduleSystem? <|> some unattributed }
+  | .error unattributed => return { payloads, noreuseReason? := moduleSystem? <|> some unattributed }
   | .ok commands =>
     let declIdxs := commands.foldl (init := ({} : Std.HashSet Nat)) fun s c => if c.isDecl then s.insert c.i else s
     return { payloads, commands,
-             noskipReason? := moduleSystem? <|> commandEntriesNoskipReason? payloads declIdxs.contains }
+             noreuseReason? := moduleSystem? <|> commandEntriesNoreuseReason? payloads declIdxs.contains }
 
-/-- The name resolutions a module's compile recorded: its `.usage` file's `resolved`, `resolvedAll` and `digested`
-(`writeUsage`). -/
-structure ResolutionRecord where
-  /-- Each name whose defining module the compile looked up, used or referred to, grouped by the module the resolver
-  mapped it to (`none`: the module itself, or no module), with the kinds under which that module provided it
-  (`resolvedGroups`). -/
-  resolved : Array (Option Name × Array (Name × UInt8))
-  /-- Whether the compile read the resolver's whole map (`allResolved`). -/
-  all : Bool
-  /-- Each imported module with digests, with the digest of the names it provides (`digestedModules`). -/
+/-- What `keepPermit` reads of a module's `.usage` (`writeUsage`). -/
+structure KeepRecord where
+  module : Name
+  /-- The digest of the `.olean` written with the `.usage`. -/
+  olean : Digest
+  githash : String
+  /-- The imports with digests, each with its provides digest (`digestedModules`). -/
   digested : Array (Name × Digest)
+  /-- The imports without digests outside the toolchain, each with its `.olean` digest (`untrackedImports`). -/
+  untracked : Array (Name × Digest)
+  /-- Each direct import's `closureDigest` as the compile imported it. -/
+  importedClosures : Array (Name × Digest)
+  /-- Each `extra` module's `moduleDigest` as the compile imported it. -/
+  importedDigests : Array (Name × Digest)
+  resolved : Array (Option Name × Array (Name × UInt8))
+  resolvedAll : Bool
+  specLookups : Array (Digest × Digest)
+  noreuse : Bool
 
-/-- The resolutions a `.usage` file records. -/
-def ResolutionRecord.ofUsage (j : Json) : Except String ResolutionRecord := do
-  let resolved ← (← j.getObjValAs? (Array (Json × Array (JName × Nat))) "resolved").mapM fun (m, ns) => do
-    let m? ← match m with
-      | .null => pure none
-      | m => some <$> nameOfJson? m
-    return (m?, ns.map fun (n, k) => (n.name, k.toUInt8))
-  let digested := (← j.getObjValAs? (Array (JName × Digest)) "digested").map fun (m, d) => (m.name, d)
-  return { resolved, all := ← j.getObjValAs? Bool "resolvedAll", digested }
+/-- The `KeepRecord` a `.usage` holds. -/
+def KeepRecord.ofUsage (j : Json) : Except String KeepRecord := do
+  let pairs (k : String) : Except String (Array (Name × Digest)) :=
+    return (← j.getObjValAs? (Array (JName × Digest)) k).map fun (m, d) => (m.name, d)
+  return {
+    module := ← nameOfJson? (← j.getObjVal? "module")
+    olean := ← j.getObjValAs? Digest "olean"
+    githash := ← j.getObjValAs? String "githash"
+    digested := ← pairs "digested"
+    untracked := ← pairs "untracked"
+    importedClosures := ← pairs "importedClosures"
+    importedDigests := ← pairs "importedDigests"
+    resolved := ← resolvedOfJson (← j.getObjVal? "resolved")
+    resolvedAll := ← j.getObjValAs? Bool "resolvedAll"
+    specLookups := ← j.getObjValAs? (Array (Digest × Digest)) "specLookups"
+    noreuse := ← j.getObjValAs? Bool "noreuse" }
 
-/-- The resolutions the `.usage` file at `path` records. -/
-def ResolutionRecord.read (path : System.FilePath) : IO ResolutionRecord := do
-  IO.ofExcept <| ResolutionRecord.ofUsage (← IO.ofExcept <| Json.parse (← IO.FS.readFile path))
+/-- The module `n` resolves to in `env` (`Environment.getModuleIdxFor?`), without recording the lookup (`noteResolved`):
+a check of what the module's compile resolved must not add to what this one's records. -/
+private def moduleIdxUnrecorded? (env : Environment) (n : Name) : Option ModuleIdx :=
+  env.base.get env |>.const2ModIdx[n]?
 
-/-- A keep permit for `env`'s imports (`KeepPermit`) if every resolution `r` records holds in `env`: each recorded name
-resolves to the same module (`Environment.getModuleIdxFor?`), which provides it with the same kinds (`providedKinds`),
-and, where the compile read the resolver's whole map, every imported module with digests provides the same names
-(`digestedModules`). This is the check Lake makes before it skips a module (`UsageSidecar.resolvedUnchanged`), asked of
-`env`'s resolver directly. Otherwise none of the module's commands is kept: the error, `resolution changed`, names
-the first difference. -/
-def keepPermit (env : Environment) (r : ResolutionRecord) : Except String KeepPermit := do
+/-- The reason the closure checks of `keepPermit` fail for `r` in `env`, if one does. -/
+private def closureChanged? (env : Environment) (r : KeepRecord) : IO (Option String) := do
+  let s := state env
+  let lib := toString (← getLibDir (← getBuildDir))
+  let recordedDigested : NameSet := r.digested.foldl (·.insert ·.1) {}
+  let untracked : NameMap Digest := r.untracked.foldl (fun m (n, d) => m.insert n d) {}
+  let mut digestedNow : NameSet := {}
+  -- every import carries digests as when the module was compiled, or is pinned by its `.olean` or the githash
+  for (m, i) in env.header.moduleNames.zipIdx do
+    if s.hasEntries i then
+      unless recordedDigested.contains m do
+        return some s!"`{m}` carries usage digests, which it did not when the module was compiled"
+      digestedNow := digestedNow.insert m
+    else
+      let olean ← findOLean m
+      if (toString olean).startsWith lib then continue
+      unless untracked.find? m == some (← fileDigest olean) do
+        return some s!"`{m}`, which carries no usage digests, is not the `.olean` the module was compiled against"
+  if let some (m, _) := r.digested.find? (!digestedNow.contains ·.1) then
+    return some s!"`{m}` carried usage digests when the module was compiled and does not here"
+  -- the closure's cross-module compiler tables and the modules the compile used whole, as the compile imported them
+  for (field, recorded, sel) in #[("closure", r.importedClosures, fun (d : Digest × Digest) => d.2),
+      ("module digest", r.importedDigests, fun (d : Digest × Digest) => d.1)] do
+    for (m, d) in recorded do
+      let now? := (env.getModuleIdx? m).bind s.importedDigests?
+      unless now?.map sel == some d do
+        return some s!"the {field} of `{m}` is not what the module was compiled against"
+  -- every name resolution, unrecorded
   let describe (m? : Option Name) (k : UInt8) : String :=
     m?.elim "the module itself or no module" fun m => s!"`{m}` (kinds {k})"
   for (m?, ns) in r.resolved do
     for (n, k) in ns do
-      let i? := env.getModuleIdxFor? n
+      let i? := moduleIdxUnrecorded? env n
       let now? := i?.map (env.header.moduleNames[·.toNat]!)
       let k' := i?.elim 0 (providedKinds env · n)
       unless now? == m? && k' == k do
-        throw s!"resolution changed: `{n}` resolved to {describe m? k} when the module was compiled, and resolves \
-          to {describe now? k'} here"
-  if r.all && digestedModules env != r.digested then
-    throw "resolution changed: the compile read the defining module of every name, and the imported modules' \
+        return some s!"resolution changed: `{n}` resolved to {describe m? k} when the module was compiled, and \
+          resolves to {describe now? k'} here"
+  if r.resolvedAll && digestedModules env != r.digested then
+    return some "resolution changed: the compile read the defining module of every name, and the imported modules' \
       provides differ here"
-  return KeepPermit.mk env.header.moduleNames
+  -- the specialization-cache keys the compile looked up, with their providers
+  unless specProvidersIn env (r.specLookups.map (·.1)) == r.specLookups do
+    return some "the providers of a specialization-cache key the module looked up changed"
+  return none
+
+/-- `keepPermit`, with the `noreuse` check only if `checkNoreuse`. -/
+private def keepPermitCore (env : Environment) (module : Name) (olean usage : System.FilePath)
+    (checkNoreuse : Bool) : IO (Except String KeepPermit) := do
+  let r ← IO.ofExcept <| KeepRecord.ofUsage (← IO.ofExcept <| Json.parse (← IO.FS.readFile usage))
+  unless r.module == module do return .error s!"the `.usage` is of `{r.module}`, not `{module}`"
+  unless env.mainModule == module do return .error s!"the environment is of `{env.mainModule}`, not `{module}`"
+  unless r.githash == Lean.githash do return .error s!"the `.usage` was written by another Lean ({r.githash})"
+  if checkNoreuse && r.noreuse then return .error "the module's commands cannot be kept (`noreuse`)"
+  unless (← fileDigest olean) == r.olean do return .error "the `.usage` was not written with this `.olean`"
+  if let some reason ← closureChanged? env r then return .error reason
+  let (data, _) ← readModuleData olean
+  return .ok { module, data, payloads := CommandEntries.ofModuleData data, imports := env.header.moduleData }
+
+/--
+A keep permit (`KeepPermit`) for module `module`'s command payloads in `env`, from its `.olean` at `olean` and the
+`.usage` at `usage` written with it, if every check holds; otherwise the reason, and none of the module's commands is
+kept. The `.usage` is the module's (`module`), was written with that `.olean` (`olean`, its digest) by this Lean
+(`githash`), and lets commands be kept (`noreuse`). Then the checks Lake makes on the module's import closure before it
+skips the module (`Module.usageUpToDate`), asked of `env` directly:
+- every import carries usage digests as when the module was compiled (`UsageSidecar.coversClosure`), and one without
+  them outside the toolchain is the same `.olean` (`untrackedImports`; Lake's `modsysHash`);
+- every direct import's `closureDigest` (`closureHash`) and every `extra` module's `moduleDigest` are as the compile
+  imported them (Lake also compares an extra module's `.olean` bytes, through the `.usekey`, which the compile does not
+  record);
+- every recorded name resolves to the same module, which provides it with the same kinds, and, where the compile read
+  the resolver's whole map, every import with digests provides the same names (`UsageSidecar.resolvedUnchanged`); these
+  lookups are not recorded (`moduleIdxUnrecorded?`);
+- every specialization-cache key the compile looked up has the same providers (`UsageSidecar.specProvidersUnchanged`).
+The module's own inputs, and what each command used (its record's uses), are its caller's to check. -/
+def keepPermit (env : Environment) (module : Name) (olean usage : System.FilePath) :
+    IO (Except String KeepPermit) :=
+  keepPermitCore env module olean usage (checkNoreuse := true)
+
+namespace Testing
+
+/-- Test support: `keepPermit` also for a module whose commands its records say cannot be kept (`noreuse`), so that a
+test can replay their payloads. -/
+def keepPermit (env : Environment) (module : Name) (olean usage : System.FilePath) :
+    IO (Except String KeepPermit) :=
+  keepPermitCore env module olean usage (checkNoreuse := false)
+
+end Testing
 
 end Lean.ModuleUsage

@@ -54,11 +54,12 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let some _ ← Elab.runFrontend mSource {} "M.lean" `M (oleanFileName? := some (dir / "M.olean")) (usageFileName? := some (dir / "M.usage")) |
     throw <| IO.userError "elaboration of M failed"
   let obs := (← ModuleUsage.commandObservations).qsort (·.i < ·.i)
-  let (md, _) ← readModuleData (dir / "M.olean")
-  let payloads := CommandEntries.ofModuleData md
+  let some first := obs[0]? | throw <| IO.userError "no commands"
+  let permit ← IO.ofExcept (← ModuleUsage.Testing.keepPermit first.before.env `M (dir / "M.olean") (dir / "M.usage"))
+  let payloads := permit.payloads
   let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
-  IO.println s!"noskip {(usage.getObjValAs? Bool "noskip").toOption}, \
-    reason {(usage.getObjValAs? String "noskipReason").toOption}"
+  IO.println s!"noreuse {(usage.getObjValAs? Bool "noreuse").toOption}, \
+    reason {(usage.getObjValAs? String "noreuseReason").toOption}"
   let exts ← persistentEnvExtensionsRef.get
   let find (n : Name) : IO (PersistentEnvExtension EnvExtensionEntry EnvExtensionEntry EnvExtensionState) := do
     let some e := exts.find? (·.name == n) | throw <| IO.userError s!"no extension {n}"
@@ -82,7 +83,6 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let watched := [`logExt, `myParamExt, `scopeExt, `Lean.Meta.Simp.simprocDeclExt, `Lean.Compiler.LCNF.monoTypeExt]
   for o in obs do
     let some ce := payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"
-    let permit ← IO.ofExcept <| ModuleUsage.keepPermit o.before.env (← IO.ofExcept <| ModuleUsage.ResolutionRecord.ofUsage usage)
     let replay ← try
         let env ← replayCommandEntries permit (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}
         pure (if view env == view o.after.env then s!"replay matches {view env}"

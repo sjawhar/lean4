@@ -12,6 +12,7 @@ public import Lean.Util.UsedByChecks
 public import Lean.Util.ModuleUsage.Basic
 public import Lean.Util.ModuleUsage.Compiled
 import Lean.ExtraModUses
+import Lean.Util.Path
 import Lean.Compiler.ImplementedByAttr
 import Lean.Compiler.CSimpAttr
 import Lean.Compiler.ModPkgExt
@@ -728,18 +729,36 @@ importers' `specLookups` are checked against. -/
 private def ownSpecKeys (env : Environment) : Array (Digest × Name) :=
   (specKeysOf (specCacheEntries env none)).qsort (·.1.lt ·.1)
 
-/-- For each key the current module looked up in the specialization cache (`lookups`), deduplicated and sorted,
-its providers among the imported non-`module` files with digests (`specProviders`); Lake rebuilds the module when
-one of these changes. Providers in modules without digests (the toolchain) are pinned by the Lean githash, those in
-`module` files by Lake's `modsysHash`. -/
-private def specLookups (env : Environment) (lookups : Array Expr) : Array (Digest × Digest) :=
-  let keys := (lookups.foldl (·.insert <| specKeyDigest ·) ({} : Std.HashSet Digest)).toArray.qsort Digest.lt
+/-- `specProviders` of `keys` in `env`: their providers among the imported non-`module` files with digests. -/
+def specProvidersIn (env : Environment) (keys : Array Digest) : Array (Digest × Digest) :=
   if keys.isEmpty then #[] else
   let s := state env
   specProviders keys <| env.header.moduleNames.zipIdx.filterMap fun (m, i) =>
     if s.hasEntries i && !(env.header.moduleData[i]?.any (·.isModule)) then
       some (m, specKeysOf (specCacheEntries env (some i)))
     else none
+
+/-- For each key the current module looked up in the specialization cache (`lookups`), deduplicated and sorted,
+its providers among the imported non-`module` files with digests (`specProvidersIn`); Lake rebuilds the module when
+one of these changes. Providers in modules without digests (the toolchain) are pinned by the Lean githash, those in
+`module` files by Lake's `modsysHash`. -/
+private def specLookups (env : Environment) (lookups : Array Expr) : Array (Digest × Digest) :=
+  specProvidersIn env <| (lookups.foldl (·.insert <| specKeyDigest ·) ({} : Std.HashSet Digest)).toArray.qsort Digest.lt
+
+/-- The imported modules without digests outside the toolchain (`module` files imported without their private level,
+or modules compiled without `--usage`), each with the digest of its `.olean` (`fileDigest`), sorted by name: what pins
+them for a check made in another process (`ModuleUsage.keepPermit`), as Lake's `modsysHash` pins `module` files.
+A toolchain module (its `.olean` under the running Lean's library directory) is pinned by the Lean githash. -/
+def untrackedImports (env : Environment) : IO (Array (Name × Digest)) := do
+  let s := state env
+  let lib := toString (← getLibDir (← getBuildDir))
+  let mut out := #[]
+  for (m, i) in env.header.moduleNames.zipIdx do
+    if s.hasEntries i then continue
+    let olean ← findOLean m
+    if (toString olean).startsWith lib then continue
+    out := out.push (m, ← fileDigest olean)
+  return out.qsort (Name.quickLt ·.1 ·.1)
 
 /-- The format version of the `.usage` sidecar and of Lake's `.usekey`; Lake reads a sidecar of any other
 version as absent. -/
@@ -760,14 +779,19 @@ changes the kinds of any of those names; `resolvedAll` is set when the whole res
 (`allResolved`), so that Lake rebuilds the module when any closure module's provides changed. Call it after
 everything else the process writes: `resolvedNames` is read last here, after this function's own lookups. `noskip`
 is set when the run reused commands from an `--incr-load` snapshot, since reused commands never call `addDecl` in
-this process and `used` may miss constants they used, and when `noskipReason?` is set (the module's command records
-cannot be used), which is written as `noskipReason`. `stmt` is `computeStmt`'s result and `commands` the per-command
-records. `usedAttrs` holds, beside each kernel constant of a `used` entry, the attrs digest the defining module
-recorded for it (`importedConstDigests?`). -/
+this process and `used` may miss constants they used.
+
+The fields for keeping the module's commands one by one (`ModuleUsage.keepPermit`): `module`, the module's name; `olean`,
+the digest of the `.olean` written beside it (`oleanDigest`, `fileDigest`), which holds the command payloads;
+`githash`, the Lean that wrote both; `untracked`, the imports without digests outside the toolchain with their `.olean`
+digests (`untrackedImports`); `stmt`, `computeStmt`'s result; `commands`, the per-command records; `usedAttrs`, beside
+each kernel constant of a `used` entry, the attrs digest the defining module recorded for it (`importedConstDigests?`);
+and `noreuse`, set when no command may be kept (`noreuseReason?`, written as `noreuseReason`). `noreuse` decides nothing
+about skipping the module whole. -/
 def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Digest)) (closure : Digest)
     (provides : Array Name × Array Name) (used : NameSet) (lookups : Array Expr)
     (stmt : Array (Name × Digest × Digest)) (commands : Array Json) (incrLoaded : Bool) (path : System.FilePath)
-    (noskipReason? : Option String := none) : IO Unit := do
+    (oleanDigest : Digest) (noreuseReason? : Option String := none) : IO Unit := do
   let s := state env
   let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecks)
   let importedHint := (← compileHints).any fun n => (env.getModuleIdxFor? n).any s.hasEntries
@@ -796,7 +820,8 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
   let names : NameHashSet := (← resolvedNames).foldl (·.insert ·) {}
   let names := nodes.foldl (fun s n => n.refs.foldl (·.insert ·) s) (used.foldl (·.insert ·) names)
   let names := (names : Std.HashSet Name).fold (fun s x => (internalPrefixes x).foldl (·.insert ·) s) names
-  let fields : List (String × Json) := [("version", usageVersion), ("noskip", incrLoaded || noskipReason?.isSome),
+  let untracked ← untrackedImports env
+  let fields : List (String × Json) := [("version", usageVersion), ("noskip", incrLoaded),
     ("moduleDigest", toJson (moduleDigestOf own)),
     ("closure", toJson closure),
     ("providesDigest", toJson (providesDigestOf provides)),
@@ -815,10 +840,15 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
     ("extra", Json.arr (extraMods.map fun u => Json.arr #[nameToJson u.module, u.isMeta])),
     ("specKeys", Json.arr ((ownSpecKeys env).map fun (d, n) => Json.arr #[toJson d, nameToJson n])),
     ("specLookups", Json.arr ((specLookups env lookups).map fun (k, p) => Json.arr #[toJson k, toJson p])),
+    ("module", nameToJson env.mainModule),
+    ("olean", toJson oleanDigest),
+    ("githash", toJson Lean.githash),
+    ("untracked", Json.arr (untracked.map fun (m, d) => pair m d)),
     ("stmt", Json.arr (stmt.map fun (n, c, a) => Json.arr #[nameToJson n, toJson c, toJson a])),
-    ("commands", Json.arr commands)]
-  let fields := match noskipReason? with
-    | some reason => fields ++ [("noskipReason", toJson reason)]
+    ("commands", Json.arr commands),
+    ("noreuse", noreuseReason?.isSome)]
+  let fields := match noreuseReason? with
+    | some reason => fields ++ [("noreuseReason", toJson reason)]
     | none => fields
   IO.FS.writeFile path (Json.mkObj fields).compress
 

@@ -1,3 +1,3 @@
-module noskip (some true), reason (some (declaration command 0: a change to Lean.protectedExt that no entry expresses))
+module noreuse (some true), reason (some (declaration command 0: a change to Lean.protectedExt that no entry expresses))
 0: refused for logExt true; refused
 1: refused for logExt false; replay matches

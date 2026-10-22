@@ -117,18 +117,19 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
       (oleanFileName? := some (dir / "M.olean")) (usageFileName? := some (dir / "M.usage")) |
     throw <| IO.userError "elaboration of M failed"
   let obs := (← ModuleUsage.commandObservations).qsort (·.i < ·.i)
-  let (md, _) ← readModuleData (dir / "M.olean")
-  let payloads := CommandEntries.ofModuleData md
+  -- the test's attributes are registered by an imported module, so a command that runs one is refused for it
+  -- (`Refusal.foreignAttribute`); the replay drops that refusal to check the records themselves
+  let some first := obs[0]? | throw <| IO.userError "no commands"
+  let permit := CommandEntries.Testing.substitutePayloads
+    (← IO.ofExcept (← ModuleUsage.Testing.keepPermit first.before.env `M (dir / "M.olean") (dir / "M.usage")))
+    (·.map fun ce => { ce with refusals := ce.refusals.filter (!· matches .foreignAttribute _) })
+  let payloads := permit.payloads
   let pExts := (← persistentEnvExtensionsRef.get).filter (·.perCommand == .recorded)
   for o in obs do
     let some ce := payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"
-    -- the test's attributes are registered by an imported module, so a command that runs one is refused for it
-    -- (`Refusal.foreignAttribute`); the replay drops that refusal to check the records themselves
-    let ce := { ce with refusals := ce.refusals.filter (!· matches .foreignAttribute _) }
     let shown := CommandEntries.Testing.shownEntries ce watched.contains
     -- as when a kept command is replayed: its constants are present, every extension is in its before-state
     let base ← CommandEntries.Testing.rollbackTo o.before.env o.after.env
-    let permit ← IO.ofExcept <| ModuleUsage.keepPermit o.before.env (← ModuleUsage.ResolutionRecord.read (dir / "M.usage"))
     let replayed? : Option Environment ← try
         pure (some (← replayCommandEntries permit base ce {}))
       catch _ => pure none

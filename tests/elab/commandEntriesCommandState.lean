@@ -1,8 +1,8 @@
 import Lean
 /-! The parts of `Elab.Command.State` other than the environment that a declaration command can change, and how
 the recorder treats each (`ModuleUsage.commandStateFields`). A change to the command scope (`scopes`: an option, a
-`variable`, a `universe`, made by a macro next to a `def`) refuses the payload (`Refusal.commandState`) and declines
-the module (`noskip`); a scope the command restores
+`variable`, a `universe`, made by a macro next to a `def`) refuses the payload (`Refusal.commandState`) and makes
+the module `noreuse`; a scope the command restores
 (`set_option … in`, `open … in`, dotted names) is not. `maxRecDepth`, which `set_option maxRecDepth … in` leaves
 changed after the command, and the name generator `ngen` are replayed: the record's `post` holds them after the
 command and the next command's context digest includes them (`commandEntriesNgenRestore`, `commandEntriesNgenDiff`
@@ -12,6 +12,7 @@ open Lean
 
 structure Run where
   obs : Array ModuleUsage.CommandObservation
+  permit : KeepPermit
   payloads : Array CommandEntries
   usage : Json
   records : Array Json
@@ -23,24 +24,24 @@ unsafe def elabM (dir : System.FilePath) (src : String) : IO Run := do
   let some _ ← Elab.runFrontend src {} "M.lean" `M (oleanFileName? := some (dir / "M.olean")) (usageFileName? := some (dir / "M.usage")) |
     throw <| IO.userError s!"elaboration failed:\n{src}"
   let obs := (← ModuleUsage.commandObservations).qsort (·.i < ·.i)
-  let (md, _) ← readModuleData (dir / "M.olean")
-  let payloads := CommandEntries.ofModuleData md
+  let some first := obs[0]? | throw <| IO.userError "no commands"
+  let permit ← IO.ofExcept (← ModuleUsage.Testing.keepPermit first.before.env `M (dir / "M.olean") (dir / "M.usage"))
+  let payloads := permit.payloads
   let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
   let records := (usage.getObjValAs? (Array Json) "commands").toOption.getD #[]
-  return { obs, payloads, usage, records }
+  return { obs, permit, payloads, usage, records }
 
 /-- Per command: its kind, the command-state fields its payload is refused for, and whether replay accepts it. -/
 unsafe def report (dir : System.FilePath) (label src : String) : IO Run := do
   let r ← elabM dir src
-  IO.println s!"== {label}: noskip {(r.usage.getObjValAs? Bool "noskip").toOption}, \
-    reason {(r.usage.getObjValAs? String "noskipReason").toOption}"
+  IO.println s!"== {label}: noreuse {(r.usage.getObjValAs? Bool "noreuse").toOption}, \
+    reason {(r.usage.getObjValAs? String "noreuseReason").toOption}"
   for o in r.obs do
     let some ce := r.payloads.find? (·.idx == o.i) | throw <| IO.userError s!"no payload {o.i}"
     let kind := (r.records[o.i]?.bind fun c => (c.getObjValAs? String "kind").toOption).getD "?"
     let markers := ce.refusals.filterMap fun | .commandState field => some field | _ => none
-    let permit ← IO.ofExcept <| ModuleUsage.keepPermit o.before.env (← IO.ofExcept <| ModuleUsage.ResolutionRecord.ofUsage r.usage)
     let replay ← try
-        discard <| replayCommandEntries permit (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}
+        discard <| replayCommandEntries r.permit (← CommandEntries.Testing.rollbackTo o.before.env o.after.env) ce {}
         pure "replayed"
       catch _ => pure "refused"
     IO.println s!"{o.i} {kind}: command-state markers {markers}, {replay}"

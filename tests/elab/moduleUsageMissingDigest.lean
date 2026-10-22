@@ -88,13 +88,13 @@ example : use_dep% base = 2 := rfl
     discard <| ModuleUsage.commandRecords noFull obs own stmt #[]
   expectError "imported constant without a full digest (module)" do
     ModuleUsage.writeUsage noFull (ModuleUsage.ownNodes noFull consts) own default (#[], #[]) {} #[] stmt #[] false
-      (dir / "W.usage")
+      (dir / "W.usage") default
   let noStmt ← modifyPrivateExt ModuleUsage.StmtState env `Lean.ModuleUsage.stmtExt fun s =>
     { s with importedModuleEntries := dropEntry `xd s.importedModuleEntries }
   expectError "imported constant without a statement digest (command)" do
     discard <| ModuleUsage.commandRecords noStmt obs own stmt #[]
   expectError "imported constant without a statement digest (module)" do
     ModuleUsage.writeUsage noStmt (ModuleUsage.ownNodes noStmt consts) own default (#[], #[]) {} #[] stmt #[] false
-      (dir / "W.usage")
+      (dir / "W.usage") default
 
 #eval main

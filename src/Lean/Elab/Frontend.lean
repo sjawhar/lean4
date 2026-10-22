@@ -403,11 +403,12 @@ def runFrontend
       let stmt := ModuleUsage.computeStmt env (ModuleUsage.stmtState env) own consts
       let recs ← ModuleUsage.moduleRecords env own stmt (sessionChanged := (← lastFrontendRun) != run)
       let provides := ModuleUsage.ownProvides env
-      return (usageFileName, nodes, own, ModuleUsage.closureDigest env own provides, provides, stmt, recs)
+      return (usageFileName, oleanFileName, nodes, own, ModuleUsage.closureDigest env own provides, provides, stmt,
+        recs)
     profileitIO ".olean serialization" finalOpts do
       let commandLints := collectCommandLints snaps none #[]
       let env ← Linter.recordLints inputCtx.fileMap env commandLints
-      let env := usage?.elim env fun (_, _, own, closure, provides, stmt, recs) =>
+      let env := usage?.elim env fun (_, _, _, own, closure, provides, stmt, recs) =>
         let env := ModuleUsage.setLocalStmt (ModuleUsage.setLocalDigests env own closure provides) stmt
         setCommandEntries env recs.payloads
       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
@@ -437,10 +438,11 @@ def runFrontend
     Firefox.Profile.serve <| Json.compress <| toJson profile
 
   -- Last of the outputs: the usage data records every name resolved in writing the others.
-  if let some (usageFileName, nodes, own, closure, provides, stmt, recs) := usage? then
+  if let some (usageFileName, oleanFileName, nodes, own, closure, provides, stmt, recs) := usage? then
     let used := ModuleUsage.usedFromInfoTrees trees (← usedNames)
     ModuleUsage.writeUsage env nodes own closure provides used (← lookedUpSpecKeys) stmt (recs.commands.map toJson)
-      (incrLoaded := incrLoadFileName?.isSome) usageFileName (noskipReason? := recs.noskipReason?)
+      (incrLoaded := incrLoadFileName?.isSome) usageFileName (← ModuleUsage.fileDigest oleanFileName)
+      (noreuseReason? := recs.noreuseReason?)
 
   -- no point in freeing the snapshot graph and all referenced data this close to process exit
   Runtime.forget snaps

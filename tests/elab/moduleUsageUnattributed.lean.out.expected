@@ -1,13 +1,13 @@
-Rejected: noskip true, 0 command records, reason: command 1 uses `doesNotExist`, which names no constant of this module or its imports
-RejectedValue: noskip true, 0 command records, reason: command 1 uses `zzMissing`, which names no constant of this module or its imports
-NestedPrefix: noskip true, 0 command records, reason: command 1 uses `_nested.KNHost_1`, which names no constant of this module or its imports
-MutualLetRec: noskip true, 0 command records, reason: command 0 uses `y.z`, which names no constant of this module or its imports
-ElabOnly: noskip true, 0 command records, reason: command 2 uses `ghost`, a constant of this module the kernel environment does not hold
-X: noskip false, 3 command records, reason: none
-IRName: noskip true, 0 command records, reason: command 1 uses `h._boxed`, which names no constant of this module or its imports
-Discarded: noskip false, 3 command records, reason: none
+Rejected: noskip false, noreuse true, 0 command records, reason: command 1 uses `doesNotExist`, which names no constant of this module or its imports
+RejectedValue: noskip false, noreuse true, 0 command records, reason: command 1 uses `zzMissing`, which names no constant of this module or its imports
+NestedPrefix: noskip false, noreuse true, 0 command records, reason: command 1 uses `_nested.KNHost_1`, which names no constant of this module or its imports
+MutualLetRec: noskip false, noreuse true, 0 command records, reason: command 0 uses `y.z`, which names no constant of this module or its imports
+ElabOnly: noskip false, noreuse true, 0 command records, reason: command 2 uses `ghost`, a constant of this module the kernel environment does not hold
+X: noskip false, noreuse false, 3 command records, reason: none
+IRName: noskip false, noreuse true, 0 command records, reason: command 1 uses `h._boxed`, which names no constant of this module or its imports
+Discarded: noskip false, noreuse false, 3 command records, reason: none
 Discarded: uses from X #[Leaf, Leaf._sizeOf_inst], uses of discarded constants #[]
-Kept: noskip false, 10 command records, reason: none
+Kept: noskip false, noreuse false, 10 command records, reason: none
 Kept: `Tree.rec_1` is its own constant: true, used by command 3: true
 Kept: `Tree.below_1` is its own constant: true, used by command 4: true
 Kept: `Tree.brecOn_1` is its own constant: true, used by command 5: true

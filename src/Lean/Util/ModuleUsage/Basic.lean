@@ -212,11 +212,21 @@ def nameOfJson? (j : Json) : Except String Name := do
       pure (.num n k.mantissa.toNat)
     | _ => throw s!"expected a name component, got {c.compress}"
 
-/-- A `Name` (de)serialized as `nameToJson`. -/
+/-- A `Name` (de)serialized as `nameToJson`: Lean writes the usage sidecars with it, and Lean and Lake read them. -/
 structure JName where
   name : Name
   deriving Inhabited, BEq
 instance : ToJson JName := ⟨(nameToJson ·.name)⟩
 instance : FromJson JName := ⟨fun j => JName.mk <$> nameOfJson? j⟩
+
+/-- Reads a `.usage`'s `resolved` groups (`ModuleUsage.resolvedGroups`): `[module or null, [[name, kinds], ...]]`. -/
+def resolvedOfJson (j : Json) : Except String (Array (Option Name × Array (Name × UInt8))) := do
+  (← j.getArr?).mapM fun g => do
+    let #[m, ns] ← g.getArr? | throw s!"expected a pair, got {g.compress}"
+    let m? ← if m.isNull then pure none else some <$> nameOfJson? m
+    let ns ← (← ns.getArr?).mapM fun e => do
+      let #[n, k] ← e.getArr? | throw s!"expected a pair, got {e.compress}"
+      return (← nameOfJson? n, (← fromJson? (α := Nat) k).toUInt8)
+    return (m?, ns)
 
 end Lean.ModuleUsage

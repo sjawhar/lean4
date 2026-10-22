@@ -575,8 +575,6 @@ def globals : List (Name × GlobalClass × String) := [
   (`Lean.extraModUsesByChecksRef, .recording, "Private (src/Lean/ExtraModUses.lean)."),
   (`Lean.extraModUsesByCmdRef, .recording,
     "Private (src/Lean/ExtraModUses.lean); read only by the per-command usage records."),
-  (`Lean.currentCommandRef, .recording,
-    "Private (src/Lean/Util/UsedByChecks.lean): the running command's index, read only to attribute what is recorded."),
   (`Lean.usedByCommandRef, .recording,
     "Private (src/Lean/Util/UsedByChecks.lean); read only by the per-command usage records."),
   (`Lean.Compiler.LCNF.baseTransparentDeclsExt, .moduleLocal,

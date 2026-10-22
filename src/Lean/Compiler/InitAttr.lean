@@ -11,7 +11,6 @@ public import Lean.Elab.InfoTree.Main
 import Init.Data.Range.Polymorphic.Stream
 import Lean.Compiler.NameMangling
 import Lean.Compiler.ModPkgExt
-import Lean.Util.UsedByChecks
 
 public section
 
@@ -200,10 +199,8 @@ private unsafe def runInitAttrForMod
 private unsafe def runInitAttrs (env : Environment) (opts : Options) : IO Unit := do
   if !(← isInitializerExecutionEnabled) then
     throw <| IO.userError "`enableInitializersExecution` must be run before calling `importModules (loadExts := true)`"
-  -- the state an imported module's initializers create is not core's (core's initializers ran when Lean started)
-  withForeignStateTagged do
-    for mod in env.header.modules, modIdx in 0...* do
-      runInitAttrForMod env opts mod modIdx
+  for mod in env.header.modules, modIdx in 0...* do
+    runInitAttrForMod env opts mod modIdx
 
 /--
 Like `runInitAttrs`, but walks only the given module indices. Used by `--incr-load`: the indices
@@ -216,10 +213,9 @@ unsafe def runInitAttrsForModules
     (env : Environment) (modIdxs : Array Nat) (opts : Options) : IO Unit := do
   if !(← isInitializerExecutionEnabled) then
     throw <| IO.userError "`enableInitializersExecution` must be run before reusing a `--incr-load` snapshot"
-  withForeignStateTagged do
-    for modIdx in modIdxs do
-      if h : modIdx < env.header.modules.size then
-        runInitAttrForMod env opts env.header.modules[modIdx] modIdx
+  for modIdx in modIdxs do
+    if h : modIdx < env.header.modules.size then
+      runInitAttrForMod env opts env.header.modules[modIdx] modIdx
 
 /--
 Returns the indices of modules in `env.header.modules` whose `regularInitAttr` has non-empty
