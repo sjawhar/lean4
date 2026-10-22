@@ -421,6 +421,12 @@ to wall clock time.
 @[extern "lean_io_mono_nanos_now"] opaque monoNanosNow : BaseIO Nat
 
 /--
+CPU time consumed by the current thread in nanoseconds. Returns `0` where the platform has no current-thread CPU
+clock.
+-/
+@[extern "lean_io_thread_cpu_nanos_now"] opaque threadCpuNanosNow : BaseIO Nat
+
+/--
 Reads bytes from a system entropy source. It is not guaranteed to be cryptographically secure.
 
 If `nBytes` is `0`, returns immediately with an empty buffer.
