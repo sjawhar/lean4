@@ -844,34 +844,35 @@ def decode? (bytes : ByteArray) : Except String ResolvedTable :=
   (decodeM bytes).run' 0
 
 /--
-Whether module `m`, whose provides changed to `provides` (its `ownProvides`), still resolves every name of the table as
-the compile saw it: each name recorded under `m` is provided by `m` with the recorded kinds, and each name recorded
-under another module or under none is not provided by `m`, except as a kernel constant alone when the compile depended
-on `m`'s copy (`declared`: the names `used` lists under `m`). Lean recorded each name `n` once (`resolvedGroups`),
-under the module `g` the resolver mapped it to, with the kinds `k` under which `g` provided it.
+Whether module `m`, whose provides changed, still resolves every name of the table as the compile saw it: each name
+recorded under `m` is provided by `m` with the recorded kinds, and each name recorded under another module or under
+none is not provided by `m`, except as a kernel constant alone when the compile depended on `m`'s copy (`declared`:
+the names `used` lists under `m`). `ids` is `providedIds` of `m`'s current `ownProvides`. Lean recorded each name `n`
+once (`resolvedGroups`), under the module `g` the resolver mapped it to, with the kinds `k` under which `g` provided
+it.
 
 This is the check `∀ (n, g, k) recorded, kindsIn m n = if g = m then k else 0 ∨ (g ≠ m ∧ kindsIn m n = kernelKind ∧
 n ∈ declared)`, inverted so that it walks `m`'s names instead of every recorded one. Let `P` be the distinct names `m`
-provides under nonzero kinds (`providedIds`); every other name has `kindsIn m n = 0`. The walk fails on an `n ∈ P`
-recorded under another group (the check demands `kindsIn m n = 0` there) unless `n` is provided as a kernel constant
-alone and is in `declared`, or recorded under `m` with `k ≠ kindsIn m n`, which also covers an entry of `m` with
-`k = 0`; otherwise it counts the entries of `m` matched. The names of `P` are distinct and each identity is one entry,
-so the matched entries are distinct, all of `m` with `k ≠ 0`, and `found = provided[m]` holds exactly when every
-entry of `m` with `k ≠ 0` has its name in `P` with kinds `k`. Together these are the check: an entry of another group
-must have its name outside `P` or be exempt, an entry of `m` with `k = 0` must have its name outside `P`, and an entry
-of `m` with `k ≠ 0` inside it with kinds `k`.
+provides under nonzero kinds (`ids`); every other name has `kindsIn m n = 0`. The walk fails on an `n ∈ P` recorded
+under another group (the check demands `kindsIn m n = 0` there) unless `n` is provided as a kernel constant alone and
+is in `declared`, or recorded under `m` with `k ≠ kindsIn m n`, which also covers an entry of `m` with `k = 0`;
+otherwise it counts the entries of `m` matched. The names of `P` are distinct and each identity is one entry, so the
+matched entries are distinct, all of `m` with `k ≠ 0`, and `found = provided[m]` holds exactly when every entry of
+`m` with `k ≠ 0` has its name in `P` with kinds `k`. Together these are the check: an entry of another group must
+have its name outside `P` or be exempt, an entry of `m` with `k = 0` must have its name outside `P`, and an entry of
+`m` with `k ≠ 0` inside it with kinds `k`.
 
 Names are compared by `resolvedId`, a 128-bit truncated SHA-256 of the injective `Enc.name`: the construction of every
 other usage digest (a declaration's digest, `moduleDigest`, `providesDigest`), so two names share an identity only
 through a collision that would hide a change behind any of those as well. Two recorded names sharing one fail
 `decode?`.
 -/
-def providerUnchanged (t : ResolvedTable) (m : Name) (provides : Array Name × Array Name) (declared : Array Name) :
+def providerUnchanged (t : ResolvedTable) (m : Name) (ids : Array (Digest × UInt8)) (declared : Array Name) :
     Bool := Id.run do
   let g? := t.modules.findIdx? (· == some m)
   let declaredIds : Std.HashSet Digest := declared.foldl (·.insert <| resolvedId ·) {}
   let mut found := 0
-  for (d, k) in providedIds provides do
+  for (d, k) in ids do
     if let some (g, k') := t.entries[d]? then
       if some g == g? then
         unless k' == k do return false
