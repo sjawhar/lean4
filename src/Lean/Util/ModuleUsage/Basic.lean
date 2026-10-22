@@ -101,14 +101,13 @@ def bool (e : Enc) (v : Bool) : Enc := e.u8 (if v then 1 else 0)
 def str (e : Enc) (s : String) : Enc := let b := s.toUTF8; ⟨(e.u64 b.size.toUInt64).buf ++ b⟩
 def nat (e : Enc) (n : Nat) : Enc := e.str (toString n)
 def digest (e : Enc) (d : Digest) : Enc := e.u64 d.hi |>.u64 d.lo
-/-- The component count, then each component root first, tagged string or number. -/
+/-- The component count, then each component root first, tagged string or number. A fold rather than a recursion on
+the prefix, whose base case would return the buffer it borrows and make the next push copy the whole buffer. -/
 def name (e : Enc) (n : Name) : Enc :=
-  go n (e.nat n.getNumParts)
-where
-  go : Name → Enc → Enc
-    | .anonymous, e => e
-    | .str p s, e => (go p e).u8 1 |>.str s
-    | .num p k, e => (go p e).u8 2 |>.nat k
+  n.components.foldl (init := e.nat n.getNumParts) fun e c => match c with
+    | .str _ s => e.u8 1 |>.str s
+    | .num _ k => e.u8 2 |>.nat k
+    | .anonymous => e
 def names (e : Enc) (ns : List Name) : Enc := ns.foldl name (e.nat ns.length)
 /-- `xs`'s size, then each element encoded by `f`. -/
 @[inline] def array {α : Type} (e : Enc) (xs : Array α) (f : Enc → α → Enc) : Enc := xs.foldl f (e.nat xs.size)
