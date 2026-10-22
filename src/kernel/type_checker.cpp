@@ -27,6 +27,7 @@ namespace lean {
 static name * g_kernel_fresh = nullptr;
 static expr * g_dont_care    = nullptr;
 static name * g_bool_true    = nullptr;
+static name * g_bool_false   = nullptr;
 static name * g_eager_reduce = nullptr;
 /* Upper bound (in bytes) on the numerals the kernel computes while reducing `Nat`
    literals (see `reduce_nat`). Protects the kernel from spending unbounded memory
@@ -623,6 +624,9 @@ optional<expr> type_checker::unfold_definition(expr const & e) {
 
 expr mk_bool_true();
 expr mk_bool_false();
+static inline bool is_bool_lit(expr const & e) {
+    return is_constant(e) && (const_name(e) == *g_bool_true || const_name(e) == *g_bool_false);
+}
 
 static inline bool is_nat_lit_ext(expr const & e) { return e == *g_nat_zero || is_nat_lit(e); }
 static inline nat get_nat_val(expr const & e) {
@@ -720,9 +724,12 @@ static optional<nat> to_nat_val(type_checker & tc, expr const & e) {
    through `instDecidableEqFin` on `toFin`). Only `decide` is shortcut, never `d` itself: `whnf d` stays the structure
    whose `decide` field is unevaluated, which is what projections in `lazy_delta_reduction` compare against the other
    side. Like the `Nat` literal rules there, this only applies to terms without free variables (or under
-   `eagerReduce`): an open argument such as `x.toNat + 4294967244` unfolds `Nat.add` once per unit of its literal. */
+   `eagerReduce`): an open argument such as `x.toNat + 4294967244` unfolds `Nat.add` once per unit of its literal.
+   Only `whnf` applies it, where the value is demanded, and `lazy_delta_reduction` when the other side is a Boolean
+   literal. Two closed `decide` terms are compared by their arguments, as without the rule, which settles
+   `decide (f (n + 1) = c) =?= decide (f m = c)` without evaluating `f`, however costly `f` is. */
 optional<expr> type_checker::reduce_dec_lit(expr const & e) {
-    if (!is_constant(app_fn(app_fn(e)), *g_dec_decide)) return none_expr();
+    if (get_app_num_args(e) != 2 || !is_constant(app_fn(app_fn(e)), *g_dec_decide)) return none_expr();
     expr const & d = app_arg(e);
     expr const & f = get_app_fn(d);
     if (!is_constant(f)) return none_expr();
@@ -776,7 +783,7 @@ optional<expr> type_checker::reduce_nat(expr const & e) {
         if (f == *g_nat_xor)  return reduce_bin_nat_op(nat_lxor, e);
         if (f == *g_nat_shiftLeft) return reduce_shiftLeft(e);
         if (f == *g_nat_shiftRight) return reduce_bin_nat_op(lean_nat_shiftr, e);
-        return reduce_dec_lit(e);
+        return none_expr();
     }
     return none_expr();
 }
@@ -808,7 +815,9 @@ expr type_checker::whnf(expr const & e) {
     expr t = e;
     while (true) {
         expr t1 = whnf_core(t);
-        if (auto v = reduce_nat(t1)) {
+        optional<expr> v = reduce_nat(t1);
+        if (!v) v = reduce_dec_lit(t1);
+        if (v) {
             m_st->m_whnf.insert(mk_pair(e, *v));
             return *v;
         } else if (auto next_t = unfold_definition(t1)) {
@@ -1141,6 +1150,10 @@ lbool type_checker::lazy_delta_reduction(expr & t_n, expr & s_n) {
                 return to_lbool(is_def_eq_core(*t_v, s_n));
             } else if (auto s_v = reduce_nat(s_n)) {
                 return to_lbool(is_def_eq_core(t_n, *s_v));
+            } else if (is_bool_lit(s_n)) {
+                if (auto t_v = reduce_dec_lit(t_n)) return to_lbool(is_def_eq_core(*t_v, s_n));
+            } else if (is_bool_lit(t_n)) {
+                if (auto s_v = reduce_dec_lit(s_n)) return to_lbool(is_def_eq_core(t_n, *s_v));
             }
         }
 
@@ -1339,6 +1352,8 @@ void initialize_type_checker() {
     mark_persistent(g_kernel_fresh->raw());
     g_bool_true    = new name{"Bool", "true"};
     mark_persistent(g_bool_true->raw());
+    g_bool_false   = new name{"Bool", "false"};
+    mark_persistent(g_bool_false->raw());
     g_eager_reduce = new name{"eagerReduce"};
     g_dont_care    = new_persistent_expr_const("dontcare");
     g_nat_zero     = new_persistent_expr_const({"Nat", "zero"});
@@ -1393,6 +1408,7 @@ void initialize_type_checker() {
 void finalize_type_checker() {
     delete g_kernel_fresh;
     delete g_bool_true;
+    delete g_bool_false;
     delete g_eager_reduce;
     delete g_dont_care;
     delete g_nat_succ;
