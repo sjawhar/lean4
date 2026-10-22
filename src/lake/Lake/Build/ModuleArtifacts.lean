@@ -25,8 +25,9 @@ public structure ModuleOutputDescrs where
   c? : Option ArtifactDescr := none
   bc? : Option ArtifactDescr := none
   ltar? : Option ArtifactDescr := none
-  /-- Usage-cutoff sidecars (`.usage`, `.usekey`), when the build wrote them. -/
+  /-- Usage-cutoff sidecars (`.usage`, `.resolved`, `.usekey`), when the build wrote them. -/
   usage? : Option ArtifactDescr := none
+  resolved? : Option ArtifactDescr := none
   usekey? : Option ArtifactDescr := none
   /--
   Set when the outputs were not compiled for this input but kept: a kept-module checker accepted
@@ -60,6 +61,8 @@ public protected def ModuleOutputDescrs.toJson (self : ModuleOutputDescrs) : Jso
     obj := obj.insert "l" ltar
   if let some usage := self.usage? then
     obj := obj.insert "u" usage
+  if let some resolved := self.resolved? then
+    obj := obj.insert "v" resolved
   if let some usekey := self.usekey? then
     obj := obj.insert "k" usekey
   if let some hash := self.keptFrom? then
@@ -85,6 +88,7 @@ public protected def ModuleOutputDescrs.fromJson? (val : Json) : Except String M
     bc? := ← obj.get? "b"
     ltar? := ← obj.get? "l"
     usage? := ← obj.get? "u"
+    resolved? := ← obj.get? "v"
     usekey? := ← obj.get? "k"
     keptFrom? := ← obj.get? "kf"
   }
@@ -103,8 +107,9 @@ public structure ModuleOutputArtifacts where
   c? : Option Artifact := none
   bc? : Option Artifact := none
   ltar? : Option Artifact := none
-  /-- Usage-cutoff sidecars (`.usage`, `.usekey`), when the build wrote them. -/
+  /-- Usage-cutoff sidecars (`.usage`, `.resolved`, `.usekey`), when the build wrote them. -/
   usage? : Option Artifact := none
+  resolved? : Option Artifact := none
   usekey? : Option Artifact := none
   /-- See `ModuleOutputDescrs.keptFrom?`. -/
   keptFrom? : Option Hash := none
@@ -122,5 +127,6 @@ public def ModuleOutputArtifacts.descrs (arts : ModuleOutputArtifacts) : ModuleO
   bc? := arts.bc?.map (·.descr)
   ltar? := arts.ltar?.map (·.descr)
   usage? := arts.usage?.map (·.descr)
+  resolved? := arts.resolved?.map (·.descr)
   usekey? := arts.usekey?.map (·.descr)
   keptFrom? := arts.keptFrom?
