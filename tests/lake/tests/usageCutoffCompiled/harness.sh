@@ -1564,35 +1564,6 @@ inst_claim_s1() { claim_z '' foo lean_nat_succ; }
 inst_claim_after_s0() { inst_claim_files X Z; }
 inst_claim_after_s1() { claim_z '' foo lean_nat_succ; }
 
-# A module's cross-module table digest when modules it does not import claim names of its own declarations. `A`
-# defines `X._sunfold` for a base `X` that no module defines, so its `tableDigest` lists the constant with its digest
-# (`foreignDerivedConsts`); in state 1 `Y` and `Z` claim `X._sunfold` with different IR declarations (`td_claim`).
-# In `td_inst`, `Z` claims the name of `A`'s instance `instA`, which `A`'s `tableDigest` leaves out as one of its own
-# declarations. `P` imports `Y`, `Z`, `A`, `R` imports `Z`, `Y`, `A` and `Q` imports `A`, `Y`, `Z`, so in `P`, `R` and
-# `Q` the claimed name resolves to `Y`, `Z` and `A` in `td_claim` and to `Z`, `Z` and `A` in `td_inst`; `A`'s table
-# digest must be the same in all three, and `P`, `Q` and `R` what a clean build makes.
-td_files() {
-  lakefile_app; mkdir_t
-  printf '%s\n' "$1" 'def adummy : Nat := 1' > T/A.lean
-  printf 'import Lean\ndef ydummy : Nat := 1\n' > T/Y.lean
-  printf 'import Lean\ndef zdummy : Nat := 1\n' > T/Z.lean
-  printf 'import T.Y\nimport T.Z\nimport T.A\ndef p : Nat := 0\n' > T/P.lean
-  printf 'import T.Z\nimport T.Y\nimport T.A\ndef r : Nat := 0\n' > T/R.lean
-  printf 'import T.A\nimport T.Y\nimport T.Z\ndef q : Nat := 0\n' > T/Q.lean
-  printf 'import T.P\nimport T.Q\nimport T.R\ndef main : IO Unit := IO.println (p + q + r)\n' > Main.lean
-}
-# `$1` claims `$2` with an `@[extern "$3"]` IR declaration.
-td_claim_mod() {
-  printf '%s\n' 'import Lean' "def ${1,,}dummy : Nat := 1" 'open Lean IR in' \
-    "run_cmd Lean.Elab.Command.liftCoreM <| IR.addDecl <| (.extern \`$2" \
-    '  #[{ x := ⟨1⟩, borrow := false, ty := .object }] .object' \
-    "  { entries := [.standard \`all \"$3\"] })" > T/$1.lean
-}
-td_claim_s0() { td_files 'def X._sunfold : Nat := 3'; }
-td_claim_s1() { td_claim_mod Y X._sunfold lean_nat_succ; td_claim_mod Z X._sunfold lean_nat_pred; }
-td_inst_s0() { td_files 'instance instA : Inhabited Nat := ⟨5⟩'; }
-td_inst_s1() { td_claim_mod Z instA lean_nat_succ; }
-
 # Used kernel constants whose `ConstantInfo` the import takes from a module other than the one the resolver answers.
 # `kern_body`: `Z` claims `foo` with an IR-only declaration and `D` imports `Z` then `A`, so `foo` resolves to `Z`
 # while the kernel's `foo` is `A`'s; `E` proves `foo 1 = 2` by `rfl` and state 1 changes `A`'s body, so a fresh `E`
@@ -1786,7 +1757,6 @@ kern_thm_all_k() {
 }
 kern_thm_all_s0() { dup_files 'theorem t : True := trivial'; kern_thm_all_k t; }
 kern_thm_all_s1() { kern_thm_all_k u; }
-
 # A claim of a name `A`'s compile created inside another specialization: `A`'s specialization of `h` created inside
 # its specialization of `g` is `h._at_.g._at_.useIt.spec_0.spec_0`; `Z` defines `useIt.spec_0`, a reading of that
 # name's creator, and claims the name (`cs_nested`; `cs_nested_ctl` without the definition). `C` specializes `h` at
@@ -1835,6 +1805,85 @@ cs_kern_s0() {
   printf 'import T.E\ndef main : IO Unit := IO.println (useFoo 1)\n' > Main.lean
 }
 cs_kern_s1() { claim_z '' foo lean_nat_succ; }
+
+# A module's stored `tableDigest` (`Lean.ModuleUsage.TableRecord`) when modules it does not import list names its
+# tables mention. `P` imports `Y`, `Z`, `A`, `R` imports `Z`, `Y`, `A` and `Q` imports `A`, `Y`, `Z`. In state 1 `Y`
+# and `Z` add IR declarations of those names. `td_claim`: `A` defines `X._sunfold` for a base `X` that no module
+# defines (`foreignDerivedConsts`), claimed by `Y` and `Z`. `td_inst`: `Z` claims the name of `A`'s instance `instA`.
+# Both are `A`'s own declarations, so its tables ask nothing of an importer and its record holds everywhere.
+# `td_hint`: `A` marks `K`'s `hQ` as a unification hint; the hint's digest is that of the declaration the importer's
+# resolver gives for `T.hQ`, which is `Y`'s claim where the resolver ranks `Y` before `K`. `A`'s record must then fail
+# there and hold elsewhere. In every case every importer's digest of `A`'s tables must be the one it computes
+# (`td_check`).
+td_files() {
+  lakefile_app; mkdir_t
+  printf '%s\n' "$1" 'def adummy : Nat := 1' > T/A.lean
+  printf 'import Lean\ndef ydummy : Nat := 1\n' > T/Y.lean
+  printf 'import Lean\ndef zdummy : Nat := 1\n' > T/Z.lean
+  printf 'import T.Y\nimport T.Z\nimport T.A\ndef p : Nat := 0\n' > T/P.lean
+  printf 'import T.Z\nimport T.Y\nimport T.A\ndef r : Nat := 0\n' > T/R.lean
+  printf 'import T.A\nimport T.Y\nimport T.Z\ndef q : Nat := 0\n' > T/Q.lean
+  printf 'import T.P\nimport T.Q\nimport T.R\ndef main : IO Unit := IO.println (p + q + r)\n' > Main.lean
+  local m
+  for m in P Q R; do
+    printf '%s\n' 'import Lean' "import T.$m" 'open Lean ModuleUsage in' \
+      '#eval show CoreM Unit from do' \
+      '  let env ← getEnv' \
+      '  let s := state env' \
+      '  let digestOf := s.closureDigestOf env {}' \
+      '  for (m, i) in env.header.moduleNames.zipIdx do' \
+      '    if m != `T.A then continue' \
+      '    unless s.hasEntries i do' \
+      '      IO.println s!"{m} has no digests"' \
+      '      continue' \
+      '    let fresh := computedTableDigest env i digestOf' \
+      '    let holds := (tableRecord? env i).any (·.holds digestOf)' \
+      '    let hq := match env.getModuleIdxFor? `T.hQ with' \
+      '      | some j => toString env.header.moduleNames[j.toNat]!' \
+      '      | none => "none"' \
+      '    IO.println s!"{m} holds={holds} equal={importedTableDigest env i digestOf == fresh} fresh={fresh.hex} hq={hq}"' \
+      > TableIn$m.lean
+  done
+}
+# `$1` claims `$2` with an `@[extern "$3"]` IR declaration.
+td_claim_mod() {
+  printf '%s\n' 'import Lean' "def ${1,,}dummy : Nat := 1" 'open Lean IR in' \
+    "run_cmd Lean.Elab.Command.liftCoreM <| IR.addDecl <| (.extern \`$2" \
+    '  #[{ x := ⟨1⟩, borrow := false, ty := .object }] .object' \
+    "  { entries := [.standard \`all \"$3\"] })" > T/$1.lean
+}
+# Every importer's digest of `A`'s tables is the one it computes, and `A`'s record holds in every importer (`$1` = all)
+# or exactly where the importer resolves `T.hQ` to `K` (`$1` = hq).
+td_check() {
+  local m out want
+  for m in P Q R; do
+    out=$("$LAKE" env lean TableIn$m.lean 2>&1) || { echo "$out"; return 1; }
+    echo "$m: $out"
+    want=true
+    if [ "$1" = hq ] && ! echo "$out" | grep -q ' hq=T\.K$'; then want=false; fi
+    echo "$out" | grep -q "^T.A holds=$want equal=true fresh=" || return 1
+  done
+}
+td_fresh() { "$LAKE" env lean TableIn$1.lean 2>&1 | sed -n 's/.* fresh=\([0-9a-f]*\) .*/\1/p'; }
+td_claim_s0() { td_files 'def X._sunfold : Nat := 3'; }
+td_claim_s1() { td_claim_mod Y X._sunfold lean_nat_succ; td_claim_mod Z X._sunfold lean_nat_pred; }
+td_claim_c_check() { td_check all; }
+td_inst_s0() { td_files 'instance instA : Inhabited Nat := ⟨5⟩'; }
+td_inst_s1() { td_claim_mod Z instA lean_nat_succ; }
+td_inst_c_check() { td_check all; }
+td_hint_s0() {
+  td_files $'import T.K\nattribute [unification_hint] T.hQ'
+  printf 'namespace T\nclass C (α : Type) : Type where\n  mk ::\naxiom Q : Nat → Type\ndef hQ (n : Nat) (X : Type) [_inst : C X] : Prop := Q n = X\nend T\n' > T/K.lean
+}
+td_hint_s1() { td_claim_mod Y T.hQ lean_nat_succ; }
+# Where `P` resolves `T.hQ` to `Y`'s claim, its digest of `A`'s tables differs from `Q`'s, which resolves it to `K`.
+td_hint_c_check() {
+  td_check hq || return 1
+  "$LAKE" env lean TableInP.lean 2>&1 | grep -q ' hq=T\.K$' && return 0
+  local p q
+  p=$(td_fresh P) q=$(td_fresh Q)
+  [ -n "$p" ] && [ "$p" != "$q" ]
+}
 
 # A control for the comparison of failing builds: `scoped_inst` with a module `N` that fails in state 1, so the
 # build fails while `M` and `W` are kept; the outputs both builds produced must still agree.
@@ -2455,7 +2504,7 @@ all_cases="spec_transitive spec_link spec_type spec_precomp plugin_replay csimp_
   binder_fun binder_jp binder_param owner_macro owner_boxed owner_move binder_info_param binder_info_type
   pre_summary ng ng_ctrl shadow shadow2 perkey_unrelated_spec perkey_provider cachespec_order cachespec_mdata_miss mdata_key_borrow mdata_key_borrow_folder
   borrow_proj borrow_ctor borrow_alias tc_hint ba_implicit bi_inl bi_inl_rev bn_mi bi_down2 bn_alias
-  cs_nested cs_nested_ctl cs_collide cs_collide_ctl cs_kern vd_mdata vd_mdata_type vd_sunfold vd_sunfold_bn
+  cs_nested cs_nested_ctl cs_collide cs_collide_ctl cs_kern td_hint vd_mdata vd_mdata_type vd_sunfold vd_sunfold_bn
   vd_sunfold_new vd_sunfold_bare dn_unsafe_rec dn_noncomp dn_never_extract
   spec_transitive:cache"
 # `spec_transitive:cache`: the state the cutoff build of `spec_transitive` leaves behind, after another build and
