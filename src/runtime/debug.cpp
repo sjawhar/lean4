@@ -19,6 +19,7 @@ Author: Leonardo de Moura
 #endif
 #include <lean/lean.h>
 #include "runtime/debug.h"
+#include "runtime/object.h"
 
 namespace lean {
 static std::set<std::string> * g_enabled_debug_tags = nullptr;
@@ -48,6 +49,7 @@ void enable_debug(char const * tag) {
 
 /* enableDebug (tag : @& String) : BaseIO Unit */
 extern "C" LEAN_EXPORT lean_obj_res lean_internal_enable_debug(b_lean_obj_arg tag) {
+    note_effect_here("enables the runtime's debug assertions");
     enable_debug(lean_string_cstr(tag));
     return lean_box(0);
 }

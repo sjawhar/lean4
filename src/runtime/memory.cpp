@@ -10,6 +10,7 @@ Author: Leonardo de Moura
 #include "runtime/exception.h"
 #include "runtime/memory.h"
 #include "runtime/thread.h"
+#include "runtime/object.h"
 
 #ifndef LEAN_CHECK_MEM_THRESHOLD
 #define LEAN_CHECK_MEM_THRESHOLD 200
@@ -127,6 +128,7 @@ void set_max_memory(size_t max) {
 }
 
 extern "C" LEAN_EXPORT lean_obj_res lean_internal_set_max_memory(size_t max) {
+    note_effect_here("sets the runtime's maximum memory");
     set_max_memory(max);
     return lean_box(0);
 }

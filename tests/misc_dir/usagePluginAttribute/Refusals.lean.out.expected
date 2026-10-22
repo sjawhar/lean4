@@ -2,4 +2,5 @@
 1: refusals #[the attribute fp_tag, whose handlers may run code outside core Lean, an effect outside the command: it writes a reference no command created]
 2: refusals #[the attribute fp_tag, whose handlers may run code outside core Lean, an effect outside the command: it writes a reference no command created]
 3: refusals #[]
-4: refusals #[]
+4: refusals #[the attribute fp_panic, whose handlers may run code outside core Lean, an effect outside the command: it sets whether the runtime exits on a panic]
+5: refusals #[]

@@ -293,9 +293,10 @@ def recordForeignAttribute (attr : Name) : BaseIO Unit := do
 
 /-- The effects on state outside a command that the runtime noted for each command since the run started (none
 outside any command): a write to a reference another command, or code outside any command, created; the resolution of
-a promise another command created; each use of process-wide state through the runtime's primitives (a file or
-directory the command did not create, a file handle it did not open, among them the standard streams, a file it created
-and left in place, the process environment, the working directory, the running executable's path, a child process). No payload carries them. Takes
+a promise, or the cancellation of a task, another command created; each use of process-wide state through the
+runtime's primitives (a file or directory the command did not create, a file handle it did not open, among them the
+standard streams, a file it created and left in place, the process environment, the working directory, the running
+executable's path, a child process, the runtime's settings). No payload carries them. Takes
 them: a second call returns only those since. -/
 def effectsByCommand : BaseIO (Array (Nat × String)) := do
   return (← takeEffects).map fun (c, what) => (c.toNat - 1, what)

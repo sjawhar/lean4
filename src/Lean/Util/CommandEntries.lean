@@ -103,9 +103,9 @@ inductive Refusal where
   store (a closure); the payload leaves them out. -/
   | uncompactable (part : Name) (at? : Option Name := none)
   /-- An effect on state outside the command that the runtime noted (`effectsByCommand`): a write to a reference it did
-  not create, the resolution of a promise it did not create, or a use of process-wide state (files, the environment,
-  the working directory, the running executable's path, child processes, the standard streams), which no payload
-  carries. -/
+  not create, the resolution of a promise or the cancellation of a task it did not create, or a use of process-wide
+  state (files, the environment, the working directory, the running executable's path, child processes, the standard
+  streams, the runtime's settings), which no payload carries. -/
   | effect (what : String)
   deriving Inhabited, BEq
 

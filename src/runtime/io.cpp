@@ -1536,12 +1536,13 @@ extern "C" LEAN_EXPORT obj_res lean_io_current_dir() {
 /*
 Effect notes. While on (`lean_io_set_effect_recording`), the runtime notes, per task context other than 0 (code outside
 any command), each effect that context has on state outside it: a write to a reference another context created
-(`m_context`), the resolution of a promise another context created, and each use of process-wide state through the
-runtime's primitives: a file or directory it did not create, a file handle it did not open (the standard streams among
-them), a file it created and left in place, the process environment, the working directory, the running executable's
-path, a child process. Not noted: values any two runs may differ in (clocks, heartbeats, random bytes, process and
-thread ids), which a kept command's result takes from the run that recorded it, and the runtime's debugging output
-(`dbg_trace`). `lean_io_take_effects` returns the notes.
+(`m_context`), the resolution or cancellation of a task or promise another context created, and each use of
+process-wide state through the runtime's primitives: a file or directory it did not create, a file handle it did not
+open (the standard streams among them), a file it created and left in place, the process environment, the working
+directory, the running executable's path, a child process, the runtime's settings (maximum heartbeats and memory, exit
+on panic, thread stack size, debug tags). Not noted: values any two runs may differ in (clocks, heartbeat counts,
+random bytes, process and thread ids), which a kept command's result takes from the run that recorded it, and the
+runtime's debugging output (`dbg_trace`). `lean_io_take_effects` returns the notes.
 */
 static std::atomic<bool> g_effects_on(false);
 
@@ -1885,6 +1886,10 @@ extern "C" LEAN_EXPORT uint8_t lean_io_check_canceled() {
 }
 
 extern "C" LEAN_EXPORT obj_res lean_io_cancel(b_obj_arg t) {
+    // cancelling a finished task does nothing
+    uint32 ctx = effect_context();
+    if (ctx != 0 && !lean_to_task(t)->m_value)
+        note_task_owner(ctx, lean_to_task(t), "cancels a task");
     lean_io_cancel_core(t);
     return box(0);
 }

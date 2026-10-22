@@ -484,6 +484,13 @@ uint32 effect_context();
 void note_effect(uint32 ctx, std::string const & what);
 /* `"command N"` for task context `ctx` (`N = ctx - 1`), `"no command"` for 0: who created an object. */
 std::string describe_context(uint32 ctx);
+/* Notes `what` for the running task context, if effects are noted and it is a command's. */
+inline void note_effect_here(char const * what) {
+    if (uint32 ctx = effect_context()) note_effect(ctx, what);
+}
+/* Notes `what` and who created `t` for task context `ctx` (not 0) when `t`, a task or a promise's task, is another
+   context's. */
+void note_task_owner(uint32 ctx, lean_task_object * t, char const * what);
 
 obj_res lean_promise_new();
 void lean_promise_resolve(obj_arg value, b_obj_arg promise);
