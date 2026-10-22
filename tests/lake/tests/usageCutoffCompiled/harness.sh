@@ -1636,7 +1636,7 @@ kern_thm_third_s0() {
 }
 kern_thm_third_s1() { kern_thm_mod W "$kern_thm_axiom"; }
 # `dup_new_trans`: as `kern_thm_trans`, but `Q` declares no `tA` in state 0 and gains the proof from `wfR` in state 1,
-# so a fresh `E` fails (a known gap, as `dup_new`).
+# so a fresh `E` fails.
 dup_new_trans_s0() {
   kern_thm_trans_s0
   printf 'import T.B\ndef qdummy : Nat := 0\n' > T/Q.lean
@@ -1644,9 +1644,14 @@ dup_new_trans_s0() {
 dup_new_trans_s1() { kern_thm_mod Q "$kern_thm_axiom"; }
 
 # A name a second closure module starts to declare: `D` imports `R` and `K` and uses nothing of either; in state 1 `K`
-# adds `t`, which `R` defines, so a fresh `D` fails at import (`dup_new`, a known gap; `dup_new_trans` is the same gap
-# where the new copy replaces the kept one). With a theorem of the same statement the import merges the copies and a
-# fresh `D` builds (`dup_new_thm`). The package is a library only.
+# adds `t`, which `R` defines, so a fresh `D` fails at import (`dup_new`; `dup_new_trans` is the same where the new
+# copy replaces the kept one; `dup_new_ms` where `R` is a `module` file). With a theorem of the same statement the
+# import merges the copies and a fresh `D` builds (`dup_new_thm`). `dup_new_tc`: the other declarer is a toolchain
+# module. `dup_new_own`: it is `D` itself, so a fresh `D` fails at its declaration. `dup_new_third`: `R` and `K` declare
+# one theorem `t`, which `D`'s compile depended on in both, and a third import `W` starts to declare `t` as a
+# definition. `dup_new_tc_outside`: `K` adds a name of a toolchain module that no module of `D`'s closure imports, so a
+# fresh `D` builds and `D` is replayed. `dup_new_deep`: as `dup_new`, but the new declarer is `K2`, which `K` imports, two
+# imports below `D`; `T`, which imports `D`, must fail with it. The package is a library only.
 dup_files() {
   printf 'name = "test"\ndefaultTargets = ["T"]\n[[lean_lib]]\nname = "T"\n' > lakefile.toml
   mkdir_t
@@ -1659,6 +1664,34 @@ dup_new_s0() { dup_files 'def t : Nat := 1'; }
 dup_new_s1() { printf 'def other : Nat := 0\ndef t : Nat := 2\n' > T/K.lean; }
 dup_new_thm_s0() { dup_files 'theorem t : True := trivial'; }
 dup_new_thm_s1() { printf 'def other : Nat := 0\ntheorem t : True := trivial\n' > T/K.lean; }
+dup_new_tc_s0() {
+  dup_files 'def r : Nat := 0'
+  printf 'import Std.Data.HashMap\nimport T.K\ndef d : Nat := 0\n' > T/D.lean
+}
+dup_new_tc_s1() { printf 'def other : Nat := 0\ndef Std.HashMap.emptyWithCapacity : Nat := 0\n' > T/K.lean; }
+dup_new_own_s0() {
+  dup_files 'def r : Nat := 0'
+  printf 'import T.K\ndef t : Nat := 1\ndef d : Nat := 0\n' > T/D.lean
+}
+dup_new_own_s1() { printf 'def other : Nat := 0\ndef t : Nat := 2\n' > T/K.lean; }
+dup_new_ms_s0() { dup_files $'module\npublic def t : Nat := 1'; }
+dup_new_ms_s1() { printf 'def other : Nat := 0\ndef t : Nat := 2\n' > T/K.lean; }
+dup_new_third_s0() {
+  dup_files 'theorem t : True := trivial'
+  printf 'def other : Nat := 0\ntheorem t : True := trivial\n' > T/K.lean
+  printf 'def w : Nat := 0\n' > T/W.lean
+  printf 'import T.R\nimport T.K\nimport T.W\ndef d : Nat := 0\n' > T/D.lean
+}
+dup_new_third_s1() { printf 'def w : Nat := 0\ndef t : Nat := 0\n' > T/W.lean; }
+dup_new_tc_outside_s0() { dup_files 'def r : Nat := 0'; }
+dup_new_tc_outside_s1() { dup_new_tc_s1; }
+dup_new_tc_outside_c_check() { grep -qE 'Replayed T\.D( |$)' ../dup_new_tc_outside.1.log; }
+dup_new_deep_s0() {
+  dup_files 'def t : Nat := 1'
+  printf 'def deep : Nat := 0\n' > T/K2.lean
+  printf 'import T.K2\ndef other : Nat := 0\n' > T/K.lean
+}
+dup_new_deep_s1() { printf 'def deep : Nat := 0\ndef t : Nat := 2\n' > T/K2.lean; }
 # `kern_thm_conflict`: `R` and `K` declare the theorem `t` with one statement, and `D` imports both and uses nothing of
 # either. State 1 changes the statement of `K`'s `t` and keeps its names, so a fresh `D` fails at import.
 kern_thm_conflict_s0() {
@@ -2306,7 +2339,8 @@ all_cases="spec_transitive spec_link spec_type spec_precomp plugin_replay csimp_
   collide_first collide_after collide_rev collide_rev_first collide_drop_loser collide_shape collide_shape_rev
   elab_claim elab_claim_after elab_claim_ms inst_claim inst_claim_after td_claim td_inst
   kern_body kern_body_after kern_codegen kern_thm_dup kern_thm_dup_after kern_thm_flip kern_thm_trans
-  kern_thm_conflict kern_thm_all kern_thm_third dup_new dup_new_trans dup_new_thm
+  kern_thm_conflict kern_thm_all kern_thm_third dup_new dup_new_trans dup_new_thm dup_new_tc dup_new_own dup_new_ms
+  dup_new_third dup_new_tc_outside dup_new_deep
   hard_recording hard_moduleext hard_speclookups hard_compilercode rp_own
   hard_usedbychecks hard_declconsts
   hard_extramod perkey_provider_inl
@@ -2333,12 +2367,6 @@ all_cases="spec_transitive spec_link spec_type spec_precomp plugin_replay csimp_
   spec_transitive:cache"
 # `spec_transitive:cache`: the state the cutoff build of `spec_transitive` leaves behind, after another build and
 # in a fresh tree that shares its artifact cache.
-# Known gaps: `all_cases` entries the cutoff gets wrong (a `:cache` variant is its own entry). Their difference from a
-# fresh build is reported, not counted; a pass, or a state 0 that does not build, is a failure.
-known_gaps=" dup_new dup_new_trans "
-for g in $known_gaps; do
-  case " $(echo $all_cases) " in *" $g "*) ;; *) echo "FAILURE: known gap $g is not in all_cases"; exit 1 ;; esac
-done
 cases=${CASES:-}
 if [ -z "$cases" ]; then
   i=0
@@ -2350,21 +2378,10 @@ fi
 failed=()
 # `NAME:cache` runs a case with the artifact cache (see `run_case`).
 for c in $cases; do
-  rc=0
   case $c in
-    *:cache) run_case "${c%:cache}" cache || rc=$? ;;
-    *) run_case $c || rc=$? ;;
+    *:cache) run_case "${c%:cache}" cache || failed+=("$c") ;;
+    *) run_case $c || failed+=($c) ;;
   esac
-  if [[ $known_gaps == *" $c "* ]] && [ $rc != 2 ]; then
-    if [ $rc = 0 ]; then
-      echo "FAILURE: $c: known gap now matches a fresh build; remove it from known_gaps"
-      failed+=("$c")
-    else
-      echo "KNOWN GAP: $c differs from a fresh build"
-    fi
-  elif [ $rc != 0 ]; then
-    failed+=("$c")
-  fi
 done
 if [ ${#failed[@]} -gt 0 ]; then
   echo "FAILURE: cases differing from a fresh build: ${failed[*]}"

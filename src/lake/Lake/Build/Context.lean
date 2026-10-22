@@ -10,6 +10,7 @@ public import Lake.Config.Cache
 public import Lake.Config.Context
 public import Lake.Build.Job.Basic
 public import Std.Sync.Mutex
+public import Lean.Data.PersistentHashSet
 public import Lean.Util.ModuleUsage
 
 open System
@@ -84,6 +85,26 @@ public def JobQueue := IO.Ref (Array OpaqueJob)
 @[inline] public def mkJobQueue : BaseIO JobQueue :=
   IO.mkRef #[]
 
+/--
+The kernel constants of the modules a usage-cutoff check may find a changed module's kernel constants duplicated in
+(`Lake.UsageSidecar.kernelDisjoint`), as name hashes (`Name.hash`). The checks of concurrent jobs share it, so its
+maps are persistent: an update copies only the nodes it changes, where a shared hash map would be copied whole.
+-/
+public structure KernelProviders where
+  /-- The workspace modules `byHash` lists, each with the digest of the state it was read in. -/
+  indexed : Lean.PHashSet (Lean.Name × Lean.ModuleUsage.Digest) := {}
+  /-- Each kernel constant's name hash with the modules that declare it, each with the digest of the state it was
+  read in (`default` for a toolchain module). -/
+  byHash : Lean.PHashMap UInt64 (Array (Lean.Name × Lean.ModuleUsage.Digest)) := {}
+  /-- The toolchain modules `byHash` lists, each with its direct imports, or `none` if its `.olean` could not be
+  read. -/
+  toolchain : Lean.PHashMap Lean.Name (Option (Array Lean.Name)) := {}
+
+/-- Lists module `m`, in the state with digest `d`, under each kernel constant name hash in `hs`. -/
+public def KernelProviders.index (s : KernelProviders) (m : Lean.Name) (d : Lean.ModuleUsage.Digest)
+    (hs : Array UInt64) : KernelProviders :=
+  { s with byHash := hs.foldl (fun b h => b.alter h fun o => some ((o.getD #[]).push (m, d))) s.byHash }
+
 /-- A Lake context with a build configuration and additional build data. -/
 public structure BuildContext extends BuildConfig, Context where
   leanTrace : BuildTrace
@@ -122,6 +143,12 @@ public structure BuildContext extends BuildConfig, Context where
   reads `MAP_PRIVATE` (`:528`).
   -/
   fileDigests : Std.Mutex (Std.HashMap FilePath (Lean.ModuleUsage.FileStamp × Lean.ModuleUsage.Digest))
+  /--
+  The kernel constants of the workspace and toolchain modules usage-cutoff checks read, indexed by name hash. A
+  workspace module's entries are keyed by a digest of the state they were read in, so they stay valid however the
+  module is rebuilt: a check uses only the entries of the module's current state.
+  -/
+  kernelProviders : Std.Mutex KernelProviders
 
 /-- A transformer to equip a monad with a `BuildContext`. -/
 public abbrev BuildT := ReaderT BuildContext
