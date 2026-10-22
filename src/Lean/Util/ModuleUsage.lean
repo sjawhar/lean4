@@ -388,14 +388,6 @@ def compute (env : Environment) (s : State) (nodes : Array Node) : Array (Name �
 def localDigests (env : Environment) (nodes := ownNodes env (ownConsts env)) : Array (Name × Digest) :=
   compute env (state env) nodes
 
-/-- Stores `own` (`localDigests env`), the module's `closureDigest`, its `ownProvides` and the digest of those with
-its `ownIndirect` for the extensions to export. Without it, the `.olean` carries no digests. -/
-def setLocalDigests (env : Environment) (own : Array (Name × Digest)) (closure : Digest)
-    (provides : Array Name × Array Name) (indirect : Array Name) : Environment :=
-  let env := ext.modifyState (asyncMode := .mainOnly) env
-    ({ · with localDigests? := some (own, { closure, provides := providesDigestOf provides indirect }) })
-  providesExt.modifyState (asyncMode := .mainOnly) env fun _ => some provides
-
 /-- The imported constants the compiler reads by a name derived from one of `xs` when it compiles a use of it: each
 one's derived constants (`derivedSuffixes`) and the prefixes whose attributes it reads with its own
 (`internalPrefixes`). Each name is looked up once. -/
@@ -519,59 +511,101 @@ def discrKeyEnc (e : Enc) : Meta.DiscrTree.Key → Enc
   | .arrow => e.u8 6
   | .proj s i n => e.u8 7 |>.name s |>.nat i |>.nat n
 
-/-- A digest of one module's entries in the cross-module compiler tables: `@[csimp]` replacements, instances
+/-- What `tableDigest` reads of one module's cross-module compiler tables. -/
+private structure TableEntries where
+  csimp : Array (ScopedEnvExtension.Entry Compiler.CSimp.Entry)
+  insts : Array (ScopedEnvExtension.Entry Meta.InstanceEntry)
+  reds : Array (ScopedEnvExtension.Entry (Name × ReducibilityStatus))
+  classes : Array ClassEntry
+  passes : Array Name
+  folders : Array Compiler.LCNF.Simp.ConstantFold.FolderOleanEntry
+  hints : Array (ScopedEnvExtension.Entry Meta.UnificationHintEntry)
+  matchers : Array Meta.Match.Extension.Entry
+  metas : Array Name
+
+/-- Module `i?`'s `TableEntries`: an imported module's from its `.olean`, the current module's from its local
+entries (`pickEntries`). -/
+private def TableEntries.ofModule (env : Environment) (i? : Option ModuleIdx) : TableEntries where
+  csimp := pickEntries i? (Compiler.CSimp.ext.ext.getModuleEntries env ·)
+    (Compiler.CSimp.ext.ext.getState env).newEntries
+  insts := pickEntries i? (Meta.instanceExtension.ext.getModuleEntries env ·)
+    (Meta.instanceExtension.ext.getState env).newEntries
+  reds := pickEntries i? (reducibilityExtraExt.ext.getModuleEntries env ·)
+    (reducibilityExtraExt.ext.getState env).newEntries
+  classes := pickEntries i? (classExtension.getModuleEntries env ·) (classExtension.getEntries env)
+  passes := pickEntries i? (Compiler.LCNF.passManagerExt.getModuleEntries env ·)
+    (Compiler.LCNF.passManagerExt.getState env).1
+  folders := pickEntries i? (Compiler.LCNF.Simp.ConstantFold.folderExt.getModuleEntries env ·)
+    ((Compiler.LCNF.Simp.ConstantFold.folderExt.getState env).1.map (·.toFolderOleanEntry))
+  hints := pickEntries i? (Meta.unificationHintExtension.ext.getModuleEntries env ·)
+    (Meta.unificationHintExtension.ext.getState env).newEntries
+  matchers := pickEntries i? (Meta.Match.Extension.extension.getModuleEntries env ·)
+    (Meta.Match.Extension.extension.getEntries env)
+  metas := declMetaEntries env i?
+
+/-- The current module's `TableEntries` as its importers read them (`ofModule env (some i)`): the entries its
+`.olean` exports at the private level, which is where the module's digests are (`ext`). -/
+private def TableEntries.ofExports (env : Environment) : TableEntries where
+  csimp := (Compiler.CSimp.ext.ext.exportedEntries env).«private»
+  insts := (Meta.instanceExtension.ext.exportedEntries env).«private»
+  reds := (reducibilityExtraExt.ext.exportedEntries env).«private»
+  classes := (PersistentEnvExtension.exportedEntries classExtension env).«private»
+  passes := (Compiler.LCNF.passManagerExt.exportedEntries env).«private»
+  folders := (Compiler.LCNF.Simp.ConstantFold.folderExt.exportedEntries env).«private»
+  hints := (Meta.unificationHintExtension.ext.exportedEntries env).«private»
+  matchers := (PersistentEnvExtension.exportedEntries Meta.Match.Extension.extension env).«private»
+  metas := declMetaExportedEntries env
+
+/-- A digest of one module's entries in the cross-module compiler tables (`t`): `@[csimp]` replacements, instances
 and classes declared for another module's declaration, reducibility set for another module's declaration,
 unification hints, `@[cpass]` installers and constant folders, each hint (with its discrimination-tree keys),
 installer and folder with its declaration's digest, matcher info and IR meta marks written for another module's
 declaration, and its derived constants for another module's base with their digests (`foreignDerivedConsts`).
-`i? = none` is the current module, `kernel` the module's kernel constants (`ownProvides`), `ownDigest` its digests.
-Which declarations are the module's own comes from `kernel` alone, and an own declaration's digest from
-`ownDigest`; `digestOf` gives another module's declaration's digest, through the resolver of the module that
-computes the digest. -/
-def tableDigest (env : Environment) (i? : Option ModuleIdx) (kernel : Array Name)
-    (ownDigest digestOf : Name → Option Digest) : Digest :=
-  let csimp := pickEntries i? (Compiler.CSimp.ext.ext.getModuleEntries env ·)
-    (Compiler.CSimp.ext.ext.getState env).newEntries
-  let insts := pickEntries i? (Meta.instanceExtension.ext.getModuleEntries env ·)
-    (Meta.instanceExtension.ext.getState env).newEntries
-  let insts := insts.filter fun e => match e with
-    | .global a | .scoped _ a => a.globalName?.any (!definedIn kernel ·)
-  let reds := pickEntries i? (reducibilityExtraExt.ext.getModuleEntries env ·)
-    (reducibilityExtraExt.ext.getState env).newEntries
-  let classes := pickEntries i? (classExtension.getModuleEntries env ·) (classExtension.getEntries env)
-  let classes := classes.filter (!definedIn kernel ·.name)
-  let passes := pickEntries i? (Compiler.LCNF.passManagerExt.getModuleEntries env ·)
-    (Compiler.LCNF.passManagerExt.getState env).1
-  let folders := pickEntries i? (Compiler.LCNF.Simp.ConstantFold.folderExt.getModuleEntries env ·)
-    ((Compiler.LCNF.Simp.ConstantFold.folderExt.getState env).1.map (·.toFolderOleanEntry))
-  let hints := pickEntries i? (Meta.unificationHintExtension.ext.getModuleEntries env ·)
-    (Meta.unificationHintExtension.ext.getState env).newEntries
-  let matchers := pickEntries i? (Meta.Match.Extension.extension.getModuleEntries env ·)
-    (Meta.Match.Extension.extension.getEntries env)
-  let matchers := matchers.filter (!definedIn kernel ·.name)
-  let metas := (declMetaEntries env i?).filter (!definedIn kernel ·)
-  let withDigest (e : Enc) (n : Name) :=
-    e.name n |>.opt (if definedIn kernel n then ownDigest n else digestOf n) Enc.digest
-  ({} : Enc)
-    |>.array csimp (scopedEnc fun e (c : Compiler.CSimp.Entry) =>
+`kernel` is the module's kernel constants (`ownProvides`) and `ownDigest` its digests: which declarations are the
+module's own comes from `kernel` alone, and an own declaration's digest from `ownDigest`. `digestOf` gives another
+module's declaration's digest, through the resolver of the module that computes the digest.
+
+Generic in the monad so that `TableRecord.ofExports` can record each name it asks `digestOf` about with the answer:
+the result depends on nothing but `t`, `kernel`, `ownDigest` and those answers. -/
+@[specialize] private def tableDigestM {m : Type → Type} [Monad m] (t : TableEntries) (kernel : Array Name)
+    (ownDigest : Name → Option Digest) (digestOf : Name → m (Option Digest)) : m Digest := do
+  let foreign (n : Name) : Bool := !definedIn kernel n
+  let insts := t.insts.filter fun e => match e with
+    | .global a | .scoped _ a => a.globalName?.any foreign
+  let classes := t.classes.filter (foreign ·.name)
+  let matchers := t.matchers.filter (foreign ·.name)
+  let metas := t.metas.filter foreign
+  let digest (n : Name) : m (Option Digest) := if definedIn kernel n then pure (ownDigest n) else digestOf n
+  let passes ← t.passes.mapM fun n => do return (n, ← digest n)
+  let folders ← t.folders.mapM fun f => do return (f.declName, f.folderDeclName, ← digest f.folderDeclName)
+  let hints ← t.hints.mapM fun e => do
+    match e with
+    | .global h | .scoped _ h => return (e, ← digest h.val)
+  let derived := (foreignDerivedConsts kernel).map fun n => (n, ownDigest n)
+  let digestEnc (e : Enc) (nd : Name × Option Digest) := e.name nd.1 |>.opt nd.2 Enc.digest
+  return ({} : Enc)
+    |>.array t.csimp (scopedEnc fun e (c : Compiler.CSimp.Entry) =>
       let ⟨fromDeclName, toDeclName, thmName⟩ := c
       e.name fromDeclName |>.name toDeclName |>.name thmName)
     |>.array insts (scopedEnc instanceEntryEnc)
-    |>.array reds (scopedEnc fun e ((n, st) : Name × ReducibilityStatus) => reducibilityEnc (e.name n) st)
+    |>.array t.reds (scopedEnc fun e ((n, st) : Name × ReducibilityStatus) => reducibilityEnc (e.name n) st)
     |>.array classes (fun e c =>
       let ⟨name, outParams, outLevelParams⟩ := c
       e.name name |>.nats outParams |>.nats outLevelParams)
-    |>.array passes withDigest
-    |>.array folders (fun e f =>
-      let ⟨declName, folderDeclName⟩ := f
-      withDigest (e.name declName) folderDeclName)
-    |>.array hints (scopedEnc fun e (h : Meta.UnificationHintEntry) =>
-      withDigest (e.array h.keys discrKeyEnc) h.val)
-    |>.array matchers (fun e m =>
-      let ⟨name, info⟩ := m
+    |>.array passes digestEnc
+    |>.array folders (fun e (declName, n, d) => digestEnc (e.name declName) (n, d))
+    |>.array hints (fun e (x, d) => scopedEnc (fun e (h : Meta.UnificationHintEntry) =>
+      digestEnc (e.array h.keys discrKeyEnc) (h.val, d)) e x)
+    |>.array matchers (fun e mt =>
+      let ⟨name, info⟩ := mt
       (matcherInfoEnc { e := e.name name } info).e)
     |>.array metas Enc.name
-    |>.array (foreignDerivedConsts kernel) withDigest |>.finish
+    |>.array derived digestEnc |>.finish
+
+/-- The `tableDigestM` of module `i?`'s entries (`TableEntries.ofModule`). `i? = none` is the current module. -/
+def tableDigest (env : Environment) (i? : Option ModuleIdx) (kernel : Array Name)
+    (ownDigest digestOf : Name → Option Digest) : Digest :=
+  Id.run <| tableDigestM (TableEntries.ofModule env i?) kernel ownDigest (pure <| digestOf ·)
 
 /-- The registered names of the environment extensions whose entries for other modules' names `tableDigest`
 reads. The census test checks that every extension it classifies as a cross-module table is listed here. -/
@@ -592,19 +626,87 @@ def State.closureDigestOf (s : State) (env : Environment) (ownMap : Std.HashMap 
     Option Digest :=
   ownMap[n]? <|> s.digestOf env n
 
+/-- A module's `tableDigest` as its importers compute it, stored in its `.olean` (`tableExt`) with the questions the
+digest asked about other modules' declarations: an importer whose own answers to all of them are these takes
+`digest` instead of computing it (`importedTableDigest`). -/
+structure TableRecord where
+  /-- `tableDigestM` of the module's exported entries (`TableEntries.ofExports`), kernel constants and digests, and
+  these answers. -/
+  digest : Digest
+  /-- Each name `tableDigestM` asked `digestOf` about, in order, with the answer. -/
+  digests : Array (Name × Option Digest)
+  deriving Inhabited
+
+/-- The current module's `TableRecord`, from its exported entries (`TableEntries.ofExports`), its kernel constants
+`provides.1` (`ownProvides`) and its digests `own` (`localDigests`), answering `digestOf` as the module's own
+`closureDigest` does (`State.closureDigestOf`). -/
+def TableRecord.ofExports (env : Environment) (own : Array (Name × Digest)) (provides : Array Name × Array Name) :
+    TableRecord :=
+  let ownMap : Std.HashMap Name Digest := own.foldl (fun m (n, d) => m.insert n d) {}
+  let digestOf := (state env).closureDigestOf env ownMap
+  let answer (n : Name) : StateM (Array (Name × Option Digest)) (Option Digest) := do
+    let d := digestOf n
+    modify (·.push (n, d))
+    return d
+  let (digest, digests) := (tableDigestM (TableEntries.ofExports env) provides.1 (ownMap[·]?) answer).run #[]
+  { digest, digests }
+
+/-- Private like `ext`, which holds the module's other digests. -/
+private builtin_initialize tableExt : PersistentEnvExtension TableRecord TableRecord (Option TableRecord) ←
+  registerPersistentEnvExtension {
+    mkInitial := pure none
+    addImportedFn := fun _ => pure none
+    addEntryFn := fun _ r => some r
+    exportEntriesFnEx := fun _ r? => { exported := #[], server := #[], «private» := r?.toArray }
+    asyncMode := .mainOnly
+  }
+
+/-- Module `i`'s `TableRecord`, if its `.olean` has one. -/
+def tableRecord? (env : Environment) (i : ModuleIdx) : Option TableRecord :=
+  (tableExt.getModuleEntries env i)[0]?
+
+/-- Stores `own` (`localDigests env`), the module's `closureDigest`, its `ownProvides` and the digest of those with
+its `ownIndirect` for the extensions to export, and its `TableRecord` for `tableExt`. Without it, the `.olean` carries
+no digests. `env` is the environment the `.olean` is written from: the record holds the entries that `writeModule`
+exports from it. -/
+def setLocalDigests (env : Environment) (own : Array (Name × Digest)) (closure : Digest)
+    (provides : Array Name × Array Name) (indirect : Array Name) : Environment :=
+  let record := TableRecord.ofExports env own provides
+  let env := tableExt.modifyState (asyncMode := .mainOnly) env fun _ => some record
+  let env := ext.modifyState (asyncMode := .mainOnly) env
+    ({ · with localDigests? := some (own, { closure, provides := providesDigestOf provides indirect }) })
+  providesExt.modifyState (asyncMode := .mainOnly) env fun _ => some provides
+
+/-- Imported module `i`'s `tableDigest` as an importer whose other modules' digests are `digestOf` computes it:
+`i`'s kernel constants (`importedKernel`) and digests (`State.findAt?`) come from its `.olean`. -/
+def computedTableDigest (env : Environment) (i : ModuleIdx) (digestOf : Name → Option Digest) : Digest :=
+  tableDigest env (some i) (importedKernel env i) ((state env).findAt? i) digestOf
+
+/-- Whether `digestOf` answers each question of `r` as `r` does. -/
+def TableRecord.holds (r : TableRecord) (digestOf : Name → Option Digest) : Bool :=
+  r.digests.all fun (n, d) => digestOf n == d
+
+/-- `computedTableDigest env i digestOf`: module `i`'s stored digest if its record holds (`TableRecord.holds`),
+which then is that value (`tableDigestM` reads the same entries, kernel constants and digests and gets the same
+answers), and computed otherwise. -/
+def importedTableDigest (env : Environment) (i : ModuleIdx) (digestOf : Name → Option Digest) : Digest :=
+  match tableRecord? env i with
+  | some r => if r.holds digestOf then r.digest else computedTableDigest env i digestOf
+  | none => computedTableDigest env i digestOf
+
 /-- A digest of the module's import closure: its modules in import order (`env.header.moduleNames`, the order
 in which every compiler table applies their entries, so that the last import wins where entries conflict), and
 for every module (imported ones with digests, and the current one, whose digests are `own` and kernel constants
-`provides.1`) the digest of its cross-module compiler tables (`tableDigest`). Importers compare it through Lake's
-`closureHash`, so a change to any module's tables, or to the import order, rebuilds every module downstream. -/
+`provides.1`) the digest of its cross-module compiler tables (`tableDigest`; `importedTableDigest` for an imported
+module). Importers compare it through Lake's `closureHash`, so a change to any module's tables, or to the import
+order, rebuilds every module downstream. -/
 def closureDigest (env : Environment) (own : Array (Name × Digest)) (provides : Array Name × Array Name) :
     Digest :=
   let s := state env
   let ownMap : Std.HashMap Name Digest := own.foldl (fun m (n, d) => m.insert n d) {}
   let digestOf := s.closureDigestOf env ownMap
   ({} : Enc).array env.header.moduleNames.zipIdx (fun e (m, i) =>
-      e.name m |>.opt (if s.hasEntries i then some (tableDigest env (some i) (importedKernel env i) (s.findAt? i)
-        digestOf) else none) Enc.digest)
+      e.name m |>.opt (if s.hasEntries i then some (importedTableDigest env i digestOf) else none) Enc.digest)
     |>.digest (tableDigest env none provides.1 (ownMap[·]?) digestOf) |>.finish
 
 /-- The imported modules whose `.olean` carries digests (`State.hasEntries`), sorted, each with the digest of the
