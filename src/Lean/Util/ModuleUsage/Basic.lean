@@ -80,8 +80,13 @@ def writeFileReplacing (path : System.FilePath) (bytes : ByteArray) : IO Unit :=
 @[extern "lean_usage_read_file_stamped"]
 opaque readFileStamped (path : @& System.FilePath) : IO (ByteArray × Option FileStamp)
 
-private def hex16 (v : UInt64) : String :=
-  let s := String.ofList (Nat.toDigits 16 v.toNat); "".pushn '0' (16 - s.length) ++ s
+/-- `v` as 16 lowercase hex digits, most significant first. Shifts a `UInt64` rather than converting it to a `Nat`,
+which goes through big-number division at 2^63 and above. -/
+private def hex16 (v : UInt64) : String := Id.run do
+  let mut s := ""
+  for i in [0:16] do
+    s := s.push (Nat.digitChar ((v >>> (4 * (15 - i)).toUInt64) &&& 0xf).toNat)
+  return s
 
 /-- 32 lowercase hex digits. -/
 def Digest.hex (d : Digest) : String := hex16 d.hi ++ hex16 d.lo
@@ -93,13 +98,14 @@ def Digest.lt (a b : Digest) : Bool := a.hi < b.hi || (a.hi == b.hi && a.lo < b.
 def Digest.ofHex? (s : String) : Option Digest := do
   let bs := s.toUTF8
   guard (bs.size == 32)
-  let v ← bs.foldlM (init := 0) fun (n : Nat) b =>
-    if '0'.toUInt8 ≤ b && b ≤ '9'.toUInt8 then
-      some (16 * n + (b.toNat - '0'.toNat))
-    else if 'a'.toUInt8 ≤ b && b ≤ 'f'.toUInt8 then
-      some (16 * n + (b.toNat - 'a'.toNat + 10))
+  let digit (b : UInt8) : Option UInt64 :=
+    if '0'.toUInt8 ≤ b && b ≤ '9'.toUInt8 then some (b - '0'.toUInt8).toUInt64
+    else if 'a'.toUInt8 ≤ b && b ≤ 'f'.toUInt8 then some (b - 'a'.toUInt8 + 10).toUInt64
     else none
-  return ⟨(v >>> 64).toUInt64, v.toUInt64⟩
+  -- Each half in a `UInt64`: a `Nat` fold would pass 2^64 and allocate a big number per digit.
+  let half (start : Nat) : Option UInt64 :=
+    bs.foldlM (start := start) (stop := start + 16) (init := 0) fun v b => (v <<< 4 ||| ·) <$> digit b
+  return ⟨← half 0, ← half 16⟩
 
 instance : ToJson Digest := ⟨fun d => .str d.hex⟩
 instance : FromJson Digest := ⟨fun j => do
