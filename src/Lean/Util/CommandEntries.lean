@@ -576,13 +576,26 @@ private unsafe def opOfEntryImpl (e : EnvExtensionEntry) : ScopedEnvExtension.Op
 @[implemented_by opOfEntryImpl]
 private opaque opOfEntry (e : EnvExtensionEntry) : ScopedEnvExtension.Op EnvExtensionEntry
 
+private unsafe def addrOfImpl {α : Type} (a : α) : USize := ptrAddrUnsafe a
+
+/-- `a`'s address: a key for an object that stays alive while it is used. -/
+@[implemented_by addrOfImpl]
+private opaque addrOf {α : Type} (a : α) : USize
+
+/-- What `viewStatesMemo` computed between two states (their addresses) of an extension (its index): its entries
+(kind 0), its scoped stack's operations (1) or a cache's entries (2), `none` for a change no entry expresses. One
+command's recording keeps it, while every state it is keyed by stays alive: a realization context's states mostly are
+its command's. -/
+private abbrev DeltaMemo := Std.HashMap (Nat × Nat × USize × USize) (Option (Array EnvExtensionEntry))
+
 /-- The change of `view` from `k₀` to `k₁`, two kernel environments of that view (`ViewStates`), and why it is not
 replayable, each refusal naming `at?`: a change no entry expresses (an unaccounted write, a `stateOnly` delta, a scoped
 stack written other than by its operations), a change to an extension payloads do not carry, entries an extension
 cannot replay, and a write to an extension that is neither persistent nor a command cache. Extensions registered after
 the environments were created (by initializers an `#eval` ran) have no state in them and are skipped. -/
-private def viewStates (regs : Registries) (view : EnvExtension.View) (k₀ k₁ : Kernel.Environment)
-    (at? : Option Name := none) : ViewStates × Array Refusal := Id.run do
+private def viewStatesMemo (regs : Registries) (view : EnvExtension.View) (k₀ k₁ : Kernel.Environment)
+    (at? : Option Name) (memo : DeltaMemo) : ViewStates × Array Refusal × DeltaMemo := Id.run do
+  let mut memo := memo
   let n := min k₀.extensions.size k₁.extensions.size
   let sameWrites := SharedDiff.sameObject k₀.unaccountedWrites k₁.unaccountedWrites
   -- per extension index below `n`, whether its state slot or its unaccounted-write count differs: an extension where
@@ -609,25 +622,49 @@ private def viewStates (regs : Registries) (view : EnvExtension.View) (k₀ k₁
     if k₀.unaccountedWrites.findD idx 0 != k₁.unaccountedWrites.findD idx 0 then
       refused := refused.push (.inexpressible ext.name at?)
     else if isScoped && view == .main then
-      match stackDelta s₀ s₁ with
+      let key := (idx, 1, addrOf s₀, addrOf s₁)
+      let ops? := match memo[key]? with
+        | some r => r
+        | none => stackDelta s₀ s₁
+      memo := memo.insert key ops?
+      match ops? with
       | some ops => unless ops.isEmpty do st := { st with scopedOps := st.scopedOps.push (ext.name, ops) }
       | none => refused := refused.push (.inexpressible ext.name at?)
     else
-      match stateChange ext s₀ s₁ with
-      | .entries es =>
+      let key := (idx, 0, addrOf s₀, addrOf s₁)
+      let es? := match memo[key]? with
+        | some r => r
+        | none => match stateChange ext s₀ s₁ with
+          | .entries es => some es
+          | .stateOnly => none
+      memo := memo.insert key es?
+      match es? with
+      | some es =>
         unless es.isEmpty do
           if isScoped || ext.ofOLeanEntry?.isSome then st := { st with entries := st.entries.push (ext.name, es) }
           else refused := refused.push (.unreplayable ext.name at?)
-      | .stateOnly => refused := refused.push (.inexpressible ext.name at?)
+      | none => refused := refused.push (.inexpressible ext.name at?)
   for cache in regs.caches do
     unless changed[cache.ext.idx]?.getD false do continue
-    let es := cache.stateDelta (cacheStateIn cache k₀) (cacheStateIn cache k₁)
+    let c₀ := cacheStateIn cache k₀
+    let c₁ := cacheStateIn cache k₁
+    let key := (cache.ext.idx, 2, addrOf c₀, addrOf c₁)
+    let es := match memo[key]? with
+      | some (some es) => es
+      | _ => cache.stateDelta c₀ c₁
+    memo := memo.insert key (some es)
     unless es.isEmpty do st := { st with caches := st.caches.push (cache.name, es) }
   for idx in [:n] do
     unless changed[idx]?.getD false do continue
     if regs.recordedIdxs.contains idx then continue
     refused := refused.push (.unrecorded (regs.names[idx]?.getD .anonymous) at?)
-  return (st, refused)
+  return (st, refused, memo)
+
+/-- `viewStatesMemo` without a memo. -/
+private def viewStates (regs : Registries) (view : EnvExtension.View) (k₀ k₁ : Kernel.Environment)
+    (at? : Option Name := none) : ViewStates × Array Refusal :=
+  let (st, r, _) := viewStatesMemo regs view k₀ k₁ at? {}
+  (st, r)
 
 /-- The cells of `l` in front of its tail `stop` (by cell identity), oldest first, each with the list after it. -/
 private unsafe def cellsSinceImpl (l stop : List AsyncConst) : Option (List (AsyncConst × List AsyncConst)) :=
@@ -741,6 +778,15 @@ private def countersDelta (before after : Environment) : Option CountersDelta :=
            recordingConstGen := after.recordingConstGen, declChangesAdded, constAddedGens,
            synthTierGen?, synthTierSet, synthTierErased }
 
+/-- Whether `countersDelta` reads the same of `e₁` as of `e₂`: the same counters, and the same constant generations,
+declaration log and stored tier objects. -/
+private def sameCounters (e₁ e₂ : Environment) : Bool :=
+  e₁.trackedGen == e₂.trackedGen && e₁.constGen == e₂.constGen && e₁.recordingConstGen == e₂.recordingConstGen &&
+    e₁.base.private.extGens == e₂.base.private.extGens &&
+    SharedDiff.sameObject e₁.constAddedGens e₂.constAddedGens &&
+    SharedDiff.sameObject e₁.declChangeLog e₂.declChangeLog &&
+    SharedDiff.sameObject e₁.storedSynthCache? e₂.storedSynthCache?
+
 /-- `env`, an environment whose counters and tier were what `c` started from, with them as `c` leaves them. -/
 private def applyCounters (env : Environment) (c : CountersDelta) : Environment :=
   let env := { env with
@@ -756,17 +802,19 @@ private def applyCounters (env : Environment) (c : CountersDelta) : Environment 
 
 /-- The realization contexts the command registered on the main branch, in registration order, each as a `context`
 record with its position among the command's main-branch constants (how many of them its environment held). -/
-private def addedContexts (regs : Registries) (before after : Environment) :
-    Array (Nat × AddedConst) × Array Refusal := Id.run do
+private def addedContexts (regs : Registries) (before after : Environment) (memo : DeltaMemo)
+    (afterCounters? : Option CountersDelta) : Array (Nat × AddedConst) × Array Refusal := Id.run do
   let n₀ := before.asyncConstsMap.private.size
   let mut ctxs : Array (Nat × Nat × AddedConst) := #[]
   let mut refused := #[]
+  let mut memo := memo
   for (c, ctx) in (NameMap.sharedDiff before.localRealizationCtxMap after.localRealizationCtxMap).1 do
     let ctxEnv := contextEnv ctx
-    let (main, r₁) := viewStates regs .main before.base.private ctxEnv.base.private (at? := c)
-    let (checked, r₂) := viewStates regs .checked before.checked.get ctxEnv.checked.get (at? := c)
+    let (main, r₁, memo') := viewStatesMemo regs .main before.base.private ctxEnv.base.private (some c) memo
+    let (checked, r₂, memo') := viewStatesMemo regs .checked before.checked.get ctxEnv.checked.get (some c) memo'
+    memo := memo'
     refused := refused ++ r₁ ++ r₂
-    let counters? := countersDelta before ctxEnv
+    let counters? := if sameCounters after ctxEnv then afterCounters? else countersDelta before ctxEnv
     if counters?.isNone then refused := refused.push (.inexpressible `Lean.Environment.declChangeLog c)
     ctxs := ctxs.push (ctxEnv.asyncConstsMap.private.size - n₀, ctxEnv.localRealizationCtxMap.size,
       .context c ctx.opts main checked (counters?.getD {}))
@@ -831,8 +879,11 @@ private def kernelMatchesElaborator (before after : Kernel.Environment) (elabCon
 /-- One command's payload (`recordCommandDelta`) with the registries `regs`. -/
 private def recordCommandDeltaWith (regs : Registries) (before after : Environment) (idx : Nat) :
     BaseIO CommandEntries := do
-  let (main, r₁) := viewStates regs .main before.base.private after.base.private
-  let (checked, r₂) := viewStates regs .checked before.checked.get after.checked.get
+  -- the command's views first: its realization contexts' states mostly are its after-states, whose deltas the memo
+  -- then holds
+  let (main, r₁, memo) := viewStatesMemo regs .main before.base.private after.base.private none {}
+  let (checked, r₂, memo) := viewStatesMemo regs .checked before.checked.get after.checked.get none memo
+  let counters? := countersDelta before after
   let mut refusals := r₁ ++ r₂
   if before.checked.get.divergentAdds != after.checked.get.divergentAdds then
     refusals := refusals.push (.divergentKernelAdd (unchecked := true))
@@ -844,11 +895,10 @@ private def recordCommandDeltaWith (regs : Registries) (before after : Environme
   | some cells =>
     unless kernelMatchesElaborator before.checked.get after.checked.get (elaboratorConsts cells) do
       refusals := refusals.push (.divergentKernelAdd (unchecked := false))
-    let (ctxs, rc) := addedContexts regs before after
+    let (ctxs, rc) := addedContexts regs before after memo counters?
     let (recs, r) := addedConsts regs w cells exportedKind
     added ← (mergeAtPositions recs ctxs).mapM (attachMerges after)
     refusals := refusals ++ rc ++ r
-  let counters? := countersDelta before after
   if counters?.isNone then refusals := refusals.push (.inexpressible `Lean.Environment.declChangeLog)
   return { idx, main, checked, added, counters := counters?.getD {}, refusals := Refusal.addNew #[] refusals }
 
