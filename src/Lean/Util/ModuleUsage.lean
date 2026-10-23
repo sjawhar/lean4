@@ -24,6 +24,7 @@ import Lean.Meta.UnificationHint
 import Lean.Compiler.MetaAttr
 import Lean.Compiler.LCNF.Specialize
 import Lean.Elab.InfoTree.Util
+import Lean.Util.CollectAxioms
 import Init.Data.String.TakeDrop
 import Init.Data.String.Search
 import Init.Data.String.Iterate
@@ -34,9 +35,10 @@ Usage data for Lake's usage cutoff: meaning digests of a module's declarations (
 when Lean runs with `--usage`), and the `.usage` sidecar recording, per imported module, the digests of
 the declarations the module used, from which Lake decides whether the module must be compiled again.
 
-A digest covers a declaration's kernel data and its compiled interface (`compiledEnc`), Merkle-closed over the
-declarations both refer to. Compiler-only names (`f._redArg`, `g._at_.h.spec_0`, ...) fold into an owner, a
-kernel constant of the same module (`ownerOf`), whose digest covers them.
+A digest covers a declaration's kernel data, the axioms its module exports for it (`storedExportedAxioms?`, from which
+importers compute their own) and its compiled interface (`compiledEnc`), Merkle-closed over the declarations these
+refer to. Compiler-only names (`f._redArg`, `g._at_.h.spec_0`, ...) fold into an owner, a kernel constant of the same
+module (`ownerOf`), whose digest covers them.
 -/
 
 namespace Lean.ModuleUsage
@@ -302,18 +304,20 @@ def ownConsts (env : Environment) (recorded : NameMap DeclConsts := {}) :
 to fold into, with every compiler-only name folded into it. -/
 structure Node where
   name : Name
-  /-- The node's kernel data and the compiled interfaces of its name and its folded names (sorted, each
-  named), with the module's package, which every native symbol of the module carries. -/
+  /-- The node's kernel data and exported axioms, and the compiled interfaces of its name and its folded names
+  (sorted, each named), with the module's package, which every native symbol of the module carries. -/
   localDigest : Digest
   /-- The nodes the node refers to (kernel references and compiled mentions, each mapped to its node), sorted,
   without the node itself. -/
   refs : Array Name
   deriving Inhabited
 
-/-- The current module's nodes, from its kernel constants (`consts`). -/
+/-- The current module's nodes, from its kernel constants (`consts`) and the axioms `storeExportedAxioms` stored for
+them. -/
 def ownNodes (env : Environment) (consts : Array (Name × ConstantInfo × Array Name)) : Array Node := Id.run do
   let s := state env
   let lc := LocalCompiled.ofEnv env
+  let axioms := (storedExportedAxioms? env).getD #[]
   let kernel : Std.HashMap Name (ConstantInfo × Array Name) :=
     consts.foldl (fun m (n, ci, rs) => m.insert n (ci, rs)) {}
   let mut folded : Std.HashMap Name (Array Name) := {}
@@ -331,7 +335,10 @@ def ownNodes (env : Environment) (consts : Array (Name × ConstantInfo × Array 
   let names := consts.map (·.1) ++ (folded.toArray.filterMap fun (n, _) => if kernel.contains n then none else some n)
   return names.map fun n => Id.run do
     let k? := kernel[n]?
-    let mut c : CEnc := { e := ({} : Enc).opt pkg Enc.str |>.opt k? fun e (ci, _) => e.digest (localHash ci) }
+    let axs? := (axioms.binSearch (n, #[]) (Name.quickLt ·.1 ·.1)).map (·.2)
+    let e := ({} : Enc).opt pkg Enc.str |>.opt k? (fun e (ci, _) => e.digest (localHash ci))
+      |>.opt axs? (·.array · Enc.name)
+    let mut c : CEnc := { e }
     c := compiledEnc env lc n c
     let fs := (folded.getD n #[]).filter (· != n) |>.qsort Name.quickLt
     c := c.nat fs.size

@@ -14,6 +14,7 @@ import Lean.Compiler.Options
 import Lean.Compiler.InitAttr  -- for `runInitAttrsForModules` on snapshot load
 import Lean.Linter.PersistentLintLog
 import Lean.Util.ProfilerServer
+import Lean.Util.CollectAxioms
 import Lean.Util.ModuleUsage
 import Lean.Util.UsedByChecks
 
@@ -393,6 +394,8 @@ def runFrontend
   let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
   let usage? ← oleanFileName?.bindM fun oleanFileName => do
     let recorded ← recordedDeclConsts
+    -- the digests cover the exported axioms, so both take the stored ones
+    let env := if usageFileName?.isSome then storeExportedAxioms env else env
     let usage? := usageFileName?.map fun usageFileName =>
       let nodes := ModuleUsage.ownNodes env (ModuleUsage.ownConsts env recorded)
       let own := ModuleUsage.localDigests env nodes

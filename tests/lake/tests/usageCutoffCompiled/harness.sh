@@ -1692,6 +1692,28 @@ dup_new_deep_s0() {
   printf 'import T.K2\ndef other : Nat := 0\n' > T/K.lean
 }
 dup_new_deep_s1() { printf 'def deep : Nat := 0\ndef t : Nat := 2\n' > T/K2.lean; }
+
+# The axioms an importer's `#print axioms` reports come from the axioms each import's `.olean` exports for its
+# declarations (`exportedAxiomsExt`). `A`'s list for `S9` follows the order in which the export visits `A`'s constants,
+# so state 1's `r7 (s : S9)` changes it although `S9` is unchanged; `B` uses only `S9`, and `Check.lean` asks for the
+# axioms of `B.t` (`axiom_summary`) or of `C.u`, which uses `t` (`axiom_summary_trans`).
+axiom_summary_a() { printf 'axiom ax : Nat\nstructure S9 where\n  x : Fin ax\ndef r7 (s : %s) : Nat := 0\n' "$1" > T/A.lean; }
+axiom_summary_s0() {
+  printf 'name = "test"\ndefaultTargets = ["T"]\n[[lean_lib]]\nname = "T"\n' > lakefile.toml
+  mkdir_t
+  axiom_summary_a Nat
+  printf 'import T.A\ntheorem t (s : S9) : s = s := rfl\n' > T/B.lean
+  printf 'import T.B\n' > T.lean
+  printf 'import T\n#print axioms t\n' > Check.lean
+}
+axiom_summary_s1() { axiom_summary_a S9; }
+axiom_summary_trans_s0() {
+  axiom_summary_s0
+  printf 'import T.B\ntheorem u (s : S9) : s = s := t s\n' > T/C.lean
+  printf 'import T.C\n' > T.lean
+  printf 'import T\n#print axioms u\n' > Check.lean
+}
+axiom_summary_trans_s1() { axiom_summary_s1; }
 # `kern_thm_conflict`: `R` and `K` declare the theorem `t` with one statement, and `D` imports both and uses nothing of
 # either. State 1 changes the statement of `K`'s `t` and keeps its names, so a fresh `D` fails at import.
 kern_thm_conflict_s0() {
@@ -2340,7 +2362,7 @@ all_cases="spec_transitive spec_link spec_type spec_precomp plugin_replay csimp_
   elab_claim elab_claim_after elab_claim_ms inst_claim inst_claim_after td_claim td_inst
   kern_body kern_body_after kern_codegen kern_thm_dup kern_thm_dup_after kern_thm_flip kern_thm_trans
   kern_thm_conflict kern_thm_all kern_thm_third dup_new dup_new_trans dup_new_thm dup_new_tc dup_new_own dup_new_ms
-  dup_new_third dup_new_tc_outside dup_new_deep
+  dup_new_third dup_new_tc_outside dup_new_deep axiom_summary axiom_summary_trans
   hard_recording hard_moduleext hard_speclookups hard_compilercode rp_own
   hard_usedbychecks hard_declconsts
   hard_extramod perkey_provider_inl
