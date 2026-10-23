@@ -32,6 +32,10 @@ a file it checks for usage cutoff is the one it recorded. -/
 @[extern "lean_usage_file_digest"]
 opaque fileDigest (path : @& System.FilePath) : IO Digest
 
+/-- `fileDigest` of a file whose bytes are `bytes`. -/
+@[extern "lean_usage_file_bytes_digest"]
+opaque fileDigestOfBytes (bytes : @& ByteArray) : Digest
+
 /-- What a file system records of a file, besides its bytes, that every write to it, truncation of it or replacement
 of its path changes: its device and inode, its size, and its modification and status-change times in seconds and
 nanoseconds. -/
