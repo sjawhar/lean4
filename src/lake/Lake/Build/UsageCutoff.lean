@@ -24,7 +24,7 @@ open System Lean
 namespace Lake
 
 /-- The parts of a module's `.usage` sidecar (written by Lean next to its `.olean`) that Lake checks. -/
-structure UsageSidecar where
+public structure UsageSidecar where
   noskip : Bool
   moduleDigest : ModuleUsage.Digest
   /-- A digest of the module's import closure (`Lean.ModuleUsage.closureDigest`). -/
@@ -197,16 +197,13 @@ def readSidecarBytes? (path : FilePath) (expected? : Option ModuleUsage.Digest) 
   | .error e =>
     error s!"{path}: read failed: {e}"
 
-/-- An entry of `BuildContext.sidecarCache`. -/
-abbrev SidecarEntry := Option ModuleUsage.FileStamp × ModuleUsage.Digest × Dynamic
+/-- A sidecar read that found parsed contents, waits for a matching read, or owns a new read and parse. -/
+inductive SidecarRead where
+  | cached (digest : ModuleUsage.Digest) (value : Dynamic)
+  | waiting (promise : IO.Promise (Option (ModuleUsage.Digest × Dynamic)))
+  | parsing (id : Nat) (promise : IO.Promise (Option (ModuleUsage.Digest × Dynamic)))
+    (replaced? : Option (IO.Promise (Option (ModuleUsage.Digest × Dynamic))))
 
-/-- The build's parse of the sidecar at `path`, with the digest of the contents it was parsed from, if the file's
-current stamp is the one recorded with it (`BuildContext.sidecarCache`). -/
-def stampedSidecar? (path : FilePath) : JobM (Option (ModuleUsage.Digest × Dynamic)) := do
-  let some stamp ← ModuleUsage.fileStamp path | return none
-  let some (some recorded, digest, value) ← (← getBuildContext).sidecarCache.atomically (return (← get)[path]?)
-    | return none
-  return if recorded == stamp then some (digest, value) else none
 
 /-- Parses the bytes of the usage-cutoff sidecar at `path`: `none` if it has another format version than
 `Lean.ModuleUsage.usageVersion` (another toolchain wrote it), or, with a warning, if it is not valid, so that the
@@ -228,40 +225,85 @@ where
 /--
 Reads a usage-cutoff sidecar. Returns `none` if it does not exist, has another format version
 (`parseUsageSidecar`), or its bytes do not have the digest `expected?` (the `.usage` a `.usekey` was written
-from). If it exists but is not valid, logs a warning and returns `none`, so the module builds normally. Reuses
-the build's parse of the same contents (`BuildContext.sidecarCache`), without reading the file while its stamp is the
-one recorded with that parse. It parses outside the cache lock; a parse with a different digest replaces an older
-entry because a sidecar rebuilt during the build must be read as its new contents.
+from). If it exists but is not valid, logs a warning and returns `none`, so the module builds normally. A matching
+sidecar read and parse runs once: concurrent readers wait on its promise without holding the cache lock or reading
+the file. A ready entry is reused only for the same non-racy file stamp. A different or racy stamp replaces any
+pending entry and resolves its readers with `none`, so they never reuse stale data or wait forever.
 -/
-def readUsageSidecar (α : Type) [FromJson α] [TypeName α] (path : FilePath)
+public def readUsageSidecar (α : Type) [FromJson α] [TypeName α] (path : FilePath)
     (expected? : Option ModuleUsage.Digest := none) : JobM (Option α) := do
-  if let some (digest, cached) ← stampedSidecar? path then
+  let stamp? ← ModuleUsage.fileStamp path
+  let action : SidecarRead ← (← getBuildContext).sidecarCache.atomically do
+    let (nextId, entries) ← get
+    match entries.get? path with
+    | some (.ready (some recorded) digest cached) =>
+      if stamp? == some recorded then return .cached digest cached
+    | some (.pending (some recorded) _ running) =>
+      if stamp? == some recorded then return .waiting running
+    | some (.pending _ _ running) =>
+      let promise ← IO.Promise.new
+      set (nextId + 1, entries.insert path (.pending stamp? nextId promise))
+      return .parsing nextId promise (some running)
+    | _ => pure ()
+    let promise ← IO.Promise.new
+    set (nextId + 1, entries.insert path (.pending stamp? nextId promise))
+    return .parsing nextId promise none
+  match action with
+  | .cached digest cached =>
     if expected?.any (· != digest) then return none
     let some value := cached.get? α | error s!"{path}: cached sidecar has the wrong type"
     return some value
-  let some (bytes, digest, stamp?) ← readSidecarBytes? path expected? | return none
-  let some value ← parseUsageSidecar α path bytes | return none
-  (← getBuildContext).sidecarCache.atomically do
-    let entries ← getThe (Std.HashMap FilePath SidecarEntry)
-    if let some (_, parsedFrom, cached) := entries.get? path then
-      if parsedFrom == digest then
-        let some winner := cached.get? α | error s!"{path}: cached sidecar has the wrong type"
-        modifyThe (Std.HashMap FilePath SidecarEntry) (·.insert path (stamp?, digest, cached))
-        return some winner
-    modifyThe (Std.HashMap FilePath SidecarEntry) (·.insert path (stamp?, digest, Dynamic.mk value))
+  | .waiting promise =>
+    let some result? ← IO.wait promise.result? | return none
+    let some (digest, result) := result? | return none
+    if expected?.any (· != digest) then return none
+    let some value := result.get? α | error s!"{path}: cached sidecar has the wrong type"
     return some value
+  | .parsing id promise replaced? =>
+    if let some replaced := replaced? then
+      unless (← replaced.isResolved) do replaced.resolve none
+    let read? ← readSidecarBytes? path expected?
+    let parsed ← match read? with
+      | some (bytes, digest, readStamp?) =>
+        let value ← parseUsageSidecar α path bytes
+        pure <| value.map fun value => (digest, readStamp?, value)
+      | none => pure none
+    let result := parsed.map fun (digest, _, value) => (digest, Dynamic.mk value)
+    let _ ← (← getBuildContext).sidecarCache.atomically do
+      let (nextId, entries) ← get
+      match entries.get? path with
+      | some (.pending _ ownerId _) =>
+        if ownerId == id then
+          let entries := match parsed with
+            | some (digest, readStamp?, value) =>
+              entries.insert path (.ready readStamp? digest (Dynamic.mk value))
+            | none => entries.erase path
+          set (nextId, entries)
+          return true
+      | _ => pure ()
+      return false
+    unless (← promise.isResolved) do promise.resolve result
+    return parsed.map (·.2.2)
 
 /--
 Reads a module's own `.usage` as `readUsageSidecar` does, but parses it on every read: only the
 module's own checks read all of it. Returns it with the digest of its bytes. Leaves its `UsageImport` in the
-build's sidecar cache for the module's importers (`importUsage?`).
+build's sidecar cache for the module's importers (`importUsage?`) and resolves a displaced pending reader with the
+new digest and import, which the reader verifies against its own expected digest.
 -/
-def readOwnUsage (path : FilePath) (expected? : Option ModuleUsage.Digest := none) :
+public def readOwnUsage (path : FilePath) (expected? : Option ModuleUsage.Digest := none) :
     JobM (Option (UsageSidecar × ModuleUsage.Digest)) := do
   let some (bytes, digest, stamp?) ← readSidecarBytes? path expected? | return none
   let some usage ← parseUsageSidecar UsageSidecar path bytes | return none
-  (← getBuildContext).sidecarCache.atomically do
-    modifyThe (Std.HashMap FilePath SidecarEntry) (·.insert path (stamp?, digest, Dynamic.mk usage.toImport))
+  let pending? ← (← getBuildContext).sidecarCache.atomically do
+    let (nextId, entries) ← get
+    let pending? := match entries.get? path with
+      | some (.pending _ _ promise) => some promise
+      | _ => none
+    set (nextId, entries.insert path (.ready stamp? digest (Dynamic.mk usage.toImport)))
+    return pending?
+  if let some pending := pending? then
+    unless (← pending.isResolved) do pending.resolve (some (digest, Dynamic.mk usage.toImport))
   return some (usage, digest)
 
 /--
