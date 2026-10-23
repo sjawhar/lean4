@@ -50,11 +50,26 @@ structure FileStamp where
 opaque fileStamp (path : @& System.FilePath) : IO (Option FileStamp)
 
 /-- `fileDigest`, with the stamp of the file the bytes were read from if it stands for them: the open file's stamp
-was the same before and after the read, and its status-change time lay more than two seconds in the past (longer
-than any file system's timestamp granularity), so that any later change to the file shows in its stamp. `none` if
-not (or on Windows). -/
+was the same before and after the read, and its status-change time lay far enough before the read began
+(`stampSettled`, against the realtime clock read before the first `fstat`) that any later change to the file shows in
+its stamp. `none` if not (or on Windows). -/
 @[extern "lean_usage_file_digest_stamped"]
 opaque fileDigestStamped (path : @& System.FilePath) : IO (Digest × Option FileStamp)
+
+/-- Whether a stamp whose status-change time has nanosecond field `ctimeNsec` and lay `ageNs` nanoseconds before its
+read began stands for the file's bytes, on a file system whose `statfs` type is `fsType` (`statfsOk`: `statfs`
+succeeded) and whose timestamp clock advances every `tickNs` nanoseconds (not positive: unknown): more than
+`max 50 ms (4 * tickNs)` on ext4, XFS, Btrfs and tmpfs with a nonzero `ctimeNsec` and a known tick, more than 2 s
+otherwise (`src/library/usage_digest.cpp`, `stamp_settled`). -/
+@[extern "lean_usage_stamp_settled"]
+opaque stampSettled (statfsOk : Bool) (fsType ctimeNsec : UInt64) (tickNs ageNs : Int64) : Bool
+
+/-- Writes `bytes` to `path` as a new file renamed over it, never changing the file at `path` in place: a stamp
+(`fileDigestStamped`) cannot tell a file being rewritten in place, whose write stalls mid-copy, from one at rest. -/
+def writeFileReplacing (path : System.FilePath) (bytes : ByteArray) : IO Unit := do
+  let tmp := path.addExtension s!"tmp.{← IO.Process.getPID}"
+  IO.FS.writeBinFile tmp bytes
+  IO.FS.rename tmp path
 
 /-- The file's bytes, with the stamp of the file they were read from if it stands for them, as for
 `fileDigestStamped`. -/
