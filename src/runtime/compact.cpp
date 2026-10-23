@@ -135,7 +135,8 @@ object_compactor::object_compactor(void * base_addr, std::vector<region_view> de
                                    bool allow_closures, size_t initial_size, size_t initial_buckets):
     m_max_sharing_table(new max_sharing_table(this, initial_buckets)),
     m_dep_regions(std::move(dep_regions)),
-    m_libs(get_loaded_libs()),
+    // only a closure's code pointer is relocated against the loaded libraries; listing them takes the loader's lock
+    m_libs(allow_closures ? get_loaded_libs() : std::vector<lib_info>()),
     m_allow_closures(allow_closures),
     m_base_addr(base_addr),
     m_begin(malloc(initial_size)),

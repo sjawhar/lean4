@@ -96,8 +96,9 @@ clears it (`startFrontendRun`). -/
 builtin_initialize extraModUsesByChecksRef : IO.Ref (Std.HashSet ExtraModUse) ← mkAccountedRef {}
 
 /-- Every extra module use with the command that requested it, before environment-level deduplication. Private, as
-`extraModUsesByChecksRef`. -/
-builtin_initialize extraModUsesByCmdRef : IO.Ref (Std.HashSet (Nat × ExtraModUse)) ← mkAccountedRef {}
+`extraModUsesByChecksRef`. Persistent: elaboration threads share the set, so a hash set's buckets would be copied on
+every insert. -/
+builtin_initialize extraModUsesByCmdRef : IO.Ref (PersistentHashSet (Nat × ExtraModUse)) ← mkAccountedRef {}
 
 builtin_initialize registerRunLog do
   extraModUsesByChecksRef.set {}
@@ -108,8 +109,13 @@ public def extraModUsesByChecks : BaseIO (Std.HashSet ExtraModUse) :=
   extraModUsesByChecksRef.get
 
 /-- The extra module uses `extraModUsesByCmdRef` holds. -/
-public def extraModUsesByCommand : BaseIO (Std.HashSet (Nat × ExtraModUse)) :=
-  extraModUsesByCmdRef.get
+public def extraModUsesByCommand : BaseIO (Array (Nat × ExtraModUse)) :=
+  return (← extraModUsesByCmdRef.get).fold (·.push ·) #[]
+
+/-- Adds `(idx, entry)` to `extraModUsesByCmdRef`, writing the reference only when the pair is new. -/
+@[noinline] def noteCommandExtraModUse (idx : Nat) (entry : ExtraModUse) : BaseIO Unit := do
+  unless (← extraModUsesByCmdRef.get).contains (idx, entry) do
+    extraModUsesByCmdRef.modify (·.insert (idx, entry))
 
 def recordExtraModUseCore [MonadLiftT IO m] (mod : Name) (isMeta : Bool) (hint : Name := .anonymous) :
     m Unit := do
@@ -117,7 +123,7 @@ def recordExtraModUseCore [MonadLiftT IO m] (mod : Name) (isMeta : Bool) (hint :
   let recording ← (usageRecordingEnabled : IO Bool)
   if recording then
     if let some idx ← (commandIdx? : IO _) then
-      (extraModUsesByCmdRef.modify (·.insert (idx, entry)) : IO Unit)
+      (noteCommandExtraModUse idx entry : IO Unit)
   if !(extraModUses.getState (asyncMode := .local) (← getEnv)).contains entry then
     trace[extraModUses] "recording {if entry.isExported then "public" else "private"} \
       {if isMeta then "meta" else "regular"} extra mod use {mod}\

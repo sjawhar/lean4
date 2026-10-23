@@ -69,7 +69,8 @@ unsafe def costs (d k : Nat) : IO (Nat × Nat) := do
   let consts ← IO.lazyPure fun _ => ModuleUsage.ownConsts env
   let own ← IO.lazyPure fun _ => ModuleUsage.localDigests env (ModuleUsage.ownNodes env consts)
   let stmt ← IO.lazyPure fun _ => ModuleUsage.computeStmt env (ModuleUsage.stmtState env) own consts
-  discard <| ModuleUsage.commandRecords env (← ModuleUsage.commandObservations) own stmt #[]
+  -- one lane: on this thread, whose heartbeats count the allocations
+  discard <| ModuleUsage.commandRecords env (← ModuleUsage.commandObservations) own stmt #[] (lanes := 1)
   return (elabCost, (← IO.getNumHeartbeats) - start)
 
 unsafe def main : IO Unit := do
