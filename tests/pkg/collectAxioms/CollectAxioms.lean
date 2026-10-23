@@ -5,6 +5,8 @@ public import CollectAxioms.Right
 public import CollectAxioms.Chain.Top
 public import CollectAxioms.Chain.Middle
 public import CollectAxioms.Chain.Bottom
+public import CollectAxioms.VisitOrder.Ax
+public import CollectAxioms.VisitOrder.Sorry
 
 /-! ## Diamond imports with same-named private axioms
 
@@ -72,3 +74,34 @@ public noncomputable def usesMultiple : Nat := chainDef.casesOn myAxiom
 /-- info: 'usesMultiple' depends on axioms: [chainAx, myAxiom] -/
 #guard_msgs in
 #print axioms usesMultiple
+
+/-! ## Structures whose constructor the export walks first
+
+The export walks a module's declarations in hash order. In `CollectAxioms.VisitOrder.Ax` it reaches
+`S9.mk` before `S9`, and in `CollectAxioms.VisitOrder.Sorry` `S15.mk` before `S15`. Each summary
+still holds the axioms of the field types. `CollectAxioms.VisitOrderFlip` checks the same summaries
+for a module that the export walks in another order. -/
+
+public theorem visitOrderThm (s : S9) : s = s := rfl
+
+/-- info: 'visitOrderThm' depends on axioms: [fieldAx] -/
+#guard_msgs in
+#print axioms visitOrderThm
+
+/-- info: 'S9' depends on axioms: [fieldAx] -/
+#guard_msgs in
+#print axioms S9
+
+/-- info: 'S9.mk' depends on axioms: [fieldAx] -/
+#guard_msgs in
+#print axioms S9.mk
+
+public theorem visitOrderSorryThm (s : S15) : s = s := rfl
+
+/-- info: 'visitOrderSorryThm' depends on axioms: [sorryAx] -/
+#guard_msgs in
+#print axioms visitOrderSorryThm
+
+/-- info: 'S15' depends on axioms: [sorryAx] -/
+#guard_msgs in
+#print axioms S15
