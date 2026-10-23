@@ -7,7 +7,6 @@ Released under Apache 2.0 license as described in the file LICENSE.
 #include <cstring>
 #include <fcntl.h>
 #include <memory>
-#include <unordered_set>
 #include <vector>
 #include <sys/stat.h>
 #if defined(LEAN_WINDOWS)
@@ -526,10 +525,61 @@ extern "C" LEAN_EXPORT obj_res lean_usage_read_file_stamped(b_obj_arg path) {
     return io_result_mk_ok(r);
 }
 
+namespace {
+/* A set of names, each held by a reference, with open addressing on `Name.hash`: a probe compares the pointer, then
+the stored hash, and only then the names. */
+class resolved_set {
+    struct slot { object * m_name; uint64_t m_hash; };
+    slot * m_slots;
+    size_t m_mask;
+    size_t m_size = 0;
+    void grow() {
+        slot * old = m_slots;
+        size_t n = m_mask + 1;
+        m_mask = 2 * n - 1;
+        m_slots = new slot[2 * n]();
+        for (size_t i = 0; i < n; i++)
+            if (old[i].m_name) {
+                size_t j = old[i].m_hash & m_mask;
+                while (m_slots[j].m_name) j = (j + 1) & m_mask;
+                m_slots[j] = old[i];
+            }
+        delete[] old;
+    }
+public:
+    resolved_set(): m_slots(new slot[1024]()), m_mask(1023) {}
+    resolved_set(resolved_set const &) = delete;
+    ~resolved_set() {
+        for (size_t i = 0; i <= m_mask; i++) if (m_slots[i].m_name) lean_dec(m_slots[i].m_name);
+        delete[] m_slots;
+    }
+    /* Adds `n` unless the set holds an equal name; returns whether it did. */
+    bool insert(b_obj_arg n) {
+        uint64_t h = lean_name_hash(n);
+        size_t i = h & m_mask;
+        while (object * o = m_slots[i].m_name) {
+            if (o == n || (m_slots[i].m_hash == h && lean_name_eq(o, n))) return false;
+            i = (i + 1) & m_mask;
+        }
+        lean_inc(n);
+        m_slots[i] = {n, h};
+        if (2 * ++m_size > m_mask) grow();
+        return true;
+    }
+    /* The names, as a new array. */
+    object * to_array() const {
+        object * r = lean_alloc_array(m_size, m_size);
+        size_t k = 0;
+        for (size_t i = 0; i <= m_mask; i++)
+            if (object * o = m_slots[i].m_name) { lean_inc(o); lean_array_set_core(r, k++, o); }
+        return r;
+    }
+};
+}
+
 /* The names whose defining module was looked up while usage recording is on (`Lean.noteResolved`). Each thread keeps
 the names it has seen, so a repeated lookup costs one probe of a set only that thread touches; a name's first sighting
 in a thread goes to the process-wide set, which keeps it marked multi-threaded. */
-typedef std::unordered_set<name, name_hash_fn, name_eq_fn> resolved_set;
 static atomic<bool> g_resolved_on(false);
 static atomic<bool> g_all_resolved(false);
 static mutex g_resolved_mutex;
@@ -544,11 +594,9 @@ extern "C" LEAN_EXPORT obj_res lean_usage_enable_resolved() {
 
 extern "C" LEAN_EXPORT obj_res lean_usage_note_resolved(b_obj_arg n, obj_arg x) {
     if (!atomic_load_explicit(&g_resolved_on, memory_order_relaxed)) return x;
-    resolved_set & seen = get_seen_resolved();
-    name const & k = TO_REF(name, n);
-    if (!seen.insert(k).second) return x;
+    if (!get_seen_resolved().insert(n)) return x;
     lock_guard<mutex> lock(g_resolved_mutex);
-    if (g_resolved->insert(k).second) lean_mark_mt(n);
+    if (g_resolved->insert(n)) lean_mark_mt(n);
     return x;
 }
 
@@ -559,9 +607,7 @@ extern "C" LEAN_EXPORT obj_res lean_usage_note_all_resolved(obj_arg x) {
 
 extern "C" LEAN_EXPORT obj_res lean_usage_resolved_names() {
     lock_guard<mutex> lock(g_resolved_mutex);
-    object * r = lean_alloc_array(0, g_resolved->size());
-    for (name const & n : *g_resolved) r = lean_array_push(r, n.to_obj_arg());
-    return r;
+    return g_resolved->to_array();
 }
 
 extern "C" LEAN_EXPORT uint8 lean_usage_all_resolved() {
