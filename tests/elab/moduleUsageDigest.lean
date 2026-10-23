@@ -2,7 +2,8 @@ import Lean
 /-! Meaning digests: `localHash` (a constant's kernel data) ignores the constant's own name but sees binder info,
 theorem proofs and Nat literals past 2^64; `attrsEnc` sees `noncomputable`, the `@[extern]` entries and the
 `@[export]` name, and is equal for declarations without attributes; `localDigests` sees the names of referenced
-constants. The serialized digest parser accepts exactly 32 lowercase hexadecimal digits. -/
+constants. The serialized digest parser accepts exactly 32 lowercase hexadecimal digits, and `hex` and `ofHex?` are
+inverse on digests with leading zeros and with the top bit of either half set. -/
 open Lean Elab Command
 def f (x : Nat) := x + 1
 def f' (x : Nat) := x + 1
@@ -31,3 +32,12 @@ noncomputable def c1 : Nat := 0
   let d := "0123456789abcdef0123456789abcdef"
   logInfo m!"{(ModuleUsage.Digest.ofHex? d).map (·.hex) == some d} \
     {(ModuleUsage.Digest.ofHex? d.toUpper).isNone} {(ModuleUsage.Digest.ofHex? (d.drop 1).toString).isNone}"
+#eval show CommandElabM Unit from do
+  let ds : List ModuleUsage.Digest := [⟨0, 0⟩, ⟨0, 1⟩, ⟨1, 0⟩, ⟨0x8000000000000000, 0xffffffffffffffff⟩,
+    ⟨0xffffffffffffffff, 0x8000000000000000⟩, ⟨0x0123456789abcdef, 0xfedcba9876543210⟩]
+  logInfo m!"{" ".intercalate (ds.map fun d => d.hex)}"
+  logInfo m!"{ds.all fun d => ModuleUsage.Digest.ofHex? d.hex == some d}"
+  -- a non-digit in either half, and a non-ASCII string of 32 bytes
+  logInfo m!"{(ModuleUsage.Digest.ofHex? "0123456789abcdeg0123456789abcdef").isNone} \
+    {(ModuleUsage.Digest.ofHex? "0123456789abcdef0123456789abcdeg").isNone} \
+    {(ModuleUsage.Digest.ofHex? "é123456789abcdef0123456789abcde").isNone}"
