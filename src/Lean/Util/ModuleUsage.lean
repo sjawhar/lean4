@@ -391,8 +391,8 @@ def localDigests (env : Environment) (nodes := ownNodes env (ownConsts env)) : A
 /-- The imported constants the compiler reads by a name derived from one of `xs` when it compiles a use of it: each
 one's derived constants (`derivedSuffixes`) and the prefixes whose attributes it reads with its own
 (`internalPrefixes`). Each name is looked up once. -/
-def derivedReads (env : Environment) (xs : NameSet) : Array Name :=
-  let (derived, prefixes) := xs.foldl (init := (#[], ({} : NameHashSet))) fun (ds, ps) x =>
+def derivedReads (env : Environment) (xs : NameHashSet) : Array Name :=
+  let (derived, prefixes) := (xs : Std.HashSet Name).fold (init := (#[], ({} : NameHashSet))) fun (ds, ps) x =>
     (derivedSuffixes.foldl (fun ds s => ds.push (x.str s)) ds, addInternalPrefixes ps x)
   (derived ++ (prefixes : Std.HashSet Name).toArray).filter fun d => (env.getModuleIdxFor? d).isSome && env.contains d
 
@@ -406,7 +406,9 @@ module (its `.olean` carries none) is left out there. -/
 def moduleUsed (env : Environment) (extra : NameSet) (nodes := ownNodes env (ownConsts env)) :
     Array (Name × Array (Name × Digest)) :=
   let s := state env
-  let used := extra.foldl (init := (∅ : NameSet)) fun u x => (s.usedNodes env x).foldl (·.insert ·) u
+  -- Hash sets: only membership matters until the end, where each module's names (unique, since `used` is a set and a
+  -- name goes under each module once) are sorted.
+  let used : NameHashSet := extra.foldl (init := {}) fun u x => (s.usedNodes env x).foldl (·.insert ·) u
   let used := nodes.foldl (init := used) fun u n => n.refs.foldl (·.insert ·) u
   let sources := nodes.foldl (·.insert ·.name) (extra.foldl (·.insert ·) used)
   let used := (derivedReads env sources).foldl (fun u d => (s.usedNodes env d).foldl (·.insert ·) u) used
@@ -415,7 +417,7 @@ def moduleUsed (env : Environment) (extra : NameSet) (nodes := ownNodes env (own
     match s.findAt? i c with
     | some d => m.alter env.header.modules[i.toNat]!.module fun o => some ((o.getD #[]).push (c, d))
     | none => m
-  let byMod := used.foldl (init := (∅ : Std.HashMap Name (Array (Name × Digest)))) fun m c =>
+  let byMod := (used : Std.HashSet Name).fold (init := (∅ : Std.HashMap Name (Array (Name × Digest)))) fun m c =>
     let r? := env.getModuleIdxFor? c
     let m := r?.elim m (push m · c)
     (env.getKernelDeclarersIfOther? c r?).elim m (·.foldl (fun m k => if r? == some k then m else push m k c) m)
