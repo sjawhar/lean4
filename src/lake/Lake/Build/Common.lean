@@ -748,6 +748,15 @@ public def computeArtifact (path : FilePath) (ext := "art") (text := false) : Jo
   let mtime := (← getMTime path |>.toBaseIO).toOption.getD 0
   return {descr := artifactWithExt hash ext, name := path.toString, path, mtime}
 
+/--
+`computeArtifact` for a file whose hash the caller computed from the bytes it just read: saves that hash to the
+file's `.hash` file, as `fetchFileHash` does.
+-/
+public def computeArtifactOfHash (path : FilePath) (hash : Hash) (ext := "art") : JobM Artifact := do
+  writeFileHash path hash
+  let mtime := (← getMTime path |>.toBaseIO).toOption.getD 0
+  return {descr := artifactWithExt hash ext, name := path.toString, path, mtime}
+
 /-- Hashes `bytes` as `computeFileHash` does; text that is not valid UTF-8 has no hash. -/
 def hashBytes? (bytes : ByteArray) (text : Bool) : Option Hash :=
   if text then Hash.ofText <$> String.fromUTF8? bytes else some (Hash.ofByteArray bytes)
