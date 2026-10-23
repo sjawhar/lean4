@@ -80,16 +80,20 @@ def writeFileReplacing (path : System.FilePath) (bytes : ByteArray) : IO Unit :=
 @[extern "lean_usage_read_file_stamped"]
 opaque readFileStamped (path : @& System.FilePath) : IO (ByteArray × Option FileStamp)
 
-/-- `v` as 16 lowercase hex digits, most significant first. Shifts a `UInt64` rather than converting it to a `Nat`,
-which goes through big-number division at 2^63 and above. -/
-private def hex16 (v : UInt64) : String := Id.run do
-  let mut s := ""
+/-- `acc` followed by `v` as 16 lowercase hex digits, most significant first. Shifts a `UInt64` rather than converting
+it to a `Nat`, which goes through big-number division at 2^63 and above. -/
+private def hex16 (acc : String) (v : UInt64) : String := Id.run do
+  let mut s := acc
   for i in [0:16] do
-    s := s.push (Nat.digitChar ((v >>> (4 * (15 - i)).toUInt64) &&& 0xf).toNat)
+    let d := ((v >>> (4 * (15 - i)).toUInt64) &&& 0xf).toUInt8
+    s := s.push (Char.ofUInt8 (if d < 10 then '0'.toUInt8 + d else 'a'.toUInt8 - 10 + d))
   return s
 
+/-- `acc` followed by `d.hex`. -/
+def Digest.hexInto (acc : String) (d : Digest) : String := hex16 (hex16 acc d.hi) d.lo
+
 /-- 32 lowercase hex digits. -/
-def Digest.hex (d : Digest) : String := hex16 d.hi ++ hex16 d.lo
+def Digest.hex (d : Digest) : String := d.hexInto ""
 
 /-- The order of `hex`, without building the strings. -/
 def Digest.lt (a b : Digest) : Bool := a.hi < b.hi || (a.hi == b.hi && a.lo < b.lo)
@@ -226,5 +230,24 @@ where
     | .anonymous, acc => acc
     | .str p s, acc => (go p acc).push (.str s)
     | .num p k, acc => (go p acc).push (.num k)
+
+/-- `acc` followed by `nameToJson n` as `Json.compress` prints it, without building the JSON value. -/
+def nameJsonInto (acc : String) (n : Name) : String :=
+  (go acc n).push ']'
+where
+  go (acc : String) : Name → String
+    | .anonymous => acc.push '['
+    | .str p s => Json.renderString s (sep (go acc p) p)
+    | .num p k => sep (go acc p) p ++ toString k
+  sep (acc : String) (p : Name) : String := if p.isAnonymous then acc else acc.push ','
+
+/-- `acc` followed by `toJson d` as `Json.compress` prints it. -/
+def digestJsonInto (acc : String) (d : Digest) : String := (d.hexInto (acc.push '"')).push '"'
+
+/-- `acc` followed by `xs` as `Json.compress` prints a JSON array, each element printed by `f`. -/
+@[inline] def arrayJsonInto {α : Type} (acc : String) (xs : Array α) (f : String → α → String) : String :=
+  let acc := acc.push '['
+  let acc := if h : 0 < xs.size then f acc xs[0] else acc
+  (xs.foldl (start := 1) (init := acc) fun acc x => f (acc.push ',') x).push ']'
 
 end Lean.ModuleUsage
