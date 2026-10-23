@@ -492,6 +492,16 @@ extern "C" LEAN_EXPORT obj_res lean_usage_file_digest(b_obj_arg path) {
     return io_result_mk_ok(d);
 }
 
+/* `Lean.ModuleUsage.fileDigestOfBytes`: `fileDigest` of a file whose bytes are `bytes` (XXH3-128 hashed in one call;
+`digest_stream`'s chunked updates give the same hash). */
+extern "C" LEAN_EXPORT obj_res lean_usage_file_bytes_digest(b_obj_arg bytes) {
+    XXH128_hash_t h = XXH3_128bits(lean_sarray_cptr(bytes), lean_sarray_size(bytes));
+    object * r = lean_alloc_ctor(0, 0, 2 * sizeof(uint64_t));
+    lean_ctor_set_uint64(r, 0, h.high64);
+    lean_ctor_set_uint64(r, sizeof(uint64_t), h.low64);
+    return r;
+}
+
 /* `Lean.ModuleUsage.fileStamp`: the stamp of the file at `path` (following symbolic links, as `open` does). */
 extern "C" LEAN_EXPORT obj_res lean_usage_file_stamp(b_obj_arg path) {
 #if defined(LEAN_WINDOWS)
