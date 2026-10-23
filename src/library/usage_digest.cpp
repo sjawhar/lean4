@@ -2,6 +2,7 @@
 Copyright (c) 2026 Theorem Labs. All rights reserved.
 Released under Apache 2.0 license as described in the file LICENSE.
 */
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -13,6 +14,9 @@ Released under Apache 2.0 license as described in the file LICENSE.
 #include <io.h>
 #else
 #include <unistd.h>
+#endif
+#if defined(__linux__)
+#include <sys/vfs.h>
 #endif
 #include "runtime/io.h"
 #include "runtime/object_ref.h"
@@ -393,12 +397,87 @@ object * mk_stamp(uint64_t const (&s)[stamp_fields]) {
     for (unsigned i = 0; i < stamp_fields; i++) lean_ctor_set_uint64(r, i * sizeof(uint64_t), s[i]);
     return r;
 }
-
-/* How long before the moment it is read a file's status-change time must lie for its stamp to stand for its bytes:
-longer than any file system's timestamp granularity (FAT's is 2 s for modification times), so that every later
-change of the file sets a status-change time that differs from the recorded one. */
-constexpr int64_t stamp_settle_sec = 2;
 #endif
+
+/* How long before a read begins a file's status-change time must lie for the stamp taken around the read to stand for
+the bytes read: longer than the lag behind CLOCK_REALTIME of the clock that stamps the file. Let `t` be the realtime
+clock read before the read's first `fstat`, `c1` the status-change time that `fstat` sees, and `c2` the one any change
+made after it sets. The file system's clock trails `t` by at most `lag`, so `c2 >= t - lag`, and `c1 < t - bound`, so
+`c2 > c1` when `bound >= lag`: the second `fstat` sees every such change. The clock must be read before the first
+`fstat`: read after the read, the age says nothing about a change made during the read in `c1`'s own tick.
+
+Linux stamps ext4, XFS, Btrfs and tmpfs inodes from the coarse realtime clock (or, with multigrain timestamps, a
+finer one), which advances once per jiffy, so `lag` is at most one jiffy, `clock_getres(CLOCK_REALTIME_COARSE)`. The
+bound is four jiffies and no less than 50 ms, as margin for late timer ticks and clock slew. These file systems record
+nanoseconds, so a zero nanosecond field marks whole-second timestamps (ext4 with 128-byte inodes, for example), which
+get the general bound. Every other file system, one `statfs` cannot identify, and a jiffy `clock_getres` does not
+report get 2 s: longer than any file system's granularity (FAT's is 2 s for modification times), including those whose
+timestamps may come from another host's clock (NFS, FUSE, 9p) or from another file system underneath (overlayfs).
+
+No bound covers two cases: a backwards step of the realtime clock, after which a later change would have to land on
+exactly the recorded tick; and a file rewritten in place, because one `write` sets the status-change time before it
+copies the bytes, so a copy that stalls past the bound after the reader's first `fstat` leaves a stamp that stands
+for mixed bytes. Usage sidecars are therefore never written in place (`Lean.ModuleUsage.writeFileReplacing`), nor is
+an `.olean`. */
+constexpr int64_t stamp_settle_fine_min_ns = 50'000'000;
+constexpr int64_t stamp_settle_ns = 2'000'000'000;
+
+/* Whether a stamp whose status-change time has nanosecond field `ctime_nsec` and lay `age_ns` before its read began
+stands for the file's bytes, on a file system of `statfs` type `fs_type` (`statfs_ok`: `statfs` succeeded) whose
+timestamp clock advances every `tick_ns` (not positive: unknown). */
+bool stamp_settled(bool statfs_ok, uint64_t fs_type, uint64_t ctime_nsec, int64_t tick_ns, int64_t age_ns) {
+    uint32_t t = static_cast<uint32_t>(fs_type);
+    // EXT4_SUPER_MAGIC (also ext2/ext3), XFS_SUPER_MAGIC, BTRFS_SUPER_MAGIC, TMPFS_MAGIC (<linux/magic.h>)
+    bool fine = statfs_ok && ctime_nsec != 0 && tick_ns > 0 &&
+        (t == 0xEF53u || t == 0x58465342u || t == 0x9123683Eu || t == 0x01021994u);
+    // `tick_ns` is capped so that the product cannot overflow; a capped bound exceeds the general one anyway.
+    int64_t bound = fine ? std::max(stamp_settle_fine_min_ns, 4 * std::min(tick_ns, stamp_settle_ns)) : stamp_settle_ns;
+    return age_ns > bound;
+}
+
+#if !defined(LEAN_WINDOWS)
+/* How often the clock Linux stamps files from advances (`stamp_settled`), or 0 if unknown. */
+int64_t coarse_tick_ns() {
+#if defined(__linux__)
+    static int64_t const tick = [] {
+        struct timespec r;
+        if (clock_getres(CLOCK_REALTIME_COARSE, &r) != 0) return int64_t(0);
+        return static_cast<int64_t>(r.tv_sec) * 1'000'000'000 + static_cast<int64_t>(r.tv_nsec);
+    }();
+    return tick;
+#else
+    return 0;
+#endif
+}
+
+/* Whether `after`, the stamp of the open file `fd` taken after reading it, stands for the bytes read, if the realtime
+clock read `start` before the read's first `fstat` (`stamp_settled`). */
+bool stamp_stands(int fd, struct timespec const & start, uint64_t const (&after)[stamp_fields]) {
+    bool statfs_ok = false;
+    uint64_t fs_type = 0;
+#if defined(__linux__)
+    struct statfs sf;
+    if (fstatfs(fd, &sf) == 0) {
+        statfs_ok = true;
+        fs_type = static_cast<uint64_t>(static_cast<uint32_t>(sf.f_type));
+    }
+#else
+    (void)fd;
+#endif
+    // Clamped so that the product cannot overflow; every age beyond 10 s gives the same result.
+    int64_t sec = std::max<int64_t>(-10, std::min<int64_t>(10,
+        static_cast<int64_t>(start.tv_sec) - static_cast<int64_t>(after[5])));
+    int64_t age_ns = sec * 1'000'000'000 + (static_cast<int64_t>(start.tv_nsec) - static_cast<int64_t>(after[6]));
+    return stamp_settled(statfs_ok, fs_type, after[6], coarse_tick_ns(), age_ns);
+}
+#endif
+}
+
+/* `Lean.ModuleUsage.stampSettled`: `stamp_settled`, for tests of the rule (`Int64` crosses the ABI as `uint64_t`). */
+extern "C" LEAN_EXPORT uint8_t lean_usage_stamp_settled(uint8_t statfs_ok, uint64_t fs_type, uint64_t ctime_nsec,
+        uint64_t tick_ns, uint64_t age_ns) {
+    return stamp_settled(statfs_ok != 0, fs_type, ctime_nsec, static_cast<int64_t>(tick_ns),
+        static_cast<int64_t>(age_ns));
 }
 
 /* The XXH3-128 hash of a file's bytes (`Lean.ModuleUsage.fileDigest`). */
@@ -428,17 +507,19 @@ extern "C" LEAN_EXPORT obj_res lean_usage_file_stamp(b_obj_arg path) {
 }
 
 /* `Lean.ModuleUsage.fileDigestStamped`: the file's digest, with the stamp of the file it read if the stamp stands for
-those bytes: the descriptor's stamp is the same before and after the read, and its status-change time lies at least
-`stamp_settle_sec` before the second `fstat`, so that no change in the same timestamp tick can follow unseen. */
+those bytes: the descriptor's stamp is the same before and after the read, and its status-change time lies far enough
+before the realtime clock read just before the first `fstat` (`stamp_settled`) that every later change of the file
+shows in the second. */
 extern "C" LEAN_EXPORT obj_res lean_usage_file_digest_stamped(b_obj_arg path) {
     obj_res err;
     FILE * f = open_for_digest(path, err);
     if (f == nullptr) return err;
     object * stamp = mk_option_none();
 #if !defined(LEAN_WINDOWS)
+    struct timespec start;
     struct stat st;
     uint64_t before[stamp_fields];
-    bool have_before = fstat(fileno(f), &st) == 0;
+    bool have_before = clock_gettime(CLOCK_REALTIME, &start) == 0 && fstat(fileno(f), &st) == 0;
     if (have_before) stamp_of(st, before);
 #endif
     object * d = digest_stream(f);
@@ -447,13 +528,9 @@ extern "C" LEAN_EXPORT obj_res lean_usage_file_digest_stamped(b_obj_arg path) {
     if (d != nullptr && have_before && fstat(fileno(f), &st) == 0) {
         uint64_t after[stamp_fields];
         stamp_of(st, after);
-        struct timespec now;
         bool same = true;
         for (unsigned i = 0; i < stamp_fields; i++) same = same && before[i] == after[i];
-        if (same && clock_gettime(CLOCK_REALTIME, &now) == 0 &&
-            static_cast<int64_t>(after[5]) + stamp_settle_sec < static_cast<int64_t>(now.tv_sec)) {
-            stamp = mk_option_some(mk_stamp(after));
-        }
+        if (same && stamp_stands(fileno(f), start, after)) stamp = mk_option_some(mk_stamp(after));
     }
 #endif
     fclose(f);
@@ -473,7 +550,8 @@ static obj_res too_large_error() {
 }
 
 /* `Lean.ModuleUsage.readFileStamped`: the file's bytes, with the stamp of the file they were read from if it stands
-for them, as `lean_usage_file_digest_stamped` decides it. Fails for a file larger than `max_stamped_read`. */
+for them, as `lean_usage_file_digest_stamped` decides it (the realtime clock is read before the first `fstat`). Fails
+for a file larger than `max_stamped_read`. */
 extern "C" LEAN_EXPORT obj_res lean_usage_read_file_stamped(b_obj_arg path) {
     obj_res err;
     FILE * f = open_for_digest(path, err);
@@ -481,9 +559,10 @@ extern "C" LEAN_EXPORT obj_res lean_usage_read_file_stamped(b_obj_arg path) {
     object * stamp = mk_option_none();
     size_t expected = 0;
 #if !defined(LEAN_WINDOWS)
+    struct timespec start;
     struct stat st;
     uint64_t before[stamp_fields];
-    bool have_before = fstat(fileno(f), &st) == 0;
+    bool have_before = clock_gettime(CLOCK_REALTIME, &start) == 0 && fstat(fileno(f), &st) == 0;
     if (have_before) {
         stamp_of(st, before);
         expected = static_cast<size_t>(st.st_size);
@@ -526,13 +605,9 @@ extern "C" LEAN_EXPORT obj_res lean_usage_read_file_stamped(b_obj_arg path) {
     if (have_before && fstat(fileno(f), &st) == 0) {
         uint64_t after[stamp_fields];
         stamp_of(st, after);
-        struct timespec now;
         bool same = true;
         for (unsigned i = 0; i < stamp_fields; i++) same = same && before[i] == after[i];
-        if (same && clock_gettime(CLOCK_REALTIME, &now) == 0 &&
-            static_cast<int64_t>(after[5]) + stamp_settle_sec < static_cast<int64_t>(now.tv_sec)) {
-            stamp = mk_option_some(mk_stamp(after));
-        }
+        if (same && stamp_stands(fileno(f), start, after)) stamp = mk_option_some(mk_stamp(after));
     }
 #endif
     fclose(f);
