@@ -988,7 +988,7 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
   let names := env.getImportedKernelDuplicates.foldl (·.insert ·.1) names
   let names := (names : Std.HashSet Name).fold addInternalPrefixes names
   let resolved := encodeResolved (resolvedGroups env names)
-  IO.FS.writeBinFile (path.withExtension "resolved") resolved
+  writeFileReplacing (path.withExtension "resolved") resolved
   let j := Json.mkObj [("version", usageVersion), ("noskip", incrLoaded),
     ("moduleDigest", toJson (moduleDigestOf own)),
     ("closure", toJson closure),
@@ -1005,6 +1005,6 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
     ("extra", Json.arr (extraMods.map fun u => Json.arr #[nameToJson u.module, u.isMeta])),
     ("specKeys", Json.arr ((ownSpecKeys env).map fun (d, n) => Json.arr #[toJson d, nameToJson n])),
     ("specLookups", Json.arr ((specLookups env lookups).map fun (k, p) => Json.arr #[toJson k, toJson p]))]
-  IO.FS.writeFile path j.compress
+  writeFileReplacing path j.compress.toUTF8
 
 end Lean.ModuleUsage
