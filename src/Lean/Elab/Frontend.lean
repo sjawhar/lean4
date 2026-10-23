@@ -400,12 +400,13 @@ def runFrontend
       let nodes := ModuleUsage.ownNodes env (ModuleUsage.ownConsts env recorded)
       let own := ModuleUsage.localDigests env nodes
       let provides := ModuleUsage.ownProvides env
-      (usageFileName, nodes, own, ModuleUsage.closureDigest env own provides, provides)
+      let indirect := ModuleUsage.ownIndirect env
+      (usageFileName, nodes, own, ModuleUsage.closureDigest env own provides, provides, indirect)
     profileitIO ".olean serialization" finalOpts do
       let commandLints := collectCommandLints snaps none #[]
       let env ← Linter.recordLints inputCtx.fileMap env commandLints
-      let env := usage?.elim env fun (_, _, own, closure, provides) =>
-        ModuleUsage.setLocalDigests env own closure provides
+      let env := usage?.elim env fun (_, _, own, closure, provides, indirect) =>
+        ModuleUsage.setLocalDigests env own closure provides indirect
       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
     return usage?
 
@@ -433,9 +434,9 @@ def runFrontend
     Firefox.Profile.serve <| Json.compress <| toJson profile
 
   -- Last of the outputs: the usage data records every name resolved in writing the others.
-  if let some (usageFileName, nodes, own, closure, provides) := usage? then
+  if let some (usageFileName, nodes, own, closure, provides, indirect) := usage? then
     let used := ModuleUsage.usedFromInfoTrees trees (← usedNames)
-    ModuleUsage.writeUsage env nodes own closure provides used (← lookedUpSpecKeys)
+    ModuleUsage.writeUsage env nodes own closure provides indirect used (← lookedUpSpecKeys)
       (incrLoaded := incrLoadFileName?.isSome) usageFileName
 
   -- no point in freeing the snapshot graph and all referenced data this close to process exit

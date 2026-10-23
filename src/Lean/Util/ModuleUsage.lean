@@ -159,7 +159,8 @@ def internalPrefixes (n : Name) : Array Name := Id.run do
 structure Markers where
   /-- The module's `closureDigest`. -/
   closure : Digest
-  /-- The digest of the names the module provides to importers' resolvers (`providesDigestOf`). -/
+  /-- The digest of the names the module provides to importers' resolvers and of the imported declarations it gives
+  a non-local attribute (`providesDigestOf`). -/
   provides : Digest
   deriving Inhabited
 
@@ -267,9 +268,15 @@ def ownProvides (env : Environment) : Array Name × Array Name :=
   let kernel := priv.toKernelEnv.constants.foldStage2 (fun ns n _ => ns.push n) #[]
   (kernel.qsort Name.quickLt, (irExtraConstNames priv .private).qsort Name.quickLt)
 
-/-- A digest of a module's `ownProvides`, which its `.olean` carries (`Markers.provides`) and its `.usage` records. -/
-def providesDigestOf (provides : Array Name × Array Name) : Digest :=
-  (({} : Enc).array provides.1 Enc.name |>.array provides.2 Enc.name).finish
+/-- The imported declarations the current module gives a non-local attribute (`indirectModUseExt`), sorted: an
+importer that records an extra module use of one of them (`recordExtraModUseFromDecl`) records this module too. -/
+def ownIndirect (env : Environment) : Array Name :=
+  ((indirectModUseExt.getEntries env).toArray.map (·.declName)).qsort Name.quickLt |>.eraseReps
+
+/-- A digest of a module's `ownProvides` and `ownIndirect`, which its `.olean` carries (`Markers.provides`) and its
+`.usage` records. -/
+def providesDigestOf (provides : Array Name × Array Name) (indirect : Array Name) : Digest :=
+  (({} : Enc).array provides.1 Enc.name |>.array provides.2 Enc.name |>.array indirect Enc.name).finish
 
 /-- The current module's `ownProvides` once `setLocalDigests` stored them, exported as the two arrays. Private level
 only, as `ext`. -/
@@ -370,12 +377,12 @@ def compute (env : Environment) (s : State) (nodes : Array Node) : Array (Name �
 def localDigests (env : Environment) (nodes := ownNodes env (ownConsts env)) : Array (Name × Digest) :=
   compute env (state env) nodes
 
-/-- Stores `own` (`localDigests env`), the module's `closureDigest` and its `ownProvides` for the extensions to
-export. Without it, the `.olean` carries no digests. -/
+/-- Stores `own` (`localDigests env`), the module's `closureDigest`, its `ownProvides` and the digest of those with
+its `ownIndirect` for the extensions to export. Without it, the `.olean` carries no digests. -/
 def setLocalDigests (env : Environment) (own : Array (Name × Digest)) (closure : Digest)
-    (provides : Array Name × Array Name) : Environment :=
+    (provides : Array Name × Array Name) (indirect : Array Name) : Environment :=
   let env := ext.modifyState (asyncMode := .mainOnly) env
-    ({ · with localDigests? := some (own, { closure, provides := providesDigestOf provides }) })
+    ({ · with localDigests? := some (own, { closure, provides := providesDigestOf provides indirect }) })
   providesExt.modifyState (asyncMode := .mainOnly) env fun _ => some provides
 
 /-- The imported constants the compiler reads by a name derived from `x` when it compiles a use of `x`: `x`'s derived
@@ -658,10 +665,11 @@ private def specLookups (env : Environment) (lookups : Array Expr) : Array (Dige
 
 /-- The format version of the `.usage` sidecar and of Lake's `.usekey`; Lake reads a sidecar of any other
 version as absent. -/
-def usageVersion : Nat := 12
+def usageVersion : Nat := 13
 
-/-- `own` is `localDigests env nodes`, `closure` the module's `closureDigest` and `provides` its `ownProvides`, as
-`setLocalDigests` stored them; `used` holds the imported names recorded while elaborating (`moduleUsed`'s `extra`);
+/-- `own` is `localDigests env nodes`, `closure` the module's `closureDigest`, `provides` its `ownProvides` and
+`indirect` its `ownIndirect`, as `setLocalDigests` stored them; `used` holds the imported names recorded while
+elaborating (`moduleUsed`'s `extra`);
 `lookups` the specialization-cache keys looked up (`lookedUpSpecKeys`). The extra module uses are the environment's
 and `extraModUsesByChecks` (those of commands whose environment was discarded); if a compile ran code or read state
 the used names do not cover (`compilerCodeSeen`, or a unification hint from an imported module with digests matched
@@ -671,13 +679,14 @@ their `.olean` files: Lake writes a `.usekey` only if those are still what the m
 writes it, so the key describes what the compile read. `digested` records each imported module's provides digest, and
 `resolved` the module and kinds every name of `used`, of the nodes' references and of `resolvedNames` resolves to
 (`resolvedGroups`), so that Lake rebuilds the module when a closure module whose provides changed gains, loses or
-changes the kinds of any of those names; `resolvedAll` is set when the whole resolver map was read
+changes the kinds of any of those names, or gives one of them a non-local attribute (`indirect`, which makes a fresh
+compile record that module as an extra use); `resolvedAll` is set when the whole resolver map was read
 (`allResolved`), so that Lake rebuilds the module when any closure module's provides changed. Call it after
 everything else the process writes: `resolvedNames` is read last here, after this function's own lookups. `noskip`
 is set when the run reused commands from an `--incr-load` snapshot, since reused commands never call `addDecl` in
 this process and `used` may miss constants they used. -/
 def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Digest)) (closure : Digest)
-    (provides : Array Name × Array Name) (used : NameSet) (lookups : Array Expr)
+    (provides : Array Name × Array Name) (indirect : Array Name) (used : NameSet) (lookups : Array Expr)
     (incrLoaded : Bool) (path : System.FilePath) : IO Unit := do
   let s := state env
   let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecks)
@@ -707,8 +716,9 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
   let j := Json.mkObj [("version", usageVersion), ("noskip", incrLoaded),
     ("moduleDigest", toJson (moduleDigestOf own)),
     ("closure", toJson closure),
-    ("providesDigest", toJson (providesDigestOf provides)),
+    ("providesDigest", toJson (providesDigestOf provides indirect)),
     ("provides", Json.arr #[Json.arr (provides.1.map nameToJson), Json.arr (provides.2.map nameToJson)]),
+    ("indirect", Json.arr (indirect.map nameToJson)),
     ("digested", Json.arr ((digestedModules env).map fun (m, d) => pair m d)),
     ("importedClosures", imported (env.header.imports.map (·.module)) (·.2)),
     ("importedDigests", imported (extraMods.map (·.module)) (·.1)),
