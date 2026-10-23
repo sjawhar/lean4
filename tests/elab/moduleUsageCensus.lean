@@ -165,7 +165,8 @@ def classification : List (Name × UsageClass × String) := [
   (`Lean.indirectModUseExt, .recording,
     "Infrastructure for `shake`'s extra-import-dependency recording (module docstring of src/Lean/ExtraModUses.lean); \
     only consulted by `recordExtraModUseFromDecl` (src/Lean/ExtraModUses.lean) to propagate a \
-    further bookkeeping entry, never to decide what code is generated."),
+    further bookkeeping entry, never to decide what code is generated. That entry is `.olean` data: each module's \
+    entries are in its provides digest (`ModuleUsage.ownIndirect`), which Lake checks against `resolved`."),
   (Lean.mkPrivateNameCore `Lean.Structure `Lean.structureExt, .R1,
     "`registerStructure` (src/Lean/Structure.lean:111-122) and `setStructureParents` (:128-131) are called \
     only by the `structure` elaborator for the structure it declares (src/Lean/Elab/Structure.lean:1303,1558). \
