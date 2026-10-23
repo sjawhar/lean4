@@ -107,6 +107,7 @@ void event_loop::run() {
 
 /* Std.Internal.UV.Loop.configure (options : @& Loop.Options) : IO Unit */
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_event_loop_configure(b_obj_arg options) {
+    note_effect_here("configures the event loop");
     bool accum = lean_ctor_get_uint8(options, 0);
     bool block = lean_ctor_get_uint8(options, 1);
 
@@ -135,6 +136,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_event_loop_configure(b_obj_arg optio
 
 /* Std.Internal.UV.Loop.alive : BaseIO Bool */
 extern "C" LEAN_EXPORT uint8_t lean_uv_event_loop_alive() {
+    note_effect_here("reads the event loop's state");
     event_loop_guard guard;
     return global_ev.alive(guard);
 }

@@ -1,3 +1,3 @@
 Plain: noskip (some false), noreuse (some false), reason none
 MS: noskip (some false), noreuse (some true), reason (some module-system)
-Ec: noskip (some false), noreuse (some true), reason (some (declaration command 1: an effect outside the command: it writes a reference no command created))
+Ec: noskip (some false), noreuse (some true), reason (some (declaration command 1: an effect outside the command: it writes a reference an imported module's initializer created))

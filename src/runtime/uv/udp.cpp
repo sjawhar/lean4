@@ -60,6 +60,7 @@ void initialize_libuv_udp_socket() {
 
 /* Std.Internal.UV.UDP.Socket.new : IO Socket */
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_new() {
+    note_effect_here("uses the network");
     lean_uv_udp_socket_object* udp_socket = (lean_uv_udp_socket_object*)malloc(sizeof(lean_uv_udp_socket_object));
     if (udp_socket == nullptr) {
         return io_result_mk_enomem();
@@ -91,6 +92,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_new() {
 
 /* Std.Internal.UV.UDP.Socket.bind (socket : @& Socket) (addr : @& SocketAddress) : IO Unit */
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_bind(b_obj_arg socket, b_obj_arg addr) {
+    note_effect_here("uses the network");
     lean_uv_udp_socket_object* udp_socket = lean_to_uv_udp_socket(socket);
 
     sockaddr_storage addr_ptr;
@@ -111,6 +113,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_bind(b_obj_arg socket, b_obj_arg
 
 /* Std.Internal.UV.UDP.Socket.connect (socket : @& Socket) (addr : @& SocketAddress) : IO Unit */
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_connect(b_obj_arg socket, b_obj_arg addr) {
+    note_effect_here("uses the network");
     lean_uv_udp_socket_object* udp_socket = lean_to_uv_udp_socket(socket);
 
     sockaddr_storage addr_ptr;
@@ -131,6 +134,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_connect(b_obj_arg socket, b_obj_
 
 /* Std.Internal.UV.UDP.Socket.send (socket : @& Socket) (data : Array ByteArray) (addr : @& Option SocketAddress) : IO (IO.Promise (Except IO.Error Unit)) */
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_send(b_obj_arg socket, obj_arg data_array, b_obj_arg opt_addr) {
+    note_effect_here("uses the network");
     lean_uv_udp_socket_object* udp_socket = lean_to_uv_udp_socket(socket);
 
     size_t array_len = lean_array_size(data_array);
@@ -252,6 +256,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_send(b_obj_arg socket, obj_arg d
 
 /* Std.Internal.UV.UDP.Socket.recv (socket : @& Socket) (size : UInt64) : IO (IO.Promise (Except IO.Error (ByteArray × SocketAddress))) */
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_recv(b_obj_arg socket, uint64_t buffer_size) {
+    note_effect_here("uses the network");
     lean_uv_udp_socket_object *udp_socket = lean_to_uv_udp_socket(socket);
 
     auto alloc_cb = [](uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
@@ -350,6 +355,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_recv(b_obj_arg socket, uint64_t 
 
 /* Std.Internal.UV.UDP.Socket.waitReadable (socket : @& Socket) : IO (IO.Promise (Except IO.Error Unit)) */
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_wait_readable(b_obj_arg socket) {
+    note_effect_here("uses the network");
     lean_uv_udp_socket_object* udp_socket = lean_to_uv_udp_socket(socket);
 
     auto alloc_cb = [](uv_handle_t* handle, size_t suggested_size, uv_buf_t *buf) {
@@ -424,6 +430,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_wait_readable(b_obj_arg socket) 
 
 /* Std.Internal.UV.UDP.Socket.cancelRecv (socket : @& Socket) : IO Unit */
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_cancel_recv(b_obj_arg socket) {
+    note_effect_here("uses the network");
     lean_uv_udp_socket_object* udp_socket = lean_to_uv_udp_socket(socket);
 
     lean_object* promise = nullptr;
@@ -461,6 +468,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_cancel_recv(b_obj_arg socket) {
 
 /* Std.Internal.UV.UDP.Socket.getPeerName (socket : @& Socket) : IO SocketAddress */
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_getpeername(b_obj_arg socket) {
+    note_effect_here("uses the network");
     lean_uv_udp_socket_object *udp_socket = lean_to_uv_udp_socket(socket);
 
     struct sockaddr_storage addr_storage;
@@ -483,6 +491,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_getpeername(b_obj_arg socket) {
 
 /* Std.Internal.UV.UDP.Socket.getSockName (socket : @& Socket) : IO SocketAddress */
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_getsockname(b_obj_arg socket) {
+    note_effect_here("uses the network");
     lean_uv_udp_socket_object *udp_socket = lean_to_uv_udp_socket(socket);
 
     struct sockaddr_storage addr_storage;
@@ -504,6 +513,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_getsockname(b_obj_arg socket) {
 
 /* Std.Internal.UV.UDP.Socket.setBroadcast (socket : @& Socket) (on : Bool) : IO Unit */
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_set_broadcast(b_obj_arg socket, uint8_t enable) {
+    note_effect_here("uses the network");
     lean_uv_udp_socket_object *udp_socket = lean_to_uv_udp_socket(socket);
 
     int result;
@@ -521,6 +531,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_set_broadcast(b_obj_arg socket, 
 
 /* Std.Internal.UV.UDP.Socket.setMulticastLoop (socket : @& Socket) (on : Bool) : IO Unit */
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_set_multicast_loop(b_obj_arg socket, uint8_t enable) {
+    note_effect_here("uses the network");
     lean_uv_udp_socket_object *udp_socket = lean_to_uv_udp_socket(socket);
 
     int result;
@@ -538,6 +549,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_set_multicast_loop(b_obj_arg soc
 
 /* Std.Internal.UV.UDP.Socket.setMulticastTTL (socket : @& Socket) (ttl : UInt32) : IO Unit */
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_set_multicast_ttl(b_obj_arg socket, uint32_t ttl) {
+    note_effect_here("uses the network");
     lean_uv_udp_socket_object *udp_socket = lean_to_uv_udp_socket(socket);
 
     int result;
@@ -555,6 +567,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_set_multicast_ttl(b_obj_arg sock
 
 /* Std.Internal.UV.UDP.Socket.setMembership (socket : @& Socket) (multicastAddr : @& IpAddr) (interfaceAddr : @& Option IpAddr) (membership : UInt8) : IO Unit */
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_set_membership(b_obj_arg socket, b_obj_arg multicast_addr, b_obj_arg interface_addr, uint8_t membership) {
+    note_effect_here("uses the network");
     lean_uv_udp_socket_object *udp_socket = lean_to_uv_udp_socket(socket);
 
     char multicast_addr_str[INET6_ADDRSTRLEN];
@@ -583,6 +596,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_set_membership(b_obj_arg socket,
 
 /* Std.Internal.UV.UDP.Socket.setMulticastInterface (socket : @& Socket) (interfaceAddr : @& IPAddr) : IO Unit */
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_set_multicast_interface(b_obj_arg socket, b_obj_arg interface_addr) {
+    note_effect_here("uses the network");
     lean_uv_udp_socket_object *udp_socket = lean_to_uv_udp_socket(socket);
 
     char interface_addr_str[INET6_ADDRSTRLEN];
@@ -603,6 +617,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_set_multicast_interface(b_obj_ar
 
 /* Std.Internal.UV.UDP.Socket.setTTL (socket : @& Socket) (ttl : UInt32) : IO Unit  */
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_udp_set_ttl(b_obj_arg socket, uint32_t ttl) {
+    note_effect_here("uses the network");
     lean_uv_udp_socket_object *udp_socket = lean_to_uv_udp_socket(socket);
 
     int result;

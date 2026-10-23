@@ -10,6 +10,7 @@ ownership of the solver object.
 */
 #include <lean/lean.h>
 #include "runtime/cadical.h"
+#include "runtime/object.h"
 
 #ifdef LEAN_CADICAL
 #include <vector>
@@ -32,6 +33,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_cadical_signature(lean_obj_arg /* u */)
 static lean_external_class * g_cadical_solver_external_class = nullptr;
 
 static void cadical_solver_finalizer(void * ptr) {
+    forget_object(ptr);
     delete static_cast<CaDiCaL::Solver *>(ptr);
 }
 
@@ -42,8 +44,11 @@ extern "C" void initialize_cadical() {
         lean_register_external_class(cadical_solver_finalizer, cadical_solver_foreach);
 }
 
+/* Every use of a solver goes through here: a solver is state, which another context's use reads or changes. */
 static inline CaDiCaL::Solver * to_solver(b_lean_obj_arg o) {
-    return static_cast<CaDiCaL::Solver *>(lean_get_external_data(o));
+    void * s = lean_get_external_data(o);
+    note_object_use(s, "uses a SAT solver another context created");
+    return static_cast<CaDiCaL::Solver *>(s);
 }
 
 static inline int to_lit(uint32_t lit) {
@@ -66,7 +71,9 @@ static inline lean_obj_res io_unit() { return lean_io_result_mk_ok(lean_box(0));
 
 /* Solver.new : BaseIO Solver */
 extern "C" LEAN_EXPORT lean_obj_res lean_cadical_solver_new() {
-    return lean_alloc_external(g_cadical_solver_external_class, new CaDiCaL::Solver());
+    CaDiCaL::Solver * s = new CaDiCaL::Solver();
+    note_object_created(s);
+    return lean_alloc_external(g_cadical_solver_external_class, s);
 }
 
 /* Solver.add (s : @& Solver) (lit : Int32) : BaseIO Unit */

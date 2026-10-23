@@ -16,6 +16,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 #include <unistd.h>
 #endif
 #include "runtime/io.h"
+#include "runtime/object.h"
 #include "runtime/object_ref.h"
 #include "runtime/thread.h"
 #include "util/name.h"
@@ -404,6 +405,7 @@ constexpr int64_t stamp_settle_sec = 2;
 
 /* The XXH3-128 hash of a file's bytes (`Lean.ModuleUsage.fileDigest`). */
 extern "C" LEAN_EXPORT obj_res lean_usage_file_digest(b_obj_arg path) {
+    note_path_read(lean_string_cstr(path));
     obj_res err;
     FILE * f = open_for_digest(path, err);
     if (f == nullptr) return err;
@@ -416,6 +418,7 @@ extern "C" LEAN_EXPORT obj_res lean_usage_file_digest(b_obj_arg path) {
 
 /* `Lean.ModuleUsage.fileStamp`: the stamp of the file at `path` (following symbolic links, as `open` does). */
 extern "C" LEAN_EXPORT obj_res lean_usage_file_stamp(b_obj_arg path) {
+    note_path_read(lean_string_cstr(path));
 #if defined(LEAN_WINDOWS)
     return io_result_mk_ok(mk_option_none());
 #else
@@ -432,6 +435,7 @@ extern "C" LEAN_EXPORT obj_res lean_usage_file_stamp(b_obj_arg path) {
 those bytes: the descriptor's stamp is the same before and after the read, and its status-change time lies at least
 `stamp_settle_sec` before the second `fstat`, so that no change in the same timestamp tick can follow unseen. */
 extern "C" LEAN_EXPORT obj_res lean_usage_file_digest_stamped(b_obj_arg path) {
+    note_path_read(lean_string_cstr(path));
     obj_res err;
     FILE * f = open_for_digest(path, err);
     if (f == nullptr) return err;
@@ -468,6 +472,7 @@ extern "C" LEAN_EXPORT obj_res lean_usage_file_digest_stamped(b_obj_arg path) {
 /* `Lean.ModuleUsage.readFileStamped`: the file's bytes, with the stamp of the file they were read from if it stands
 for them, as `lean_usage_file_digest_stamped` decides it. */
 extern "C" LEAN_EXPORT obj_res lean_usage_read_file_stamped(b_obj_arg path) {
+    note_path_read(lean_string_cstr(path));
     obj_res err;
     FILE * f = open_for_digest(path, err);
     if (f == nullptr) return err;

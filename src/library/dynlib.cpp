@@ -67,6 +67,8 @@ static inline void * symbol_ptr(b_obj_arg sym) {
 
 /* Dynlib.load : System.FilePath -> IO Dynlib */
 extern "C" LEAN_EXPORT obj_res lean_dynlib_load(b_obj_arg path) {
+    if (uint32 ctx = effect_context())
+        note_effect(ctx, std::string("loads the native library ") + string_cstr(path));
 #ifdef LEAN_WINDOWS
     HMODULE h = LoadLibrary(string_cstr(path));
     if (!h) {
@@ -114,6 +116,7 @@ extern "C" LEAN_EXPORT obj_res lean_dynlib_get(b_obj_arg dynlib, b_obj_arg name)
 
 /* Dynlib.Symbol.runAsInit : {Dynlib} -> Symbol -> IO Unit */
 extern "C" LEAN_EXPORT obj_res lean_dynlib_symbol_run_as_init(b_obj_arg /* dynlib */, b_obj_arg sym) {
+    note_effect_here("runs a native library's initializer");
     auto init_fn = reinterpret_cast<object *(*)(uint8_t)>(symbol_ptr(sym));
     return init_fn(1 /* builtin */);
 }

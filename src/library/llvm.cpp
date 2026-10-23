@@ -15,6 +15,7 @@ Lean's IR.
 
 #include "runtime/array_ref.h"
 #include "runtime/debug.h"
+#include "runtime/object.h"
 #include "runtime/string_ref.h"
 
 #ifdef LEAN_LLVM
@@ -245,6 +246,8 @@ extern "C" LEAN_EXPORT size_t lean_llvm_create_context() {
         false && ("Please build a version of Lean4 with -DLLVM=ON to invoke "
                   "the LLVM backend function."));
 #else
+    // the backend's objects are state that is not tracked by context, and it writes files
+    note_effect_here("uses the LLVM backend");
     LLVMContextRef ctx = LLVMContextCreate();
     return Context_to_lean(ctx);
 #endif  // LEAN_LLVM

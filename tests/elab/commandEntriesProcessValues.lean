@@ -6,7 +6,8 @@ a command. What the recorder itself looks up while writing the `.usage` is not r
 permit (`ModuleUsage.keepPermit`) requires every recorded value unchanged in the process that keeps: `E` read `FOO` in
 a command, `IV` read `BAR` in an imported module's initializer, so a reuse run with the same values keeps their
 commands and one with a changed, newly set or unset value is refused. A command reading a file outside the toolchain (a
-relative path, an absolute one, or one under the toolchain that resolves outside it) is still refused. -/
+relative path, an absolute one, or one under the toolchain that resolves outside it) is still refused, and an imported
+module's initializer reading a file makes the module `noreuse`. -/
 open Lean
 
 def runLean (dir : System.FilePath) (args : Array String) (env : Array (String × Option String) := #[]) :
@@ -91,6 +92,14 @@ initialize yBar : String ← return (← IO.getEnv \"BAR\").getD \"unset\"
 elab \"bar_term\" : term => return mkStrLit yBar
 "
 
+/-- an initializer that reads a file when the module is imported -/
+def zSource : String := "import Lean
+open Lean Elab Term
+
+initialize zData : String ← IO.FS.readFile \"data.txt\"
+elab \"data_term\" : term => return mkStrLit zData
+"
+
 def reuse (dir : System.FilePath) (m : String) (env : Array (String × Option String) := #[]) : IO Unit := do
   IO.print (← runLean dir #["--run", "Reuse.lean", dir.toString, s!"{m}.lean", s!"{m}.olean", s!"{m}.usage"] env).2
 
@@ -110,18 +119,22 @@ def noreuseReason (dir : System.FilePath) (m : String) : IO Unit := do
   IO.FS.writeFile (dir / "Reuse.lean") reuseSource
   IO.FS.writeFile (dir / "X.lean") xSource
   IO.FS.writeFile (dir / "Y.lean") ySource
+  IO.FS.writeFile (dir / "Z.lean") zSource
+  IO.FS.writeFile (dir / "data.txt") "one"
   IO.FS.writeFile (dir / "E.lean") "import X\ndef a : String := foo_term\ntheorem t : True := trivial\n"
   IO.FS.writeFile (dir / "Tc.lean") "import X\ndef b : Bool := toolchain_term\ntheorem t : True := trivial\n"
   IO.FS.writeFile (dir / "Es.lean") "import X\ndef c : Bool := escape_term\n"
   IO.FS.writeFile (dir / "Rel.lean") "import X\ndef d : Bool := relative_term\n"
   IO.FS.writeFile (dir / "IV.lean") "import Y\ndef v : String := bar_term\n"
+  IO.FS.writeFile (dir / "IF.lean") "import Z\ndef w : String := data_term\n"
   IO.FS.writeFile (dir / "Pl.lean") "import X\ndef p : Nat := 1\n"
-  for m in ["X", "Y"] do compile dir m
+  for m in ["X", "Y", "Z"] do compile dir m
   compile dir "E" #[("FOO", some "1")]
   compile dir "Tc"
   compile dir "Es"
   compile dir "Rel"
   compile dir "IV" #[("BAR", some "1")]
+  compile dir "IF"
   compile dir "Pl"
   IO.println "the process values recorded:"
   valueKeys dir "E"
@@ -143,3 +156,5 @@ def noreuseReason (dir : System.FilePath) (m : String) : IO Unit := do
   IO.println "BAR read by an imported module's initializer, BAR=1 as when IV was compiled, then BAR=2:"
   reuse dir "IV" #[("BAR", some "1")]
   reuse dir "IV" #[("BAR", some "2")]
+  IO.println "a file read by an imported module's initializer:"
+  noreuseReason dir "IF"

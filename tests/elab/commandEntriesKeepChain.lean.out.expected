@@ -23,7 +23,7 @@ plainUnchecked: 10 commands, 6 kept, refused #[0, 1, 4, 7], 0 differences
   command 0 refused: #[a write to plainExt, neither persistent nor a command cache]
   command 1 refused: #[a write to plainSyncExt, neither persistent nor a command cache]
   command 4 refused: #[a declaration the kernel added without checking it]
-  command 7 refused: #[the attribute ref_tag, whose handlers may run code outside core Lean, an effect outside the command: it writes a reference no command created]
+  command 7 refused: #[the attribute ref_tag, whose handlers may run code outside core Lean, an effect outside the command: it writes a reference an imported module's initializer created]
 uncheckedOption: 3 commands, 2 kept, refused #[0], 0 differences
   command 0 refused: #[a declaration the kernel added without checking it]
 ax1 : @Prop Prop

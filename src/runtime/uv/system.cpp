@@ -4,6 +4,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 Author: Sofia Rodrigues
 */
 #include <climits>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include "runtime/uv/system.h"
@@ -23,6 +24,7 @@ typedef struct {
 
 // Std.Internal.UV.System.getProcessTitle : IO String
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_get_process_title() {
+    note_effect_here("reads the process title");
     char title[512];
     int result = uv_get_process_title(title, sizeof(title));
 
@@ -36,6 +38,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_get_process_title() {
 
 // Std.Internal.UV.System.setProcessTitle : @& String → IO Unit
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_set_process_title(b_obj_arg title) {
+    note_effect_here("sets the process title");
     const char* title_str = lean_string_cstr(title);
     if (strlen(title_str) != lean_string_size(title) - 1) {
         return mk_embedded_nul_error(title);
@@ -78,6 +81,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_getppid() {
 
 // Std.Internal.UV.System.cpuInfo : IO (Array CPUInfo)
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_cpu_info() {
+    note_effect_here("reads the processors' description");
     uv_cpu_info_t* cpu_infos;
     int count;
 
@@ -134,11 +138,14 @@ static lean_obj_res get_uv_string(int (*get)(char *, size_t *)) {
 
 // Std.Internal.UV.System.cwd : IO String
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_cwd() {
-    return get_uv_string(uv_cwd);
+    lean_obj_res r = get_uv_string(uv_cwd);
+    if (lean_io_result_is_ok(r)) note_value_read("workingDirectory", lean_string_cstr(lean_io_result_get_value(r)));
+    return r;
 }
 
 // Std.Internal.UV.System.chdir : @& String → IO Unit
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_chdir(b_obj_arg path) {
+    note_effect_here("changes the working directory");
     const char* path_str = lean_string_cstr(path);
     if (strlen(path_str) != lean_string_size(path) - 1) {
         return mk_embedded_nul_error(path);
@@ -155,16 +162,19 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_chdir(b_obj_arg path) {
 
 // Std.Internal.UV.System.osHomedir : IO String
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_homedir() {
+    note_effect_here("reads the home directory");
     return get_uv_string(uv_os_homedir);
 }
 
 // Std.Internal.UV.System.osTmpdir : IO String
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_tmpdir() {
+    note_effect_here("reads the temporary directory");
     return get_uv_string(uv_os_tmpdir);
 }
 
 // Std.Internal.UV.System.osGetPasswd : IO PasswdInfo
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_get_passwd() {
+    note_effect_here("reads the user database");
     uv_passwd_t passwd;
 
     int result = uv_os_get_passwd(&passwd);
@@ -193,6 +203,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_get_passwd() {
 
 // Std.Internal.UV.System.osGetGroup : IO (Option GroupInfo)
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_get_group(uint64_t gid) {
+    note_effect_here("reads the group database");
 #if UV_VERSION_HEX >= 0x012D00
     uv_group_t group;
     int result = uv_os_get_group(&group, gid);
@@ -237,6 +248,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_get_group(uint64_t gid) {
 
 // Std.Internal.UV.System.osEnviron : IO (Array (String × String))
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_environ() {
+    note_effect_here("reads the whole environment");
     uv_env_item_t* env;
     int count;
     int result = uv_os_environ(&env, &count);
@@ -269,6 +281,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_getenv(b_obj_arg name) {
     if (strlen(name_str) != lean_string_size(name) - 1) {
         return lean_io_result_mk_ok(lean_box(0));
     }
+    note_value_read(std::string("env:") + name_str, std::getenv(name_str));
     char stack_buffer[1024];
     size_t size = sizeof(stack_buffer);
 
@@ -310,6 +323,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_getenv(b_obj_arg name) {
 
 // Std.Internal.UV.System.osSetenv : @& String → @& String → IO Unit
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_setenv(b_obj_arg name, b_obj_arg value) {
+    note_effect_here("writes an environment variable");
     const char* name_str = lean_string_cstr(name);
     const char* value_str = lean_string_cstr(value);
     if (strlen(name_str) != lean_string_size(name) - 1) {
@@ -330,6 +344,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_setenv(b_obj_arg name, b_obj_arg 
 
 // Std.Internal.UV.System.osUnsetenv : @& String → IO Unit
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_unsetenv(b_obj_arg name) {
+    note_effect_here("writes an environment variable");
     const char* name_str = lean_string_cstr(name);
     if (strlen(name_str) != lean_string_size(name) - 1) {
         return mk_embedded_nul_error(name);
@@ -346,6 +361,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_unsetenv(b_obj_arg name) {
 
 // Std.Internal.UV.System.osGetHostname : IO String
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_gethostname() {
+    note_effect_here("reads the host name");
     char hostname[256];
     size_t size = sizeof(hostname);
 
@@ -361,6 +377,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_gethostname() {
 
 // Std.Internal.UV.System.osGetPriority : UInt64 → IO Int64
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_getpriority(uint64_t pid) {
+    note_effect_here("reads a process priority");
     int priority;
 
     int result = uv_os_getpriority(pid, &priority);
@@ -374,6 +391,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_getpriority(uint64_t pid) {
 
 // Std.Internal.UV.System.osSetPriority : UInt64 → Int64 → IO Unit
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_setpriority(uint64_t pid, int64_t priority) {
+    note_effect_here("sets a process priority");
     if (priority < INT_MIN || priority > INT_MAX) {
         return io_result_mk_uv_error(UV_EINVAL);
     }
@@ -389,6 +407,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_setpriority(uint64_t pid, int64_t
 
 // Std.Internal.UV.System.osUname : IO UnameInfo
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_uname() {
+    note_effect_here("reads the operating system's description");
     uv_utsname_t uname_info;
 
     int result = uv_os_uname(&uname_info);
@@ -516,6 +535,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_exepath() {
         return io_result_mk_uv_error(result);
     }
 
+    note_value_read("appPath", buffer);
     lean_object* path = lean_mk_string(buffer);
     return lean_io_result_mk_ok(path);
 }

@@ -3,11 +3,12 @@ import Lean
 payload carries and a later command may read: a write to an `IO.Ref` it did not create (one an imported module's
 initializer created, also on a worker thread or held in an extension's initial state; one core created, such as
 `IO.stdGenRef`; one another command created), the resolution of a promise and the cancellation of a task another
-command created, and a use of process-wide state through the runtime's primitives (a file it did not create, or one it
-created and left in place, a child process; the runtime's settings, which only compiled code can change, in
-`usagePluginAttribute`). Reading a reference, writing one the command itself creates, output its elaboration captures,
-a temporary file it creates and removes, and reading the environment or the working directory (whose values the module
-records, `commandEntriesProcessValues`) are not effects. -/
+command created, the use of a SAT solver another command created, and a use of process-wide state through the
+runtime's primitives (a file it did not create, among them an `.olean` read whole, or one it created and left in place;
+a child process; the environment written; the host name; the network; the runtime's settings, which only compiled code
+can change, in `usagePluginAttribute`). Reading a reference, writing one the command itself creates, output its
+elaboration captures, a temporary file it creates and removes, a solver it creates, and reading the environment or the
+working directory (whose values the module records, `commandEntriesProcessValues`) are not effects. -/
 open Lean
 
 def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
@@ -16,6 +17,8 @@ def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
     throw <| IO.userError s!"lean {args} failed ({out.exitCode}):\n{out.stdout}\n{out.stderr}"
 
 def xSource : String := "import Lean
+import Std.Internal.UV.System
+import Std.Internal.UV.TCP
 open Lean Elab Tactic Command Term
 
 initialize tacticRef : IO.Ref Nat ← IO.mkRef 0
@@ -83,6 +86,24 @@ elab \"get_env\" : command => discard <| IO.getEnv \"HOME\"
 elab \"get_cwd\" : command => discard <| IO.currentDir
 elab \"spawn\" : command => discard <| IO.Process.output { cmd := \"true\" }
 elab \"print_out\" : command => IO.println \"captured\"
+elab \"read_olean\" : command => discard <| readModuleData \"X.olean\"
+elab \"uv_getenv\" : command => discard <| Std.Internal.UV.System.osGetenv \"HOME\"
+elab \"uv_setenv\" : command => Std.Internal.UV.System.osSetenv \"DECL2_EFFECTS_TEST\" \"1\"
+elab \"uv_hostname\" : command => discard Std.Internal.UV.System.osGetHostname
+elab \"tcp_new\" : command => discard Std.Internal.UV.TCP.Socket.new
+
+/-- a SAT solver a command keeps in an extension's state, for a later command to use -/
+initialize solverExt : EnvExtension (Option Lean.Cadical.Internal.Solver) ← registerEnvExtension (pure none)
+elab \"make_solver\" : command => do
+  let s ← Lean.Cadical.Internal.Solver.new
+  modifyEnv (solverExt.setState · (some s))
+elab \"use_solver\" : command => do
+  if let some s := solverExt.getState (← getEnv) then Lean.Cadical.Internal.Solver.add s 1
+elab \"own_solver\" : command => do
+  let s ← Lean.Cadical.Internal.Solver.new
+  Lean.Cadical.Internal.Solver.add s 1
+  Lean.Cadical.Internal.Solver.add s 0
+  discard s.solve
 "
 
 def mSource : String := "import X
@@ -110,6 +131,14 @@ get_env
 get_cwd
 spawn
 print_out
+read_olean
+uv_getenv
+uv_setenv
+uv_hostname
+tcp_new
+make_solver
+use_solver
+own_solver
 "
 
 #eval IO.FS.withTempDir fun dir => do

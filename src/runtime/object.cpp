@@ -1354,6 +1354,8 @@ extern "C" LEAN_EXPORT obj_res lean_io_promise_new() {
 }
 
 void note_task_owner(uint32 ctx, lean_task_object * t, char const * what) {
+    // what imported modules' initializers do in the process follows from the imported modules
+    if (ctx == import_context) return;
     lean_task_imp * imp = t->m_imp;
     if (imp == nullptr) return;
     uint32 owner = imp->m_context;
