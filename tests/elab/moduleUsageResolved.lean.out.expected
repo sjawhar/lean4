@@ -15,6 +15,7 @@ P unrelated: true P gains a: false
 truncated: truncated
 trailing: trailing bytes
 duplicate: two entries of the identity ced2a81aec1f310df34ddf3620430fc4
+resolvedId = Enc.name: true
 version (some 14) resolved field false
 digest matches true none group true
 own name true
