@@ -154,6 +154,17 @@ def internalPrefixes (n : Name) : Array Name := Id.run do
     out := out.push c
   return out
 
+/-- `ps` with `internalPrefixes x`. The walk stops at the first prefix `ps` holds, since the prefixes after it are that
+prefix's own `internalPrefixes`: the result holds every name's `internalPrefixes` if each name `ps` held before the
+first call is passed here too. -/
+def addInternalPrefixes (ps : NameHashSet) (x : Name) : NameHashSet := Id.run do
+  let mut ps : Std.HashSet Name := ps
+  for p in internalPrefixes x do
+    let (had, ps') := ps.containsThenInsert p
+    ps := ps'
+    if had then break
+  return ps
+
 /-- The entries that open a module's digest payload in its `.olean`, before the module's digests sorted by name
 (`Markers.entries`). Their name is never looked up, so no user constant can collide with it. -/
 structure Markers where
@@ -385,11 +396,13 @@ def setLocalDigests (env : Environment) (own : Array (Name × Digest)) (closure 
     ({ · with localDigests? := some (own, { closure, provides := providesDigestOf provides indirect }) })
   providesExt.modifyState (asyncMode := .mainOnly) env fun _ => some provides
 
-/-- The imported constants the compiler reads by a name derived from `x` when it compiles a use of `x`: `x`'s derived
-constants (`derivedSuffixes`) and the prefixes whose attributes it reads with `x`'s (`internalPrefixes`). -/
-def derivedReads (env : Environment) (x : Name) : Array Name :=
-  (derivedSuffixes.toArray.map x.str ++ internalPrefixes x).filter fun d =>
-    (env.getModuleIdxFor? d).isSome && env.contains d
+/-- The imported constants the compiler reads by a name derived from one of `xs` when it compiles a use of it: each
+one's derived constants (`derivedSuffixes`) and the prefixes whose attributes it reads with its own
+(`internalPrefixes`). Each name is looked up once. -/
+def derivedReads (env : Environment) (xs : NameSet) : Array Name :=
+  let (derived, prefixes) := xs.foldl (init := (#[], ({} : NameHashSet))) fun (ds, ps) x =>
+    (derivedSuffixes.foldl (fun ds s => ds.push (x.str s)) ds, addInternalPrefixes ps x)
+  (derived ++ (prefixes : Std.HashSet Name).toArray).filter fun d => (env.getModuleIdxFor? d).isSome && env.contains d
 
 /-- Per module, sorted: each imported node the current module depends on, with its digest in that module. The nodes
 are the `State.usedNodes` of every imported name that the current module's nodes refer to or that is in `extra`, and
@@ -404,8 +417,7 @@ def moduleUsed (env : Environment) (extra : NameSet) (nodes := ownNodes env (own
   let used := extra.foldl (init := (∅ : NameSet)) fun u x => (s.usedNodes env x).foldl (·.insert ·) u
   let used := nodes.foldl (init := used) fun u n => n.refs.foldl (·.insert ·) u
   let sources := nodes.foldl (·.insert ·.name) (extra.foldl (·.insert ·) used)
-  let used := sources.foldl (init := used) fun u x =>
-    (derivedReads env x).foldl (fun u d => (s.usedNodes env d).foldl (·.insert ·) u) u
+  let used := (derivedReads env sources).foldl (fun u d => (s.usedNodes env d).foldl (·.insert ·) u) used
   let used := env.getImportedKernelDuplicates.foldl (·.insert ·.1) used
   let push (m : Std.HashMap Name (Array (Name × Digest))) (i : ModuleIdx) (c : Name) :=
     match s.findAt? i c with
@@ -426,23 +438,30 @@ unsafe structure WalkState where
   mctx : MetavarContext := {}
   used : NameSet
 
+/-- Whether `e` was visited, marking it visited. -/
+@[inline] unsafe def WalkState.visit (s : WalkState) (e : Expr) : Bool × WalkState :=
+  if e.hasMVar then
+    let (seen, opened) := s.opened.containsThenInsert { value := e }
+    (seen, { s with opened })
+  else
+    let (seen, closed) := s.closed.containsThenInsert { value := e }
+    (seen, { s with closed })
+
+/-- `s` with `c` used. -/
+@[inline] unsafe def WalkState.use (s : WalkState) (c : Name) : WalkState :=
+  { s with used := s.used.insert c }
+
 /-- Adds the constants of `e` with its metavariables instantiated by `s.mctx`, following assignments in place
 of building the instantiated term. -/
 unsafe def walkExpr (e : Expr) : StateM WalkState Unit := do
-  let s ← get
-  if e.hasMVar then
-    if s.opened.contains e then return
-    set { s with opened := s.opened.insert e }
-  else
-    if s.closed.contains e then return
-    set { s with closed := s.closed.insert e }
+  if ← modifyGet (·.visit e) then return
   match e with
   | .forallE _ d b _ | .lam _ d b _ => walkExpr d; walkExpr b
   | .letE _ t v b _ => walkExpr t; walkExpr v; walkExpr b
   | .app f a => walkExpr f; walkExpr a
   | .mdata _ b => walkExpr b
-  | .proj n _ b => modify (fun s => { s with used := s.used.insert n }); walkExpr b
-  | .const c _ => modify fun s => { s with used := s.used.insert c }
+  | .proj n _ b => modify (·.use n); walkExpr b
+  | .const c _ => modify (·.use c)
   | .mvar m =>
     let mctx := (← get).mctx
     if let some v := mctx.getExprAssignmentCore? m then walkExpr v
@@ -455,7 +474,7 @@ unsafe def usedFromInfoTreesImpl (trees : Array Elab.InfoTree) (init : NameSet) 
       unless ptrEq (← get).mctx ctx.mctx do
         modify fun s => { s with mctx := ctx.mctx, opened := mkPtrSet }
       walkExpr ti.expr
-    | .ofFieldInfo fi => modify fun s => { s with used := s.used.insert fi.projName }
+    | .ofFieldInfo fi => modify (·.use fi.projName)
     | _ => pure ()
   (walk.run { used := init }).2.used
 
@@ -712,7 +731,7 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
   let names : NameHashSet := (← resolvedNames).foldl (·.insert ·) {}
   let names := nodes.foldl (fun s n => n.refs.foldl (·.insert ·) s) (used.foldl (·.insert ·) names)
   let names := env.getImportedKernelDuplicates.foldl (·.insert ·.1) names
-  let names := (names : Std.HashSet Name).fold (fun s x => (internalPrefixes x).foldl (·.insert ·) s) names
+  let names := (names : Std.HashSet Name).fold addInternalPrefixes names
   let j := Json.mkObj [("version", usageVersion), ("noskip", incrLoaded),
     ("moduleDigest", toJson (moduleDigestOf own)),
     ("closure", toJson closure),
