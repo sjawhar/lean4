@@ -170,9 +170,10 @@ def recordDeclConsts (decl : Declaration) : BaseIO Unit := do
   let some vals := declConstVals decl | do
     let used := decl.foldExprM (m := Id) (fun s e => e.foldConsts s fun c s => s.insert c) ({} : NameSet)
     usedByChecksRef.modify fun acc => used.foldl (·.insert ·) acc
+  -- one walk of type and value, so that a subterm they share is visited once
   let recs := vals.map fun (n, type, value?) =>
-    let s := type.foldConsts ({} : NameSet) fun c s => s.insert c
-    (n, ({ type, value?, consts := value?.elim s fun v => v.foldConsts s fun c s => s.insert c } : DeclConsts))
+    let consts := (value?.elim type (.app type ·)).foldConsts ({} : NameSet) fun c s => s.insert c
+    (n, ({ type, value?, consts } : DeclConsts))
   usedByChecksRef.modify fun acc => recs.foldl (fun acc (_, r) => r.consts.foldl (·.insert ·) acc) acc
   declConstsRef.modify fun m => recs.foldl (fun m (n, r) => m.insert n r) m
 
