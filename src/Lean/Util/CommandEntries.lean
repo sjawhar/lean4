@@ -164,24 +164,351 @@ structure CommandEntries where
   refusals : Array Refusal := #[]
   deriving Nonempty
 
+/-- The form a module's command payloads take in its `.olean` (`commandEntriesExt` exports one, `CommandEntries.pack`):
+all of them written in one pass into a byte string of unsigned LEB128 numbers (tags, counts, counters, the indices of
+extension names) and arrays of the objects those refer to. The `.olean` holds a few objects for them instead of each
+payload's tree of small ones, and refers to the objects the payloads share with the rest of the module (names, entries)
+instead of repeating them. A part whose entries are the same array as an earlier part of its payload's (a realization
+context's states mostly are its command's after-states, whose delta the recorder computes once) is written as a
+reference to it, which unpacks to the same array again. `PackedPayloads.unpack` reads them back. -/
+structure PackedPayloads where
+  bytes : ByteArray := .empty
+  /-- The distinct names of the extensions, scoped stacks and command caches parts are recorded for, indexed from
+  `bytes`. -/
+  parts : Array Name := #[]
+  /-- The other names, in order: added constants, realizations, declaration-log entries, constant generations. -/
+  names : Array Name := #[]
+  entries : Array EnvExtensionEntry := #[]
+  options : Array Options := #[]
+  refusals : Array Refusal := #[]
+  synthSet : Array (Meta.SynthInstanceCacheKey × List Meta.SynthInstanceCacheEntry) := #[]
+  synthErased : Array Meta.SynthInstanceCacheKey := #[]
+  deriving Inhabited
+
+namespace PackedPayloads
+
+private def kindToNat : ConstantKind → Nat
+  | .defn => 0 | .thm => 1 | .axiom => 2 | .opaque => 3 | .quot => 4 | .induct => 5 | .ctor => 6 | .recursor => 7
+
+private def kindOfNat? : Nat → Option ConstantKind
+  | 0 => some .defn | 1 => some .thm | 2 => some .axiom | 3 => some .opaque | 4 => some .quot | 5 => some .induct
+  | 6 => some .ctor | 7 => some .recursor | _ => none
+
+/-- `b` followed by `n` in unsigned LEB128. -/
+private partial def pushNat (b : ByteArray) (n : Nat) : ByteArray :=
+  if n < 128 then b.push n.toUInt8 else pushNat (b.push (n % 128 + 128).toUInt8) (n / 128)
+
+/-- The packing so far, its arrays at top level so that each push updates an unshared array in place. -/
+private structure Writer where
+  bytes : ByteArray := .emptyWithCapacity 4096
+  parts : Array Name := #[]
+  partIdx : Std.HashMap Name Nat := {}
+  names : Array Name := #[]
+  entries : Array EnvExtensionEntry := #[]
+  options : Array Options := #[]
+  refusals : Array Refusal := #[]
+  synthSet : Array (Meta.SynthInstanceCacheKey × List Meta.SynthInstanceCacheEntry) := #[]
+  synthErased : Array Meta.SynthInstanceCacheKey := #[]
+  /-- The last `CountersDelta.extGens` written: a counters record with equal generations writes only a marker. -/
+  lastExtGens : Array Nat := #[]
+  /-- The parts of the payload being written so far, in order, which a later part with the same entries refers to. -/
+  cmdParts : Array (Name × Array EnvExtensionEntry) := #[]
+
+private abbrev W := StateM Writer
+
+/-- Whether `a` and `b` are the same array object. Not equal elements: a payload read back from an `.olean` shares the
+objects its compaction merged, so comparing elements would pack it in another form than the run that recorded it. -/
+private unsafe def sameEntriesImpl (a b : Array EnvExtensionEntry) : Bool :=
+  ptrAddrUnsafe a == ptrAddrUnsafe b
+
+@[implemented_by sameEntriesImpl]
+private opaque sameEntries (a b : Array EnvExtensionEntry) : Bool
+
+@[inline] private def nat (n : Nat) : W Unit :=
+  modify fun w => { w with bytes := pushNat w.bytes n }
+
+@[inline] private def name (n : Name) : W Unit :=
+  modify fun w => { w with names := w.names.push n }
+
+private def nameArray (ns : Array Name) : W Unit := do
+  nat ns.size
+  modify fun w => { w with names := w.names ++ ns }
+
+private def part (n : Name) : W Unit := do
+  let w ← get
+  match w.partIdx[n]? with
+  | some i => nat i
+  | none =>
+    let i := w.parts.size
+    set { w with parts := w.parts.push n, partIdx := w.partIdx.insert n i }
+    nat i
+
+/-- Each part: its extension's index, then `0` and the position of an earlier part of the payload with the same entries,
+or the number of its entries plus one and the entries. -/
+private def partArray (ps : Array (Name × Array EnvExtensionEntry)) : W Unit := do
+  nat ps.size
+  for (n, es) in ps do
+    part n
+    let earlier := (← get).cmdParts.findIdx? fun (n', es') => n' == n && sameEntries es es'
+    match earlier with
+    | some j => nat 0; nat j
+    | none =>
+      nat (es.size + 1)
+      modify fun w => { w with entries := w.entries ++ es }
+    modify fun w => { w with cmdParts := w.cmdParts.push (n, es) }
+
+private def views (st : ViewStates) : W Unit := do
+  partArray st.entries
+  partArray st.scopedOps
+  partArray st.caches
+
+private def counters (c : CountersDelta) : W Unit := do
+  nat c.trackedGen
+  if c.extGens == (← get).lastExtGens then
+    nat 0
+  else
+    nat (c.extGens.size + 1)
+    for g in c.extGens do nat g
+    modify fun w => { w with lastExtGens := c.extGens }
+  nat c.constGen
+  nat c.recordingConstGen
+  nat c.declChangesAdded.length
+  for n in c.declChangesAdded do name n
+  nat c.constAddedGens.size
+  for (n, g) in c.constAddedGens do
+    name n
+    nat g
+  nat (c.synthTierGen?.map (· + 1) |>.getD 0)
+  nat c.synthTierSet.size
+  modify fun w => { w with synthSet := w.synthSet ++ c.synthTierSet }
+  nat c.synthTierErased.size
+  modify fun w => { w with synthErased := w.synthErased ++ c.synthTierErased }
+
+private partial def added : AddedConst → W Unit
+  | .plain n => do nat 0; name n
+  | .async n k? states nested => do
+    nat 1; name n
+    nat (k?.map (kindToNat · + 1) |>.getD 0)
+    views states
+    nat nested.size
+    for a in nested do added a
+  | .realization forConst key consts states merges => do
+    nat 2; name forConst; name key; nameArray consts; views states
+    nat merges.size
+    for (f, k) in merges do name f; name k
+  | .merged forConst key consts => do
+    nat 3; name forConst; name key; nameArray consts
+  | .context forConst opts main checked c => do
+    nat 4; name forConst
+    modify fun w => { w with options := w.options.push opts }
+    views main; views checked; counters c
+
+private def entry (ce : CommandEntries) : W Unit := do
+  modify fun w => { w with cmdParts := #[] }
+  nat ce.idx
+  views ce.main
+  views ce.checked
+  nat ce.added.size
+  for a in ce.added do added a
+  counters ce.counters
+  nat ce.refusals.size
+  modify fun w => { w with refusals := w.refusals ++ ce.refusals }
+
+end PackedPayloads
+
+/-- `ces` as a module's `.olean` stores them (`PackedPayloads`). -/
+def CommandEntries.pack (ces : Array CommandEntries) : PackedPayloads :=
+  let w := ((do PackedPayloads.nat ces.size; for ce in ces do PackedPayloads.entry ce) : PackedPayloads.W Unit).run {}
+    |>.2
+  { bytes := w.bytes, parts := w.parts, names := w.names, entries := w.entries, options := w.options,
+    refusals := w.refusals, synthSet := w.synthSet, synthErased := w.synthErased }
+
+namespace PackedPayloads
+
+/-- How far `unpack` has read each part of the packing. -/
+private structure Reader where
+  pos : Nat := 0
+  names : Nat := 0
+  entries : Nat := 0
+  options : Nat := 0
+  refusals : Nat := 0
+  synthSet : Nat := 0
+  synthErased : Nat := 0
+  lastExtGens : Array Nat := #[]
+  /-- The parts of the payload being read so far (`partArray`). -/
+  cmdParts : Array (Array EnvExtensionEntry) := #[]
+
+private abbrev R := ReaderT PackedPayloads (StateT Reader (Except String))
+
+private def readNat : R Nat := do
+  let b := (← read).bytes
+  let rec go (pos acc shift : Nat) : Except String (Nat × Nat) :=
+    if h : pos < b.size then
+      let byte := b[pos]
+      let acc := acc + (byte.toNat % 128) * 2 ^ shift
+      if byte < 128 then .ok (acc, pos + 1) else go (pos + 1) acc (shift + 7)
+    else .error "the packed payloads end inside a number"
+  termination_by b.size - pos
+  let (n, pos) ← go (← getThe Reader).pos 0 0
+  modifyThe Reader ({ · with pos })
+  return n
+
+/-- `xs[i:i+n]`, or an error naming `what` if `xs` is shorter. -/
+private def slice {α : Type} (xs : Array α) (i n : Nat) (what : String) : Except String (Array α) :=
+  if i + n ≤ xs.size then .ok (xs.extract i (i + n)) else .error s!"the packed payloads hold too few {what}"
+
+private def readName : R Name := do
+  let r ← getThe Reader
+  let some n := (← read).names[r.names]? | throw "the packed payloads hold too few names"
+  set { r with names := r.names + 1 }
+  return n
+
+private def readNames : R (Array Name) := do
+  let n ← readNat
+  let r ← getThe Reader
+  let ns ← slice (← read).names r.names n "names"
+  set { r with names := r.names + n }
+  return ns
+
+private def readParts : R (Array (Name × Array EnvExtensionEntry)) := do
+  let n ← readNat
+  let mut out := Array.emptyWithCapacity n
+  for _ in [0:n] do
+    let some ext := (← read).parts[← readNat]? | throw "a part index of the packed payloads is out of range"
+    let es ← match ← readNat with
+      | 0 => do
+        let some es := (← getThe Reader).cmdParts[← readNat]? |
+          throw "a part of the packed payloads refers to a part after it"
+        pure es
+      | k + 1 => do
+        let r ← getThe Reader
+        let es ← slice (← read).entries r.entries k "entries"
+        set { r with entries := r.entries + k }
+        pure es
+    modifyThe Reader fun r => { r with cmdParts := r.cmdParts.push es }
+    out := out.push (ext, es)
+  return out
+
+private def readViews : R ViewStates := do
+  return { entries := ← readParts, scopedOps := ← readParts, caches := ← readParts }
+
+private def readCounters : R CountersDelta := do
+  let trackedGen ← readNat
+  let extGens ← match ← readNat with
+    | 0 => pure (← getThe Reader).lastExtGens
+    | k + 1 => do
+      let mut gs := Array.emptyWithCapacity k
+      for _ in [0:k] do gs := gs.push (← readNat)
+      modifyThe Reader ({ · with lastExtGens := gs })
+      pure gs
+  let constGen ← readNat
+  let recordingConstGen ← readNat
+  let declChangesAdded := (← readNames).toList
+  let n ← readNat
+  let mut constAddedGens := Array.emptyWithCapacity n
+  for _ in [0:n] do constAddedGens := constAddedGens.push (← readName, ← readNat)
+  let synthTierGen? := match ← readNat with | 0 => none | g + 1 => some g
+  let k ← readNat
+  let r ← getThe Reader
+  let synthTierSet ← slice (← read).synthSet r.synthSet k "synthesis cache bindings"
+  set { r with synthSet := r.synthSet + k }
+  let k ← readNat
+  let r ← getThe Reader
+  let synthTierErased ← slice (← read).synthErased r.synthErased k "synthesis cache keys"
+  set { r with synthErased := r.synthErased + k }
+  return { trackedGen, extGens, constGen, recordingConstGen, declChangesAdded, constAddedGens, synthTierGen?,
+           synthTierSet, synthTierErased }
+
+private partial def readAdded : R AddedConst := do
+  match ← readNat with
+  | 0 => return .plain (← readName)
+  | 1 =>
+    let n ← readName
+    let k? ← match ← readNat with
+      | 0 => pure none
+      | k + 1 => match kindOfNat? k with
+        | some k => pure (some k)
+        | none => throw "a constant kind of the packed payloads is out of range"
+    let states ← readViews
+    let m ← readNat
+    let mut nested := Array.emptyWithCapacity m
+    for _ in [0:m] do nested := nested.push (← readAdded)
+    return .async n k? states nested
+  | 2 =>
+    let forConst ← readName
+    let key ← readName
+    let consts ← readNames
+    let states ← readViews
+    let m ← readNat
+    let mut merges := Array.emptyWithCapacity m
+    for _ in [0:m] do merges := merges.push (← readName, ← readName)
+    return .realization forConst key consts states merges
+  | 3 => return .merged (← readName) (← readName) (← readNames)
+  | 4 =>
+    let forConst ← readName
+    let r ← getThe Reader
+    let some opts := (← read).options[r.options]? | throw "the packed payloads hold too few options"
+    set { r with options := r.options + 1 }
+    return .context forConst opts (← readViews) (← readViews) (← readCounters)
+  | _ => throw "an added-constant tag of the packed payloads is out of range"
+
+private def readEntry : R CommandEntries := do
+  modifyThe Reader ({ · with cmdParts := #[] })
+  let idx ← readNat
+  let main ← readViews
+  let checked ← readViews
+  let n ← readNat
+  let mut added := Array.emptyWithCapacity n
+  for _ in [0:n] do added := added.push (← readAdded)
+  let counters ← readCounters
+  let k ← readNat
+  let r ← getThe Reader
+  let refusals ← slice (← read).refusals r.refusals k "refusals"
+  set { r with refusals := r.refusals + k }
+  return { idx, main, checked, added, counters, refusals }
+
+/-- The payloads `p` holds (`CommandEntries.pack`), or why `p` is not a packing of payloads: it ends early, an index or
+a tag is out of range, or something is left over. -/
+def unpack (p : PackedPayloads) : Except String (Array CommandEntries) := do
+  let act : R (Array CommandEntries) := do
+    let n ← readNat
+    let mut out := Array.emptyWithCapacity n
+    for _ in [0:n] do out := out.push (← readEntry)
+    let r ← getThe Reader
+    unless r.pos == p.bytes.size && r.names == p.names.size && r.entries == p.entries.size &&
+        r.options == p.options.size && r.refusals == p.refusals.size && r.synthSet == p.synthSet.size &&
+        r.synthErased == p.synthErased.size do
+      throw "the packed payloads hold more than their payloads"
+    return out
+  return (← (act.run p).run {}).1
+
+end PackedPayloads
+
 builtin_initialize commandEntriesExt :
-    PersistentEnvExtension CommandEntries CommandEntries (Array CommandEntries) ←
+    PersistentEnvExtension PackedPayloads CommandEntries (Array CommandEntries) ←
   registerPersistentEnvExtension {
     mkInitial := pure #[]
     addImportedFn := fun _ => pure #[]
     addEntryFn := Array.push
     exportEntriesFnEx := fun _ entries =>
-      { exported := #[], server := #[], «private» := entries }
+      { exported := #[], server := #[], «private» := if entries.isEmpty then #[] else #[CommandEntries.pack entries] }
     asyncMode := .mainOnly
     perCommand := .recorder
   }
 
-private unsafe def ofModuleDataImpl (md : ModuleData) : Array CommandEntries :=
-  ((md.entries.find? (·.1 == commandEntriesExt.name)).map (·.2.map unsafeCast)).getD #[]
+private unsafe def ofModuleDataImpl? (md : ModuleData) : Except String (Array CommandEntries) :=
+  match md.entries.find? (·.1 == commandEntriesExt.name) with
+  | none => .ok #[]
+  | some (_, #[p]) => (unsafeCast p : PackedPayloads).unpack
+  | some (_, es) => .error s!"the `.olean` holds {es.size} packings of command payloads"
 
-/-- The command payloads a module's `.olean` data holds. -/
-@[implemented_by ofModuleDataImpl]
-opaque CommandEntries.ofModuleData (md : ModuleData) : Array CommandEntries
+/-- The command payloads a module's `.olean` data holds (`PackedPayloads.unpack`), or why they cannot be read. -/
+@[implemented_by ofModuleDataImpl?]
+opaque CommandEntries.ofModuleData? (md : ModuleData) : Except String (Array CommandEntries)
+
+/-- The command payloads a module's `.olean` data holds; none if they cannot be read (`ofModuleData?`). -/
+def CommandEntries.ofModuleData (md : ModuleData) : Array CommandEntries :=
+  (ofModuleData? md).toOption.getD #[]
 
 private abbrev ErasedPersistentEnvExtension :=
   PersistentEnvExtension EnvExtensionEntry EnvExtensionEntry EnvExtensionState
@@ -683,7 +1010,7 @@ structure KeepPermit where
   module : Name
   /-- The module's `.olean` data, read by `ModuleUsage.keepPermit`. -/
   data : ModuleData
-  /-- The module's command payloads (`CommandEntries.ofModuleData data`), the only ones a keep with the permit takes. -/
+  /-- The module's command payloads (`CommandEntries.ofModuleData? data`), the only ones a keep with the permit takes. -/
   payloads : Array CommandEntries
   /-- The imported module data of the environment the permit was checked in (`EnvironmentHeader.moduleData`). -/
   private imports : Array ModuleData

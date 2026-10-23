@@ -263,7 +263,10 @@ private def keepPermitCore (env : Environment) (module : Name) (olean usage : Sy
   if let some reason ← closureChanged? env r then return .error reason
   if let some reason ← valuesChanged? r then return .error reason
   let (data, _) ← readModuleData olean
-  return .ok { module, data, payloads := CommandEntries.ofModuleData data, imports := env.header.moduleData }
+  let payloads ← match CommandEntries.ofModuleData? data with
+    | .ok payloads => pure payloads
+    | .error e => return .error s!"the `.olean`'s command payloads cannot be read: {e}"
+  return .ok { module, data, payloads, imports := env.header.moduleData }
 
 /--
 A keep permit (`KeepPermit`) for module `module`'s command payloads in `env`, from its `.olean` at `olean` and the
