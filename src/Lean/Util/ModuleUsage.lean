@@ -977,38 +977,50 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
   let extraMods := allExtra.toArray.filter (fun u => (env.getModuleIdx? u.module).any s.hasEntries)
     |>.qsort fun a b => let k (u : ExtraModUse) := 2 * u.isExported.toNat + u.isMeta.toNat
       Name.quickLt a.module b.module || (a.module == b.module && k a < k b)
-  let imported (ms : Array Name) (field : Digest × Digest → Digest) : Json :=
-    Json.arr <| (ms.qsort Name.quickLt).eraseReps.filterMap fun m => do
-      return Json.arr #[nameToJson m, toJson (field (← s.importedDigests? (← env.getModuleIdx? m)))]
-  let pair (n : Name) (d : Digest) := Json.arr #[nameToJson n, toJson d]
-  let usedJson := Json.arr ((moduleUsed env used nodes).map fun (m, cs) =>
-    Json.arr #[nameToJson m, Json.arr (cs.map fun (n, d) => pair n d)])
+  let imported (ms : Array Name) (field : Digest × Digest → Digest) : Array (Name × Digest) :=
+    (ms.qsort Name.quickLt).eraseReps.filterMap fun m => do
+      return (m, field (← s.importedDigests? (← env.getModuleIdx? m)))
+  let usedMods := moduleUsed env used nodes
   let resolvedAll ← allResolved
   -- Every name whose resolution can reach an output: used, looked up, referred to by a node, an imported kernel
   -- constant several modules declare (`moduleUsed`), or a prefix whose attributes the compiler reads with one of those
-  -- (`internalPrefixes`). `resolvedGroups` looks up only these.
-  let names : NameHashSet := (← resolvedNames).foldl (·.insert ·) {}
-  let names := nodes.foldl (fun s n => n.refs.foldl (·.insert ·) s) (used.foldl (·.insert ·) names)
-  let names := env.getImportedKernelDuplicates.foldl (·.insert ·.1) names
-  let names := (names : Std.HashSet Name).fold addInternalPrefixes names
+  -- (`internalPrefixes`). `resolvedGroups` looks up only these. Each distinct name's prefixes are added once, when the
+  -- name is first inserted (`addInternalPrefixes`).
+  let looked ← resolvedNames
+  let add (s : NameHashSet) (n : Name) : NameHashSet :=
+    let (had, s) := (s : Std.HashSet Name).containsThenInsert n
+    if had then s else addInternalPrefixes s n
+  let names := looked.foldl add (Std.HashSet.emptyWithCapacity looked.size : Std.HashSet Name)
+  let names := nodes.foldl (fun s n => n.refs.foldl add s) (used.foldl add names)
+  let names := env.getImportedKernelDuplicates.foldl (add · ·.1) names
   let resolved := encodeResolved (resolvedGroups env names)
   writeFileReplacing (path.withExtension "resolved") resolved
-  let j := Json.mkObj [("version", usageVersion), ("noskip", incrLoaded),
-    ("moduleDigest", toJson (moduleDigestOf own)),
-    ("closure", toJson closure),
-    ("providesDigest", toJson (providesDigestOf provides indirect)),
-    ("provides", Json.arr #[Json.arr (provides.1.map nameToJson), Json.arr (provides.2.map nameToJson)]),
-    ("indirect", Json.arr (indirect.map nameToJson)),
-    ("digested", Json.arr ((digestedModules env).map fun (m, d) => pair m d)),
-    ("importedClosures", imported (env.header.imports.map (·.module)) (·.2)),
-    ("importedDigests", imported (extraMods.map (·.module)) (·.1)),
-    ("own", Json.arr (own.map fun (n, d) => pair n d)),
-    ("used", usedJson),
-    ("resolvedAll", resolvedAll),
-    ("resolvedDigest", toJson (Digest.ofBytes resolved)),
-    ("extra", Json.arr (extraMods.map fun u => Json.arr #[nameToJson u.module, u.isMeta])),
-    ("specKeys", Json.arr ((ownSpecKeys env).map fun (d, n) => Json.arr #[toJson d, nameToJson n])),
-    ("specLookups", Json.arr ((specLookups env lookups).map fun (k, p) => Json.arr #[toJson k, toJson p]))]
-  writeFileReplacing path j.compress.toUTF8
+  -- The JSON object `Json.mkObj` would build of these fields, printed as `Json.compress` prints it: keys in sorted
+  -- order, no whitespace.
+  let pair (acc : String) (nd : Name × Digest) : String :=
+    (digestJsonInto ((nameJsonInto (acc.push '[') nd.1).push ',') nd.2).push ']'
+  let mut out := digestJsonInto "{\"closure\":" closure
+  out := arrayJsonInto (out ++ ",\"digested\":") (digestedModules env) pair
+  out := arrayJsonInto (out ++ ",\"extra\":") extraMods fun acc u =>
+    nameJsonInto (acc.push '[') u.module ++ (if u.isMeta then ",true]" else ",false]")
+  out := arrayJsonInto (out ++ ",\"importedClosures\":") (imported (env.header.imports.map (·.module)) (·.2)) pair
+  out := arrayJsonInto (out ++ ",\"importedDigests\":") (imported (extraMods.map (·.module)) (·.1)) pair
+  out := arrayJsonInto (out ++ ",\"indirect\":") indirect nameJsonInto
+  out := digestJsonInto (out ++ ",\"moduleDigest\":") (moduleDigestOf own)
+  out := out ++ ",\"noskip\":" ++ toString incrLoaded
+  out := arrayJsonInto (out ++ ",\"own\":") own pair
+  out := arrayJsonInto ((arrayJsonInto (out ++ ",\"provides\":[") provides.1 nameJsonInto).push ',') provides.2
+    nameJsonInto |>.push ']'
+  out := digestJsonInto (out ++ ",\"providesDigest\":") (providesDigestOf provides indirect)
+  out := out ++ ",\"resolvedAll\":" ++ toString resolvedAll
+  out := digestJsonInto (out ++ ",\"resolvedDigest\":") (Digest.ofBytes resolved)
+  out := arrayJsonInto (out ++ ",\"specKeys\":") (ownSpecKeys env) fun acc (d, n) =>
+    (nameJsonInto ((digestJsonInto (acc.push '[') d).push ',') n).push ']'
+  out := arrayJsonInto (out ++ ",\"specLookups\":") (specLookups env lookups) fun acc (k, p) =>
+    (digestJsonInto ((digestJsonInto (acc.push '[') k).push ',') p).push ']'
+  out := arrayJsonInto (out ++ ",\"used\":") usedMods fun acc (m, cs) =>
+    (arrayJsonInto ((nameJsonInto (acc.push '[') m).push ',') cs pair).push ']'
+  out := (out ++ ",\"version\":" ++ toString usageVersion).push '}'
+  writeFileReplacing path out.toUTF8
 
 end Lean.ModuleUsage
