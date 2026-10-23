@@ -16,9 +16,9 @@ public section
 /-!
 What a module records for reusing its commands in a later build: which command-state changes a payload carries
 (`commandStateFields`), each command's payload with its refusals (`commandPayloads`), and the module's payloads,
-records and `noreuse` reason (`moduleRecords`); and what lets a later build keep them: a permit bound to the environment
-the module's `.olean` and `.usage` are checked in, where every check Lake makes before it skips the module holds
-(`keepPermit`).
+records and `noreuse` reason (`startModuleRecords`, `PendingRecords.finish`); and what lets a later build keep them: a
+permit bound to the environment the module's `.olean` and `.usage` are checked in, where every check Lake makes before
+it skips the module holds (`keepPermit`).
 -/
 
 namespace Lean.ModuleUsage
@@ -70,11 +70,11 @@ def commandStateChanges (before after : Elab.Command.State) : Array Refusal := I
     refused := refused.push (.commandState `infoState)
   return refused
 
-/-- The command payloads of the observed commands (`observations`, in command order; `recordCommandDeltas`), each also
+/-- The command payloads of the observed commands (`observations`, in command order; `commandDeltaRecorder`), each also
 refused for the command-state fields it changed (`commandStateChanges`), the attributes with handlers outside core
 Lean it ran (`foreignAttributesByCommand`) and its effects on state outside it the runtime noted (`effects`,
 `RecordedEffects.byCommand`), as the `.olean` stores them (`CommandEntries.compact`), with the digest of their compacted
-bytes. -/
+bytes; the commands in parallel (`CommandEntries.parallelMap`). -/
 def commandPayloads (observations : Array CommandObservation) (effects : Array (Nat × String)) :
     IO (Array (CommandEntries × Digest)) := do
   let byCommand (records : Array (Nat × Refusal)) : Std.HashMap Nat (Array Refusal) :=
@@ -82,46 +82,73 @@ def commandPayloads (observations : Array CommandObservation) (effects : Array (
   let foreign := byCommand <| (← foreignAttributesByCommand).reverse.toArray.map fun (i, attr) =>
     (i, .foreignAttribute attr)
   let effects := byCommand <| effects.map fun (i, what) => (i, .effect what)
-  let deltas ← recordCommandDeltas (observations.map fun obs => (obs.before.env, obs.after.env, obs.i))
-  (observations.zip deltas).mapM fun (obs, ce) => do
+  let record ← commandDeltaRecorder
+  CommandEntries.parallelMap observations fun obs => do
+    let ce ← record obs.before.env obs.after.env obs.i
     let extra := commandStateChanges obs.before obs.after ++ foreign.getD obs.i #[] ++ effects.getD obs.i #[]
     let (ce, bytes) ← CommandEntries.compact { ce with refusals := Refusal.addNew ce.refusals extra }
     return (ce, Digest.ofBytes bytes)
 
-/-- What a module records for reusing its commands: its command payloads, its `.usage` command records, and why none of
-its commands may be kept (`noreuseReason?`). That decides nothing about skipping the module whole (`noskip`). -/
+/-- What a module's `.usage` records for reusing its commands: its command records, and why none of its commands may be
+kept (`noreuseReason?`). That decides nothing about skipping the module whole (`noskip`). Its payloads are
+`PendingRecords.payloads`. -/
 structure ModuleRecords where
-  payloads : Array CommandEntries := #[]
   commands : Array CommandRecord := #[]
   noreuseReason? : Option String := none
 
-/-- The module's payloads, records and `noreuse` reason, from the observations (`commandObservationsRef`):
+/-- The first part of the module's records (`PendingRecords.finish` completes them), which needs no digest of the
+module's own constants: the observations (`commandObservationsRef`) and the noted effects, read once every kernel
+check of the module has finished (`env.checked`), and the payloads (`commandPayloads`), computed in a task so that the
+frontend digests the module's constants meanwhile. -/
+structure PendingRecords where
+  private mk ::
+  observations : Array CommandObservation
+  /-- The records, when the observations are not the module's (`startModuleRecords`). -/
+  done? : Option ModuleRecords
+  /-- Why no command may be kept, whatever the commands' records say. -/
+  wholeModule? : Option String
+  payloadsTask : Task (Except IO.Error (Array (CommandEntries × Digest)))
+
+/-- Starts the module's records (`PendingRecords`):
 - a frontend the module ran in-process (`sessionChanged`: another run started, `startFrontendRun`; or a repeated
   command index: `Lean.Elab.process` recorded from index 0 again) leaves observations that are not the module's: none;
 - a module-system file is never partially re-elaborated: no payloads, `noreuse`;
 - an imported module's initializer or an extension's initial state used process-wide state while the header was
-  processed (`RecordedEffects.atImport`), on which every command may depend: `noreuse`;
-- a command that used a name no digest stands for: no records, `noreuse` (`commandRecords`);
-- a declaration command with a refusal: `noreuse` (`commandEntriesNoreuseReason?`). -/
-def moduleRecords (env : Environment) (own : Array (Name × Digest)) (stmt : Array (Name × Digest × Digest))
-    (sessionChanged : Bool) : IO ModuleRecords := do
+  processed (`RecordedEffects.atImport`), on which every command may depend: `noreuse`. -/
+def startModuleRecords (env : Environment) (sessionChanged : Bool) : IO PendingRecords := do
+  -- the kernel checks run in their commands' contexts and note effects there
+  discard <| IO.wait env.checked
   let observations := (← commandObservations).qsort (·.i < ·.i)
   let effects ← takeRecordedEffects
   let nested := sessionChanged ||
     (observations.foldl (fun s o => s.insert o.i) ({} : Std.HashSet Nat)).size != observations.size
   let moduleSystem? := guard env.header.isModule *> some "module-system"
   if nested then
-    return { noreuseReason? := moduleSystem? <|> some "command observations of a nested frontend" }
-  -- why no command may be kept, whatever the commands' records say
+    return { observations, wholeModule? := none, payloadsTask := .pure (.ok #[])
+             done? := some { noreuseReason? := moduleSystem? <|> some "command observations of a nested frontend" } }
   let wholeModule? := moduleSystem? <|> effects.atImport[0]?.map (s!"an imported module's initializer {·}")
-  let compacted ← if env.header.isModule then pure #[] else commandPayloads observations effects.byCommand
+  let payloadsTask ← if env.header.isModule then pure (.pure (.ok #[]))
+    else IO.asTask (commandPayloads observations effects.byCommand)
+  return { observations, done? := none, wholeModule?, payloadsTask }
+
+/-- The module's command payloads, as its `.olean` stores them (`commandPayloads`), once computed. -/
+def PendingRecords.payloads (p : PendingRecords) : IO (Array CommandEntries) :=
+  return (← IO.ofExcept (← IO.wait p.payloadsTask)).map (·.1)
+
+/-- The module's records and `noreuse` reason, from `p` and the digests of the module's constants (`own`, `stmt`):
+- a command that used a name no digest stands for: no records, `noreuse` (`commandRecords`);
+- a declaration command with a refusal: `noreuse` (`commandEntriesNoreuseReason?`). -/
+def PendingRecords.finish (p : PendingRecords) (env : Environment) (own : Array (Name × Digest))
+    (stmt : Array (Name × Digest × Digest)) : IO ModuleRecords := do
+  if let some records := p.done? then return records
+  let compacted ← IO.ofExcept (← IO.wait p.payloadsTask)
   let payloads := compacted.map (·.1)
-  match ← commandRecords env observations own stmt compacted with
-  | .error unattributed => return { payloads, noreuseReason? := wholeModule? <|> some unattributed }
+  match ← commandRecords env p.observations own stmt compacted with
+  | .error unattributed => return { noreuseReason? := p.wholeModule? <|> some unattributed }
   | .ok commands =>
     let declIdxs := commands.foldl (init := ({} : Std.HashSet Nat)) fun s c => if c.isDecl then s.insert c.i else s
-    return { payloads, commands,
-             noreuseReason? := wholeModule? <|> commandEntriesNoreuseReason? payloads declIdxs.contains }
+    return { commands,
+             noreuseReason? := p.wholeModule? <|> commandEntriesNoreuseReason? payloads declIdxs.contains }
 
 /-- What `keepPermit` reads of a module's `.usage` (`writeUsage`). -/
 structure KeepRecord where

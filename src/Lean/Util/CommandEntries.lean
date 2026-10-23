@@ -27,16 +27,18 @@ structure ViewStates where
 
 /-- What an environment's validation counters and the persistent tier of its type class resolution cache became since
 an earlier environment of its branch: the counters (`Environment.trackedGen` and the generations of the tracked
-extensions in the main-branch view, `constGen`, `recordingConstGen`, `declChangeLog`) as they are after, the constants'
-generations added (`constAddedGens`), and the change of the stored tier (`Environment.storedSynthCache?`). A tier entry
-is valid where these counters say so, so a keep sets them as the full run left them (`applyCounters`): a command
-elaborated after a kept one then finds the tier and validates its entries as in the full run. -/
+extensions in the main-branch view, `constGen`, `recordingConstGen`) as they are after, the entries logged in
+`declChangeLog`, the constants' generations added (`constAddedGens`), and the change of the stored tier
+(`Environment.storedSynthCache?`). A tier entry is valid where these counters say so, so a keep sets them as the full
+run left them (`applyCounters`): a command elaborated after a kept one then finds the tier and validates its entries as
+in the full run. -/
 structure CountersDelta where
   trackedGen : Nat := 0
   extGens : Array Nat := #[]
   constGen : Nat := 0
   recordingConstGen : Nat := 0
-  declChangeLog : DeclChangeLog := {}
+  /-- The entries `declChangeLog` gained, newest first (`DeclChangeLog.entries` without the earlier environment's). -/
+  declChangesAdded : List Name := []
   constAddedGens : Array (Name × Nat) := #[]
   /-- The stored tier's generation after, `none` for no tier. -/
   synthTierGen? : Option Nat := none
@@ -264,7 +266,7 @@ private def viewStates (regs : Registries) (view : EnvExtension.View) (k₀ k₁
       | some s₀, some s₁ => SharedDiff.sameObject s₀ s₁
       | _, _ => true
     changed := changed.push <|
-      !sameSlot || (!sameWrites && k₀.unaccountedWrites[idx]?.getD 0 != k₁.unaccountedWrites[idx]?.getD 0)
+      !sameSlot || (!sameWrites && k₀.unaccountedWrites.findD idx 0 != k₁.unaccountedWrites.findD idx 0)
   let mut st : ViewStates := {}
   let mut refused := #[]
   for ext in regs.persistent do
@@ -277,7 +279,7 @@ private def viewStates (regs : Registries) (view : EnvExtension.View) (k₀ k₁
       unless SharedDiff.sameObject s₀ s₁ do refused := refused.push (.notCarried ext.name at?)
       continue
     let isScoped := regs.scopedByName.contains ext.name
-    if k₀.unaccountedWrites[idx]?.getD 0 != k₁.unaccountedWrites[idx]?.getD 0 then
+    if k₀.unaccountedWrites.findD idx 0 != k₁.unaccountedWrites.findD idx 0 then
       refused := refused.push (.inexpressible ext.name at?)
     else if isScoped && view == .main then
       match stackDelta s₀ s₁ with
@@ -291,8 +293,7 @@ private def viewStates (regs : Registries) (view : EnvExtension.View) (k₀ k₁
           else refused := refused.push (.unreplayable ext.name at?)
       | .stateOnly => refused := refused.push (.inexpressible ext.name at?)
   for cache in regs.caches do
-    let idx := cache.ext.idx
-    unless idx < k₀.extensions.size && idx < k₁.extensions.size do continue
+    unless changed[cache.ext.idx]?.getD false do continue
     let es := cache.stateDelta (cacheStateIn cache k₀) (cacheStateIn cache k₁)
     unless es.isEmpty do st := { st with caches := st.caches.push (cache.name, es) }
   for idx in [:n] do
@@ -403,14 +404,14 @@ declaration log does not extend `before`'s or `after` lacks a constant generatio
 private def countersDelta (before after : Environment) : Option CountersDelta := do
   let (constAddedGens, removed) := PersistentHashMap.sharedDiff before.constAddedGens after.constAddedGens
   unless removed.isEmpty do none
-  discard <| List.newPrefix? after.declChangeLog.entries before.declChangeLog.entries
+  let declChangesAdded ← List.newPrefix? after.declChangeLog.entries before.declChangeLog.entries
   let (synthTierGen?, synthTierSet, synthTierErased) := match after.storedSynthCache? with
     | none => (none, #[], #[])
     | some (gen, entries) =>
       let (set, erased) := PersistentHashMap.sharedDiff ((before.storedSynthCache?.map (·.2)).getD {}) entries
       (some gen, set, erased)
   return { trackedGen := after.trackedGen, extGens := after.base.private.extGens, constGen := after.constGen,
-           recordingConstGen := after.recordingConstGen, declChangeLog := after.declChangeLog, constAddedGens,
+           recordingConstGen := after.recordingConstGen, declChangesAdded, constAddedGens,
            synthTierGen?, synthTierSet, synthTierErased }
 
 /-- `env`, an environment whose counters and tier were what `c` started from, with them as `c` leaves them. -/
@@ -420,7 +421,7 @@ private def applyCounters (env : Environment) (c : CountersDelta) : Environment 
     base.private.extGens := c.extGens
     constGen := c.constGen
     recordingConstGen := c.recordingConstGen
-    declChangeLog := c.declChangeLog
+    declChangeLog := c.declChangesAdded.foldr (fun d log => log.push d) env.declChangeLog
     constAddedGens := c.constAddedGens.foldl (fun m (n, g) => m.insert n g) env.constAddedGens }
   env.setStoredSynthCache <| c.synthTierGen?.map fun gen =>
     let entries := (env.storedSynthCache?.map (·.2)).getD {}
@@ -535,10 +536,27 @@ unchecked additions). Takes time proportional to what the command changed, apart
 def recordCommandDelta (before after : Environment) (idx : Nat) : IO CommandEntries := do
   recordCommandDeltaWith (← Registries.get) before after idx
 
-/-- `recordCommandDelta` of each `(before, after, idx)`, reading the extension registries once. -/
-def recordCommandDeltas (commands : Array (Environment × Environment × Nat)) : IO (Array CommandEntries) := do
-  let regs ← Registries.get
-  commands.mapM fun (before, after, idx) => recordCommandDeltaWith regs before after idx
+/-- `f` of each element of `xs`, in order, computed in `lanes` tasks, each over a contiguous block of `xs`; the first
+error in that order is rethrown. For the recorder's per-command work at the end of a module: it reads the finished
+commands' states only, so the commands' records do not depend on each other. Few lanes: the commands' states are
+shared objects, whose reference counts every lane updates, so that many lanes spend more time contending for them than
+they save. Each task inherits the calling thread's task context, so that none of its effects is noted against a
+command. One lane runs on the calling thread. -/
+def CommandEntries.parallelMap {α β : Type} (xs : Array α) (f : α → IO β) (lanes : Nat := 4) : IO (Array β) := do
+  if lanes ≤ 1 || xs.size ≤ 1 then return ← xs.mapM f
+  let size := (xs.size + lanes - 1) / lanes
+  let mut tasks := #[]
+  for k in [0:lanes] do
+    let part := xs.extract (k * size) ((k + 1) * size)
+    unless part.isEmpty do tasks := tasks.push (← IO.asTask (part.mapM f))
+  let mut out := Array.emptyWithCapacity xs.size
+  for t in tasks do
+    out := out ++ (← IO.ofExcept (← IO.wait t))
+  return out
+
+/-- `recordCommandDelta`, with the extension registries read once, now: for recording many commands. -/
+def commandDeltaRecorder : IO (Environment → Environment → Nat → BaseIO CommandEntries) :=
+  return recordCommandDeltaWith (← Registries.get)
 
 /-- Whether `a` compacts (`CompactedRegion.bytes`): it holds no closure. -/
 private def compacts (a : α) : IO Bool := do

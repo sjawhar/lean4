@@ -373,6 +373,15 @@ def stmtHash (env : Environment) (c : ConstantInfo) : Digest × Digest :=
     |>.finish
   (core, attrs)
 
+/-- `xs.map f`, in up to four tasks over contiguous blocks of at least 256 elements: for the per-constant digests of a
+module with many constants, each of which reads only the environment. -/
+private def mapLanes {α β : Type} (xs : Array α) (f : α → β) : Array β :=
+  let lanes := min 4 (xs.size / 256)
+  if lanes ≤ 1 then xs.map f else
+  let size := (xs.size + lanes - 1) / lanes
+  let tasks := (List.range lanes).map fun k => Task.spawn fun _ => (xs.extract (k * size) ((k + 1) * size)).map f
+  tasks.foldl (fun out t => out ++ t.get) #[]
+
 /-- The kernel never unfolds a theorem, opaque or axiom, so a type mentioning one depends on its statement
 only. -/
 def isStmtOnly : ConstantInfo → Bool
@@ -402,9 +411,10 @@ def computeStmt (env : Environment) (s : StmtState) (own : Array (Name × Digest
     Array (Name × Digest × Digest) := Id.run do
   let full : Std.HashMap Name Digest := own.foldl (fun m (n, d) => m.insert n d) {}
   let fs := state env
+  let hashed := mapLanes consts fun (n, ci, _) =>
+    (n, ci, stmtHash env ci, ci.type.getUsedConstantsAsSet.toArray.qsort Name.quickLt)
   let byName : Std.HashMap Name (ConstantInfo × (Digest × Digest) × Array Name) :=
-    consts.foldl (init := {}) fun m (n, ci, _) =>
-      m.insert n (ci, stmtHash env ci, ci.type.getUsedConstantsAsSet.toArray.qsort Name.quickLt)
+    hashed.foldl (init := {}) fun m (n, ci, h, rs) => m.insert n (ci, h, rs)
   let stmtOnly (r : Name) : Bool := ((byName[r]?.map (·.1)) <|> env.find? r).any isStmtOnly
   let sccs := SCC.scc (consts.map (·.1)).toList fun n =>
     byName[n]!.2.2.toList.filter fun r => byName.contains r && stmtOnly r

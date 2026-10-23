@@ -61,11 +61,16 @@ opaque fileDigestStamped (path : @& System.FilePath) : IO (Digest × Option File
 @[extern "lean_usage_read_file_stamped"]
 opaque readFileStamped (path : @& System.FilePath) : IO (ByteArray × Option FileStamp)
 
-private def hex16 (v : UInt64) : String :=
-  let s := String.ofList (Nat.toDigits 16 v.toNat); "".pushn '0' (16 - s.length) ++ s
+/-- `s` followed by `v`'s 16 lowercase hex digits. -/
+private def pushHex16 (s : String) (v : UInt64) : String := Id.run do
+  let mut s := s
+  for i in [0:16] do
+    let d := ((v >>> (60 - 4 * i.toUInt64)) &&& 15).toNat
+    s := s.push (Char.ofNat (if d < 10 then 48 + d else 87 + d))
+  return s
 
 /-- 32 lowercase hex digits. -/
-def Digest.hex (d : Digest) : String := hex16 d.hi ++ hex16 d.lo
+def Digest.hex (d : Digest) : String := pushHex16 (pushHex16 "" d.hi) d.lo
 
 /-- The order of `hex`, without building the strings. -/
 def Digest.lt (a b : Digest) : Bool := a.hi < b.hi || (a.hi == b.hi && a.lo < b.lo)
@@ -101,14 +106,16 @@ def bool (e : Enc) (v : Bool) : Enc := e.u8 (if v then 1 else 0)
 def str (e : Enc) (s : String) : Enc := let b := s.toUTF8; ⟨(e.u64 b.size.toUInt64).buf ++ b⟩
 def nat (e : Enc) (n : Nat) : Enc := e.str (toString n)
 def digest (e : Enc) (d : Digest) : Enc := e.u64 d.hi |>.u64 d.lo
-/-- The component count, then each component root first, tagged string or number. -/
-def name (e : Enc) (n : Name) : Enc :=
-  go n (e.nat n.getNumParts)
-where
-  go : Name → Enc → Enc
-    | .anonymous, e => e
-    | .str p s, e => (go p e).u8 1 |>.str s
-    | .num p k, e => (go p e).u8 2 |>.nat k
+/-- The component count, then each component root first, tagged string or number. The buffer is threaded through a
+loop, not a recursion over the prefix: there the compiler borrows it, and each component's push copies it. -/
+def name (e : Enc) (n : Name) : Enc := Id.run do
+  let mut e := e.nat n.getNumParts
+  for c in n.components do
+    e := match c with
+      | .str _ s => e.u8 1 |>.str s
+      | .num _ k => e.u8 2 |>.nat k
+      | .anonymous => e
+  return e
 def names (e : Enc) (ns : List Name) : Enc := ns.foldl name (e.nat ns.length)
 /-- `xs`'s size, then each element encoded by `f`. -/
 @[inline] def array {α : Type} (e : Enc) (xs : Array α) (f : Enc → α → Enc) : Enc := xs.foldl f (e.nat xs.size)

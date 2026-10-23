@@ -397,20 +397,25 @@ def runFrontend
   let usage? ← oleanFileName?.bindM fun oleanFileName => do
     let recorded ← recordedDeclConsts
     let usage? ← usageFileName?.mapM fun usageFileName => do
+      let pending ← ModuleUsage.startModuleRecords env (sessionChanged := (← lastFrontendRun) != run)
       let consts := ModuleUsage.ownConsts env recorded
       let nodes := ModuleUsage.ownNodes env consts
       let own := ModuleUsage.localDigests env nodes
       let stmt := ModuleUsage.computeStmt env (ModuleUsage.stmtState env) own consts
-      let recs ← ModuleUsage.moduleRecords env own stmt (sessionChanged := (← lastFrontendRun) != run)
+      let payloads ← pending.payloads
+      -- the `.usage` command records build while the `.olean`, which holds none of them, is written
+      let recs ← IO.asTask do
+        let recs ← pending.finish env own stmt
+        return (recs, ← CommandEntries.parallelMap recs.commands fun r => pure (toJson r))
       let provides := ModuleUsage.ownProvides env
       return (usageFileName, oleanFileName, nodes, own, ModuleUsage.closureDigest env own provides, provides, stmt,
-        recs)
+        payloads, recs)
     profileitIO ".olean serialization" finalOpts do
       let commandLints := collectCommandLints snaps none #[]
       let env ← Linter.recordLints inputCtx.fileMap env commandLints
-      let env := usage?.elim env fun (_, _, _, own, closure, provides, stmt, recs) =>
+      let env := usage?.elim env fun (_, _, _, own, closure, provides, stmt, payloads, _) =>
         let env := ModuleUsage.setLocalStmt (ModuleUsage.setLocalDigests env own closure provides) stmt
-        setCommandEntries env recs.payloads
+        setCommandEntries env payloads
       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
     return usage?
 
@@ -438,9 +443,10 @@ def runFrontend
     Firefox.Profile.serve <| Json.compress <| toJson profile
 
   -- Last of the outputs: the usage data records every name resolved in writing the others.
-  if let some (usageFileName, oleanFileName, nodes, own, closure, provides, stmt, recs) := usage? then
+  if let some (usageFileName, oleanFileName, nodes, own, closure, provides, stmt, _, recs) := usage? then
+    let (recs, commands) ← IO.ofExcept (← IO.wait recs)
     let used := ModuleUsage.usedFromInfoTrees trees (← usedNames)
-    ModuleUsage.writeUsage env nodes own closure provides used (← lookedUpSpecKeys) stmt (recs.commands.map toJson)
+    ModuleUsage.writeUsage env nodes own closure provides used (← lookedUpSpecKeys) stmt commands
       (incrLoaded := incrLoadFileName?.isSome) usageFileName (← ModuleUsage.fileDigest oleanFileName)
       (noreuseReason? := recs.noreuseReason?)
 

@@ -292,9 +292,10 @@ structure Environment where
   header                  : EnvironmentHeader := private_decl% {}
   /--
   Per environment extension index, the writes to its state through `EnvExtension.modifyState`/`setState` that no
-  sanctioned writer accounted for (`EnvExtension.unaccountedWrites`). Grown on demand.
+  sanctioned writer accounted for (`EnvExtension.unaccountedWrites`); an index absent has none. Persistent, as a write
+  copies only a path of it, where environments share it.
   -/
-  private unaccountedWrites : Array Nat := #[]
+  private unaccountedWrites : PersistentHashMap Nat Nat := {}
   /--
   Per environment extension index, the registered persistent extension's identity, copied from the registry when the
   environment is created or its extension array grows. Read by accounted writes only.
@@ -318,9 +319,7 @@ private def Environment.identityMatches (env : Environment) (idx : Nat) (id : En
 
 /-- Counts `n` writes to extension `idx`'s state that no sanctioned writer accounted for. -/
 private def Environment.countUnaccountedWrite (env : Environment) (idx : Nat) (n : Nat := 1) : Environment :=
-  let ws := env.unaccountedWrites
-  let ws := if idx < ws.size then ws else ws ++ Array.replicate (idx + 1 - ws.size) 0
-  { env with unaccountedWrites := ws.modify idx (· + n) }
+  { env with unaccountedWrites := env.unaccountedWrites.insert idx (env.unaccountedWrites.findD idx 0 + n) }
 
 /-- Exceptions that can be raised by the kernel when type checking new declarations. -/
 inductive Exception where
@@ -1887,7 +1886,7 @@ private def viewEnv (env : Environment) : View → Kernel.Environment
 /-- The writes to `ext`'s state in `view` that were counted as unaccounted (`modifyState`, or an accounted write
 through a record other than the registered one). The per-command recorder compares it across a command. -/
 def unaccountedWrites {σ : Type} (ext : EnvExtension σ) (env : Environment) (view : View) : Nat :=
-  (viewEnv env view).unaccountedWrites[ext.idx]?.getD 0
+  (viewEnv env view).unaccountedWrites.findD ext.idx 0
 
 -- `unsafe` fails to infer `Nonempty` here
 private unsafe def getStateInUnsafe {σ : Type} [Inhabited σ] (ext : EnvExtension σ) (env : Environment)
@@ -3321,7 +3320,7 @@ where
               (ext.getStateImpl newEnv.extensions)
               (consts.map (·.constInfo.name))) }
         -- the realization's unaccounted writes to the state `replay` copies count in `kenv` too
-        let written := newEnv.unaccountedWrites[ext.idx]?.getD 0 - oldEnv.unaccountedWrites[ext.idx]?.getD 0
+        let written := newEnv.unaccountedWrites.findD ext.idx 0 - oldEnv.unaccountedWrites.findD ext.idx 0
         if written > 0 then
           kenv := kenv.countUnaccountedWrite ext.idx written
     for c in consts do

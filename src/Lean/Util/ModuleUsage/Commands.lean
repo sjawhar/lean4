@@ -280,10 +280,12 @@ def scopeFields : Array Name := #[`header, `opts, `currNamespace, `openDecls, `l
   `includedVars, `omittedVars, `isNoncomputable, `isPublic, `isMeta, `attrs]
 
 /-- The command-context portion available before payload recording is folded in by the reuse frontend.
-`quotCtxts` is the digest of `st.usedQuotCtxts`. -/
-def ctxDigest (st : Elab.Command.State) (quotCtxts : NameSetDigest) (entries : Digest) : Digest :=
+`quotCtxts` is the digest of `st.usedQuotCtxts`; `scopes` is `st.scopes` encoded, which a caller following the commands
+of a module can reuse while the scope stack stays the same object. -/
+def ctxDigest (st : Elab.Command.State) (quotCtxts : NameSetDigest) (entries : Digest)
+    (scopes : Enc := scopesEnc {} st.scopes) : Digest :=
   let g := st.auxDeclNGen.toRecord
-  scopesEnc {} st.scopes |>.nat st.nextMacroScope |>.nat st.maxRecDepth |>.name g.namePrefix |>.nat g.idx
+  scopes |>.nat st.nextMacroScope |>.nat st.maxRecDepth |>.name g.namePrefix |>.nat g.idx
     |>.nat g.parentIdxs.length |> g.parentIdxs.foldl Enc.nat
     |>.name st.ngen.namePrefix |>.nat st.ngen.idx
     |>.nat quotCtxts.size |>.u64 quotCtxts.hi |>.u64 quotCtxts.lo
@@ -321,6 +323,14 @@ def isAuxName (env : Environment) (n : Name) : Bool :=
     s.contains "._auxLemma" || s.contains "._proof_" || s.contains "._eq_" ||
     s.endsWith "._sunfold" || s.endsWith "._native"
 
+/-- One command's record as `commandRecords` computes it apart from the commands before it, or why there are none. -/
+private inductive CommandPart where
+  | record (r : CommandRecord)
+  /-- the command used a name no digest stands for (`UseDigests.unattributed`) -/
+  | unattributed (reason : String)
+  /-- a constant of this module lacks a statement digest -/
+  | broken (msg : String)
+
 /-- What a command's record holds for one name it used. -/
 private inductive UseDigests where
   /-- a constant of an imported module that carries no usage digests (`importedConstDigests?`) -/
@@ -343,9 +353,10 @@ private partial def transientDeps (transient : Std.HashMap Name NameSet) (seen o
 /-- The per-command records of `observations` (in command order), or why there are none: a command used a name no
 digest stands for, one that names no constant (a declaration the kernel or the elaborator rejected referred to it; an
 IR-only name) or a constant of this module the kernel environment does not hold. None of the module's commands may
-then be kept (`noreuse`). -/
+then be kept (`noreuse`). What a record holds of its command alone is computed in `lanes` tasks
+(`CommandEntries.parallelMap`). -/
 def commandRecords (env : Environment) (observations : Array CommandObservation) (own : Array (Name × Digest))
-    (stmt : Array (Name × Digest × Digest)) (payloads : Array (CommandEntries × Digest)) :
+    (stmt : Array (Name × Digest × Digest)) (payloads : Array (CommandEntries × Digest)) (lanes : Nat := 4) :
     IO (Except String (Array CommandRecord)) := do
   let declEntries := (← declsByCommand).toArray.reverse
   let explicitUses := (← usedByCommand).toArray.reverse
@@ -374,7 +385,6 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
             compiled code for without defining it"
         | .untracked => .untracked
     return .unattributed s!"command {i} uses `{n}`, a constant of this module the kernel environment does not hold"
-  let mut occurrences : Std.HashMap (Name × Digest) Nat := {}
   let payloadByIdx : Std.HashMap Nat (CommandEntries × Digest) :=
     payloads.foldl (fun m p => m.insert p.1.idx p) {}
   -- per-command lookups, so that each command's record costs what the command added
@@ -382,17 +392,10 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
     fun m (i, _, used) => m.alter i fun us => some ((us.getD #[]).push used)
   let explicitByIdx : Std.HashMap Nat (Array Name) := explicitUses.foldl (init := {})
     fun m (i, n) => m.alter i fun ns => some ((ns.getD #[]).push n)
-  let extrasByIdx : Std.HashMap Nat (Array ExtraModUse) := extras.toArray.foldl (init := {})
+  let extrasByIdx : Std.HashMap Nat (Array ExtraModUse) := extras.foldl (init := {})
     fun m (i, u) => m.alter i fun us => some ((us.getD #[]).push u)
-  -- a hash chain over the payloads so far: extending it costs the same at every command
-  let mut entries : Digest := ({} : Enc).finish
-  let mut quotSet : NameSet := {}
-  let mut quotDigest : NameSetDigest := {}
-  let mut out := #[]
-  for obs in observations do
-    let (quotAdded, quotRemoved) := NameSet.sharedDiff quotSet obs.before.usedQuotCtxts
-    quotDigest := quotRemoved.foldl (·.erase ·) (quotAdded.foldl (·.insert ·) quotDigest)
-    quotSet := obs.before.usedQuotCtxts
+  -- each command's record but for what chains through the commands before it (a non-declaration's `key`, `ctx`)
+  let part (obs : CommandObservation) : CommandPart := Id.run do
     let before := obs.before.env.checked.get
     let after := obs.after.env.checked.get
     let added : NameSet := match before.constants.sharedDiff? after.constants with
@@ -401,11 +404,12 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
       | none => after.constants.foldStage2 (fun (s : NameSet) n _ =>
         if before.constants.contains n then s else s.insert n) {}
     let addedNames := added.toArray.qsort Name.quickLt
-    let decls := addedNames.filter (!isAuxName env ·)
-    let aux := addedNames.filter (isAuxName env)
+    let isAux := addedNames.map (isAuxName env)
+    let decls := (addedNames.zip isAux).filterMap fun (n, a) => if a then none else some n
+    let aux := (addedNames.zip isAux).filterMap fun (n, a) => if a then some n else none
     let mut refsSet : NameSet := {}
     let mut full : NameSet := {}
-    for n in addedNames do
+    for n in addedNames, a in isAux do
       if let some ci := env.find? n then
         let rs := refs env ci
         refsSet := rs.foldl (·.insert ·) refsSet
@@ -414,7 +418,7 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
           | some ri => if isStmtOnly ri && !env.contains (Compiler.mkUnsafeRecName r) then s.insert r else s
           | none => s
         let valueUsed := ValueSensitive.unsafelyUsedValues env stmtOnlyRefs ci
-        let auxDefn := isAuxName env n && ci matches .defnInfo _
+        let auxDefn := a && ci matches .defnInfo _
         for r in rs do
           if (env.find? r).isSome && (!stmtOnlyRefs.contains r || valueUsed.contains r || auxDefn) then
             full := full.insert r
@@ -442,22 +446,16 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
     let mut fullUses := #[]
     let mut stmtUses := #[]
     for n in used do
-      match ← IO.ofExcept (digestsOf obs.i n) with
-      | .untracked => pure ()
-      | .unattributed reason => return .error reason
-      | .digests d core attrs =>
+      match digestsOf obs.i n with
+      | .error msg => return .broken msg
+      | .ok .untracked => pure ()
+      | .ok (.unattributed reason) => return .unattributed reason
+      | .ok (.digests d core attrs) =>
         if full.contains n then fullUses := fullUses.push (n, d, attrs)
         else stmtUses := stmtUses.push (n, core)
     let usesFull := fullUses.qsort fun a b => Name.quickLt a.1 b.1
     let usesStmt := stmtUses.qsort fun a b => Name.quickLt a.1 b.1
     let text := textDigest obs.stx
-    let kind := obs.stx.getKind
-    let key ← if !decls.isEmpty then
-      pure (.names decls)
-    else
-      let occ := occurrences[(kind, text)]?.getD 0
-      occurrences := occurrences.insert (kind, text) (occ + 1)
-      pure (.kind kind text occ)
     let extra := ((extrasByIdx.getD obs.i #[]).filterMap fun u =>
       if (env.getModuleIdx? u.module).any fs.hasEntries then some (u.module, u.isMeta)
       else none).qsort fun a b => Name.quickLt a.1 b.1 ||
@@ -478,20 +476,47 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
     let sparseCasesOn := sparseCasesOn.qsort fun a b => Name.quickLt a.2 b.2
     let structRes := structureResolutionCacheDelta obs.before.env obs.after.env
       |>.qsort fun a b => Name.quickLt a.1 b.1
-    let ctx := ctxDigest obs.before quotDigest entries
-    out := out.push {
-      i := obs.i, key, text, ctx
+    return .record {
+      i := obs.i, key := .names decls, text, ctx := default
       isDecl := !decls.isEmpty
-      isInit := kind == ``Lean.Parser.Command.«initialize»
+      isInit := obs.stx.getKind == ``Lean.Parser.Command.«initialize»
       decls, aux, usesStmt, usesFull, extra
       post := CommandPost.ofStates obs.before obs.after
       caches := { matcher, auxLemma, eqnsInv, sparseCasesOn, structRes }
     }
+  let parts ← CommandEntries.parallelMap observations (lanes := lanes) fun obs => pure (part obs)
+  let mut occurrences : Std.HashMap (Name × Digest) Nat := {}
+  -- a hash chain over the payloads so far: extending it costs the same at every command
+  let mut entries : Digest := ({} : Enc).finish
+  let mut quotSet : NameSet := {}
+  let mut quotDigest : NameSetDigest := {}
+  -- the encoded scopes of the last command, which the next one usually shares
+  let mut lastScopes : Option (List Elab.Command.Scope × Enc) := none
+  let mut out := #[]
+  for obs in observations, p in parts do
+    let r ← match p with
+      | .record r => pure r
+      | .unattributed reason => return .error reason
+      | .broken msg => throw (IO.userError msg)
+    let (quotAdded, quotRemoved) := NameSet.sharedDiff quotSet obs.before.usedQuotCtxts
+    quotDigest := quotRemoved.foldl (·.erase ·) (quotAdded.foldl (·.insert ·) quotDigest)
+    quotSet := obs.before.usedQuotCtxts
+    let key ← if r.isDecl then pure r.key else
+      let kind := obs.stx.getKind
+      let occ := occurrences[(kind, r.text)]?.getD 0
+      occurrences := occurrences.insert (kind, r.text) (occ + 1)
+      pure (.kind kind r.text occ)
+    let scopes := match lastScopes with
+      | some (s, e) => if SharedDiff.sameObject s obs.before.scopes then e else scopesEnc {} obs.before.scopes
+      | none => scopesEnc {} obs.before.scopes
+    lastScopes := some (obs.before.scopes, scopes)
+    let ctx := ctxDigest obs.before quotDigest entries scopes
+    out := out.push { r with key, ctx }
     if let some (payload, digest) := payloadByIdx[obs.i]? then
       entries := (({} : Enc).digest entries |>.digest digest).finish
       -- a change no entry expresses (an erasure) is determined by the command's text and context
       unless payload.refusals.isEmpty do
-        entries := (({} : Enc).digest entries |>.digest text |>.digest ctx).finish
+        entries := (({} : Enc).digest entries |>.digest r.text |>.digest ctx).finish
   return .ok out
 
 end Lean.ModuleUsage

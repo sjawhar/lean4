@@ -27,7 +27,8 @@ unsafe def recordsCost (k : Nat) : IO Nat := do
   let own := ModuleUsage.localDigests env (ModuleUsage.ownNodes env consts)
   let stmt := ModuleUsage.computeStmt env (ModuleUsage.stmtState env) own consts
   let start ← IO.getNumHeartbeats
-  discard <| ModuleUsage.commandRecords env (← ModuleUsage.commandObservations) own stmt #[]
+  -- one lane: on this thread, whose heartbeats count the allocations
+  discard <| ModuleUsage.commandRecords env (← ModuleUsage.commandObservations) own stmt #[] (lanes := 1)
   return (← IO.getNumHeartbeats) - start
 
 unsafe def main : IO Unit := do
