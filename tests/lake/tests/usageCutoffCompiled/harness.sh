@@ -1869,6 +1869,20 @@ hard_extramod_s0() {
 hard_extramod_s1() { hard_extramod_a 20; }
 hard_extramod_c_check() { hard_rejected hard_extramod; }
 
+# `emu_indirect`: `M` quotes ``foo, which records `foo`'s module and every module that gives the imported `foo` a
+# non-local attribute as extra module uses (`recordExtraModUseFromDecl`). State 1 gives it `[simp]` in `X`, which `M`
+# imports and uses nothing of, so a fresh `M` records `X` too. `emu_indirect_rev` drops the attribute.
+emu_indirect_s0() {
+  lakefile_app; mkdir_t
+  printf 'theorem foo : 1 = 1 := rfl\n' > T/A.lean
+  printf 'import T.A\ndef other : Nat := 0\n' > T/X.lean
+  printf 'import T.A\nimport T.X\ndef m : Lean.Name := ``foo\n' > T/M.lean
+  printf 'import T.M\ndef main : IO Unit := IO.println m\n' > Main.lean
+}
+emu_indirect_s1() { printf 'import T.A\nattribute [simp] foo\ndef other : Nat := 0\n' > T/X.lean; }
+emu_indirect_rev_s0() { emu_indirect_s0; emu_indirect_s1; }
+emu_indirect_rev_s1() { printf 'import T.A\ndef other : Nat := 0\n' > T/X.lean; }
+
 hard_moduleext_s0() {
   nonbuiltin_files; nonbuiltin_y '' ''
   hard_m $'import Lean\n' "$(hard_try 'run_meta modifyEnv fun env => Lean.ModuleUsage.ext.modifyState (asyncMode := .mainOnly) env fun s => { s with importedModuleEntries := #[] }')"
@@ -2365,7 +2379,7 @@ all_cases="spec_transitive spec_link spec_type spec_precomp plugin_replay csimp_
   dup_new_third dup_new_tc_outside dup_new_deep axiom_summary axiom_summary_trans
   hard_recording hard_moduleext hard_speclookups hard_compilercode rp_own
   hard_usedbychecks hard_declconsts
-  hard_extramod perkey_provider_inl
+  hard_extramod emu_indirect emu_indirect_rev perkey_provider_inl
   class_same class_cross nospec_type folder_cross reducible_cross binder_inline perkey_provider_folder
   local_inst_own erase_inst_own scoped_inst local_red_own2 local_red_own3 scoped_red_own
   table_order folder_order red_order
