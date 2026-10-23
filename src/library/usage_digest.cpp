@@ -60,6 +60,8 @@ class hasher {
     }
 public:
     explicit hasher(unsigned char tag) { SHA256_Init(&m_ctx); u8(tag); }
+    /* No tag: for bytes that must hash as `Lean.ModuleUsage.Enc.finish` hashes an `Enc` buffer. */
+    hasher() { SHA256_Init(&m_ctx); }
     hasher & u8(unsigned char v) { put(&v, 1); return *this; }
     hasher & u64(uint64_t v) {
         unsigned char b[8];
@@ -74,6 +76,20 @@ public:
         if (n.is_small()) return u8(0).u64(n.get_small_value());
         std::string s = n.to_std_string();
         return u8(1).str(s.data(), s.size());
+    }
+    /* `Lean.ModuleUsage.Enc.nat`: the decimal digits `toString` writes, as `Enc.str`. */
+    hasher & enc_nat(nat const & n) {
+        if (!n.is_small()) {
+            std::string s = n.to_std_string();
+            return str(s.data(), s.size());
+        }
+        return enc_nat(static_cast<uint64_t>(n.get_small_value()));
+    }
+    hasher & enc_nat(uint64_t v) {
+        char b[20];
+        size_t i = sizeof(b);
+        do { b[--i] = static_cast<char>('0' + v % 10); v /= 10; } while (v != 0);
+        return str(b + i, sizeof(b) - i);
     }
     digest finish() {
         SHA256_Update(&m_ctx, m_buf, m_len);
@@ -294,6 +310,35 @@ extern "C" LEAN_EXPORT obj_res lean_usage_digest_bytes(b_obj_arg bytes) {
     digest d;
     memcpy(d.b, md, digest_size);
     return mk_digest_obj(d);
+#endif
+}
+
+#ifndef LEAN_EMSCRIPTEN
+namespace {
+/* `Lean.ModuleUsage.Enc.name`'s components, root first: tag 1 and `Enc.str` for a string, tag 2 and `Enc.nat` for a
+number. */
+void enc_name_components(hasher & h, name const & n) {
+    if (n.is_anonymous()) return;
+    enc_name_components(h, n.get_prefix());
+    if (n.is_string()) h.u8(1).str(n.get_string().data(), n.get_string().num_bytes());
+    else h.u8(2).enc_nat(n.get_numeral());
+}
+}
+#endif
+
+/* `Lean.ModuleUsage.resolvedId`: the digest `Enc.finish` gives `Enc.name n` on an empty `Enc`, hashed as it is encoded
+instead of from a buffer. */
+extern "C" LEAN_EXPORT obj_res lean_usage_resolved_id(b_obj_arg n) {
+#ifdef LEAN_EMSCRIPTEN
+    lean_internal_panic("usage digests require OpenSSL");
+#else
+    name const & nm = TO_REF(name, n);
+    uint64_t parts = 0;
+    for (name const * p = &nm; !p->is_anonymous(); p = &p->get_prefix()) parts++;
+    hasher h;
+    h.enc_nat(parts);
+    enc_name_components(h, nm);
+    return mk_digest_obj(h.finish());
 #endif
 }
 
