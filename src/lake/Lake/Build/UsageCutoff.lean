@@ -45,10 +45,13 @@ structure UsageSidecar where
   resolved : Array (Option Name × Array (Name × UInt8))
   /-- Whether the compile read the resolver's whole map (`Lean.allResolved`). -/
   resolvedAll : Bool
-  /-- The digest of the names the module provides to the resolver (`Lean.ModuleUsage.providesDigestOf`). -/
+  /-- The digest of the names the module provides to the resolver and of `indirect`
+  (`Lean.ModuleUsage.providesDigestOf`). -/
   providesDigest : ModuleUsage.Digest
   /-- The module's kernel constants and compiled names, each sorted (`Lean.ModuleUsage.ownProvides`). -/
   provides : Array Name × Array Name
+  /-- The imported declarations the module gives a non-local attribute, sorted (`Lean.ModuleUsage.ownIndirect`). -/
+  indirect : Array Name
   /-- The specialization-cache keys the module created, each with the specialization of its last entry for the
   key (`Lean.ModuleUsage.specKeysOf`). -/
   specKeys : Array (ModuleUsage.Digest × Name)
@@ -96,11 +99,14 @@ def nameDigestPairs (j : Json) : Except String (NameMap (ModuleUsage.Digest × M
     let #[n, a, b] ← e.getArr? | throw s!"expected a triple, got {e.compress}"
     return m.insert (← fromJson? (α := SidecarName) n).name (← fromJson? a, ← fromJson? b)
 
+/-- Reads a JSON array of names. -/
+def namesOfJson (j : Json) : Except String (Array Name) :=
+  return (← fromJson? (α := Array SidecarName) j).map (·.name)
+
 /-- Reads a module's `provides`: a JSON pair of name arrays. -/
 def providesOfJson (j : Json) : Except String (Array Name × Array Name) := do
   let #[k, e] ← j.getArr? | throw s!"expected a pair of name arrays, got {j.compress}"
-  let names (a : Json) := return (← fromJson? (α := Array SidecarName) a).map (·.name)
-  return (← names k, ← names e)
+  return (← namesOfJson k, ← namesOfJson e)
 
 /-- Reads a `.usage`'s `resolved` groups: `[module or null, [[name, kinds], ...]]`. -/
 def resolvedOfJson (j : Json) : Except String (Array (Option Name × Array (Name × UInt8))) := do
@@ -134,6 +140,7 @@ instance : FromJson UsageSidecar where
       resolvedAll := ← j.getObjValAs? Bool "resolvedAll"
       providesDigest := ← j.getObjValAs? ModuleUsage.Digest "providesDigest"
       provides := ← providesOfJson (← j.getObjVal? "provides")
+      indirect := ← namesOfJson (← j.getObjVal? "indirect")
       specKeys := specKeys.map fun (d, n) => (d, n.name)
       specLookups := ← j.getObjValAs? (Array (ModuleUsage.Digest × ModuleUsage.Digest)) "specLookups"
     }
@@ -146,13 +153,14 @@ structure UsageImport where
   own : NameMap ModuleUsage.Digest
   providesDigest : ModuleUsage.Digest
   provides : Array Name × Array Name
+  indirect : Array Name
   specKeys : Array (ModuleUsage.Digest × Name)
   deriving TypeName
 
 /-- The `UsageImport` view of a module's own `.usage`. -/
 def UsageSidecar.toImport (u : UsageSidecar) : UsageImport :=
   { moduleDigest := u.moduleDigest, closure := u.closure, own := u.own, providesDigest := u.providesDigest,
-    provides := u.provides, specKeys := u.specKeys }
+    provides := u.provides, indirect := u.indirect, specKeys := u.specKeys }
 
 /-- Reads only the fields an importer checks (`importUsage?`). The fields it skips are not importer inputs; a
 sidecar that `UsageSidecar` would reject fails its own module's check, and the importer still binds the sidecar to
@@ -167,6 +175,7 @@ instance : FromJson UsageImport where
       own := own.foldl (init := {}) fun m (n, d) => m.insert n.name d
       providesDigest := ← j.getObjValAs? ModuleUsage.Digest "providesDigest"
       provides := ← providesOfJson (← j.getObjVal? "provides")
+      indirect := ← namesOfJson (← j.getObjVal? "indirect")
       specKeys := specKeys.map fun (d, n) => (d, n.name)
     }
 
@@ -506,12 +515,16 @@ def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetu
 
 /--
 Whether every name whose defining module the compile looked up, used or referred to (`UsageSidecar.resolved`) still
-resolves to the same module, with the same kinds, as when Lean compiled it, and no closure module gained a kernel
-constant another declares (`UsageSidecar.kernelDisjoint`). Each workspace module of the closure whose provides digest
-(`UsageImport.providesDigest`, from a `.usage` that `importUsage?` binds to its current `.olean`) differs from the one
-the compile imported (`UsageSidecar.digested`) must still provide each name the resolver mapped to it with the
-recorded kinds, and none of the other names. A module whose provides digest is unchanged is not asked about any name.
-If the compile read the resolver's whole map (`UsageSidecar.resolvedAll`), no such module may exist.
+resolves to the same module, with the same kinds, as when Lean compiled it, no closure module gained a kernel
+constant another declares (`UsageSidecar.kernelDisjoint`), and no closure module that changed gives one of those names
+a non-local attribute. Each workspace module of the closure whose provides digest (`UsageImport.providesDigest`, from
+a `.usage` that `importUsage?` binds to its current `.olean`) differs from the one the compile imported
+(`UsageSidecar.digested`) must still provide each name the resolver mapped to it with the recorded kinds, and none of
+the other names, and none of those names may be in its `indirect`: a fresh compile that records an extra module use of
+such a name (`Lean.recordExtraModUseFromDecl`, which looks the name up first) also records that module. A module the
+compile recorded as an extra use is not asked: its `.olean` is pinned (`UsekeySidecar.extra`), so its provides digest
+is unchanged. A module whose provides digest is unchanged is not asked about any name. If the compile read the
+resolver's whole map (`UsageSidecar.resolvedAll`), no such module may exist.
 
 This decides without restating how the resolver ranks providers (`Environment.getModuleIdxFor?`), which differs
 between toolchains. It relies on one property, which every such resolver has: for a resolver that picks a winner
@@ -547,6 +560,9 @@ def UsageSidecar.resolvedUnchanged (usage : UsageSidecar) (presetup : ModulePreS
         unless !winner && now == ModuleUsage.kernelKind &&
             (declared.binSearch (n, default) (Name.quickLt ·.1 ·.1)).isSome do
           return false
+    for n in imp.indirect do
+      if usage.resolved.any fun (_, ns) => (ns.binSearch (n, 0) (Name.quickLt ·.1 ·.1)).isSome then
+        return false
     changed := changed.push (m, imp)
   if changed.isEmpty then return true
   usage.kernelDisjoint presetup hashes importArts changed
