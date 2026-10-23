@@ -863,23 +863,28 @@ unchecked additions). Takes time proportional to what the command changed, apart
 def recordCommandDelta (before after : Environment) (idx : Nat) : IO CommandEntries := do
   recordCommandDeltaWith (← Registries.get) before after idx
 
-/-- `f` of each element of `xs`, in order, computed in `lanes` tasks, each over a contiguous block of `xs`; the first
-error in that order is rethrown. For the recorder's per-command work at the end of a module: it reads the finished
-commands' states only, so the commands' records do not depend on each other. Few lanes: the commands' states are
-shared objects, whose reference counts every lane updates, so that many lanes spend more time contending for them than
-they save. Each task inherits the calling thread's task context, so that none of its effects is noted against a
-command. One lane runs on the calling thread. -/
-def CommandEntries.parallelMap {α β : Type} (xs : Array α) (f : α → IO β) (lanes : Nat := 4) : IO (Array β) := do
-  if lanes ≤ 1 || xs.size ≤ 1 then return ← xs.mapM f
+/-- `f` of each of up to `lanes` contiguous blocks of `xs`, each in its own task, concatenated in order; `f` gives as many
+results as its block has elements. The first error in that order is rethrown. For the recorder's per-command work at
+the end of a module: it reads the finished commands' states only, so the commands' records do not depend on each
+other. Few lanes: the commands' states are shared objects, whose reference counts every lane updates, so that many
+lanes spend more time contending for them than they save. Each task inherits the calling thread's task context, so
+that none of its effects is noted against a command. With one lane, `f` runs on the calling thread. -/
+def CommandEntries.parallelBlocks {α β : Type} (xs : Array α) (f : Array α → IO (Array β)) (lanes : Nat := 4) :
+    IO (Array β) := do
+  if lanes ≤ 1 || xs.size ≤ 1 then return ← f xs
   let size := (xs.size + lanes - 1) / lanes
   let mut tasks := #[]
   for k in [0:lanes] do
     let part := xs.extract (k * size) ((k + 1) * size)
-    unless part.isEmpty do tasks := tasks.push (← IO.asTask (part.mapM f))
+    unless part.isEmpty do tasks := tasks.push (← IO.asTask (f part))
   let mut out := Array.emptyWithCapacity xs.size
   for t in tasks do
     out := out ++ (← IO.ofExcept (← IO.wait t))
   return out
+
+/-- `f` of each element of `xs`, in order, in `lanes` tasks (`CommandEntries.parallelBlocks`). -/
+def CommandEntries.parallelMap {α β : Type} (xs : Array α) (f : α → IO β) (lanes : Nat := 4) : IO (Array β) :=
+  CommandEntries.parallelBlocks xs (·.mapM f) lanes
 
 /-- `recordCommandDelta`, with the extension registries read once, now: for recording many commands. -/
 def commandDeltaRecorder : IO (Environment → Environment → Nat → BaseIO CommandEntries) :=
@@ -930,23 +935,18 @@ private partial def compactingRecord : AddedConst → IO (AddedConst × Array Re
     return (.context forConst opts main checked counters, r₁ ++ r₂)
   | a => return (a, #[])
 
-/-- `ce` as an `.olean` stores it, with its compacted bytes (`CompactedRegion.bytes`): every recorded part that holds
-a value no `.olean` can store (a closure) is left out and refused (`Refusal.uncompactable`). A payload that compacts
-whole is compacted once. -/
-def CommandEntries.compact (ce : CommandEntries) : IO (CommandEntries × ByteArray) := do
-  try
-    return (ce, ← CompactedRegion.bytes ce)
-  catch _ =>
-    let (main, r₁) ← compactingStates ce.main none
-    let (checked, r₂) ← compactingStates ce.checked none
-    let mut refused := ce.refusals ++ r₁ ++ r₂
-    let mut added := #[]
-    for a in ce.added do
-      let (a, r) ← compactingRecord a
-      added := added.push a
-      refused := refused ++ r
-    let ce := { ce with main, checked, added, refusals := Refusal.addNew #[] refused }
-    return (ce, ← CompactedRegion.bytes ce)
+/-- `ce`, a payload that does not compact whole, as an `.olean` stores it: every recorded part that holds a value no
+`.olean` can store (a closure) is left out and refused (`Refusal.uncompactable`). -/
+def CommandEntries.withoutUncompactable (ce : CommandEntries) : IO CommandEntries := do
+  let (main, r₁) ← compactingStates ce.main none
+  let (checked, r₂) ← compactingStates ce.checked none
+  let mut refused := ce.refusals ++ r₁ ++ r₂
+  let mut added := #[]
+  for a in ce.added do
+    let (a, r) ← compactingRecord a
+    added := added.push a
+    refused := refused ++ r
+  return { ce with main, checked, added, refusals := Refusal.addNew #[] refused }
 
 /-- Replaces the current module's command payload with `entries` before writing its `.olean`. -/
 def setCommandEntries (env : Environment) (entries : Array CommandEntries) : Environment :=

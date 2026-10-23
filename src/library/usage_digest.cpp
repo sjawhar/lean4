@@ -303,6 +303,171 @@ extern "C" LEAN_EXPORT obj_res lean_usage_expr_digest(uint8 mode, uint8 mdata, b
 #endif
 }
 
+namespace {
+#ifndef LEAN_EMSCRIPTEN
+enum : unsigned char {
+    tag_obj_ctor = 50, tag_obj_array, tag_obj_sarray, tag_obj_string, tag_obj_mpz, tag_obj_thunk, tag_obj_task,
+    tag_obj_promise, tag_obj_ref
+};
+
+/* The bytes of one node of an object digest, gathered and then hashed by XXH3-128, as a file's digest is
+(`digest_stream`): a node is a few dozen bytes, which a SHA-256 per node would hash ten times slower. */
+class node_hasher {
+    std::vector<unsigned char> & m_buf;
+public:
+    node_hasher(std::vector<unsigned char> & buf, unsigned char tag):m_buf(buf) { m_buf.clear(); m_buf.push_back(tag); }
+    node_hasher & u8(unsigned char v) { m_buf.push_back(v); return *this; }
+    node_hasher & u64(uint64_t v) {
+        for (int i = 0; i < 8; i++) m_buf.push_back(static_cast<unsigned char>(v >> (8 * i)));
+        return *this;
+    }
+    node_hasher & str(void const * p, size_t n) {
+        u64(n);
+        unsigned char const * c = static_cast<unsigned char const *>(p);
+        m_buf.insert(m_buf.end(), c, c + n);
+        return *this;
+    }
+    node_hasher & dig(digest const & d) { m_buf.insert(m_buf.end(), d.b, d.b + digest_size); return *this; }
+    digest finish() {
+        XXH128_hash_t h = XXH3_128bits(m_buf.data(), m_buf.size());
+        digest d;
+        for (size_t i = 0; i < 8; i++) {
+            d.b[i] = static_cast<unsigned char>(h.high64 >> (56 - 8 * i));
+            d.b[8 + i] = static_cast<unsigned char>(h.low64 >> (56 - 8 * i));
+        }
+        return d;
+    }
+};
+
+/* Content digests of object graphs (`Lean.ModuleUsage.objectsDigests`): a Merkle hash (`node_hasher`) over the objects,
+each hashing its kind, its scalar contents and its children's digests (a boxed scalar child by its value), for the
+values `CompactedRegion.bytes` stores: a thunk's, a task's and a promise's values, a reference's contents. A closure or
+an external object, which it refuses, makes the digest fail. One digester for many roots digests each object they share
+once; the roots are borrowed for the call, so every object it memoizes stays alive and at its address. */
+class object_digester {
+    ptr_digest_map             m_memo;
+    std::vector<object *>      m_todo;
+    std::vector<unsigned char> m_buf;
+
+    static object * child_of_wrapper(object * o) {
+        switch (lean_ptr_tag(o)) {
+        case LeanThunk:   return lean_thunk_get(o);
+        case LeanTask:    return lean_task_get(o);
+        case LeanPromise: return reinterpret_cast<object *>(lean_to_promise(o)->m_result);
+        case LeanRef:     return lean_to_ref(o)->m_value;
+        default:          lean_unreachable();
+        }
+    }
+
+    void push_if_new(object * c) {
+        if (!lean_is_scalar(c) && m_memo.find(c) == nullptr) m_todo.push_back(c);
+    }
+
+    void put_child(node_hasher & h, object * c) {
+        if (lean_is_scalar(c)) h.u8(0).u64(reinterpret_cast<uint64_t>(c));
+        else h.u8(1).dig(*m_memo.find(c));
+    }
+
+    /* `o`'s digest, given its children's in `m_memo`. */
+    digest node_digest(object * o) {
+        switch (lean_ptr_tag(o)) {
+        case LeanArray: {
+            size_t n = lean_array_size(o);
+            node_hasher h(m_buf, tag_obj_array);
+            h.u64(n);
+            for (size_t i = 0; i < n; i++) put_child(h, lean_array_cptr(o)[i]);
+            return h.finish();
+        }
+        case LeanScalarArray: {
+            size_t n = lean_sarray_size(o), esz = lean_sarray_elem_size(o);
+            node_hasher h(m_buf, tag_obj_sarray);
+            h.u64(esz).str(reinterpret_cast<char const *>(lean_sarray_cptr(o)), n * esz);
+            return h.finish();
+        }
+        case LeanString:
+            return node_hasher(m_buf, tag_obj_string).str(lean_string_cstr(o), lean_string_size(o) - 1).finish();
+        case LeanMPZ: {
+            std::string s = to_mpz(o)->m_value.to_string();
+            return node_hasher(m_buf, tag_obj_mpz).str(s.data(), s.size()).finish();
+        }
+        case LeanThunk: case LeanTask: case LeanPromise: case LeanRef: {
+            unsigned char tag = lean_ptr_tag(o) == LeanThunk ? tag_obj_thunk : lean_ptr_tag(o) == LeanTask ? tag_obj_task
+                : lean_ptr_tag(o) == LeanPromise ? tag_obj_promise : tag_obj_ref;
+            node_hasher h(m_buf, tag);
+            put_child(h, child_of_wrapper(o));
+            return h.finish();
+        }
+        default: {
+            unsigned n = lean_ctor_num_objs(o);
+            size_t scalars = lean_object_byte_size(o) - sizeof(lean_ctor_object) - n * sizeof(void *);
+            node_hasher h(m_buf, tag_obj_ctor);
+            h.u8(lean_ptr_tag(o)).u64(n)
+                .str(reinterpret_cast<char const *>(lean_ctor_obj_cptr(o) + n), scalars);
+            for (unsigned i = 0; i < n; i++) put_child(h, lean_ctor_get(o, i));
+            return h.finish();
+        }
+        }
+    }
+
+public:
+    /* `root`'s digest, or `false` if it holds a closure or an external object. Children first, with an explicit
+    stack: terms nest deeper than the C stack allows. */
+    bool digest_of(object * root, digest & out) {
+        if (lean_is_scalar(root)) {
+            out = node_hasher(m_buf, tag_obj_ctor).u8(0).u64(reinterpret_cast<uint64_t>(root)).finish();
+            return true;
+        }
+        m_todo.clear();
+        push_if_new(root);
+        while (!m_todo.empty()) {
+            object * o = m_todo.back();
+            if (m_memo.find(o) != nullptr) { m_todo.pop_back(); continue; }
+            size_t pending = m_todo.size();
+            switch (lean_ptr_tag(o)) {
+            case LeanClosure: case LeanExternal: case LeanReserved:
+                m_todo.clear();
+                return false;
+            case LeanArray:
+                for (size_t i = 0, n = lean_array_size(o); i < n; i++) push_if_new(lean_array_cptr(o)[i]);
+                break;
+            case LeanScalarArray: case LeanString: case LeanMPZ:
+                break;
+            case LeanThunk: case LeanTask: case LeanPromise: case LeanRef:
+                push_if_new(child_of_wrapper(o));
+                break;
+            default:
+                for (unsigned i = 0, n = lean_ctor_num_objs(o); i < n; i++) push_if_new(lean_ctor_get(o, i));
+                break;
+            }
+            if (m_todo.size() != pending) continue;
+            m_todo.pop_back();
+            m_memo.insert(o, node_digest(o));
+        }
+        out = *m_memo.find(root);
+        return true;
+    }
+};
+#endif
+}
+
+/* `objectsDigests : @& Array α → Array (Option Digest)`: each element's content digest (`object_digester`), `none` for
+one that holds a closure or an external object; one digester for all, so the objects they share are digested once. */
+extern "C" LEAN_EXPORT obj_res lean_usage_objects_digests(b_obj_arg xs) {
+#ifdef LEAN_EMSCRIPTEN
+    lean_internal_panic("usage digests require OpenSSL");
+#else
+    object_digester d;
+    size_t n = lean_array_size(xs);
+    object * r = lean_alloc_array(n, n);
+    for (size_t i = 0; i < n; i++) {
+        digest x;
+        lean_array_cptr(r)[i] = d.digest_of(lean_array_cptr(xs)[i], x) ? mk_option_some(mk_digest_obj(x))
+            : mk_option_none();
+    }
+    return r;
+#endif
+}
+
 /* One digest of an array of expressions, by one digester, so subterms they share are digested once. */
 extern "C" LEAN_EXPORT obj_res lean_usage_exprs_digest(uint8 mode, uint8 mdata, b_obj_arg es) {
 #ifdef LEAN_EMSCRIPTEN

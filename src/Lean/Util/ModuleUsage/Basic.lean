@@ -187,6 +187,13 @@ opaque exprDigest (mode : BinderMode) (mdata : MDataMode) (e : @& Expr) : Digest
 @[extern "lean_usage_exprs_digest"]
 opaque exprsDigest (mode : BinderMode) (mdata : MDataMode) (es : @& Array Expr) : Digest
 
+/-- For each of `xs`, a digest of its contents (`src/library/usage_digest.cpp`): a Merkle SHA-256 over its objects that
+counts what `CompactedRegion.bytes` stores of each, so two elements with equal contents get equal digests however their
+objects are shared; `none` for an element holding a value `CompactedRegion.bytes` refuses (a closure, an external
+object). The objects the elements share are digested once. -/
+@[extern "lean_usage_objects_digests"]
+opaque objectsDigests {α : Type} (xs : @& Array α) : Array (Option Digest)
+
 def externEnc (e : Enc) (d : ExternAttrData) : Enc :=
   let ⟨entries⟩ := d
   entries.foldl (init := e.nat entries.length) fun e x => match x with

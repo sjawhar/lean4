@@ -73,8 +73,9 @@ def commandStateChanges (before after : Elab.Command.State) : Array Refusal := I
 /-- The command payloads of the observed commands (`observations`, in command order; `commandDeltaRecorder`), each also
 refused for the command-state fields it changed (`commandStateChanges`), the attributes with handlers outside core
 Lean it ran (`foreignAttributesByCommand`) and its effects on state outside it the runtime noted (`effects`,
-`RecordedEffects.byCommand`), as the `.olean` stores them (`CommandEntries.compact`), with the digest of their compacted
-bytes; the commands in parallel (`CommandEntries.parallelMap`). -/
+`RecordedEffects.byCommand`), as the `.olean` stores them (a payload holding a closure without the parts that hold one,
+`CommandEntries.withoutUncompactable`), with the digest of their contents (`objectsDigests`); the commands in parallel
+(`CommandEntries.parallelBlocks`), one digester per block, so that what a block's payloads share is digested once. -/
 def commandPayloads (observations : Array CommandObservation) (effects : Array (Nat × String)) :
     IO (Array (CommandEntries × Digest)) := do
   let byCommand (records : Array (Nat × Refusal)) : Std.HashMap Nat (Array Refusal) :=
@@ -83,11 +84,18 @@ def commandPayloads (observations : Array CommandObservation) (effects : Array (
     (i, .foreignAttribute attr)
   let effects := byCommand <| effects.map fun (i, what) => (i, .effect what)
   let record ← commandDeltaRecorder
-  CommandEntries.parallelMap observations fun obs => do
-    let ce ← record obs.before.env obs.after.env obs.i
-    let extra := commandStateChanges obs.before obs.after ++ foreign.getD obs.i #[] ++ effects.getD obs.i #[]
-    let (ce, bytes) ← CommandEntries.compact { ce with refusals := Refusal.addNew ce.refusals extra }
-    return (ce, Digest.ofBytes bytes)
+  CommandEntries.parallelBlocks observations fun block => do
+    let ces ← block.mapM fun obs => do
+      let ce ← record obs.before.env obs.after.env obs.i
+      let extra := commandStateChanges obs.before obs.after ++ foreign.getD obs.i #[] ++ effects.getD obs.i #[]
+      return { ce with refusals := Refusal.addNew ce.refusals extra }
+    (ces.zip (objectsDigests ces)).mapM fun
+      | (ce, some d) => return (ce, d)
+      | (ce, none) => do
+        let ce ← CommandEntries.withoutUncompactable ce
+        let some d := (objectsDigests #[ce])[0]?.join |
+          throw <| IO.userError s!"command {ce.idx}'s payload holds a value no `.olean` can store outside its parts"
+        return (ce, d)
 
 /-- What a module's `.usage` records for reusing its commands: its command records, and why none of its commands may be
 kept (`noreuseReason?`). That decides nothing about skipping the module whole (`noskip`). Its payloads are
