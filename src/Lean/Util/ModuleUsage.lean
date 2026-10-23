@@ -307,11 +307,10 @@ def kindsIn (kernel extra : Array Name) (n : Name) : UInt8 :=
   (if kernel.binSearchContains n Name.quickLt then kernelKind else 0) |||
     (if extra.binSearchContains n Name.quickLt then extraKind else 0)
 
-/-- The kind bits with which imported module `i` provides `n`, from its `.olean` (`ownProvides`): `0` if it lists
-no such name or carries no digests. -/
-def providedKinds (env : Environment) (i : ModuleIdx) (n : Name) : UInt8 :=
+/-- Imported module `i`'s `ownProvides`, from its `.olean`: empty arrays if it carries no digests. -/
+def importedOwnProvides (env : Environment) (i : ModuleIdx) : Array Name × Array Name :=
   let es := providesExt.getModuleEntries env i
-  kindsIn (es[0]?.getD #[]) (es[1]?.getD #[]) n
+  (es[0]?.getD #[], es[1]?.getD #[])
 
 /-- The current module's own constants, from the kernel environment, each with its `refs`. -/
 def ownConsts (env : Environment) (recorded : NameMap DeclConsts := {}) :
@@ -719,19 +718,24 @@ def digestedModules (env : Environment) : Array (Name × Digest) :=
     |>.qsort (Name.quickLt ·.1 ·.1)
 
 /-- `names` grouped by the module the resolver maps each to (`Environment.getModuleIdxFor?`; `none`: the current
-module, or no module), each with the kinds under which that module provides it (`providedKinds`; `0` for `none` and
-for a module without digests). The `none` group comes first, then the modules by name, names sorted. -/
-def resolvedGroups (env : Environment) (names : NameHashSet) : Array (Option Name × Array (Name × UInt8)) :=
-  let byMod : Std.HashMap (Option Nat) (Array (Name × UInt8)) := (names : Std.HashSet Name).fold (init := {}) fun m n =>
-    let i? := env.getModuleIdxFor? n
-    let k := i?.elim 0 (providedKinds env · n)
-    m.alter (i?.map (·.toNat)) fun o => some ((o.getD #[]).push (n, k))
-  let groups := byMod.toArray.map fun (i?, ns) =>
-    (i?.map (env.header.moduleNames[·]!), ns.qsort (Name.quickLt ·.1 ·.1))
-  groups.qsort fun a b => match a.1, b.1 with
-    | none, some _ => true
-    | some x, some y => Name.quickLt x y
-    | _, _ => false
+module, or no module), each with the kinds under which that module provides it (`kindsIn` of its
+`importedOwnProvides`; `0` for `none` and for a module without digests). The `none` group comes first, then the
+modules by name, names sorted. -/
+def resolvedGroups (env : Environment) (names : NameHashSet) : Array (Option Name × Array (Name × UInt8)) := Id.run do
+  -- Index 0 holds the `none` group, index `i + 1` module `i`'s.
+  let byMod := (names : Std.HashSet Name).fold
+    (init := Array.replicate (env.header.moduleNames.size + 1) (#[] : Array Name))
+    fun g n => g.modify ((env.getModuleIdxFor? n).elim 0 (·.toNat + 1)) (·.push n)
+  let mut mods := #[]
+  for k in [1:byMod.size] do
+    let ns := byMod[k]!
+    unless ns.isEmpty do
+      let (kernel, extra) := importedOwnProvides env (k - 1 : Nat)
+      mods := mods.push (env.header.moduleNames[k - 1]!,
+        (ns.qsort Name.quickLt).map fun n => (n, kindsIn kernel extra n))
+  let groups := (mods.qsort (Name.quickLt ·.1 ·.1)).map fun (m, es) => (some m, es)
+  let own := byMod[0]!
+  return if own.isEmpty then groups else #[(none, (own.qsort Name.quickLt).map (·, 0))] ++ groups
 
 /-- A name's identity in a module's `.resolved` sidecar (`encodeResolved`): the digest of its canonical encoding,
 `(({} : Enc).name n).finish`, computed natively without building the buffer (`src/library/usage_digest.cpp`). Lean's
