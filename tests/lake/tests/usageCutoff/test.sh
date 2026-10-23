@@ -458,6 +458,14 @@ printf 'import Test.A\ndef b := a + 1\n' > Test/B.lean
 printf 'import Test.A\nexample : a = 1 := rfl\n' > Test/C.lean
 printf 'import Test.A\n#print axioms ta\n' > Test/D.lean
 test_run build Test.B Test.C Test.D
+# a `.usekey` binds the `.olean` bytes Lake recorded, hashed in the read that hashed the artifact, and those are the
+# bytes the file has after Lake made it read-only and linked it into the cache
+test_exp "$(stat -c %h .lake/build/lib/lean/Test/B.olean)" -ge 2
+test_exp ! -w .lake/build/lib/lean/Test/B.olean
+printf '%s\n' 'import Lean' 'def main (args : List String) : IO Unit := do' \
+  '  IO.println (← Lean.ModuleUsage.fileDigest args[0]!).hex' > ../oleanDigest.lean
+d=$("$LAKE" env lean --run ../oleanDigest.lean .lake/build/lib/lean/Test/B.olean)
+test_cmd_out "\"olean\":\"$d\"" cat .lake/build/lib/lean/Test/B.usekey
 # unrelated addition: A recompiles, nothing below it does
 printf 'def a := 1\ntheorem ta : a = 1 := sorry\ndef unrelated := 2\n' > Test/A.lean
 lake_out build -v Test.B Test.C Test.D
