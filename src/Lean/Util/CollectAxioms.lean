@@ -95,6 +95,8 @@ binary search without requiring the extension object.
 -/
 structure ExportedAxiomsState where
   importedModuleEntries : Array (Array (Name × Array Name)) := #[]
+  /-- The current module's entries, once `storeExportedAxioms` stored them; the export returns these. -/
+  localEntries? : Option (Array (Name × Array Name)) := none
 
 instance : Inhabited ExportedAxiomsState := ⟨{}⟩
 
@@ -124,6 +126,7 @@ builtin_initialize exportedAxiomsExt :
     addImportedFn := fun importedEntries => pure { importedModuleEntries := importedEntries }
     addEntryFn    := fun s _ => s
     exportEntriesFnEx := fun env s =>
+      if let some entries := s.localEntries? then .uniform entries else
       let exportedEnv := env.setExporting true
       let privateEnv := env.setExporting false
       -- Collect current-module declarations visible in the exported view.
@@ -144,6 +147,20 @@ builtin_initialize exportedAxiomsExt :
       .uniform entries
     asyncMode     := .mainOnly
   }
+
+/-- Runs `exportedAxiomsExt`'s export for the current module and stores its entries (`storedExportedAxioms?`), which
+the export then returns. Call it once the module's kernel constants are final: one added later gets no entry, and
+importers walk its body instead. -/
+public def storeExportedAxioms (env : Environment) : Environment :=
+  let s := exportedAxiomsExt.getState (asyncMode := .mainOnly) env
+  let entries := (exportedAxiomsExt.exportEntriesFn env { s with localEntries? := none }).private
+  exportedAxiomsExt.modifyState (asyncMode := .mainOnly) env ({ · with localEntries? := some entries })
+
+/-- The entries `storeExportedAxioms` stored, sorted by name, which the `.olean` carries: an importer computes its
+axioms for a declaration that uses one of these names from them, so the usage digests cover them
+(`Lean.ModuleUsage.ownNodes`). -/
+public def storedExportedAxioms? (env : Environment) : Option (Array (Name × Array Name)) :=
+  (exportedAxiomsExt.getState (asyncMode := .mainOnly) env).localEntries?
 
 /-- Collect all axioms transitively used by a constant. -/
 public def collectAxioms [Monad m] [MonadEnv m] (constName : Name) : m (Array Name) := do
