@@ -90,6 +90,9 @@ public inductive SidecarEntry where
   | pending (stamp? : Option Lean.ModuleUsage.FileStamp) (id : Nat)
     (promise : IO.Promise (Option (Lean.ModuleUsage.Digest × Dynamic)))
 
+/-- Number of independently locked file-digest cache shards in one build. -/
+public def fileDigestShardCount : Nat := 64
+
 /-- A Lake context with a build configuration and additional build data. -/
 public structure BuildContext extends BuildConfig, Context where
   leanTrace : BuildTrace
@@ -117,16 +120,17 @@ public structure BuildContext extends BuildConfig, Context where
   sidecarCache : Std.Mutex (Nat × Std.HashMap FilePath SidecarEntry)
   /--
   The content hashes (`Lean.ModuleUsage.fileDigest`) that usage-cutoff checks computed in this build, each with the
-  stamp of the file its bytes were read from (`Lean.ModuleUsage.fileDigestStamped`). A check reuses a hash only while
-  the file's current stamp is the recorded one; any write, truncation or replacement of the file through the file
-  system changes its stamp, so a check never takes a hash for bytes other than the file's current ones.
+  stamp of the file its bytes were read from (`Lean.ModuleUsage.fileDigestStamped`). The maps are sharded by path
+  hash, so independent hash lookups do not contend. A check reuses a hash only while the file's current stamp is the
+  recorded one; any write, truncation or replacement of the file through the file system changes its stamp, so a
+  check never takes a hash for bytes other than the file's current ones.
 
   A store through a `MAP_SHARED` mapping changes a file's bytes without a `write`, and the kernel may update its
   modification time late, so the reuse relies on no writer of a hashed file using one. Lean writes an `.olean`
   through a stream to a temporary file it then renames (`src/library/module.cpp:314,408`) and maps the files it
   reads `MAP_PRIVATE` (`:528`).
   -/
-  fileDigests : Std.Mutex (Std.HashMap FilePath (Lean.ModuleUsage.FileStamp × Lean.ModuleUsage.Digest))
+  fileDigests : Array (Std.Mutex (Std.HashMap FilePath (Lean.ModuleUsage.FileStamp × Lean.ModuleUsage.Digest)))
 
 /-- A transformer to equip a monad with a `BuildContext`. -/
 public abbrev BuildT := ReaderT BuildContext

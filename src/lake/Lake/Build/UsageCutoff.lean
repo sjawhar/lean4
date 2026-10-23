@@ -328,7 +328,8 @@ def contentHash (hashes : ContentHashes) (file : FilePath) : JobM ModuleUsage.Di
   return hash
 where
   stampedDigest : JobM ModuleUsage.Digest := do
-    let memo := (← getBuildContext).fileDigests
+    let memos := (← getBuildContext).fileDigests
+    let some memo := memos[(hash file).toNat % memos.size]? | unreachable!
     if let some stamp ← ModuleUsage.fileStamp file then
       if let some (recorded, hash) ← memo.atomically (return (← get)[file]?) then
         if recorded == stamp then return hash
