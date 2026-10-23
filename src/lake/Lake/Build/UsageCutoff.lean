@@ -612,7 +612,7 @@ public def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     ("closure", toJson closure),
     ("extra", Json.arr extra)
   ]
-  IO.FS.writeFile mod.usekeyFile key.compress
+  ModuleUsage.writeFileReplacing mod.usekeyFile key.compress.toUTF8
 
 /--
 Whether nothing the module used changed meaning since Lean wrote its `.usage`: its `.usekey` (read first) was written
