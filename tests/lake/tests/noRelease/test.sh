@@ -25,7 +25,7 @@ git config user.name test
 git config user.email test@example.com
 git add --all
 git commit -m "initial commit"
-git tag release
+git -c tag.gpgSign=false tag release
 INIT_REV=`git rev-parse release`
 git commit --allow-empty -m "second commit"
 popd
@@ -104,7 +104,7 @@ EOF
 # Test retagging
 echo "# TEST: Retagging"
 test_cmd git -C dep tag -d release
-test_cmd git -C dep tag release
+test_cmd git -c tag.gpgSign=false -C dep tag release
 NEW_REV=`git -C dep rev-parse release`
 test_exp ! "$INIT_REV" = "$NEW_REV"
 test_cmd_eq "$INIT_REV" git -C .lake/packages/dep rev-parse HEAD
