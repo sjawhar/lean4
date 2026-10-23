@@ -1,10 +1,11 @@
 import Lean
 /-! The `.resolved` sidecar: `lean --usage=A.usage` writes `A.resolved`, whose digest `A.usage` records
 (`resolvedDigest`) and which no longer holds a `resolved` field; `ResolvedTable.decode?` reads back what
-`encodeResolved` writes and rejects truncated or trailing bytes and duplicate entries; and
+`encodeResolved` writes and rejects truncated or trailing bytes and duplicate entries;
 `ResolvedTable.providerUnchanged` agrees with the direct check (every recorded name has the changed provider's kinds
 if recorded under it and none otherwise, except a name the provider declares as a kernel constant alone and the
-compile used from it) on every case below. -/
+compile used from it) on every case below; and the native `resolvedId` is the digest of `Enc.name`'s bytes for
+anonymous, string, numeric (small, at 2^63 and past 2^64), mixed and non-ASCII names. -/
 open Lean ModuleUsage
 
 /-- The direct check `providerUnchanged` inverts. -/
@@ -53,6 +54,10 @@ def cases : List (String × Array Name × Array Name × Array Name) := [
   IO.println s!"trailing: {bad (b.push 0)}"
   IO.println s!"duplicate: {bad (encodeResolved #[(none, #[(`a, 0)]), (some `M, #[(`a, 1)])])}"
 
+#eval show IO Unit from do
+  let names : List Name := [.anonymous, `a, `a.b.c, .num .anonymous 0, .num `x 7, .num `x 9223372036854775808,
+    .num `x 18446744073709551616, .str (.num `x 3) "y", .str (.num `_private.M 0) "f", .str `ℕ "é", .str `a ""]
+  IO.println s!"resolvedId = Enc.name: {names.all fun n => resolvedId n == (({} : Enc).name n).finish}"
 #eval show IO Unit from IO.FS.withTempDir fun dir => do
   IO.FS.writeFile (dir / "A.lean") "def a := 1\ndef b := a + 1\n"
   let out ← IO.Process.output

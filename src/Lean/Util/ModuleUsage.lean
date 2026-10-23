@@ -731,9 +731,11 @@ def resolvedGroups (env : Environment) (names : NameHashSet) : Array (Option Nam
     | some x, some y => Name.quickLt x y
     | _, _ => false
 
-/-- A name's identity in a module's `.resolved` sidecar (`encodeResolved`): the digest of its canonical encoding
-(`Enc.name`). Lean's writer and Lake's check (`ResolvedTable.providerUnchanged`) both call it. -/
-def resolvedId (n : Name) : Digest := (({} : Enc).name n).finish
+/-- A name's identity in a module's `.resolved` sidecar (`encodeResolved`): the digest of its canonical encoding,
+`(({} : Enc).name n).finish`, computed natively without building the buffer (`src/library/usage_digest.cpp`). Lean's
+writer and Lake's check (`ResolvedTable.providerUnchanged`) both call it. -/
+@[extern "lean_usage_resolved_id"]
+opaque resolvedId (n : @& Name) : Digest
 
 /-- Each distinct name of `provides`, a module's `ownProvides` (each array sorted by `Name.quickLt`), with its
 `resolvedId` and the nonzero kinds under which `provides` lists it (`kindsIn`). -/
@@ -974,7 +976,7 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
     |>.qsort fun a b => let k (u : ExtraModUse) := 2 * u.isExported.toNat + u.isMeta.toNat
       Name.quickLt a.module b.module || (a.module == b.module && k a < k b)
   let imported (ms : Array Name) (field : Digest × Digest → Digest) : Json :=
-    Json.arr <| (ms.qsort Name.quickLt).toList.eraseDups.toArray.filterMap fun m => do
+    Json.arr <| (ms.qsort Name.quickLt).eraseReps.filterMap fun m => do
       return Json.arr #[nameToJson m, toJson (field (← s.importedDigests? (← env.getModuleIdx? m)))]
   let pair (n : Name) (d : Digest) := Json.arr #[nameToJson n, toJson d]
   let usedJson := Json.arr ((moduleUsed env used nodes).map fun (m, cs) =>
