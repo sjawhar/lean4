@@ -477,6 +477,7 @@ static inline HANDLE win_handle(FILE * fp) {
 /* Handle.lock : (@& Handle) → (exclusive : Bool) → IO Unit */
 extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_lock(b_obj_arg h, uint8_t x) {
     OVERLAPPED o = {0};
+    note_handle_use(io_get_handle(h));
     HANDLE wh = win_handle(io_get_handle(h));
     DWORD flags = x ? LOCKFILE_EXCLUSIVE_LOCK : 0;
     if (LockFileEx(wh, flags, 0, MAXDWORD, MAXDWORD, &o)) {
@@ -489,6 +490,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_lock(b_obj_arg h, uint8_t x) 
 /* Handle.tryLock : (@& Handle) → (exclusive : Bool) → IO Bool */
 extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_try_lock(b_obj_arg h, uint8_t x) {
     OVERLAPPED o = {0};
+    note_handle_use(io_get_handle(h));
     HANDLE wh = win_handle(io_get_handle(h));
     DWORD flags = (x ? LOCKFILE_EXCLUSIVE_LOCK : 0) | LOCKFILE_FAIL_IMMEDIATELY;
     if (LockFileEx(wh, flags, 0, MAXDWORD, MAXDWORD, &o)) {
@@ -505,6 +507,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_try_lock(b_obj_arg h, uint8_t
 /* Handle.unlock : (@& Handle) → IO Unit */
 extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_unlock(b_obj_arg h) {
     OVERLAPPED o = {0};
+    note_handle_use(io_get_handle(h));
     HANDLE wh = win_handle(io_get_handle(h));
     if (UnlockFileEx(wh, 0, MAXDWORD, MAXDWORD, &o)) {
         return io_result_mk_ok(box(0));
@@ -520,6 +523,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_unlock(b_obj_arg h) {
 
 /* Handle.setInheritable : (@& Handle) → (inheritable : Bool) → IO Unit */
 extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_set_inheritable(b_obj_arg h, uint8_t x) {
+    note_handle_use(io_get_handle(h));
     HANDLE wh = win_handle(io_get_handle(h));
     if (SetHandleInformation(wh, HANDLE_FLAG_INHERIT, x ? HANDLE_FLAG_INHERIT : 0)) {
         return io_result_mk_ok(box(0));
@@ -569,6 +573,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_unlock(b_obj_arg h) {
 
 /* Handle.setInheritable : (@& Handle) → (inheritable : Bool) → IO Unit */
 extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_set_inheritable(b_obj_arg h, uint8_t x) {
+    note_handle_use(io_get_handle(h));
     int fd = fileno(io_get_handle(h));
     int flags = fcntl(fd, F_GETFD);
     if (flags == -1 || fcntl(fd, F_SETFD, x ? (flags & ~FD_CLOEXEC) : (flags | FD_CLOEXEC)) == -1) {
@@ -582,6 +587,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_set_inheritable(b_obj_arg h, 
 /* Handle.isTty : (@& Handle) → BaseIO Bool */
 extern "C" LEAN_EXPORT uint8_t lean_io_prim_handle_is_tty(b_obj_arg h) {
     FILE * fp = io_get_handle(h);
+    note_handle_use(fp);
 #ifdef LEAN_WINDOWS
     /*
     On Windows, there are two approaches for detecting a console.
@@ -1540,15 +1546,19 @@ extern "C" LEAN_EXPORT obj_res lean_io_current_dir() {
 /*
 Effect notes. While on (`lean_io_set_effect_recording`), the runtime notes, per task context other than 0 (code outside
 any command), each effect that context has on state outside it: a write to a reference another context created
-(`m_context`), the resolution or cancellation of a task or promise another context created, and each use of
-process-wide state through the runtime's primitives: a file or directory it did not create, a file handle it did not
-open (the standard streams among them), a file it created and left in place, a child process, the runtime's settings
-(maximum heartbeats and memory, exit on panic, thread stack size, debug tags).
+(`m_context`), the resolution or cancellation of a task or promise another context created, the use of a mutable
+native object (a SAT solver) another context created, and each use of process-wide state through the runtime's
+primitives: a file or directory it did not create, a file handle it did not open (the standard streams among them), a
+file it created and left in place, the working directory changed, a child process, the network, signals, a native
+library loaded, the process's other settings (the runtime's maximum heartbeats and memory, exit on panic, thread stack
+size, debug tags, the event loop, the process title and priority, the environment written), and host facts (the host
+name, the user and group database, the network interfaces). The import context (`import_context`) notes only the
+process-wide uses: what imported modules' initializers do inside the process follows from the imported modules.
 
 Not effects: reads of the toolchain's own files (`in_pinned_dirs`), which the Lean githash pins, recorded as a read of
-the value `toolchain` (the pinned directories' root); values any two runs may differ in (clocks, heartbeat counts,
-random bytes, process and thread ids), which a kept command's result takes from the run that recorded it; and the
-runtime's debugging output (`dbg_trace`).
+the value `toolchain` (the pinned directories' root); values two runs may differ in (clocks, timers, heartbeat counts,
+random bytes, process and thread ids, resource usage and free memory), which a kept command's result takes from the run
+that recorded it; and the runtime's debugging output (`dbg_trace`, `timeit`).
 
 Value reads: in every context, the first value of each environment variable, of the running executable's path and of
 the working directory read, and whether a later read saw another one (`lean_io_take_value_reads`). A later build
@@ -1572,6 +1582,8 @@ static mutex * g_effects_mutex = nullptr;
 static std::unordered_map<uint32, context_effects> * g_effects = nullptr;
 // the file handles opened while effects are noted, with the context that opened them
 static std::unordered_map<FILE *, uint32> * g_handle_contexts = nullptr;
+// the mutable native objects created while effects are noted, with the context that created them
+static std::unordered_map<void const *, uint32> * g_object_contexts = nullptr;
 static std::map<std::string, value_read> * g_value_reads = nullptr;
 // the toolchain directories whose files the Lean githash pins, resolved, each ending in `/`, and their root as given
 static std::vector<std::string> * g_pinned_dirs = nullptr;
@@ -1583,7 +1595,9 @@ uint32 effect_context() {
 }
 
 std::string describe_context(uint32 ctx) {
-    return ctx == 0 ? std::string("no command") : "command " + std::to_string(ctx - 1);
+    return ctx == 0 ? std::string("no command")
+        : ctx == import_context ? std::string("an imported module's initializer")
+        : "command " + std::to_string(ctx - 1);
 }
 
 static void note_value_read_core(std::string const & key, char const * value) {
@@ -1692,6 +1706,10 @@ static void note_path_create(char const * what, char const * p, bool dir) {
     }
 }
 
+void note_path_write(char const * p) {
+    note_path_create("writes", p, false);
+}
+
 /* For the effect context, about to remove `p`: forgets it if the context created it, else notes `what p`. */
 static void note_path_remove(char const * what, char const * p) {
     uint32 ctx = effect_context();
@@ -1713,8 +1731,8 @@ static void note_handle_use(FILE * fp) {
     lock_guard<mutex> lock(*g_effects_mutex);
     auto it = g_handle_contexts->find(fp);
     if (it != g_handle_contexts->end() && it->second == ctx) return;
-    char const * what = fp == stdout ? "writes to the standard output" : fp == stderr ? "writes to the standard error"
-        : fp == stdin ? "reads the standard input" : "uses a file handle another context opened";
+    char const * what = fp == stdout ? "uses the standard output" : fp == stderr ? "uses the standard error"
+        : fp == stdin ? "uses the standard input" : "uses a file handle another context opened";
     note_effect_core((*g_effects)[ctx], what);
 }
 
@@ -1734,6 +1752,42 @@ static void note_handle_open(FILE * fp) {
     if (ctx == 0) return;
     lock_guard<mutex> lock(*g_effects_mutex);
     (*g_handle_contexts)[fp] = ctx;
+}
+
+void note_object_created(void const * o) {
+    uint32 ctx = effect_context();
+    if (ctx == 0) return;
+    lock_guard<mutex> lock(*g_effects_mutex);
+    (*g_object_contexts)[o] = ctx;
+}
+
+// Bumped whenever an object is forgotten: a thread's last checked use (below) then no longer stands for its address.
+static std::atomic<uint64_t> g_object_gen(0);
+// The last object a thread's context used, checked: an object's many uses in a row take the mutex once.
+static thread_local void const * t_checked_object = nullptr;
+static thread_local uint32 t_checked_ctx = 0;
+static thread_local uint64_t t_checked_gen = 0;
+
+void note_object_use(void const * o, char const * what) {
+    uint32 ctx = effect_context();
+    if (ctx == 0) return;
+    uint64_t gen = g_object_gen.load(std::memory_order_acquire);
+    if (o == t_checked_object && ctx == t_checked_ctx && gen == t_checked_gen) return;
+    {
+        lock_guard<mutex> lock(*g_effects_mutex);
+        auto it = g_object_contexts->find(o);
+        if (it == g_object_contexts->end() || it->second != ctx) note_effect_core((*g_effects)[ctx], what);
+    }
+    t_checked_object = o;
+    t_checked_ctx = ctx;
+    t_checked_gen = gen;
+}
+
+void forget_object(void const * o) {
+    if (!g_effects_mutex) return;
+    lock_guard<mutex> lock(*g_effects_mutex);
+    g_object_contexts->erase(o);
+    g_object_gen.fetch_add(1, std::memory_order_acq_rel);
 }
 
 /* Forgets `fp`, which is being closed. */
@@ -1815,12 +1869,13 @@ extern "C" LEAN_EXPORT obj_res lean_io_mark_ref_accounted(b_obj_arg ref) {
     return box(0);
 }
 
-/* For the effect context, about to write `ref`: notes it unless the context created it or it is accounted. */
+/* For the effect context, about to write `ref`: notes it unless the context created it or it is accounted. Writes of
+   the import context are not noted (`import_context`). */
 static inline void note_ref_write(b_obj_arg ref) {
     if (LEAN_LIKELY(!g_effects_on.load(std::memory_order_relaxed))) return;
     uint32 ctx = get_task_context();
     uint32 owner = lean_to_ref(ref)->m_context;
-    if (ctx != 0 && owner != ctx && owner != LEAN_REF_ACCOUNTED)
+    if (ctx != 0 && ctx != import_context && owner != ctx && owner != LEAN_REF_ACCOUNTED)
         note_effect(ctx, "writes a reference " + describe_context(owner) + " created");
 }
 
@@ -2083,6 +2138,7 @@ void initialize_io() {
     g_effects_mutex = new mutex();
     g_effects = new std::unordered_map<uint32, context_effects>();
     g_handle_contexts = new std::unordered_map<FILE *, uint32>();
+    g_object_contexts = new std::unordered_map<void const *, uint32>();
     g_value_reads = new std::map<std::string, value_read>();
     g_pinned_dirs = new std::vector<std::string>();
     g_pinned_root = new std::string();

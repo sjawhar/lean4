@@ -478,13 +478,16 @@ inline obj_res st_ref_swap(b_obj_arg r, obj_arg v) { return lean_st_ref_swap(r, 
 
 /* The task context of the running thread (`lean_io_set_task_context`). */
 uint32 get_task_context();
+/* The task context of imported modules' initializers and extension initial states while a module's header is
+   processed (`Lean.withImportContext`): its effects on process-wide state concern the whole module. */
+constexpr uint32 import_context = 0xFFFFFFFEu;
 /* The task context of the running thread while effects are noted (`lean_io_set_effect_recording`), else 0. */
 uint32 effect_context();
 /* Notes for task context `ctx` (not 0) that it caused `what`, an effect on state outside it (`lean_io_take_effects`). */
 void note_effect(uint32 ctx, std::string const & what);
 /* `"command N"` for task context `ctx` (`N = ctx - 1`), `"no command"` for 0: who created an object. */
 std::string describe_context(uint32 ctx);
-/* Notes `what` for the running task context, if effects are noted and it is a command's. */
+/* Notes `what` for the running task context, if effects are noted and it is a command's or the import's. */
 inline void note_effect_here(char const * what) {
     if (uint32 ctx = effect_context()) note_effect(ctx, what);
 }
@@ -497,6 +500,14 @@ void note_task_owner(uint32 ctx, lean_task_object * t, char const * what);
 void note_value_read(std::string const & key, char const * value);
 /* For the effect context, about to read the file or directory `p` (`lean_io_take_effects`). */
 void note_path_read(char const * p);
+/* For the effect context, about to write the file `p`, creating it if it does not exist. */
+void note_path_write(char const * p);
+/* Records that the effect context created the mutable native object `o`, which it may use freely. */
+void note_object_created(void const * o);
+/* For the effect context, about to use the mutable native object `o`: notes `what` unless the context created it. */
+void note_object_use(void const * o, char const * what);
+/* Forgets `o`, which is being freed. */
+void forget_object(void const * o);
 
 obj_res lean_promise_new();
 void lean_promise_resolve(obj_arg value, b_obj_arg promise);

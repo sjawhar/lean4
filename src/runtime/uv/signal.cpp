@@ -105,6 +105,7 @@ void handle_signal_event(uv_signal_t* handle, int) {
 
 /* Std.Internal.UV.Signal.mk (signum : Int32) (repeating : Bool) : IO Signal */
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_signal_mk(uint32_t signum_obj, uint8_t repeating) {
+    note_effect_here("handles a signal");
     int signum = (int)(int32_t)signum_obj;
 
     // See `Signal.toInt32` in Std.Async.Signal
@@ -168,6 +169,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_signal_mk(uint32_t signum_obj, uint8
 
 /* Std.Internal.UV.Signal.next (signal : @& Signal) : IO (IO.Promise Int) */
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_signal_next(b_obj_arg obj) {
+    note_effect_here("handles a signal");
     lean_uv_signal_object * signal = lean_to_uv_signal(obj);
 
     // Stays NULL when `stop` dropped this signal's promise.
@@ -271,6 +273,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_signal_next(b_obj_arg obj) {
 
 /* Std.Internal.UV.Signal.stop (signal : @& Signal) : IO Unit */
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_signal_stop(b_obj_arg obj) {
+    note_effect_here("handles a signal");
     lean_uv_signal_object * signal = lean_to_uv_signal(obj);
 
     lean_object * promise = NULL;
@@ -308,6 +311,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_signal_stop(b_obj_arg obj) {
 
 /* Std.Internal.UV.Signal.cancel (signal : @& Signal) : IO Unit */
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_signal_cancel(b_obj_arg obj) {
+    note_effect_here("handles a signal");
     lean_uv_signal_object * signal = lean_to_uv_signal(obj);
 
     lean_object * promise = NULL;

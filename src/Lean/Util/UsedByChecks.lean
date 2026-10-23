@@ -21,7 +21,7 @@ code that a module runs while it is elaborated cannot clear or switch off what i
 run that finds another run started after it (`lastFrontendRun`) does not take the logs as its own.
 -/
 
-/-- Marks `r` as accounted: the runtime's effect notes skip writes to it (`effectsByCommand`). Only for references
+/-- Marks `r` as accounted: the runtime's effect notes skip writes to it (`takeRecordedEffects`). Only for references
 whose state across commands a command payload carries or no command's result depends on: the usage recorders' own
 logs, and the caches whose writes the payloads record. -/
 @[extern "lean_io_mark_ref_accounted"]
@@ -223,6 +223,10 @@ on (`withCommandContext`), in that command's asynchronous work too. -/
 @[extern "lean_io_get_task_context"]
 opaque getTaskContext : BaseIO UInt32
 
+/-- The task context of imported modules' initializers and extension initial states while a module's header is
+processed (`withImportContext`). -/
+def importContext : UInt32 := 0xFFFFFFFE
+
 @[extern "lean_io_set_effect_recording"]
 private opaque setEffectRecording (on : Bool) (pinned : @& Array String) (root : @& String) : BaseIO Unit
 
@@ -267,7 +271,7 @@ def registerRunLog (clear : BaseIO Unit) : IO Unit := do
 
 /--
 Starts a `runFrontend` run and returns its number, which no earlier run got. With `record`, switches recording on
-(`enableUsageRecording`) with the runtime's effect notes and value reads (`effectsByCommand`, `takeValueReads`;
+(`enableUsageRecording`) with the runtime's effect notes and value reads (`takeRecordedEffects`, `takeValueReads`;
 `pinnedToolchainDirs`), and clears the per-run logs: the names `addDecl` and `recordUsedName` recorded, the per-command
 logs, the effect notes, the value reads, and the logs other modules registered (`registerRunLog`). The names the
 resolver looked up (`resolvedNames`) are kept for the whole process. The logs are
@@ -300,10 +304,20 @@ def withCommandContext [Monad m] [MonadFinally m] [MonadLiftT BaseIO m] (i : Nat
   (setTaskContext (i + 1).toUInt32 : BaseIO Unit)
   try act finally (setTaskContext old : BaseIO Unit)
 
+/-- Runs `act`, which runs imported modules' initializers or computes the initial states of environment extensions
+while a module's header is processed, in the import context (`importContext`) when recording is on outside any command:
+its uses of process-wide state concern every command of the module (`RecordedEffects.atImport`). Inside a command (an
+import a command makes), `act` stays the command's. -/
+def withImportContext [Monad m] [MonadFinally m] [MonadLiftT BaseIO m] (act : m α) : m α := do
+  unless (← (usageRecordingRef.get : BaseIO Bool)) do return ← act
+  unless (← (getTaskContext : BaseIO UInt32)) == 0 do return ← act
+  (setTaskContext importContext : BaseIO Unit)
+  try act finally (setTaskContext 0 : BaseIO Unit)
+
 /-- The command whose elaboration the running code belongs to (`withCommandContext`), `none` outside any. -/
 def commandIdx? : BaseIO (Option Nat) := do
   let c ← getTaskContext
-  return if c == 0 then none else some (c.toNat - 1)
+  return if c == 0 || c == importContext then none else some (c.toNat - 1)
 
 /-- Records, when recording is on and inside a command (`commandIdx?`), that it submitted the declarations `names` to
 `addDecl`, with the constants `used` of their types and values. -/
@@ -323,14 +337,25 @@ def recordForeignAttribute (attr : Name) : BaseIO Unit := do
   if (← usageRecordingRef.get) then
     if let some i ← commandIdx? then foreignAttributesByCommandRef.modify ((i, attr) :: ·)
 
-/-- The effects on state outside a command that the runtime noted for each command since the run started (none
-outside any command): a write to a reference another command, or code outside any command, created; the resolution of
-a promise, or the cancellation of a task, another command created; each use of process-wide state through the
-runtime's primitives (a file or directory the command did not create, outside the toolchain's; a file handle it did
-not open, among them the standard streams; a file it created and left in place; a child process; the runtime's
-settings). No payload carries them. Takes them: a second call returns only those since. -/
-def effectsByCommand : BaseIO (Array (Nat × String)) := do
-  return (← takeEffects).map fun (c, what) => (c.toNat - 1, what)
+/-- The effects on state outside the code that had them, as the runtime noted them (`src/runtime/io.cpp`). -/
+structure RecordedEffects where
+  /-- Each command's (by index): a write to a reference another command, or code outside any command, created; the
+  resolution of a promise, or the cancellation of a task, another command created; the use of a mutable native object
+  another context created; each use of process-wide state through the runtime's primitives (a file or directory the
+  command did not create, outside the toolchain's; a file handle it did not open, among them the standard streams; a
+  file it created and left in place; the working directory changed; a child process; the network; signals; a native
+  library loaded; the runtime's and the process's settings; host facts). No payload carries them. -/
+  byCommand : Array (Nat × String) := #[]
+  /-- The uses of process-wide state of imported modules' initializers and extension initial states while the header
+  was processed (`withImportContext`), on which every command of the module may depend. -/
+  atImport : Array String := #[]
+
+/-- The effects the runtime noted since the run started (`RecordedEffects`). Takes them: a second call returns only
+those since. -/
+def takeRecordedEffects : BaseIO RecordedEffects := do
+  return (← takeEffects).foldl (init := {}) fun r (c, what) =>
+    if c == importContext then { r with atImport := r.atImport.push what }
+    else { r with byCommand := r.byCommand.push (c.toNat - 1, what) }
 
 /-- The records of `recordCommandDecls`, newest first. -/
 def declsByCommand : BaseIO (List (Nat × Array Name × NameSet)) :=

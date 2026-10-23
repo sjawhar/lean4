@@ -3121,7 +3121,9 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
               publicConstantMap := publicConstantMap.insert cname cinfo
             -- no need to check for duplicates again, `privateConstMap` should be a superset
 
-  let exts ← mkInitialExtensionStates
+  -- extensions' initial states and imported modules' initializers run user code: a module's usage data records what
+  -- that code does to process-wide state (`withImportContext`)
+  let exts ← withImportContext mkInitialExtensionStates
   -- safety: as in `modifyState`
   let exts := unsafe kernelDeclarersExt.setStateImpl exts kernelDeclarers
   let privateConstants : ConstMap := SMap.fromHashMap privateConstantMap false
@@ -3172,7 +3174,7 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
        Safety: There are no concurrent accesses to `env` at this point. -/
     env ← unsafe Runtime.markPersistent env
   if loadExts then
-    env ← finalizePersistentExtensions env moduleData opts
+    env ← withImportContext (finalizePersistentExtensions env moduleData opts)
     if leakEnv then
       /- Ensure the final environment including environment extension states is
         marked persistent as documented.

@@ -94,6 +94,7 @@ extern "C" LEAN_EXPORT uint64_t lean_io_get_tid() {
 }
 
 extern "C" LEAN_EXPORT obj_res lean_io_process_child_wait(b_obj_arg, b_obj_arg child) {
+    note_effect_here("uses a child process");
     HANDLE h = static_cast<HANDLE>(lean_get_external_data(cnstr_get(child, 3)));
     DWORD exit_code;
     if (WaitForSingleObject(h, INFINITE) == WAIT_FAILED) {
@@ -106,6 +107,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_process_child_wait(b_obj_arg, b_obj_arg c
 }
 
 extern "C" LEAN_EXPORT obj_res lean_io_process_child_try_wait(b_obj_arg, b_obj_arg child) {
+    note_effect_here("uses a child process");
     HANDLE h = static_cast<HANDLE>(lean_get_external_data(cnstr_get(child, 3)));
     DWORD exit_code;
     DWORD ret = WaitForSingleObject(h, 0);
@@ -122,6 +124,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_process_child_try_wait(b_obj_arg, b_obj_a
 }
 
 extern "C" LEAN_EXPORT obj_res lean_io_process_child_kill(b_obj_arg, b_obj_arg child) {
+    note_effect_here("uses a child process");
     HANDLE h = static_cast<HANDLE>(lean_get_external_data(cnstr_get(child, 3)));
     if (!TerminateProcess(h, 1)) {
         return io_result_mk_error((sstream() << GetLastError()).str());
@@ -320,6 +323,11 @@ void finalize_process() {}
 
 #else
 
+/* The key of the child process `pid` among the mutable native objects (`note_object_use`): odd, unlike an object. */
+static void const * child_key(pid_t pid) {
+    return reinterpret_cast<void const *>((static_cast<uintptr_t>(static_cast<uint32>(pid)) << 1) | 1);
+}
+
 extern "C" LEAN_EXPORT obj_res lean_io_process_get_current_dir() {
     char path[PATH_MAX];
     char * cwd = getcwd(path, PATH_MAX);
@@ -363,6 +371,7 @@ extern "C" LEAN_EXPORT uint64_t lean_io_get_tid() {
 extern "C" LEAN_EXPORT obj_res lean_io_process_child_wait(b_obj_arg, b_obj_arg child) {
     static_assert(sizeof(pid_t) == sizeof(uint32), "pid_t is expected to be a 32-bit type"); // NOLINT
     pid_t pid = cnstr_get_uint32(child, 3 * sizeof(object *));
+    note_object_use(child_key(pid), "uses a child process another context started");
     int status;
     if (waitpid(pid, &status, 0) == -1) {
         return io_result_mk_error(decode_io_error(errno, nullptr));
@@ -379,6 +388,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_process_child_wait(b_obj_arg, b_obj_arg c
 extern "C" LEAN_EXPORT obj_res lean_io_process_child_try_wait(b_obj_arg, b_obj_arg child) {
     static_assert(sizeof(pid_t) == sizeof(uint32), "pid_t is expected to be a 32-bit type"); // NOLINT
     pid_t pid = cnstr_get_uint32(child, 3 * sizeof(object *));
+    note_object_use(child_key(pid), "uses a child process another context started");
     int status;
     int ret = waitpid(pid, &status, WNOHANG);
     if (ret == -1) {
@@ -401,6 +411,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_process_child_try_wait(b_obj_arg, b_obj_a
 extern "C" LEAN_EXPORT obj_res lean_io_process_child_kill(b_obj_arg, b_obj_arg child) {
     static_assert(sizeof(pid_t) == sizeof(uint32), "pid_t is expected to be a 32-bit type"); // NOLINT
     pid_t pid = cnstr_get_uint32(child, 3 * sizeof(object *));
+    note_object_use(child_key(pid), "uses a child process another context started");
     bool setsid = cnstr_get_uint8(child, 3 * sizeof(object *) + sizeof(pid_t));
     if ((setsid ? killpg(pid, SIGKILL) : kill(pid, SIGKILL)) == -1) {
         return io_result_mk_error(decode_io_error(errno, nullptr));
@@ -713,7 +724,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_process_spawn(obj_arg args_) {
         std::cout.flush();
     }
     try {
-        return spawn(
+        obj_res r = spawn(
                 cnstr_get_ref_t<string_ref>(args, 1),
                 cnstr_get_ref_t<array_ref<string_ref>>(args, 2),
                 stdin_mode,
@@ -723,6 +734,11 @@ extern "C" LEAN_EXPORT obj_res lean_io_process_spawn(obj_arg args_) {
                 cnstr_get_ref_t<array_ref<pair_ref<string_ref, option_ref<string_ref>>>>(args, 4),
                 cnstr_get_uint8(args.raw(), 5 * sizeof(object *)),
                 cnstr_get_uint8(args.raw(), 5 * sizeof(object *) + 1));
+#if !defined(LEAN_WINDOWS)
+        if (lean_io_result_is_ok(r))
+            note_object_created(child_key(cnstr_get_uint32(lean_io_result_get_value(r), 3 * sizeof(object *))));
+#endif
+        return r;
     } catch (int err) {
         return lean_io_result_mk_error(decode_io_error(err, nullptr));
     } catch (std::system_error const & err) {

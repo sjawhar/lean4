@@ -21,6 +21,7 @@ Authors: Leonardo de Moura, Gabriel Ebner, Sebastian Ullrich
 #include "runtime/sstream.h"
 #include "runtime/hash.h"
 #include "runtime/io.h"
+#include "runtime/object.h"
 #include "runtime/compact.h"
 #include "runtime/buffer.h"
 #include "runtime/string_ref.h"
@@ -300,6 +301,7 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_o
     object_compactor & compactor = *to_compactor(cs_obj.raw());
 
     char const * olean_fn = lean_string_cstr(ofname);
+    note_path_write(olean_fn);
     // We first write to a temp file and then move it to the correct path (possibly deleting an
     // older file) so that we neither expose partially-written files nor modify possibly
     // memory-mapped files.
@@ -467,6 +469,7 @@ static object * mk_compacted_region(b_obj_arg ofname, object * root,
 // Supports both `v2` and `v3` formats.
 extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_obj_arg odep_regions, object *) {
     std::string olean_fn(lean_string_cstr(ofname));
+    note_path_read(olean_fn.c_str());
     try {
         std::vector<region_view> dep_regions = extract_dep_regions(odep_regions);
 #ifdef LEAN_WINDOWS

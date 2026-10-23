@@ -72,14 +72,16 @@ def commandStateChanges (before after : Elab.Command.State) : Array Refusal := I
 
 /-- The command payloads of the observed commands (`observations`, in command order; `recordCommandDeltas`), each also
 refused for the command-state fields it changed (`commandStateChanges`), the attributes with handlers outside core
-Lean it ran (`foreignAttributesByCommand`) and the effects on state outside it the runtime noted (`effectsByCommand`),
-as the `.olean` stores them (`CommandEntries.compact`), with the digest of their compacted bytes. -/
-def commandPayloads (observations : Array CommandObservation) : IO (Array (CommandEntries × Digest)) := do
+Lean it ran (`foreignAttributesByCommand`) and its effects on state outside it the runtime noted (`effects`,
+`RecordedEffects.byCommand`), as the `.olean` stores them (`CommandEntries.compact`), with the digest of their compacted
+bytes. -/
+def commandPayloads (observations : Array CommandObservation) (effects : Array (Nat × String)) :
+    IO (Array (CommandEntries × Digest)) := do
   let byCommand (records : Array (Nat × Refusal)) : Std.HashMap Nat (Array Refusal) :=
     records.foldl (init := {}) fun m (i, r) => m.alter i fun rs => some ((rs.getD #[]).push r)
   let foreign := byCommand <| (← foreignAttributesByCommand).reverse.toArray.map fun (i, attr) =>
     (i, .foreignAttribute attr)
-  let effects := byCommand <| (← effectsByCommand).map fun (i, what) => (i, .effect what)
+  let effects := byCommand <| effects.map fun (i, what) => (i, .effect what)
   let deltas ← recordCommandDeltas (observations.map fun obs => (obs.before.env, obs.after.env, obs.i))
   (observations.zip deltas).mapM fun (obs, ce) => do
     let extra := commandStateChanges obs.before obs.after ++ foreign.getD obs.i #[] ++ effects.getD obs.i #[]
@@ -97,24 +99,29 @@ structure ModuleRecords where
 - a frontend the module ran in-process (`sessionChanged`: another run started, `startFrontendRun`; or a repeated
   command index: `Lean.Elab.process` recorded from index 0 again) leaves observations that are not the module's: none;
 - a module-system file is never partially re-elaborated: no payloads, `noreuse`;
+- an imported module's initializer or an extension's initial state used process-wide state while the header was
+  processed (`RecordedEffects.atImport`), on which every command may depend: `noreuse`;
 - a command that used a name no digest stands for: no records, `noreuse` (`commandRecords`);
 - a declaration command with a refusal: `noreuse` (`commandEntriesNoreuseReason?`). -/
 def moduleRecords (env : Environment) (own : Array (Name × Digest)) (stmt : Array (Name × Digest × Digest))
     (sessionChanged : Bool) : IO ModuleRecords := do
   let observations := (← commandObservations).qsort (·.i < ·.i)
+  let effects ← takeRecordedEffects
   let nested := sessionChanged ||
     (observations.foldl (fun s o => s.insert o.i) ({} : Std.HashSet Nat)).size != observations.size
   let moduleSystem? := guard env.header.isModule *> some "module-system"
   if nested then
     return { noreuseReason? := moduleSystem? <|> some "command observations of a nested frontend" }
-  let compacted ← if env.header.isModule then pure #[] else commandPayloads observations
+  -- why no command may be kept, whatever the commands' records say
+  let wholeModule? := moduleSystem? <|> effects.atImport[0]?.map (s!"an imported module's initializer {·}")
+  let compacted ← if env.header.isModule then pure #[] else commandPayloads observations effects.byCommand
   let payloads := compacted.map (·.1)
   match ← commandRecords env observations own stmt compacted with
-  | .error unattributed => return { payloads, noreuseReason? := moduleSystem? <|> some unattributed }
+  | .error unattributed => return { payloads, noreuseReason? := wholeModule? <|> some unattributed }
   | .ok commands =>
     let declIdxs := commands.foldl (init := ({} : Std.HashSet Nat)) fun s c => if c.isDecl then s.insert c.i else s
     return { payloads, commands,
-             noreuseReason? := moduleSystem? <|> commandEntriesNoreuseReason? payloads declIdxs.contains }
+             noreuseReason? := wholeModule? <|> commandEntriesNoreuseReason? payloads declIdxs.contains }
 
 /-- What `keepPermit` reads of a module's `.usage` (`writeUsage`). -/
 structure KeepRecord where

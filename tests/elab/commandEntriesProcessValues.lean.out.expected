@@ -19,3 +19,5 @@ Rel: noreuse reason: declaration command 0: an effect outside the command: it re
 BAR read by an imported module's initializer, BAR=1 as when IV was compiled, then BAR=2:
 IV: command 0: kept
 IV: module refused: the process value env:BAR is not what it was when the module was compiled
+a file read by an imported module's initializer:
+IF: noreuse reason: an imported module's initializer reads data.txt

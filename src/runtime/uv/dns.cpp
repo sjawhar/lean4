@@ -35,6 +35,7 @@ bool is_safe_ascii_str(const char *s, size_t len) {
 
 // Std.Internal.IO.Async.DNS.getAddrInfo (host service : @& String) (family : UInt8) : IO (IO.Promise (Except IO.Error (Array IPAddr)))
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_dns_get_info(b_obj_arg name, b_obj_arg service, uint8_t family) {
+    note_effect_here("resolves a network name or address");
     char const * name_cstr = lean_string_cstr(name);
     char const * service_cstr = lean_string_cstr(service);
 
@@ -129,6 +130,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_dns_get_info(b_obj_arg name, b_obj_a
 
 // Std.Internal.IO.Async.DNS.getNameInfo (host : @& SocketAddress) : IO (IO.Promise (Except IO.Error (String × String)))
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_dns_get_name(b_obj_arg addr) {
+    note_effect_here("resolves a network name or address");
     uv_getnameinfo_t* req = (uv_getnameinfo_t*)malloc(sizeof(uv_getnameinfo_t));
     if (req == nullptr) {
         return io_result_mk_enomem();
