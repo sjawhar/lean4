@@ -588,7 +588,8 @@ or if `importUsage?` accepts no `.usage` for a direct import or a workspace `ext
 skipped.
 -/
 public def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
-    (importArts : NameMap ImportArtifacts) (modsysBefore : ModuleUsage.Digest) : JobM Unit := do
+    (importArts : NameMap ImportArtifacts) (modsysBefore : ModuleUsage.Digest)
+    (oleanDigest? : Option ModuleUsage.Digest := none) : JobM Unit := do
   let some (usage, usageDigest) ← readOwnUsage mod.usageFile | return
   unless usage.coversClosure importArts do return
   let hashes ← IO.mkRef {}
@@ -607,7 +608,7 @@ public def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     ("version", ModuleUsage.usageVersion),
     ("usage", toJson usageDigest),
     ("local", toJson presetup.localTrace.hash.hex),
-    ("olean", toJson (← contentHash hashes mod.oleanFile)),
+    ("olean", toJson (← oleanDigest?.getDM (contentHash hashes mod.oleanFile))),
     ("modsys", toJson modsys),
     ("closure", toJson closure),
     ("extra", Json.arr extra)

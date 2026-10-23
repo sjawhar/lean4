@@ -1177,11 +1177,13 @@ def Module.verifiedLocalLtar? (mod : Module) : JobM (Option Artifact) := do
   return none
 
 def Module.computeArtifacts
-  (mod : Module) (isModule : Bool) (skipIR : Bool)
+  (mod : Module) (isModule : Bool) (skipIR : Bool) (oleanHash? : Option Hash := none)
 : FetchM ModuleOutputArtifacts :=
   return {
     isModule
-    olean := ← compute mod.oleanFile "olean"
+    olean := ← match oleanHash? with
+      | some hash => computeArtifactOfHash mod.oleanFile hash "olean"
+      | none => compute mod.oleanFile "olean"
     oleanServer? := ← computeIf isModule mod.oleanServerFile "olean.server"
     oleanPrivate? := ← computeIf isModule mod.oleanPrivateFile "olean.private"
     ilean := ← compute mod.ileanFile "ilean"
@@ -1356,8 +1358,12 @@ def Module.buildLean
   compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile outputPaths args
     (← getLeanPath) (← getLean)
   mod.checkSourceUnchanged presetup
-  let arts ← mod.computeArtifacts setup.isModule presetup.postponeCompile
-  if let some modsysBefore := modsysBefore? then mod.writeUsekey presetup setup.importArts modsysBefore
+  -- With usage cutoff, one read of the `.olean` gives both the artifact's hash and the `.usekey`'s: the bytes the
+  -- outputs record are the bytes the key binds.
+  let olean? ← if usage then some <$> IO.FS.readBinFile mod.oleanFile else pure none
+  let arts ← mod.computeArtifacts setup.isModule presetup.postponeCompile (olean?.map Hash.ofByteArray)
+  if let some modsysBefore := modsysBefore? then
+    mod.writeUsekey presetup setup.importArts modsysBefore (olean?.map ModuleUsage.fileDigestOfBytes)
   return arts
 
 /--
