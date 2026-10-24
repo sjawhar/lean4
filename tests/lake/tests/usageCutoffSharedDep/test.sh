@@ -31,7 +31,7 @@ waiter() {
     '  throw <| IO.userError "the test did not release the build"'
 }
 
-# `T.E` reads `D.usage` when it writes its `.usekey`. `T.Slow` imports `T.X`, which imports `T.E`,
+# `T.E` reads `D.usekey` when it writes its own `.usekey`. `T.Slow` imports `T.X`, which imports `T.E`,
 # and holds the build until the test creates `release`; `M` is built after it.
 write_a() {
   printf 'import D\ndef early : Nat := sharedValue + %s\n' $1 > a/T/E.lean
@@ -152,9 +152,8 @@ test_exp $rc != 0
 no_match_text "Replayed T.M" after.log
 match_text "T/M.lean" after.log
 
-# A `.usage` counts only with the `.usekey` written from it. `b` rebuilds `D`, and `D.usage` from before the
-# rebuild is put back next to the new `D.usekey` and `D.olean` (the pair a check holds when it reads `D.usage` just
-# before the rebuild and the other two files after it): `M` is not replayed against the old `sharedValue`.
+# An importer reads a dependency's `.usekey`, never its `.usage`. `b` rebuilds `D`, and `D.usage` from before the
+# rebuild is put back next to the new `D.usekey` and `D.olean`: `M` is not replayed against the old `sharedValue`.
 printf 'def sharedValue : Nat := 1\n' > dep/D.lean
 printf 'import D\ntheorem kept : sharedValue = 1 := rfl\n' > a/T/M.lean
 (cd a && test_run build T.M)
