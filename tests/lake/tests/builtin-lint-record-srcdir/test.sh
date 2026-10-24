@@ -8,7 +8,8 @@ source ../common.sh
 # line numbers taken from the unedited file. Two names for one file would make
 # two passes, and the second pass would use line numbers that the first pass
 # made stale (`src/Violations.lean` puts an env-linter declaration after the
-# text-linter one so that either order shows it).
+# text-linter one so that either order shows it). The report mode must name
+# that same file for both kinds of warning.
 
 ./clean.sh
 
@@ -35,6 +36,15 @@ lake_out lint --builtin-lint Violations || true
 match_pat 'Variable name `unusedLocal` is not explicitly referenced' produced.out
 match_pat 'firstDummyMarker' produced.out
 match_pat 'secondDummyMarker' produced.out
+
+# The report names the module's source file for both kinds of warning: the
+# env-linter lines show the same file as the text-linter line, and it exists.
+text_file=$(sed -n 's/^\(.*\):10:6: warning: Variable name `unusedLocal`.*/\1/p' produced.out)
+env_file=$(sed -n 's/^\(.*\):5:1: error: firstDummyMarker .*/\1/p' produced.out)
+echo "? text-linter file '$text_file', env-linter file '$env_file'"
+test_exp -f "$text_file"
+test_exp "$env_file" = "$text_file"
+match_text "$text_file:15:1: error: secondDummyMarker " produced.out
 
 # --- Record exceptions: one pass over one file records all three. ---
 lake_out lint --record-exceptions Violations
