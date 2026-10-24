@@ -381,5 +381,74 @@ if command -v jq > /dev/null; then # skip if no jq found
   test_exp -f $libPath
 fi
 
+# Verify that targets restored from the cache replay the log of their build:
+# a copy of a package at another path that shares the cache prints the same
+# messages as the tree that built it, without building anything itself.
+LOG_CACHE="$(norm_path "$TEST_DIR")/.lake/log-cache"
+test_cmd mkdir -p .lake/log
+test_cmd cp -r log .lake/log/tree1
+test_cmd cp -r log .lake/log/tree2
+test_cmd chmod -R u+w .lake/log
+# log_build TREE ARGS...: `lake build ARGS...` in TREE with the shared cache
+log_build() {
+  tree="$1"; shift
+  LAKE_CACHE_DIR="$LOG_CACHE" LAKE_ARTIFACT_CACHE=true \
+    lake_out -d ".lake/log/$tree" build "$@"
+}
+# log_msgs FILE: save the messages that the jobs of the last build printed
+# (what follows the first job line, without the job lines and the summary)
+log_msgs() {
+  awk '/^[^ ]+ \[[0-9]+\/[0-9]+\] /{jobs=1; next} /^(Build completed|All targets up-to-date)/{next} jobs' \
+    produced.out > "$1"
+}
+# Modules: the `sorry` warning and the linter warning
+log_build tree1 Log
+log_msgs .lake/log/mods.expected
+match_text 'declaration uses' .lake/log/mods.expected
+match_text 'linter.unusedVariables' .lake/log/mods.expected
+# The cached logs name no path of the tree that built them (the trace's
+# verbose entry with the command line of `lean` does)
+no_match_text tree1 "$LOG_CACHE"/outputs/log/*.json
+log_build tree2 Log --no-build
+log_msgs .lake/log/mods.out
+check_diff .lake/log/mods.expected .lake/log/mods.out
+# A second build replays them from the tree's own traces
+log_build tree2 Log --no-build
+log_msgs .lake/log/mods.out
+check_diff .lake/log/mods.expected .lake/log/mods.out
+# `--wfail` fails on the restored warnings as it does on the built ones
+test_cmd rm -rf .lake/log/tree2/.lake
+LAKE_CACHE_DIR="$LOG_CACHE" LAKE_ARTIFACT_CACHE=true \
+  test_status 1 -d .lake/log/tree2 build Log --no-build --wfail
+# Other artifacts (`buildArtifactUnlessUpToDate`)
+log_build tree1 warnArt
+log_msgs .lake/log/art.expected
+match_text 'a warning logged by its build' .lake/log/art.expected
+log_build tree2 warnArt --no-build
+log_msgs .lake/log/art.out
+check_diff .lake/log/art.expected .lake/log/art.out
+# Modules unpacked from an archive in the cache
+log_build tree1 Log -o "$TEST_DIR/.lake/log/outputs.jsonl"
+LAKE_CACHE_DIR="$LOG_CACHE" test_run -d .lake/log/tree1 \
+  cache add "$TEST_DIR/.lake/log/outputs.jsonl"
+match_text ltar "$LOG_CACHE"/outputs/log/*.json
+test_cmd rm -rf .lake/log/tree2/.lake
+log_build tree2 Log --no-build
+match_text 'Unpacked Log.Sorry' produced.out
+log_msgs .lake/log/mods.out
+check_diff .lake/log/mods.expected .lake/log/mods.out
+# Mappings without a log (as written by older versions of Lake) still restore
+if command -v jq > /dev/null; then # skip if no jq found
+  for f in "$LOG_CACHE"/outputs/log/*.json; do
+    jq 'del(.log)' "$f" > "$f.new"
+    test_cmd mv "$f.new" "$f"
+  done
+  no_match_text '"log"' "$LOG_CACHE"/outputs/log/*.json
+  test_cmd rm -rf .lake/log/tree2/.lake
+  log_build tree2 Log warnArt --no-build
+  log_msgs .lake/log/old.out
+  check_diff /dev/null .lake/log/old.out
+fi
+
 # Cleanup
 rm -f produced.* Ignored.lean
