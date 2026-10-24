@@ -86,3 +86,12 @@ compressed
   let recorded : Option String := (values.find? fun (e : String × Option String) => e.1 == "solver").bind (·.2)
   let expected := (ModuleUsage.valueDigest? (some (← ModuleUsage.fileDigest solverPath).hex)).map ModuleUsage.Digest.hex
   IO.println s!"solver value is its bytes' digest: {recorded.isSome && recorded == expected}"
+  -- the digest is that of the file the spawn ran, by its stamp: under another stamp (a replaced solver) it is an error
+  let some stamp ← ModuleUsage.fileStamp solverPath | throw <| IO.userError "no stamp of the solver"
+  let bound ← ModuleUsage.recordedValue? "solver" (some s!"{solverPath}\n{stamp.toRecorded}")
+  let other ← try
+      discard <| ModuleUsage.recordedValue? "solver" (some s!"{solverPath}\n0:0:0:0:0:0:0")
+      pure "accepted"
+    catch _ => pure "rejected"
+  IO.println s!"bound to the run's stamp: {bound == some (← ModuleUsage.fileDigest solverPath).hex}, \
+    another stamp {other}"

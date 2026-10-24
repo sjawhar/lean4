@@ -14,3 +14,4 @@ command 12: refusals #[an effect outside the command: it spawns the process TOOL
 command 13: refusals #[]
 values #[appPath, solver, toolchain]
 solver value is its bytes' digest: true
+bound to the run's stamp: true, another stamp rejected

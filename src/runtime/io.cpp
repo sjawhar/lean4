@@ -1650,9 +1650,12 @@ static bool has_dot_component(std::string const & p) {
 }
 
 /* Whether `p` is a path `e`'s context created, or lies in a directory it created; never a path with a `.`, `..` or
-   empty component. */
+   empty component, nor on Windows one with a backslash, which separates components there too. */
 static bool created_by(context_effects const & e, std::string const & p) {
     if (has_dot_component(p)) return false;
+#if defined(LEAN_WINDOWS)
+    if (p.find('\\') != std::string::npos) return false;
+#endif
     if (e.created.count(p)) return true;
     for (std::string const & d : e.dirs)
         if (p.size() > d.size() && p.compare(0, d.size(), d) == 0 && p[d.size()] == '/') return true;
@@ -1705,6 +1708,33 @@ static std::string resolved_path(char const * p) {
 #endif
 }
 
+/* The stamp of the file at `p` as `Lean.ModuleUsage.fileStamp` gives it (device, inode, size, modification and
+   status-change times), its fields separated by `:`; empty if `p` cannot be examined. */
+static std::string file_stamp_string(char const * p) {
+#if defined(LEAN_WINDOWS)
+    return std::string();
+#else
+    struct stat st;
+    if (stat(p, &st) != 0) return std::string();
+#if defined(__APPLE__)
+    struct timespec const & mt = st.st_mtimespec;
+    struct timespec const & ct = st.st_ctimespec;
+#else
+    struct timespec const & mt = st.st_mtim;
+    struct timespec const & ct = st.st_ctim;
+#endif
+    uint64_t s[7] = {static_cast<uint64_t>(st.st_dev), static_cast<uint64_t>(st.st_ino),
+        static_cast<uint64_t>(st.st_size), static_cast<uint64_t>(mt.tv_sec), static_cast<uint64_t>(mt.tv_nsec),
+        static_cast<uint64_t>(ct.tv_sec), static_cast<uint64_t>(ct.tv_nsec)};
+    std::string r;
+    for (unsigned i = 0; i < 7; i++) {
+        if (i > 0) r += ':';
+        r += std::to_string(s[i]);
+    }
+    return r;
+#endif
+}
+
 std::string note_process_spawn(char const * cmd, std::vector<std::string> const * files) {
     uint32 ctx = effect_context();
     if (ctx == 0) return std::string();
@@ -1716,18 +1746,20 @@ std::string note_process_spawn(char const * cmd, std::vector<std::string> const 
     // the solver, with no environment and plain file names (`lean_io_process_spawn`), reads and writes only the files
     // named on its command line, so those must be the context's
     bool trusted = files && cmd[0] == '/' && !solver.empty() && resolved_path(cmd) == solver;
+    // the Lean githash does not pin the solver's bytes (the build copies any `cadical` it finds): the value records
+    // the stamp of the file this spawn runs, which `Lean.ModuleUsage.recordedValue?` binds its digest to
+    std::string stamp = trusted ? file_stamp_string(solver.c_str()) : std::string();
     lock_guard<mutex> lock(*g_effects_mutex);
     context_effects & e = (*g_effects)[ctx];
-    if (trusted)
+    if (trusted && !stamp.empty())
         for (std::string const & f : *files)
             if (!created_by(e, f)) { trusted = false; break; }
-    if (!trusted) {
+    if (!trusted || stamp.empty()) {
         note_effect_core(e, std::string("spawns the process ") + cmd);
         return std::string();
     }
-    // the Lean githash does not pin the solver's bytes: the build copies any `cadical` it finds
     note_value_read_core("toolchain", g_pinned_root->c_str());
-    note_value_read_core("solver", solver.c_str());
+    note_value_read_core("solver", (solver + "\n" + stamp).c_str());
     return solver;
 }
 

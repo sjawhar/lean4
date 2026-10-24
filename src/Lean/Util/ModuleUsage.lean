@@ -844,20 +844,31 @@ def untrackedImports (env : Environment) : IO (Array (Name × Digest)) := do
 def valueDigest? (v? : Option String) : Option Digest :=
   v?.map fun v => (({} : Enc).str v).finish
 
-/-- The value a process value stands for in `.usage`: for `solver`, whose recorded value is the path of the SAT solver
-a command ran (`pinnedToolchainDirs`), the digest of the solver's bytes (`none` if it cannot be read), which the Lean
-githash does not pin; any other value as read. -/
+/-- `s` as the runtime writes a file's stamp: its fields in decimal, separated by `:`. -/
+def FileStamp.toRecorded (s : FileStamp) : String :=
+  s!"{s.dev}:{s.ino}:{s.size}:{s.mtimeSec}:{s.mtimeNsec}:{s.ctimeSec}:{s.ctimeNsec}"
+
+/-- The value a process value stands for in `.usage`: any value as read, but for `solver`, which the Lean githash does
+not pin, the digest of the bytes of the SAT solver a command ran. The runtime records its path and the stamp of the
+file the spawn ran (`note_process_spawn`); the digest must be of the bytes that stamp stands for
+(`fileDigestStamped`). Throws if it cannot be, for example if the solver was replaced or cannot be read. -/
 def recordedValue? (key : String) (v? : Option String) : IO (Option String) := do
   if key != "solver" then return v?
-  let some path := v? | return none
-  try return some (← fileDigest path).hex catch _ => return none
+  let some v := v? | throw <| IO.userError "no SAT solver path recorded"
+  let path := (v.takeWhile (· != '\n')).copy
+  let stamp := ((v.dropWhile (· != '\n')).drop 1).copy
+  if stamp.isEmpty then throw <| IO.userError s!"a malformed SAT solver value {v}"
+  let (d, now?) ← fileDigestStamped ⟨path⟩
+  unless now?.map FileStamp.toRecorded == some stamp do
+    throw <| IO.userError s!"the SAT solver {path} changed after the command ran it, or its stamp is too recent"
+  return some d.hex
 
-/-- The value of the process value `key` in this process now, as `.usage` records it (`recordedValue?`,
-`currentValue?`). -/
+/-- The value of the process value `key` in this process now, as `.usage` records it (`recordedValue?`): for `solver`,
+the digest of the bytes of the solver this Lean runs, which throws if they cannot be read; otherwise `currentValue?`. -/
 def currentRecordedValue? (key : String) : IO (Option String) := do
   if key == "solver" then
     let (_, _, solver) ← pinnedToolchainDirs
-    return ← recordedValue? key (some solver)
+    return some (← fileDigest ⟨solver⟩).hex
   currentValue? key
 
 /-- The format version of the `.usage` sidecar and of Lake's `.usekey`; Lake reads a sidecar of any other
@@ -945,10 +956,14 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
   let names := nodes.foldl (fun s n => n.refs.foldl (·.insert ·) s) (used.foldl (·.insert ·) names)
   let names := env.getImportedKernelDuplicates.foldl (·.insert ·.1) names
   let names := (names : Std.HashSet Name).fold addInternalPrefixes names
-  let values ← (← takeValueReads).mapM fun (k, v?, changed) => return (k, ← recordedValue? k v?, changed)
+  -- a value `recordedValue?` cannot give (the SAT solver's bytes) leaves nothing a keep could compare
+  let values ← (← takeValueReads).mapM fun (k, v?, changed) => do
+    try return (k, ← recordedValue? k v?, changed, none)
+    catch e => return (k, none, changed, some s!"the process value {k} cannot be recorded: {e}")
   let untracked ← untrackedImports env
-  let noreuseReason? := noreuseReason? <|> values.findSome? fun (k, _, changed) =>
+  let noreuseReason? := noreuseReason? <|> values.findSome? (·.2.2.2) <|> values.findSome? fun (k, _, changed, _) =>
     guard changed *> some s!"the process value {k} changed while the module was compiled"
+  let values := values.map fun (k, v?, changed, _) => (k, v?, changed)
   let fields : List (String × Json) := [("version", usageVersion), ("noskip", incrLoaded),
     ("moduleDigest", toJson (moduleDigestOf own)),
     ("closure", toJson closure),

@@ -433,10 +433,13 @@ public:
                 break;
             case LeanScalarArray: case LeanString: case LeanMPZ:
                 break;
-            case LeanPromise:
-                if (lean_to_promise(o)->m_result == nullptr) { m_todo.clear(); return false; }
+            case LeanPromise: {
+                // its task, which `lean_task_get` would wait on until the promise is resolved
+                object * t = reinterpret_cast<object *>(lean_to_promise(o)->m_result);
+                if (t == nullptr || lean_to_task(t)->m_value == nullptr) { m_todo.clear(); return false; }
                 push_if_new(child_of_wrapper(o));
                 break;
+            }
             case LeanThunk: case LeanTask:
                 push_if_new(child_of_wrapper(o));
                 break;

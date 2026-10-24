@@ -254,7 +254,7 @@ toolchain at the recorded root, or the bytes of the SAT solver it ran (`currentR
 private def valuesChanged? (r : KeepRecord) : IO (Option String) := do
   for (k, d?) in r.values do
     let now? ← try valueDigest? <$> currentRecordedValue? k
-      catch _ => return some s!"the compile read the process value {k}, which this Lean does not read"
+      catch e => return some s!"the compile read the process value {k}, which this Lean cannot read: {e}"
     unless now? == d? do
       return some s!"the process value {k} is not what it was when the module was compiled"
   return none

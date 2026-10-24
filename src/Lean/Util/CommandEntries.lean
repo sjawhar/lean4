@@ -344,7 +344,8 @@ private structure Reader where
 
 private abbrev R := ReaderT PackedPayloads (StateT Reader (Except String))
 
-/-- A number the writer wrote (`pushNat`): below `2 ^ 64`, so at most ten bytes. -/
+/-- A number the writer wrote (`pushNat`), of at most ten bytes (below `2 ^ 70`): the writer writes counts, indices
+and generation counters, all far below that. -/
 private def readNat : R Nat := do
   let b := (← read).bytes
   let rec go (pos acc shift : Nat) : Except String (Nat × Nat) :=
@@ -439,7 +440,11 @@ private def readCounters : R CountersDelta := do
   return { trackedGen, extGens, constGen, recordingConstGen, declChangesAdded, constAddedGens, synthTierGen?,
            synthTierSet, synthTierErased }
 
-private partial def readAdded : R AddedConst := do
+/-- How deep asynchronous constants' records may nest in a packing `unpack` accepts, so that a malformed packing cannot
+exhaust the stack; a deeper one is rejected, and its module's commands are elaborated again. -/
+private def maxAddedDepth : Nat := 256
+
+private partial def readAdded (depth : Nat := 0) : R AddedConst := do
   match ← readNat with
   | 0 => return .plain (← readName)
   | 1 =>
@@ -451,8 +456,9 @@ private partial def readAdded : R AddedConst := do
         | none => throw "a constant kind of the packed payloads is out of range"
     let states ← readViews
     let m ← readByteCount
-    let mut nested := Array.emptyWithCapacity m
-    for _ in [0:m] do nested := nested.push (← readAdded)
+    if m > 0 && depth ≥ maxAddedDepth then throw "the packed payloads nest records too deeply"
+    let mut nested := #[]
+    for _ in [0:m] do nested := nested.push (← readAdded (depth + 1))
     return .async n k? states nested
   | 2 =>
     let forConst ← readName
