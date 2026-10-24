@@ -49,7 +49,7 @@ match_text "Built Test.HU" produced.out
 # a name component that is neither a string nor a number is corrupt input: warned, then built
 printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 3\n' > Test/H.lean
 rm -f .lake/build/lib/lean/Test/HU.usekey
-printf '{"version":14,"usage":"00000000000000000000000000000000","local":"0000000000000000","olean":"00000000000000000000000000000000","modsys":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","extra":[[[true],"00000000000000000000000000000000","00000000000000000000000000000000"]]}' > .lake/build/lib/lean/Test/HU.usekey
+printf '{"version":15,"usage":"00000000000000000000000000000000","local":"0000000000000000","olean":"00000000000000000000000000000000","modsys":"00000000000000000000000000000000","closure":"00000000000000000000000000000000","extra":[[[true],"00000000000000000000000000000000","00000000000000000000000000000000"]]}' > .lake/build/lib/lean/Test/HU.usekey
 test_out "expected a name component" build Test.HU
 match_text "Built Test.HU" produced.out
 # so is a sidecar that is not UTF-8
@@ -93,6 +93,27 @@ test_run build Test.B
 rm .lake/build/lib/lean/Test/B.usekey
 printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 3\n' > Test/A.lean
 test_out "Built Test.B" build Test.B
+# an importer reads only its imports' `.usekey` files, each only for the import's current `.olean`: A's key from
+# before A's rebuild, put back next to the new A.olean, still records the old `a`, so B, which uses `a`, builds
+# instead of replaying against it
+cp .lake/build/lib/lean/Test/A.usekey old-A.usekey
+printf 'def a := 7\ntheorem ta : a = 7 := rfl\ndef unrelated := 3\n' > Test/A.lean
+test_run build Test.A
+rm -f .lake/build/lib/lean/Test/A.usekey
+cp old-A.usekey .lake/build/lib/lean/Test/A.usekey
+test_out "Built Test.B" build -v Test.B
+# a missing import key: B builds. B got no key above (A's key did not bind A's `.olean`), so it builds once more and
+# then replays an unrelated edit to A through A's key alone
+printf 'def a := 7\ntheorem ta : a = 7 := rfl\ndef unrelated := 4\n' > Test/A.lean
+test_run build Test.B
+test_exp -f .lake/build/lib/lean/Test/B.usekey
+printf 'def a := 7\ntheorem ta : a = 7 := rfl\ndef unrelated := 5\n' > Test/A.lean
+lake_out build -v Test.B
+match_text "Replayed Test.B" produced.out
+printf 'def a := 7\ntheorem ta : a = 7 := rfl\ndef unrelated := 6\n' > Test/A.lean
+test_run build Test.A
+rm .lake/build/lib/lean/Test/A.usekey
+test_out "Built Test.B" build -v Test.B
 # disabled: Lake asks Lean for no usage data, so B has no sidecars and its `.olean` no digests
 printf 'def a := 2\ntheorem ta : a = 2 := rfl\ndef unrelated := 4\n' > Test/A.lean
 LAKE_USAGE_CUTOFF=0 test_out "Built Test.B" build Test.B
