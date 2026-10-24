@@ -184,12 +184,26 @@ public def BuildMetadata.writeFile (path : FilePath) (data : BuildMetadata) : IO
   IO.FS.writeFile path (toJson data).pretty
 
 /--
-Write a trace file containing metadata on an artifact fetched from a cache,
-including the log of its build stored in the cache.
+Replays the log of an up-to-date trace, setting the current build action to `replay`,
+or to `reuse` for a synthetic trace with an empty log.
 -/
-@[inline] public def writeFetchTrace
+def BuildMetadata.replayCached (data : BuildMetadata) : JobM Unit := do
+  if data.synthetic && data.log.isEmpty then
+    updateAction .reuse
+  else
+    updateAction .replay
+    data.log.replay
+
+/--
+Write a trace file containing metadata on an artifact fetched from a cache,
+including the log of its build stored in the cache, and replay that log.
+-/
+public def writeFetchTrace
   (path : FilePath) (inputHash : Hash) (outputs : Json) (log : Log)
-: IO Unit := BuildMetadata.writeFile path (.ofFetch inputHash outputs log)
+: JobM Unit := do
+  let data := BuildMetadata.ofFetch inputHash outputs log
+  data.writeFile path
+  data.replayCached
 
 /-- Write a trace file containing metadata about a build. -/
 @[inline] public def writeBuildTrace
@@ -285,11 +299,7 @@ or if the trace is not up-to-date, the build action will be set to `reuse`.
 public def SavedTrace.replayCachedIfUpToDate (inputHash : Hash) (self : SavedTrace) : JobM Bool := do
   if let .ok data := self then
     if data.depHash == inputHash then
-      if data.synthetic && data.log.isEmpty then
-        updateAction .reuse
-      else
-        updateAction .replay
-        data.log.replay
+      data.replayCached
       return true
   updateAction .reuse
   return false
@@ -297,17 +307,6 @@ public def SavedTrace.replayCachedIfUpToDate (inputHash : Hash) (self : SavedTra
 @[deprecated replayCachedIfUpToDate (since := "2026-04-15")]
 public abbrev SavedTrace.replayOrFetchIfUpToDate (inputHash : Hash) (self : SavedTrace) : JobM Bool := do
   self.replayCachedIfUpToDate inputHash
-
-/--
-**For internal use only.**
-Replays the build log stored in the cache with outputs fetched from it,
-setting the current build action to `replay` if the log is not empty
-(as `replayCachedIfUpToDate` does for the trace written for the fetch).
--/
-public def replayFetchedLog (log : Log) : JobM Unit := do
-  unless log.isEmpty do
-    updateAction .replay
-    log.replay
 
 /-- **For internal use only.** -/
 public class ToOutputJson (α : Type u) where
@@ -738,7 +737,6 @@ public def buildArtifactUnlessUpToDate
       unless (← savedTrace.replayCachedIfUpToDate inputHash) do
         removeFileIfExists file
         writeFetchTrace traceFile inputHash (toJson art.descr) log
-        replayFetchedLog log
       if restore then
         some <$> restoreArtifact file art exe
       else
@@ -749,13 +747,13 @@ public def buildArtifactUnlessUpToDate
         if let some art ← fetchArt? restore then
           return art
         else
-          let iniPos ← getLogPos
           let status ← savedTrace.replayIfUpToDate' file depTrace
           unless status.isUpToDate do
             discard <| doBuild depTrace traceFile
           if status.isCacheable then
-            let log := (← getLog).takeFrom iniPos
             let art ← cacheArtifact file ext text exe restore
+            -- The trace holds the log of the action that produced `file`: its replay or its build
+            let log := (← readTraceFile traceFile).log
             (← getLakeCache).writeOutputs pkg.cacheScope inputHash art.descr (log := log)
             return art
           else
