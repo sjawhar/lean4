@@ -389,11 +389,15 @@ test_cmd mkdir -p .lake/log
 test_cmd cp -r log .lake/log/tree1
 test_cmd cp -r log .lake/log/tree2
 test_cmd chmod -R u+w .lake/log
-# log_build TREE ARGS...: `lake build ARGS...` in TREE with the shared cache
-log_build() {
-  tree="$1"; shift
-  LAKE_CACHE_DIR="$LOG_CACHE" LAKE_ARTIFACT_CACHE=true \
-    lake_out -d ".lake/log/$tree" build "$@"
+# with_cache CACHE CMD...: run CMD with the artifact cache on and stored in CACHE
+with_cache() {
+  cache="$1"; shift
+  LAKE_CACHE_DIR="$cache" LAKE_ARTIFACT_CACHE=true "$@"
+}
+# cache_build CACHE TREE ARGS...: `lake build ARGS...` in the copy TREE with the cache in CACHE
+cache_build() {
+  cache="$1"; tree="$2"; shift 2
+  with_cache "$cache" lake_out -d ".lake/log/$tree" build "$@"
 }
 # log_msgs FILE: save the messages that the jobs of the last build printed
 # (what follows the first job line, without the job lines and the summary)
@@ -402,7 +406,7 @@ log_msgs() {
     produced.out > "$1"
 }
 # Modules: the `sorry` warning and the linter warning
-log_build tree1 Log
+cache_build "$LOG_CACHE" tree1 Log
 log_msgs .lake/log/mods.expected
 match_text 'declaration uses' .lake/log/mods.expected
 match_text 'linter.unusedVariables' .lake/log/mods.expected
@@ -411,45 +415,43 @@ match_text 'linter.unusedVariables' .lake/log/mods.expected
 log_maps() { cat "$LOG_CACHE"/outputs/log/*.json > .lake/log/maps.json; }
 log_maps
 no_match_text tree1 .lake/log/maps.json
-log_build tree2 Log --no-build
+cache_build "$LOG_CACHE" tree2 Log --no-build
 log_msgs .lake/log/mods.out
 check_diff .lake/log/mods.expected .lake/log/mods.out
 # A second build replays them from the tree's own traces
-log_build tree2 Log --no-build
+cache_build "$LOG_CACHE" tree2 Log --no-build
 log_msgs .lake/log/mods.out
 check_diff .lake/log/mods.expected .lake/log/mods.out
 # `--wfail` fails on the restored warnings as it does on the built ones
 test_cmd rm -rf .lake/log/tree2/.lake
-LAKE_CACHE_DIR="$LOG_CACHE" LAKE_ARTIFACT_CACHE=true \
-  test_status 1 -d .lake/log/tree2 build Log --no-build --wfail
+with_cache "$LOG_CACHE" test_status 1 -d .lake/log/tree2 build Log --no-build --wfail
 # A mapping written from a trace (the cache lost the mapping, and the trace
 # still names outputs in the cache) keeps the trace's log
 test_cmd rm -rf "$LOG_CACHE/outputs"
-log_build tree1 Log --no-build
+cache_build "$LOG_CACHE" tree1 Log --no-build
 log_maps
 match_text 'declaration uses' .lake/log/maps.json
 test_cmd rm -rf .lake/log/tree2/.lake
-log_build tree2 Log --no-build
+cache_build "$LOG_CACHE" tree2 Log --no-build
 log_msgs .lake/log/mods.out
 check_diff .lake/log/mods.expected .lake/log/mods.out
 # Other artifacts (`buildArtifactUnlessUpToDate`)
-log_build tree1 warnArt
+cache_build "$LOG_CACHE" tree1 warnArt
 log_msgs .lake/log/art.expected
 match_text 'a warning logged by its build' .lake/log/art.expected
 match_text 'an info message logged by its build' .lake/log/art.expected
-log_build tree2 warnArt --no-build
+cache_build "$LOG_CACHE" tree2 warnArt --no-build
 log_msgs .lake/log/art.out
 check_diff .lake/log/art.expected .lake/log/art.out
 # Modules unpacked from an archive in the cache
-log_build tree1 Log -o "$TEST_DIR/.lake/log/outputs.jsonl"
-LAKE_CACHE_DIR="$LOG_CACHE" test_run -d .lake/log/tree1 \
-  cache add "$TEST_DIR/.lake/log/outputs.jsonl"
+cache_build "$LOG_CACHE" tree1 Log -o "$TEST_DIR/.lake/log/outputs.jsonl"
+with_cache "$LOG_CACHE" test_run -d .lake/log/tree1 cache add "$TEST_DIR/.lake/log/outputs.jsonl"
 log_maps
 match_text ltar .lake/log/maps.json
 # `cache add` wrote the module mappings without a log
 no_match_text 'declaration uses' .lake/log/maps.json
 test_cmd rm -rf .lake/log/tree2/.lake
-log_build tree2 Log --no-build
+cache_build "$LOG_CACHE" tree2 Log --no-build
 match_text 'Unpacked Log.Sorry' produced.out
 log_msgs .lake/log/mods.out
 check_diff .lake/log/mods.expected .lake/log/mods.out
@@ -465,7 +467,7 @@ if command -v jq > /dev/null; then # skip if no jq found
   log_maps
   no_match_text '"log"' .lake/log/maps.json
   test_cmd rm -rf .lake/log/tree2/.lake
-  log_build tree2 Log warnArt --no-build
+  cache_build "$LOG_CACHE" tree2 Log warnArt --no-build
   log_msgs .lake/log/old.out
   check_diff /dev/null .lake/log/old.out
 fi
@@ -478,20 +480,15 @@ REBUILD_CACHE="$(norm_path "$TEST_DIR")/.lake/rebuild-cache"
 test_cmd cp -r log .lake/log/tree3
 test_cmd cp -r log .lake/log/tree4
 test_cmd chmod -R u+w .lake/log/tree3 .lake/log/tree4
-rebuild_build() {
-  tree="$1"; shift
-  LAKE_CACHE_DIR="$REBUILD_CACHE" LAKE_ARTIFACT_CACHE=true \
-    lake_out -d ".lake/log/$tree" build "$@"
-}
-rebuild_build tree3 Log.Sorry warnArt
+cache_build "$REBUILD_CACHE" tree3 Log.Sorry warnArt
 for f in .lake/log/tree3/.lake/build/lib/lean/Log/Sorry.olean .lake/log/tree3/.lake/build/warn.txt; do
   test_cmd chmod u+w "$f"
   echo changed >> "$f"
   test_cmd rm -f "$f.hash"
 done
 test_cmd rm -rf "$REBUILD_CACHE"
-rebuild_build tree3 Log.Sorry warnArt
-rebuild_build tree4 Log.Sorry warnArt --no-build
+cache_build "$REBUILD_CACHE" tree3 Log.Sorry warnArt
+cache_build "$REBUILD_CACHE" tree4 Log.Sorry warnArt --no-build
 log_msgs .lake/log/rebuild.out
 test_cmd_eq 1 grep -c 'declaration uses' .lake/log/rebuild.out
 test_cmd_eq 1 grep -c 'a warning logged by its build' .lake/log/rebuild.out
