@@ -880,14 +880,18 @@ def usageVersion : Nat := 13
 def parseUsageHead (s : String) : Except String Json :=
   Json.parse (s.takeWhile (· != '\n')).copy
 
-/-- A `.usage` file's text `s` as one object: the module's fields (`parseUsageHead`) with the command records and
-statement digests of its second line (`writeUsage`). -/
-def parseUsage (s : String) : Except String Json := do
-  let .obj head ← parseUsageHead s | throw "the first line of a `.usage` is not a JSON object"
+/-- `parseUsage` of a `.usage` file's text `s`, whose first line is `head` (`parseUsageHead`). -/
+def parseUsageWithHead (s : String) (head : Json) : Except String Json := do
+  let .obj head := head | throw "the first line of a `.usage` is not a JSON object"
   let rest := (s.dropWhile (· != '\n')).drop 1
   if rest.isEmpty then return .obj head
   let .obj records ← Json.parse rest.copy | throw "the second line of a `.usage` is not a JSON object"
   return .obj (records.foldl (init := head) fun m k v => m.insert k v)
+
+/-- A `.usage` file's text `s` as one object: the module's fields (`parseUsageHead`) with the command records and
+statement digests of its second line (`writeUsage`). -/
+def parseUsage (s : String) : Except String Json := do
+  parseUsageWithHead s (← parseUsageHead s)
 
 /-- The command record `c` (`CommandRecord` as JSON) with the process values its command read (`reads`, by command
 index: `commandValueKeys`) among its `values`, sorted. -/

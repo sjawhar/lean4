@@ -545,7 +545,7 @@ where
         }
         traceState
       }
-      if let some req := ctx.reuse? then req.start headerEnv
+      if let some req := ctx.reuse? then req.start headerEnv opts
       let prom ← IO.Promise.new
       let cancelTk ← IO.CancelToken.new
       parseCmd none parserState cmdState prom (sync := true) cancelTk [] 0 ctx

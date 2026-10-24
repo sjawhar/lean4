@@ -99,26 +99,34 @@ private def commandRefusals (i : Nat) (ctxs : Array UInt32) (effects : RecordedE
 /-- The command payloads of the observed commands (`observations`, in command order; `commandDeltaRecorder`), each also
 refused for the command-state fields it changed (`commandStateChanges`) and for what it and the realizations it used
 did beyond the payload (`commandRefusals`), as the `.olean` stores them with the digest of their contents
-(`digested`); the commands in parallel (`CommandEntries.parallelBlocks`), one digester per block. -/
-def commandPayloads (observations : Array CommandObservation) (effects : RecordedEffects) :
+(`digested`); the commands in parallel (`CommandEntries.parallelBlocks`), one digester per block. A payload a reuse run
+computed already (`precomputed`, `commandPayload`, with the refusals beside the recorder's it was computed with) is
+taken as it is if the command's refusals are still those. -/
+def commandPayloads (observations : Array CommandObservation) (effects : RecordedEffects)
+    (precomputed : Std.HashMap Nat (Array Refusal × CommandEntries × Digest) := {}) :
     IO (Array (CommandEntries × Digest)) := do
   let refusals : Std.HashMap Nat (Array Refusal) ← observations.foldlM (init := {}) fun m obs => do
     return m.insert obs.i (← commandRefusals obs.i (← commandContexts obs.i) effects)
+  let refusalsOf (i : Nat) := refusals.getD i #[]
   let record ← commandDeltaRecorder
   CommandEntries.parallelBlocks observations fun block => do
-    digested <| ← block.mapM fun obs => do
+    let (done, todo) := block.partition fun obs => precomputed[obs.i]?.any (·.1 == refusalsOf obs.i)
+    let computed ← digested <| ← todo.mapM fun obs => do
       let ce ← record obs.before.env obs.after.env obs.i
-      return withRefusals ce obs.before obs.after (refusals.getD obs.i #[])
+      return withRefusals ce obs.before obs.after (refusalsOf obs.i)
+    let reused := done.filterMap fun obs => precomputed[obs.i]?.map (·.2)
+    return (computed ++ reused).qsort (·.1.idx < ·.1.idx)
 
 /-- Command `i`'s payload as `commandPayloads` computes it, alone, from the command's states `before` and `after` and
-the effects the runtime noted so far (`effects`), for a reuse run that needs it before the module ends. -/
+the effects the runtime noted so far (`effects`), for a reuse run that needs it before the module ends, with the
+refusals beside the recorder's it was computed with (for `commandPayloads`' `precomputed`). -/
 def commandPayload (i : Nat) (before after : Elab.Command.State) (effects : RecordedEffects) :
-    IO (CommandEntries × Digest) := do
+    IO (Array Refusal × CommandEntries × Digest) := do
   let ce ← (← commandDeltaRecorder) before.env after.env i
   let refusals ← commandRefusals i (← commandContexts i) effects
   let some p := (← digested #[withRefusals ce before after refusals])[0]? |
     throw <| IO.userError s!"command {i}'s payload was not digested"
-  return p
+  return (refusals, p)
 
 /-- What a module's `.usage` records for reusing its commands: its command records, and why none of its commands may be
 kept (`noreuseReason?`). That decides nothing about skipping the module whole (`noskip`). Its payloads are
@@ -142,8 +150,9 @@ structure PendingRecords where
   wholeModule? : Option String
   payloadsTask : Task (Except IO.Error (Array (CommandEntries × Digest)))
 
-/-- Starts the module's records (`PendingRecords`), with the commands a reuse run kept (`kept`, in command order) and
-the effects it took from the runtime while it ran (`earlier`, `takeRecordedEffects`):
+/-- Starts the module's records (`PendingRecords`), with the commands a reuse run kept (`kept`, in command order), the
+effects it took from the runtime while it ran (`earlier`, `takeRecordedEffects`) and the payloads it computed already
+(`precomputed`, `commandPayloads`):
 - a frontend the module ran in-process (`sessionChanged`: another run started, `startFrontendRun`; or a repeated
   command index: `Lean.Elab.process` recorded from index 0 again) leaves observations that are not the module's: none;
 - a module-system file is never partially re-elaborated: no payloads, `noreuse`;
@@ -151,7 +160,8 @@ the effects it took from the runtime while it ran (`earlier`, `takeRecordedEffec
   processed (`RecordedEffects.ofImport`), or read a value that may differ in another run (`importReadNondeterministic`),
   on which every command may depend: `noreuse`. -/
 def startModuleRecords (env : Environment) (sessionChanged : Bool) (kept : Array KeptCommand := #[])
-    (earlier : RecordedEffects := {}) : IO PendingRecords := do
+    (earlier : RecordedEffects := {}) (precomputed : Std.HashMap Nat (Array Refusal × CommandEntries × Digest) := {}) :
+    IO PendingRecords := do
   -- the kernel checks run in their commands' contexts and note effects there
   discard <| IO.wait env.checked
   let observations := (← commandObservations).qsort (·.i < ·.i)
@@ -168,7 +178,7 @@ def startModuleRecords (env : Environment) (sessionChanged : Bool) (kept : Array
     else none
   let payloadsTask ← if env.header.isModule then pure (.pure (.ok #[]))
     else IO.asTask do
-      let ps ← commandPayloads observations effects
+      let ps ← commandPayloads observations effects precomputed
       return (ps ++ kept.map fun k => (k.payload, k.digest)).qsort (·.1.idx < ·.1.idx)
   return { observations, kept, done? := none, wholeModule?, payloadsTask }
 
@@ -314,20 +324,51 @@ private def valuesChanged? (r : KeepRecord) : IO (Option String) := do
       return some s!"the process value {k} is not what it was when the module was compiled"
   return none
 
-/-- `keepPermit`, with the `noreuse` check only if `checkNoreuse`. -/
-private def keepPermitCore (env : Environment) (module : Name) (olean usage : System.FilePath)
-    (checkNoreuse : Bool) (lib? : Option String) : IO (Except String KeepPermit) := do
+/-- What `keepPermit` reads of a module's `.olean` and `.usage`, which needs no environment (`readPermitFiles`). Each
+failure is kept, for `keepPermit` to report where its checks reach it. -/
+structure PermitFiles where
+  /-- The `.usage`'s text. -/
+  text : String
+  /-- Its first line (`parseUsageHead`). -/
+  head : Except String Json
+  record : Except String KeepRecord
+  /-- The `.olean`'s digest (`fileDigest`). -/
+  olean : Except IO.Error Digest
+  /-- The `.olean`'s data and command payloads (`CommandEntries.ofModuleData?`), read only if the `.usage` is this
+  Lean's and was written with that `.olean`. -/
+  data? : Option (Except IO.Error (ModuleData × Except String (Array CommandEntries)))
+
+/-- Reads the module's `.olean` at `olean` and the `.usage` at `usage` written with it, as `keepPermit` does, so that a
+caller can read them before its environment is made (`keepPermitOf`). -/
+def readPermitFiles (olean usage : System.FilePath) : IO PermitFiles := do
+  let text ← IO.FS.readFile usage
+  let head := parseUsageHead text
+  let record := head >>= KeepRecord.ofUsage
+  let digest ← (fileDigest olean).toBaseIO
+  let read : IO (ModuleData × Except String (Array CommandEntries)) := do
+    let (data, _) ← readModuleData olean
+    return (data, CommandEntries.ofModuleData? data)
+  let data? ← match record, digest with
+    | .ok r, .ok d => if r.githash == Lean.githash && r.olean == d then some <$> read.toBaseIO else pure none
+    | _, _ => pure none
+  return { text, head, record, olean := digest, data? }
+
+/-- `keepPermitOf`, with the `noreuse` check only if `checkNoreuse`. -/
+private def keepPermitCore (env : Environment) (module : Name) (files : PermitFiles) (checkNoreuse : Bool)
+    (lib? : Option String) : IO (Except String KeepPermit) := do
   let lib ← lib?.getDM do return toString (← getLibDir (← getBuildDir))
-  let r ← IO.ofExcept <| KeepRecord.ofUsage (← IO.ofExcept <| parseUsageHead (← IO.FS.readFile usage))
+  let r ← IO.ofExcept files.record
   unless r.module == module do return .error s!"the `.usage` is of `{r.module}`, not `{module}`"
   unless env.mainModule == module do return .error s!"the environment is of `{env.mainModule}`, not `{module}`"
   unless r.githash == Lean.githash do return .error s!"the `.usage` was written by another Lean ({r.githash})"
   if checkNoreuse && r.noreuse then return .error "the module's commands cannot be kept (`noreuse`)"
-  unless (← fileDigest olean) == r.olean do return .error "the `.usage` was not written with this `.olean`"
+  unless (← MonadExcept.ofExcept files.olean) == r.olean do
+    return .error "the `.usage` was not written with this `.olean`"
   if let some reason ← closureChanged? env r lib then return .error reason
   if let some reason ← valuesChanged? r then return .error reason
-  let (data, _) ← readModuleData olean
-  let payloads ← match CommandEntries.ofModuleData? data with
+  let some data? := files.data? | throw <| IO.userError "the `.olean` was not read"
+  let (data, payloads?) ← MonadExcept.ofExcept data?
+  let payloads ← match payloads? with
     | .ok payloads => pure payloads
     | .error e => return .error s!"the `.olean`'s command payloads cannot be read: {e}"
   return .ok { module, data, payloads, imports := env.header.moduleData }
@@ -355,16 +396,21 @@ The module's own inputs, and what each command used (its record's uses), are its
 toolchain's library directory, which a run that records usage reads before recording starts (`getLibDir`, through the
 executable's path): read here, it would be one of the run's process values. -/
 def keepPermit (env : Environment) (module : Name) (olean usage : System.FilePath) (lib? : Option String := none) :
+    IO (Except String KeepPermit) := do
+  keepPermitCore env module (← readPermitFiles olean usage) (checkNoreuse := true) lib?
+
+/-- `keepPermit`, with its files read already (`readPermitFiles`). -/
+def keepPermitOf (env : Environment) (module : Name) (files : PermitFiles) (lib? : Option String := none) :
     IO (Except String KeepPermit) :=
-  keepPermitCore env module olean usage (checkNoreuse := true) lib?
+  keepPermitCore env module files (checkNoreuse := true) lib?
 
 namespace Testing
 
 /-- Test support: `keepPermit` also for a module whose commands its records say cannot be kept (`noreuse`), so that a
 test can replay their payloads. -/
 def keepPermit (env : Environment) (module : Name) (olean usage : System.FilePath) :
-    IO (Except String KeepPermit) :=
-  keepPermitCore env module olean usage (checkNoreuse := false) none
+    IO (Except String KeepPermit) := do
+  keepPermitCore env module (← readPermitFiles olean usage) (checkNoreuse := false) none
 
 end Testing
 

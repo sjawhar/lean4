@@ -12,10 +12,11 @@ public import Lean.Parser.Module
 public section
 
 /-!
-A reuse run (`lean --reuse-olean=F --reuse-usage=F`): the frontend takes a keep permit for the module's previous `.olean`
-and `.usage` once its header is processed (`Request.start`), then decides for each command in order whether to keep it
-from its previous payload or to elaborate it (`Request.decide`), keeps it (`Request.keep`), and at the end hands what it
-kept to the module's records (`Request.finish`).
+A reuse run (`lean --reuse-olean=F --reuse-usage=F`): the frontend reads the module's previous `.olean` and `.usage`
+while its header is processed (`Request.new`), takes a keep permit for them once the header is processed
+(`Request.start`), then decides for each command in order whether to keep it from its previous payload or to elaborate
+it (`Request.decide`), keeps it (`Request.keep`), and at the end hands what it kept to the module's records
+(`Request.finish`).
 
 The rule, in terms of the previous build's records: command `i` is kept iff the previous build has a record and a
 payload for command `i`, the record is of a declaration command that is no `initialize`, the payload has no refusal,
@@ -42,17 +43,10 @@ structure Inputs where
   command with one of them among its extra uses is elaborated. -/
   changedExtra : NameSet := {}
 
-/-- What the previous build's `.usage` gives a reuse run besides its records. -/
-structure Previous where
-  permit : KeepPermit
+/-- What the previous build's `.usage` gives a reuse run besides its permit's checks, read without an environment. -/
+structure PreviousUsage where
   /-- The previous build's records, by command index. -/
   records : Array CommandRecord
-  /-- The previous build's payloads, by command index. -/
-  payloads : Std.HashMap Nat CommandEntries
-  /-- The previous build's constants. -/
-  consts : NameMap ConstantInfo
-  /-- The command of the previous build that added each constant of the module. -/
-  ownerCmd : NameMap Nat
   /-- Per imported constant of the previous `.usage`'s `used`: each module with its digest there. -/
   used : NameMap (Array (Name × Digest))
   /-- The names of `used` that no record lists among its uses. -/
@@ -64,6 +58,16 @@ structure Previous where
   specKeys : Array Digest
   /-- The previous `.usage`'s `allExtra`. -/
   allExtra : Bool
+
+/-- What the previous build gives a reuse run. -/
+structure Previous extends PreviousUsage where
+  permit : KeepPermit
+  /-- The previous build's payloads, by command index. -/
+  payloads : Std.HashMap Nat CommandEntries
+  /-- The previous build's constants. -/
+  consts : NameMap ConstantInfo
+  /-- The command of the previous build that added each constant of the module. -/
+  ownerCmd : NameMap Nat
 
 /-- A keep `Request.decide` allows. -/
 structure Plan where
@@ -100,25 +104,66 @@ structure Progress where
   total : Nat := 0
   /-- The runtime's effect notes taken while the run went on (`takeRecordedEffects`). -/
   effects : RecordedEffects := {}
+  /-- The payloads of elaborated commands computed while the run went on, with their refusals beside the recorder's
+  (`commandPayload`). -/
+  computed : Std.HashMap Nat (Array Refusal × CommandEntries × Digest) := {}
 
 inductive Status where
   | declined (reason : String)
   | active (prev : Previous) (progress : IO.Ref Progress)
+
+/-- What a reuse run reads of the module's previous `.olean` and `.usage` while its header is processed
+(`Request.new`): the files of its keep permit (`readPermitFiles`), why the `.usage` is no JSON object if it is not
+(`parseUsage`), and what the `.usage` gives besides the permit's checks. -/
+structure Prefetched where
+  files : PermitFiles
+  unreadable? : Option String
+  usage : Except String PreviousUsage
+
+private def prefetch (olean usage : System.FilePath) (opts : Options) : IO Prefetched :=
+  profileitIO "reuse prefetch" opts do
+    let files ← readPermitFiles olean usage
+    match files.head >>= parseUsageWithHead files.text with
+    | .error e => return { files, unreadable? := some e, usage := .error e }
+    | .ok j => return { files, unreadable? := none, usage := files.record >>= ofJson j }
+where
+  ofJson (j : Json) (record : KeepRecord) : Except String PreviousUsage := do
+    let records ← j.getObjValAs? (Array CommandRecord) "commands"
+    unless records.zipIdx.all fun (r, i) => r.i == i do
+      throw "the previous `.usage`'s records are not in command order"
+    let usedJ ← j.getObjValAs? (Array (JName × Array (JName × Digest))) "used"
+    let used : NameMap (Array (Name × Digest)) := usedJ.foldl (init := {}) fun m (mod, cs) =>
+      cs.foldl (fun m (c, d) => m.insert c.name ((m.getD c.name #[]).push (mod.name, d))) m
+    let recorded : NameSet := records.foldl (init := {}) fun s r =>
+      r.usesFull.foldl (·.insert ·.1) (r.usesStmt.foldl (·.insert ·.1) s)
+    return {
+      records, used
+      usedUnattributed := used.foldl (init := #[]) fun out n _ => if recorded.contains n then out else out.push n
+      resolved := record.resolved.flatMap fun (_, ns) => ns.map (·.1)
+      resolvedAll := record.resolvedAll
+      specKeys := record.specLookups.map (·.1)
+      allExtra := ← j.getObjValAs? Bool "allExtra" }
 
 /-- A reuse run's state, shared by the frontend's command loop and the end of `runFrontend`. -/
 structure Request where
   inputs : Inputs
   /-- The toolchain's library directory, read before recording started (`keepPermit`'s `lib?`). -/
   lib? : Option String
+  /-- The previous outputs, read in a task from `new` on, when `inputs` gives them. -/
+  prefetched? : Option (Task (Except IO.Error Prefetched))
   status : IO.Ref Status
 
-/-- The request for `inputs`; declined until `start` takes a permit. -/
-def Request.new (inputs : Inputs) (lib? : Option String) : BaseIO Request := do
+/-- The request for `inputs`, which starts reading the previous outputs (`Prefetched`); declined until `start` takes a
+permit. -/
+def Request.new (inputs : Inputs) (lib? : Option String) (opts : Options) : BaseIO Request := do
   let reason := match inputs.previous with
     | .error reason => reason
     | .ok _ => "the header was not processed"
+  let prefetched? ← match inputs.previous with
+    | .error _ => pure none
+    | .ok (olean, usage) => some <$> IO.asTask (prefetch olean usage opts)
   -- accounted (`mkAccountedRef`): the commands write them, and no command's result depends on them
-  return { inputs, lib?, status := ← mkAccountedRef (.declined reason) }
+  return { inputs, lib?, prefetched?, status := ← mkAccountedRef (.declined reason) }
 
 private partial def addedNames : AddedConst → Array Name
   | .plain n => #[n]
@@ -131,42 +176,26 @@ private partial def addedNames : AddedConst → Array Name
 def addedConstants (ce : CommandEntries) : Array Name :=
   ce.added.flatMap addedNames
 
-private def readPrevious (env : Environment) (olean usage : System.FilePath) (lib? : Option String) :
+private def readPrevious (env : Environment) (pre : Prefetched) (lib? : Option String) :
     IO (Except String Previous) := do
-  let j ← match parseUsage (← IO.FS.readFile usage) with
-    | .ok j => pure j
-    | .error e => return .error s!"the previous `.usage` cannot be read: {e}"
-  let permit ← match ← keepPermit env env.mainModule olean usage lib? with
+  if let some e := pre.unreadable? then return .error s!"the previous `.usage` cannot be read: {e}"
+  let permit ← match ← keepPermitOf env env.mainModule pre.files lib? with
     | .ok permit => pure permit
     | .error reason => return .error reason
   -- a kept command has no snapshot whose code quality entries the end of the run would add, and the entries do not
   -- say which command logged them
   if permit.data.entries.any fun (n, es) => n == `Lean.Linter.codeQualityLogExt && !es.isEmpty then
     return .error "the previous build logged code quality entries"
-  let parse : Except String Previous := do
-    let records ← j.getObjValAs? (Array CommandRecord) "commands"
-    unless records.zipIdx.all fun (r, i) => r.i == i do
-      throw "the previous `.usage`'s records are not in command order"
-    let payloads : Std.HashMap Nat CommandEntries := permit.payloads.foldl (fun m ce => m.insert ce.idx ce) {}
-    let md := permit.data
-    let consts : NameMap ConstantInfo := (md.constNames.zip md.constants).foldl (fun m (n, c) => m.insert n c) {}
-    let ownerCmd : NameMap Nat := permit.payloads.foldl (init := {}) fun m ce =>
-      (addedConstants ce).foldl (fun m n => if m.contains n then m else m.insert n ce.idx) m
-    let usedJ ← j.getObjValAs? (Array (JName × Array (JName × Digest))) "used"
-    let used : NameMap (Array (Name × Digest)) := usedJ.foldl (init := {}) fun m (mod, cs) =>
-      cs.foldl (fun m (c, d) => m.insert c.name ((m.getD c.name #[]).push (mod.name, d))) m
-    let recorded : NameSet := records.foldl (init := {}) fun s r =>
-      r.usesFull.foldl (·.insert ·.1) (r.usesStmt.foldl (·.insert ·.1) s)
-    let usedUnattributed := used.foldl (init := #[]) fun out n _ => if recorded.contains n then out else out.push n
-    let resolved := (← resolvedOfJson (← j.getObjVal? "resolved")).flatMap fun (_, ns) => ns.map (·.1)
-    return {
-      permit, records, payloads, consts, ownerCmd, used, usedUnattributed, resolved
-      resolvedAll := ← j.getObjValAs? Bool "resolvedAll"
-      specKeys := (← j.getObjValAs? (Array (Digest × Digest)) "specLookups").map (·.1)
-      allExtra := ← j.getObjValAs? Bool "allExtra" }
-  let prev ← match parse with
-    | .ok prev => pure prev
+  let usage ← match pre.usage with
+    | .ok usage => pure usage
     | .error e => return .error s!"the previous `.usage` cannot be read: {e}"
+  let md := permit.data
+  let prev : Previous := {
+    toPreviousUsage := usage, permit
+    payloads := permit.payloads.foldl (fun m ce => m.insert ce.idx ce) {}
+    consts := (md.constNames.zip md.constants).foldl (fun m (n, c) => m.insert n c) {}
+    ownerCmd := permit.payloads.foldl (init := {}) fun m ce =>
+      (addedConstants ce).foldl (fun m n => if m.contains n then m else m.insert n ce.idx) m }
   -- a use no record lists (a name compiled code or the interpreter resolved, `recordUsedName`) may be any command's
   let s := state env
   if let some n := prev.usedUnattributed.find? fun n =>
@@ -175,12 +204,14 @@ private def readPrevious (env : Environment) (olean usage : System.FilePath) (li
   return .ok prev
 
 /-- Takes a keep permit for the module of `env`, the environment after its header, from its previous `.olean` and
-`.usage` (`keepPermit`); without one, every command is elaborated and the module's `.usage` says why. -/
-def Request.start (req : Request) (env : Environment) : IO Unit := do
-  let .ok (olean, usage) := req.inputs.previous | return
-  let status ← try
+`.usage` (`keepPermitOf`, on the files `new` read); without one, every command is elaborated and the module's `.usage`
+says why. -/
+def Request.start (req : Request) (env : Environment) (opts : Options) : IO Unit := do
+  let some prefetched := req.prefetched? | return
+  let status ← profileitIO "reuse permit" opts do
+    try
       if env.header.isModule then pure (.declined "module-system") else
-      match ← readPrevious env olean usage req.lib? with
+      match ← readPrevious env (← MonadExcept.ofExcept (← IO.wait prefetched)) req.lib? with
       | .ok prev => pure (.active prev (← mkAccountedRef {}))
       | .error reason => pure (.declined reason)
     catch e => pure (.declined s!"the previous outputs cannot be read: {e}")
@@ -208,13 +239,13 @@ private def catchUp (prev : Previous) : StateT Progress IO Unit := do
     discard <| IO.wait after.env.checked
     let taken ← takeRecordedEffects
     modify fun p => { p with effects := p.effects ++ taken }
-    let (ce, d) ← commandPayload j before after (← get).effects
+    let (rs, ce, d) ← commandPayload j before after (← get).effects
     let (ctx, chain) := (← get).chain.ctx before
     let text := textDigest stx
     let same ← match prev.records[j]?, ← previousDigest prev j with
       | some r, some old => pure (old == d && (ce.refusals.isEmpty || (r.text == text && contextMatches r ctx)))
       | _, _ => pure false
-    modify fun p => { p with chain := chain.push ce d text ctx, intact := same }
+    modify fun p => { p with chain := chain.push ce d text ctx, intact := same, computed := p.computed.insert j (rs, ce, d) }
 
 /-- Whether command `i`'s context, the command starting from `st`, is its previous record's (`contextMatches`), with
 the context it has. -/
@@ -308,6 +339,8 @@ private def decideWith (inputs : Inputs) (prev : Previous) (i : Nat) (stx : Synt
     (st : Elab.Command.State) (r : CommandRecord) (ce : CommandEntries) : StateT Progress IO (Except String Plan) := do
   if !r.isDecl then return .error "nonconst"
   if r.isInit then return .error "initialize"
+  -- after a command whose payload is not the previous build's, no context is a record's (`Progress.intact`)
+  unless (← get).intact do return .error "ctx"
   unless ce.refusals.isEmpty do return .error "refused"
   unless r.text == textDigest stx do return .error "text"
   unless r.span == span do return .error "position"
@@ -326,7 +359,7 @@ def Request.decide (req : Request) (i : Nat) (stx : Syntax) (span : CommandSpan)
     IO (Option Plan) := do
   let .active prev progress ← req.status.get | return none
   if Parser.isTerminalCommand stx then return none
-  let (out, p) ← (do
+  let (out, p) ← profileitIO "reuse decision" st.scopes.head!.opts <| (do
       modify fun p => { p with total := p.total + 1 }
       let some r := prev.records[i]? | return .error "new"
       let some ce := prev.payloads[i]? | return .error "new"
@@ -397,6 +430,8 @@ structure Outcome where
   kept : Array KeptCommand := #[]
   /-- The runtime's effect notes the run took (`takeRecordedEffects`). -/
   effects : RecordedEffects := {}
+  /-- The payloads of elaborated commands the run computed (`Progress.computed`). -/
+  computed : Std.HashMap Nat (Array Refusal × CommandEntries × Digest) := {}
   /-- The previous `.usage`'s observations for the kept commands (`ModuleUsage.Carried`). -/
   carried : Carried := {}
   /-- The names the previous `.usage` lists in `used` that no record lists among its uses, for the kept commands. -/
@@ -414,11 +449,11 @@ def Request.finish (req : Request) : IO Outcome := do
     let field := Json.mkObj [("kept", p.kept.size), ("total", p.total),
       ("reElab", toJson (p.reasons.map (·.1))),
       ("elabReasons", Json.mkObj (counts.toList.map fun (r, n) => (r, toJson n)))]
-    if p.kept.isEmpty then return { field, effects := p.effects }
+    if p.kept.isEmpty then return { field, effects := p.effects, computed := p.computed }
     let carried : Carried :=
       { extra := p.kept.flatMap (·.record.extra), resolved := prev.resolved, resolvedAll := prev.resolvedAll
         specKeys := prev.specKeys, allExtra := prev.allExtra }
-    return { field, kept := p.kept, effects := p.effects, carried, usedUnattributed := prev.usedUnattributed
-             previous? := some prev.permit.data }
+    return { field, kept := p.kept, effects := p.effects, computed := p.computed, carried
+             usedUnattributed := prev.usedUnattributed, previous? := some prev.permit.data }
 
 end Lean.Elab.Reuse

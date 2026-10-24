@@ -353,7 +353,7 @@ def runFrontend
     : IO (Option Environment) := do
   let startTime := (← IO.monoNanosNow).toFloat / 1000000000
   -- read before recording starts, so that it is no process value of the run (`ModuleUsage.keepPermit`)
-  let reuseLib? ← if reuse?.isSome then some <$> (return toString (← getLibDir (← getBuildDir))) else pure none
+  let reuseLib? ← if reuse?.isSome then do pure (some (toString (← getLibDir (← getBuildDir)))) else pure none
   -- the recording logs are global: a frontend this module runs in-process clears or extends them, which `run` detects
   let run ← startFrontendRun (record := oleanFileName?.isSome && usageFileName?.isSome)
   let inputCtx := Parser.mkInputContext input fileName
@@ -405,7 +405,7 @@ def runFrontend
       unsafe enableInitializersExecution
     return snap
   -- a reuse run keeps commands from the module's previous build (`Elab.Reuse`); it needs the `.usage` it writes
-  let reuseReq? ← if usageFileName?.isSome then reuse?.mapM (liftM <| Reuse.Request.new · reuseLib?) else pure none
+  let reuseReq? ← if usageFileName?.isSome then reuse?.mapM (liftM <| Reuse.Request.new · reuseLib? opts) else pure none
   let snap ← Language.Lean.process setup old? reuseReq? ctx
   let snaps := Language.toSnapshotTree snap
   let severityOverrides := errorOnKinds.foldl (·.insert · .error) {}
@@ -467,7 +467,7 @@ def runFrontend
     let env := if usageFileName?.isSome then storeExportedAxioms env else env
     let usage? ← usageFileName?.mapM fun usageFileName => do
       let pending ← ModuleUsage.startModuleRecords env (sessionChanged := (← lastFrontendRun) != run) kept
-        (reused?.elim {} (·.effects))
+        (reused?.elim {} (·.effects)) (reused?.elim {} (·.computed))
       let consts := ModuleUsage.ownConsts env recorded
       let nodes := ModuleUsage.ownNodes env consts
       let own := ModuleUsage.localDigests env nodes
