@@ -318,7 +318,9 @@ private def entry (ce : CommandEntries) : W Unit := do
 
 end PackedPayloads
 
-/-- `ces` as a module's `.olean` stores them (`PackedPayloads`). -/
+/-- `ces` as a module's `.olean` stores them (`PackedPayloads`). `PackedPayloads.unpack` reads back only numbers below
+`2 ^ 70` (command indices, counts and generation counters, which the recorder keeps far below it) and records of
+asynchronous constants nested at most 256 deep; it rejects a packing of anything beyond. -/
 def CommandEntries.pack (ces : Array CommandEntries) : PackedPayloads :=
   let w := ((do PackedPayloads.nat ces.size; for ce in ces do PackedPayloads.entry ce) : PackedPayloads.W Unit).run {}
     |>.2

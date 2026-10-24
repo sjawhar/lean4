@@ -1709,7 +1709,10 @@ static std::string resolved_path(char const * p) {
 }
 
 /* The stamp of the file at `p` as `Lean.ModuleUsage.fileStamp` gives it (device, inode, size, modification and
-   status-change times), its fields separated by `:`; empty if `p` cannot be examined. */
+   status-change times), its fields separated by `:`; empty if `p` cannot be examined or its status-change time lies
+   less than two seconds in the past: as for `Lean.ModuleUsage.fileDigestStamped`, only a settled stamp changes with
+   every later change of the file, on file systems whose timestamps are coarse. The toolchain's directories are trusted
+   not to be replaced while a module compiles, as the running Lean's own files are. */
 static std::string file_stamp_string(char const * p) {
 #if defined(LEAN_WINDOWS)
     return std::string();
@@ -1723,6 +1726,8 @@ static std::string file_stamp_string(char const * p) {
     struct timespec const & mt = st.st_mtim;
     struct timespec const & ct = st.st_ctim;
 #endif
+    struct timespec now;
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0 || ct.tv_sec + 2 >= now.tv_sec) return std::string();
     uint64_t s[7] = {static_cast<uint64_t>(st.st_dev), static_cast<uint64_t>(st.st_ino),
         static_cast<uint64_t>(st.st_size), static_cast<uint64_t>(mt.tv_sec), static_cast<uint64_t>(mt.tv_nsec),
         static_cast<uint64_t>(ct.tv_sec), static_cast<uint64_t>(ct.tv_nsec)};
