@@ -21,8 +21,7 @@ A linter warning recorded in `lintLogExt` when its module is built.
 
 The entry stores no source path, so that the `.olean` does not depend on where the source file
 was: `message.fileName` is empty. The module that owns the entry (the key in `getAllLints`) names
-the source, and consumers such as `lake lint` resolve the module to its file through their source
-search path.
+the source, and consumers such as `lake lint` resolve the module to its source file.
 -/
 structure LintEntry where
   linter  : Name
