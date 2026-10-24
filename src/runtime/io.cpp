@@ -1633,8 +1633,26 @@ static bool path_exists(char const * p) {
     return stat(p, &st) == 0;
 }
 
-/* Whether `p` is a path `e`'s context created, or lies in a directory it created. */
+/* Whether `p` has a `.`, `..` or empty component, through which it can name a file outside the directory it starts
+   with. */
+static bool has_dot_component(std::string const & p) {
+    size_t start = 0;
+    while (start <= p.size()) {
+        size_t end = p.find('/', start);
+        if (end == std::string::npos) end = p.size();
+        size_t len = end - start;
+        if ((len == 0 && start != 0) || (len == 1 && p[start] == '.') ||
+            (len == 2 && p[start] == '.' && p[start + 1] == '.'))
+            return true;
+        start = end + 1;
+    }
+    return false;
+}
+
+/* Whether `p` is a path `e`'s context created, or lies in a directory it created; never a path with a `.`, `..` or
+   empty component. */
 static bool created_by(context_effects const & e, std::string const & p) {
+    if (has_dot_component(p)) return false;
     if (e.created.count(p)) return true;
     for (std::string const & d : e.dirs)
         if (p.size() > d.size() && p.compare(0, d.size(), d) == 0 && p[d.size()] == '/') return true;
@@ -1687,25 +1705,30 @@ static std::string resolved_path(char const * p) {
 #endif
 }
 
-void note_process_spawn(char const * cmd, std::vector<std::string> const * files) {
+std::string note_process_spawn(char const * cmd, std::vector<std::string> const * files) {
     uint32 ctx = effect_context();
-    if (ctx == 0) return;
+    if (ctx == 0) return std::string();
     std::string solver;
     {
         lock_guard<mutex> lock(*g_effects_mutex);
         solver = *g_pinned_solver;
     }
-    // the solver reads and writes only the files named on its command line, so those must be the context's
+    // the solver, with no environment and plain file names (`lean_io_process_spawn`), reads and writes only the files
+    // named on its command line, so those must be the context's
     bool trusted = files && cmd[0] == '/' && !solver.empty() && resolved_path(cmd) == solver;
     lock_guard<mutex> lock(*g_effects_mutex);
     context_effects & e = (*g_effects)[ctx];
     if (trusted)
         for (std::string const & f : *files)
             if (!created_by(e, f)) { trusted = false; break; }
-    if (trusted)
-        note_value_read_core("toolchain", g_pinned_root->c_str());
-    else
+    if (!trusted) {
         note_effect_core(e, std::string("spawns the process ") + cmd);
+        return std::string();
+    }
+    // the Lean githash does not pin the solver's bytes: the build copies any `cadical` it finds
+    note_value_read_core("toolchain", g_pinned_root->c_str());
+    note_value_read_core("solver", solver.c_str());
+    return solver;
 }
 
 void note_path_read(char const * p) {

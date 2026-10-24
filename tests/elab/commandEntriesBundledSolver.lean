@@ -1,10 +1,12 @@
 import Lean
 /-! A command that runs the toolchain's own SAT solver (`bin/cadical`, `bv_decide`'s default) is not refused for it
-when the solver reads no inherited standard stream, runs with no working directory or environment variable set, and
-every argument but its options (`--name`, `--name=N`) is a file the command created: the Lean githash pins the solver
-as it pins the toolchain's files, and the module records the value `toolchain` instead. Any other spawn is an effect:
-the solver on a file the command did not create, under another name, with a working directory, an environment
-variable, an inherited standard stream or an option naming a file, and another toolchain executable. -/
+when the solver reads no inherited standard stream or environment, runs with no working directory or environment
+variable set, and every argument but its options (`--name`, `--name=N`) is a file the command created, named by a plain
+absolute path (no `.` or `..` component, not named as compressed, which makes the solver run a helper through the
+shell): the module records the values `toolchain` and `solver` (the solver's bytes, which the Lean githash does not
+pin) instead. Any other spawn is an effect: the solver on a file the command did not create, under another name, with
+a working directory, an environment variable, the inherited environment, an inherited standard stream, an option
+naming a file, a path through `..` or a compressed file's name, and another toolchain executable. -/
 open Lean
 
 def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
@@ -24,7 +26,14 @@ def runOn (cmd : IO String) (args : System.FilePath → Array String) (cfg : IO.
   IO.FS.withTempFile fun h cnf => do
     h.putStr \"p cnf 1 1\\n1 0\\n\"
     h.flush
-    let spawn := cfg { cmd := ← cmd, args := args cnf, stdin := .null, stdout := .null, stderr := .null }
+    let spawn := cfg { cmd := ← cmd, args := args cnf, stdin := .null, stdout := .null, stderr := .null, inheritEnv := false }
+    try discard (← IO.Process.spawn spawn).wait catch _ => pure ()
+
+/-- runs the solver on the file `name` it creates in a directory it creates, named by `path` -/
+def runInDir (name : String) (path : System.FilePath → String → String) : CommandElabM Unit := do
+  IO.FS.withTempDir fun d => do
+    IO.FS.writeFile (d / name) \"p cnf 1 1\\n1 0\\n\"
+    let spawn : IO.Process.SpawnArgs := { cmd := toString (← solver), args := #[path d name, \"--quiet\"], stdin := .null, stdout := .null, stderr := .null, inheritEnv := false }
     try discard (← IO.Process.spawn spawn).wait catch _ => pure ()
 
 elab \"own_file\" : command => runOn (toString <$> solver) (fun f => #[f.toString, \"--quiet\", \"--seed=1\"]) id
@@ -36,6 +45,10 @@ elab \"inherited\" : command => runOn (toString <$> solver) (fun f => #[f.toStri
 elab \"file_option\" : command => runOn (toString <$> solver) (fun f => #[f.toString, \"--output=out.txt\"]) id
 elab \"other_tool\" : command =>
   runOn (return toString ((← IO.appPath).parent.get! / \"lean\")) (fun _ => #[\"--version\"]) id
+elab \"inherited_env\" : command => runOn (toString <$> solver) (fun f => #[f.toString]) ({ · with inheritEnv := true })
+elab \"in_dir\" : command => runInDir \"p.cnf\" fun d n => (d / n).toString
+elab \"dot_path\" : command => runInDir \"p.cnf\" fun d n => (d / \"..\" / d.fileName.get! / n).toString
+elab \"compressed\" : command => runInDir \"p.cnf.xz\" fun d n => (d / n).toString
 "
 
 def mSource : String := "import X
@@ -48,6 +61,10 @@ with_env
 inherited
 file_option
 other_tool
+inherited_env
+in_dir
+dot_path
+compressed
 "
 
 #eval IO.FS.withTempDir fun dir => do
@@ -64,3 +81,8 @@ other_tool
   let usage ← IO.ofExcept <| ModuleUsage.parseUsage (← IO.FS.readFile (dir / "M.usage"))
   let values : Array (String × Option String) ← IO.ofExcept <| usage.getObjValAs? _ "values"
   IO.println s!"values {values.map Prod.fst}"
+  -- the solver's value is the digest of its bytes (`ModuleUsage.recordedValue?`), stored as `valueDigest?` of it
+  let solverPath := ((← IO.appPath).parent.get! / "cadical").withExtension System.FilePath.exeExtension
+  let recorded : Option String := (values.find? fun (e : String × Option String) => e.1 == "solver").bind (·.2)
+  let expected := (ModuleUsage.valueDigest? (some (← ModuleUsage.fileDigest solverPath).hex)).map ModuleUsage.Digest.hex
+  IO.println s!"solver value is its bytes' digest: {recorded.isSome && recorded == expected}"

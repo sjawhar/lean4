@@ -236,8 +236,9 @@ private opaque takeEffects : BaseIO (Array (UInt32 × String))
 /-- The process values read in any context since recording was switched on (`startFrontendRun`), sorted by key: each
 environment variable (`env:NAME`), the running executable's path (`appPath`), the working directory
 (`workingDirectory`), and the toolchain directories (`toolchain`) when a command read a file in them or ran the
-toolchain's SAT solver on its own files (`pinnedToolchainDirs`), which the runtime then does not note as an effect; each
-with the value first read (`none`: absent) and whether a later read saw another value. Takes them. -/
+toolchain's SAT solver on its own files (`pinnedToolchainDirs`), which the runtime then does not note as an effect,
+with the solver's path (`solver`) in the latter case; each with the value first read (`none`: absent) and whether a
+later read saw another value. Takes them. -/
 @[extern "lean_io_take_value_reads"]
 opaque takeValueReads : BaseIO (Array (String × Option String × Bool))
 
@@ -255,8 +256,9 @@ def currentValue? (key : String) : IO (Option String) := do
 
 /-- The directories under the running Lean's root that the Lean githash pins (its executables, headers and library),
 whose files a command reads without an effect, and the SAT solver it ships (`bv_decide`'s default), which a command
-runs without an effect on files it created, the solver reading and writing only the files its command line names:
-the root is recorded as the value `toolchain` instead. -/
+runs without an effect on files it created, with no environment and no file named as compressed, the solver reading
+and writing only the files its command line names: the root is recorded as the value `toolchain` instead, and the
+solver's path as `solver` (`ModuleUsage.recordedValue?` records its bytes). -/
 def pinnedToolchainDirs : IO (String × Array String × String) := do
   let root ← getBuildDir
   return (toString root, #[toString (root / "bin"), toString (root / "include"), toString (← getLibDir root)],

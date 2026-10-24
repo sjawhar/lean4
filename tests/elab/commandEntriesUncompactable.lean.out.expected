@@ -1,7 +1,7 @@
 lean #[-o, ST.olean, --usage=ST.usage, ST.lean]: exit 0
 command 0: refusals #[a change to the command state's scopes], caches #[]
-command 1: refusals #[entries for Lean.storedTracesExt that no .olean can store (a closure)], caches #[Lean.closedTermCacheExt, Lean.Compiler.LCNF.baseTypeExt, Lean.Compiler.LCNF.impureExt, Lean.Compiler.LCNF.declOrderExt, Lean.Compiler.LCNF.simpleGroundDeclExt]
+command 1: refusals #[entries for Lean.storedTracesExt that a payload cannot hold (a closure, a reference)], caches #[Lean.closedTermCacheExt, Lean.Compiler.LCNF.baseTypeExt, Lean.Compiler.LCNF.impureExt, Lean.Compiler.LCNF.declOrderExt, Lean.Compiler.LCNF.simpleGroundDeclExt]
 command 2: refusals #[], caches #[]
 command 3: refusals #[], caches #[]
-noreuse (some true), reason (some (declaration command 1: entries for Lean.storedTracesExt that no .olean can store (a closure)))
+noreuse (some true), reason (some (declaration command 1: entries for Lean.storedTracesExt that a payload cannot hold (a closure, a reference)))
 lean #[-o, Importer.olean, --usage=Importer.usage, Importer.lean]: exit 0

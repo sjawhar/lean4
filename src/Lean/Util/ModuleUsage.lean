@@ -472,7 +472,9 @@ def computeStmt (env : Environment) (s : StmtState) (own : Array (Name × Digest
       e := e.name m |>.digest core |>.nat outside.size
       for r in outside do
         let so := stmtOnly r
-        let d := if so then out[r]? <|> (s.find? env r).map (·.1) else full[r]? <|> fs.digestOf env r
+        -- a constant several modules declare: the environment can hold another declarer's copy (`State.digestOf`)
+        let multi := (env.getKernelDeclarersIfOther? r (env.getModuleIdxFor? r)).isSome
+        let d := if so && !multi then out[r]? <|> (s.find? env r).map (·.1) else full[r]? <|> fs.digestOf env r
         e := e.name r |>.bool so |>.opt d Enc.digest
     let d := e.finish
     for m in scc do out := out.insert m d
@@ -842,6 +844,22 @@ def untrackedImports (env : Environment) : IO (Array (Name × Digest)) := do
 def valueDigest? (v? : Option String) : Option Digest :=
   v?.map fun v => (({} : Enc).str v).finish
 
+/-- The value a process value stands for in `.usage`: for `solver`, whose recorded value is the path of the SAT solver
+a command ran (`pinnedToolchainDirs`), the digest of the solver's bytes (`none` if it cannot be read), which the Lean
+githash does not pin; any other value as read. -/
+def recordedValue? (key : String) (v? : Option String) : IO (Option String) := do
+  if key != "solver" then return v?
+  let some path := v? | return none
+  try return some (← fileDigest path).hex catch _ => return none
+
+/-- The value of the process value `key` in this process now, as `.usage` records it (`recordedValue?`,
+`currentValue?`). -/
+def currentRecordedValue? (key : String) : IO (Option String) := do
+  if key == "solver" then
+    let (_, _, solver) ← pinnedToolchainDirs
+    return ← recordedValue? key (some solver)
+  currentValue? key
+
 /-- The format version of the `.usage` sidecar and of Lake's `.usekey`; Lake reads a sidecar of any other
 version as absent. -/
 def usageVersion : Nat := 13
@@ -927,7 +945,7 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
   let names := nodes.foldl (fun s n => n.refs.foldl (·.insert ·) s) (used.foldl (·.insert ·) names)
   let names := env.getImportedKernelDuplicates.foldl (·.insert ·.1) names
   let names := (names : Std.HashSet Name).fold addInternalPrefixes names
-  let values ← takeValueReads
+  let values ← (← takeValueReads).mapM fun (k, v?, changed) => return (k, ← recordedValue? k v?, changed)
   let untracked ← untrackedImports env
   let noreuseReason? := noreuseReason? <|> values.findSome? fun (k, _, changed) =>
     guard changed *> some s!"the process value {k} changed while the module was compiled"

@@ -8,7 +8,7 @@ module
 prelude
 public import Lean.ScopedEnvExtension
 public import Lean.Meta.Basic
-import Lean.CompactedRegion
+import Lean.Util.ModuleUsage.Basic
 import all Lean.Environment  -- for the per-view writes and counters, branches, realizations and their contexts
 
 public section
@@ -101,8 +101,9 @@ inductive Refusal where
   | unrelatedConstMap (at? : Option Name := none)
   /-- A change to the command state's field `field`, which payloads do not carry. -/
   | commandState (field : Name)
-  /-- Entries recorded for `part` (an extension, a scoped stack or a command cache) that hold a value no `.olean` can
-  store (a closure); the payload leaves them out. -/
+  /-- Entries recorded for `part` (an extension, a scoped stack or a command cache) that hold a value a payload cannot
+  hold (`ModuleUsage.objectsDigests`: a closure, an external object, an unresolved promise, a reference); the payload
+  leaves them out. -/
   | uncompactable (part : Name) (at? : Option Name := none)
   /-- An effect on state outside the command that the runtime noted (`RecordedEffects.byCommand`): a write to a
   reference it did not create, the resolution of a promise or the cancellation of a task it did not create, the use of
@@ -138,7 +139,7 @@ protected def toString : Refusal → String
   | foreignRealizationContext c => s!"the realization of {c}, in a context the payload cannot provide"
   | unrelatedConstMap at? => s!"a constant map that does not extend the one before it{inRecord at?}"
   | commandState field => s!"a change to the command state's {field}"
-  | uncompactable part at? => s!"entries for {part} that no .olean can store (a closure){inRecord at?}"
+  | uncompactable part at? => s!"entries for {part} that a payload cannot hold (a closure, a reference){inRecord at?}"
   | effect what => s!"an effect outside the command: it {what}"
 
 instance : ToString Refusal := ⟨Refusal.toString⟩
@@ -336,22 +337,35 @@ private structure Reader where
   synthSet : Nat := 0
   synthErased : Nat := 0
   lastExtGens : Array Nat := #[]
-  /-- The parts of the payload being read so far (`partArray`). -/
-  cmdParts : Array (Array EnvExtensionEntry) := #[]
+  /-- The parts of the payload being read so far (`partArray`), with their extensions. -/
+  cmdParts : Array (Name × Array EnvExtensionEntry) := #[]
+  /-- The indices into `PackedPayloads.parts` read so far. -/
+  partsRead : Std.HashSet Nat := {}
 
 private abbrev R := ReaderT PackedPayloads (StateT Reader (Except String))
 
+/-- A number the writer wrote (`pushNat`): below `2 ^ 64`, so at most ten bytes. -/
 private def readNat : R Nat := do
   let b := (← read).bytes
   let rec go (pos acc shift : Nat) : Except String (Nat × Nat) :=
     if h : pos < b.size then
       let byte := b[pos]
       let acc := acc + (byte.toNat % 128) * 2 ^ shift
-      if byte < 128 then .ok (acc, pos + 1) else go (pos + 1) acc (shift + 7)
+      if byte < 128 then .ok (acc, pos + 1)
+      else if shift ≥ 63 then .error "a number of the packed payloads is too long"
+      else go (pos + 1) acc (shift + 7)
     else .error "the packed payloads end inside a number"
   termination_by b.size - pos
   let (n, pos) ← go (← getThe Reader).pos 0 0
   modifyThe Reader ({ · with pos })
+  return n
+
+/-- A count of elements that each take at least one byte, so no more than the bytes left: a malformed packing is
+rejected before anything is allocated for it. -/
+private def readByteCount : R Nat := do
+  let n ← readNat
+  unless n ≤ (← read).bytes.size - (← getThe Reader).pos do
+    throw "a count of the packed payloads exceeds the bytes left"
   return n
 
 /-- `xs[i:i+n]`, or an error naming `what` if `xs` is shorter. -/
@@ -372,21 +386,24 @@ private def readNames : R (Array Name) := do
   return ns
 
 private def readParts : R (Array (Name × Array EnvExtensionEntry)) := do
-  let n ← readNat
+  let n ← readByteCount
   let mut out := Array.emptyWithCapacity n
   for _ in [0:n] do
-    let some ext := (← read).parts[← readNat]? | throw "a part index of the packed payloads is out of range"
+    let i ← readNat
+    let some ext := (← read).parts[i]? | throw "a part index of the packed payloads is out of range"
+    modifyThe Reader fun r => { r with partsRead := r.partsRead.insert i }
     let es ← match ← readNat with
       | 0 => do
-        let some es := (← getThe Reader).cmdParts[← readNat]? |
+        let some (ext', es) := (← getThe Reader).cmdParts[← readNat]? |
           throw "a part of the packed payloads refers to a part after it"
+        unless ext' == ext do throw "a part of the packed payloads refers to a part of another extension"
         pure es
       | k + 1 => do
         let r ← getThe Reader
         let es ← slice (← read).entries r.entries k "entries"
         set { r with entries := r.entries + k }
         pure es
-    modifyThe Reader fun r => { r with cmdParts := r.cmdParts.push es }
+    modifyThe Reader fun r => { r with cmdParts := r.cmdParts.push (ext, es) }
     out := out.push (ext, es)
   return out
 
@@ -398,6 +415,8 @@ private def readCounters : R CountersDelta := do
   let extGens ← match ← readNat with
     | 0 => pure (← getThe Reader).lastExtGens
     | k + 1 => do
+      unless k ≤ (← read).bytes.size - (← getThe Reader).pos do
+        throw "a count of the packed payloads exceeds the bytes left"
       let mut gs := Array.emptyWithCapacity k
       for _ in [0:k] do gs := gs.push (← readNat)
       modifyThe Reader ({ · with lastExtGens := gs })
@@ -405,7 +424,7 @@ private def readCounters : R CountersDelta := do
   let constGen ← readNat
   let recordingConstGen ← readNat
   let declChangesAdded := (← readNames).toList
-  let n ← readNat
+  let n ← readByteCount
   let mut constAddedGens := Array.emptyWithCapacity n
   for _ in [0:n] do constAddedGens := constAddedGens.push (← readName, ← readNat)
   let synthTierGen? := match ← readNat with | 0 => none | g + 1 => some g
@@ -431,7 +450,7 @@ private partial def readAdded : R AddedConst := do
         | some k => pure (some k)
         | none => throw "a constant kind of the packed payloads is out of range"
     let states ← readViews
-    let m ← readNat
+    let m ← readByteCount
     let mut nested := Array.emptyWithCapacity m
     for _ in [0:m] do nested := nested.push (← readAdded)
     return .async n k? states nested
@@ -441,6 +460,8 @@ private partial def readAdded : R AddedConst := do
     let consts ← readNames
     let states ← readViews
     let m ← readNat
+    unless 2 * m ≤ (← read).names.size - (← getThe Reader).names do
+      throw "the packed payloads hold too few names"
     let mut merges := Array.emptyWithCapacity m
     for _ in [0:m] do merges := merges.push (← readName, ← readName)
     return .realization forConst key consts states merges
@@ -458,7 +479,7 @@ private def readEntry : R CommandEntries := do
   let idx ← readNat
   let main ← readViews
   let checked ← readViews
-  let n ← readNat
+  let n ← readByteCount
   let mut added := Array.emptyWithCapacity n
   for _ in [0:n] do added := added.push (← readAdded)
   let counters ← readCounters
@@ -468,18 +489,21 @@ private def readEntry : R CommandEntries := do
   set { r with refusals := r.refusals + k }
   return { idx, main, checked, added, counters, refusals }
 
-/-- The payloads `p` holds (`CommandEntries.pack`), or why `p` is not a packing of payloads: it ends early, an index or
-a tag is out of range, or something is left over. -/
+/-- The payloads `p` holds (`CommandEntries.pack`), or why `p` is not a packing of payloads: it ends early, a count, an
+index or a tag is out of range, a part refers to a later part or to another extension's, a part name is repeated, or
+something is left over. -/
 def unpack (p : PackedPayloads) : Except String (Array CommandEntries) := do
   let act : R (Array CommandEntries) := do
-    let n ← readNat
+    let n ← readByteCount
     let mut out := Array.emptyWithCapacity n
     for _ in [0:n] do out := out.push (← readEntry)
     let r ← getThe Reader
     unless r.pos == p.bytes.size && r.names == p.names.size && r.entries == p.entries.size &&
         r.options == p.options.size && r.refusals == p.refusals.size && r.synthSet == p.synthSet.size &&
-        r.synthErased == p.synthErased.size do
+        r.synthErased == p.synthErased.size && r.partsRead.size == p.parts.size do
       throw "the packed payloads hold more than their payloads"
+    unless (p.parts.foldl (·.insert ·) ({} : Std.HashSet Name)).size == p.parts.size do
+      throw "the packed payloads name a part twice"
     return out
   return (← (act.run p).run {}).1
 
@@ -583,10 +607,11 @@ private unsafe def addrOfImpl {α : Type} (a : α) : USize := ptrAddrUnsafe a
 @[implemented_by addrOfImpl]
 private opaque addrOf {α : Type} (a : α) : USize
 
-/-- What `viewStatesMemo` computed between two states (their addresses) of an extension (its index): its entries
-(kind 0), its scoped stack's operations (1) or a cache's entries (2), `none` for a change no entry expresses. One
-command's recording keeps it, while every state it is keyed by stays alive: a realization context's states mostly are
-its command's. -/
+/-- What `viewStatesMemo` computed between two states (their addresses): an extension's entries (kind 0, keyed by its
+index), its scoped stack's operations (1, the same) or a cache's entries (2, keyed by its position in
+`Registries.caches`: several caches can read one extension), `none` for a change no entry expresses. One command's
+recording keeps it, while every state it is keyed by stays alive: a realization context's states mostly are its
+command's. -/
 private abbrev DeltaMemo := Std.HashMap (Nat × Nat × USize × USize) (Option (Array EnvExtensionEntry))
 
 /-- The change of `view` from `k₀` to `k₁`, two kernel environments of that view (`ViewStates`), and why it is not
@@ -645,11 +670,11 @@ private def viewStatesMemo (regs : Registries) (view : EnvExtension.View) (k₀ 
           if isScoped || ext.ofOLeanEntry?.isSome then st := { st with entries := st.entries.push (ext.name, es) }
           else refused := refused.push (.unreplayable ext.name at?)
       | none => refused := refused.push (.inexpressible ext.name at?)
-  for cache in regs.caches do
+  for cache in regs.caches, ci in [:regs.caches.size] do
     unless changed[cache.ext.idx]?.getD false do continue
     let c₀ := cacheStateIn cache k₀
     let c₁ := cacheStateIn cache k₁
-    let key := (cache.ext.idx, 2, addrOf c₀, addrOf c₁)
+    let key := (ci, 2, addrOf c₀, addrOf c₁)
     let es := match memo[key]? with
       | some (some es) => es
       | _ => cache.stateDelta c₀ c₁
@@ -941,13 +966,10 @@ def CommandEntries.parallelMap {α β : Type} (xs : Array α) (f : α → IO β)
 def commandDeltaRecorder : IO (Environment → Environment → Nat → BaseIO CommandEntries) :=
   return recordCommandDeltaWith (← Registries.get)
 
-/-- Whether `a` compacts (`CompactedRegion.bytes`): it holds no closure. -/
-private def compacts (a : α) : IO Bool := do
-  try
-    discard <| CompactedRegion.bytes a
-    return true
-  catch _ =>
-    return false
+/-- Whether a payload can hold `a`: its contents have a digest (`ModuleUsage.objectsDigests`), so it holds no closure,
+external object, unresolved promise or reference. -/
+private def compacts (a : α) : Bool :=
+  (ModuleUsage.objectsDigests #[a])[0]?.join.isSome
 
 /-- `parts` without those that do not compact, each refused (`Refusal.uncompactable`, in the record of `at?`). -/
 private def compactingParts (parts : Array (Name × Array EnvExtensionEntry)) (at? : Option Name) :
@@ -955,7 +977,7 @@ private def compactingParts (parts : Array (Name × Array EnvExtensionEntry)) (a
   let mut kept := #[]
   let mut refused := #[]
   for (part, es) in parts do
-    if ← compacts es then kept := kept.push (part, es)
+    if compacts es then kept := kept.push (part, es)
     else refused := refused.push (.uncompactable part at?)
   return (kept, refused)
 
@@ -986,8 +1008,8 @@ private partial def compactingRecord : AddedConst → IO (AddedConst × Array Re
     return (.context forConst opts main checked counters, r₁ ++ r₂)
   | a => return (a, #[])
 
-/-- `ce`, a payload that does not compact whole, as an `.olean` stores it: every recorded part that holds a value no
-`.olean` can store (a closure) is left out and refused (`Refusal.uncompactable`). -/
+/-- `ce`, a payload that does not compact whole, as an `.olean` stores it: every recorded part that holds a value a
+payload cannot hold (`compacts`) is left out and refused (`Refusal.uncompactable`). -/
 def CommandEntries.withoutUncompactable (ce : CommandEntries) : IO CommandEntries := do
   let (main, r₁) ← compactingStates ce.main none
   let (checked, r₂) ← compactingStates ce.checked none

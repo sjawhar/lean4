@@ -727,40 +727,72 @@ static bool is_solver_option(std::string const & a) {
     return i == a.size() && i > digits;
 }
 
+static bool ends_with(std::string const & s, char const * suffix) {
+    size_t n = strlen(suffix);
+    return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
+}
+
+/* Whether the SAT solver reads or writes the file argument `a` itself: an absolute path of letters, digits and
+   `._+-` only, without `.`, `..` or empty components, and not named as compressed. The solver runs a decompressor or
+   compressor through the shell for a file named `*.gz`, `*.bz2`, `*.xz`, `*.lzma` or `*.7z`, with the name unquoted. */
+static bool is_plain_solver_file(std::string const & a) {
+    if (a.size() < 2 || a[0] != '/') return false;
+    for (unsigned char c : a)
+        if (!isalnum(c) && c != '/' && c != '.' && c != '_' && c != '+' && c != '-') return false;
+    size_t start = 1;
+    while (start <= a.size()) {
+        size_t end = a.find('/', start);
+        if (end == std::string::npos) end = a.size();
+        size_t len = end - start;
+        if (len == 0 || (len == 1 && a[start] == '.') || (len == 2 && a[start] == '.' && a[start + 1] == '.'))
+            return false;
+        start = end + 1;
+    }
+    for (char const * s : {".gz", ".bz2", ".xz", ".lzma", ".7z"})
+        if (ends_with(a, s)) return false;
+    return true;
+}
+
 extern "C" LEAN_EXPORT obj_res lean_io_process_spawn(obj_arg args_) {
     object_ref args(args_);
     object_ref stdio_cfg = cnstr_get_ref(args, 0);
     stdio stdin_mode  = static_cast<stdio>(cnstr_get_uint8(stdio_cfg.raw(), 0));
     stdio stdout_mode = static_cast<stdio>(cnstr_get_uint8(stdio_cfg.raw(), 1));
     stdio stderr_mode = static_cast<stdio>(cnstr_get_uint8(stdio_cfg.raw(), 2));
+    bool inherit_env = cnstr_get_uint8(args.raw(), 5 * sizeof(object *));
     // a child process acts on state no task context accounts for, unless it is the toolchain's own SAT solver on
-    // files the context created (`note_process_spawn`)
+    // files the context created (`note_process_spawn`), which then runs from the path the check resolved
+    std::string solver;
     if (effect_context()) {
         std::vector<std::string> files;
+        // the solver reads options from its environment and runs helpers it finds on `PATH`
         bool plain = stdin_mode != stdio::INHERIT && stdout_mode != stdio::INHERIT && stderr_mode != stdio::INHERIT &&
             !cnstr_get_ref_t<option_ref<string_ref>>(args, 3) &&
-            cnstr_get_ref_t<array_ref<pair_ref<string_ref, option_ref<string_ref>>>>(args, 4).size() == 0;
+            cnstr_get_ref_t<array_ref<pair_ref<string_ref, option_ref<string_ref>>>>(args, 4).size() == 0 &&
+            !inherit_env;
         if (plain) {
             for (string_ref const & a : cnstr_get_ref_t<array_ref<string_ref>>(args, 2)) {
                 std::string s = a.to_std_string();
-                if (!is_solver_option(s)) files.push_back(std::move(s));
+                if (is_solver_option(s)) continue;
+                if (!is_plain_solver_file(s)) { plain = false; break; }
+                files.push_back(std::move(s));
             }
         }
-        note_process_spawn(string_cstr(cnstr_get(args.raw(), 1)), plain ? &files : nullptr);
+        solver = note_process_spawn(string_cstr(cnstr_get(args.raw(), 1)), plain ? &files : nullptr);
     }
     if (stdin_mode == stdio::INHERIT) {
         std::cout.flush();
     }
     try {
         obj_res r = spawn(
-                cnstr_get_ref_t<string_ref>(args, 1),
+                solver.empty() ? cnstr_get_ref_t<string_ref>(args, 1) : string_ref(solver),
                 cnstr_get_ref_t<array_ref<string_ref>>(args, 2),
                 stdin_mode,
                 stdout_mode,
                 stderr_mode,
                 cnstr_get_ref_t<option_ref<string_ref>>(args, 3),
                 cnstr_get_ref_t<array_ref<pair_ref<string_ref, option_ref<string_ref>>>>(args, 4),
-                cnstr_get_uint8(args.raw(), 5 * sizeof(object *)),
+                inherit_env,
                 cnstr_get_uint8(args.raw(), 5 * sizeof(object *) + 1));
 #if !defined(LEAN_WINDOWS)
         if (lean_io_result_is_ok(r))

@@ -282,8 +282,8 @@ printf 'def ta1 := 1\n' > Test/TA.lean
 printf 'import Test.TA\ndef tb := ta1\n' > Test/TB.lean
 test_run build Test.TB
 test_cmd_out '"extra":[]' cat .lake/build/lib/lean/Test/TB.usage
-sed -e 's/"used":\[/"used":[[["Init","Prelude"],[[["Nat","add"],"00000000000000000000000000000000"]]],/' \
-  -e 's/"extra":\[\]/"extra":[[["Init","Prelude"],false]]/' \
+sed -e '1s/"used":\[/"used":[[["Init","Prelude"],[[["Nat","add"],"00000000000000000000000000000000"]]],/' \
+  -e '1s/"extra":\[\]/"extra":[[["Init","Prelude"],false]]/' \
   .lake/build/lib/lean/Test/TB.usage > TB.usage.tmp
 mv -f TB.usage.tmp .lake/build/lib/lean/Test/TB.usage
 # the key accepts only the `.usage` it was written from (`usage`: the first 128 bits of its SHA-256), so point it at

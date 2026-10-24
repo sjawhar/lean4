@@ -213,9 +213,13 @@ public def satQuery (solverPath : System.FilePath) (problemPath : System.FilePat
   let options := SatOptions.ofMode mode |>.addLrat binaryProofs
   let cmd := solverPath.toString
   let args := #[ problemPath.toString, proofOutput.toString] ++ options.toArgs
+  -- The solver the toolchain ships (`TacticContext.determineSolver`) needs no environment, and options it would read
+  -- from one could change its result.
+  let bundled := solverPath == ((← IO.appPath).parent.get! / "cadical").withExtension System.FilePath.exeExtension
 
   -- We implement timeouting ourselves because cadicals -t option is not available on Windows.
-  let out? ← runInterruptible timeout { cmd, args, stdin := .piped, stdout := .piped, stderr := .null }
+  let out? ← runInterruptible timeout
+    { cmd, args, stdin := .piped, stdout := .piped, stderr := .null, inheritEnv := !bundled }
   match out? with
   | .timeout => throwSatTimeout
   | .success { exitCode := exitCode, stdout := stdout, stderr := stderr} =>

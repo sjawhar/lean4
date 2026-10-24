@@ -383,11 +383,18 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
       throw s!"usage: command {i} uses `{n}`, a constant of this module without a statement digest"
     if let some m := env.getModuleIdxFor? n then
       return match ← importedConstDigests? env m n with
-        -- the full digest a compile depends on: with each other kernel declarer's (`State.digestOf`)
-        | .digests full core attrs => .digests ((fs.digestOf env n).getD full) core attrs
+        -- the full digest a compile depends on: with each other kernel declarer's (`State.digestOf`); the environment
+        -- can hold another declarer's copy, whose statement may differ in binder names and infos, so a statement-only
+        -- use takes that digest too
+        | .digests full core attrs =>
+          let full := (fs.digestOf env n).getD full
+          .digests full (if (env.getKernelDeclarersIfOther? n (some m)).isSome then full else core) attrs
         | .codeOnly => .unattributed s!"command {i} uses `{n}`, which `{env.header.modules[m.toNat]!.module}` \
             compiled code for without defining it"
-        | .untracked => .untracked
+        -- a toolchain module's copy is pinned by the Lean githash, another declarer's is not
+        | .untracked => match fs.digestOf env n with
+          | some d => .digests d d d
+          | none => .untracked
     return .unattributed s!"command {i} uses `{n}`, a constant of this module the kernel environment does not hold"
   let payloadByIdx : Std.HashMap Nat (CommandEntries × Digest) :=
     payloads.foldl (fun m p => m.insert p.1.idx p) {}

@@ -7,5 +7,10 @@ command 5: refusals #[an effect outside the command: it spawns the process TOOLC
 command 6: refusals #[an effect outside the command: it spawns the process TOOLCHAIN/bin/cadical]
 command 7: refusals #[an effect outside the command: it spawns the process TOOLCHAIN/bin/cadical]
 command 8: refusals #[an effect outside the command: it spawns the process TOOLCHAIN/bin/lean]
-command 9: refusals #[]
-values #[appPath, toolchain]
+command 9: refusals #[an effect outside the command: it spawns the process TOOLCHAIN/bin/cadical]
+command 10: refusals #[]
+command 11: refusals #[an effect outside the command: it spawns the process TOOLCHAIN/bin/cadical]
+command 12: refusals #[an effect outside the command: it spawns the process TOOLCHAIN/bin/cadical]
+command 13: refusals #[]
+values #[appPath, solver, toolchain]
+solver value is its bytes' digest: true

@@ -307,7 +307,7 @@ namespace {
 #ifndef LEAN_EMSCRIPTEN
 enum : unsigned char {
     tag_obj_ctor = 50, tag_obj_array, tag_obj_sarray, tag_obj_string, tag_obj_mpz, tag_obj_thunk, tag_obj_task,
-    tag_obj_promise, tag_obj_ref
+    tag_obj_promise
 };
 
 /* The bytes of one node of an object digest, gathered and then hashed by XXH3-128, as a file's digest is
@@ -341,9 +341,11 @@ public:
 
 /* Content digests of object graphs (`Lean.ModuleUsage.objectsDigests`): a Merkle hash (`node_hasher`) over the objects,
 each hashing its kind, its scalar contents and its children's digests (a boxed scalar child by its value), for the
-values `CompactedRegion.bytes` stores: a thunk's, a task's and a promise's values, a reference's contents. A closure or
-an external object, which it refuses, makes the digest fail. One digester for many roots digests each object they share
-once; the roots are borrowed for the call, so every object it memoizes stays alive and at its address. */
+values `CompactedRegion.bytes` stores: a thunk's, a task's and a resolved promise's values. A closure, an external
+object, an unresolved promise or a reference, which it refuses, makes the digest fail: a content digest does not see
+which references of a graph are the same object, which `ST.Ref.ptrEq` observes. One digester for many roots digests
+each object they share once; the roots are borrowed for the call, so every object it memoizes stays alive and at its
+address. */
 class object_digester {
     ptr_digest_map             m_memo;
     std::vector<object *>      m_todo;
@@ -354,7 +356,6 @@ class object_digester {
         case LeanThunk:   return lean_thunk_get(o);
         case LeanTask:    return lean_task_get(o);
         case LeanPromise: return reinterpret_cast<object *>(lean_to_promise(o)->m_result);
-        case LeanRef:     return lean_to_ref(o)->m_value;
         default:          lean_unreachable();
         }
     }
@@ -390,9 +391,9 @@ class object_digester {
             std::string s = to_mpz(o)->m_value.to_string();
             return node_hasher(m_buf, tag_obj_mpz).str(s.data(), s.size()).finish();
         }
-        case LeanThunk: case LeanTask: case LeanPromise: case LeanRef: {
+        case LeanThunk: case LeanTask: case LeanPromise: {
             unsigned char tag = lean_ptr_tag(o) == LeanThunk ? tag_obj_thunk : lean_ptr_tag(o) == LeanTask ? tag_obj_task
-                : lean_ptr_tag(o) == LeanPromise ? tag_obj_promise : tag_obj_ref;
+                : tag_obj_promise;
             node_hasher h(m_buf, tag);
             put_child(h, child_of_wrapper(o));
             return h.finish();
@@ -410,7 +411,7 @@ class object_digester {
     }
 
 public:
-    /* `root`'s digest, or `false` if it holds a closure or an external object. Children first, with an explicit
+    /* `root`'s digest, or `false` if it holds an object the digester refuses. Children first, with an explicit
     stack: terms nest deeper than the C stack allows. */
     bool digest_of(object * root, digest & out) {
         if (lean_is_scalar(root)) {
@@ -424,7 +425,7 @@ public:
             if (m_memo.find(o) != nullptr) { m_todo.pop_back(); continue; }
             size_t pending = m_todo.size();
             switch (lean_ptr_tag(o)) {
-            case LeanClosure: case LeanExternal: case LeanReserved:
+            case LeanClosure: case LeanExternal: case LeanReserved: case LeanRef:
                 m_todo.clear();
                 return false;
             case LeanArray:
@@ -432,7 +433,11 @@ public:
                 break;
             case LeanScalarArray: case LeanString: case LeanMPZ:
                 break;
-            case LeanThunk: case LeanTask: case LeanPromise: case LeanRef:
+            case LeanPromise:
+                if (lean_to_promise(o)->m_result == nullptr) { m_todo.clear(); return false; }
+                push_if_new(child_of_wrapper(o));
+                break;
+            case LeanThunk: case LeanTask:
                 push_if_new(child_of_wrapper(o));
                 break;
             default:
@@ -451,7 +456,7 @@ public:
 }
 
 /* `objectsDigests : @& Array α → Array (Option Digest)`: each element's content digest (`object_digester`), `none` for
-one that holds a closure or an external object; one digester for all, so the objects they share are digested once. */
+one that holds an object the digester refuses; one digester for all, so the objects they share are digested once. */
 extern "C" LEAN_EXPORT obj_res lean_usage_objects_digests(b_obj_arg xs) {
 #ifdef LEAN_EMSCRIPTEN
     lean_internal_panic("usage digests require OpenSSL");

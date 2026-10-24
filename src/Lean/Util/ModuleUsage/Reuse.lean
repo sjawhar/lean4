@@ -249,11 +249,11 @@ private def closureChanged? (env : Environment) (r : KeepRecord) : IO (Option St
   return none
 
 /-- The reason a process value the module's compile read (`values`) differs in this process, if one does: a command
-may have read it, as an environment variable, the working directory, the executable's path, or a file of the
-toolchain at the recorded root. -/
+may have read it, as an environment variable, the working directory, the executable's path, a file of the
+toolchain at the recorded root, or the bytes of the SAT solver it ran (`currentRecordedValue?`). -/
 private def valuesChanged? (r : KeepRecord) : IO (Option String) := do
   for (k, d?) in r.values do
-    let now? ← try valueDigest? <$> currentValue? k
+    let now? ← try valueDigest? <$> currentRecordedValue? k
       catch _ => return some s!"the compile read the process value {k}, which this Lean does not read"
     unless now? == d? do
       return some s!"the process value {k} is not what it was when the module was compiled"

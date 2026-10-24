@@ -1,0 +1,3 @@
+command 0: caches #[]
+command 1: caches #[(fstCache, #[1]), (sndCache, #[2])]
+command 2: caches #[]
