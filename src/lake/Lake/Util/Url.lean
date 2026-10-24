@@ -9,8 +9,10 @@ prelude
 public import Lake.Util.Log
 import Lake.Util.JsonObject
 import Lake.Util.Proc
+import Lake.Util.CacheToken
 import Init.Data.String.TakeDrop
 import Init.Data.String.Search
+import Init.Data.String.Modify
 import Init.TacticsExtra  -- shake: keep (out-of-line macro_rules def, fix)
 
 open Lean
@@ -110,39 +112,78 @@ public def uriEncode (s : String) (init := "") : String :=
   return (← IO.getEnv "CURL").getD "curl"
 
 /--
+The `curl` arguments that make a download give up on a stalled transfer: one that has not
+connected within 10 seconds, or that has received less than 1 KiB per second for 30 seconds.
+-/
+public def downloadTimeoutArgs : Array String :=
+  #["--connect-timeout", "10", "--speed-limit", "1024", "--speed-time", "30"]
+
+/--
+The scheme and authority of an HTTP(S) URL, lowercased (e.g., `https://storage.googleapis.com`),
+which identify the host (and port) that a request to the URL goes to.
+Returns `none` for a URL of another scheme or with user information in its authority.
+-/
+public def urlOrigin? (url : String) : Option String := do
+  let url := url.toLower
+  let (scheme, rest) ←
+    if let some rest := url.dropPrefix? "https://" then some ("https", rest)
+    else if let some rest := url.dropPrefix? "http://" then some ("http", rest)
+    else none
+  let authority := (rest.takeWhile fun c => c != '/' && c != '?' && c != '#').copy
+  guard (!authority.isEmpty && !authority.any fun c => c == '@' || c == '\\')
+  return s!"{scheme}://{authority}"
+
+/--
+Returns the HTTP status code in the JSON that `curl -w "%{json}"` wrote to `stderr`.
+-/
+public def curlResponseCode (stderr : String) : LogIO Nat := do
+  match Json.parse stderr >>= JsonObject.fromJson? with
+  | .ok data =>
+    match (data.get? "response_code" <|> data.get? "http_code") with
+    | .ok (some code) => return code
+    | .ok none => error s!"curl's JSON output did not contain a response code; JSON received:\n{stderr}"
+    | .error e => error s!"curl's JSON output contained an invalid JSON response code: {e}; JSON received:\n{stderr}"
+  | .error e =>
+    error s!"curl produced invalid JSON output: {e}; received:\n{stderr}"
+
+/--
 Performs a HTTP `GET` request of a URL (using `curl` with JSON output) and, if successful,
 return the body.  Otherwise, returns `none` on a 404 and errors on anything else.
+
+With `cacheToken`, the request carries the cache token (see `CacheToken.get?`) and does not
+follow redirects, so that the token goes only to the host of `url`. If the token is refused
+(HTTP 401), the request is retried once with a new token.
 -/
 public def getUrl?
-  (url : String) (headers : Array String := #[])
+  (url : String) (headers : Array String := #[]) (cacheToken := false)
 : LogIO (Option String) := withLogErrorPos do
-  let args := #[
-      "-s", "-L", "-w", "%{stderr}%{json}\n",
-      "--retry", "3" -- intermittent network errors can occur
-  ]
-  let args := headers.foldl (init := args) (· ++ #["-H", ·])
-  let out ← captureProc' {cmd := ← Internal.getCurl, args := args.push url}
-  match Json.parse out.stderr >>= JsonObject.fromJson? with
-  | .ok data =>
-    let code ← id do
-      match (data.get? "response_code" <|> data.get? "http_code") with
-      | .ok (some code) => return code
-      | .ok none => error s!"curl's JSON output did not contain a response code"
-      | .error e => error s!"curl's JSON output contained an invalid JSON response code: {e}"
-    if code == 200 then
-      return some out.stdout.trimAscii.copy
-    else if code == 404 then
-      return none
-    else
-      error s!"failed to GET URL, error {code}; received:\n{out.stdout}"
-  | .error e =>
-    error s!"curl produced invalid JSON output: {e}"
+  let request (token? : Option String) : LogIO (Nat × IO.Process.Output) :=
+    CacheToken.withCurlArgs token? fun authArgs => do
+      let args := #[
+          "-s", "-w", "%{stderr}%{json}\n",
+          "--retry", "3" -- intermittent network errors can occur
+      ] ++ downloadTimeoutArgs ++ authArgs
+      let args := if token?.isSome then args else args.push "-L"
+      let args := headers.foldl (init := args) (· ++ #["-H", ·])
+      let out ← captureProc' {cmd := ← Internal.getCurl, args := args.push url}
+      return (← curlResponseCode out.stderr, out)
+  let token? ← if cacheToken then CacheToken.get? else pure none
+  let (code, out) ← request token?
+  let (code, out) ← match code, token? with
+    | 401, some token => do request (← CacheToken.renew token)
+    | _, _ => pure (code, out)
+  if code == 200 then
+    return some out.stdout.trimAscii.copy
+  else if code == 404 then
+    return none
+  else
+    error s!"failed to GET URL, error {code}; received:\n{out.stdout}"
 
 /-- Perform a HTTP `GET` request of a URL (using `curl`) and return the body. -/
 public def getUrl (url : String) (headers : Array String := #[]) : LogIO String := do
   let args := #[
       "-s", "-L",
       "--retry", "3" -- intermittent network errors can occur
-  ]
+  ] ++ downloadTimeoutArgs
   let args := headers.foldl (init := args) (· ++ #["-H", ·])
   captureProc {cmd := ← Internal.getCurl, args := args.push url}

@@ -632,7 +632,7 @@ public def resolveArtifact
           downloaded artifact {descr.hash}\
           \n  local path: {path}\
           \n  remote URL: {url}"
-        liftM <| downloadArtifactCore descr.hash url path
+        liftM <| downloadArtifactCore descr.hash url path (service.sendsCacheToken url)
         let r := {read := true, write := false, execution := exe}
         if let .error e ← IO.setAccessRights path ⟨r, r, r⟩ |>.toBaseIO then
           logWarning s!"could not mark downloaded artifact read-only: {e}"
