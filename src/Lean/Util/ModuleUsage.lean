@@ -818,12 +818,13 @@ def specProvidersIn (env : Environment) (keys : Array Digest) : Array (Digest ×
       some (m, specKeysOf (specCacheEntries env (some i)))
     else none
 
-/-- For each key the current module looked up in the specialization cache (`lookups`), deduplicated and sorted,
-its providers among the imported non-`module` files with digests (`specProvidersIn`); Lake rebuilds the module when
-one of these changes. Providers in modules without digests (the toolchain) are pinned by the Lean githash, those in
-`module` files by Lake's `modsysHash`. -/
-private def specLookups (env : Environment) (lookups : Array Expr) : Array (Digest × Digest) :=
-  specProvidersIn env <| (lookups.foldl (·.insert <| specKeyDigest ·) ({} : Std.HashSet Digest)).toArray.qsort Digest.lt
+/-- For each key the current module looked up in the specialization cache (`lookups`, and the key digests `more`),
+deduplicated and sorted, its providers among the imported non-`module` files with digests (`specProvidersIn`); Lake
+rebuilds the module when one of these changes. Providers in modules without digests (the toolchain) are pinned by the
+Lean githash, those in `module` files by Lake's `modsysHash`. -/
+private def specLookups (env : Environment) (lookups : Array Expr) (more : Array Digest) : Array (Digest × Digest) :=
+  let keys := lookups.foldl (·.insert <| specKeyDigest ·) (more.foldl (·.insert ·) ({} : Std.HashSet Digest))
+  specProvidersIn env <| keys.toArray.qsort Digest.lt
 
 /-- The imported modules without digests outside the toolchain (`module` files imported without their private level,
 or modules compiled without `--usage`), each with the digest of its `.olean` (`fileDigest`), sorted by name: what pins
@@ -896,6 +897,17 @@ private def addValueReads (reads : Std.HashMap Nat (Array String)) (c : Json) : 
   let all := (((c.getObjValAs? (Array String) "values").toOption.getD #[]) ++ ks).qsort (· < ·)
   c.setObjVal! "values" (toJson (all.foldl (fun out k => if out.back? == some k then out else out.push k) #[]))
 
+/-- What a reuse run (`Lean.Elab.Reuse`) takes into a module's `.usage` from the previous build's for the commands it
+kept, which it did not elaborate and so did not observe: the kept records' extra module uses, and the observations of
+the previous `.usage` that no record attributes to a command (the names it resolved, whether it read the resolver's
+whole map, the specialization-cache keys it looked up, whether a compile made every import an extra use). -/
+structure Carried where
+  extra : Array (Name × Bool) := #[]
+  resolved : Array Name := #[]
+  resolvedAll : Bool := false
+  specKeys : Array Digest := #[]
+  allExtra : Bool := false
+
 /-- `own` is `localDigests env nodes`, `closure` the module's `closureDigest`, `provides` its `ownProvides` and
 `indirect` its `ownIndirect`, as `setLocalDigests` stored them; `used` holds the imported names recorded while
 elaborating (`moduleUsed`'s `extra`);
@@ -926,20 +938,27 @@ realization it used (`addValueReads`, `commandValueKeys`);
 `usedAttrs`, beside each kernel constant of a `used` entry, the attrs digest the defining module
 recorded for it (`importedConstDigests?`); and `noreuse`, set when no command may be kept (`noreuseReason?`, or a
 process value that changed during the run; written as `noreuseReason`). `noreuse` decides nothing about skipping the
-module whole.
+module whole. `allExtra` is set when a compile made every imported module with digests an extra use.
+
+A reuse run passes what it carries from the previous `.usage` (`carried`, `Carried`) and its `reuse` field (`reuse?`:
+what it kept, or why it kept nothing).
 
 The file has two lines (`parseUsage`): the module's fields, which Lake reads (`parseUsageHead`), then `stmt` and
 `commands`, which only a keep reads and which are most of the file. -/
 def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Digest)) (closure : Digest)
     (provides : Array Name × Array Name) (indirect : Array Name) (used : NameSet) (lookups : Array Expr)
     (stmt : Array (Name × Digest × Digest)) (commands : Array Json) (incrLoaded : Bool) (path : System.FilePath)
-    (oleanDigest : Digest) (noreuseReason? : Option String := none) : IO Unit := do
+    (oleanDigest : Digest) (noreuseReason? : Option String := none) (carried : Carried := {})
+    (reuse? : Option Json := none) : IO Unit := do
   let s := state env
   let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecks)
+  let allExtra := carried.extra.foldl (init := allExtra) fun es (m, isMeta) =>
+    es.insert { module := m, isExported := false, isMeta }
   let importedHint := (← compileHints).any fun n =>
     let r? := env.getModuleIdxFor? n
     r?.any s.hasEntries || (env.getKernelDeclarersIfOther? n r?).any (·.any s.hasEntries)
-  let allExtra := if (← compilerCodeSeen) || importedHint then
+  let everyImport := (← compilerCodeSeen) || importedHint || carried.allExtra
+  let allExtra := if everyImport then
       env.header.moduleNames.foldl (·.insert { module := ·, isExported := false, isMeta := false }) allExtra
     else allExtra
   let extraMods := allExtra.toArray.filter (fun u => (env.getModuleIdx? u.module).any s.hasEntries)
@@ -958,11 +977,11 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
         | .digests _ _ attrs => some (n, attrs)
         | _ => none
     return (m, attrs)
-  let resolvedAll ← allResolved
+  let resolvedAll := (← allResolved) || carried.resolvedAll
   -- Every name whose resolution can reach an output: used, looked up, referred to by a node, an imported kernel
   -- constant several modules declare (`moduleUsed`), or a prefix whose attributes the compiler reads with one of those
   -- (`internalPrefixes`). `resolvedGroups` looks up only these.
-  let names : NameHashSet := (← resolvedNames).foldl (·.insert ·) {}
+  let names : NameHashSet := (← resolvedNames).foldl (·.insert ·) (carried.resolved.foldl (·.insert ·) {})
   let names := nodes.foldl (fun s n => n.refs.foldl (·.insert ·) s) (used.foldl (·.insert ·) names)
   let names := env.getImportedKernelDuplicates.foldl (·.insert ·.1) names
   let names := (names : Std.HashSet Name).fold addInternalPrefixes names
@@ -995,8 +1014,10 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
     ("usedAttrs", Json.arr (usedAttrs.map fun (m, cs) =>
       Json.arr #[nameToJson m, Json.arr (cs.map fun (n, a) => pair n a)])),
     ("extra", Json.arr (extraMods.map fun u => Json.arr #[nameToJson u.module, u.isMeta])),
+    ("allExtra", everyImport),
     ("specKeys", Json.arr ((ownSpecKeys env).map fun (d, n) => Json.arr #[toJson d, nameToJson n])),
-    ("specLookups", Json.arr ((specLookups env lookups).map fun (k, p) => Json.arr #[toJson k, toJson p])),
+    ("specLookups", Json.arr ((specLookups env lookups carried.specKeys).map fun (k, p) =>
+      Json.arr #[toJson k, toJson p])),
     ("module", nameToJson env.mainModule),
     ("olean", toJson oleanDigest),
     ("githash", toJson Lean.githash),
@@ -1005,6 +1026,9 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
     ("noreuse", noreuseReason?.isSome)]
   let fields := match noreuseReason? with
     | some reason => fields ++ [("noreuseReason", toJson reason)]
+    | none => fields
+  let fields := match reuse? with
+    | some reuse => fields ++ [("reuse", reuse)]
     | none => fields
   let records := Json.mkObj [("stmt", Json.arr (stmt.map fun (n, c, a) => Json.arr #[nameToJson n, toJson c, toJson a])),
     ("commands", Json.arr commands)]

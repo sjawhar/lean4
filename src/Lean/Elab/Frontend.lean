@@ -18,6 +18,7 @@ import Lean.Util.CollectAxioms
 import Lean.Util.ModuleUsage
 import Lean.Util.UsedByChecks
 import Lean.Util.CommandEntries
+import Lean.Util.Path
 import Lean.Util.ModuleUsage.Reuse
 
 public section
@@ -288,9 +289,12 @@ def runFrontend
     (incrLoadFileName? : Option System.FilePath := none)
     (incrHeaderSaveFileName? : Option System.FilePath := none)
     (usageFileName? : Option System.FilePath := none)
+    (reuse? : Option Reuse.Inputs := none)
     (codegen : Environment → IO Unit := fun _ => pure ())
     : IO (Option Environment) := do
   let startTime := (← IO.monoNanosNow).toFloat / 1000000000
+  -- read before recording starts, so that it is no process value of the run (`ModuleUsage.keepPermit`)
+  let reuseLib? ← if reuse?.isSome then some <$> (return toString (← getLibDir (← getBuildDir))) else pure none
   -- the recording logs are global: a frontend this module runs in-process clears or extends them, which `run` detects
   let run ← startFrontendRun (record := oleanFileName?.isSome && usageFileName?.isSome)
   let inputCtx := Parser.mkInputContext input fileName
@@ -341,8 +345,9 @@ def runFrontend
       -- imports) calls `importModules`, which in turn requires the flag to be set. Restore it.
       unsafe enableInitializersExecution
     return snap
-  let processor := Language.Lean.process
-  let snap ← processor setup old? ctx
+  -- a reuse run keeps commands from the module's previous build (`Elab.Reuse`); it needs the `.usage` it writes
+  let reuseReq? ← if usageFileName?.isSome then reuse?.mapM (liftM <| Reuse.Request.new · reuseLib?) else pure none
+  let snap ← Language.Lean.process setup old? reuseReq? ctx
   let snaps := Language.toSnapshotTree snap
   let severityOverrides := errorOnKinds.foldl (·.insert · .error) {}
 
@@ -395,12 +400,15 @@ def runFrontend
     return none
 
   let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
+  let reused? ← reuseReq?.mapM (·.finish)
+  let kept := reused?.elim #[] (·.kept)
   let usage? ← oleanFileName?.bindM fun oleanFileName => do
     let recorded ← recordedDeclConsts
     -- the digests cover the exported axioms, so both take the stored ones
     let env := if usageFileName?.isSome then storeExportedAxioms env else env
     let usage? ← usageFileName?.mapM fun usageFileName => do
-      let pending ← ModuleUsage.startModuleRecords env (sessionChanged := (← lastFrontendRun) != run)
+      let pending ← ModuleUsage.startModuleRecords env (sessionChanged := (← lastFrontendRun) != run) kept
+        (reused?.elim {} (·.effects))
       let consts := ModuleUsage.ownConsts env recorded
       let nodes := ModuleUsage.ownNodes env consts
       let own := ModuleUsage.localDigests env nodes
@@ -408,7 +416,7 @@ def runFrontend
       let payloads ← pending.payloads
       -- the `.usage` command records build while the `.olean`, which holds none of them, is written
       let recs ← IO.asTask do
-        let recs ← pending.finish env own stmt
+        let recs ← pending.finish env own stmt nodes
         return (recs, ← CommandEntries.parallelMap recs.commands fun r => pure (toJson r))
       let provides := ModuleUsage.ownProvides env
       let indirect := ModuleUsage.ownIndirect env
@@ -450,9 +458,14 @@ def runFrontend
   if let some (usageFileName, oleanFileName, nodes, own, closure, provides, indirect, stmt, _, recs) := usage? then
     let (recs, commands) ← IO.ofExcept (← IO.wait recs)
     let used := ModuleUsage.usedFromInfoTrees trees (← usedNames)
+    -- the kept commands have no info trees and declared nothing here: their uses are their records'
+    let used := kept.foldl (init := used) fun s k =>
+      k.record.usesFull.foldl (·.insert ·.1) (k.record.usesStmt.foldl (·.insert ·.1) s)
+    let used := (reused?.elim #[] (·.usedUnattributed)).foldl (·.insert ·) used
     ModuleUsage.writeUsage env nodes own closure provides indirect used (← lookedUpSpecKeys) stmt commands
       (incrLoaded := incrLoadFileName?.isSome) usageFileName (← ModuleUsage.fileDigest oleanFileName)
-      (noreuseReason? := recs.noreuseReason?)
+      (noreuseReason? := recs.noreuseReason?) (carried := reused?.elim {} (·.carried))
+      (reuse? := reused?.map (·.field))
 
   -- no point in freeing the snapshot graph and all referenced data this close to process exit
   Runtime.forget snaps

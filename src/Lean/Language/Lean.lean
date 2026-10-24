@@ -16,6 +16,7 @@ public import Lean.Language.Lean.Types
 public import Lean.Language.Lean.Util
 public import Lean.Elab.Import
 import Lean.Util.ModuleUsage.Commands
+public import Lean.Elab.Reuse
 
 public section
 
@@ -242,6 +243,8 @@ open Lean.Parser
 structure LeanProcessingContext extends ProcessingContext where
   /-- Position of the first file difference if there was a previous invocation. -/
   firstDiffPos? : Option String.Pos.Raw
+  /-- The reuse run the commands are processed for (`lean --reuse-olean`), if any. -/
+  reuse? : Option Elab.Reuse.Request := none
 
 /-- Monad transformer holding all relevant data for Lean processing. -/
 abbrev LeanProcessingT m := ReaderT LeanProcessingContext m
@@ -259,11 +262,11 @@ Embeds a `LeanProcessingM` action into `ProcessingM`, optionally using the old i
 up reuse analysis and supplying a cancellation token that should be triggered as soon as reuse is
 ruled out.
 -/
-def LeanProcessingM.run (act : LeanProcessingM α) (oldInputCtx? : Option InputContext) :
-    ProcessingM α := do
+def LeanProcessingM.run (act : LeanProcessingM α) (oldInputCtx? : Option InputContext)
+    (reuse? : Option Elab.Reuse.Request := none) : ProcessingM α := do
   -- compute position of syntactic change once
   let firstDiffPos? := oldInputCtx?.map (·.inputString.firstDiffPos (← read).inputString)
-  ReaderT.adapt ({ · with firstDiffPos? }) act
+  ReaderT.adapt ({ · with firstDiffPos?, reuse? }) act
 
 /--
 Returns true if there was a previous run and the given position is before any textual change
@@ -372,7 +375,8 @@ The `setupImports` function is called after the header has been parsed and befor
 is parsed in order to supply additional file metadata (or abort with a given terminal snapshot); see
 `SetupImportsResult`.
 
-`old?` is a previous resulting snapshot, if any, to be reused for incremental processing.
+`old?` is a previous resulting snapshot, if any, to be reused for incremental processing. `reuse?` is the reuse run
+(`lean --reuse-olean`) the commands are processed for, which may keep commands from the module's previous build.
 -/
 /-
 General notes:
@@ -389,8 +393,8 @@ General notes:
 -/
 partial def process
     (setupImports : HeaderSyntax → ProcessingT IO (Except HeaderProcessedSnapshot SetupImportsResult))
-    (old? : Option InitialSnapshot) : ProcessingM InitialSnapshot := do
-  parseHeader old? |>.run (old?.map (·.ictx))
+    (old? : Option InitialSnapshot) (reuse? : Option Elab.Reuse.Request := none) : ProcessingM InitialSnapshot := do
+  parseHeader old? |>.run (old?.map (·.ictx)) reuse?
 where
   parseHeader (old? : Option HeaderParsedSnapshot) : LeanProcessingM HeaderParsedSnapshot := do
     let ctx ← read
@@ -541,6 +545,7 @@ where
         }
         traceState
       }
+      if let some req := ctx.reuse? then req.start headerEnv
       let prom ← IO.Promise.new
       let cancelTk ← IO.CancelToken.new
       parseCmd none parserState cmdState prom (sync := true) cancelTk [] 0 ctx
@@ -761,6 +766,21 @@ where
       LeanProcessingM (Command.State × Task Elab.InfoState) := do
     let ctx ← read
     let recording ← usageRecordingEnabled
+    let span := ModuleUsage.CommandSpan.of ctx.fileMap stx
+    -- a reuse run keeps the command from the module's previous build where its records allow it; a keep that fails is
+    -- an error of the command, which is elaborated instead
+    let mut reuseError? : Option String := none
+    if let some req := ctx.reuse? then
+      let error (e : IO.Error) := let s := toString e; if s.startsWith "reuse: " then s else s!"reuse: {s}"
+      match ← (req.decide cmdIdx stx span cmdState).toBaseIO with
+      | .ok (some plan) =>
+        match ← withCommandContext cmdIdx (req.keep plan cmdState ctx.fileMap).toBaseIO with
+        | .ok kept =>
+          snap.new.resolve <| .ofTyped { diagnostics := .empty : SnapshotLeaf }
+          return (kept, .pure kept.infoState)
+        | .error e => reuseError? := some (error e)
+      | .ok none => pure ()
+      | .error e => reuseError? := some (error e)
     -- what the elaboration and its tasks do is attributed to the command; promises the frontend created for the
     -- command's snapshots are resolved outside it
     let (cmdState, info) ← withCommandContext cmdIdx do
@@ -787,6 +807,13 @@ where
             withLoggingExceptions act cmdCtx cmdStateRef
       let cmdState ← cmdStateRef.get
       let mut messages := cmdState.messages
+      if let some e := reuseError? then
+        messages := messages.add {
+          fileName := ctx.fileName
+          severity := MessageSeverity.error
+          pos      := ctx.fileMap.toPosition beginPos
+          data     := e
+        }
       if !output.isEmpty then
         messages := messages.add {
           fileName := ctx.fileName
@@ -798,7 +825,9 @@ where
       -- the info trees with their lazy parts substituted: the snapshot reports them and the recorder reads them
       let info := cmdState.infoState.substituteLazy
       if recording then
-        ModuleUsage.recordCommandObservation cmdIdx stx cmdStateBefore cmdState info
+        ModuleUsage.recordCommandObservation cmdIdx stx span cmdStateBefore cmdState info
+      if let some req := ctx.reuse? then
+        req.elaborated cmdIdx stx cmdStateBefore cmdState
       return (cmdState, info)
     -- definitely resolve eventually
     snap.new.resolve <| .ofTyped { diagnostics := .empty : SnapshotLeaf }

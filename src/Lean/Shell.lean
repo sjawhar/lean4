@@ -140,6 +140,13 @@ def displayHelp (useStderr : Bool) : IO Unit := do
   out.putStrLn    "  -o, --o=oname          create olean file"
   out.putStrLn    "  -i, --i=iname          create ilean file"
   out.putStrLn    "      --usage=file       with -o, add usage-cutoff digests to the olean and write its sidecar to file"
+  out.putStrLn    "      --reuse-olean=file, --reuse-usage=file"
+  out.putStrLn    "                         with --usage, keep commands from the module's previous .olean and .usage"
+  out.putStrLn    "      --reuse-ilean=file with --reuse-olean, the previous .ilean for the kept commands' references"
+  out.putStrLn    "      --reuse-changed-extra=module"
+  out.putStrLn    "                         with --reuse-olean, elaborate the commands that used the module whole"
+  out.putStrLn    "      --reuse-declined=reason"
+  out.putStrLn    "                         with --usage, keep no command and record why in the usage sidecar"
   out.putStrLn    "  -c, --c=fname          name of the C output file"
   out.putStrLn    "  -b, --bc=fname         name of the LLVM bitcode file"
   out.putStrLn    "      --stdin            take input from stdin"
@@ -241,6 +248,11 @@ structure ShellOptions where
   incrSaveFileName? : Option System.FilePath := none
   incrLoadFileName? : Option System.FilePath := none
   incrHeaderSaveFileName? : Option System.FilePath := none
+  reuseOleanFileName? : Option System.FilePath := none
+  reuseUsageFileName? : Option System.FilePath := none
+  reuseIleanFileName? : Option System.FilePath := none
+  reuseChangedExtra : Array Name := #[]
+  reuseDeclined? : Option String := none
 
 @[export lean_shell_options_mk]
 def mkShellOptions (_ : Unit) : ShellOptions := {}
@@ -435,6 +447,17 @@ def ShellOptions.process (opts : ShellOptions)
     return {opts with incrLoadFileName? := ← checkOptArg "Z" optArg?}
   | 'H' => -- `--incr-header-save=file`
     return {opts with incrHeaderSaveFileName? := ← checkOptArg "H" optArg?}
+  | 'K' => -- `--reuse-olean=file`
+    return {opts with reuseOleanFileName? := ← checkOptArg "reuse-olean" optArg?}
+  | 'Q' => -- `--reuse-usage=file`
+    return {opts with reuseUsageFileName? := ← checkOptArg "reuse-usage" optArg?}
+  | 'G' => -- `--reuse-ilean=file`
+    return {opts with reuseIleanFileName? := ← checkOptArg "reuse-ilean" optArg?}
+  | 'F' => -- `--reuse-changed-extra=module`
+    let arg ← checkOptArg "reuse-changed-extra" optArg?
+    return {opts with reuseChangedExtra := opts.reuseChangedExtra.push arg.toName}
+  | 'X' => -- `--reuse-declined=reason`
+    return {opts with reuseDeclined? := ← checkOptArg "reuse-declined" optArg?}
   | _ =>
     pure ()
   eprint "Unknown command line option\n"
@@ -544,6 +567,21 @@ def shellMain (args : List String) (opts : ShellOptions) : IO UInt32 := do
           throw e
     else
       pure `_stdin
+  if opts.reuseDeclined?.isSome && (opts.reuseOleanFileName?.isSome || opts.reuseUsageFileName?.isSome) then
+    IO.eprintln "error: --reuse-declined cannot be combined with --reuse-olean/--reuse-usage"
+    return 1
+  if opts.reuseOleanFileName?.isSome != opts.reuseUsageFileName?.isSome then
+    IO.eprintln "error: --reuse-olean and --reuse-usage must be given together"
+    return 1
+  let reuse? : Option Elab.Reuse.Inputs := match opts.reuseDeclined?, opts.reuseOleanFileName?,
+      opts.reuseUsageFileName? with
+    | some reason, _, _ => some { previous := .error reason }
+    | none, some olean, some usage => some { previous := .ok (olean, usage), ilean? := opts.reuseIleanFileName?
+                                             changedExtra := opts.reuseChangedExtra.foldl (·.insert ·) {} }
+    | _, _, _ => none
+  if reuse?.isSome && (opts.oleanFileName?.isNone || opts.usageFileName?.isNone) then
+    IO.eprintln "error: --reuse-olean, --reuse-usage and --reuse-declined need -o and --usage"
+    return 1
   -- Runs inside `runFrontend`, before the usage data, which records the names emission resolves.
   let codegen (env : Environment) : IO Unit := do
     if opts.run then return
@@ -564,6 +602,7 @@ def shellMain (args : List String) (opts : ShellOptions) : IO UInt32 := do
     (incrLoadFileName? := opts.incrLoadFileName?)
     (incrHeaderSaveFileName? := opts.incrHeaderSaveFileName?)
     (usageFileName? := opts.usageFileName?)
+    (reuse? := reuse?)
     (codegen := codegen)
   if let some env := env? then
     if opts.run then

@@ -1,0 +1,8 @@
+first build: exit 0, reuse null, output ""
+Lake's reason: exit 0, reuse {"declined":"no-saved-trace"}, output ""
+previous outputs: exit 0, reuse {"elabReasons":{},"kept":2,"reElab":[],"total":2}, output ""
+truncated .usage: exit 0, reuse {"declined":"the previous `.usage` cannot be read: offset 40: unexpected end of input"}, output ""
+missing .olean: exit 0, reuse {"declined":"the previous outputs cannot be read: no such file or directory (error code: 2)\n  file: M.missing.olean"}, output ""
+declined with the reuse flags: exit 1, reuse -, output "error: --reuse-declined cannot be combined with --reuse-olean/--reuse-usage"
+one reuse flag: exit 1, reuse -, output "error: --reuse-olean and --reuse-usage must be given together"
+without --usage: exit 1, output "error: --reuse-olean, --reuse-usage and --reuse-declined need -o and --usage"
