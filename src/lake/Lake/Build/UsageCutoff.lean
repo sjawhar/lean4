@@ -209,7 +209,7 @@ abbrev SidecarEntry := Option ModuleUsage.FileStamp × ModuleUsage.Digest × Dyn
 current stamp is the one recorded with it (`BuildContext.sidecarCache`). -/
 def stampedSidecar? (path : FilePath) : JobM (Option (ModuleUsage.Digest × Dynamic)) := do
   let some stamp ← ModuleUsage.fileStamp path | return none
-  let some (some recorded, digest, value) ← (← getBuildContext).sidecarCache.atomically (return (← get)[path]?)
+  let some (some recorded, digest, value) ← (← getBuildContext).sidecarCache.atomically (return (← get).find? path)
     | return none
   return if recorded == stamp then some (digest, value) else none
 
@@ -245,14 +245,14 @@ def readUsageSidecar (α : Type) [FromJson α] [TypeName α] (path : FilePath)
     return some value
   let some (bytes, digest, stamp?) ← readSidecarBytes? path expected? | return none
   (← getBuildContext).sidecarCache.atomically do
-    let entries ← getThe (Std.HashMap FilePath SidecarEntry)
-    if let some (_, parsedFrom, cached) := entries.get? path then
+    let entries ← getThe (PHashMap FilePath SidecarEntry)
+    if let some (_, parsedFrom, cached) := entries.find? path then
       if parsedFrom == digest then
         let some value := cached.get? α | error s!"{path}: cached sidecar has the wrong type"
-        modifyThe (Std.HashMap FilePath SidecarEntry) (·.insert path (stamp?, digest, cached))
+        modifyThe (PHashMap FilePath SidecarEntry) (·.insert path (stamp?, digest, cached))
         return some value
     let some value ← parseUsageSidecar α path bytes | return none
-    modifyThe (Std.HashMap FilePath SidecarEntry) (·.insert path (stamp?, digest, Dynamic.mk value))
+    modifyThe (PHashMap FilePath SidecarEntry) (·.insert path (stamp?, digest, Dynamic.mk value))
     return some value
 
 /--
@@ -265,7 +265,7 @@ def readOwnUsage (path : FilePath) (expected? : Option ModuleUsage.Digest := non
   let some (bytes, digest, stamp?) ← readSidecarBytes? path expected? | return none
   let some usage ← parseUsageSidecar UsageSidecar path bytes | return none
   (← getBuildContext).sidecarCache.atomically do
-    modifyThe (Std.HashMap FilePath SidecarEntry) (·.insert path (stamp?, digest, Dynamic.mk usage.toImport))
+    modifyThe (PHashMap FilePath SidecarEntry) (·.insert path (stamp?, digest, Dynamic.mk usage.toImport))
   return some (usage, digest)
 
 /--
@@ -292,7 +292,7 @@ where
   stampedDigest : JobM ModuleUsage.Digest := do
     let memo := (← getBuildContext).fileDigests
     if let some stamp ← ModuleUsage.fileStamp file then
-      if let some (recorded, hash) ← memo.atomically (return (← get)[file]?) then
+      if let some (recorded, hash) ← memo.atomically (return (← get).find? file) then
         if recorded == stamp then return hash
     let (hash, stamp?) ← ModuleUsage.fileDigestStamped file
     if let some stamp := stamp? then
@@ -370,9 +370,8 @@ def closureHash (hashes : ContentHashes) (presetup : ModulePreSetup)
     (importArts : NameMap ImportArtifacts)
     (importedClosures? : Option (NameMap ModuleUsage.Digest) := none) :
     JobM (Option ModuleUsage.Digest) := do
-  let mods := presetup.directImports.filterMap (·.module?) |>.map (·.name)
-    |>.qsort Name.quickLt |>.toList.eraseDups
-  let mut e := ({} : ModuleUsage.Enc).nat mods.length
+  let mods := presetup.directImports.filterMap (·.module?) |>.map (·.name) |>.qsort Name.quickLt |>.eraseReps
+  let mut e := ({} : ModuleUsage.Enc).nat mods.size
   for m in mods do
     let some (_, imp) ← importUsage? hashes importArts m | return none
     if let some imported := importedClosures? then
