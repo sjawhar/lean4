@@ -7,6 +7,7 @@ module
 
 prelude
 public import Init.System.IO
+import Init.Data.ToString.Macro
 
 open System
 
@@ -23,6 +24,18 @@ public def removeFileIfExists (path : FilePath) : IO Unit := do
   try IO.FS.removeFile path catch
     | .noFileOrDirectory .. => pure ()
     | e => throw e
+
+/-- Counts the temporary paths returned in this process, so that each is new. -/
+builtin_initialize tmpPathCount : IO.Ref Nat ← IO.mkRef 0
+
+/--
+Returns a temporary path next to {lean}`path`, {lit}`<path>.<pid>.<n>.tmp`, that no concurrent
+call, in this process or in another, returns. It suits a file that is written, then renamed
+into place.
+-/
+public def uniqueTmpPath (path : FilePath) : BaseIO FilePath := do
+  let n ← tmpPathCount.modifyGet fun n => (n, n + 1)
+  return s!"{path}.{← IO.Process.getPID}.{n}.tmp"
 
 /--
 Write the UTF-8 encoded string {lean}`content` to {lean}`path`.

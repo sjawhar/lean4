@@ -666,23 +666,32 @@ def computeUploadService
   if let some service := service? then
     let some service := lakeCfg.cacheServices.find? (.mkSimple service)
       | error (serviceNotFound service lakeCfg.config.cache.services)
-    let some key := lakeEnv.cacheKey?
-      | error "uploads require an authentication key configured through `LAKE_CACHE_KEY`"
-    return service.withKey key
+    withUploadKey lakeEnv.cacheKey? service
   else
     match lakeEnv.cacheKey?, lakeEnv.cacheArtifactEndpoint?, lakeEnv.cacheRevisionEndpoint? with
     | some key, some artifactEndpoint, some revisionEndpoint =>
       return .uploadService key artifactEndpoint revisionEndpoint
     | key?, none, none =>
       if let some service := lakeCfg.defaultCacheUploadService? then
-        let some key := key?
-          | error "uploads require an authentication key configured through `LAKE_CACHE_KEY`"
-        return service.withKey key
+        withUploadKey key? service
       else
         error "no default upload service configured; the `--service` option must be set"
     | key?, artifactEndpoint?, revisionEndpoint? =>
       error (invalidEndpointConfig key? artifactEndpoint? revisionEndpoint?)
 where
+  /-
+  A service that uses the cache token needs no key for the uploads that carry it
+  (those to the host of its artifact endpoint).
+  -/
+  withUploadKey (key? : Option String) (service : CacheService) : CliStateM CacheService := do
+    if let some key := key? then
+      return service.withKey key
+    else if service.usesCacheToken then
+      return service
+    else
+      error "uploads require an authentication key configured through `LAKE_CACHE_KEY` \
+        (or, for the service that `LAKE_REMOTE_CACHE` names, a token command configured \
+        through `LAKE_CACHE_TOKEN_CMD`)"
   invalidEndpointConfig key? artifactEndpoint? revisionEndpoint? :=
     s!"invalid endpoint configuration:\
     \n  LAKE_CACHE_KEY is {if key?.isNone then "unset" else "set"}\
