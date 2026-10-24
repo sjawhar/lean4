@@ -5,6 +5,7 @@ MutualLetRec: noskip false, noreuse true, 0 command records, reason: command 0 u
 ElabOnly: noskip false, noreuse true, 0 command records, reason: command 2 uses `ghost`, a constant of this module the kernel environment does not hold
 X: noskip false, noreuse false, 3 command records, reason: none
 IRName: noskip false, noreuse true, 0 command records, reason: command 1 uses `h._boxed`, which names no constant of this module or its imports
+CompiledImport: noskip false, noreuse true, 0 command records, reason: command 1 uses `h`, which this module compiled code for without defining it
 Discarded: noskip false, noreuse false, 3 command records, reason: none
 Discarded: uses from X #[Leaf, Leaf._sizeOf_inst], uses of discarded constants #[]
 Kept: noskip false, noreuse false, 10 command records, reason: none

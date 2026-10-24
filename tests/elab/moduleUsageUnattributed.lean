@@ -3,7 +3,8 @@ import Lean
 records (the module skip, `noskip`, is unchanged); `lean -o --usage` succeeds as it does without usage recording. Such a name names no constant: a declaration the
 kernel rejected referred to it (an absent constant in a type or, through `addDecl`'s asynchronous check, in a value; a
 `_nested` auxiliary; an IR-only name of an import), or a `mutual` block that failed before `addDecl` mentioned it. Or it
-is a constant the elaborator holds and the kernel never received. The constants the kernel and `addDecl` create without
+is an imported constant whose code the module compiles again, or a constant the elaborator holds and the kernel never
+received. The constants the kernel and `addDecl` create without
 elaboration are attributed: a nested inductive's auxiliary recursors (`T.rec_1`), `.below_1`/`.brecOn_1`, `sizeOf_spec`
 lemmas and `_unsafe_rec` definitions are uses with this module's digests, and in an environment the module discards
 they stand for what their declaration used. -/
@@ -93,6 +94,13 @@ import X
 open Lean
 #guard_msgs (drop error) in
 #eval addDecl <| .axiomDecl { name := `ax, levelParams := [], type := .const `h._boxed [], isUnsafe := false }
+"
+  -- an imported constant whose code this module compiles again: neither its import's digests nor this module's stand
+  -- for the code it then has
+  discard <| compile dir "CompiledImport" "import Lean
+import X
+open Lean
+run_meta Lean.Compiler.compile #[``h]
 "
   -- created without elaboration inside an environment the command discards: attributed to their declarations, so
   -- the command's uses are the imported constants they stand for, none of the discarded constants

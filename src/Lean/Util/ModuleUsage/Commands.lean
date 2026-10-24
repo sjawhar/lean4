@@ -375,9 +375,12 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
       return .unattributed s!"command {i} uses `{n}`, which names no constant of this module or its imports"
     -- a constant this module added is its own, even where an import compiled code under its name
     if let some full := fullLocal[n]? then
-      let some (core, attrs) := stmtLocal[n]? |
-        throw s!"usage: command {i} uses `{n}`, a constant of this module without a statement digest"
-      return .digests full core attrs
+      if let some (core, attrs) := stmtLocal[n]? then
+        return .digests full core attrs
+      -- an imported constant whose code this module compiled again (`Lean.Compiler.compile`)
+      if (env.getModuleIdxFor? n).isSome then
+        return .unattributed s!"command {i} uses `{n}`, which this module compiled code for without defining it"
+      throw s!"usage: command {i} uses `{n}`, a constant of this module without a statement digest"
     if let some m := env.getModuleIdxFor? n then
       return match ← importedConstDigests? env m n with
         -- the full digest a compile depends on: with each other kernel declarer's (`State.digestOf`)
