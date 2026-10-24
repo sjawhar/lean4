@@ -237,10 +237,11 @@ private opaque takeEffects : BaseIO (Array (UInt32 × String))
 environment variable (`env:NAME`), the running executable's path (`appPath`), the working directory
 (`workingDirectory`), and the toolchain directories (`toolchain`) when a command read a file in them or ran the
 toolchain's SAT solver on its own files (`pinnedToolchainDirs`), which the runtime then does not note as an effect,
-with the solver's path (`solver`) in the latter case; each with the value first read (`none`: absent) and whether a
-later read saw another value. Takes them. -/
+with the solver's path (`solver`) in the latter case; each with the value first read (`none`: absent), whether a
+later read saw another value, and the commands that read it (`withCommandContext`, the tasks a command starts included;
+a read outside any command or in the import context is the module's alone), sorted. Takes them. -/
 @[extern "lean_io_take_value_reads"]
-opaque takeValueReads : BaseIO (Array (String × Option String × Bool))
+opaque takeValueReads : BaseIO (Array (String × Option String × Bool × Array Nat))
 
 /-- The value of the process value `key` (`takeValueReads`) in this process now, `none` if absent or unreadable;
 throws for an unknown key. -/

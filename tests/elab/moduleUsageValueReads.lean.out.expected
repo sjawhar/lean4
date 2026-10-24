@@ -1,0 +1,7 @@
+module values #[env:BAR, env:BAZ, env:FOO, env:QUX], noreuse (some false)
+command 0: values #[env:FOO]
+command 1: values #[env:BAR]
+command 2: values #[]
+command 3: values #[env:QUX]
+command 4: values #[env:BAR, env:FOO]
+command 5: values #[]

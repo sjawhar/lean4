@@ -888,6 +888,14 @@ def parseUsage (s : String) : Except String Json := do
   let .obj records ← Json.parse rest.copy | throw "the second line of a `.usage` is not a JSON object"
   return .obj (records.foldl (init := head) fun m k v => m.insert k v)
 
+/-- The command record `c` (`CommandRecord` as JSON) with the process values its command read (`reads`, by command
+index: `takeValueReads`) among its `values`, sorted. -/
+private def addValueReads (reads : Std.HashMap Nat (Array String)) (c : Json) : Json := Id.run do
+  let .ok i := c.getObjValAs? Nat "i" | return c
+  let some ks := reads[i]? | return c
+  let all := (((c.getObjValAs? (Array String) "values").toOption.getD #[]) ++ ks).qsort (· < ·)
+  c.setObjVal! "values" (toJson (all.foldl (fun out k => if out.back? == some k then out else out.push k) #[]))
+
 /-- `own` is `localDigests env nodes`, `closure` the module's `closureDigest`, `provides` its `ownProvides` and
 `indirect` its `ownIndirect`, as `setLocalDigests` stored them; `used` holds the imported names recorded while
 elaborating (`moduleUsed`'s `extra`);
@@ -913,7 +921,8 @@ the digest of the `.olean` written beside it (`oleanDigest`, `fileDigest`), whic
 digests (`untrackedImports`); `values`, each process value the run read (`takeValueReads`, taken before this
 function's own lookups, such as `untrackedImports`' of the toolchain's path) with the digest of its value
 (`valueDigest?`), which a keep requires unchanged; `stmt`, `computeStmt`'s result; `commands`, the
-per-command records; `usedAttrs`, beside each kernel constant of a `used` entry, the attrs digest the defining module
+per-command records, each with the process values its command read in the run among its `values` (`addValueReads`);
+`usedAttrs`, beside each kernel constant of a `used` entry, the attrs digest the defining module
 recorded for it (`importedConstDigests?`); and `noreuse`, set when no command may be kept (`noreuseReason?`, or a
 process value that changed during the run; written as `noreuseReason`). `noreuse` decides nothing about skipping the
 module whole.
@@ -956,14 +965,18 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
   let names := nodes.foldl (fun s n => n.refs.foldl (·.insert ·) s) (used.foldl (·.insert ·) names)
   let names := env.getImportedKernelDuplicates.foldl (·.insert ·.1) names
   let names := (names : Std.HashSet Name).fold addInternalPrefixes names
+  let reads ← takeValueReads
+  let readers : Std.HashMap Nat (Array String) := reads.foldl (init := {}) fun m (k, _, _, cmds) =>
+    cmds.foldl (fun m i => m.insert i ((m.getD i #[]).push k)) m
   -- a value `recordedValue?` cannot give (the SAT solver's bytes) leaves nothing a keep could compare
-  let values ← (← takeValueReads).mapM fun (k, v?, changed) => do
+  let values ← reads.mapM fun (k, v?, changed, _) => do
     try return (k, ← recordedValue? k v?, changed, none)
     catch e => return (k, none, changed, some s!"the process value {k} cannot be recorded: {e}")
   let untracked ← untrackedImports env
   let noreuseReason? := noreuseReason? <|> values.findSome? (·.2.2.2) <|> values.findSome? fun (k, _, changed, _) =>
     guard changed *> some s!"the process value {k} changed while the module was compiled"
   let values := values.map fun (k, v?, changed, _) => (k, v?, changed)
+  let commands := if readers.isEmpty then commands else commands.map (addValueReads readers)
   let fields : List (String × Json) := [("version", usageVersion), ("noskip", incrLoaded),
     ("moduleDigest", toJson (moduleDigestOf own)),
     ("closure", toJson closure),

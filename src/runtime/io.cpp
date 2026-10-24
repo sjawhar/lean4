@@ -1562,8 +1562,9 @@ random bytes, process and thread ids, resource usage and free memory), which a k
 that recorded it; and the runtime's debugging output (`dbg_trace`, `timeit`).
 
 Value reads: in every context, the first value of each environment variable, of the running executable's path and of
-the working directory read, and whether a later read saw another one (`lean_io_take_value_reads`). A later build
-compares them with its own (`Lean.ModuleUsage.keepPermit`).
+the working directory read, whether a later read saw another one, and the command contexts that read it, sorted (not
+0 or the import context, whose reads are the module's alone) (`lean_io_take_value_reads`). A later build compares them
+with its own (`Lean.ModuleUsage.keepPermit`).
 */
 static std::atomic<bool> g_effects_on(false);
 
@@ -1578,6 +1579,8 @@ struct value_read {
     std::string value;
     // a later read saw another value
     bool changed;
+    // the command contexts that read it, sorted
+    std::vector<uint32> contexts;
 };
 static mutex * g_effects_mutex = nullptr;
 static std::unordered_map<uint32, context_effects> * g_effects = nullptr;
@@ -1603,19 +1606,24 @@ std::string describe_context(uint32 ctx) {
         : "command " + std::to_string(ctx - 1);
 }
 
-static void note_value_read_core(std::string const & key, char const * value) {
+static void note_value_read_core(std::string const & key, char const * value, uint32 ctx) {
     auto it = g_value_reads->find(key);
     if (it == g_value_reads->end()) {
-        g_value_reads->emplace(key, value_read{value != nullptr, value ? value : "", false});
+        it = g_value_reads->emplace(key, value_read{value != nullptr, value ? value : "", false, {}}).first;
     } else if (it->second.present != (value != nullptr) || (value && it->second.value != value)) {
         it->second.changed = true;
     }
+    if (ctx == 0 || ctx == import_context) return;
+    std::vector<uint32> & cs = it->second.contexts;
+    auto pos = std::lower_bound(cs.begin(), cs.end(), ctx);
+    if (pos == cs.end() || *pos != ctx) cs.insert(pos, ctx);
 }
 
 void note_value_read(std::string const & key, char const * value) {
     if (!g_effects_on.load(std::memory_order_relaxed)) return;
+    uint32 ctx = get_task_context();
     lock_guard<mutex> lock(*g_effects_mutex);
-    note_value_read_core(key, value);
+    note_value_read_core(key, value, ctx);
 }
 
 static void note_effect_core(context_effects & e, std::string const & what) {
@@ -1763,8 +1771,8 @@ std::string note_process_spawn(char const * cmd, std::vector<std::string> const 
         note_effect_core(e, std::string("spawns the process ") + cmd);
         return std::string();
     }
-    note_value_read_core("toolchain", g_pinned_root->c_str());
-    note_value_read_core("solver", (solver + "\n" + stamp).c_str());
+    note_value_read_core("toolchain", g_pinned_root->c_str(), ctx);
+    note_value_read_core("solver", (solver + "\n" + stamp).c_str(), ctx);
     return solver;
 }
 
@@ -1780,7 +1788,7 @@ void note_path_read(char const * p) {
     bool pinned = in_pinned_dirs(p, dirs);
     lock_guard<mutex> lock(*g_effects_mutex);
     if (pinned)
-        note_value_read_core("toolchain", g_pinned_root->c_str());
+        note_value_read_core("toolchain", g_pinned_root->c_str(), ctx);
     else
         note_effect_core((*g_effects)[ctx], std::string("reads ") + p);
 }
@@ -1940,8 +1948,9 @@ extern "C" LEAN_EXPORT obj_res lean_io_take_effects() {
     return r;
 }
 
-/* takeValueReads : BaseIO (Array (String × Option String × Bool)): the value reads since recording was switched on,
-   sorted by key, each with its first value and whether a later read saw another; clears them */
+/* takeValueReads : BaseIO (Array (String × Option String × Bool × Array Nat)): the value reads since recording was
+   switched on, sorted by key, each with its first value, whether a later read saw another, and the commands that read
+   it (their contexts less one), sorted; clears them */
 extern "C" LEAN_EXPORT obj_res lean_io_take_value_reads() {
     std::map<std::string, value_read> reads;
     {
@@ -1950,9 +1959,14 @@ extern "C" LEAN_EXPORT obj_res lean_io_take_value_reads() {
     }
     object * r = lean_alloc_array(0, reads.size());
     for (auto const & [key, v] : reads) {
+        object * cmds = lean_alloc_array(0, v.contexts.size());
+        for (uint32 ctx : v.contexts) cmds = lean_array_push(cmds, lean_usize_to_nat(ctx - 1));
+        object * last = lean_alloc_ctor(0, 2, 0);
+        lean_ctor_set(last, 0, lean_box(v.changed));
+        lean_ctor_set(last, 1, cmds);
         object * rest = lean_alloc_ctor(0, 2, 0);
         lean_ctor_set(rest, 0, v.present ? mk_option_some(mk_string(v.value)) : mk_option_none());
-        lean_ctor_set(rest, 1, lean_box(v.changed));
+        lean_ctor_set(rest, 1, last);
         object * p = lean_alloc_ctor(0, 2, 0);
         lean_ctor_set(p, 0, mk_string(key));
         lean_ctor_set(p, 1, rest);

@@ -180,6 +180,8 @@ structure CommandRecord where
   extra : Array (Name × Bool)
   post : CommandPost
   caches : CommandCachesRecord
+  /-- The process values the command read (`takeValueReads`), sorted: `writeUsage` adds those of the run. -/
+  values : Array String := #[]
   deriving Inhabited, BEq
 
 instance : ToJson CommandRecord := ⟨fun r => Json.mkObj [
@@ -189,7 +191,7 @@ instance : ToJson CommandRecord := ⟨fun r => Json.mkObj [
   ("usesStmt", .arr (r.usesStmt.map fun (n, d) => .arr #[nameToJson n, toJson d])),
   ("usesFull", .arr (r.usesFull.map fun (n, d, a) => .arr #[nameToJson n, toJson d, toJson a])),
   ("extra", .arr (r.extra.map fun (m, isMeta) => .arr #[nameToJson m, isMeta])),
-  ("post", toJson r.post), ("caches", toJson r.caches)]⟩
+  ("post", toJson r.post), ("caches", toJson r.caches), ("values", toJson r.values)]⟩
 
 instance : FromJson CommandRecord := ⟨fun j => return {
   i := ← j.getObjValAs? Nat "i"
@@ -207,7 +209,8 @@ instance : FromJson CommandRecord := ⟨fun j => return {
     fun (n, d, a) => (n.name, d, a)
   extra := (← j.getObjValAs? (Array (JName × Bool)) "extra").map fun (m, b) => (m.name, b)
   post := ← j.getObjValAs? CommandPost "post"
-  caches := ← j.getObjValAs? CommandCachesRecord "caches" }⟩
+  caches := ← j.getObjValAs? CommandCachesRecord "caches"
+  values := ← j.getObjValAs? (Array String) "values" }⟩
 
 private def matcherKeyDigest (value : Expr) (compile isPrivate : Bool) : Digest :=
   (({} : Enc).digest (exprDigest .namesInfos .eqv value) |>.bool compile |>.bool isPrivate).finish
