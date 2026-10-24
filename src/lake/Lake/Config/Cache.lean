@@ -442,16 +442,21 @@ def writeOutputsCore
 : IO Unit := do
   let file := cache.outputsFile scope inputHash
   createParentDirs file
-  -- Verbose entries (e.g., the command line of the build) are diagnostics of the build
-  -- in the tree that ran it and name its paths, so they are not kept with the outputs.
-  let log := log.filter (·.level ≥ .info)
-  let log? := if log.isEmpty then none else some log
-  let out := {service?, scope? := remoteScope?, data := out, log? : CacheOutput}
-  let contents := (toJson out).pretty
   if overwrite then
     IO.FS.writeFile file contents
   else
-    writeFileIfNew file contents
+    -- Rendered only once the file is created: a mapping not to overwrite usually exists already
+    let h ← try IO.FS.Handle.mk file .writeNew catch
+      | .alreadyExists .. => return
+      | e => throw e
+    h.putStr contents
+where
+  contents : String :=
+    -- Verbose entries (e.g., the command line of the build) are diagnostics of the build
+    -- in the tree that ran it and name its paths, so they are not kept with the outputs.
+    let log := log.filter (·.level ≥ .info)
+    let log? := if log.isEmpty then none else some log
+    (toJson {service?, scope? := remoteScope?, data := out, log? : CacheOutput}).pretty
 
 /--
 Cache the outputs corresponding to the given input for the package,
