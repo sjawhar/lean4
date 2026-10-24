@@ -99,10 +99,13 @@ def printWarnings (results : Std.HashMap Name MessageData) (filePath : System.Fi
 
 /--
 Formats a map of linter warnings grouped by filename with `-- filename` comments.
+
+With `useErrorFormat`, each module's file is resolved through `srcSearchPath?`, or through
+`getSrcSearchPath` when it is `none`.
 -/
-def groupedByFilename (results : Std.HashMap Name MessageData) (useErrorFormat : Bool := false) :
-    CoreM MessageData := do
-  let sp ← if useErrorFormat then getSrcSearchPath else pure {}
+def groupedByFilename (results : Std.HashMap Name MessageData) (useErrorFormat : Bool := false)
+    (srcSearchPath? : Option SearchPath := none) : CoreM MessageData := do
+  let sp ← if useErrorFormat then srcSearchPath?.getDM getSrcSearchPath else pure {}
   let grouped : Std.HashMap Name (System.FilePath × Std.HashMap Name MessageData) ←
     results.foldM (init := {}) fun grouped declName msg => do
       let mod ← findModuleOf? declName
@@ -122,19 +125,24 @@ def groupedByFilename (results : Std.HashMap Name MessageData) (useErrorFormat :
 
 /--
 Formats the linter results as Lean code with comments and `#check` commands.
+
+`srcSearchPath?` resolves modules to their files when grouping by filename in the error format
+(see `groupedByFilename`).
 -/
 def formatLinterResults
     (results : Array (NamedEnvLinter × Std.HashMap Name MessageData))
     (decls : Array Name)
     (groupByFilename : Bool)
     (whereDesc : String)
-    (numLinters : Nat) (useErrorFormat : Bool := false) :
+    (numLinters : Nat) (useErrorFormat : Bool := false)
+    (srcSearchPath? : Option SearchPath := none) :
     CoreM MessageData := do
   let formattedResults ← results.filterMapM fun (linter, results) => do
     if !results.isEmpty then
       let warnings ←
         if groupByFilename || useErrorFormat then
           groupedByFilename results (useErrorFormat := useErrorFormat)
+            (srcSearchPath? := srcSearchPath?)
         else
           printWarnings results
       pure $ some m!"/- The `{linter.optName}` linter reports:\n{linter.errorsFound} -/\n{warnings}\n"

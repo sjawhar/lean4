@@ -44,8 +44,8 @@ public structure Args where
   /-- An array of modules containing code quality checks that are
   imported alongside each top-level module -/
   checks : Array Name := #[]
-  /-- Source search path used to resolve modules to their `.lean` files when reporting text-linter
-  warnings and when recording exceptions. Populated from the workspace's `LEAN_SRC_PATH`, since
+  /-- Source search path used to resolve modules to their `.lean` files when reporting linter
+  findings and when recording exceptions. Populated from the workspace's `LEAN_SRC_PATH`, since
   `getSrcSearchPath` alone does not cover package sources during a `lake lint` run. -/
   srcSearchPath : SearchPath := {}
 
@@ -358,7 +358,8 @@ elaborated declarations, so they run here rather than during the build; per-decl
 By default all registered linters run; with `--lint-only`, only those explicitly enabled by the
 command-line overrides do.
 
-In `report` mode the findings are printed to stdout (grouped by file). In `recordExceptions` mode,
+In `report` mode the findings are printed to stdout, grouped by the file that `sp` resolves for
+each module, as for text linters. In `recordExceptions` mode,
 each flagged declaration is resolved to a source position via its declaration range and to a file
 via `sp`, yielding exception records for the caller to write; declarations whose range or source
 file cannot be resolved are reported on stderr and flagged as unlocated. In `codeQuality` mode,
@@ -381,7 +382,7 @@ def runEnvironmentLinters (args : Args) (linterOpts : Linter.LinterOptions) (sp 
           let fmtResults ←
             Linter.EnvLinter.formatLinterResults results decls
               (groupByFilename := true) (useErrorFormat := true)
-              s!"in {mod}" linters.size
+              s!"in {mod}" linters.size (srcSearchPath? := sp)
           IO.print (← fmtResults.toString)
         else
           IO.println s!"-- Environment linting passed for {mod}."
