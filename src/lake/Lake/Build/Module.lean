@@ -94,22 +94,24 @@ structure ModuleImportData where
   let imps ← imports.mapM fun imp => do
     let (includeSelf, transImports) ← f imp
     return {module := imp, transImports, includeSelf : ModuleImportData}
-  let task : JobTask OrdModuleSet := imps.foldl (init := .pure (.ok .empty {})) fun r imp =>
-    r.bind (sync := true) fun r =>
-    imp.transImports.task.map (sync := true) fun
-    | .ok transImps _ =>
-      match r with
-      | .ok impSet s =>
-        let impSet := impSet.appendArray transImps
-        let impSet := if imp.includeSelf then impSet.insert imp.module else impSet
-        .ok impSet s
-      | .error e s => .error e s
-    | .error _ _ =>
-      let entry := LogEntry.error s!"{fileName}: bad import '{imp.module.name}'"
-      match r with
-      | .ok _ s => .error 0 (s.logEntry entry)
-      | .error e s => .error e (s.logEntry entry)
-  return Job.ofTask <| task.map (sync := true) fun
+  -- One fold once every import is done (see `Job.zipWithAll`).
+  let tasks := imps.toList.map (·.transImports.task)
+  return Job.ofTask <| Task.mapList (sync := true) (tasks := tasks) fun rs =>
+    let r := (imps.toList.zip rs).foldl (init := (.ok .empty {} : JobResult OrdModuleSet)) fun r (imp, ri) =>
+      match ri with
+      | .ok transImps _ =>
+        match r with
+        | .ok impSet s =>
+          let impSet := impSet.appendArray transImps
+          let impSet := if imp.includeSelf then impSet.insert imp.module else impSet
+          .ok impSet s
+        | .error e s => .error e s
+      | .error _ _ =>
+        let entry := LogEntry.error s!"{fileName}: bad import '{imp.module.name}'"
+        match r with
+        | .ok _ s => .error 0 (s.logEntry entry)
+        | .error e s => .error e (s.logEntry entry)
+    match r with
     | .ok impSet s => .ok impSet.toArray s
     | .error e s => .error e s
 
@@ -434,6 +436,22 @@ def Package.discriminant (self : Package) :=
   else
     s!"{self.prettyName}@{self.version}"
 
+/--
+Adds `imps`, single-package imports with the jobs of their export information, to the result of `s`
+in order. It is the same job as one `s.zipWith (sync := true) (·.addImport nonModule imp ·) job` per
+import, but it adds them in one task once all the jobs are done, which keeps the fold linear in the
+number of imports (see `Job.zipWithAll`).
+-/
+def ModuleImportInfo.addImports
+  (nonModule : Bool) (s : Job ModuleImportInfo) (imps : Array (Import × Job ModuleMetaExportInfo))
+: Job ModuleImportInfo :=
+  if imps.isEmpty then s else
+  let rs := Task.mapList (sync := true) id (imps.toList.map (·.2.task))
+  Job.ofTask <| s.task.bind (sync := true) fun r =>
+  rs.map (sync := true) fun rs =>
+    (imps.toList.zip rs).foldl (init := r) fun r ((imp, _), ri) =>
+      Job.zipResults (·.addImport nonModule imp ·) r ri
+
 set_option linter.unusedVariables.funArgs false in
 def fetchImportInfo
   (fileName : String) (pkgName modName : Name) (header : ModuleHeader)
@@ -442,10 +460,13 @@ def fetchImportInfo
   let nonModule := !header.isModule
   let info := ModuleImportInfo.nil modName
   let impArtsJob : Job ModuleImportInfo := .pure info
-  header.imports.foldlM (init := impArtsJob) fun s imp => do
+  -- `s` holds the imports before `pending`, the single-package imports since, which
+  -- `ModuleImportInfo.addImports` adds in one task.
+  let init : Job ModuleImportInfo × Array (Import × Job ModuleMetaExportInfo) := (impArtsJob, #[])
+  let (s, pending) ← header.imports.foldlM (init := init) fun (s, pending) imp => do
     if modName = imp.module then
       logError s!"{fileName}: module imports itself"
-      return .error
+      return (.error, #[])
     let mods ← findModules imp.module
     if nonModule && !allowNonModules then
       if let some mod := mods.find? (·.requiresModuleSystem) then
@@ -458,7 +479,7 @@ def fetchImportInfo
             system; consider adding `module` to the start of this file"
     let n := mods.size
     if h : n = 0 then
-      return s
+      return (s, pending)
     else if n = 1 then -- common fast path
       let mod := mods[0]
       -- Remark: We've decided to disable this check for now
@@ -467,7 +488,7 @@ def fetchImportInfo
       --     the module `{imp.module}` from the package `{mod.pkg.discriminant}`"
       --   return .error
       let importJob ← mod.fetchExportInfo
-      return s.zipWith (sync := true) (·.addImport nonModule imp ·) importJob
+      return (s, pending.push (imp, importJob))
     else
       -- Remark: We've decided to disable this check for now
       -- let isImportable (mod) :=
@@ -486,22 +507,25 @@ def fetchImportInfo
       --       s!"{msg}\n  {mod.pkg.discriminant}"
       --   logError msg
       --   return .error
+      let s := ModuleImportInfo.addImports nonModule s pending
       let mods : Vector Module n := .mk mods rfl
       let expInfosJob ← Job.collectVector <$> mods.mapM (·.fetchExportInfo)
-      s.bindM (sync := true) fun impInfo => do
-      expInfosJob.mapM (sync := true) fun expInfos => do
-        let expInfo := expInfos[0]
-        let impHash := expInfo.disambiguationHash nonModule imp
-        let allEquiv := expInfos.toArray.all (start := 1) fun expInfo =>
-          impHash == expInfo.disambiguationHash nonModule imp
-        unless allEquiv do
-          let msg := s!"{fileName}: could not disambiguate the module `{imp.module}`; \
-            multiple packages provide distinct definitions:"
-          let msg := n.fold (init := msg) fun i h s =>
-            let hash := expInfos[i].disambiguationHash nonModule imp
-            s!"{s}\n  {mods[i].pkg.discriminant} (hash: {hash})"
-          error msg
-        return impInfo.addImport nonModule imp expInfo
+      let s ← s.bindM (sync := true) fun impInfo => do
+        expInfosJob.mapM (sync := true) fun expInfos => do
+          let expInfo := expInfos[0]
+          let impHash := expInfo.disambiguationHash nonModule imp
+          let allEquiv := expInfos.toArray.all (start := 1) fun expInfo =>
+            impHash == expInfo.disambiguationHash nonModule imp
+          unless allEquiv do
+            let msg := s!"{fileName}: could not disambiguate the module `{imp.module}`; \
+              multiple packages provide distinct definitions:"
+            let msg := n.fold (init := msg) fun i h s =>
+              let hash := expInfos[i].disambiguationHash nonModule imp
+              s!"{s}\n  {mods[i].pkg.discriminant} (hash: {hash})"
+            error msg
+          return impInfo.addImport nonModule imp expInfo
+      return (s, #[])
+  return ModuleImportInfo.addImports nonModule s pending
 
 /-- The `ModuleFacetConfig` for the builtin `importInfoFacet`. -/
 public def Module.importInfoFacetConfig : ModuleFacetConfig importInfoFacet :=
