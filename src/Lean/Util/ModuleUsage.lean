@@ -965,8 +965,8 @@ private def specLookups (env : Environment) (lookups : Array Expr) : Array (Dige
       some (m, specKeysOf (specCacheEntries env (some i)))
     else none
 
-/-- The format version of the `.usage` sidecar, of its `.resolved` sidecar and of Lake's `.usekey`; Lake reads a
-sidecar of any other version as absent. -/
+/-- The format version of the `.usage` sidecar and of its `.resolved` sidecar; Lake reads a sidecar of any other
+version as absent. -/
 def usageVersion : Nat := 14
 
 /-- `own` is `localDigests env nodes`, `closure` the module's `closureDigest`, `provides` its `ownProvides` and
@@ -977,7 +977,7 @@ and `extraModUsesByChecks` (those of commands whose environment was discarded); 
 the used names do not cover (`compilerCodeSeen`, or a unification hint from an imported module with digests matched
 inside a compile, `compileHints`), every imported module with digests is one. `importedClosures` records each direct
 import's `closureDigest` and `importedDigests` each extra module's `moduleDigest`, as this compile imported them from
-their `.olean` files: Lake writes a `.usekey` only if those are still what the modules' `.usage` files say when it
+their `.olean` files: Lake writes a `.usekey` only if those are still what the modules' `.usekey` files say when it
 writes it, so the key describes what the compile read. `digested` records each imported module's provides digest, and
 the `.resolved` sidecar written next to `path` (`path` with the extension `resolved`, `encodeResolved`) the module and
 kinds every name of `used`, of the nodes' references and of `resolvedNames` resolves to (`resolvedGroups`), so that
