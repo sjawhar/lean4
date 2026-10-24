@@ -714,17 +714,20 @@ def Module.recFetchPreSetup (mod : Module) : FetchM (Job ModulePreSetup) := ensu
     let leanOptions := mod.leanOptions ++ extra
     -- Every input of the module's trace except `depTrace` (the imports' `info.trace` and `extraDepJob`'s trace,
     -- which `localTrace` mixes in separately).
-    let localInputs := libTraces ++ #[
-      ← getLeanTrace, input.trace, traceOptions leanOptions "options",
+    let leanTrace ← getLeanTrace
+    let rest := #[traceOptions leanOptions "options",
       pureTrace input.header.isModule "isModule", pureTrace mod.name "Module.name",
       pureTrace mod.pkg.id? "Package.id?", pureTrace mod.leanArgs "Module.leanArgs",
       pureTrace (← usageCutoffEnabled) "usage cutoff"]
+    let localInputs := libTraces ++ #[leanTrace, input.trace] ++ rest
+    let localInputsNoSrc := libTraces ++ #[leanTrace] ++ rest
     addTrace depTrace
     localInputs.forM addTrace
     let localTrace := localInputs.foldl (·.mix ·) ((BuildTrace.nil "local").mix extraDepJob.getTrace)
+    let localNoSrcTrace := localInputsNoSrc.foldl (·.mix ·) ((BuildTrace.nil "local").mix extraDepJob.getTrace)
     return {
       trace := ← getTrace
-      localTrace
+      localTrace, localNoSrcTrace
       srcFile := input.path
       srcMTime := input.trace.mtime
       srcHash := input.trace.hash
@@ -1330,13 +1333,21 @@ def Module.checkSourceUnchanged (mod : Module) (presetup : ModulePreSetup) : Job
     error s!"{relSrcFile}: source file was modified during the build; \
       its outputs were discarded (build again to compile the current version)"
 
+/-- Whether a compile of the module may keep commands from its previous outputs (`lean --reuse-olean`): not, for the
+reason `lean` records in the module's new `.usage` (`lean --reuse-declined`), or if `Module.reuseCheck` allows it. -/
+inductive ReuseRequest where
+  | declined (reason : String)
+  | check
+
 /--
 Compiles the module. `setup?` is its `ModuleSetup` if the caller already computed it
 (`Module.skipOrBuild`); otherwise it is computed here. Only with usage cutoff enabled does Lean
-record usage (`--usage`: digests in the `.olean`, the `.usage`) and Lake write the `.usekey`.
+record usage (`--usage`: digests in the `.olean`, the `.usage`) and Lake write the `.usekey`. With it, `lean` may
+keep commands from the module's previous outputs (`reuse`): Lake moves the previous `.olean`, `.usage` and `.ilean`
+aside (`.old`) for the compile and removes them after it, or passes the reason it does not.
 -/
 def Module.buildLean
-  (mod : Module) (presetup : ModulePreSetup) (setup? : Option ModuleSetup := none)
+  (mod : Module) (presetup : ModulePreSetup) (reuse : ReuseRequest) (setup? : Option ModuleSetup := none)
 : JobM ModuleOutputArtifacts := do buildAction (← getTrace) mod.traceFile do
   let usage ← usageCutoffEnabled
   let args := mod.weakLeanArgs ++ mod.leanArgs
@@ -1344,11 +1355,31 @@ def Module.buildLean
   let relSrcFile := relPathFrom mod.pkg.dir presetup.srcFile
   let setup ← setup?.getDM (mkModuleSetup mod presetup)
   let outputPaths := mod.mkArtifacts presetup.srcFile presetup.isModule
+  -- the previous outputs leave the paths `lean` writes, which `clearOutputArtifacts` empties
+  let (reuseArgs, previous) ← if !usage then pure (#[], #[]) else
+    match reuse with
+    | .declined reason => pure (#[s!"--reuse-declined={reason}"], #[])
+    | .check => do
+      match ← mod.reuseCheck presetup setup.importArts with
+      | .error reason => pure (#[s!"--reuse-declined={reason}"], #[])
+      | .ok changed =>
+        let aside (f : FilePath) := f.addExtension "old"
+        let mut moved := #[]
+        for f in #[mod.oleanFile, mod.usageFile, mod.ileanFile] do
+          if ← f.pathExists then
+            IO.FS.rename f (aside f)
+            moved := moved.push (aside f)
+        let ilean := if moved.contains (aside mod.ileanFile) then #[s!"--reuse-ilean={aside mod.ileanFile}"] else #[]
+        pure (#[s!"--reuse-olean={aside mod.oleanFile}", s!"--reuse-usage={aside mod.usageFile}"] ++ ilean ++
+          changed.map (s!"--reuse-changed-extra={·}"), moved)
   mod.clearOutputArtifacts
   mod.clearOutputHashes
   let modsysBefore? ← if usage then some <$> modsysHash (← IO.mkRef {}) setup.importArts else pure none
-  compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile outputPaths args
-    (← getLeanPath) (← getLean)
+  try
+    compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile outputPaths (args ++ reuseArgs)
+      (← getLeanPath) (← getLean)
+  finally
+    for f in previous do removeFileIfExists f
   mod.checkSourceUnchanged presetup
   let arts ← mod.computeArtifacts setup.isModule presetup.postponeCompile
   if let some modsysBefore := modsysBefore? then mod.writeUsekey presetup setup.importArts modsysBefore
@@ -1363,27 +1394,36 @@ def Module.usageCutoffApplies (mod : Module) (presetup : ModulePreSetup) : JobM 
   unless (← usageCutoffEnabled) do return false
   mod.checkArtifactsExist presetup.isModule presetup.postponeCompile
 
+/-- Why usage cutoff does not apply to the module (`Module.usageCutoffApplies`), as `lean --reuse-declined` records
+it. -/
+def Module.cutoffDeclined (mod : Module) (presetup : ModulePreSetup) : JobM ReuseRequest := do
+  if presetup.isModule then return .declined "module-system"
+  if mod.shouldPrecompile then return .declined "precompiled"
+  unless (← usageCutoffEnabled) do return .declined "cutoff-off"
+  return .declined "no-previous-olean"
+
 /--
 Skips compiling a module whose trace is stale if usage cutoff applies to it
 (`Module.usageCutoffApplies`), nothing it used changed meaning (`Module.usageUpToDate`), and its outputs are
 still what the saved trace describes (`Module.keepOutputs?`): replays its saved log and rewrites its trace with
 `depTrace`, which vouches for those outputs under the new input hash. Otherwise, builds it, reusing the module setup
-the check computed. With `cacheWith? = some useLocalFile`, the outputs it returns are in the cache: kept ones were
+the check computed, and keeping commands from its previous outputs where something it used changed meaning
+(`Module.buildLean`). With `cacheWith? = some useLocalFile`, the outputs it returns are in the cache: kept ones were
 checked while saving them (`recacheOutputArtifacts?`), built ones are saved after the build.
 -/
 def Module.skipOrBuild (mod : Module) (presetup : ModulePreSetup) (savedTrace : SavedTrace)
     (depTrace : BuildTrace) (cacheWith? : Option Bool := none) : JobM ModuleOutputArtifacts := do
-  let build (setup? : Option ModuleSetup) : JobM ModuleOutputArtifacts := do
-    let arts ← mod.buildLean presetup setup?
+  let build (setup? : Option ModuleSetup) (reuse : ReuseRequest) : JobM ModuleOutputArtifacts := do
+    let arts ← mod.buildLean presetup reuse setup?
     match cacheWith? with
     | some useLocalFile => mod.cacheOutputArtifacts presetup.isModule useLocalFile presetup.postponeCompile
     | none => return arts
-  let .ok data := savedTrace | build none
-  unless (← mod.usageCutoffApplies presetup) do return ← build none
+  let .ok data := savedTrace | build none (.declined "no-saved-trace")
+  unless (← mod.usageCutoffApplies presetup) do return ← build none (← mod.cutoffDeclined presetup)
   let setup ← mkModuleSetup mod presetup
-  unless (← mod.usageUpToDate presetup setup.importArts) do return ← build setup
+  unless (← mod.usageUpToDate presetup setup.importArts) do return ← build setup .check
   let some arts ← mod.keepOutputs? presetup.isModule presetup.postponeCompile savedTrace.moduleOutputDescrs?
-      cacheWith? | build setup
+      cacheWith? | build setup (.declined "outputs-changed")
   mod.checkSourceUnchanged presetup
   updateAction .replay
   data.log.replay
@@ -1497,9 +1537,9 @@ where
             -- leaves the hash unconfirmed, so rebuild instead.
             if status == .hashUpToDate then
               unless (← unpackLocalLtar depTrace.hash) do
-                discard <| mod.buildLean presetup
+                discard <| mod.buildLean presetup (.declined "no-previous-olean")
             else
-              discard <| mod.buildLean presetup
+              discard <| mod.buildLean presetup (.declined "no-previous-olean")
         else
           cached? := some (← mod.skipOrBuild presetup savedTrace depTrace (cacheWith? := some restore))
         if status.isCacheable then
@@ -1509,7 +1549,7 @@ where
               if let some arts ← mod.keepOutputs? presetup.isModule presetup.postponeCompile
                   savedTrace.moduleOutputDescrs? (cacheWith? := some restore) then
                 return arts
-              discard <| mod.buildLean presetup
+              discard <| mod.buildLean presetup (.declined "outputs-changed")
             mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile
           let arts := {arts with ltar? := arts.ltar? <|> ltar?}
           (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs
@@ -1524,9 +1564,9 @@ where
           -- As above: restore on a hash match and rebuild on a mtime match.
           if status == .hashUpToDate then
             unless (← unpackLocalLtar depTrace.hash) do
-              discard <| mod.buildLean presetup
+              discard <| mod.buildLean presetup (.declined "no-previous-olean")
           else
-            discard <| mod.buildLean presetup
+            discard <| mod.buildLean presetup (.declined "no-previous-olean")
         mod.computeArtifacts presetup.isModule presetup.postponeCompile
       else
         if (← mod.pkg.isArtifactCacheReadable) then

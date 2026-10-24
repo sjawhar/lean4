@@ -62,6 +62,9 @@ structure UsageSidecar where
 /-- A module's `.usekey` sidecar: what Lake saw of the module's build when Lean wrote its `.usage`. -/
 structure UsekeySidecar where
   localHash : Hash
+  /-- The module's local trace hash without its source (`ModulePreSetup.localNoSrcTrace`): whether a compile of other
+  sources of the module may keep commands of this one (`Module.reuseCheck`). -/
+  localNoSrc? : Option Hash
   /-- The digest of the bytes of the module's `.usage` (`ModuleUsage.Digest.ofBytes`) the key was written from:
   readers take the key first and accept only that `.usage`. -/
   usage : ModuleUsage.Digest
@@ -156,6 +159,7 @@ instance : FromJson UsekeySidecar where
   fromJson? j := do
     return {
       localHash := ← j.getObjValAs? Hash "local"
+      localNoSrc? := (j.getObjValAs? Hash "localNoSrc").toOption
       usage := ← j.getObjValAs? ModuleUsage.Digest "usage"
       olean := ← j.getObjValAs? ModuleUsage.Digest "olean"
       modsys := ← j.getObjValAs? ModuleUsage.Digest "modsys"
@@ -578,6 +582,7 @@ public def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     ("version", ModuleUsage.usageVersion),
     ("usage", toJson usageDigest),
     ("local", toJson presetup.localTrace.hash.hex),
+    ("localNoSrc", toJson presetup.localNoSrcTrace.hash.hex),
     ("olean", toJson (← contentHash hashes mod.oleanFile)),
     ("modsys", toJson modsys),
     ("closure", toJson closure),
@@ -620,3 +625,36 @@ public def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
     unless imp.moduleDigest == digest do return false
   unless (← usage.resolvedUnchanged presetup hashes importArts) do return false
   usage.specProvidersUnchanged hashes importArts
+
+/--
+Whether `lean` may keep commands from the module's previous outputs as it compiles the module again: the reason it may
+not, which `lean --reuse-declined` records in the new `.usage`, or the workspace modules of the previous `.usage`'s
+`extra` whose `.olean` or `moduleDigest` is not what its `.usekey` recorded (`lean --reuse-changed-extra`: a command
+that used one of them whole is elaborated). Lake checks what Lean's keep permit (`Lean.ModuleUsage.keepPermit`) does
+not: `LAKE_DECL_CUTOFF` is not `0`; the previous `.olean`, `.usage` and `.usekey` exist, the `.usekey` is readable and
+binds the `.usage` and the `.olean` (`UsekeySidecar.usage`, `UsekeySidecar.olean`); the `.usage` is readable and not
+`noskip`; the module's local inputs but its source are unchanged (`UsekeySidecar.localNoSrc?`: the toolchain, options,
+plugins, dynlibs, Lean arguments); and no module-system file of its closure changed (`modsysHash`).
+-/
+public def Module.reuseCheck (mod : Module) (presetup : ModulePreSetup) (importArts : NameMap ImportArtifacts) :
+    JobM (Except String (Array Name)) := do
+  if (← IO.getEnv "LAKE_DECL_CUTOFF") == some "0" then return .error "decl-cutoff-off"
+  unless ← mod.oleanFile.pathExists do return .error "no-previous-olean"
+  unless ← mod.usageFile.pathExists do return .error "no-previous-usage"
+  unless ← mod.usekeyFile.pathExists do return .error "no-usekey"
+  let some key ← readUsageSidecar UsekeySidecar mod.usekeyFile | return .error "usekey-unreadable"
+  let some (usage, _) ← readOwnUsage mod.usageFile (expected? := key.usage) | return .error "usage-unreadable"
+  if usage.noskip then return .error "noskip"
+  unless key.localNoSrc? == some presetup.localNoSrcTrace.hash do return .error "local-inputs-changed"
+  let hashes ← IO.mkRef {}
+  unless (← contentHash hashes mod.oleanFile) == key.olean do return .error "olean-hash-mismatch"
+  unless (← modsysHash hashes importArts) == key.modsys do return .error "modsys-changed"
+  let mut changed := #[]
+  for m in usage.extra do
+    if (← findModule? m).isNone then continue
+    let same ← do
+      let some (oleanHash, digest) := key.extra.find? m | pure false
+      let some (olean, imp) ← importUsage? hashes importArts m | pure false
+      pure ((← contentHash hashes olean) == oleanHash && imp.moduleDigest == digest)
+    unless same do changed := changed.push m
+  return .ok changed

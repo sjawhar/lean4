@@ -649,4 +649,65 @@ match_text "Built Test.SB" default.log
 no_match_text "Replayed Test.SB" default.log
 test_exp ! -f cache12/.lake/build/lib/lean/Test/SB.usage
 
+# Declaration-level reuse: a module compiled again under the usage cutoff keeps commands from its previous outputs.
+# Lake passes them to `lean` (`--reuse-olean`, `--reuse-usage`, `--reuse-ilean`) or the reason it does not
+# (`--reuse-declined`), and `lean` records what it kept in the `.usage` `reuse` field. The action line stays `Built`,
+# and the log says nothing about reuse (the paths of this checkout and `-v`'s command lines aside: `reuse/`, `reuse-`).
+mkdir -p declkeep/Test
+cp lakefile.toml declkeep/
+cd declkeep
+M=.lake/build/lib/lean/Test/M
+no_reuse_log() { no_match_pat 'reuse([^-/]|$)' produced.out; }
+printf 'theorem L : 1 = 1 := rfl\ndef v := 5\n' > Test/A.lean
+printf 'import Test.A\ntheorem a : 1 = 1 := L\ntheorem c : v = v := rfl\ndef b := v + 1\n#print axioms a\n' > Test/M.lean
+printf 'import Test.M\n#eval b\n' > Test/N.lean
+test_out "Built Test.M" build -v Test.N
+no_reuse_log
+match_text '"reuse":{"declined":"no-saved-trace"}' $M.usage
+# `L`'s proof changes: M is built again, keeping every declaration (`#print axioms` is elaborated); N still builds
+printf 'theorem L : 1 = 1 := by rfl\ndef v := 5\n' > Test/A.lean
+test_out "Built Test.M" build -v Test.N
+no_reuse_log
+match_text '"reuse":{"elabReasons":{"nonconst":1},"kept":3,"reElab":[3],"total":4}' $M.usage
+test_exp ! -e $M.olean.old
+test_exp ! -e $M.usage.old
+test_exp ! -e $M.ilean.old
+# a build with nothing to do, and a usage skip, leave the `.usage` as it is
+cp $M.usage usage.before
+test_not_out "Built Test.M" build -v Test.N
+test_cmd cmp usage.before $M.usage
+printf 'theorem L : 1 = 1 := by rfl\ndef v := 5\ndef unused := 0\n' > Test/A.lean
+test_out "Replayed Test.M" build -v Test.N
+no_reuse_log
+test_cmd cmp usage.before $M.usage
+# `v` changes: `c` and `b` use it and are elaborated, `a` is kept
+printf 'theorem L : 1 = 1 := by rfl\ndef v := 6\n' > Test/A.lean
+test_out "Built Test.M" build -v Test.N
+no_reuse_log
+match_text '"reuse":{"elabReasons":{"full":2,"nonconst":1},"kept":1,"reElab":[1,2,3],"total":4}' $M.usage
+# `LAKE_DECL_CUTOFF=0` turns reuse off; the next build reuses again
+printf 'theorem L : 1 = 1 := by rfl\ndef v := 7\n' > Test/A.lean
+LAKE_DECL_CUTOFF=0 test_out "Built Test.M" build -v Test.N
+no_reuse_log
+match_text '"reuse":{"declined":"decl-cutoff-off"}' $M.usage
+printf 'theorem L : 1 = 1 := by rfl\ndef v := 8\n' > Test/A.lean
+test_out "Built Test.M" build -v Test.N
+match_text '"reuse":{"elabReasons":{"full":2,"nonconst":1},"kept":1,"reElab":[1,2,3],"total":4}' $M.usage
+# without the previous `.usekey`, or with an `.olean` its `.usekey` does not describe, Lake declines
+rm $M.usekey
+printf 'theorem L : 1 = 1 := by rfl\ndef v := 9\n' > Test/A.lean
+test_out "Built Test.M" build -v Test.N
+match_text '"reuse":{"declined":"no-usekey"}' $M.usage
+rm -f $M.olean && cp .lake/build/lib/lean/Test/A.olean $M.olean
+printf 'theorem L : 1 = 1 := by rfl\ndef v := 10\n' > Test/A.lean
+test_out "Built Test.M" build -v Test.N
+match_text '"reuse":{"declined":"olean-hash-mismatch"}' $M.usage
+# a module-system file is never partially compiled again
+printf 'module\n\npublic def ms := 1\n' > Test/MS.lean
+test_run build Test.MS
+printf 'module\n\npublic def ms := 2\n' > Test/MS.lean
+test_out "Built Test.MS" build -v Test.MS
+match_text '"reuse":{"declined":"module-system"}' .lake/build/lib/lean/Test/MS.usage
+cd ..
+
 rm -f produced.out

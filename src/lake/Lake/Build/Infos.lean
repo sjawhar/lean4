@@ -85,6 +85,9 @@ public structure ModulePreSetup where
   trace : BuildTrace
   irSigTrace : BuildTrace
   localTrace : BuildTrace
+  /-- `localTrace` without the module's source: what a compile of other sources of the module may keep commands of a
+  previous compile under (`Module.reuseCheck`). -/
+  localNoSrcTrace : BuildTrace
   srcMTime : MTime
   /-- The hash of the source's contents as Lake read them (see `Module.recFetchInput`). -/
   srcHash : Hash
