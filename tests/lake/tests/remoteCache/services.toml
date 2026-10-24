@@ -1,0 +1,43 @@
+# Cache services for `test.sh`, served by `../cacheTransfer/server.py`.
+# `test.sh` replaces `%URL%` with the URL of one mock server
+# and `%URL2%` with the URL of a second one, which listens on another port.
+
+# Accepts only bearer tokens, as a Cloud Storage bucket without HMAC keys does
+[[cache.service]]
+name = "bearer"
+type = "s3"
+artifactEndpoint = "%URL%/bearer/a0"
+revisionEndpoint = "%URL%/bearer/r0"
+
+# The same store, for uploads through AWS Signature Version 4
+[[cache.service]]
+name = "ok"
+type = "s3"
+artifactEndpoint = "%URL%/ok/a0"
+revisionEndpoint = "%URL%/ok/r0"
+
+# A second service, on the second server
+[[cache.service]]
+name = "other"
+type = "s3"
+artifactEndpoint = "%URL2%/ok/a0"
+revisionEndpoint = "%URL2%/ok/r0"
+
+# A service whose revisions are on another host than its artifacts
+[[cache.service]]
+name = "split"
+type = "s3"
+artifactEndpoint = "%URL%/bearer/a0"
+revisionEndpoint = "%URL2%/ok/r0"
+
+[[cache.service]]
+name = "truncate"
+type = "s3"
+artifactEndpoint = "%URL%/truncate/a0"
+revisionEndpoint = "%URL%/ok/r0"
+
+[[cache.service]]
+name = "deny"
+type = "s3"
+artifactEndpoint = "%URL%/deny/a0"
+revisionEndpoint = "%URL%/deny/r0"
