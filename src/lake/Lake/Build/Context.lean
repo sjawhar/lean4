@@ -127,22 +127,24 @@ public structure BuildContext extends BuildConfig, Context where
   (`Lean.ModuleUsage.Digest.ofBytes`) of the contents it was parsed from and the stamp of the file those contents were
   read from (`Lean.ModuleUsage.readFileStamped`), if it stands for them. Another process may rewrite a sidecar during
   the build (e.g., a build of another workspace that requires the same path dependency), so a cached parse serves
-  only a read of the same contents, or a file whose current stamp is the recorded one.
+  only a read of the same contents, or a file whose current stamp is the recorded one. Persistent, as
+  `kernelProviders` is: concurrent jobs share the map, so an insert into a hash map would copy it whole.
   -/
   sidecarCache : Std.Mutex
-    (Std.HashMap FilePath (Option Lean.ModuleUsage.FileStamp × Lean.ModuleUsage.Digest × Dynamic))
+    (Lean.PHashMap FilePath (Option Lean.ModuleUsage.FileStamp × Lean.ModuleUsage.Digest × Dynamic))
   /--
   The content hashes (`Lean.ModuleUsage.fileDigest`) that usage-cutoff checks computed in this build, each with the
   stamp of the file its bytes were read from (`Lean.ModuleUsage.fileDigestStamped`). A check reuses a hash only while
   the file's current stamp is the recorded one; any write, truncation or replacement of the file through the file
-  system changes its stamp, so a check never takes a hash for bytes other than the file's current ones.
+  system changes its stamp, so a check never takes a hash for bytes other than the file's current ones. Persistent,
+  as `sidecarCache` is.
 
   A store through a `MAP_SHARED` mapping changes a file's bytes without a `write`, and the kernel may update its
   modification time late, so the reuse relies on no writer of a hashed file using one. Lean writes an `.olean`
   through a stream to a temporary file it then renames (`src/library/module.cpp:314,408`) and maps the files it
   reads `MAP_PRIVATE` (`:528`).
   -/
-  fileDigests : Std.Mutex (Std.HashMap FilePath (Lean.ModuleUsage.FileStamp × Lean.ModuleUsage.Digest))
+  fileDigests : Std.Mutex (Lean.PHashMap FilePath (Lean.ModuleUsage.FileStamp × Lean.ModuleUsage.Digest))
   /--
   The kernel constants of the workspace and toolchain modules usage-cutoff checks read, indexed by name hash. A
   workspace module's entries are keyed by a digest of the state they were read in, so they stay valid however the
