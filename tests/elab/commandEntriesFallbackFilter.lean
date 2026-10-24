@@ -53,7 +53,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   catch e =>
     IO.println s!"command 0 (@[pre_tag] def d): refused: {e}"
   IO.println s!"command 1 (def d.later): preExt payload {preEntries ce₁}"
-  let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
+  let usage ← IO.ofExcept <| ModuleUsage.parseUsage (← IO.FS.readFile (dir / "M.usage"))
   IO.println s!"noreuse: {(usage.getObjValAs? Bool "noreuse").toOption}, \
     reason: {(usage.getObjValAs? String "noreuseReason").toOption}"
 

@@ -58,7 +58,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let some first := obs[0]? | throw <| IO.userError "no commands"
   let permit ← IO.ofExcept (← ModuleUsage.Testing.keepPermit first.before.env `M (dir / "M.olean") (dir / "M.usage"))
   let payloads := permit.payloads
-  let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
+  let usage ← IO.ofExcept <| ModuleUsage.parseUsage (← IO.FS.readFile (dir / "M.usage"))
   let records := (usage.getObjValAs? (Array Json) "commands").toOption.getD #[]
   -- commands: 0 `open`, 1 and 2 `fresh_axiom`, 3 `theorem pm`
   let some kept := obs.find? (·.i == 1) | throw <| IO.userError "no observation 1"
@@ -98,7 +98,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
   let some first := obs[0]? | throw <| IO.userError "no commands"
   let permit ← IO.ofExcept (← ModuleUsage.Testing.keepPermit first.before.env `N (dir / "N.olean") (dir / "N.usage"))
   let payloads := permit.payloads
-  let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "N.usage"))
+  let usage ← IO.ofExcept <| ModuleUsage.parseUsage (← IO.FS.readFile (dir / "N.usage"))
   let records := (usage.getObjValAs? (Array Json) "commands").toOption.getD #[]
   let some kept := obs.find? (·.i == 2) | throw <| IO.userError "no observation 2 in N"
   let some next := obs.find? (·.i == 3) | throw <| IO.userError "no observation 3 in N"

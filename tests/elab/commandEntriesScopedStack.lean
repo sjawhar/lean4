@@ -26,7 +26,7 @@ unsafe def check (dir : System.FilePath) (label src : String) (probes : List Nam
   let some first := obs[0]? | throw <| IO.userError "no commands"
   let permit ← IO.ofExcept (← ModuleUsage.Testing.keepPermit first.before.env `M (dir / "M.olean") (dir / "M.usage"))
   let payloads := permit.payloads
-  let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
+  let usage ← IO.ofExcept <| ModuleUsage.parseUsage (← IO.FS.readFile (dir / "M.usage"))
   let cmds := (usage.getObjValAs? (Array Json) "commands").toOption.getD #[]
   IO.println s!"== {label}: noreuse {(usage.getObjValAs? Bool "noreuse").toOption}, \
     reason {(usage.getObjValAs? String "noreuseReason").toOption}"

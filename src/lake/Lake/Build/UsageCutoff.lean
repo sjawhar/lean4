@@ -201,7 +201,10 @@ def parseUsageSidecar (α : Type) [FromJson α] (path : FilePath) (bytes : ByteA
     return none
 where
   parse : Except String (Option α) := do
-    let some contents := String.fromUTF8? bytes | throw "not UTF-8"
+    -- only the first line: a `.usage`'s second holds its command records, which no check reads
+    -- (`Lean.ModuleUsage.writeUsage`)
+    let line := bytes.extract 0 ((bytes.findIdx? (· == 10)).getD bytes.size)
+    let some contents := String.fromUTF8? line | throw "not UTF-8"
     let j ← Json.parse contents
     let v ← j.getObjValAs? Nat "version"
     if v != ModuleUsage.usageVersion then return none

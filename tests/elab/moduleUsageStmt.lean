@@ -39,7 +39,7 @@ def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
   IO.FS.writeFile (dir / "M.lean") "import X\ndef m := xd\ntheorem m2 : 1 = 1 := xs\n@[unreplayable] def unsupported := 0\n"
   runLean dir #["-o", "X.olean", "--usage=X.usage", "X.lean"]
   runLean dir #["-o", "M.olean", "--usage=M.usage", "M.lean"]
-  let rd (f : String) : IO Json := do IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / f))
+  let rd (f : String) : IO Json := do IO.ofExcept <| ModuleUsage.parseUsage (← IO.FS.readFile (dir / f))
   let x ← rd "X.usage"
   let m ← rd "M.usage"
   let arr (j : Json) (k : String) : Array Json := (j.getObjValAs? (Array Json) k).toOption.getD #[]

@@ -19,6 +19,6 @@ def runLean (dir : System.FilePath) (args : Array String) : IO Unit := do
   for m in ["X", "Plain", "MS", "Ec"] do
     runLean dir #["-o", s!"{m}.olean", s!"--usage={m}.usage", s!"{m}.lean"]
   for m in ["Plain", "MS", "Ec"] do
-    let j ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / s!"{m}.usage"))
+    let j ← IO.ofExcept <| ModuleUsage.parseUsage (← IO.FS.readFile (dir / s!"{m}.usage"))
     IO.println s!"{m}: noskip {(j.getObjValAs? Bool "noskip").toOption}, noreuse {(j.getObjValAs? Bool "noreuse").toOption}, \
       reason {(j.getObjValAs? String "noreuseReason").toOption}"

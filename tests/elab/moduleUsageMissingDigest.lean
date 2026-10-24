@@ -62,7 +62,7 @@ example : use_dep% base = 2 := rfl
   let some env ← Elab.runFrontend input {} (dir / "M.lean").toString `M
       (oleanFileName? := some (dir / "M.olean")) (usageFileName? := some (dir / "M.usage")) |
     throw <| IO.userError "elaboration failed"
-  let j ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
+  let j ← IO.ofExcept <| ModuleUsage.parseUsage (← IO.FS.readFile (dir / "M.usage"))
   let cmds ← IO.ofExcept <| j.getObjValAs? (Array ModuleUsage.CommandRecord) "commands"
   let some m2 := cmds.find? (fun (r : ModuleUsage.CommandRecord) => r.decls.contains `m2) |
     throw <| IO.userError "no record for m2"

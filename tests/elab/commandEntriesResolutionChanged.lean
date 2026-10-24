@@ -106,11 +106,13 @@ def zSource (claim : Bool) : String :=
   IO.println "SZ provides no specialization:"
   IO.print (← runLean dir reuse).2
   let usage ← IO.FS.readFile (dir / "SM.usage")
-  let j ← IO.ofExcept <| Json.parse usage
+  let j ← IO.ofExcept <| ModuleUsage.parseUsageHead usage
   let lookups : Array (String × String) ← IO.ofExcept <| j.getObjValAs? (Array (String × String)) "specLookups"
   IO.println s!"SM.usage recording other providers for the {lookups.size} key(s) g looked up:"
   let other := lookups.map fun (p : String × String) => (p.1, "".pushn '0' 32)
-  IO.FS.writeFile (dir / "SM.usage") (j.setObjVal! "specLookups" (toJson other)).compress
+  -- the module's fields are the first line; the command records after it stay as they are
+  let records := (usage.dropWhile (· != '\n')).copy
+  IO.FS.writeFile (dir / "SM.usage") ((j.setObjVal! "specLookups" (toJson other)).compress ++ records)
   IO.print (← runLean dir reuse).2
   IO.FS.writeFile (dir / "SM.usage") usage
   IO.FS.writeFile (dir / "SZ.lean") "import SA\ndef zz : Nat := 0\ndef h (x : Nat) : Nat := applyTwice (· + 1) x\n"

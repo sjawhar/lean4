@@ -7,7 +7,7 @@ def noskipOf (dir : System.FilePath) (args : Array String) : IO Bool := do
   let out ← IO.Process.output { cmd := "lean", args := #[s!"--root={dir}"] ++ args, cwd := dir }
   unless out.exitCode = 0 do
     throw <| IO.userError s!"lean {args} failed ({out.exitCode}):\n{out.stdout}\n{out.stderr}"
-  let j ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "A.usage"))
+  let j ← IO.ofExcept <| ModuleUsage.parseUsage (← IO.FS.readFile (dir / "A.usage"))
   IO.ofExcept <| j.getObjValAs? Bool "noskip"
 
 #eval IO.FS.withTempDir fun dir => do

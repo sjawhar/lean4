@@ -12,7 +12,7 @@ def digestOfF (dir : System.FilePath) (src : String) : IO String := do
     { cmd := "lean", args := #[s!"--root={dir}", "-o", "A.olean", "--usage=A.usage", "A.lean"], cwd := dir }
   unless out.exitCode = 0 do
     throw <| IO.userError s!"lean failed ({out.exitCode}):\n{out.stdout}\n{out.stderr}"
-  let j ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "A.usage"))
+  let j ← IO.ofExcept <| ModuleUsage.parseUsage (← IO.FS.readFile (dir / "A.usage"))
   let own ← IO.ofExcept <| j.getObjValAs? (Array (Json × String)) "own"
   let some (_, d) := own.find? (·.1 == ModuleUsage.nameToJson `f)
     | throw <| IO.userError "no digest for f"

@@ -846,6 +846,19 @@ def valueDigest? (v? : Option String) : Option Digest :=
 version as absent. -/
 def usageVersion : Nat := 13
 
+/-- The first line of a `.usage` file's text `s` (`writeUsage`): the module's fields, without the command records. -/
+def parseUsageHead (s : String) : Except String Json :=
+  Json.parse (s.takeWhile (· != '\n')).copy
+
+/-- A `.usage` file's text `s` as one object: the module's fields (`parseUsageHead`) with the command records and
+statement digests of its second line (`writeUsage`). -/
+def parseUsage (s : String) : Except String Json := do
+  let .obj head ← parseUsageHead s | throw "the first line of a `.usage` is not a JSON object"
+  let rest := (s.dropWhile (· != '\n')).drop 1
+  if rest.isEmpty then return .obj head
+  let .obj records ← Json.parse rest.copy | throw "the second line of a `.usage` is not a JSON object"
+  return .obj (records.foldl (init := head) fun m k v => m.insert k v)
+
 /-- `own` is `localDigests env nodes`, `closure` the module's `closureDigest`, `provides` its `ownProvides` and
 `indirect` its `ownIndirect`, as `setLocalDigests` stored them; `used` holds the imported names recorded while
 elaborating (`moduleUsed`'s `extra`);
@@ -874,7 +887,10 @@ function's own lookups, such as `untrackedImports`' of the toolchain's path) wit
 per-command records; `usedAttrs`, beside each kernel constant of a `used` entry, the attrs digest the defining module
 recorded for it (`importedConstDigests?`); and `noreuse`, set when no command may be kept (`noreuseReason?`, or a
 process value that changed during the run; written as `noreuseReason`). `noreuse` decides nothing about skipping the
-module whole. -/
+module whole.
+
+The file has two lines (`parseUsage`): the module's fields, which Lake reads (`parseUsageHead`), then `stmt` and
+`commands`, which only a keep reads and which are most of the file. -/
 def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Digest)) (closure : Digest)
     (provides : Array Name × Array Name) (indirect : Array Name) (used : NameSet) (lookups : Array Expr)
     (stmt : Array (Name × Digest × Digest)) (commands : Array Json) (incrLoaded : Bool) (path : System.FilePath)
@@ -940,12 +956,13 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
     ("githash", toJson Lean.githash),
     ("untracked", Json.arr (untracked.map fun (m, d) => pair m d)),
     ("values", Json.arr (values.map fun (k, v?, _) => Json.arr #[toJson k, toJson (valueDigest? v?)])),
-    ("stmt", Json.arr (stmt.map fun (n, c, a) => Json.arr #[nameToJson n, toJson c, toJson a])),
-    ("commands", Json.arr commands),
     ("noreuse", noreuseReason?.isSome)]
   let fields := match noreuseReason? with
     | some reason => fields ++ [("noreuseReason", toJson reason)]
     | none => fields
-  IO.FS.writeFile path (Json.mkObj fields).compress
+  let records := Json.mkObj [("stmt", Json.arr (stmt.map fun (n, c, a) => Json.arr #[nameToJson n, toJson c, toJson a])),
+    ("commands", Json.arr commands)]
+  -- `compress` escapes every newline inside a string, so each line holds exactly one object
+  IO.FS.writeFile path ((Json.mkObj fields).compress ++ "\n" ++ records.compress)
 
 end Lean.ModuleUsage

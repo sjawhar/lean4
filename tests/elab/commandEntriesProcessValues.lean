@@ -105,13 +105,13 @@ def reuse (dir : System.FilePath) (m : String) (env : Array (String × Option St
 
 /-- The keys of the process values `m.usage` records. -/
 def valueKeys (dir : System.FilePath) (m : String) : IO Unit := do
-  let j ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / s!"{m}.usage"))
+  let j ← IO.ofExcept <| ModuleUsage.parseUsage (← IO.FS.readFile (dir / s!"{m}.usage"))
   let vs ← IO.ofExcept <| j.getObjValAs? (Array (String × Option String)) "values"
   IO.println s!"{m}: values {vs.map (·.1)}"
 
 /-- `m.usage`'s `noreuse` reason, the temporary directory and the toolchain shown as `DIR` and `TOOLCHAIN`. -/
 def noreuseReason (dir : System.FilePath) (m : String) : IO Unit := do
-  let j ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / s!"{m}.usage"))
+  let j ← IO.ofExcept <| ModuleUsage.parseUsage (← IO.FS.readFile (dir / s!"{m}.usage"))
   let r := (j.getObjValAs? String "noreuseReason").toOption.getD "none"
   IO.println s!"{m}: noreuse reason: {(r.replace (toString (← getBuildDir)) "TOOLCHAIN").replace dir.toString "DIR"}"
 

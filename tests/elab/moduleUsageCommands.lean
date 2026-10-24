@@ -49,7 +49,7 @@ def u (x : Nat) : Nat := uhMul x x
 #eval IO.FS.withTempDir fun dir => do
   IO.FS.writeFile (dir / "M.lean") src
   runLean dir #["-o", "M.olean", "--usage=M.usage", "M.lean"]
-  let j ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
+  let j ← IO.ofExcept <| ModuleUsage.parseUsage (← IO.FS.readFile (dir / "M.usage"))
   let cmds ← IO.ofExcept <| j.getObjValAs? (Array ModuleUsage.CommandRecord) "commands"
   let showNames (ns : Array Name) : String := toString (ns.qsort Name.lt).toList
   let mut prevIdx := 0

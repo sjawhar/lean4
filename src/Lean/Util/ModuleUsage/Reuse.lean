@@ -262,7 +262,7 @@ private def valuesChanged? (r : KeepRecord) : IO (Option String) := do
 /-- `keepPermit`, with the `noreuse` check only if `checkNoreuse`. -/
 private def keepPermitCore (env : Environment) (module : Name) (olean usage : System.FilePath)
     (checkNoreuse : Bool) : IO (Except String KeepPermit) := do
-  let r ← IO.ofExcept <| KeepRecord.ofUsage (← IO.ofExcept <| Json.parse (← IO.FS.readFile usage))
+  let r ← IO.ofExcept <| KeepRecord.ofUsage (← IO.ofExcept <| parseUsageHead (← IO.FS.readFile usage))
   unless r.module == module do return .error s!"the `.usage` is of `{r.module}`, not `{module}`"
   unless env.mainModule == module do return .error s!"the environment is of `{env.mainModule}`, not `{module}`"
   unless r.githash == Lean.githash do return .error s!"the `.usage` was written by another Lean ({r.githash})"

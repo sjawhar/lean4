@@ -27,7 +27,7 @@ unsafe def elabM (dir : System.FilePath) (src : String) : IO Run := do
   let some first := obs[0]? | throw <| IO.userError "no commands"
   let permit ← IO.ofExcept (← ModuleUsage.Testing.keepPermit first.before.env `M (dir / "M.olean") (dir / "M.usage"))
   let payloads := permit.payloads
-  let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
+  let usage ← IO.ofExcept <| ModuleUsage.parseUsage (← IO.FS.readFile (dir / "M.usage"))
   let records := (usage.getObjValAs? (Array Json) "commands").toOption.getD #[]
   return { obs, permit, payloads, usage, records }
 

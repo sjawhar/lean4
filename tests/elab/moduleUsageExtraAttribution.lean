@@ -40,7 +40,7 @@ def afterRealize := 0
 "
   for m in ["X", "Y", "Z", "M"] do
     runLean dir #["-o", s!"{m}.olean", s!"--usage={m}.usage", s!"{m}.lean"]
-  let j ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
+  let j ← IO.ofExcept <| ModuleUsage.parseUsage (← IO.FS.readFile (dir / "M.usage"))
   let cmds ← IO.ofExcept <| j.getObjValAs? (Array ModuleUsage.CommandRecord) "commands"
   let owners (mod : Name) : List (Array Name) :=
     (cmds.filter fun (r : ModuleUsage.CommandRecord) => r.extra.contains (mod, false)).toList.map

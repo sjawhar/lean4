@@ -71,7 +71,7 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun dir => do
     (← IO.ofExcept (← ModuleUsage.Testing.keepPermit first.before.env `M (dir / "M.olean") (dir / "M.usage")))
     (·.map fun ce => { ce with refusals := ce.refusals.filter (!· matches .foreignAttribute _) })
   let payloads := permit.payloads
-  let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
+  let usage ← IO.ofExcept <| ModuleUsage.parseUsage (← IO.FS.readFile (dir / "M.usage"))
   IO.println s!"noreuse {(usage.getObjValAs? Bool "noreuse").toOption}, \
     reason {(usage.getObjValAs? String "noreuseReason").toOption}"
   for o in obs do

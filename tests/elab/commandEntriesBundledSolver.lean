@@ -61,6 +61,6 @@ other_tool
   for ce in CommandEntries.ofModuleData md do
     let shown := ce.refusals.map fun r => (toString r).replace root "TOOLCHAIN"
     IO.println s!"command {ce.idx}: refusals {shown}"
-  let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "M.usage"))
+  let usage ← IO.ofExcept <| ModuleUsage.parseUsage (← IO.FS.readFile (dir / "M.usage"))
   let values : Array (String × Option String) ← IO.ofExcept <| usage.getObjValAs? _ "values"
   IO.println s!"values {values.map Prod.fst}"

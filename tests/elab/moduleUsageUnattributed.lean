@@ -17,7 +17,7 @@ def compile (dir : System.FilePath) (name src : String) : IO (Option Json) := do
   unless out.exitCode = 0 do
     IO.println s!"{name}: lean -o --usage failed ({out.exitCode}): {out.stderr.trimAscii}{out.stdout.trimAscii}"
     return none
-  let j ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / s!"{name}.usage"))
+  let j ← IO.ofExcept <| ModuleUsage.parseUsage (← IO.FS.readFile (dir / s!"{name}.usage"))
   let cmds ← IO.ofExcept <| j.getObjValAs? (Array Json) "commands"
   let reason := (j.getObjValAs? String "noreuseReason").toOption.getD "none"
   IO.println s!"{name}: noskip {← IO.ofExcept <| j.getObjValAs? Bool "noskip"}, noreuse {← IO.ofExcept <| j.getObjValAs? Bool "noreuse"}, {cmds.size} command records, \

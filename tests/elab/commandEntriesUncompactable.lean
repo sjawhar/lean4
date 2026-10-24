@@ -27,7 +27,7 @@ theorem foo (n : Nat) : n + 0 = n := by simp
   let (md, _) ← readModuleData (dir / "ST.olean")
   for ce in CommandEntries.ofModuleData md do
     IO.println s!"command {ce.idx}: refusals {ce.refusals}, caches {ce.main.caches.map Prod.fst ++ ce.checked.caches.map Prod.fst}"
-  let usage ← IO.ofExcept <| Json.parse (← IO.FS.readFile (dir / "ST.usage"))
+  let usage ← IO.ofExcept <| ModuleUsage.parseUsage (← IO.FS.readFile (dir / "ST.usage"))
   IO.println s!"noreuse {(usage.getObjValAs? Bool "noreuse").toOption}, \
     reason {(usage.getObjValAs? String "noreuseReason").toOption}"
   runLean dir #["-o", "Importer.olean", "--usage=Importer.usage", "Importer.lean"]
