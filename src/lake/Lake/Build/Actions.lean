@@ -11,6 +11,7 @@ import Lake.Util.Proc
 import Lake.Util.FilePath
 import Lake.Util.IO
 import Lake.Util.Url
+import Lake.Util.CacheToken
 import Init.Data.String.Search
 import Init.Data.String.TakeDrop
 import Init.System.Platform
@@ -166,17 +167,50 @@ public def compileExe
     env :=  macosxDeploymentTarget?.elim #[] fun ver => #[("MACOSX_DEPLOYMENT_TARGET", some ver)]
   }
 
-/-- Download a file using `curl`, clobbering any existing file. -/
+/--
+Download a file using `curl`, replacing any existing file.
+
+`curl` writes to a temporary file next to `file`, unique to this download, which `check`
+vets before it is renamed into place. Thus, `file` never holds a partial download, and a
+failed download (whose temporary file is removed) leaves it as it was. The download gives up
+on a stalled transfer (see `downloadTimeoutArgs`).
+
+With `cacheToken`, the request carries the cache token (see `CacheToken.get?`) and does not
+follow redirects, so that the token goes only to the host of `url`. If the token is refused
+(HTTP 401), the request is retried once with a new token.
+-/
 public def download
   (url : String) (file : FilePath) (headers : Array String := #[])
+  (cacheToken := false) (check : FilePath → LogIO PUnit := fun _ => pure ())
 : LogIO PUnit := do
-  if (← file.pathExists) then
-    IO.FS.removeFile file
-  else
-    createParentDirs file
-  let args := #["-s", "-S", "-f", "-o", file.toString, "-L", url]
-  let args := headers.foldl (init := args) (· ++ #["-H", ·])
-  proc (quiet := true) {cmd := ← Internal.getCurl, args}
+  createParentDirs file
+  let tmp ← uniqueTmpPath file
+  let fetch (token? : Option String) : LogIO (IO.Process.Output × Nat) :=
+    CacheToken.withCurlArgs token? fun authArgs => do
+      let args := #["-s", "-S", "-f", "-o", tmp.toString, "-w", "%{http_code}"]
+      let args := args ++ downloadTimeoutArgs ++ authArgs
+      let args := if token?.isSome then args else args.push "-L"
+      let args := headers.foldl (init := args) (· ++ #["-H", ·])
+      let out ← rawProc {cmd := ← Internal.getCurl, args := args.push url}
+      return (out, out.stdout.trimAscii.toNat?.getD 0)
+  try
+    let token? ← if cacheToken then CacheToken.get? else pure none
+    let (out, code) ← fetch token?
+    let (out, _) ← match code, token? with
+      | 401, some token => do fetch (← CacheToken.renew token)
+      | _, _ => pure (out, code)
+    -- The standard output is the status code that `-w` reports
+    let out := {out with stdout := ""}
+    if out.exitCode = 0 then
+      logOutput out logVerbose
+    else
+      logOutput out logInfo
+      error s!"external command '{← Internal.getCurl}' exited with code {out.exitCode}"
+    check tmp
+    IO.FS.rename tmp file
+  finally
+    -- After a successful download, the temporary file is already gone
+    discard <| (removeFileIfExists tmp).toBaseIO
 
 /-- Unpack an archive `file` using `tar` into the directory `dir`. -/
 public def untar (file : FilePath) (dir : FilePath) (gzip := true) : LogIO PUnit := do
