@@ -59,23 +59,6 @@ structure UsageSidecar where
   (`Lean.ModuleUsage.specProviders`). -/
   specLookups : Array (ModuleUsage.Digest × ModuleUsage.Digest)
 
-/-- A module's `.usekey` sidecar: what Lake saw of the module's build when Lean wrote its `.usage`. -/
-structure UsekeySidecar where
-  localHash : Hash
-  /-- The digest of the bytes of the module's `.usage` (`ModuleUsage.Digest.ofBytes`) the key was written from:
-  readers take the key first and accept only that `.usage`. -/
-  usage : ModuleUsage.Digest
-  /-- The `contentHash` of the module's own `.olean` when the key was written. -/
-  olean : ModuleUsage.Digest
-  /-- `modsysHash` of the module's import closure. -/
-  modsys : ModuleUsage.Digest
-  /-- `closureHash` of the module's direct imports. -/
-  closure : ModuleUsage.Digest
-  /-- For each workspace `extra` module of the `.usage`: the `contentHash` of its `.olean` and its
-  `moduleDigest`. -/
-  extra : NameMap (ModuleUsage.Digest × ModuleUsage.Digest)
-  deriving TypeName
-
 /--
 A name in a usage sidecar, as `Lean.ModuleUsage.nameToJson` writes it: the JSON array of its
 components, root first, each a string or a number. Unlike `toJson Name`, this round-trips
@@ -135,8 +118,8 @@ instance : FromJson UsageSidecar where
       specLookups := ← j.getObjValAs? (Array (ModuleUsage.Digest × ModuleUsage.Digest)) "specLookups"
     }
 
-/-- The parts of an imported module's `.usage` that its importers' checks read (`importUsage?`), which
-the build's sidecar cache keeps: a `UsageSidecar` without the lists only the module's own checks read. -/
+/-- The parts of a module's `.usage` that its importers' checks read (`importUsage?`), which its `.usekey` carries
+(`UsekeySidecar.importer`): a `UsageSidecar` without the lists only the module's own checks read. -/
 structure UsageImport where
   moduleDigest : ModuleUsage.Digest
   closure : ModuleUsage.Digest
@@ -150,15 +133,8 @@ structure UsageImport where
   specKeys : Array (ModuleUsage.Digest × Name)
   deriving TypeName
 
-/-- The `UsageImport` view of a module's own `.usage`. -/
-def UsageSidecar.toImport (u : UsageSidecar) : UsageImport :=
-  { moduleDigest := u.moduleDigest, closure := u.closure, own := u.own, providesDigest := u.providesDigest,
-    provides := u.provides, indirect := u.indirect, providedIds := .mk fun _ => ModuleUsage.providedIds u.provides,
-    specKeys := u.specKeys }
-
-/-- Reads only the fields an importer checks (`importUsage?`). The fields it skips are not importer inputs; a
-sidecar that `UsageSidecar` would reject fails its own module's check, and the importer still binds the sidecar to
-the `.olean` through the `.usekey`. -/
+/-- Reads the fields an importer checks, from a `.usekey`'s `importer` or from a module-system file's `.usage`, which
+holds them under the same names and in the same form. -/
 instance : FromJson UsageImport where
   fromJson? j := do
     let own ← j.getObjValAs? (Array (SidecarName × ModuleUsage.Digest)) "own"
@@ -175,6 +151,44 @@ instance : FromJson UsageImport where
       specKeys := specKeys.map fun (d, n) => (d, n.name)
     }
 
+/-- The `importer` object of the module's `.usekey` (`UsekeySidecar.importer`): `u`'s fields that `UsageImport`
+reads, in the form the `.usage` holds them. -/
+def UsageSidecar.importerJson (u : UsageSidecar) : Json :=
+  let names (ns : Array Name) := Json.arr (ns.map ModuleUsage.nameToJson)
+  Json.mkObj [
+    ("closure", toJson u.closure),
+    ("indirect", names u.indirect),
+    ("moduleDigest", toJson u.moduleDigest),
+    ("own", Json.arr <| u.own.foldl (init := #[]) fun (a : Array Json) n d =>
+      a.push (Json.arr #[ModuleUsage.nameToJson n, toJson d])),
+    ("provides", Json.arr #[names u.provides.1, names u.provides.2]),
+    ("providesDigest", toJson u.providesDigest),
+    ("specKeys", Json.arr (u.specKeys.map fun (d, n) => Json.arr #[toJson d, ModuleUsage.nameToJson n]))]
+
+/-- The format version of Lake's `.usekey` sidecar; Lake reads a key of any other version as absent. -/
+def usekeyVersion : Nat := 15
+
+/-- A module's `.usekey` sidecar: what Lake saw of the module's build when Lean wrote its `.usage`, and the parts of
+that `.usage` its importers read. -/
+structure UsekeySidecar where
+  localHash : Hash
+  /-- The digest of the bytes of the module's `.usage` (`ModuleUsage.Digest.ofBytes`) the key was written from: the
+  module's own check takes the key first and accepts only that `.usage`. -/
+  usage : ModuleUsage.Digest
+  /-- The `contentHash` of the module's own `.olean` when the key was written. -/
+  olean : ModuleUsage.Digest
+  /-- `modsysHash` of the module's import closure. -/
+  modsys : ModuleUsage.Digest
+  /-- `closureHash` of the module's direct imports. -/
+  closure : ModuleUsage.Digest
+  /-- For each workspace `extra` module of the `.usage`: the `contentHash` of its `.olean` and its
+  `moduleDigest`. -/
+  extra : NameMap (ModuleUsage.Digest × ModuleUsage.Digest)
+  /-- What importers read of the `.usage` the key was written from (`UsageSidecar.importerJson`), so that an importer
+  reads the key alone: `olean` binds these fields to the module's `.olean` as `usage` binds the `.usage`. -/
+  importer : UsageImport
+  deriving TypeName
+
 instance : FromJson UsekeySidecar where
   fromJson? j := do
     return {
@@ -184,6 +198,7 @@ instance : FromJson UsekeySidecar where
       modsys := ← j.getObjValAs? ModuleUsage.Digest "modsys"
       closure := ← j.getObjValAs? ModuleUsage.Digest "closure"
       extra := ← nameDigestPairs (← j.getObjVal? "extra")
+      importer := ← j.getObjValAs? UsageImport "importer"
     }
 
 /--
@@ -213,10 +228,11 @@ def stampedSidecar? (path : FilePath) : JobM (Option (ModuleUsage.Digest × Dyna
     | return none
   return if recorded == stamp then some (digest, value) else none
 
-/-- Parses the bytes of the usage-cutoff sidecar at `path`: `none` if it has another format version than
-`Lean.ModuleUsage.usageVersion` (another toolchain wrote it), or, with a warning, if it is not valid, so that the
-module builds normally. -/
-def parseUsageSidecar (α : Type) [FromJson α] (path : FilePath) (bytes : ByteArray) : JobM (Option α) := do
+/-- Parses the bytes of the usage-cutoff sidecar at `path`: `none` if it has another format version than `version`
+(`Lean.ModuleUsage.usageVersion` for a `.usage`, `usekeyVersion` for a `.usekey`; another toolchain wrote it), or,
+with a warning, if it is not valid, so that the module builds normally. -/
+def parseUsageSidecar (α : Type) [FromJson α] (version : Nat) (path : FilePath) (bytes : ByteArray) :
+    JobM (Option α) := do
   match parse with
   | .ok value => return value
   | .error e =>
@@ -227,7 +243,7 @@ where
     let some contents := String.fromUTF8? bytes | throw "not UTF-8"
     let j ← Json.parse contents
     let v ← j.getObjValAs? Nat "version"
-    if v != ModuleUsage.usageVersion then return none
+    if v != version then return none
     some <$> fromJson? (α := α) j
 
 /--
@@ -237,7 +253,7 @@ from). If it exists but is not valid, logs a warning and returns `none`, so the 
 the build's parse of the same contents (`BuildContext.sidecarCache`), without reading the file while its stamp is the
 one recorded with that parse.
 -/
-def readUsageSidecar (α : Type) [FromJson α] [TypeName α] (path : FilePath)
+def readUsageSidecar (α : Type) [FromJson α] [TypeName α] (version : Nat) (path : FilePath)
     (expected? : Option ModuleUsage.Digest := none) : JobM (Option α) := do
   if let some (digest, cached) ← stampedSidecar? path then
     if expected?.any (· != digest) then return none
@@ -251,21 +267,19 @@ def readUsageSidecar (α : Type) [FromJson α] [TypeName α] (path : FilePath)
         let some value := cached.get? α | error s!"{path}: cached sidecar has the wrong type"
         modifyThe (PHashMap FilePath SidecarEntry) (·.insert path (stamp?, digest, cached))
         return some value
-    let some value ← parseUsageSidecar α path bytes | return none
+    let some value ← parseUsageSidecar α version path bytes | return none
     modifyThe (PHashMap FilePath SidecarEntry) (·.insert path (stamp?, digest, Dynamic.mk value))
     return some value
 
 /--
-Reads a module's own `.usage` as `readUsageSidecar` does, but parses it on every read: only the
-module's own checks read all of it. Returns it with the digest of its bytes. Leaves its `UsageImport` in the
-build's sidecar cache for the module's importers (`importUsage?`).
+Reads a module's own `.usage` as `readUsageSidecar` does, but parses it on every read and keeps no parse: only the
+module's own checks read all of it, and its importers read its `.usekey` instead (`importUsage?`). Returns it with
+the digest of its bytes.
 -/
 def readOwnUsage (path : FilePath) (expected? : Option ModuleUsage.Digest := none) :
     JobM (Option (UsageSidecar × ModuleUsage.Digest)) := do
-  let some (bytes, digest, stamp?) ← readSidecarBytes? path expected? | return none
-  let some usage ← parseUsageSidecar UsageSidecar path bytes | return none
-  (← getBuildContext).sidecarCache.atomically do
-    modifyThe (PHashMap FilePath SidecarEntry) (·.insert path (stamp?, digest, Dynamic.mk usage.toImport))
+  let some (bytes, digest, _) ← readSidecarBytes? path expected? | return none
+  let some usage ← parseUsageSidecar UsageSidecar ModuleUsage.usageVersion path bytes | return none
   return some (usage, digest)
 
 /--
@@ -317,33 +331,32 @@ public def modsysHash (hashes : ContentHashes) (importArts : NameMap ImportArtif
   return e.finish
 
 /--
-The `.olean` of importee `m` in `importArts` and its `.usage`, or `none` if either is missing, the
-`.usage` is invalid, or nothing shows that the `.usage` describes that `.olean`: unless `m` is a
-module-system file, its `.usekey` is read first, and the `.usage` must be the one it was written from (its digest,
-`UsekeySidecar.usage`) and the `.olean` the one it records (`contentHash` of the current bytes). Another workspace can
-replace the three files while they are read; reading the key first makes every mixture of old and new files fail
-one of the two comparisons, so the check sees one state of the module or none. An `.olean` rewritten behind Lake's
-back (e.g., by `lean -o` of other contents, which leaves the old sidecars and `.hash`) is not checked against the
-old `.usage` either. A module-system file's bytes are pinned by `modsysHash` instead.
+The `.olean` of importee `m` in `importArts` and what its importers read of its `.usage` (`UsageImport`), or `none`
+if nothing shows that those fields describe that `.olean`. Unless `m` is a module-system file, they come from its
+`.usekey` alone (`UsekeySidecar.importer`, copied from the `.usage` the key was written from), and only if the key
+records the `.olean`'s current bytes (`UsekeySidecar.olean`, `contentHash`). The key is one file, read once, so the
+check sees one state of the module or none even while another workspace rebuilds it. An `.olean` rewritten behind
+Lake's back (e.g., by `lean -o` of other contents, which leaves the old sidecars and `.hash`) is not checked against
+the old key either, and a `.usage` beside the key is never read: one from another compile changes nothing. A
+module-system file's `.usage` is read instead, its bytes pinned by `modsysHash`.
 -/
 def importUsage? (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) (m : Name) :
     JobM (Option (FilePath × UsageImport)) := do
   let some arts := importArts.find? m | return none
   let some olean := arts.olean? | return none
-  let usageFile := olean.withExtension "usage"
   if arts.oleanServer?.isSome then
-    return (olean, ·) <$> (← readUsageSidecar UsageImport usageFile)
-  let some key ← readUsageSidecar UsekeySidecar (olean.withExtension "usekey") | return none
-  let some usage ← readUsageSidecar UsageImport usageFile (expected? := key.usage) | return none
+    return (olean, ·) <$>
+      (← readUsageSidecar UsageImport ModuleUsage.usageVersion (olean.withExtension "usage"))
+  let some key ← readUsageSidecar UsekeySidecar usekeyVersion (olean.withExtension "usekey") | return none
   unless key.olean == (← contentHash hashes olean) do return none
-  return some (olean, usage)
+  return some (olean, key.importer)
 
 /--
 Whether every key the module looked up in the specialization cache (`UsageSidecar.specLookups`) has the same
 providers in its closure as when Lean compiled it: the closure's non-module workspace modules that map the key, each
 with the specialization it maps the key to, digested by the function Lean used (`Lean.ModuleUsage.specProviders`).
-Each closure module's keys come from its `.usage` once `importUsage?` has bound it to the module's current `.olean`,
-in this check's `hashes`. An import that starts providing a key the module missed, stops providing one it
+Each closure module's keys come from `importUsage?`, which binds them to the module's current `.olean` in this check's
+`hashes`. An import that starts providing a key the module missed, stops providing one it
 hit, or maps it elsewhere changes which specialization a fresh compile uses, so the module rebuilds. A module-system
 module's keys are pinned by `modsysHash`, a toolchain module's by the Lean githash.
 -/
@@ -359,7 +372,7 @@ def UsageSidecar.specProvidersUnchanged (usage : UsageSidecar) (hashes : Content
 
 /--
 A digest of the recorded `closure` digest of each direct workspace import, with its name, or `none`
-if `importUsage?` accepts no `.usage` for one, or, given `importedClosures?` (`UsageSidecar.importedClosures`), if
+if `importUsage?` accepts nothing for one, or, given `importedClosures?` (`UsageSidecar.importedClosures`), if
 one's `closure` is not the one the compile imported. A module's closure is its direct imports plus their
 closures; a direct toolchain import is pinned by the source text and the Lean githash (local
 trace). A module is replayed only if this digest is unchanged, so every workspace module's recorded
@@ -427,20 +440,21 @@ where
     freeRegionsThen (parts.map (·.2)) (hashes, imports)
 
 /--
-Whether no closure module whose provides changed (`changed`, each with its current `.usage`) declares a kernel
-constant that another module of the compile declares too, unless the compile depended on that module's copy (`used`
-lists the name under it, as `Lean.ModuleUsage.moduleUsed` lists every declarer of each duplicate the import saw). For
-such a name a fresh compile fails at the import (`throwAlreadyImported`) or at the module's own declaration, or keeps
-a copy the compile did not depend on (`subsumesInfo`). The other declarers are every other workspace module of the
-closure (`importArts`), the compiled module itself (`UsageSidecar.provides`) and every toolchain module a fresh
-compile imports: those its direct imports and the workspace modules' (their `ModuleInput.imports`) name outside the
-workspace, and their imports (`ModuleData.imports`), transitively, as a non-`module` file imports every module its
-imports reach. Lean finds such a module's `.olean` in the workspace's library directories (`getLeanPath`, which Lake
-passes as `LEAN_PATH`) and then its own (`Lean.initSearchPath`), and reads its parts as an import does
-(`Lean.readModuleDataPartsOfFile`). A non-`module` file's kernel constants come from its current `.usage`, which its
-`.usekey` binds to its `.olean`; a `module` file's and a toolchain module's from the private part of their `.olean`,
-pinned by `modsysHash` and by the Lean githash. A module that starts to declare a name has changed provides unless it
-is a toolchain module, a `module` file or the compiled module, so every new duplicate has a declarer this checks.
+Whether no closure module whose provides changed (`changed`, each with its `provides` as `importUsage?` binds them)
+declares a kernel constant that another module of the compile declares too, unless the compile depended on that
+module's copy (`used` lists the name under it, as `Lean.ModuleUsage.moduleUsed` lists every declarer of each duplicate
+the import saw). For such a name a fresh compile fails at the import (`throwAlreadyImported`) or at the module's own
+declaration, or keeps a copy the compile did not depend on (`subsumesInfo`). The other declarers are every other
+workspace module of the closure (`importArts`), the compiled module itself (`UsageSidecar.provides`) and every
+toolchain module a fresh compile imports: those its direct imports and the workspace modules' (their
+`ModuleInput.imports`) name outside the workspace, and their imports (`ModuleData.imports`), transitively, as a
+non-`module` file imports every module its imports reach. Lean finds such a module's `.olean` in the workspace's
+library directories (`getLeanPath`, which Lake passes as `LEAN_PATH`) and then its own (`Lean.initSearchPath`), and
+reads its parts as an import does (`Lean.readModuleDataPartsOfFile`). A non-`module` file's kernel constants come from
+its `provides`, which its `.usekey` holds and binds to its `.olean` (`importUsage?`); a `module` file's and a toolchain
+module's from the private part of their `.olean`, pinned by `modsysHash` and by the Lean githash. A module that starts
+to declare a name has changed provides unless it is a toolchain module, a `module` file or the compiled module, so
+every new duplicate has a declarer this checks.
 
 Names are compared by `Name.hash`, so a hash collision only rebuilds. The `.olean` reads assume the data layout of
 the Lean that Lake was built with, so with another Lean, or if a read fails, the check fails. Kernel constants are
@@ -527,7 +541,7 @@ Whether every name whose defining module the compile looked up, used or referred
 at `resolvedFile`, `readResolvedSidecar`) still resolves to the same module, with the same kinds, as when Lean compiled
 it, no closure module gained a kernel constant another declares (`UsageSidecar.kernelDisjoint`), and no closure module
 that changed gives one of those names a non-local attribute. Each workspace module of the closure whose provides
-digest (`UsageImport.providesDigest`, from a `.usage` that `importUsage?` binds to its current `.olean`) differs from
+digest (`UsageImport.providesDigest`, which `importUsage?` binds to its current `.olean`) differs from
 the one the compile imported (`UsageSidecar.digested`) must still provide each name the resolver mapped to it with the
 recorded kinds, and none of the other names (`Lean.ModuleUsage.ResolvedTable.providerUnchanged`), and none of those
 names may be in its `indirect`: a fresh compile that records an extra module use of such a name
@@ -573,9 +587,9 @@ def UsageSidecar.resolvedUnchanged (usage : UsageSidecar) (presetup : ModulePreS
 
 /--
 Writes the module's `.usekey` from the `.usage` Lean just wrote: the digest of the `.usage` bytes, the module's
-local trace hash, the hash of its `.olean`, the `modsysHash` of its closure, the `closureHash` of its direct imports
-and, for each workspace `extra` module, the hash of its `.olean` and its current `moduleDigest`. Each `.olean` hash
-is of its bytes (`contentHash`).
+local trace hash, the hash of its `.olean`, the `modsysHash` of its closure, the `closureHash` of its direct imports,
+for each workspace `extra` module, the hash of its `.olean` and its current `moduleDigest`, and the `.usage` fields its
+importers read (`UsageSidecar.importerJson`). Each `.olean` hash is of its bytes (`contentHash`).
 
 The key must describe what the compile read, and another workspace can rebuild a shared dependency while the module
 compiles. So every direct import's `closure` and every `extra` module's `moduleDigest`, read now through
@@ -583,7 +597,7 @@ compiles. So every direct import's `closure` and every `extra` module's `moduleD
 took from the `.olean` files it loaded), and the closure's module-system files must have the bytes they had before
 the compile (`modsysBefore`).
 Writes nothing if not, or if the `.usage` does not cover the closure (`UsageSidecar.coversClosure`) or is missing,
-or if `importUsage?` accepts no `.usage` for a direct import or a workspace `extra` module, so the module is never
+or if `importUsage?` accepts nothing for a direct import or a workspace `extra` module, so the module is never
 skipped.
 -/
 public def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
@@ -604,13 +618,14 @@ public def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     extra := extra.push <|
       Json.arr #[ModuleUsage.nameToJson m, toJson (← contentHash hashes olean), toJson imp.moduleDigest]
   let key := Json.mkObj [
-    ("version", ModuleUsage.usageVersion),
+    ("version", usekeyVersion),
     ("usage", toJson usageDigest),
     ("local", toJson presetup.localTrace.hash.hex),
     ("olean", toJson (← oleanDigest?.getDM (contentHash hashes mod.oleanFile))),
     ("modsys", toJson modsys),
     ("closure", toJson closure),
-    ("extra", Json.arr extra)
+    ("extra", Json.arr extra),
+    ("importer", usage.importerJson)
   ]
   ModuleUsage.writeFileReplacing mod.usekeyFile key.compress.toUTF8
 
@@ -619,7 +634,7 @@ Whether nothing the module used changed meaning since Lean wrote its `.usage`: i
 from its current `.usage` (`UsekeySidecar.usage`) and `.olean`, its `.usage` covers its closure (`importArts`,
 `UsageSidecar.coversClosure`), its local inputs are unchanged, no module-system module in its closure changed
 (`modsysHash`), its closure is unchanged (`closureHash`), every constant it used from a workspace module has the
-same digest in that module's current `.usage` (one its key binds to its current `.olean`, `importUsage?`), every
+same digest in that module's `own` (which its key binds to its current `.olean`, `importUsage?`), every
 workspace `extra` module has the same `.olean` hash and `moduleDigest`, every name whose defining module it looked up,
 used or referred to resolves as before (`UsageSidecar.resolvedUnchanged`), and every specialization-cache key it
 looked up has the same providers (`UsageSidecar.specProvidersUnchanged`). Every `.olean` hash is of the file's bytes
@@ -627,7 +642,7 @@ looked up has the same providers (`UsageSidecar.specProvidersUnchanged`). Every 
 -/
 public def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
     (importArts : NameMap ImportArtifacts) : JobM Bool := do
-  let some key ← readUsageSidecar UsekeySidecar mod.usekeyFile | return false
+  let some key ← readUsageSidecar UsekeySidecar usekeyVersion mod.usekeyFile | return false
   let some (usage, _) ← readOwnUsage mod.usageFile (expected? := key.usage) | return false
   if usage.noskip || key.localHash != presetup.localTrace.hash || !usage.coversClosure importArts then
     return false

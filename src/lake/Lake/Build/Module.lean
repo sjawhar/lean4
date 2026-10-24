@@ -858,8 +858,8 @@ public def Module.cacheOutputHashes (mod : Module) : IO PUnit := do
 /--
 Resolves module outputs' usage-cutoff sidecars. A sidecar the entry names that does not resolve
 (e.g., pruned from the cache) fails, so the entry is a miss: the module rebuilds and writes its
-sidecars again, and its dependents, which use its `.usage` only with its `.usekey` (`importUsage?`),
-keep skipping.
+sidecars again, and its dependents, which read only its `.usekey` and accept it only for its `.olean`
+(`importUsage?`), keep skipping.
 -/
 def ModuleOutputDescrs.resolveSidecars
   (descrs : ModuleOutputDescrs) (service? : Option CacheServiceName) (scope? : Option CacheServiceScope)
