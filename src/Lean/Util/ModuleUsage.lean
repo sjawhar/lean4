@@ -717,26 +717,6 @@ def digestedModules (env : Environment) : Array (Name × Digest) :=
   env.header.moduleNames.zipIdx.filterMap (fun (m, i) => (m, ·) <$> s.importedProvides? i)
     |>.qsort (Name.quickLt ·.1 ·.1)
 
-/-- `names` grouped by the module the resolver maps each to (`Environment.getModuleIdxFor?`; `none`: the current
-module, or no module), each with the kinds under which that module provides it (`kindsIn` of its
-`importedOwnProvides`; `0` for `none` and for a module without digests). The `none` group comes first, then the
-modules by name, names sorted. -/
-def resolvedGroups (env : Environment) (names : NameHashSet) : Array (Option Name × Array (Name × UInt8)) := Id.run do
-  -- Index 0 holds the `none` group, index `i + 1` module `i`'s.
-  let byMod := (names : Std.HashSet Name).fold
-    (init := Array.replicate (env.header.moduleNames.size + 1) (#[] : Array Name))
-    fun g n => g.modify ((env.getModuleIdxFor? n).elim 0 (·.toNat + 1)) (·.push n)
-  let mut mods := #[]
-  for k in [1:byMod.size] do
-    let ns := byMod[k]!
-    unless ns.isEmpty do
-      let (kernel, extra) := importedOwnProvides env (k - 1 : Nat)
-      mods := mods.push (env.header.moduleNames[k - 1]!,
-        (ns.qsort Name.quickLt).map fun n => (n, kindsIn kernel extra n))
-  let groups := (mods.qsort (Name.quickLt ·.1 ·.1)).map fun (m, es) => (some m, es)
-  let own := byMod[0]!
-  return if own.isEmpty then groups else #[(none, (own.qsort Name.quickLt).map (·, 0))] ++ groups
-
 /-- A name's identity in a module's `.resolved` sidecar (`encodeResolved`): the digest of its canonical encoding,
 `(({} : Enc).name n).finish`, computed natively without building the buffer (`src/library/usage_digest.cpp`). Lean's
 writer and Lake's check (`ResolvedTable.providerUnchanged`) both call it. -/
@@ -758,12 +738,53 @@ def providedIds (provides : Array Name × Array Name) : Array (Digest × UInt8) 
       out := out.push (resolvedId n, extraKind)
   return out
 
+/-- One entry of a `.resolved` group: a name's `resolvedId` (`hi`, `lo`, as `Digest`) and its kinds, unboxed so that a
+group sorts without following a pointer per comparison. -/
+structure ResolvedEntry where
+  hi : UInt64
+  lo : UInt64
+  kinds : UInt8
+  deriving BEq, Inhabited
+
+/-- Name `n`'s entry with kinds `k`. -/
+def ResolvedEntry.ofName (n : Name) (k : UInt8) : ResolvedEntry :=
+  let d := resolvedId n
+  ⟨d.hi, d.lo, k⟩
+
+/-- The order of `.resolved` entries: by identity (`Digest.lt`), then kinds. Two entries of one group share an identity
+only through a collision, which `ResolvedTable.decode?` rejects; ordering by kinds too makes their bytes canonical. -/
+@[inline] def ResolvedEntry.lt (a b : ResolvedEntry) : Bool :=
+  a.hi < b.hi || (a.hi == b.hi && (a.lo < b.lo || (a.lo == b.lo && a.kinds < b.kinds)))
+
+/-- `names` grouped by the module the resolver maps each to (`Environment.getModuleIdxFor?`; `none`: the current
+module, or no module), each with the kinds under which that module provides it (`kindsIn` of its
+`importedOwnProvides`; `0` for `none` and for a module without digests). The `none` group comes first, then the
+modules by name, each group's entries by `ResolvedEntry.lt`: an order of the names alone, whatever order the set
+holds them in. -/
+def resolvedGroups (env : Environment) (names : NameHashSet) : Array (Option Name × Array ResolvedEntry) := Id.run do
+  -- Index 0 holds the `none` group, index `i + 1` module `i`'s.
+  let byMod := (names : Std.HashSet Name).fold
+    (init := Array.replicate (env.header.moduleNames.size + 1) (#[] : Array Name))
+    fun g n => g.modify ((env.getModuleIdxFor? n).elim 0 (·.toNat + 1)) (·.push n)
+  let mut mods := #[]
+  for k in [1:byMod.size] do
+    let ns := byMod[k]!
+    unless ns.isEmpty do
+      let (kernel, extra) := importedOwnProvides env (k - 1 : Nat)
+      let es := if kernel.isEmpty && extra.isEmpty then ns.map (ResolvedEntry.ofName · 0) else
+        ns.map fun n => ResolvedEntry.ofName n (kindsIn kernel extra n)
+      mods := mods.push (env.header.moduleNames[k - 1]!, es.qsort ResolvedEntry.lt)
+  let groups := (mods.qsort (Name.quickLt ·.1 ·.1)).map fun (m, es) => (some m, es)
+  let own := byMod[0]!
+  return if own.isEmpty then groups else
+    #[(none, (own.map (ResolvedEntry.ofName · 0)).qsort ResolvedEntry.lt)] ++ groups
+
 /-- The bytes of a module's `.resolved` sidecar, from its `resolvedGroups`: the groups (`Enc.array`), each its module
-(`Enc.opt`, `Enc.name`) and its entries (`Enc.array`), each its name's `resolvedId` (`Enc.digest`) and its kinds
-(`Enc.u8`). Read by `ResolvedTable.decode?`. -/
-def encodeResolved (groups : Array (Option Name × Array (Name × UInt8))) : ByteArray :=
-  (({} : Enc).array groups fun e (m?, ns) =>
-    e.opt m? Enc.name |>.array ns fun e (n, k) => e.digest (resolvedId n) |>.u8 k).buf
+(`Enc.opt`, `Enc.name`) and its entries (`Enc.array`), each its name's `resolvedId` (`Enc.digest`: `hi`, then `lo`) and
+its kinds (`Enc.u8`). Read by `ResolvedTable.decode?`. -/
+def encodeResolved (groups : Array (Option Name × Array ResolvedEntry)) : ByteArray :=
+  (({} : Enc).array groups fun e (m?, es) =>
+    e.opt m? Enc.name |>.array es fun e x => e.u64 x.hi |>.u64 x.lo |>.u8 x.kinds).buf
 
 /-- A module's `.resolved` sidecar as Lake reads it (`ResolvedTable.decode?`): its `resolvedGroups`, each name by its
 `resolvedId`. -/
