@@ -150,7 +150,8 @@ where
     else s!"{ms}ms"
 
 def drainQueue : MonitorM (Array OpaqueJob) := do
-  let newJobs ← (← read).jobs.modifyGet ((·, #[]))
+  -- The queue holds the most recently registered job first (see `JobQueue`).
+  let newJobs := (← (← read).jobs.modifyGet ((·, []))).toArray.reverse
   modify fun s => {s with totalJobs := s.totalJobs + newJobs.size}
   return newJobs
 
@@ -259,7 +260,7 @@ def monitorJobs'
 @[inline, deprecated "Deprecated without replacement." (since := "2025-01-08")]
 public def monitorJobs
   (initJobs : Array OpaqueJob)
-  (jobs : IO.Ref (Array OpaqueJob))
+  (jobs : IO.Ref (List OpaqueJob))
   (out : IO.FS.Stream)
   (failLv outLv : LogLevel)
   (minAction : JobAction)

@@ -40,7 +40,7 @@ Registers the job for the top-level build monitor,
   (caption : String) (job : Job α) (optional := false)
 : m (Job α) := do
   let job : Job α := {job with caption, optional}
-  (← getBuildContext).registeredJobs.modify (·.push job)
+  (← getBuildContext).registeredJobs.modify (job :: ·)
   return job.renew
 
 /-- Wraps stray I/O, logs, and errors in `x` into the produced job.  -/
