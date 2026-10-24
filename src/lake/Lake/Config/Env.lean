@@ -70,6 +70,17 @@ public structure Env where
   cacheRevisionEndpoint? : Option String
   /-- The name of the cache service (i.e., `LAKE_CACHE_SERVICE`). -/
   cacheService? : Option CacheServiceName
+  /--
+  The shell command that prints the bearer token of the remote cache service
+  (i.e., `LAKE_CACHE_TOKEN_CMD`; see `CacheToken.get?`).
+  Like the token, it is not added to the environment of processes Lake starts.
+  -/
+  cacheTokenCmd? : Option String := none
+  /--
+  The name of the `s3` cache service that the cache token is sent to (i.e., `LAKE_REMOTE_CACHE`).
+  It is not added to the environment of processes Lake starts.
+  -/
+  remoteCache? : Option String := none
   /-- The initial Lean library search path of the environment (i.e., `LEAN_PATH`). -/
   initLeanPath : SearchPath
   /-- The initial Lean source search path of the environment (i.e., `LEAN_SRC_PATH`). -/
@@ -181,6 +192,8 @@ public def compute
     cacheArtifactEndpoint? := (← IO.getEnv "LAKE_CACHE_ARTIFACT_ENDPOINT").map normalizeUrl
     cacheRevisionEndpoint? := (← IO.getEnv "LAKE_CACHE_REVISION_ENDPOINT").map normalizeUrl
     cacheService? := (← IO.getEnv "LAKE_CACHE_SERVICE").map (.ofString ·.trimAscii.copy)
+    cacheTokenCmd? := (← IO.getEnv "LAKE_CACHE_TOKEN_CMD").filter (!·.trimAscii.isEmpty)
+    remoteCache? := (← IO.getEnv "LAKE_REMOTE_CACHE").map (·.trimAscii.copy) |>.filter (!·.isEmpty)
     githashOverride := (← IO.getEnv "LEAN_GITHASH").getD ""
     toolchain
     initLeanPath := ← getSearchPath "LEAN_PATH",
@@ -214,6 +227,13 @@ where
        return default
   normalizeUrl url :=
     if url.back == '/' then url.dropEnd 1 |>.copy else url
+
+/--
+The name of the cache service that receives the cache token, if any:
+the one `LAKE_REMOTE_CACHE` names, if `LAKE_CACHE_TOKEN_CMD` is set.
+-/
+public def cacheTokenService? (env : Env) : Option String :=
+  if env.cacheTokenCmd?.isSome then env.remoteCache? else none
 
 /-- The toolchain identifier for the Lake cache corresponding to the environment's toolchain. -/
 @[inline] public def cacheToolchain (env : Env) : CacheToolchain :=

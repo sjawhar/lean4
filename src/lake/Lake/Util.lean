@@ -7,6 +7,7 @@ module
 
 prelude
 public import Lake.Util.Binder
+public import Lake.Util.CacheToken
 public import Lake.Util.Casing
 public import Lake.Util.Cli
 public import Lake.Util.Cycle

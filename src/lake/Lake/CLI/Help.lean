@@ -673,6 +673,12 @@ Files are uploaded using the AWS Signature Version 4 authentication protocol
 via `curl`. Thus, the service should generally be an S3-compatible bucket.
 The authentication key is set via the `LAKE_CACHE_KEY` environment variable.
 
+A service that accepts only OAuth bearer tokens (e.g., a Cloud Storage bucket
+without HMAC keys) is instead named by `LAKE_REMOTE_CACHE`, with a command
+that prints a token in `LAKE_CACHE_TOKEN_CMD` (see `lake cache services`).
+Uploads to it need no key, and they only create objects: an object that is
+already present is left as it is, which is not an error.
+
 Since Lake does not currently use cryptographically secure hashes for
 artifacts and outputs, uploads to the cache are prefixed with a scope to
 avoid clashes. This is controlled by `--scope` or `--repo`. With `--repo`,
@@ -798,7 +804,20 @@ The configuration of the system cache could look something like the following:
   artifactEndpoint = \"https://my-s3.com/a0\"
   revisionEndpoint = \"https://my-s3.com/r0\"
 
-If no `cache.defaultService` is configured, Lake will use Reservoir by default."
+If no `cache.defaultService` is configured, Lake will use Reservoir by default.
+
+Requests to an `s3` service that accepts only OAuth bearer tokens (e.g., a
+Cloud Storage bucket without HMAC keys) can carry a token:
+
+  LAKE_REMOTE_CACHE=<name>      the service that receives the token
+  LAKE_CACHE_TOKEN_CMD=<cmd>    a shell command that prints the token
+
+Lake runs the command (with `sh -c`) when it first sends such a request, not
+at startup. It reuses the token for up to 45 minutes, and it runs the command
+again and retries the request once if the service refuses the token (HTTP
+401). The token goes only to the host of the service's artifact endpoint, as
+`Authorization: Bearer <token>`, and only through a temporary file that `curl`
+reads: never on a command line or in the environment of a process Lake starts."
 
 def helpScriptCli :=
 "Manage Lake scripts
