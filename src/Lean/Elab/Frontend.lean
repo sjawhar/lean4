@@ -153,6 +153,65 @@ private partial def collectCommandLints (t : Language.SnapshotTree) (cmdStx? : O
   t.children.foldl (init := acc) fun acc child =>
     collectCommandLints child.get (child.stx? <|> cmdStx?) acc
 
+private unsafe def previousLintsImpl (md : ModuleData) : Array Linter.LintEntry :=
+  match md.entries.find? (·.1 == ``Linter.lintLogExt) with
+  | some (_, es) => unsafeCast es
+  | none => #[]
+
+/-- The persistent lint log entries of a module's `.olean` data. -/
+@[implemented_by previousLintsImpl]
+private opaque previousLints (md : ModuleData) : Array Linter.LintEntry
+
+/--
+`Linter.recordLints` for a reuse run that kept the commands `kept`: a kept command has no diagnostics, so its entries are
+those of the previous `.olean` (`previous`) whose messages are in its span, each command's in its place. The snapshot
+tree lists the header's nodes, then each command's node with its elaboration's nodes, in command order.
+-/
+private def recordLintsWithKept (fileMap : FileMap) (env : Environment) (snap : Language.Lean.InitialSnapshot)
+    (snaps : Language.SnapshotTree) (kept : Array ModuleUsage.KeptCommand) (previous : Array Linter.LintEntry) :
+    BaseIO Environment := do
+  let all := collectCommandLints snaps none #[]
+  let cmds := (Language.Lean.foldCmdSnaps? snap #[] (·.push ·)).getD #[]
+  let sizes := cmds.map fun c => (collectCommandLints (Language.toSnapshotTree c.elabSnap) none #[]).size + 1
+  let mut start := all.size - sizes.foldl (· + ·) 0
+  let mut env ← Linter.recordLints fileMap env (all.extract 0 start)
+  let keptSpans : Std.HashMap Nat ModuleUsage.CommandSpan := kept.foldl (fun m k => m.insert k.i k.span) {}
+  for size in sizes, i in [0:sizes.size] do
+    if let some span := keptSpans[i]? then
+      for e in previous do
+        if span.contains e.message.pos then env := Linter.lintLogExt.addEntry env e
+    else
+      env ← Linter.recordLints fileMap env (all.extract start (start + size))
+    start := start + size
+  return env
+
+/--
+The `.ilean` references and declarations for a reuse run that kept the commands `kept`, from those of its elaborated
+commands (`refs`, `decls`): a kept command has no info tree, so its references are the previous `.ilean`'s in its span,
+each identifier's usages in range order as `Server.findModuleRefs` orders them, with their parent declarations.
+-/
+private def mergeKeptRefs (fileMap : FileMap) (kept : Array ModuleUsage.KeptCommand) (previous : Server.Ilean)
+    (refs : Lsp.ModuleRefs) (decls : Lsp.Decls) : Lsp.ModuleRefs × Lsp.Decls := Id.run do
+  let spans := kept.map fun k => (fileMap.leanPosToLspPos k.span.pos, fileMap.leanPosToLspPos k.span.endPos)
+  let le (a b : Lsp.Position) := a.line < b.line || (a.line == b.line && a.character ≤ b.character)
+  let inKept (l : Lsp.RefInfo.Location) : Bool := spans.any fun (s, e) => le s l.range.start && le l.range.start e
+  let previousDecls : Std.TreeMap String Lsp.DeclInfo := previous.decls
+  let mut refs : Std.TreeMap Lsp.RefIdent Lsp.RefInfo := refs
+  let mut decls : Std.TreeMap String Lsp.DeclInfo := decls
+  for (ident, info) in previous.references do
+    let defn? := info.definition?.filter inKept
+    let usages := info.usages.filter inKept
+    if defn?.isNone && usages.isEmpty then continue
+    let fresh := refs.getD ident { definition? := none, usages := #[] }
+    let definition? := match fresh.definition?, defn? with
+      | some a, some b => if a.range < b.range then some a else some b
+      | a, b => a <|> b
+    refs := refs.insert ident { definition?, usages := (fresh.usages ++ usages).qsort (·.range < ·.range) }
+    for l in defn?.toArray ++ usages do
+      if let some d := l.parentDecl? then
+        if let some i := previousDecls[d]? then decls := decls.insert d i
+  return (refs, decls)
+
 /--
 On-disk wrapper for `--incr-(header-)save`: bundles the snapshot with the indices
 `runInitAttrsForModules` walks on load so we skip page-faulting dep-region `Name`s for modules
@@ -423,8 +482,10 @@ def runFrontend
       return (usageFileName, oleanFileName, nodes, own, ModuleUsage.closureDigest env own provides, provides, indirect,
         stmt, payloads, recs)
     profileitIO ".olean serialization" finalOpts do
-      let commandLints := collectCommandLints snaps none #[]
-      let env ← Linter.recordLints inputCtx.fileMap env commandLints
+      let env ← match reused?.bind (·.previous?) with
+        | some previous =>
+          recordLintsWithKept inputCtx.fileMap env snap snaps kept (previousLints previous)
+        | none => Linter.recordLints inputCtx.fileMap env (collectCommandLints snaps none #[])
       let env := usage?.elim env fun (_, _, _, own, closure, provides, indirect, stmt, payloads, _) =>
         let env := ModuleUsage.setLocalStmt (ModuleUsage.setLocalDigests env own closure provides indirect) stmt
         setCommandEntries env payloads
@@ -434,6 +495,12 @@ def runFrontend
   if let some ileanFileName := ileanFileName? then
     let references := Lean.Server.findModuleRefs inputCtx.fileMap trees (localVars := false)
     let (moduleRefs, decls) ← references.toLspModuleRefs
+    let previousIlean? ← if kept.isEmpty then pure none else
+      (reuseReq?.bind (·.inputs.ilean?)).bindM fun f => do
+        try return (Json.parse (← IO.FS.readFile f) >>= fromJson? (α := Server.Ilean)).toOption
+        catch _ => return none
+    let (moduleRefs, decls) := previousIlean?.elim (moduleRefs, decls) fun previous =>
+      mergeKeptRefs inputCtx.fileMap kept previous moduleRefs decls
     let ilean := {
       module        := mainModuleName
       directImports := Server.collectImports ⟨snap.stx⟩
