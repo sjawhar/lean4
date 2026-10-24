@@ -354,6 +354,15 @@ def commandValueKeys (reads : Array (String × Option String × Bool × Array UI
     unless keys.isEmpty do out := out.insert i (sortedDistinct (· < ·) keys)
   return out
 
+@[extern "lean_io_set_value_reads_unrecorded"]
+private opaque setValueReadsUnrecorded (b : Bool) : BaseIO Unit
+
+/-- Runs `act` without recording the process values it reads on the running thread (`takeValueReads`; a task it starts
+records its own): a run's check of the values a previous run read is no read of the run's own. -/
+def withoutValueReads [Monad m] [MonadFinally m] [MonadLiftT BaseIO m] (act : m α) : m α := do
+  (setValueReadsUnrecorded true : BaseIO Unit)
+  try act finally (setValueReadsUnrecorded false : BaseIO Unit)
+
 /-- The value of the process value `key` (`takeValueReads`) in this process now, `none` if absent or unreadable;
 throws for an unknown key. -/
 def currentValue? (key : String) : IO (Option String) := do

@@ -902,11 +902,13 @@ private def addValueReads (reads : Std.HashMap Nat (Array String)) (c : Json) : 
   c.setObjVal! "values" (toJson (all.foldl (fun out k => if out.back? == some k then out else out.push k) #[]))
 
 /-- What a reuse run (`Lean.Elab.Reuse`) takes into a module's `.usage` from the previous build's for the commands it
-kept, which it did not elaborate and so did not observe: the kept records' extra module uses, and the observations of
-the previous `.usage` that no record attributes to a command (the names it resolved, whether it read the resolver's
-whole map, the specialization-cache keys it looked up, whether a compile made every import an extra use). -/
+kept, which it did not elaborate and so did not observe: the kept records' extra module uses and process values (with
+the previous `.usage`'s digests, which the keep permit found equal to this process's), and the observations of the
+previous `.usage` that no record attributes to a command (the names it resolved, whether it read the resolver's whole
+map, the specialization-cache keys it looked up, whether a compile made every import an extra use). -/
 structure Carried where
   extra : Array (Name × Bool) := #[]
+  values : Array (String × Option Digest) := #[]
   resolved : Array Name := #[]
   resolvedAll : Bool := false
   specKeys : Array Digest := #[]
@@ -998,7 +1000,9 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
   let untracked ← untrackedImports env
   let noreuseReason? := noreuseReason? <|> values.findSome? (·.2.2.2) <|> values.findSome? fun (k, _, changed, _) =>
     guard changed *> some s!"the process value {k} changed while the module was compiled"
-  let values := values.map fun (k, v?, changed, _) => (k, v?, changed)
+  let readKeys : Std.HashSet String := values.foldl (·.insert ·.1) {}
+  let readDigests : Array (String × Option Digest) := values.map fun (k, v?, _, _) => (k, valueDigest? v?)
+  let valueDigests := (readDigests ++ carried.values.filter (!readKeys.contains ·.1)).qsort (·.1 < ·.1)
   let commands := if readers.isEmpty then commands else commands.map (addValueReads readers)
   let fields : List (String × Json) := [("version", usageVersion), ("noskip", incrLoaded),
     ("moduleDigest", toJson (moduleDigestOf own)),
@@ -1026,7 +1030,7 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
     ("olean", toJson oleanDigest),
     ("githash", toJson Lean.githash),
     ("untracked", Json.arr (untracked.map fun (m, d) => pair m d)),
-    ("values", Json.arr (values.map fun (k, v?, _) => Json.arr #[toJson k, toJson (valueDigest? v?)])),
+    ("values", Json.arr (valueDigests.map fun (k, d?) => Json.arr #[toJson k, toJson d?])),
     ("noreuse", noreuseReason?.isSome)]
   let fields := match noreuseReason? with
     | some reason => fields ++ [("noreuseReason", toJson reason)]

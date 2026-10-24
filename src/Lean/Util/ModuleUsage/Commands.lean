@@ -643,7 +643,8 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
     let (usesStmt, usesFull) ← match usesOf k.i used full compiled with
       | .ok uses => pure uses
       | .error p => return p
-    return .record { r with usesStmt, usesFull, extra := k.record.extra }
+    -- the command did not run here: the process values it read are those of its previous run
+    return .record { r with usesStmt, usesFull, extra := k.record.extra, values := k.record.values }
   let parts ← CommandEntries.parallelMap observations (lanes := lanes) fun obs =>
     pure (obs.i, obs.stx, obs.before, (none : Option Digest), part obs)
   let parts := (parts ++ kept.map fun k => (k.i, k.stx, k.before, some k.record.ctx, keptPart k)).qsort (·.1 < ·.1)

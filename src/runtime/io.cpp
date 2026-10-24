@@ -1784,7 +1784,11 @@ extern "C" LEAN_EXPORT uint8 lean_io_set_nondeterministic_reads_unrecorded(uint8
     return prev;
 }
 
+// while set, the thread's value reads are not recorded (`lean_io_set_value_reads_unrecorded`)
+static thread_local bool t_value_reads_unrecorded = false;
+
 static void note_value_read_core(std::string const & key, char const * value, uint32 ctx) {
+    if (t_value_reads_unrecorded) return;
     auto it = g_value_reads->find(key);
     if (it == g_value_reads->end()) {
         it = g_value_reads->emplace(key, value_read{value != nullptr, value ? value : "", false, {}}).first;
@@ -2195,6 +2199,12 @@ extern "C" LEAN_EXPORT obj_res lean_io_context_value_keys(b_obj_arg cs) {
     object * r = lean_alloc_array(0, keys.size());
     for (std::string const & k : keys) r = lean_array_push(r, mk_string(k));
     return r;
+}
+
+/* setValueReadsUnrecorded (b : Bool) : BaseIO Unit: while `b`, the running thread's value reads are not recorded */
+extern "C" LEAN_EXPORT obj_res lean_io_set_value_reads_unrecorded(uint8 b) {
+    t_value_reads_unrecorded = b;
+    return box(0);
 }
 
 /* markRefAccounted (r : @& IO.Ref α) : BaseIO Unit: writes to `r` are noted for no context */

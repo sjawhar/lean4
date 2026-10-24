@@ -58,6 +58,8 @@ structure PreviousUsage where
   specKeys : Array Digest
   /-- The previous `.usage`'s `allExtra`. -/
   allExtra : Bool
+  /-- The digest of each process value of the previous `.usage`'s `values`. -/
+  valueDigests : Std.HashMap String (Option Digest)
 
 /-- What the previous build gives a reuse run. -/
 structure Previous extends PreviousUsage where
@@ -142,7 +144,8 @@ where
       resolved := record.resolved.flatMap fun (_, ns) => ns.map (·.1)
       resolvedAll := record.resolvedAll
       specKeys := record.specLookups.map (·.1)
-      allExtra := ← j.getObjValAs? Bool "allExtra" }
+      allExtra := ← j.getObjValAs? Bool "allExtra"
+      valueDigests := record.values.foldl (init := {}) fun m (k, d?) => m.insert k d? }
 
 /-- A reuse run's state, shared by the frontend's command loop and the end of `runFrontend`. -/
 structure Request where
@@ -211,7 +214,8 @@ def Request.start (req : Request) (env : Environment) (opts : Options) : IO Unit
   let status ← profileitIO "reuse permit" opts do
     try
       if env.header.isModule then pure (.declined "module-system") else
-      match ← readPrevious env (← MonadExcept.ofExcept (← IO.wait prefetched)) req.lib? with
+      -- the permit's reads of the values the previous build read are not this run's (`valuesChanged?`)
+      match ← withoutValueReads (readPrevious env (← MonadExcept.ofExcept (← IO.wait prefetched)) req.lib?) with
       | .ok prev => pure (.active prev (← mkAccountedRef {}))
       | .error reason => pure (.declined reason)
     catch e => pure (.declined s!"the previous outputs cannot be read: {e}")
@@ -450,9 +454,11 @@ def Request.finish (req : Request) : IO Outcome := do
       ("reElab", toJson (p.reasons.map (·.1))),
       ("elabReasons", Json.mkObj (counts.toList.map fun (r, n) => (r, toJson n)))]
     if p.kept.isEmpty then return { field, effects := p.effects, computed := p.computed }
+    let keys := p.kept.foldl (init := ({} : Std.HashSet String)) fun s k => k.record.values.foldl (·.insert ·) s
     let carried : Carried :=
       { extra := p.kept.flatMap (·.record.extra), resolved := prev.resolved, resolvedAll := prev.resolvedAll
-        specKeys := prev.specKeys, allExtra := prev.allExtra }
+        specKeys := prev.specKeys, allExtra := prev.allExtra
+        values := keys.toArray.filterMap fun k => (prev.valueDigests[k]?).map (k, ·) }
     return { field, kept := p.kept, effects := p.effects, computed := p.computed, carried
              usedUnattributed := prev.usedUnattributed, previous? := some prev.permit.data }
 

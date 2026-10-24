@@ -1,0 +1,9 @@
+z edited: reuse run exit 0, output "", reuse {"elabReasons":{"text":1},"kept":3,"reElab":[3],"total":4}
+z edited: fresh build exit 0; values: reuse run [env:BAR, env:FOO], fresh [env:BAR, env:FOO]
+z edited: command values: reuse run [[env:FOO], [env:BAR], [], [], []], fresh [[env:FOO], [env:BAR], [], [], []]
+z edited: usage fields differing from the fresh build's but `reuse`: []
+b reads nothing: reuse run exit 0, output "", reuse {"elabReasons":{"position":2,"text":1},"kept":1,"reElab":[1,2,3],"total":4}
+b reads nothing: fresh build exit 0; values: reuse run [env:FOO], fresh [env:FOO]
+b reads nothing: command values: reuse run [[env:FOO], [], [], [], []], fresh [[env:FOO], [], [], [], []]
+b reads nothing: usage fields differing from the fresh build's but `reuse`: [resolved]
+FOO changed after the z edit: exit 0, reuse {"declined":"the process value env:FOO is not what it was when the module was compiled"}
