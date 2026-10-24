@@ -464,8 +464,16 @@ extern "C" LEAN_EXPORT obj_res lean_usage_file_digest_stamped(b_obj_arg path) {
     return io_result_mk_ok(r);
 }
 
+/* The largest file `lean_usage_read_file_stamped` reads, so that a damaged sidecar cannot make Lake allocate without
+bound. The `.usage` of a module whose closure has about 4,900 workspace modules is about 3 MB. */
+constexpr size_t max_stamped_read = size_t(256) << 20;
+
+static obj_res too_large_error() {
+    return io_result_mk_error("larger than " + std::to_string(max_stamped_read) + " bytes");
+}
+
 /* `Lean.ModuleUsage.readFileStamped`: the file's bytes, with the stamp of the file they were read from if it stands
-for them, as `lean_usage_file_digest_stamped` decides it. */
+for them, as `lean_usage_file_digest_stamped` decides it. Fails for a file larger than `max_stamped_read`. */
 extern "C" LEAN_EXPORT obj_res lean_usage_read_file_stamped(b_obj_arg path) {
     obj_res err;
     FILE * f = open_for_digest(path, err);
@@ -480,6 +488,10 @@ extern "C" LEAN_EXPORT obj_res lean_usage_read_file_stamped(b_obj_arg path) {
         stamp_of(st, before);
         expected = static_cast<size_t>(st.st_size);
     }
+    if (expected > max_stamped_read) {
+        fclose(f);
+        return too_large_error();
+    }
 #endif
     // One byte beyond the expected size, so that a file of that size is read to its end without growing the array.
     object * bytes = lean_alloc_sarray(1, 0, expected + 1);
@@ -487,6 +499,11 @@ extern "C" LEAN_EXPORT obj_res lean_usage_read_file_stamped(b_obj_arg path) {
     for (;;) {
         size_t cap = lean_sarray_capacity(bytes);
         if (size == cap) {
+            if (cap > max_stamped_read) {
+                fclose(f);
+                lean_dec(bytes);
+                return too_large_error();
+            }
             object * grown = lean_alloc_sarray(1, size, 2 * cap);
             memcpy(lean_sarray_cptr(grown), lean_sarray_cptr(bytes), size);
             lean_dec(bytes);
