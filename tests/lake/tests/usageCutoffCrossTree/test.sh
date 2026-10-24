@@ -344,7 +344,8 @@ case8() {
 }
 
 # 9. A module's index keeps the 8 most recently written compiles, and a hit rewrites the file of the compile it
-# restores, which makes it recent again
+# restores, which makes it recent again. t3's compile of `a := 1` is a new file, not the first compile's again: its
+# `.usage` records the provides digest of each import (`digested`), and t3's `X` provides another name.
 case9() {
   local v names=()
   mkpkg t
@@ -370,7 +371,8 @@ case9() {
   jobhas Test.B "Built Test.B"
   test_exp -f "$d/${names[2]}"
   test_exp ! -e "$d/${names[3]}"
-  test_exp -f "$d/${names[1]}"
+  test_exp -f "$d/$(idxname t3 B)"
+  test_exp "$(find "$d" -maxdepth 1 -name '*.json' | wc -l)" = 8
 }
 
 # 10. No lookup and no index write without a writable cache and restored artifacts (each tree has its own value of
