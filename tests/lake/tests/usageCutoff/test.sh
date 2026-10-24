@@ -708,6 +708,44 @@ test_run build Test.MS
 printf 'module\n\npublic def ms := 2\n' > Test/MS.lean
 test_out "Built Test.MS" build -v Test.MS
 match_text '"reuse":{"declined":"module-system"}' .lake/build/lib/lean/Test/MS.usage
+# a `.usage` that is `noskip` (a compile that loaded an `--incr-load` snapshot writes one; here the flag is set by
+# hand, with the `.usekey` rebound to the new bytes) lets Lake neither skip the module nor pass the reuse flags: the
+# module is compiled again in full
+cat > SetNoskip.lean <<'EOF'
+import Lean
+open Lean
+
+def main (args : List String) : IO Unit := do
+  let [usage, key] := args | throw <| IO.userError "usage: SetNoskip M.usage M.usekey"
+  let text := (← IO.FS.readFile usage).replace "\"noskip\":false" "\"noskip\":true"
+  let keyJ := (← IO.ofExcept <| Json.parse (← IO.FS.readFile key)).setObjVal! "usage"
+    (toJson (ModuleUsage.Digest.ofBytes text.toUTF8))
+  -- under an artifact cache the sidecars are read-only links into it: replaced, never written through
+  IO.FS.removeFile usage
+  IO.FS.writeFile usage text
+  IO.FS.removeFile key
+  IO.FS.writeFile key keyJ.compress
+EOF
+printf 'theorem L : 1 = 1 := rfl\ndef v := 11\n' > Test/A.lean
+test_run build Test.N
+test_cmd "$LAKE" env lean --run SetNoskip.lean $M.usage $M.usekey
+match_text '"noskip":true' $M.usage
+printf 'theorem L : 1 = 1 := by rfl\ndef v := 11\n' > Test/A.lean
+test_out "Built Test.M" build -v Test.N
+no_reuse_log
+match_text '"reuse":{"declined":"noskip"}' $M.usage
+cd ..
+# a module of a `precompileModules` library is never partially compiled again
+mkdir -p declpre/Test
+printf 'name = "test"\n[[lean_lib]]\nname = "Test"\nprecompileModules = true\n' > declpre/lakefile.toml
+cd declpre
+printf 'theorem L : 1 = 1 := rfl\ndef v := 5\n' > Test/A.lean
+printf 'import Test.A\ntheorem a : 1 = 1 := L\ndef b := v + 1\n' > Test/M.lean
+test_run build Test.M
+printf 'theorem L : 1 = 1 := by rfl\ndef v := 5\n' > Test/A.lean
+test_out "Built Test.M" build -v Test.M
+no_reuse_log
+match_text '"reuse":{"declined":"precompiled"}' .lake/build/lib/lean/Test/M.usage
 cd ..
 
 rm -f produced.out
