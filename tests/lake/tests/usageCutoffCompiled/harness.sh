@@ -728,9 +728,9 @@ lcnf_override_s1() { lo_y $'def y : Nat := app k 7\ndef evil (n : Nat) : Nat := 
 # unfolds to a type former, so `S` is a trivial structure around `n` (trivial-structure info, constructor layout);
 # `M` reads `S` in the kept layout while `Main`, rebuilt because `mkS` changes, builds it in the new one.
 # `abi_void`: the same for the impure trivial-structure info, with a field whose type unfolds to `Void`.
-# `abi_enum` guards the IR type of `E`: it is computed through `toLCNFType`, which unfolds at `.all`
-# transparency, so the local attribute leaves it, and `Y`'s code, unchanged. `abi_monotype`: `Y` overwrites the
-# mono type of its own constructor through the public `monoTypeExt.insert`.
+# `abi_enum` (control): the IR type of `E` is computed through `toLCNFType`, which unfolds at `.all` transparency, so
+# the local attribute leaves it, and `Y`'s code, unchanged. `abi_monotype`: `Y` overwrites the mono type of its own
+# constructor through the public `monoTypeExt.insert`.
 abi_files() {
   lakefile_app; mkdir_t
   printf 'def Pred : Type := Nat → Prop\ninstance : Inhabited Pred := ⟨fun _ => True⟩\n' > T/A.lean
@@ -1510,6 +1510,42 @@ elab_claim_ms_s0() {
 }
 elab_claim_ms_s1() { claim_z '' ru lean_nat_succ; }
 
+# A name the elaborator generates from the module of a constant it mentions (`mkBaseNameWithSuffix`, through
+# `findModuleOf?`): an anonymous instance gets the suffix of the current project unless a constant of its type resolves
+# to a module of the project. `C`, in library `T`, declares `instance : Inhabited Foo` for `U.A`'s `Foo`, so it is
+# named `instInhabitedFoo_t`; in state 1 `Z` claims `Foo` with an IR declaration. `declname_claim`: `C` imports `Z`
+# then `U.A`, so `Foo` resolves to `T.Z`, a module of the project, and a fresh `C` names the instance
+# `instInhabitedFoo`; `declname_claim_after` (control): `U.A` then `Z`, and the name stays.
+declname_claim_files() {
+  printf 'name = "test"\ndefaultTargets = ["T"]\n[[lean_lib]]\nname = "T"\n[[lean_lib]]\nname = "U"\n' > lakefile.toml
+  mkdir -p T U
+  printf 'def Foo : Type := Nat\ndef foo0 : Foo := (0 : Nat)\n' > U/A.lean
+  printf 'import Lean\ndef zdummy : Nat := 1\n' > T/Z.lean
+  printf 'import %s\nimport %s\ninstance : Inhabited Foo := ⟨foo0⟩\n' "$1" "$2" > T/C.lean
+  printf 'import T.C\n' > T.lean
+  printf 'import T\nopen Lean in\n#eval show CoreM Unit from do\n' > Check.lean
+  printf '  for n in [`instInhabitedFoo, `instInhabitedFoo_t] do IO.println s!"{n} {(← getEnv).contains n}"\n' >> Check.lean
+}
+declname_claim_s0() { declname_claim_files T.Z U.A; }
+declname_claim_s1() { claim_z '' Foo lean_nat_succ; }
+declname_claim_after_s0() { declname_claim_files U.A T.Z; }
+declname_claim_after_s1() { claim_z '' Foo lean_nat_succ; }
+
+# A compile that reads the resolver's whole map (`Environment.const2ModIdx`) records `resolvedAll`, so that a change to
+# any closure module's provides rebuilds it. `M` defines `c` from whether the map has `zextra`, which no term of `M`
+# names; state 1 adds `zextra` to `Z`, which `M` imports and uses nothing of.
+resolved_all_s0() {
+  printf 'name = "test"\ndefaultTargets = ["T"]\n[[lean_lib]]\nname = "T"\n' > lakefile.toml
+  mkdir_t
+  printf 'def zdummy : Nat := 1\n' > T/Z.lean
+  printf 'import Lean\nimport T.Z\nopen Lean Elab Command in\nrun_cmd do\n' > T/M.lean
+  printf '  let has := (← getEnv).const2ModIdx.contains `zextra\n' >> T/M.lean
+  printf '  elabCommand (← `(def $(mkIdent `c) : Bool := $(quote has)))\n' >> T/M.lean
+  printf 'import T.M\n' > T.lean
+  printf 'import T\n#eval c\n' > Check.lean
+}
+resolved_all_s1() { printf 'def zdummy : Nat := 1\ndef zextra : Nat := 2\n' > T/Z.lean; }
+
 # An instance another module declares for a declaration it does not define, whose name a sibling module then claims.
 # `W` defines `foo : Inhabited Nat`, `X` makes it an instance, and `M` takes `default : Nat` through it; `foo` is
 # `@[inline]`, so `M`'s code inlines `W`'s `foo` while `foo` resolves to `W`. In state 1 `Z` claims `foo` with an IR
@@ -1695,9 +1731,15 @@ dup_new_deep_s1() { printf 'def deep : Nat := 0\ndef t : Nat := 2\n' > T/K2.lean
 
 # The axioms an importer's `#print axioms` reports come from the axioms each import's `.olean` exports for its
 # declarations (`exportedAxiomsExt`). `A`'s list for `S9` follows the order in which the export visits `A`'s constants,
-# so state 1's `r7 (s : S9)` changes it although `S9` is unchanged; `B` uses only `S9`, and `Check.lean` asks for the
-# axioms of `B.t` (`axiom_summary`) or of `C.u`, which uses `t` (`axiom_summary_trans`).
-axiom_summary_a() { printf 'axiom ax : Nat\nstructure S9 where\n  x : Fin ax\ndef r7 (s : %s) : Nat := 0\n' "$1" > T/A.lean; }
+# so state 1's `r7 (s : S9)` changes it although `S9` is unchanged: from no axioms to both of `ax1` and `ax2`, which
+# `S9`'s fields use, so that the change is one of membership, not only of order. `B` uses only `S9`, and `Check.lean`
+# asks for the axioms of `B.t` (`axiom_summary`) or of `C.u`, which uses `t` (`axiom_summary_trans`).
+# `CheckAxioms.lean` prints every entry each module's `.olean` exports, in order, so the entries a compile with the
+# usage data writes (`storeExportedAxioms`) are compared with those of the fresh build, which writes none.
+axiom_summary_a() {
+  printf 'axiom ax1 : Nat\naxiom ax2 : Nat\nstructure S9 where\n  x : Fin ax1\n  y : Fin ax2\n' > T/A.lean
+  printf 'def r7 (s : %s) : Nat := 0\n' "$1" >> T/A.lean
+}
 axiom_summary_s0() {
   printf 'name = "test"\ndefaultTargets = ["T"]\n[[lean_lib]]\nname = "T"\n' > lakefile.toml
   mkdir_t
@@ -1705,6 +1747,20 @@ axiom_summary_s0() {
   printf 'import T.A\ntheorem t (s : S9) : s = s := rfl\n' > T/B.lean
   printf 'import T.B\n' > T.lean
   printf 'import T\n#print axioms t\n' > Check.lean
+  cat > CheckAxioms.lean <<'EOF'
+import Lean
+import T
+open Lean
+-- the extension is private: its entries are read from each module's data, by the suffix of its name
+unsafe def axEntries : CoreM Unit := do
+  let env ← getEnv
+  for h : i in [0:env.header.moduleNames.size] do
+    let m := env.header.moduleNames[i]
+    if m.getRoot == `T then
+      let es := (env.header.moduleData[i]!.entries.find? (·.1.toString.endsWith ".exportedAxiomsExt")).elim #[] (·.2)
+      IO.println s!"{m}: {es.map (unsafeCast : EnvExtensionEntry → Name × Array Name)}"
+#eval axEntries
+EOF
 }
 axiom_summary_s1() { axiom_summary_a S9; }
 axiom_summary_trans_s0() {
@@ -2373,7 +2429,8 @@ all_cases="spec_transitive spec_link spec_type spec_precomp plugin_replay csimp_
   cov_projfn cov_projfn_rev cov_mlike cov_sparse cov_auxrec cov_sibmatch cov_sibmatch_rev cov_ctlmatch
   cov_sibinst cov_sibclass cov_sibmeta cov_ckind_rev cov_recarg_rev
   collide_first collide_after collide_rev collide_rev_first collide_drop_loser collide_shape collide_shape_rev
-  elab_claim elab_claim_after elab_claim_ms inst_claim inst_claim_after td_claim td_inst
+  elab_claim elab_claim_after elab_claim_ms declname_claim declname_claim_after resolved_all inst_claim inst_claim_after
+  td_claim td_inst
   kern_body kern_body_after kern_codegen kern_thm_dup kern_thm_dup_after kern_thm_flip kern_thm_trans
   kern_thm_conflict kern_thm_all kern_thm_third dup_new dup_new_trans dup_new_thm dup_new_tc dup_new_own dup_new_ms
   dup_new_third dup_new_tc_outside dup_new_deep axiom_summary axiom_summary_trans
