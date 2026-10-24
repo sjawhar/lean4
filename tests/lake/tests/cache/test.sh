@@ -408,7 +408,9 @@ match_text 'declaration uses' .lake/log/mods.expected
 match_text 'linter.unusedVariables' .lake/log/mods.expected
 # The cached logs name no path of the tree that built them (the trace's
 # verbose entry with the command line of `lean` does)
-no_match_text tree1 "$LOG_CACHE"/outputs/log/*.json
+log_maps() { cat "$LOG_CACHE"/outputs/log/*.json > .lake/log/maps.json; }
+log_maps
+no_match_text tree1 .lake/log/maps.json
 log_build tree2 Log --no-build
 log_msgs .lake/log/mods.out
 check_diff .lake/log/mods.expected .lake/log/mods.out
@@ -420,10 +422,21 @@ check_diff .lake/log/mods.expected .lake/log/mods.out
 test_cmd rm -rf .lake/log/tree2/.lake
 LAKE_CACHE_DIR="$LOG_CACHE" LAKE_ARTIFACT_CACHE=true \
   test_status 1 -d .lake/log/tree2 build Log --no-build --wfail
+# A mapping written from a trace (the cache lost the mapping, and the trace
+# still names outputs in the cache) keeps the trace's log
+test_cmd rm -rf "$LOG_CACHE/outputs"
+log_build tree1 Log --no-build
+log_maps
+match_text 'declaration uses' .lake/log/maps.json
+test_cmd rm -rf .lake/log/tree2/.lake
+log_build tree2 Log --no-build
+log_msgs .lake/log/mods.out
+check_diff .lake/log/mods.expected .lake/log/mods.out
 # Other artifacts (`buildArtifactUnlessUpToDate`)
 log_build tree1 warnArt
 log_msgs .lake/log/art.expected
 match_text 'a warning logged by its build' .lake/log/art.expected
+match_text 'an info message logged by its build' .lake/log/art.expected
 log_build tree2 warnArt --no-build
 log_msgs .lake/log/art.out
 check_diff .lake/log/art.expected .lake/log/art.out
@@ -431,28 +444,36 @@ check_diff .lake/log/art.expected .lake/log/art.out
 log_build tree1 Log -o "$TEST_DIR/.lake/log/outputs.jsonl"
 LAKE_CACHE_DIR="$LOG_CACHE" test_run -d .lake/log/tree1 \
   cache add "$TEST_DIR/.lake/log/outputs.jsonl"
-match_text ltar "$LOG_CACHE"/outputs/log/*.json
+log_maps
+match_text ltar .lake/log/maps.json
+# `cache add` wrote the module mappings without a log
+no_match_text 'declaration uses' .lake/log/maps.json
 test_cmd rm -rf .lake/log/tree2/.lake
 log_build tree2 Log --no-build
 match_text 'Unpacked Log.Sorry' produced.out
 log_msgs .lake/log/mods.out
 check_diff .lake/log/mods.expected .lake/log/mods.out
+# The unpack rewrote the mapping with the log of the archive's trace
+log_maps
+match_text 'declaration uses' .lake/log/maps.json
 # Mappings without a log (as written by older versions of Lake) still restore
 if command -v jq > /dev/null; then # skip if no jq found
   for f in "$LOG_CACHE"/outputs/log/*.json; do
     jq 'del(.log)' "$f" > "$f.new"
     test_cmd mv "$f.new" "$f"
   done
-  no_match_text '"log"' "$LOG_CACHE"/outputs/log/*.json
+  log_maps
+  no_match_text '"log"' .lake/log/maps.json
   test_cmd rm -rf .lake/log/tree2/.lake
   log_build tree2 Log warnArt --no-build
   log_msgs .lake/log/old.out
   check_diff /dev/null .lake/log/old.out
 fi
 
-# When a replay cannot keep the outputs its trace describes (here, because they
-# were changed after the build) and Lake builds them again, the cache keeps the
-# log of that build alone: a copy that restores them prints each message once.
+# A replay stores the log it replayed. Where Lake rechecks the outputs a replay
+# keeps against the hashes their trace records, changing them after the build
+# (below) makes it rebuild them, and the cache must then keep the log of that
+# rebuild alone. Either way, a copy that restores them prints each message once.
 REBUILD_CACHE="$(norm_path "$TEST_DIR")/.lake/rebuild-cache"
 test_cmd cp -r log .lake/log/tree3
 test_cmd cp -r log .lake/log/tree4
