@@ -450,5 +450,30 @@ if command -v jq > /dev/null; then # skip if no jq found
   check_diff /dev/null .lake/log/old.out
 fi
 
+# When a replay cannot keep the outputs its trace describes (here, because they
+# were changed after the build) and Lake builds them again, the cache keeps the
+# log of that build alone: a copy that restores them prints each message once.
+REBUILD_CACHE="$(norm_path "$TEST_DIR")/.lake/rebuild-cache"
+test_cmd cp -r log .lake/log/tree3
+test_cmd cp -r log .lake/log/tree4
+test_cmd chmod -R u+w .lake/log/tree3 .lake/log/tree4
+rebuild_build() {
+  tree="$1"; shift
+  LAKE_CACHE_DIR="$REBUILD_CACHE" LAKE_ARTIFACT_CACHE=true \
+    lake_out -d ".lake/log/$tree" build "$@"
+}
+rebuild_build tree3 Log.Sorry warnArt
+for f in .lake/log/tree3/.lake/build/lib/lean/Log/Sorry.olean .lake/log/tree3/.lake/build/warn.txt; do
+  test_cmd chmod u+w "$f"
+  echo changed >> "$f"
+  test_cmd rm -f "$f.hash"
+done
+test_cmd rm -rf "$REBUILD_CACHE"
+rebuild_build tree3 Log.Sorry warnArt
+rebuild_build tree4 Log.Sorry warnArt --no-build
+log_msgs .lake/log/rebuild.out
+test_cmd_eq 1 grep -c 'declaration uses' .lake/log/rebuild.out
+test_cmd_eq 1 grep -c 'a warning logged by its build' .lake/log/rebuild.out
+
 # Cleanup
 rm -f produced.* Ignored.lean
