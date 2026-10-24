@@ -1,0 +1,13 @@
+name = "root"
+defaultTargets = ["main"]
+
+[[require]]
+name = "dep"
+path = "dep"
+
+[[lean_lib]]
+name = "Linters"
+
+[[lean_exe]]
+name = "main"
+root = "Main"

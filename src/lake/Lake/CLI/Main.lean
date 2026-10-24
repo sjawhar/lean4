@@ -1123,11 +1123,10 @@ def runBuiltinLint
   for c in checks do
     unless (ws.findTargetModule? c).isSome do
       error s!"unknown checks module `{c}`; it must be a module of a package in the workspace"
-  -- Executables' source directories are not in `LEAN_SRC_PATH`, but their modules are linted too.
-  let exeSrcPath : SearchPath := ws.packages.foldl (init := {}) fun dirs pkg =>
-    pkg.targetDecls.foldr (init := dirs) fun cfg dirs =>
-      if let some cfg := cfg.leanExeConfig? then pkg.srcDir / cfg.srcDir :: dirs else dirs
-  let args := { args with mods, checks, srcSearchPath := ws.augmentedLeanSrcPath ++ exeSrcPath }
+  -- Lint output names the source file Lake compiles for each module (as `+mod` resolves it).
+  let args := { args with
+    mods, checks, srcSearchPath := ws.augmentedLeanSrcPath,
+    moduleSrcFile? := fun mod => (ws.findTargetModule? mod).map (·.leanFile) }
   -- Checks modules are imported alongside each lint target, so they must be built as well.
   let buildMods := mods ++ checks.filter (!mods.contains ·)
   let specs ← parseTargetSpecs ws (buildMods.map (s!"+{·}") |>.toList)

@@ -11,7 +11,7 @@ name = "Foo"
 [[lean_lib]]
 name = "FooTest"
 srcDir = "test"
-roots = ["Foo.Test"]
+roots = ["Foo.Test", "Foo.Doc"]
 
 # A srcDir that no library uses.
 [[lean_exe]]

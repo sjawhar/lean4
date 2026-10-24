@@ -1,7 +1,7 @@
 import Linters
 
 -- Env linter (`linter.dummyMarker`, default-on): recorded via
--- `findDeclarationRanges?` and the workspace source search path.
+-- `findDeclarationRanges?` and the file Lake compiles for the module.
 def firstDummyMarker : Nat := 1
 
 -- Text linter (`linter.unusedVariables`, default-on): recorded from the
