@@ -3,7 +3,7 @@
 # Released under Apache 2.0 license as described in the file LICENSE.
 # Authors: Mac Malone, Claude Code
 
-"""A mock remote artifact cache for `test.sh`.
+"""A mock remote artifact cache for `test.sh` and `../remoteCache/test.sh`.
 
 Serves an S3-style bucket (`GET`/`PUT` of `<store>/<path>`) and the part of the
 Reservoir API that Lake uses. Faults are selected by the first path segment, so
@@ -18,9 +18,20 @@ a test picks one by pointing an endpoint at it (e.g. `.../corrupt/a0`):
             in the store, so that curl leaves no output file to read
   badcount  Reservoir artifact URL lookup returns too few URLs
   apierror  Reservoir requests return an API error object
+  bearer    401 unless the request carries `Authorization: Bearer <token>`
+            for a token listed in the `--tokens` file (read on each request,
+            so a test can change it), and otherwise as `ok`
 
 A fault that does not apply to a request kind (e.g. `badcount` on a `GET`)
-behaves as `ok`. Each request is logged to stdout as `<method> <path> -> <status>`.
+behaves as `ok`. Like Cloud Storage, a `PUT` with the header
+`x-goog-if-generation-match: 0` only creates an object: if the object exists,
+it is left untouched and the response is 412.
+
+Each request is logged to stdout as
+`<method> <path> -> <status> auth=<bearer|none|other> gen=<value|->`, where
+`auth` is the scheme of the `Authorization` header (`other` for any scheme but
+`Bearer`, e.g. AWS Signature Version 4) and `gen` is the value of the
+`x-goog-if-generation-match` header.
 
 This is Python rather than `Std.Http` because `truncate` and `reset` are
 transport-level faults: a body cut short of its declared `Content-Length` and a
@@ -45,7 +56,22 @@ DENY_BODY = (
     b"<Error><Code>AccessDenied</Code><Message>mock denial</Message></Error>\n"
 )
 
+UNAUTHORIZED_BODY = (
+    b'<?xml version="1.0" encoding="UTF-8"?>\n'
+    b"<Error><Code>AuthenticationRequired</Code>"
+    b"<Message>mock authentication required</Message></Error>\n"
+)
+
+PRECONDITION_BODY = (
+    b'<?xml version="1.0" encoding="UTF-8"?>\n'
+    b"<Error><Code>PreconditionFailed</Code>"
+    b"<Message>mock object already exists</Message></Error>\n"
+)
+
 STORE = "."
+
+# The file listing the bearer tokens that `bearer` mode accepts, one per line
+TOKENS = None
 
 
 class Mode(StrEnum):
@@ -59,6 +85,7 @@ class Mode(StrEnum):
     EMPTY = "empty"
     BAD_COUNT = "badcount"
     API_ERROR = "apierror"
+    BEARER = "bearer"
 
 
 def content_type(path):
@@ -82,7 +109,30 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def log(self, status):
-        print("%s %s -> %s" % (self.command, self.path, status), flush=True)
+        auth = self.headers.get("Authorization")
+        if auth is None:
+            scheme = "none"
+        elif auth.startswith("Bearer "):
+            scheme = "bearer"
+        else:
+            scheme = "other"
+        gen = self.headers.get("x-goog-if-generation-match", "-")
+        print(
+            "%s %s -> %s auth=%s gen=%s" % (self.command, self.path, status, scheme, gen),
+            flush=True,
+        )
+
+    def authorized(self):
+        """Whether the request carries a bearer token that `--tokens` lists."""
+        auth = self.headers.get("Authorization", "")
+        if TOKENS is None or not auth.startswith("Bearer "):
+            return False
+        try:
+            with open(TOKENS) as f:
+                accepted = set(f.read().split())
+        except FileNotFoundError:
+            return False
+        return auth[len("Bearer ") :] in accepted
 
     def parse(self):
         """Split a path into its fault mode and the object path under it.
@@ -116,6 +166,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def deny(self):
         self.respond(403, DENY_BODY, "application/xml")
+
+    def unauthorized(self):
+        self.respond(401, UNAUTHORIZED_BODY, "application/xml")
 
     def reset(self):
         # Neither a response nor a body: `curl` reports an empty reply and,
@@ -203,6 +256,8 @@ class Handler(BaseHTTPRequestHandler):
         mode, parts, query = self.parse()
         if mode is None:
             self.not_found("no fault mode in path: %s" % self.path)
+        elif mode == Mode.BEARER and not self.authorized():
+            self.unauthorized()
         elif mode == Mode.RESET:
             self.reset()
         elif mode == Mode.DENY:
@@ -216,6 +271,8 @@ class Handler(BaseHTTPRequestHandler):
         mode, parts, _ = self.parse()
         if mode is None:
             self.not_found("no fault mode in path: %s" % self.path)
+        elif mode == Mode.BEARER and not self.authorized():
+            self.unauthorized()
         elif mode == Mode.RESET:
             self.reset()
         elif mode == Mode.DENY:
@@ -232,6 +289,8 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         if mode is None:
             self.not_found("no fault mode in path: %s" % self.path)
+        elif mode == Mode.BEARER and not self.authorized():
+            self.unauthorized()
         elif mode == Mode.RESET:
             self.reset()
         elif mode == Mode.DENY:
@@ -239,7 +298,17 @@ class Handler(BaseHTTPRequestHandler):
         else:
             path = os.path.join(STORE, *parts)
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "wb") as f:
+            if self.headers.get("x-goog-if-generation-match") == "0":
+                # Create only: an existing object, even one being written by
+                # another request, keeps its bytes and its modification time
+                try:
+                    f = open(path, "xb")
+                except FileExistsError:
+                    self.respond(412, PRECONDITION_BODY, "application/xml")
+                    return
+            else:
+                f = open(path, "wb")
+            with f:
                 f.write(body)
             self.respond(200, b"", "application/xml")
 
@@ -260,10 +329,14 @@ def main():
         "--port-file", required=True, help="where to write the bound port"
     )
     parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument(
+        "--tokens", help="file listing the bearer tokens that `bearer` mode accepts"
+    )
     args = parser.parse_args()
 
-    global STORE
+    global STORE, TOKENS
     STORE = args.store
+    TOKENS = args.tokens
     os.makedirs(STORE, exist_ok=True)
 
     # Port 0 lets the OS pick a free port, so parallel tests cannot collide
