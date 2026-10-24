@@ -6,7 +6,8 @@ source ../../tests/common.sh
 # still runs passes every later step a value that Lean marks as shared between threads, and Lean
 # copies such a value on each update, so a fold that extends an array in each step takes about 16
 # times as long for 4 times as many steps. A right fold (`Job.collectList`) that merges the logs also
-# copies the logs merged so far in each step.
+# copies the logs merged so far in each step. Also tests that registering a job takes constant time:
+# the queue of registered jobs is shared with the build monitor's thread in the same way.
 
 ./clean.sh
 
@@ -44,6 +45,16 @@ f1=$(fold_cpu "$N")
 f4=$(fold_cpu $((4 * N)))
 echo "import fold: $N imports: $f1 CPU-s; $((4 * N)) imports: $f4 CPU-s"
 test_cmd awk -v a="$f1" -v b="$f4" 'BEGIN { exit !(b < 8 * a + 1) }'
+
+# `registerJob`: the time to register 80,000 finished jobs in one fetch, against the time to make
+# and keep the same jobs without registering them
+reg_ms() {
+  "$LAKE" build "$1" 2>&1 | sed -n 's/.* jobs: \([0-9]*\) ms.*/\1/p'
+}
+k=$(reg_ms keepJobs)
+r=$(reg_ms registerJobs)
+echo "registerJob: 80000 jobs: $r ms; kept without registering: $k ms"
+test_exp "$r" -lt $((5 * k + 100))
 
 # Cleanup
 rm -f produced.out cpu.produced.out

@@ -90,3 +90,22 @@ target collectVector4 : Unit :=
   collectTime "collectVector" (fun js => (Job.collectVector js.toVector).map (·.toArray)) 40000
 target collectList1 : Unit := collectTime "collectList" (Job.collectList ·.toList) 10000 (slow := 9999)
 target collectList4 : Unit := collectTime "collectList" (Job.collectList ·.toList) 40000 (slow := 39999)
+
+/--
+Prints how many milliseconds it takes to register `n` finished jobs for the build monitor
+(`register`), or to make the same jobs and keep them without registering them.
+-/
+def registerTime (n : Nat) (register : Bool) : FetchM (Job Unit) := do
+  let t0 ← IO.monoNanosNow
+  let mut jobs : Array (Job Unit) := #[]
+  for i in [0:n] do
+    let job : Job Unit := Job.pure ()
+    if register then
+      jobs := jobs.push (← registerJob s!"job {i}" job)
+    else
+      jobs := jobs.push ({job with caption := s!"job {i}"} : Job Unit).renew
+  IO.println s!"{n} jobs: {((← IO.monoNanosNow) - t0) / 1000000} ms"
+  return Job.nil
+
+target keepJobs : Unit := registerTime 80000 false
+target registerJobs : Unit := registerTime 80000 true

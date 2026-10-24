@@ -74,13 +74,20 @@ Whether the build should show progress information.
 public def BuildConfig.showProgress (cfg : BuildConfig) : Bool :=
   (cfg.noBuild ∧ cfg.verbosity == .verbose) ∨ cfg.verbosity != .quiet
 
-/-- Mutable reference of registered build jobs. -/
+/--
+Mutable reference of registered build jobs, the most recently registered first.
+
+Registering a job prepends it, which takes constant time. The build's tasks reach the reference,
+so Lean marks it, and every value stored in it, as shared between threads, and never updates such
+a value in place: pushing onto an array here would copy every job queued since the build monitor
+last took them.
+-/
 @[expose] -- for codegen
-public def JobQueue := IO.Ref (Array OpaqueJob)
+public def JobQueue := IO.Ref (List OpaqueJob)
 
 /-- Returns a new empty job queue. -/
 @[inline] public def mkJobQueue : BaseIO JobQueue :=
-  IO.mkRef #[]
+  IO.mkRef []
 
 /-- A Lake context with a build configuration and additional build data. -/
 public structure BuildContext extends BuildConfig, Context where
