@@ -487,9 +487,10 @@ workspace, and their imports (`ModuleData.imports`), transitively, as a non-`mod
 imports reach. Lean finds such a module's `.olean` in the workspace's library directories (`getLeanPath`, which Lake
 passes as `LEAN_PATH`) and then its own (`Lean.initSearchPath`), and reads its parts as an import does
 (`Lean.readModuleDataPartsOfFile`). A non-`module` file's kernel constants come from its current `.usage`, which its
-`.usekey` binds to its `.olean`; a `module` file's and a toolchain module's from the private part of their `.olean`,
-pinned by `modsysHash` and by the Lean githash. A module that starts to declare a name has changed provides unless it
-is a toolchain module, a `module` file or the compiled module, so every new duplicate has a declarer this checks.
+`.usekey` binds to its `.olean` (a kept module's too: they come from its `.olean`, which the accept did not change);
+a `module` file's and a toolchain module's from the private part of their `.olean`, pinned by `modsysHash` and by the
+Lean githash. A module that starts to declare a name has changed provides unless it is a toolchain module, a `module`
+file or the compiled module, so every new duplicate has a declarer this checks.
 
 Names are compared by `Name.hash`, so a hash collision only rebuilds. The `.olean` reads assume the data layout of
 the Lean that Lake was built with, so with another Lean, or if a read fails, the check fails. Kernel constants are
@@ -513,7 +514,7 @@ def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetu
         e := e.digest (← contentHash hashes p)
       closure := closure.push (m, e.finish, none)
     else
-      let some (_, imp) ← importUsage? hashes importArts m | return false
+      let some (_, imp) ← importUsage? hashes importArts m (kept := true) | return false
       closure := closure.push (m, imp.providesDigest, some imp.provides.1)
   let kp := (← getBuildContext).kernelProviders
   for (m, d, kernel?) in closure do
