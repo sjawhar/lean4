@@ -228,16 +228,16 @@ processed (`withImportContext`). -/
 def importContext : UInt32 := 0xFFFFFFFE
 
 @[extern "lean_io_set_effect_recording"]
-private opaque setEffectRecording (on : Bool) (pinned : @& Array String) (root : @& String) : BaseIO Unit
+private opaque setEffectRecording (on : Bool) (pinned : @& Array String) (root solver : @& String) : BaseIO Unit
 
 @[extern "lean_io_take_effects"]
 private opaque takeEffects : BaseIO (Array (UInt32 × String))
 
 /-- The process values read in any context since recording was switched on (`startFrontendRun`), sorted by key: each
 environment variable (`env:NAME`), the running executable's path (`appPath`), the working directory
-(`workingDirectory`), and the toolchain directories (`toolchain`) when a command read a file in them, which the runtime
-then does not note as an effect; each with the value first read (`none`: absent) and whether a later read saw another
-value. Takes them. -/
+(`workingDirectory`), and the toolchain directories (`toolchain`) when a command read a file in them or ran the
+toolchain's SAT solver on its own files (`pinnedToolchainDirs`), which the runtime then does not note as an effect; each
+with the value first read (`none`: absent) and whether a later read saw another value. Takes them. -/
 @[extern "lean_io_take_value_reads"]
 opaque takeValueReads : BaseIO (Array (String × Option String × Bool))
 
@@ -254,10 +254,13 @@ def currentValue? (key : String) : IO (Option String) := do
   try return some (toString (← read)) catch _ => return none
 
 /-- The directories under the running Lean's root that the Lean githash pins (its executables, headers and library),
-whose files a command reads without an effect: the root is recorded as the value `toolchain` instead. -/
-def pinnedToolchainDirs : IO (String × Array String) := do
+whose files a command reads without an effect, and the SAT solver it ships (`bv_decide`'s default), which a command
+runs without an effect on files it created, the solver reading and writing only the files its command line names:
+the root is recorded as the value `toolchain` instead. -/
+def pinnedToolchainDirs : IO (String × Array String × String) := do
   let root ← getBuildDir
-  return (toString root, #[toString (root / "bin"), toString (root / "include"), toString (← getLibDir root)])
+  return (toString root, #[toString (root / "bin"), toString (root / "include"), toString (← getLibDir root)],
+    toString ((root / "bin" / "cadical").withExtension System.FilePath.exeExtension))
 
 /-- The actions that clear the per-run logs of other modules (`registerRunLog`). -/
 private builtin_initialize runLogClearsRef : IO.Ref (Array (BaseIO Unit)) ← mkAccountedRef #[]
@@ -282,13 +285,13 @@ def startFrontendRun (record : Bool) : BaseIO Nat := do
   let run ← frontendRunsRef.modifyGet fun n => (n + 1, n + 1)
   if record then
     -- before recording starts: reading the executable's path here is no read of the run's
-    let (root, pinned) ← (pinnedToolchainDirs.toBaseIO : BaseIO _) <&> (·.toOption.getD ("", #[]))
+    let (root, pinned, solver) ← (pinnedToolchainDirs.toBaseIO : BaseIO _) <&> (·.toOption.getD ("", #[], ""))
     enableUsageRecording
     usedByChecksRef.set {}
     declsByCommandRef.set []
     usedByCommandRef.set []
     foreignAttributesByCommandRef.set []
-    setEffectRecording true pinned root
+    setEffectRecording true pinned root solver
     for clear in ← runLogClearsRef.get do clear
   return run
 

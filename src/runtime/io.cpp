@@ -1556,7 +1556,8 @@ name, the user and group database, the network interfaces). The import context (
 process-wide uses: what imported modules' initializers do inside the process follows from the imported modules.
 
 Not effects: reads of the toolchain's own files (`in_pinned_dirs`), which the Lean githash pins, recorded as a read of
-the value `toolchain` (the pinned directories' root); values two runs may differ in (clocks, timers, heartbeat counts,
+the value `toolchain` (the pinned directories' root), and for the same reason a run of the toolchain's own SAT solver on
+files the context created (`note_process_spawn`); values two runs may differ in (clocks, timers, heartbeat counts,
 random bytes, process and thread ids, resource usage and free memory), which a kept command's result takes from the run
 that recorded it; and the runtime's debugging output (`dbg_trace`, `timeit`).
 
@@ -1588,6 +1589,8 @@ static std::map<std::string, value_read> * g_value_reads = nullptr;
 // the toolchain directories whose files the Lean githash pins, resolved, each ending in `/`, and their root as given
 static std::vector<std::string> * g_pinned_dirs = nullptr;
 static std::string * g_pinned_root = nullptr;
+// the toolchain's own SAT solver, resolved; empty if it has none
+static std::string * g_pinned_solver = nullptr;
 static constexpr size_t max_effect_notes = 8;
 
 uint32 effect_context() {
@@ -1672,6 +1675,37 @@ static bool in_pinned_dirs(char const * p, std::vector<std::string> const & dirs
         if (r.compare(0, d.size(), d) == 0) return true;
     return false;
 #endif
+}
+
+/* `p` with its symbolic links resolved, empty if it does not resolve. */
+static std::string resolved_path(char const * p) {
+#if defined(LEAN_WINDOWS)
+    return std::string();
+#else
+    char buf[PATH_MAX];
+    return realpath(p, buf) ? std::string(buf) : std::string();
+#endif
+}
+
+void note_process_spawn(char const * cmd, std::vector<std::string> const * files) {
+    uint32 ctx = effect_context();
+    if (ctx == 0) return;
+    std::string solver;
+    {
+        lock_guard<mutex> lock(*g_effects_mutex);
+        solver = *g_pinned_solver;
+    }
+    // the solver reads and writes only the files named on its command line, so those must be the context's
+    bool trusted = files && cmd[0] == '/' && !solver.empty() && resolved_path(cmd) == solver;
+    lock_guard<mutex> lock(*g_effects_mutex);
+    context_effects & e = (*g_effects)[ctx];
+    if (trusted)
+        for (std::string const & f : *files)
+            if (!created_by(e, f)) { trusted = false; break; }
+    if (trusted)
+        note_value_read_core("toolchain", g_pinned_root->c_str());
+    else
+        note_effect_core(e, std::string("spawns the process ") + cmd);
 }
 
 void note_path_read(char const * p) {
@@ -1797,9 +1831,11 @@ static void forget_handle(FILE * fp) {
     g_handle_contexts->erase(fp);
 }
 
-/* setEffectRecording (on : Bool) (pinned : @& Array String) (root : @& String) : BaseIO Unit; switching it on forgets
-   earlier notes and value reads, and pins the directories `pinned` (`in_pinned_dirs`), recorded as `root` when read */
-extern "C" LEAN_EXPORT obj_res lean_io_set_effect_recording(uint8 on, b_obj_arg pinned, b_obj_arg root) {
+/* setEffectRecording (on : Bool) (pinned : @& Array String) (root solver : @& String) : BaseIO Unit; switching it on
+   forgets earlier notes and value reads, and pins the directories `pinned` (`in_pinned_dirs`) and the SAT solver
+   `solver` (`note_process_spawn`), recorded as `root` when used */
+extern "C" LEAN_EXPORT obj_res lean_io_set_effect_recording(uint8 on, b_obj_arg pinned, b_obj_arg root,
+                                                           b_obj_arg solver) {
     if (on) {
         std::vector<std::string> dirs;
 #if !defined(LEAN_WINDOWS)
@@ -1808,11 +1844,13 @@ extern "C" LEAN_EXPORT obj_res lean_io_set_effect_recording(uint8 on, b_obj_arg 
             if (realpath(string_cstr(lean_array_get_core(pinned, i)), buf)) dirs.push_back(std::string(buf) + "/");
         }
 #endif
+        std::string s = resolved_path(string_cstr(solver));
         lock_guard<mutex> lock(*g_effects_mutex);
         g_effects->clear();
         g_value_reads->clear();
         *g_pinned_dirs = std::move(dirs);
         *g_pinned_root = string_cstr(root);
+        *g_pinned_solver = std::move(s);
     }
     g_effects_on.store(on != 0);
     return box(0);
@@ -2142,6 +2180,7 @@ void initialize_io() {
     g_value_reads = new std::map<std::string, value_read>();
     g_pinned_dirs = new std::vector<std::string>();
     g_pinned_root = new std::string();
+    g_pinned_solver = new std::string();
 #if !defined(LEAN_WINDOWS) && !defined(LEAN_EMSCRIPTEN)
     // We want to handle SIGPIPE ourselves
     lean_always_assert(signal(SIGPIPE, SIG_IGN) != SIG_ERR);

@@ -107,9 +107,10 @@ inductive Refusal where
   /-- An effect on state outside the command that the runtime noted (`RecordedEffects.byCommand`): a write to a
   reference it did not create, the resolution of a promise or the cancellation of a task it did not create, the use of
   a mutable native object it did not create, or a use of process-wide state (files outside the toolchain's, child
-  processes, the network, the standard streams, the process's settings), which no payload carries. Reads of the
-  environment, the working directory and the executable's path are no effects: the module records their values
-  (`takeValueReads`), which a keep requires unchanged (`ModuleUsage.keepPermit`). -/
+  processes but the toolchain's SAT solver run on files the command created, the network, the standard streams, the
+  process's settings), which no payload carries. Reads of the environment, the working directory and the executable's
+  path are no effects: the module records their values (`takeValueReads`), which a keep requires unchanged
+  (`ModuleUsage.keepPermit`). -/
   | effect (what : String)
   deriving Inhabited, BEq
 

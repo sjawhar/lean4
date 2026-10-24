@@ -711,15 +711,43 @@ void finalize_process() {}
 
 extern "C" lean_object* lean_mk_io_error_other_error(uint32_t, lean_object*);
 
+/* Whether `a` is an option of the toolchain's SAT solver that names no file: `--name` or `--name=N` for an integer
+   `N`. */
+static bool is_solver_option(std::string const & a) {
+    if (a.size() < 3 || a[0] != '-' || a[1] != '-') return false;
+    size_t i = 2;
+    while (i < a.size() && (isalnum(static_cast<unsigned char>(a[i])) || a[i] == '-')) i++;
+    if (i == 2) return false;
+    if (i == a.size()) return true;
+    if (a[i] != '=') return false;
+    i++;
+    if (i < a.size() && a[i] == '-') i++;
+    size_t digits = i;
+    while (i < a.size() && isdigit(static_cast<unsigned char>(a[i]))) i++;
+    return i == a.size() && i > digits;
+}
+
 extern "C" LEAN_EXPORT obj_res lean_io_process_spawn(obj_arg args_) {
     object_ref args(args_);
-    // a child process acts on state no task context accounts for
-    if (uint32 ctx = effect_context())
-        note_effect(ctx, std::string("spawns the process ") + string_cstr(cnstr_get(args.raw(), 1)));
     object_ref stdio_cfg = cnstr_get_ref(args, 0);
     stdio stdin_mode  = static_cast<stdio>(cnstr_get_uint8(stdio_cfg.raw(), 0));
     stdio stdout_mode = static_cast<stdio>(cnstr_get_uint8(stdio_cfg.raw(), 1));
     stdio stderr_mode = static_cast<stdio>(cnstr_get_uint8(stdio_cfg.raw(), 2));
+    // a child process acts on state no task context accounts for, unless it is the toolchain's own SAT solver on
+    // files the context created (`note_process_spawn`)
+    if (effect_context()) {
+        std::vector<std::string> files;
+        bool plain = stdin_mode != stdio::INHERIT && stdout_mode != stdio::INHERIT && stderr_mode != stdio::INHERIT &&
+            !cnstr_get_ref_t<option_ref<string_ref>>(args, 3) &&
+            cnstr_get_ref_t<array_ref<pair_ref<string_ref, option_ref<string_ref>>>>(args, 4).size() == 0;
+        if (plain) {
+            for (string_ref const & a : cnstr_get_ref_t<array_ref<string_ref>>(args, 2)) {
+                std::string s = a.to_std_string();
+                if (!is_solver_option(s)) files.push_back(std::move(s));
+            }
+        }
+        note_process_spawn(string_cstr(cnstr_get(args.raw(), 1)), plain ? &files : nullptr);
+    }
     if (stdin_mode == stdio::INHERIT) {
         std::cout.flush();
     }

@@ -6,6 +6,7 @@ Author: Leonardo de Moura
 */
 #pragma once
 #include <string>
+#include <vector>
 #include <lean/lean.h>
 #include "runtime/mpz.h"
 
@@ -500,6 +501,11 @@ void note_task_owner(uint32 ctx, lean_task_object * t, char const * what);
 void note_value_read(std::string const & key, char const * value);
 /* For the effect context, about to read the file or directory `p` (`lean_io_take_effects`). */
 void note_path_read(char const * p);
+/* For the effect context, about to spawn `cmd`: a read of the value `toolchain` when `cmd` is the toolchain's own SAT
+   solver and `files` lists every argument that is not an option, each a path the context created; `files` is null
+   when the spawn also reads anything else (an inherited standard stream, a set working directory or environment
+   variable, another argument). Otherwise it notes the spawn. */
+void note_process_spawn(char const * cmd, std::vector<std::string> const * files);
 /* For the effect context, about to write the file `p`, creating it if it does not exist. */
 void note_path_write(char const * p);
 /* Records that the effect context created the mutable native object `o`, which it may use freely. */
