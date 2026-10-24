@@ -4,6 +4,9 @@ open private Lean.Environment.setCheckedSync from Lean.Environment
 open private Lean.Kernel.Environment.mk from Lean.Environment
 open private Lean.Kernel.Environment.extensions from Lean.Environment
 open private Lean.Kernel.Environment.extGens from Lean.Environment
+open private Lean.Kernel.Environment.unaccountedWrites from Lean.Environment
+open private Lean.Kernel.Environment.extIdentities from Lean.Environment
+open private Lean.Kernel.Environment.divergentAdds from Lean.Environment
 
 /- Redefine `propext : False`. -/
 open Lean Elab Meta in
@@ -26,6 +29,9 @@ open Lean Elab Meta in
     (Lean.Kernel.Environment.extGens env.toKernelEnv)
     env.toKernelEnv.trackedGen
     env.header
+    (Lean.Kernel.Environment.unaccountedWrites env.toKernelEnv)
+    (Lean.Kernel.Environment.extIdentities env.toKernelEnv)
+    (Lean.Kernel.Environment.divergentAdds env.toKernelEnv)
   Lean.Environment.setCheckedSync env kenv
 
 theorem efsq : ∀ (x y z n : Nat),
