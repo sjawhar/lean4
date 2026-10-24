@@ -380,7 +380,8 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
       return .digests full core attrs
     if let some m := env.getModuleIdxFor? n then
       return match ← importedConstDigests? env m n with
-        | .digests full core attrs => .digests full core attrs
+        -- the full digest a compile depends on: with each other kernel declarer's (`State.digestOf`)
+        | .digests full core attrs => .digests ((fs.digestOf env n).getD full) core attrs
         | .codeOnly => .unattributed s!"command {i} uses `{n}`, which `{env.header.modules[m.toNat]!.module}` \
             compiled code for without defining it"
         | .untracked => .untracked
