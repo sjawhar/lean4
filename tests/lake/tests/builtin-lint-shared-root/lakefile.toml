@@ -1,0 +1,20 @@
+name = "lint-shared-root"
+defaultTargets = ["Foo"]
+
+[[lean_lib]]
+name = "Linters"
+
+[[lean_lib]]
+name = "Foo"
+
+# Shares the root directory `Foo` with the library above, from another srcDir.
+[[lean_lib]]
+name = "FooTest"
+srcDir = "test"
+roots = ["Foo.Test"]
+
+# A srcDir that no library uses.
+[[lean_exe]]
+name = "tool"
+srcDir = "exe"
+root = "Tool"
