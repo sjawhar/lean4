@@ -44,8 +44,8 @@ public structure Args where
   /-- An array of modules containing code quality checks that are
   imported alongside each top-level module -/
   checks : Array Name := #[]
-  /-- Source search path used to resolve modules to their `.lean` files when recording
-  exceptions for environment linters. Populated from the workspace's `LEAN_SRC_PATH`, since
+  /-- Source search path used to resolve modules to their `.lean` files when reporting text-linter
+  warnings and when recording exceptions. Populated from the workspace's `LEAN_SRC_PATH`, since
   `getSrcSearchPath` alone does not cover package sources during a `lake lint` run. -/
   srcSearchPath : SearchPath := {}
 
@@ -290,13 +290,15 @@ overrides applied via `leanOptOverrides`) and are recovered here from the `.olea
 an environment imported at the `server` olean level. With `--lint-only`,
 the recorded entries are additionally filtered to the explicitly enabled linters.
 
-In `report` mode the warnings are printed to stdout. In `recordExceptions` mode, each entry
-carrying a command position is turned into an exception record for the caller to write; entries
-without one are reported on stderr and flagged as unlocated. In `codeQuality` mode, the warnings
-are aggregated per module/linter pair into code quality entries whose scalar value is the number
-of warnings, for the caller to emit as JSON.
+The recorded entries store no file name (see `Linter.LintEntry`), so each module's source file is
+resolved through `sp`, as for environment linters. In `report` mode the warnings are printed to
+stdout under that file. In `recordExceptions` mode, each entry carrying a command position is
+turned into an exception record in that file for the caller to write; entries without one, or
+whose module's source file cannot be located, are reported on stderr and flagged as unlocated. In
+`codeQuality` mode, the warnings are aggregated per module/linter pair into code quality entries
+whose scalar value is the number of warnings, for the caller to emit as JSON.
 -/
-def runTextLinters (args : Args) (linterOpts : Linter.LinterOptions)
+def runTextLinters (args : Args) (linterOpts : Linter.LinterOptions) (sp : SearchPath)
     (env : Environment) (mod : Name) : IO LintingOutcome := do
   let textGroups := collectTextLints env mod.getRoot
   let textGroups :=
@@ -311,17 +313,26 @@ def runTextLinters (args : Args) (linterOpts : Linter.LinterOptions)
   | .report =>
       for (m, entries) in textGroups do
         IO.println s!"-- Text linter diagnostics in {m}:"
+        let file := (← sp.findWithExt "lean" m).getD (modToFilePath "." m "lean")
         for e in entries do
-          IO.print e.message.toString
+          IO.print ({ e.message with fileName := file.toString } : SerialMessage).toString
       return .reported textFailed
   | .recordExceptions =>
       let mut records : Array ExceptionRecord := #[]
       let mut anyUnlocated := false
       for (m, entries) in textGroups do
+        let file? ← sp.findWithExt "lean" m
         for e in entries do
           match e.position? with
           | some pos =>
-            records := records.push { file := e.file, pos, option := e.linter }
+            match file? with
+            | some file =>
+              records := records.push { file, pos, option := e.linter }
+            | none =>
+              IO.eprintln s!"\
+                warning: could not locate source file for `{m}` \
+                to record a `{e.linter}` exception"
+              anyUnlocated := true
           | none =>
             IO.eprintln s!"\
               warning: could not determine the command position of a `{e.linter}` text-linter \
@@ -472,7 +483,7 @@ public def run (args : Args) : IO UInt32 := do
       linterSets := (Lean.Linter.linterSetsExt.getState env).merged
     }
 
-    let textLintingOutcome ← runTextLinters args linterOpts env mod
+    let textLintingOutcome ← runTextLinters args linterOpts sp env mod
     match textLintingOutcome with
     | .reported textFailed =>
       anyFailed := anyFailed || textFailed
