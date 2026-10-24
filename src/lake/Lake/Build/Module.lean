@@ -1181,7 +1181,6 @@ where
       unless (← savedTrace.replayCachedIfUpToDate inputHash) do
         mod.clearOutputArtifacts
         writeFetchTrace mod.traceFile inputHash (toJson arts.descrs) log
-        replayFetchedLog log
       let arts ←
         if restoreAll then
           mod.restoreAllArtifacts arts
@@ -1204,7 +1203,6 @@ where
       | .complete arts =>
         return arts
       | .incomplete savedTrace ltar? =>
-        let iniPos ← getLogPos
         let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
         if status.isUpToDate then
           unless (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) do
@@ -1218,9 +1216,11 @@ where
         else
           discard <| mod.buildLean presetup
         if status.isCacheable then
-          let log := (← getLog).takeFrom iniPos
           let arts ← mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile
           let arts := {arts with ltar? := arts.ltar? <|> ltar?}
+          -- The trace holds the log of the action that produced the outputs: their replay,
+          -- unpack or build
+          let log := (← readTraceFile mod.traceFile).log
           (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs (log := log)
           return arts
         else
