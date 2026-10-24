@@ -100,12 +100,14 @@ def printWarnings (results : Std.HashMap Name MessageData) (filePath : System.Fi
 /--
 Formats a map of linter warnings grouped by filename with `-- filename` comments.
 
-With `useErrorFormat`, each module's file is resolved through `srcSearchPath?`, or through
-`getSrcSearchPath` when it is `none`.
+With `useErrorFormat`, each module's file is resolved through `srcSearchPath?` to the first file
+that exists (`SearchPath.findExistingWithExt`), or, when it is `none`, through `getSrcSearchPath`
+by the module's root.
 -/
 def groupedByFilename (results : Std.HashMap Name MessageData) (useErrorFormat : Bool := false)
     (srcSearchPath? : Option SearchPath := none) : CoreM MessageData := do
   let sp ← if useErrorFormat then srcSearchPath?.getDM getSrcSearchPath else pure {}
+  let find := if srcSearchPath?.isSome then sp.findExistingWithExt else sp.findWithExt
   let grouped : Std.HashMap Name (System.FilePath × Std.HashMap Name MessageData) ←
     results.foldM (init := {}) fun grouped declName msg => do
       let mod ← findModuleOf? declName
@@ -115,7 +117,7 @@ def groupedByFilename (results : Std.HashMap Name MessageData) (useErrorFormat :
         | some (fp, msgs) => pure (fp, msgs.insert declName msg)
         | none => do
           let fp ← if useErrorFormat then
-            pure <| (← sp.findWithExt "lean" mod).getD (modToFilePath "." mod "lean")
+            pure <| (← find "lean" mod).getD (modToFilePath "." mod "lean")
           else pure default
           pure (fp, .insert {} declName msg)
   let grouped' := grouped.toArray.qsort fun (a, _) (b, _) => toString a < toString b

@@ -44,9 +44,10 @@ public structure Args where
   /-- An array of modules containing code quality checks that are
   imported alongside each top-level module -/
   checks : Array Name := #[]
-  /-- Source search path used to resolve modules to their `.lean` files when reporting linter
-  findings and when recording exceptions. Populated from the workspace's `LEAN_SRC_PATH`, since
-  `getSrcSearchPath` alone does not cover package sources during a `lake lint` run. -/
+  /-- Source search path used to resolve modules to their `.lean` files (the first entry where the
+  file exists) when reporting linter findings and when recording exceptions. Populated from the
+  workspace's `LEAN_SRC_PATH` and its executables' source directories, since `getSrcSearchPath`
+  alone does not cover package sources during a `lake lint` run. -/
   srcSearchPath : SearchPath := {}
 
 /--
@@ -251,7 +252,7 @@ def runDeferredChecks (args : Args) (linterOpts : Linter.LinterOptions) (sp : Se
       for (failMod, c, _) in failures do
         match ← deferredSitePos? failMod c.site with
         | some pos =>
-          match ← sp.findWithExt "lean" failMod with
+          match ← sp.findExistingWithExt "lean" failMod with
           | some file =>
             recs := recs.push { file, pos, option := linter.doc.deferred.name }
           | none =>
@@ -268,7 +269,7 @@ def runDeferredChecks (args : Args) (linterOpts : Linter.LinterOptions) (sp : Se
     else
       for (failMod, c, msg) in failures do
         let context := if c.sourceString.isEmpty then "" else s!" ({c.sourceString})"
-        match ← sp.findWithExt "lean" failMod with
+        match ← sp.findExistingWithExt "lean" failMod with
         | some file =>
           IO.eprintln s!"{file}: error: in {describeSite c.site}{context}: {← msg.toString}"
         | none =>
@@ -313,7 +314,7 @@ def runTextLinters (args : Args) (linterOpts : Linter.LinterOptions) (sp : Searc
   | .report =>
       for (m, entries) in textGroups do
         IO.println s!"-- Text linter diagnostics in {m}:"
-        let file := (← sp.findWithExt "lean" m).getD (modToFilePath "." m "lean")
+        let file := (← sp.findExistingWithExt "lean" m).getD (modToFilePath "." m "lean")
         for e in entries do
           IO.print ({ e.message with fileName := file.toString } : SerialMessage).toString
       return .reported textFailed
@@ -321,7 +322,7 @@ def runTextLinters (args : Args) (linterOpts : Linter.LinterOptions) (sp : Searc
       let mut records : Array ExceptionRecord := #[]
       let mut anyUnlocated := false
       for (m, entries) in textGroups do
-        let file? ← sp.findWithExt "lean" m
+        let file? ← sp.findExistingWithExt "lean" m
         for e in entries do
           match e.position? with
           | some pos =>
@@ -396,7 +397,7 @@ def runEnvironmentLinters (args : Args) (linterOpts : Linter.LinterOptions) (sp 
           match ← findDeclarationRanges? declName with
           | some ranges =>
             let declMod := (← findModuleOf? declName).getD mainModule
-            match ← sp.findWithExt "lean" declMod with
+            match ← sp.findExistingWithExt "lean" declMod with
             | some file =>
               recs := recs.push { file, pos := ranges.range.pos, option := linter.optName }
             | none =>

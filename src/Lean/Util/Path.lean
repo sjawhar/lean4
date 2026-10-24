@@ -76,6 +76,15 @@ def findModuleWithExt (sp : SearchPath) (ext : String) (mod : Name) : IO (Option
       return some path
   return none
 
+/-- Returns the first path `p / <mod as a path>.ext`, for `p` in `sp` in order, that exists.
+Unlike `findWithExt`, this does not stop at the first entry that holds `mod`'s root, so a module
+is found even when several entries share its root directory (e.g. a package's library and its
+test library under another source directory). -/
+def findExistingWithExt (sp : SearchPath) (ext : String) (mod : Name) : IO (Option FilePath) :=
+  sp.findSomeM? fun p => do
+    let path := modToFilePath p mod ext
+    return if ← path.pathExists then some path else none
+
 def findAllWithExt (sp : SearchPath) (ext : String) : IO (Array FilePath) := do
   let mut paths := #[]
   for p in sp do
