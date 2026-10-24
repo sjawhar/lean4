@@ -1148,9 +1148,9 @@ def Module.recBuildElabArts (mod : Module) : FetchM (Job ModuleOutputArtifacts) 
 where
   fetchFromCache? presetup savedTrace restoreAll : JobM ModuleFetchState := do
     let inputHash := (← getTrace).hash
-    let some ltarOrArts ← getArtifacts? inputHash savedTrace mod.pkg
+    let some ((ltarOrArts : ModuleOutputs), log) ← getArtifacts? inputHash savedTrace mod.pkg
       | return .incomplete savedTrace none
-    match (ltarOrArts : ModuleOutputs) with
+    match ltarOrArts with
     | .ltar ltar =>
       updateAction .unpack
       mod.clearOutputArtifacts
@@ -1160,6 +1160,8 @@ where
       let savedTrace ← readTraceFile mod.traceFile
       let arts? ← getArtifactsUsingTrace? inputHash savedTrace mod.pkg
       if let some (arts : ModuleOutputArtifacts) := arts? then
+        -- The archive's trace holds the log of the module's build
+        savedTrace.log.replay
         -- On initial unpack from cache ensure all artifacts uniformly
         -- end up in the build directory and, if writable, the cache
         let arts ← mod.restoreAllArtifacts {arts with ltar? := some ltar}
@@ -1167,7 +1169,8 @@ where
           let arts ← mod.cacheOutputArtifacts presetup.isModule restoreAll presetup.postponeCompile
           -- Note: Cache service metadata is not preserved on an output update because it would
           -- result in downloading module outputs that are not available on the remote.
-          (← getLakeCache).writeOutputs mod.pkg.cacheScope inputHash arts.descrs (overwrite := true)
+          (← getLakeCache).writeOutputs mod.pkg.cacheScope inputHash arts.descrs
+            (log := savedTrace.log) (overwrite := true)
           return .complete arts
         else
           return .complete arts
@@ -1177,7 +1180,8 @@ where
     | .arts arts =>
       unless (← savedTrace.replayCachedIfUpToDate inputHash) do
         mod.clearOutputArtifacts
-        writeFetchTrace mod.traceFile inputHash (toJson arts.descrs)
+        writeFetchTrace mod.traceFile inputHash (toJson arts.descrs) log
+        replayFetchedLog log
       let arts ←
         if restoreAll then
           mod.restoreAllArtifacts arts
@@ -1200,6 +1204,7 @@ where
       | .complete arts =>
         return arts
       | .incomplete savedTrace ltar? =>
+        let iniPos ← getLogPos
         let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
         if status.isUpToDate then
           unless (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) do
@@ -1213,9 +1218,10 @@ where
         else
           discard <| mod.buildLean presetup
         if status.isCacheable then
+          let log := (← getLog).takeFrom iniPos
           let arts ← mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile
           let arts := {arts with ltar? := arts.ltar? <|> ltar?}
-          (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs
+          (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs (log := log)
           return arts
         else
           let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile

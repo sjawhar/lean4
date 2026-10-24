@@ -122,9 +122,9 @@ public instance : FromJson BuildMetadata := ⟨BuildMetadata.fromJson?⟩
 public def BuildMetadata.parse (contents : String) : Except String BuildMetadata := do
   Json.parse contents >>= fromJson?
 
-/-- Construct build metadata from a cached input-to-output mapping. -/
-public def BuildMetadata.ofFetch (inputHash : Hash) (outputs : Json) : BuildMetadata :=
-  {depHash := inputHash, outputs? := outputs, synthetic := true, inputs := #[], log := {}}
+/-- Construct build metadata from a cached input-to-output mapping and the build log stored with it. -/
+public def BuildMetadata.ofFetch (inputHash : Hash) (outputs : Json) (log : Log) : BuildMetadata :=
+  {depHash := inputHash, outputs? := outputs, synthetic := true, inputs := #[], log}
 
 partial def serializeInputs (inputs : Array BuildTrace) : Array (String × Json) :=
   inputs.foldl (init := {}) fun r trace =>
@@ -155,6 +155,11 @@ public inductive SavedTrace
 | invalid
 | ok (data : BuildMetadata)
 
+/-- The build log recorded in the saved trace (empty if there is none). -/
+public def SavedTrace.log : SavedTrace → Log
+| .ok data => data.log
+| _ => {}
+
 /--
 Try to read data from a trace file.
 Logs if the read failed or the contents where invalid.
@@ -178,9 +183,13 @@ public def BuildMetadata.writeFile (path : FilePath) (data : BuildMetadata) : IO
   createParentDirs path
   IO.FS.writeFile path (toJson data).pretty
 
-/-- Write a trace file containing metadata on an artifact fetched from a cache. -/
-@[inline] public def writeFetchTrace (path : FilePath) (inputHash : Hash) (outputs : Json) : IO Unit :=
-  BuildMetadata.writeFile path (.ofFetch inputHash outputs)
+/--
+Write a trace file containing metadata on an artifact fetched from a cache,
+including the log of its build stored in the cache.
+-/
+@[inline] public def writeFetchTrace
+  (path : FilePath) (inputHash : Hash) (outputs : Json) (log : Log)
+: IO Unit := BuildMetadata.writeFile path (.ofFetch inputHash outputs log)
 
 /-- Write a trace file containing metadata about a build. -/
 @[inline] public def writeBuildTrace
@@ -288,6 +297,17 @@ public def SavedTrace.replayCachedIfUpToDate (inputHash : Hash) (self : SavedTra
 @[deprecated replayCachedIfUpToDate (since := "2026-04-15")]
 public abbrev SavedTrace.replayOrFetchIfUpToDate (inputHash : Hash) (self : SavedTrace) : JobM Bool := do
   self.replayCachedIfUpToDate inputHash
+
+/--
+**For internal use only.**
+Replays the build log stored in the cache with outputs fetched from it,
+setting the current build action to `replay` if the log is not empty
+(as `replayCachedIfUpToDate` does for the trace written for the fetch).
+-/
+public def replayFetchedLog (log : Log) : JobM Unit := do
+  unless log.isEmpty do
+    updateAction .replay
+    log.replay
 
 /-- **For internal use only.** -/
 public class ToOutputJson (α : Type u) where
@@ -527,15 +547,16 @@ public class ResolveOutputs (α : Type) where
 open ResolveOutputs in
 /--
 Retrieve artifacts from the Lake cache using only the outputs
-stored in the cached input-to-content mapping.
+stored in the cached input-to-content mapping, along with the build log stored with them.
 
 **For internal use only.**
 -/
 @[specialize] def getArtifactsUsingCache?
   [ResolveOutputs α] (inputHash : Hash) (pkg : Package)
-: JobM (Option α) := do
+: JobM (Option (α × Log)) := do
   try
-    (← (← getLakeCache).readOutputs? pkg.cacheScope inputHash).mapM resolveOutputs
+    (← (← getLakeCache).readOutputs? pkg.cacheScope inputHash).mapM fun out =>
+      return (← resolveOutputs out, out.log?.getD {})
   catch e =>
     let log ← takeLogFrom e
     let msg := s!"input '{inputHash.toString.take 7}' found in package artifact cache, \
@@ -550,8 +571,8 @@ open ResolveOutputs in
 /--
 Retrieve artifacts from the Lake cache using only the outputs stored in the saved trace file.
 
-If the cache is writable, saves the input-to-output mapping derived from the trace to the cache,
-unless a mapping for the `inputHash` already exists.
+If the cache is writable, saves the input-to-output mapping derived from the trace
+(with the trace's log) to the cache, unless a mapping for the `inputHash` already exists.
 
 **For internal use only.**
 -/
@@ -564,7 +585,8 @@ unless a mapping for the `inputHash` already exists.
         try
           let arts ← resolveOutputs (.ofData out)
           if (← pkg.isArtifactCacheWritable) then
-            let act := (← getLakeCache).writeOutputs pkg.cacheScope inputHash out (overwrite := false)
+            let act := (← getLakeCache).writeOutputs pkg.cacheScope inputHash out
+              (log := data.log) (overwrite := false)
             if let .error e ← act.toBaseIO then
               logWarning s!"could not write outputs to cache: {e}"
           return some arts
@@ -575,15 +597,16 @@ unless a mapping for the `inputHash` already exists.
 open ResolveOutputs in
 /--
 Retrieve artifacts from the Lake cache using the outputs stored in either
-the saved trace file or in the cached input-to-content mapping.
+the saved trace file or in the cached input-to-content mapping,
+along with the build log stored with them.
 
 **For internal use only.**
 -/
 @[inline] public nonrec def getArtifacts?
   [ResolveOutputs α] (inputHash : Hash) (savedTrace : SavedTrace) (pkg : Package)
-: JobM (Option α) := do
+: JobM (Option (α × Log)) := do
   if let some a ← getArtifactsUsingTrace? inputHash savedTrace pkg then
-    return some a
+    return some (a, savedTrace.log)
   if let some a ← getArtifactsUsingCache? inputHash pkg then
     return some a
   return none
@@ -710,11 +733,12 @@ public def buildArtifactUnlessUpToDate
   if let some pkg ← getCurrPackage? then
     let inputHash := depTrace.hash
     let fetchArt? restore := do
-      let some (art : XArtifact exe) ← getArtifacts? inputHash savedTrace pkg
+      let some ((art : XArtifact exe), log) ← getArtifacts? inputHash savedTrace pkg
         | return none
       unless (← savedTrace.replayCachedIfUpToDate inputHash) do
         removeFileIfExists file
-        writeFetchTrace traceFile inputHash (toJson art.descr)
+        writeFetchTrace traceFile inputHash (toJson art.descr) log
+        replayFetchedLog log
       if restore then
         some <$> restoreArtifact file art exe
       else
@@ -725,12 +749,14 @@ public def buildArtifactUnlessUpToDate
         if let some art ← fetchArt? restore then
           return art
         else
+          let iniPos ← getLogPos
           let status ← savedTrace.replayIfUpToDate' file depTrace
           unless status.isUpToDate do
             discard <| doBuild depTrace traceFile
           if status.isCacheable then
+            let log := (← getLog).takeFrom iniPos
             let art ← cacheArtifact file ext text exe restore
-            (← getLakeCache).writeOutputs pkg.cacheScope inputHash art.descr
+            (← getLakeCache).writeOutputs pkg.cacheScope inputHash art.descr (log := log)
             return art
           else
             computeArtifact file ext text
