@@ -77,6 +77,13 @@ public structure Artifact extends descr : ArtifactDescr where
   name := path.toString
   /-- The artifact's modification time. -/
   mtime : MTime
+  /--
+  Whether Lake was to save the artifact in its local cache but did not, because the cache's file
+  system did not hard-link it to its name (see `Cache.saveArtifact`). Then `path` is the build
+  output, and Lake writes no input-to-output mapping for the target, which would name an artifact
+  that the cache does not hold.
+  -/
+  cacheSkipped : Bool := false
   deriving Inhabited, Repr
 
 namespace Artifact
