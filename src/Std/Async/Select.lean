@@ -125,6 +125,7 @@ was already won, in which case the winner's result takes priority.
 def Selectable.combine (selectables : Array (Selectable α)) : IO (Selector α) := do
   return {
     tryFn := do
+      IO.noteRandomGeneratorUse
       let gen ← IO.stdGenRef.get
       let (selectables, gen) := shuffleIt selectables gen
       IO.stdGenRef.set gen
@@ -136,6 +137,7 @@ def Selectable.combine (selectables : Array (Selectable α)) : IO (Selector α) 
       return none
 
     registerFn := fun waiter => do
+      IO.noteRandomGeneratorUse
       let gen ← IO.stdGenRef.get
       let (selectables, gen) := shuffleIt selectables gen
       IO.stdGenRef.set gen
@@ -218,6 +220,7 @@ def Selectable.tryOne (selectables : Array (Selectable α)) : Async (Option α) 
   if selectables.isEmpty then
     throw <| .userError "Selectable.tryOne requires at least one Selectable"
 
+  IO.noteRandomGeneratorUse
   let gen ← IO.stdGenRef.get
   let (selectables, gen) := shuffleIt selectables gen
   IO.stdGenRef.set gen

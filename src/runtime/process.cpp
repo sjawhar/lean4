@@ -86,10 +86,12 @@ extern "C" LEAN_EXPORT obj_res lean_io_process_set_current_dir(b_obj_arg path) {
 }
 
 extern "C" LEAN_EXPORT uint32_t lean_io_process_get_pid() {
+    note_nondeterministic_read();
     return GetCurrentProcessId();
 }
 
 extern "C" LEAN_EXPORT uint64_t lean_io_get_tid() {
+    note_nondeterministic_read();
     return GetCurrentThreadId();
 }
 
@@ -133,6 +135,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_process_child_kill(b_obj_arg, b_obj_arg c
 }
 
 extern "C" LEAN_EXPORT uint32_t lean_io_process_child_pid(b_obj_arg, b_obj_arg child) {
+    note_nondeterministic_read();
     HANDLE h = static_cast<HANDLE>(lean_get_external_data(cnstr_get(child, 3)));
     return GetProcessId(h);
 }
@@ -350,11 +353,13 @@ extern "C" LEAN_EXPORT obj_res lean_io_process_set_current_dir(b_obj_arg path) {
 }
 
 extern "C" LEAN_EXPORT uint32_t lean_io_process_get_pid() {
+    note_nondeterministic_read();
     static_assert(sizeof(pid_t) == sizeof(uint32), "pid_t is expected to be a 32-bit type"); // NOLINT
     return getpid();
 }
 
 extern "C" LEAN_EXPORT uint64_t lean_io_get_tid() {
+    note_nondeterministic_read();
     uint64_t tid;
 #ifdef __APPLE__
     lean_always_assert(pthread_threadid_np(NULL, &tid) == 0);
@@ -420,6 +425,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_process_child_kill(b_obj_arg, b_obj_arg c
 }
 
 extern "C" LEAN_EXPORT uint32_t lean_io_process_child_pid(b_obj_arg, b_obj_arg child) {
+    note_nondeterministic_read();
     static_assert(sizeof(pid_t) == sizeof(uint32), "pid_t is expected to be a 32-bit type"); // NOLINT
     pid_t pid = cnstr_get_uint32(child, 3 * sizeof(object *));
     return pid;

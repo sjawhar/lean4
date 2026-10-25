@@ -122,7 +122,8 @@ structure PendingRecords where
   command index: `Lean.Elab.process` recorded from index 0 again) leaves observations that are not the module's: none;
 - a module-system file is never partially re-elaborated: no payloads, `noreuse`;
 - an imported module's initializer or an extension's initial state used process-wide state while the header was
-  processed (`RecordedEffects.atImport`), on which every command may depend: `noreuse`. -/
+  processed (`RecordedEffects.atImport`), or read a value that may differ in another run (`importReadNondeterministic`),
+  on which every command may depend: `noreuse`. -/
 def startModuleRecords (env : Environment) (sessionChanged : Bool) : IO PendingRecords := do
   -- the kernel checks run in their commands' contexts and note effects there
   discard <| IO.wait env.checked
@@ -134,7 +135,10 @@ def startModuleRecords (env : Environment) (sessionChanged : Bool) : IO PendingR
   if nested then
     return { observations, wholeModule? := none, payloadsTask := .pure (.ok #[])
              done? := some { noreuseReason? := moduleSystem? <|> some "command observations of a nested frontend" } }
-  let wholeModule? := moduleSystem? <|> effects.atImport[0]?.map (s!"an imported module's initializer {·}")
+  let wholeModule? := moduleSystem? <|> effects.atImport[0]?.map (s!"an imported module's initializer {·}") <|>
+    if (← importReadNondeterministic) then
+      some "an imported module's initializer read a value that may differ in another run"
+    else none
   let payloadsTask ← if env.header.isModule then pure (.pure (.ok #[]))
     else IO.asTask (commandPayloads observations effects.byCommand)
   return { observations, done? := none, wholeModule?, payloadsTask }

@@ -382,6 +382,41 @@ def takeRecordedEffects : BaseIO RecordedEffects := do
     if c == importContext then { r with atImport := r.atImport.push what }
     else { r with byCommand := r.byCommand.push (c.toNat - 1, what) }
 
+@[extern "lean_io_read_nondeterministic"]
+private opaque readNondeterministic (c : UInt32) : BaseIO Bool
+
+/-- Whether command `i` (in its task context, `withCommandContext`, the tasks it starts included) read a value tied to
+this process or this moment since the run started (`startFrontendRun`): a clock (`IO.monoMsNow`, `IO.monoNanosNow`,
+`Std.Time.Timestamp.now`), a process, thread or child process id (`IO.Process.getPID`, `IO.getTID`,
+`IO.Process.Child.pid`), the libuv counterparts and uptime, the process's resource usage, the system's memory, the
+number of hardware threads (`System.Platform.Internal.getHardwareConcurrency`), or whether a handle is a terminal
+(`IO.FS.Handle.isTty`). Not an effect (`takeRecordedEffects`). Such a value from another run is one this run cannot
+produce, so such a command is not kept; values with the same range in every run (random bytes, the random generator's
+numbers, task states, temporary file names, heartbeats) are not recorded. -/
+def commandReadNondeterministic (i : Nat) : BaseIO Bool :=
+  readNondeterministic (i + 1).toUInt32
+
+/-- Whether an imported module's initializer or an extension's initial state, while the header was processed
+(`withImportContext`), read a value tied to this process or this moment, as `commandReadNondeterministic` records for a
+command, or a value with the same range in every run: random bytes, the random generator's numbers (`IO.rand`,
+`IO.setRandSeed` and every other user of `IO.stdGenRef`, `IO.noteRandomGeneratorUse`), a temporary file name, a task's
+state (`IO.getTaskState`, `IO.hasFinished`, `IO.Promise.isResolved`), which task finished first (`IO.waitAny`),
+cancellation (`IO.checkCanceled`), or how the tasks it started that run IO code (`IO.asTask`, `IO.mapTask`,
+`IO.bindTask`) were scheduled. Every command of the module may hold such a value, so that commands kept from another
+run and commands elaborated in this one would hold different ones. -/
+def importReadNondeterministic : BaseIO Bool :=
+  readNondeterministic importContext
+
+@[extern "lean_io_set_nondeterministic_reads_unrecorded"]
+private opaque setNondeterministicReadsUnrecorded (b : Bool) : BaseIO Bool
+
+/-- Runs `act` without recording its reads on the running thread for `commandReadNondeterministic` (a task it starts
+records its own): for the elaborator's own reads, whose values reach no command's effects. Nested uses restore the
+setting of the enclosing one. -/
+def withoutNondeterministicReads [Monad m] [MonadFinally m] [MonadLiftT BaseIO m] (act : m α) : m α := do
+  let prev ← (setNondeterministicReadsUnrecorded true : BaseIO Bool)
+  try act finally (discard (setNondeterministicReadsUnrecorded prev) : BaseIO Unit)
+
 /-- The records of `recordCommandDecls`, newest first. -/
 def declsByCommand : BaseIO (List (Nat × Array Name × NameSet)) :=
   declsByCommandRef.get

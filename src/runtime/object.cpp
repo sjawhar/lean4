@@ -1136,6 +1136,8 @@ static unsigned get_lean_num_threads() {
 
 /* getHardwareConcurrency (_ : Unit) : UInt32 */
 extern "C" LEAN_EXPORT uint32 lean_internal_get_hardware_concurrency(obj_arg) {
+    // the machine's, which another build's machine may differ in
+    note_nondeterministic_read();
     return hardware_concurrency();
 }
 

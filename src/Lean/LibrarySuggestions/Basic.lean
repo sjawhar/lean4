@@ -453,6 +453,7 @@ def empty : Selector := fun _ _ => pure #[]
 
 /-- A random premise selection algorithm, provided solely for testing purposes. -/
 def random (gen : StdGen := ⟨37, 59⟩) : Selector := fun _ cfg => do
+  IO.noteRandomGeneratorUse
   IO.stdGenRef.set gen
   let env ← getEnv
   let max := cfg.maxSuggestions

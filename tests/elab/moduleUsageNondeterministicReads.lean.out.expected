@@ -1,0 +1,7 @@
+N: exit 0
+true false true false true
+D: noreuse true, reason "an imported module's initializer read a value that may differ in another run"
+F: noreuse true, reason "an imported module's initializer read a value that may differ in another run"
+H: noreuse true, reason "an imported module's initializer read a value that may differ in another run"
+U: noreuse true, reason "an imported module's initializer read a value that may differ in another run"
+E: noreuse false, reason null

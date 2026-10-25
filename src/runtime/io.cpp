@@ -587,7 +587,8 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_set_inheritable(b_obj_arg h, 
 /* Handle.isTty : (@& Handle) → BaseIO Bool */
 extern "C" LEAN_EXPORT uint8_t lean_io_prim_handle_is_tty(b_obj_arg h) {
     FILE * fp = io_get_handle(h);
-    note_handle_use(fp);
+    // a property of this process's streams, not a use of the stream
+    note_nondeterministic_read();
 #ifdef LEAN_WINDOWS
     /*
     On Windows, there are two approaches for detecting a console.
@@ -745,6 +746,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_put_str(b_obj_arg h, b_obj_ar
 
 /* Std.Time.Timestamp.now : IO Timestamp */
 extern "C" LEAN_EXPORT obj_res lean_get_current_time() {
+    note_nondeterministic_read();
     using namespace std::chrono;
 
     std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
@@ -918,6 +920,7 @@ extern "C" LEAN_EXPORT obj_res lean_get_windows_local_timezone_id_at(uint64_t tm
 
 /* monoMsNow : BaseIO Nat */
 extern "C" LEAN_EXPORT obj_res lean_io_mono_ms_now() {
+    note_nondeterministic_read();
     static_assert(sizeof(std::chrono::milliseconds::rep) <= sizeof(uint64), "size of std::chrono::nanoseconds::rep may not exceed 64");
     auto now = std::chrono::steady_clock::now();
     auto tm = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
@@ -926,6 +929,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_mono_ms_now() {
 
 /* monoNanosNow : BaseIO Nat */
 extern "C" LEAN_EXPORT obj_res lean_io_mono_nanos_now() {
+    note_nondeterministic_read();
     static_assert(sizeof(std::chrono::nanoseconds::rep) <= sizeof(uint64), "size of std::chrono::nanoseconds::rep may not exceed 64");
     auto now = std::chrono::steady_clock::now();
     auto tm = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch());
@@ -934,6 +938,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_mono_nanos_now() {
 
 /* getRandomBytes (nBytes : USize) : IO ByteArray */
 extern "C" LEAN_EXPORT obj_res lean_io_get_random_bytes (size_t nbytes) {
+    note_import_nondeterministic_read();
     // Adapted from https://github.com/rust-random/getrandom/blob/30308ae845b0bf3839e5a92120559eaf56048c28/src/
 
     if (nbytes == 0) return io_result_mk_ok(lean_alloc_sarray(1, 0, 0));
@@ -1360,6 +1365,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_hard_link(b_obj_arg orig, b_obj_arg link)
 
 /* createTempFile : IO (Handle × FilePath) */
 extern "C" LEAN_EXPORT obj_res lean_io_create_tempfile(lean_object * /* w */) {
+    note_import_nondeterministic_read();
     char path[PATH_MAX];
     size_t base_len = PATH_MAX;
     int ret = uv_os_tmpdir(path, &base_len);
@@ -1407,6 +1413,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_create_tempfile(lean_object * /* w */) {
 
 /* createTempDir : IO FilePath */
 extern "C" LEAN_EXPORT obj_res lean_io_create_tempdir(lean_object * /* w */) {
+    note_import_nondeterministic_read();
     char path[PATH_MAX];
     size_t base_len = PATH_MAX;
     int ret = uv_os_tmpdir(path, &base_len);
@@ -1557,9 +1564,15 @@ process-wide uses: what imported modules' initializers do inside the process fol
 
 Not effects: reads of the toolchain's own files (`in_pinned_dirs`), which the Lean githash pins, recorded as a read of
 the value `toolchain` (the pinned directories' root), and for the same reason a run of the toolchain's own SAT solver on
-files the context created (`note_process_spawn`); values two runs may differ in (clocks, timers, heartbeat counts,
-random bytes, process and thread ids, resource usage and free memory), which a kept command's result takes from the run
-that recorded it; and the runtime's debugging output (`dbg_trace`, `timeit`).
+files the context created (`note_process_spawn`); reads of values tied to this process or this moment (clocks, process,
+thread and child process ids, resource usage, the system's memory and hardware threads, whether a handle is a
+terminal), the command contexts and the import context that read one being recorded (`note_nondeterministic_read`);
+values with the same range in every run (random bytes, the random generator's numbers (`IO.rand`), task states, which
+task finished first, cancellation, heartbeat counts, temporary file names, and the scheduling of a task that runs IO
+code), which the import context's reads of are recorded as of the others, since every command may hold what imported
+modules' initializers computed (`note_import_nondeterministic_read`, all but heartbeat counts; a task that runs IO code
+counts when the import context creates it, `lean_io_as_task`, `lean_io_map_task`, `lean_io_bind_task`);
+and the runtime's debugging output (`dbg_trace`, `timeit`, `allocprof`).
 
 Value reads: in every context, the first value of each environment variable, of the running executable's path and of
 the working directory read, whether a later read saw another one, and the command contexts that read it, sorted (not
@@ -1631,6 +1644,57 @@ extern "C" LEAN_EXPORT uint32 lean_io_live_tasks(uint32 ctx) {
     lock_guard<mutex> lock(*g_live_tasks_mutex);
     auto it = g_live_tasks->find(ctx);
     return it == g_live_tasks->end() ? 0 : static_cast<uint32>(it->second);
+}
+
+// the command contexts and the import context that read a nondeterministic source while effects were noted
+// (`note_nondeterministic_read`)
+static std::unordered_set<uint32> * g_nondet_contexts = nullptr;
+// bumped whenever `g_nondet_contexts` is cleared, invalidating each thread's `t_nondet_ctx`
+static std::atomic<uint32> g_nondet_generation(0);
+// the context and generation for which the thread last recorded a read, so that repeated reads skip the lock
+static thread_local uint32 t_nondet_ctx = 0;
+static thread_local uint32 t_nondet_gen = 0;
+// while set, the thread's nondeterministic reads are not recorded (`lean_io_set_nondeterministic_reads_unrecorded`)
+static thread_local bool t_nondet_unrecorded = false;
+
+void note_nondeterministic_read() {
+    uint32 ctx = effect_context();
+    if (ctx == 0 || ctx == LEAN_REF_ACCOUNTED || t_nondet_unrecorded) return;
+    uint32 gen = g_nondet_generation.load(std::memory_order_acquire);
+    if (ctx == t_nondet_ctx && gen == t_nondet_gen) return;
+    {
+        lock_guard<mutex> lock(*g_effects_mutex);
+        g_nondet_contexts->insert(ctx);
+    }
+    t_nondet_ctx = ctx;
+    t_nondet_gen = gen;
+}
+
+void note_import_nondeterministic_read() {
+    if (effect_context() == import_context) note_nondeterministic_read();
+}
+
+/* noteRandomGeneratorUse : BaseIO Unit: the running code uses the random generator state `IO.stdGenRef`, seeded when
+   the process starts, a value with the same range in every run (`note_import_nondeterministic_read`) */
+extern "C" LEAN_EXPORT obj_res lean_io_note_random_generator_use() {
+    note_import_nondeterministic_read();
+    return box(0);
+}
+
+/* readNondeterministic (ctx : UInt32) : BaseIO Bool: whether code of task context `ctx` read a value tied to this process
+   or this moment, or for the import context also a value with the same range in every run, since effect notes were
+   switched on (`note_nondeterministic_read`, `note_import_nondeterministic_read`) */
+extern "C" LEAN_EXPORT uint8 lean_io_read_nondeterministic(uint32 ctx) {
+    lock_guard<mutex> lock(*g_effects_mutex);
+    return g_nondet_contexts->count(ctx) != 0;
+}
+
+/* setNondeterministicReadsUnrecorded (b : Bool) : BaseIO Bool: sets whether the running thread's nondeterministic reads
+   are not recorded; returns the previous setting */
+extern "C" LEAN_EXPORT uint8 lean_io_set_nondeterministic_reads_unrecorded(uint8 b) {
+    bool prev = t_nondet_unrecorded;
+    t_nondet_unrecorded = b != 0;
+    return prev;
 }
 
 static void note_value_read_core(std::string const & key, char const * value, uint32 ctx) {
@@ -1927,8 +1991,8 @@ static void forget_handle(FILE * fp) {
 }
 
 /* setEffectRecording (on : Bool) (pinned : @& Array String) (root solver : @& String) : BaseIO Unit; switching it on
-   forgets earlier notes and value reads, and pins the directories `pinned` (`in_pinned_dirs`) and the SAT solver
-   `solver` (`note_process_spawn`), recorded as `root` when used */
+   forgets earlier notes, value reads and nondeterministic reads, and pins the directories `pinned` (`in_pinned_dirs`)
+   and the SAT solver `solver` (`note_process_spawn`), recorded as `root` when used */
 extern "C" LEAN_EXPORT obj_res lean_io_set_effect_recording(uint8 on, b_obj_arg pinned, b_obj_arg root,
                                                            b_obj_arg solver) {
     if (on) {
@@ -1943,6 +2007,8 @@ extern "C" LEAN_EXPORT obj_res lean_io_set_effect_recording(uint8 on, b_obj_arg 
         lock_guard<mutex> lock(*g_effects_mutex);
         g_effects->clear();
         g_value_reads->clear();
+        g_nondet_contexts->clear();
+        g_nondet_generation.fetch_add(1, std::memory_order_release);
         *g_pinned_dirs = std::move(dirs);
         *g_pinned_root = string_cstr(root);
         *g_pinned_solver = std::move(s);
@@ -2158,6 +2224,7 @@ static obj_res lean_io_as_task_fn(obj_arg act, obj_arg) {
 
 /* asTask {α : Type} (act : BaseIO α) (prio : Nat) : BaseIO (Task α) */
 extern "C" LEAN_EXPORT obj_res lean_io_as_task(obj_arg act, obj_arg prio) {
+    note_import_nondeterministic_read();
     object * c = lean_alloc_closure((void*)lean_io_as_task_fn, 2, 1);
     lean_closure_set(c, 0, act);
     object * t = lean_task_spawn_core(c, lean_unbox(prio), /* keep_alive */ true);
@@ -2172,6 +2239,7 @@ static obj_res lean_io_bind_task_fn(obj_arg f, obj_arg a) {
 
 /*  mapTask (f : α → BaseIO β) (t : Task α) (prio : Nat) (sync : Bool) : BaseIO (Task β) */
 extern "C" LEAN_EXPORT obj_res lean_io_map_task(obj_arg f, obj_arg t, obj_arg prio, uint8 sync) {
+    note_import_nondeterministic_read();
     object * c = lean_alloc_closure((void*)lean_io_bind_task_fn, 2, 1);
     lean_closure_set(c, 0, f);
     object * t2 = lean_task_map_core(c, t, lean_unbox(prio), sync, /* keep_alive */ true);
@@ -2180,6 +2248,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_map_task(obj_arg f, obj_arg t, obj_arg pr
 
 /*  bindTask (t : Task α) (f : α → BaseIO (Task β)) (prio : Nat) (sync : Bool) : BaseIO (Task β) */
 extern "C" LEAN_EXPORT obj_res lean_io_bind_task(obj_arg t, obj_arg f, obj_arg prio, uint8 sync) {
+    note_import_nondeterministic_read();
     object * c = lean_alloc_closure((void*)lean_io_bind_task_fn, 2, 1);
     lean_closure_set(c, 0, f);
     object * t2 = lean_task_bind_core(t, c, lean_unbox(prio), sync, /* keep_alive */ true);
@@ -2187,6 +2256,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_bind_task(obj_arg t, obj_arg f, obj_arg p
 }
 
 extern "C" LEAN_EXPORT uint8_t lean_io_check_canceled() {
+    note_import_nondeterministic_read();
     return lean_io_check_canceled_core();
 }
 
@@ -2200,6 +2270,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_cancel(b_obj_arg t) {
 }
 
 extern "C" LEAN_EXPORT uint8_t lean_io_get_task_state(b_obj_arg t) {
+    note_import_nondeterministic_read();
     return lean_io_get_task_state_core(t);
 }
 
@@ -2208,6 +2279,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_wait(obj_arg t) {
 }
 
 extern "C" LEAN_EXPORT obj_res lean_io_wait_any(b_obj_arg task_list) {
+    note_import_nondeterministic_read();
     object * t = lean_io_wait_any_core(task_list);
     object * v = lean_task_get(t);
     lean_inc(v);
@@ -2279,6 +2351,7 @@ void initialize_io() {
     g_handle_contexts = new std::unordered_map<FILE *, uint32>();
     g_object_contexts = new std::unordered_map<void const *, uint32>();
     g_value_reads = new std::map<std::string, value_read>();
+    g_nondet_contexts = new std::unordered_set<uint32>();
     g_live_tasks_mutex = new mutex();
     g_live_tasks = new std::unordered_map<uint32, int64_t>();
     g_pinned_dirs = new std::vector<std::string>();

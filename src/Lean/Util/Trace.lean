@@ -225,6 +225,9 @@ invocations, which is the common case."
 
 @[inline] private def withStartStop [Monad m] [MonadLiftT BaseIO m] (opts : Options) (act : m α) :
     m (α × Float × Float) := do
+  -- the trace nodes use the times only for the profiler; a clock read would mark the command nondeterministic
+  if !trace.profiler.get opts then
+    return (← act, 0, 0)
   if trace.profiler.useHeartbeats.get opts then
     let start ← IO.getNumHeartbeats
     let a ← act

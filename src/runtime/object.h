@@ -500,6 +500,19 @@ void note_task_owner(uint32 ctx, lean_task_object * t, char const * what);
 bool note_task_created(uint32 ctx);
 /* Uncounts a task `note_task_created` counted for `ctx`, once it is finished or dropped. */
 void note_task_freed(uint32 ctx);
+/* While effects are noted, records that the running task context, a command's or the import context, read a value tied
+   to this process or this moment: a clock, a process, thread or child process id, the process's resource usage, the
+   system's memory or hardware threads, or whether a handle is a terminal (`lean_io_read_nondeterministic`). Not an
+   effect. A command is kept only with a result a fresh build in this process could produce; such a value from another
+   run is one this run cannot produce, so a command that read one is not kept. Values with the same range in every run
+   (random bytes, task states, which task finished first, cancellation, temporary file names, heartbeats, timing
+   output) are not recorded in a command: a kept command's old value is one a fresh build could produce too. */
+void note_nondeterministic_read();
+/* As `note_nondeterministic_read`, for a value with the same range in every run (random bytes, a temporary file name, a
+   task's state, which task finished first, cancellation), only in the import context: every command may hold what
+   imported modules' initializers computed, so that a kept command would hold another run's value where the commands
+   elaborated hold this run's. */
+void note_import_nondeterministic_read();
 /* While effects are noted, records in any context that the running code read the process value `key` (an
    environment variable `env:NAME`, `appPath`, `workingDirectory`), which is `value`, or absent for `nullptr`
    (`lean_io_take_value_reads`). */

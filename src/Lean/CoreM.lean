@@ -796,7 +796,8 @@ def wrapAsyncAsSnapshot {α : Type} (act : α → CoreM Unit) (cancelTk? : Optio
     (desc : String := by exact decl_name%.toString) : CoreM (α → BaseIO SnapshotTree) := do
   let f ← wrapAsync (cancelTk? := cancelTk?) fun a => do
     IO.FS.withIsolatedStreams (isolateStderr := stderrAsMessages.get (← getOptions)) do
-      let tid ← IO.getTID
+      -- the thread id only labels the traces of the profiler's output
+      let tid ← withoutNondeterministicReads IO.getTID
       -- reset trace/info state and message log so as not to report them twice
       modify fun st => { st with
         messages := st.messages.markAllReported

@@ -54,6 +54,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_set_process_title(b_obj_arg title) {
 
 // Std.Internal.UV.System.uptime : IO UInt64
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_uptime() {
+    note_nondeterministic_read();
     double uptime;
 
     int result = uv_uptime(&uptime);
@@ -69,12 +70,14 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_uptime() {
 
 // Std.Internal.UV.System.osGetPid : IO UInt64
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_getpid() {
+    note_nondeterministic_read();
     uv_pid_t pid = uv_os_getpid();
     return lean_io_result_mk_ok(lean_box_uint64(pid));
 }
 
 // Std.Internal.UV.System.osGetPpid : IO UInt64
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_getppid() {
+    note_nondeterministic_read();
     uv_pid_t ppid = uv_os_getppid();
     return lean_io_result_mk_ok(lean_box_uint64(ppid));
 }
@@ -432,12 +435,14 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_uname() {
 
 // Std.Internal.UV.System.hrtime : IO UInt64
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_hrtime() {
+    note_nondeterministic_read();
     uint64_t time = uv_hrtime();
     return lean_io_result_mk_ok(lean_box_uint64(time));
 }
 
 // Std.Internal.UV.System.random : UInt64 → IO (IO.Promise (Except IO.Error ByteArray))
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_random(uint64_t size) {
+    note_import_nondeterministic_read();
     // libuv rejects larger requests with `UV_E2BIG`; checking first avoids allocating the array.
     if (size > 0x7FFFFFFF) {
         return io_result_mk_uv_error(UV_E2BIG);
@@ -498,6 +503,7 @@ static inline uint64_t timeval_to_millis(uv_timeval_t t) {
 
 // Std.Internal.UV.System.getrusage : IO RUsage
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_getrusage() {
+    note_nondeterministic_read();
     uv_rusage_t usage;
     int result = uv_getrusage(&usage);
     if (result < 0) {
@@ -542,24 +548,28 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_exepath() {
 
 // Std.Internal.UV.System.freeMemory : IO UInt64
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_get_free_memory() {
+    note_nondeterministic_read();
     uint64_t mem = uv_get_free_memory();
     return lean_io_result_mk_ok(lean_box_uint64(mem));
 }
 
 // Std.Internal.UV.System.totalMemory : IO UInt64
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_get_total_memory() {
+    note_nondeterministic_read();
     uint64_t mem = uv_get_total_memory();
     return lean_io_result_mk_ok(lean_box_uint64(mem));
 }
 
 // Std.Internal.UV.System.constrainedMemory : IO UInt64
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_get_constrained_memory() {
+    note_nondeterministic_read();
     uint64_t mem = uv_get_constrained_memory();
     return lean_io_result_mk_ok(lean_box_uint64(mem));
 }
 
 // Std.Internal.UV.System.availableMemory : IO UInt64
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_get_available_memory() {
+    note_nondeterministic_read();
 #if UV_VERSION_HEX >= 0x012D00
     uint64_t mem = uv_get_available_memory();
     return lean_io_result_mk_ok(lean_box_uint64(mem));

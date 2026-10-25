@@ -126,9 +126,18 @@ initialize IO.stdGenRef : IO.Ref StdGen ←
   IO.mkRef (mkStdGen seed)
 
 /--
+Notes that the running code uses the random generator state `IO.stdGenRef`, whose numbers depend on a seed drawn when
+the process starts: while usage recording processes a module's header, the imported modules' initializers that use it
+read a value that may differ in another run. Every function that reads or writes `IO.stdGenRef` calls it first.
+-/
+@[extern "lean_io_note_random_generator_use"]
+opaque IO.noteRandomGeneratorUse : BaseIO Unit
+
+/--
 Seeds the random number generator state used by `IO.rand`.
 -/
-def IO.setRandSeed (n : Nat) : BaseIO Unit :=
+def IO.setRandSeed (n : Nat) : BaseIO Unit := do
+  IO.noteRandomGeneratorUse
   IO.stdGenRef.set (mkStdGen n)
 
 /--
@@ -138,6 +147,7 @@ state.
 This state can be seeded using `IO.setRandSeed`.
 -/
 def IO.rand (lo hi : Nat) : BaseIO Nat := do
+  IO.noteRandomGeneratorUse
   let gen ← IO.stdGenRef.get
   let (r, gen) := randNat gen lo hi
   IO.stdGenRef.set gen
