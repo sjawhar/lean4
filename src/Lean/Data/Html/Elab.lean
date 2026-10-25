@@ -34,7 +34,7 @@ public meta def Element.checkNoVoidChildren (stx : Element) : CoreM Unit := do
         -- Everything up to the start tag's `>` is kept; children and end tag are dropped.
         let some ltPos := startTag.lt.getPos? | pure m!""
         let some gtPos := startTag.gt.getPos? | pure m!""
-        let selfClosing := ltPos.extract (← getFileMap).source gtPos ++ "/>"
+        let selfClosing := ltPos.extract (← getFileMapOfSyntax).source gtPos ++ "/>"
         MessageData.hint "Make it self-closing" #[selfClosing] (ref? := stx)
       -- Note: having children implies having an end tag in the grammar.
       throwErrorAt stx m!"Void element `{tagName}` cannot have children or an end tag{hint}"

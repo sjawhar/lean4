@@ -372,6 +372,7 @@ private partial def added : AddedConst → W Unit
     let o := result.observed
     stringArray o.values
     nameArray o.uses
+    nat o.fileContext.toNat
     nat o.extra.size
     for (m, isExported, isMeta) in o.extra do name m; nat (2 * isExported.toNat + isMeta.toNat)
     nat o.decls.size
@@ -571,6 +572,8 @@ private partial def readAdded (depth : Nat := 0) : R AddedConst := do
       | _ => throw "a realization report tag of the packed payloads is out of range"
     let values ← readStrings
     let uses ← readNames
+    let fileContext ← readNat
+    unless fileContext < 256 do throw "a file-context read of the packed payloads is out of range"
     let k ← readByteCount
     let mut extra := Array.emptyWithCapacity k
     for _ in [0:k] do
@@ -582,7 +585,7 @@ private partial def readAdded (depth : Nat := 0) : R AddedConst := do
     let mut decls := Array.emptyWithCapacity d
     for _ in [0:d] do decls := decls.push (← readNames, ← readNames)
     return .realization forConst key consts states
-      { merges, report, observed := { values, uses, extra, decls } }
+      { merges, report, observed := { values, uses, fileContext := fileContext.toUInt8, extra, decls } }
   | 3 => return .merged (← readName) (← readName) (← readNames)
   | 4 =>
     let forConst ← readName

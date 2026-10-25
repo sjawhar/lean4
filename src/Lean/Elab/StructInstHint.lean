@@ -71,7 +71,7 @@ def mkMissingFieldsHint (fields : Array (Name × Option Expr)) (stx : Syntax) : 
     else
       Format.line.joinSep newFields.toList
 
-  let fileMap ← getFileMap
+  let fileMap ← getFileMapOfSyntax
   let col (p : String.Pos.Raw) := (fileMap.utf8PosToLspPos p).character
   let indent :=
     if let some initFieldPos := view.initFieldPos? then
@@ -168,7 +168,7 @@ where
     let some penultimateFieldPos := rawFields[lastInterveningSepIdx - 1].getPos? | return false
     let some lastFieldPos := rawFields[lastInterveningSepIdx + 1].getPos? | return false
     let some lastFieldTailPos := rawFields[lastInterveningSepIdx + 1].getTailPos? | return false
-    let fileMap ← getFileMap
+    let fileMap ← getFileMapOfSyntax
     let ⟨penultimateFieldLine, penultimateFieldCol⟩ := fileMap.utf8PosToLspPos penultimateFieldPos
     let ⟨lastFieldLine, lastFieldCol⟩ := fileMap.utf8PosToLspPos lastFieldPos
     return lastFieldLine == penultimateFieldLine || lastFieldCol < penultimateFieldCol

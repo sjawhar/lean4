@@ -237,6 +237,9 @@ private builtin_initialize usedByContextRef : IO.Ref (PersistentHashMap UInt32 N
 ran, newest first. Such a handler may write state no command payload carries. -/
 private builtin_initialize foreignAttributesByContextRef : IO.Ref (PersistentHashMap UInt32 (List Name)) ←
   mkAccountedRef {}
+/-- Per task context, what its code read of the module's file beyond its command's own source
+(`recordFileContextRead`). -/
+private builtin_initialize fileContextByContextRef : IO.Ref (PersistentHashMap UInt32 UInt8) ← mkAccountedRef {}
 /-- Per task context, the extra module uses its code recorded (`recordContextExtraModUse`): module, exported, meta. -/
 private builtin_initialize extraModUsesByContextRef :
     IO.Ref (PersistentHashMap UInt32 (PersistentHashSet (Name × Bool × Bool))) ← mkAccountedRef {}
@@ -355,13 +358,14 @@ def commandValueKeys (reads : Array (String × Option String × Bool × Array UI
   return out
 
 @[extern "lean_io_set_value_reads_unrecorded"]
-private opaque setValueReadsUnrecorded (b : Bool) : BaseIO Unit
+private opaque setValueReadsUnrecorded (b : Bool) : BaseIO Bool
 
 /-- Runs `act` without recording the process values it reads on the running thread (`takeValueReads`; a task it starts
-records its own): a run's check of the values a previous run read is no read of the run's own. -/
+records its own): a run's check of the values a previous run read is no read of the run's own. Nested uses restore the
+setting of the enclosing one. -/
 def withoutValueReads [Monad m] [MonadFinally m] [MonadLiftT BaseIO m] (act : m α) : m α := do
-  (setValueReadsUnrecorded true : BaseIO Unit)
-  try act finally (setValueReadsUnrecorded false : BaseIO Unit)
+  let prev ← (setValueReadsUnrecorded true : BaseIO Bool)
+  try act finally (discard (setValueReadsUnrecorded prev) : BaseIO Unit)
 
 /-- The value of the process value `key` (`takeValueReads`) in this process now, `none` if absent or unreadable;
 throws for an unknown key. -/
@@ -415,6 +419,7 @@ def startFrontendRun (record : Bool) : BaseIO Nat := do
     realizationDeclsRef.set {}
     usedByContextRef.set {}
     foreignAttributesByContextRef.set {}
+    fileContextByContextRef.set {}
     extraModUsesByContextRef.set {}
     carriedValuesByContextRef.set {}
     setEffectRecording true pinned root solver
@@ -472,6 +477,22 @@ the attribute `attr` that may run code outside core Lean. -/
 def recordForeignAttribute (attr : Name) : BaseIO Unit := do
   if let some c ← recordingContext? then foreignAttributesByContextRef.modify fun m => m.insert c (attr :: m.findD c [])
 
+/-- The file name of the module being elaborated (`commandFileContextReads`). -/
+def FileContextRead.fileName : UInt8 := 1
+/-- The module's source, beyond the syntax of the command reading it (`commandFileContextReads`). -/
+def FileContextRead.source : UInt8 := 2
+
+/-- Records, when recording is on and inside a command or a realization (`recordingContext?`), that it read `what`
+(`FileContextRead`) through the elaborators' accessors (`MonadLog.getFileName`, `MonadFileMap.getFileMap`). Core reads
+of positions and text of the command's own syntax, and of the file name for message metadata, use other accessors and
+are not recorded: a reuse run compares the command's source and position (`CommandSpan`), and shows its messages with
+the file name it runs on. -/
+def recordFileContextRead (what : UInt8) : BaseIO Unit := do
+  if let some c ← recordingContext? then
+    let bits := ((← fileContextByContextRef.get).find? c).getD 0
+    unless bits ||| what == bits do
+      fileContextByContextRef.modify fun m => m.insert c (m.findD c 0 ||| what)
+
 /-- Records, when recording is on and inside a command or a realization (`recordingContext?`), the extra module use of
 `module` (`Lean.recordExtraModUse`) with its visibility and phase, writing the log only when the use is new. -/
 @[noinline] def recordContextExtraModUse (module : Name) (isExported isMeta : Bool) : BaseIO Unit := do
@@ -494,6 +515,15 @@ def declsByContext : BaseIO (Array (UInt32 × Array Name × NameSet)) :=
 def usedByContexts (ctxs : Array UInt32) : BaseIO NameSet := do
   let m ← usedByContextRef.get
   return ctxs.foldl (init := {}) fun s c => (m.findD c {}).foldl (·.insert ·) s
+
+/-- What the task contexts `ctxs` read of the module's file (`FileContextRead` bits, `recordFileContextRead`). -/
+def fileContextReadsOf (ctxs : Array UInt32) : BaseIO UInt8 := do
+  let m ← fileContextByContextRef.get
+  return ctxs.foldl (init := 0) fun bits c => bits ||| m.findD c 0
+
+/-- What command `i` read of the module's file (`FileContextRead` bits), through its contexts (`commandContexts`). -/
+def commandFileContextReads (i : Nat) : BaseIO UInt8 := do
+  fileContextReadsOf (← commandContexts i)
 
 /-- Orders extra module uses by module, then visibility and phase. -/
 private def extraLt (a b : Name × Bool × Bool) : Bool :=
@@ -519,14 +549,15 @@ def commandForeignAttributes (i : Nat) (ctxs : Array UInt32) : BaseIO (Array Nam
 /-- What a realization's code observed that a command which used it observed too (`commandContexts`), as a command
 payload's realization record carries it (`CommandEntries`), so that a keep, which re-adds the realization without
 running `realize`, hands it to every later request (`recordRealizationObservations`): the process values it read, the
-constants it used without a reference, its extra module uses (module, exported, meta), and the declarations it
-submitted to `addDecl` that the command's environment after it lacks (an `evalExpr`'s, whose uses count as the
-command's, `ModuleUsage.commandRecords`) with the constants of their types and values; each sorted. Its effects and
-reads of values tied to the run are not among them: they refuse every command that used the realization and mark it as
-not to be kept, so no kept command has any. -/
+constants it used without a reference, what it read of the module's file (`FileContextRead` bits), its extra module
+uses (module, exported, meta), and the declarations it submitted to `addDecl` that the command's environment after it
+lacks (an `evalExpr`'s, whose uses count as the command's, `ModuleUsage.commandRecords`) with the constants of their
+types and values; each sorted. Its effects and reads of values tied to the run are not among them: they refuse every
+command that used the realization and mark it as not to be kept, so no kept command has any. -/
 structure RealizationObservations where
   values : Array String := #[]
   uses : Array Name := #[]
+  fileContext : UInt8 := 0
   extra : Array (Name × Bool × Bool) := #[]
   decls : Array (Array Name × Array Name) := #[]
   deriving Inhabited, BEq
@@ -556,6 +587,7 @@ def realizationObservations (lacks : Array Name → Bool) (r : UInt64) : BaseIO 
   return {
     values := sortedDistinct (· < ·) values
     uses := (← usedByContexts ctxs).toArray
+    fileContext := ← fileContextReadsOf ctxs
     extra := ← extraModUsesOf ctxs
     decls := sortedDistinct (fun a b => namesLt a.1 b.1 || (a.1 == b.1 && namesLt a.2 b.2)) decls }
 
@@ -568,6 +600,7 @@ def recordRealizationObservations (r : UInt64) (obs : RealizationObservations) :
   unless obs.values.isEmpty do carriedValuesByContextRef.modify (·.insert c obs.values)
   unless obs.uses.isEmpty do
     usedByContextRef.modify fun m => m.insert c (obs.uses.foldl (·.insert ·) (m.findD c {}))
+  unless obs.fileContext == 0 do fileContextByContextRef.modify fun m => m.insert c (m.findD c 0 ||| obs.fileContext)
   unless obs.extra.isEmpty do
     extraModUsesByContextRef.modify fun m => m.insert c (obs.extra.foldl (·.insert ·) (m.findD c {}))
   for (ns, used) in obs.decls do

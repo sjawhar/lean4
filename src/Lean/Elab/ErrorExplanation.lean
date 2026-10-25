@@ -119,7 +119,7 @@ open Command in
   if errorExplanationExt.getState (← getEnv) |>.contains name then
     throwErrorAt id m!"Cannot add explanation: An error explanation already exists for `{name}`"
   let (declLoc? : Option DeclarationLocation) ← do
-    let map ← getFileMap
+    let map ← getFileMapOfSyntax
     let start := id.raw.getPos?.getD 0
     let fin := id.raw.getTailPos?.getD start
     pure <| some {

@@ -336,8 +336,10 @@ instance : MonadResolveName CommandElabM where
 
 instance : MonadLog CommandElabM where
   getRef      := getRef
-  getFileMap  := return (← read).fileMap
-  getFileName := return (← read).fileName
+  getFileMap  := do recordFileContextRead FileContextRead.source; return (← read).fileMap
+  getFileMapOfSyntax := return (← read).fileMap
+  getFileName := do recordFileContextRead FileContextRead.fileName; return (← read).fileName
+  getFileNameOfMessages := return (← read).fileName
   hasErrors   := return (← get).messages.hasErrors
   logMessage msg := do
     if (← read).suppressElabErrors then

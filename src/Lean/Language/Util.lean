@@ -21,7 +21,7 @@ namespace Lean.Language
 partial def SnapshotTree.trace (s : SnapshotTree) : CoreM Unit :=
   go .skip s
 where go range? s := do
-  let file ← getFileMap
+  let file ← getFileMapOfSyntax
   let mut desc := f!"{s.element.desc}"
   match range? with
   | .some range => desc := desc ++ f!"{file.toPosition range.start}-{file.toPosition range.stop} "

@@ -2201,10 +2201,12 @@ extern "C" LEAN_EXPORT obj_res lean_io_context_value_keys(b_obj_arg cs) {
     return r;
 }
 
-/* setValueReadsUnrecorded (b : Bool) : BaseIO Unit: while `b`, the running thread's value reads are not recorded */
-extern "C" LEAN_EXPORT obj_res lean_io_set_value_reads_unrecorded(uint8 b) {
+/* setValueReadsUnrecorded (b : Bool) : BaseIO Bool: while `b`, the running thread's value reads are not recorded;
+   returns the previous setting */
+extern "C" LEAN_EXPORT uint8 lean_io_set_value_reads_unrecorded(uint8 b) {
+    bool prev = t_value_reads_unrecorded;
     t_value_reads_unrecorded = b;
-    return box(0);
+    return prev;
 }
 
 /* markRefAccounted (r : @& IO.Ref α) : BaseIO Unit: writes to `r` are noted for no context */

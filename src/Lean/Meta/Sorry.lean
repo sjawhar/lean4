@@ -86,7 +86,7 @@ def mkLabeledSorry (type : Expr) (synthetic : Bool) (unique : Bool) : MetaM Expr
     Elab.throwAbortCommand
   let tag ←
     if let (some startSPos, some endSPos) := ((← getRef).getPos?, (← getRef).getTailPos?) then
-      let fileMap ← getFileMap
+      let fileMap ← getFileMapOfSyntax
       SorryLabelView.encode {
         module? := some {
           module := (← getMainModule)

@@ -471,7 +471,7 @@ def addTraceAsMessages [Monad m] [MonadRef m] [MonadLog m] [MonadTrace m] : m Un
     -- cmdline and info view differ in how they insert newlines in between trace nodes so we just
     -- put them in a synthetic root node for now and let the rendering functions handle this case
     let data := .tagged `trace <| .trace { cls := .anonymous } .nil traceMsg
-    logMessage <| Elab.mkMessageCore (← getFileName) (← getFileMap) data .information pos endPos
+    logMessage <| Elab.mkMessageCore (← getFileNameOfMessages) (← getFileMapOfSyntax) data .information pos endPos
 
 builtin_initialize
   registerTraceClass `debug

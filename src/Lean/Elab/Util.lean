@@ -256,7 +256,7 @@ def nestedExceptionToMessageData [Monad m] [MonadLog m] (ex : Exception) : m Mes
     if pos == exPos then
       return ex.toMessageData
     else
-      let exPosition := (← getFileMap).toPosition exPos
+      let exPosition := (← getFileMapOfSyntax).toPosition exPos
       return m!"{exPosition.line}:{exPosition.column} {ex.toMessageData}"
 
 def throwErrorWithNestedErrors [MonadError m] [Monad m] [MonadLog m] (msg : MessageData) (exs : Array Exception) : m α := do

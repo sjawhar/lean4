@@ -234,7 +234,7 @@ def Suggestion.pretty (s : Suggestion) (w : Option Nat := none) (indent column :
   s.suggestion.prettyExtra w indent column
 
 def Suggestion.processEdit (s : Suggestion) (range : Lean.Syntax.Range) : CoreM Lsp.TextEdit := do
-  let map ← getFileMap
+  let map ← getFileMapOfSyntax
   -- FIXME: this produces incorrect results when `by` is at the beginning of the line, i.e.
   -- replacing `tac` in `by tac`, because the next line will only be 2 space indented
   -- (less than `tac` which starts at column 3)

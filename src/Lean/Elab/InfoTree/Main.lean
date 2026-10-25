@@ -30,7 +30,7 @@ def saveNoFileMap : m CommandContextInfo := return {
 
 def save [MonadFileMap m] : m CommandContextInfo := do
   let ctx ← saveNoFileMap
-  return { ctx with fileMap := (← getFileMap) }
+  return { ctx with fileMap := (← getFileMapOfSyntax) }
 
 end CommandContextInfo
 

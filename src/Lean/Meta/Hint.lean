@@ -443,7 +443,7 @@ def mkSuggestionsMessage (suggestions : Array Suggestion) (ref : Syntax)
       }
     }
     pushInfoLeaf info
-    let map ← getFileMap
+    let map ← getFileMapOfSyntax
     let rangeContents := String.Pos.Raw.extract map.source range.start range.stop
     let edits ← do
       if let some msgData := suggestion.messageData? then
@@ -453,7 +453,7 @@ def mkSuggestionsMessage (suggestions : Array Suggestion) (ref : Syntax)
     let mut edits := edits
     if let some previewRange := suggestion.previewSpan? >>= Syntax.getRange? then
       if previewRange.includes range then
-        let map ← getFileMap
+        let map ← getFileMapOfSyntax
         if previewRange.start < range.start then
           edits := #[(.skip, (String.Pos.Raw.extract map.source previewRange.start range.start))] ++ edits
         if range.stop < previewRange.stop then

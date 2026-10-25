@@ -75,7 +75,7 @@ This is used when the literal has no source position, as in a docstring that cam
 -/
 private def parseFromContents (p : ParserFn) (contents : String) : m Syntax := do
   let env ← getEnv
-  let ictx := mkInputContext contents (← getFileName)
+  let ictx := mkInputContext contents (← getFileNameOfMessages)
   let s := p.run ictx { env, options := ← getOptions } (getTokenTable env) (mkParserState contents)
   if !s.allErrors.isEmpty then
     throwError (s.toErrorMsg ictx)
@@ -87,12 +87,12 @@ private def parseFromContents (p : ParserFn) (contents : String) : m Syntax := d
 def parseContent (p : ParserFn) (tok : Syntax) (contents : String) : m Syntax := do
   if (tok.getPos? (canonicalOnly := true)).isNone then
     return ← parseFromContents p contents
-  let text ← getFileMap
+  let text ← getFileMapOfSyntax
   let env ← getEnv
   let ⟨pos, endPos⟩ ← strLitRange ⟨tok⟩
   let endPos := if endPos ≤ text.source.rawEndPos then endPos else text.source.rawEndPos
   let ictx :=
-    mkInputContext text.source (← getFileName)
+    mkInputContext text.source (← getFileNameOfMessages)
       (endPos := endPos) (endPos_valid := by simp only [endPos]; split <;> simp [*])
   -- TODO fallback for non-original syntax
   let s := (mkParserState text.source).setPos pos
@@ -108,7 +108,7 @@ def parseContent (p : ParserFn) (tok : Syntax) (contents : String) : m Syntax :=
 def parseQuotedStrLit (p : ParserFn) (strLit : StrLit) : m Syntax := do
   if (strLit.raw.getPos? (canonicalOnly := true)).isNone then
     return ← parseFromContents p strLit.getString
-  let text ← getFileMap
+  let text ← getFileMapOfSyntax
   let env ← getEnv
   let ⟨pos, _⟩ ← strLitRange strLit
   let pos ← do
@@ -122,7 +122,7 @@ def parseQuotedStrLit (p : ParserFn) (strLit : StrLit) : m Syntax := do
     else
       throwErrorAt strLit "Not a quoted string literal"
   let str := strLit.getString
-  let ictx := mkInputContext str (← getFileName)
+  let ictx := mkInputContext str (← getFileNameOfMessages)
   let s := mkParserState str
   let s := p.run ictx { env, options := ← getOptions } (getTokenTable env) s
 
@@ -168,7 +168,7 @@ def parseContent' (p : ParserFn) (tok : Syntax) (contents : String) : m (Syntax 
   let s : StrLit := ⟨tok⟩
   if (tok.getPos? (canonicalOnly := true)).isNone then
     let env ← getEnv
-    let ictx := mkInputContext contents (← getFileName)
+    let ictx := mkInputContext contents (← getFileNameOfMessages)
     let st := p.run ictx { env, options := ← getOptions } (getTokenTable env) (mkParserState contents)
     let err ←
       if !st.allErrors.isEmpty then
@@ -177,12 +177,12 @@ def parseContent' (p : ParserFn) (tok : Syntax) (contents : String) : m (Syntax 
         logError ((st.mkError "end of input").toErrorMsg ictx); pure true
       else pure false
     return (st.stxStack.back, err)
-  let text ← getFileMap
+  let text ← getFileMapOfSyntax
   let env ← getEnv
   let endPos := s.raw.getTailPos? true |>.get!
   let endPos := if endPos ≤ text.source.rawEndPos then endPos else text.source.rawEndPos
   let ictx :=
-    mkInputContext text.source (← getFileName)
+    mkInputContext text.source (← getFileNameOfMessages)
       (endPos := endPos) (endPos_valid := by simp only [endPos]; split <;> simp [*])
   -- TODO fallback for non-original syntax
   let s := (mkParserState text.source).setPos (s.raw.getPos? (canonicalOnly := true)).get!

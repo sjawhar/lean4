@@ -155,7 +155,7 @@ The saved deferred check is not associated with the docstring or module doc unti
 added to the environment. After this call, the internal state stores `Name.anonymous`.
 -/
 def addDeferredCheck (check : Dynamic) (imports : Array Name) (ref : Syntax) : DocM Nat := do
-  let fileMap ← getFileMap
+  let fileMap ← getFileMapOfSyntax
   let sourceString :=
     match ref.getRange? with
     | some ⟨s, e⟩ => String.Pos.Raw.extract fileMap.source s e
@@ -1672,7 +1672,7 @@ public partial def elabInline (stx : TSyntax ``Parser.inline) :
           try suggestions := suggestions ++ (← withEnableInfoTree false <| suggest content)
           catch | _ => pure ()
         unless suggestions.isEmpty do
-          let text ← getFileMap
+          let text ← getFileMapOfSyntax
           let str := String.Pos.Raw.extract text.source b e
           let ss : Array (String × Option String × Option String) ←
             suggestions.mapM fun {role, args, moreInfo} => do
@@ -1791,7 +1791,7 @@ public partial def elabBlock (stx : TSyntax ``Parser.block) :
           try suggestions := suggestions ++ (← withEnableInfoTree false <| suggest content)
           catch | _ => pure ()
         unless suggestions.isEmpty do
-          let text ← getFileMap
+          let text ← getFileMapOfSyntax
           let str := String.Pos.Raw.extract text.source b e
           let ss : Array (String × Option String × Option String) ←
             suggestions.mapM fun {name, args, moreInfo} => do

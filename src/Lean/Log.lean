@@ -26,13 +26,19 @@ class MonadLog (m : Type → Type) extends MonadFileMap m where
   hasErrors    : m Bool
   /-- Log a new message. -/
   logMessage   : Message → m Unit
+  /-- `getFileName`, for the metadata of a message only (`Message.fileName`): unlike `getFileName`, a run that records
+  usage does not record it as a read of the file name (`Lean.recordFileContextRead`), because a reuse run shows a kept
+  command's messages with the file name it runs on. -/
+  getFileNameOfMessages : m String := getFileName
 
-export MonadLog (getFileName logMessage)
+export MonadLog (getFileName logMessage getFileNameOfMessages)
 
 instance (m n) [MonadLift m n] [MonadLog m] : MonadLog n where
   getRef      := liftM (MonadLog.getRef : m _)
   getFileMap  := liftM (getFileMap : m _)
+  getFileMapOfSyntax := liftM (getFileMapOfSyntax : m _)
   getFileName := liftM (getFileName : m _)
+  getFileNameOfMessages := liftM (getFileNameOfMessages : m _)
   hasErrors   := liftM (MonadLog.hasErrors : m _)
   logMessage  := fun msg => liftM (logMessage msg : m _ )
 
@@ -49,7 +55,7 @@ def getRefPos : m String.Pos.Raw := do
 Return the line and column numbers associated with the current reference syntax (i.e., the syntax object returned by `getRef`.)
 -/
 def getRefPosition : m Position := do
-  let fileMap ← getFileMap
+  let fileMap ← getFileMapOfSyntax
   return fileMap.toPosition (← getRefPos)
 
 /-- If `warningAsError` is set to `true`, then warning messages are treated as errors. -/
@@ -114,10 +120,10 @@ def logAt (ref : Syntax) (msgData : MessageData)
     let ref    := replaceRef ref (← MonadLog.getRef)
     let pos    := ref.getPos?.getD 0
     let endPos := ref.getTailPos?.getD pos
-    let fileMap ← getFileMap
+    let fileMap ← getFileMapOfSyntax
     let msgData ← addMessageContext msgData.appendDescriptionWidgetIfNamed
     logMessage {
-      fileName := (← getFileName)
+      fileName := (← getFileNameOfMessages)
       pos := fileMap.toPosition pos
       endPos := fileMap.toPosition endPos
       data := msgData

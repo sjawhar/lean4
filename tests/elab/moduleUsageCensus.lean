@@ -578,6 +578,8 @@ def globals : List (Name × GlobalClass × String) := [
     "Private (src/Lean/Util/UsedByChecks.lean); read only by the per-command usage records."),
   (`Lean.usedByContextRef, .recording,
     "Private (src/Lean/Util/UsedByChecks.lean); read only by the per-command usage records."),
+  (`Lean.fileContextByContextRef, .recording,
+    "Private (src/Lean/Util/UsedByChecks.lean); read only by the per-command usage records."),
   (`Lean.Compiler.LCNF.baseTransparentDeclsExt, .moduleLocal,
     "`mkOrderedDeclSetExt` (src/Lean/Compiler/LCNF/PhaseExt.lean:26): non-persistent, initially empty."),
   (`Lean.Compiler.LCNF.monoTransparentDeclsExt, .moduleLocal,

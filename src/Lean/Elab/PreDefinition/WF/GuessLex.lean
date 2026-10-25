@@ -658,7 +658,7 @@ def formatTable : Array (Array String) → String := fun xss => Id.run do
 
 /-- Concise textual representation of the source location of a recursive call  -/
 def RecCallWithContext.posString (rcc : RecCallWithContext) : MetaM String := do
-  let fileMap ← getFileMap
+  let fileMap ← getFileMapOfSyntax
   let .some pos := rcc.ref.getPos? | return ""
   let position := fileMap.toPosition pos
   let endPosStr := match rcc.ref.getTailPos? with

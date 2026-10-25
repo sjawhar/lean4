@@ -61,7 +61,7 @@ def getAllCodeQualityEntries (env : Environment) : Array (Name × Array CodeQual
   env.header.moduleNames.mapIdx fun i mod =>
     (mod, codeQualityLogExt.getModuleEntries env i (level := .server))
 
-instance : MonadFileMap (ReaderT FileMap BaseIO) := ⟨read⟩
+instance : MonadFileMap (ReaderT FileMap BaseIO) where getFileMap := read
 
 /--
 Records linter warnings and looks up positions of their associated commands from a build

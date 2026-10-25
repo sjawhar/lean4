@@ -1,0 +1,11 @@
+E: exit 0
+N: exit 0
+N.lean:5:11: warning: Variable name `x` is not explicitly referenced.
+
+Hint: The binding can be removed (if unused) or named `_` (if used implicitly). Alternatively, prefix the name with `_` to silence this warning:
+  [apply] _x
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+1 : Nat
+reads by command: #[0, 1, 2, 0, 0, 0]
+N.usage names FILE_CONTEXT_READS_TEST: false

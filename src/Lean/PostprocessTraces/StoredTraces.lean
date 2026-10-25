@@ -184,7 +184,7 @@ meta def elabPostprocessStoredTraces : CommandElab
     let pos := ref.getPos?.getD 0
     let endPos := ref.getTailPos?.getD pos
     for msg in stored.messages do
-      logMessage <| mkMessageCore (← getFileName) (← getFileMap) msg.data .information pos endPos
+      logMessage <| mkMessageCore (← getFileNameOfMessages) (← getFileMapOfSyntax) msg.data .information pos endPos
   | _ => throwUnsupportedSyntax
 
 end Lean.Elab.PostprocessTraces

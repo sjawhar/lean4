@@ -15,7 +15,7 @@ namespace Lean.Elab
 def getDeclarationRange? [Monad m] [MonadFileMap m] (stx : Syntax) : m (Option DeclarationRange) := do
   let some range := stx.getRange?
     | return none
-  let fileMap ← getFileMap
+  let fileMap ← getFileMapOfSyntax
   return some <| .ofStringPositions fileMap range.start range.stop
 
 /--

@@ -49,7 +49,7 @@ def getNamesFrom {m} [Monad m] [MonadEnv m] [MonadFileMap m] (pos : String.Pos.R
     m (Array Syntax) := do
   -- declarations from parallelism branches should not be interesting here, so use `local`
   let drs := declRangeExt.toPersistentEnvExtension.getState (asyncMode := .local) (← getEnv)
-  let fm ← getFileMap
+  let fm ← getFileMapOfSyntax
   let mut nms := #[]
   for (nm, rgs) in drs do
     if pos ≤ fm.ofPosition rgs.range.pos then

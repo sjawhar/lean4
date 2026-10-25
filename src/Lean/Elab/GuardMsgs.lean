@@ -220,7 +220,7 @@ def runAndCollectMessages (cmd : Syntax) : CommandElabM MessageLog := do
       | .check       => toCheck := toCheck.add msg
       | .drop        => pure ()
       | .pass => toPassthrough := toPassthrough.add msg
-    let map ← getFileMap
+    let map ← getFileMapOfSyntax
     let reportPos? :=
       if reportPositions then
         tk.getPos?.map (map.toPosition · |>.line)

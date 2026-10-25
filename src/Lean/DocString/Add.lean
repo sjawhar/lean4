@@ -152,7 +152,7 @@ parse error.
 -/
 def parseVersoDocStringAt (openPos startPos endPos : String.Pos.Raw) :
     CoreM (Option VersoDocument) := do
-  let text ← getFileMap
+  let text ← getFileMapOfSyntax
   let endPos := if endPos ≤ text.source.rawEndPos then endPos else text.source.rawEndPos
   have endPos_valid : endPos ≤ text.source.rawEndPos := by
     unfold endPos
@@ -160,7 +160,7 @@ def parseVersoDocStringAt (openPos startPos endPos : String.Pos.Raw) :
 
   let env ← getEnv
   let ictx : InputContext :=
-    .mk text.source (← getFileName) (fileMap := text)
+    .mk text.source (← getFileNameOfMessages) (fileMap := text)
       (endPos := endPos) (endPos_valid := endPos_valid)
   let pmctx : ParserModuleContext := {
     env,
@@ -263,7 +263,7 @@ def versoDocStringOfText
     (declName : Name) (binders : Syntax) (docComment : String) :
     TermElabM VersoDocResult := do
   let env ← getEnv
-  let ictx : InputContext := .mk docComment (← getFileName)
+  let ictx : InputContext := .mk docComment (← getFileNameOfMessages)
   let text := ictx.fileMap
   let pmctx : ParserModuleContext := {
     env,

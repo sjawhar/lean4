@@ -160,7 +160,7 @@ def name (full : Option Ident := none) (scope : DocScope := .local)
         -- to allow code with leading or trailing backticks. But our suggestions shouldn't prefer
         -- that form here. Thus, the suggestion uses the delimiter positions instead of the string
         -- literal.
-        let text ← getFileMap
+        let text ← getFileMapOfSyntax
         let ref? := do
           let stx ← (xs : Array Syntax)[0]?
           let some (.code v) := InlineView.of ⟨stx⟩
@@ -256,7 +256,7 @@ def module (checked : flag true) (xs : TSyntaxArray ``Parser.inline) : DocM (Inl
               let some e := braceClose.getPos?
                 | pure none
               pure <| some {
-                span? := some (Syntax.mkStrLit (String.Pos.Raw.extract (← getFileMap).source b e) (info := .synthetic b e)),
+                span? := some (Syntax.mkStrLit (String.Pos.Raw.extract (← getFileMapOfSyntax).source b e) (info := .synthetic b e)),
                 previewSpan? := some ref,
                 suggestion := "" : Meta.Hint.Suggestion
               }
@@ -587,7 +587,7 @@ def given (type : Option StrLit := none) (typeIsMeta : flag false) («show» : f
   modify (fun st => { st with lctx })
 
   if «show» then
-    let text ← getFileMap
+    let text ← getFileMapOfSyntax
     let mut outStrs := #[]
     let mut failed := false
     for stx in stxs do
@@ -671,7 +671,7 @@ def givenInstance («show» : flag true) (xs : TSyntaxArray ``Parser.inline) :
   modify fun st => { st with lctx, localInstances }
 
   if «show» then
-    let text ← getFileMap
+    let text ← getFileMapOfSyntax
     let mut outStrs := #[]
     let mut failed := false
     for stx in stxs do
@@ -919,17 +919,17 @@ def lean (name : Option Ident := none) (error warning : flag false) («show» : 
   -- contents (e.g. for a docstring that came from a macro).
   let (text, ictx, pos) ←
     if let some pos := code.raw.getPos? true then
-      let text ← getFileMap
+      let text ← getFileMapOfSyntax
       let endPos := code.raw.getTailPos? true |>.getD text.source.rawEndPos
       let endPos := if endPos ≤ text.source.rawEndPos then endPos else text.source.rawEndPos
       pure (text,
-        mkInputContext text.source (← getFileName)
+        mkInputContext text.source (← getFileNameOfMessages)
           (endPos := endPos) (endPos_valid := by simp only [endPos]; split <;> simp [*]),
         pos)
     else
-      let ictx := mkInputContext code.getVersoCodeBlock (← getFileName)
+      let ictx := mkInputContext code.getVersoCodeBlock (← getFileNameOfMessages)
       pure (ictx.fileMap, ictx, (0 : String.Pos.Raw))
-  let cctx : Command.Context := {fileName := ← getFileName, fileMap := text, snap? := none, cancelTk? := none}
+  let cctx : Command.Context := {fileName := ← getFileNameOfMessages, fileMap := text, snap? := none, cancelTk? := none}
   let scopes := (← get).scopes
   let ((cmds, cmdState), trees) ← withHighlightingInfoTrees do
     let mut cmdState : Command.State := { env, maxRecDepth := ← MonadRecDepth.getMaxRecDepth, scopes }
@@ -1012,7 +1012,7 @@ where
           (mkNullNode (#[name] ++ args)).getRange?
         | _ => none
     if let some ⟨b, e⟩ := range? then
-      let str := b.extract (← getFileMap).source e
+      let str := b.extract (← getFileMapOfSyntax).source e
       let str := if str.startsWith "kw?" then "kw" ++ str.drop 3 else str
       let stx := Syntax.mkStrLit str (info := .synthetic b e (canonical := true))
       let suggs := suggestions.map (fun (s : String) => {suggestion := str ++ s})

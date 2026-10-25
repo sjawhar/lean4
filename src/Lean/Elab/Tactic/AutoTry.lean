@@ -298,7 +298,7 @@ def collectTriggerPoints (cmd : Syntax) (opts : Options) (tree : InfoTree)
       return acc
   -- Unsolved-goal triggers come from the message log.
   if onUnsolved || onEmpty then
-    let fileMap ← getFileMap
+    let fileMap ← getFileMapOfSyntax
     let some cmdRange := cmd.getRange? (canonicalOnly := true) | return acc
     -- Dedup key is `(message range, goal mvarid)`: same range + same mvarid is a true
     -- duplicate (`runLintersAsync` merges the snapshot tree's diagnostics into the
@@ -372,7 +372,7 @@ the command (so tests are robust to moving the example up or down the file).
 def emitAppendSuggestions (tacticSeq ref : Syntax) (insertPos : String.Pos.Raw)
     (suggs : Array (TSyntax `tactic)) (cmdLine : Nat) : CommandElabM Unit := do
   if suggs.isEmpty then return
-  let fileMap ← getFileMap
+  let fileMap ← getFileMapOfSyntax
   let sep := computeAppendSep tacticSeq fileMap
   let origSpan := mkEmptyRangeStx insertPos
   let showEdits := debug.autoTry.showEdits.get (← getOptions)
@@ -478,7 +478,8 @@ def autoTryHook : Linter where run := withSetOptionIn fun stx => do
     trace[autoTry] "skipping: command has non-unsolved-goal errors"
     return
   trace[autoTry] "running: onEmpty={onEmpty} onUnsolved={onUnsolved} onSorry={onSorry}"
-  let fileMap := (← read).fileMap
+  -- `goalsAt?` (through `singleGoalAtInsertPos`) reads the source past the tactic, up to the end of the file
+  let fileMap ← getFileMap
   let cmdLine := (fileMap.toPosition (stx.getPos?.getD 0)).line
   let msgs := (← get).messages.reportedPlusUnreported
   let trees ← getInfoTrees

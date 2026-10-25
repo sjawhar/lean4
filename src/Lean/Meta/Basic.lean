@@ -2856,7 +2856,7 @@ def realizeValue [BEq α] [Hashable α] [TypeName α] [TypeName β] (forConst : 
     let mut snap := snap
     -- localize diagnostics
     if let some range := (← getRef).getRange? then
-      let fileMap ← getFileMap
+      let fileMap ← getFileMapOfSyntax
       snap ← setAllDiagRanges snap (fileMap.toPosition range.start) (fileMap.toPosition range.stop)
     Core.logSnapshotTask <| .finished (stx? := none) snap
   match res.res? with
@@ -2961,7 +2961,7 @@ def realizeConst (forConst : Name) (constName : Name) (realize : MetaM Unit) :
         let mut snap := snap
         -- localize diagnostics
         if let some range := (← getRef).getRange? then
-          let fileMap ← getFileMap
+          let fileMap ← getFileMapOfSyntax
           snap ← setAllDiagRanges snap (fileMap.toPosition range.start) (fileMap.toPosition range.stop)
         Core.logSnapshotTask <| .finished (stx? := none) snap
       if let some e := res.error? then

@@ -46,8 +46,12 @@ structure FileMap where
 
 class MonadFileMap (m : Type → Type) where
   getFileMap : m FileMap
+  /-- `getFileMap`, to read positions and text of the syntax being elaborated only: unlike `getFileMap`, a run that
+  records usage does not record it as a read of the file's source (`Lean.recordFileContextRead`), because a reuse run
+  compares that syntax's source and position. -/
+  getFileMapOfSyntax : m FileMap := getFileMap
 
-export MonadFileMap (getFileMap)
+export MonadFileMap (getFileMap getFileMapOfSyntax)
 
 namespace FileMap
 
