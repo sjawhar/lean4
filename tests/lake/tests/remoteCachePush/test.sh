@@ -453,6 +453,117 @@ EOF
   test_exp -f "$STORE_DIR/a0/$PUSH_SCOPE/in/$ADMIT_INPUT.json"
 }
 
+# The interposer that pauses a Lake process at a race of the shared cache (see `Interpose.c`)
+INTERPOSE="$WORK_DIR/interpose.so"
+build_interpose() {
+  if [ ! -f "$INTERPOSE" ]; then
+    test_cmd cc -shared -fPIC -o "$INTERPOSE" "$TEST_DIR/Interpose.c" -ldl
+  fi
+}
+# Waits for a file that a paused process creates
+wait_probe() {
+  local i
+  for i in $(seq 1 600); do
+    if [ -e "$1" ]; then return 0; fi
+    sleep 0.1
+  done
+  echo "FAILURE: $1 did not appear"
+  return 1
+}
+
+# Waits for one of two files that a process creates, and prints which one appeared first
+wait_probe_any() {
+  local i
+  for i in $(seq 1 600); do
+    if [ -e "$1" ]; then echo "$1"; return 0; fi
+    if [ -e "$2" ]; then echo "$2"; return 0; fi
+    sleep 0.1
+  done
+  echo "FAILURE: neither $1 nor $2 appeared" >&2
+  return 1
+}
+# The cache artifact of the `.olean` of a module that machine A's queue names
+olean_artifact() {
+  echo "$1/artifacts/$(push_check artifacts "$PUSH_QUEUE" "$2" | grep '\.olean$')"
+}
+
+case_push_repair_race() {
+  # A build that repairs a cache entry while the push has found its bytes wrong keeps its
+  # repair: the push takes the entry away from its name only by renaming it, so it only ever
+  # removes bytes that it hashed itself, and it pushes the right bytes that it then finds.
+  # The push is paused where it takes the entry away from its name, the entry is repaired, and
+  # the push goes on.
+  push_fresh
+  build_a
+  local entry good
+  entry="$(olean_artifact "$PUSH_CACHE" Push.Basic)"
+  good="$WORK_DIR/good-entry"
+  test_cmd cp "$entry" "$good"
+  # The entry no longer has the hash in its name, as a write through its hard link leaves it
+  test_cmd push_check flip "$PUSH_A/.lake/build/lib/lean/Push/Basic.olean"
+  test_cmd rm -f "$WORK_DIR/entry-ready" "$WORK_DIR/entry-release"
+  build_interpose
+  PROBE_ENTRY_READY="$WORK_DIR/entry-ready" PROBE_ENTRY_RELEASE="$WORK_DIR/entry-release" \
+    LD_PRELOAD="$INTERPOSE" on_a "$LAKE" cache push > "$WORK_DIR/push-race.log" 2>&1 &
+  local push=$!
+  wait_probe "$WORK_DIR/entry-ready"
+  # Another build repairs the entry, as `Cache.saveArtifact` does: the wrong bytes go, the
+  # right ones take their name
+  test_cmd rm -f "$entry"
+  test_cmd cp "$good" "$entry"
+  test_cmd touch "$WORK_DIR/entry-release"
+  wait $push
+  cat "$WORK_DIR/push-race.log"
+  # The repair is still there, and the push sent it
+  test_cmd cmp "$entry" "$good"
+  test_cmd_eq 0 queued
+  test_cmd push_check status "$PUSH_STATUS" $PUSH_COMPILES 0 0 0
+  test_exp ! -e "$PUSH_DROPPED"
+}
+
+case_push_mapping_overwrite() {
+  # A mapping that a build writes over an existing one is published through a temporary file
+  # that is renamed into place, so another process reads the old mapping or the new one, never
+  # a file that one writer has truncated. With the cache's artifacts gone and its mappings
+  # kept, a build compiles each target again and writes each mapping over the old one.
+  push_fresh
+  build_a
+  test_cmd rm -rf "$PUSH_A/.lake/build" "$PUSH_CACHE/artifacts" "$WORK_DIR/mapping-ready" \
+    "$WORK_DIR/mapping-release" "$WORK_DIR/mapping-rename"
+  build_interpose
+  PROBE_MAPPING_READY="$WORK_DIR/mapping-ready" PROBE_MAPPING_RELEASE="$WORK_DIR/mapping-release" \
+    PROBE_MAPPING_RENAME="$WORK_DIR/mapping-rename" LD_PRELOAD="$INTERPOSE" \
+    on_a "$LAKE" --dir "$PUSH_A" build $PUSH_TARGETS > "$WORK_DIR/mapping-build.log" 2>&1 &
+  local build=$!
+  wait_probe_any "$WORK_DIR/mapping-ready" "$WORK_DIR/mapping-rename"
+  test_cmd touch "$WORK_DIR/mapping-release"
+  wait $build
+  cat "$WORK_DIR/mapping-build.log"
+  # No writer truncated a mapping in place, and the mappings were replaced by a rename
+  test_exp ! -e "$WORK_DIR/mapping-ready"
+  test_exp -e "$WORK_DIR/mapping-rename"
+  # Every mapping of the cache is whole JSON
+  test_cmd push_check mappings "$PUSH_CACHE"
+}
+
+case_push_unset() {
+  # After `LAKE_REMOTE_CACHE` is unset, the mappings that an earlier build downloaded no longer
+  # read the shared bucket: with their artifacts pruned from the cache, the build makes `pair`'s
+  # two files again and sends no request. (`pair` is a target other than a module, whose mapping
+  # names each artifact by its SHA-256 in the bucket.)
+  push_fresh
+  build_a
+  on_a test_run cache push
+  restore_b pair
+  test_exp -d "$PUSH_CACHE_B/outputs"
+  test_cmd rm -rf "$PUSH_CACHE_B/artifacts" "$PUSH_B/.lake/build"
+  : > "$SERVER_LOG"
+  LAKE_CACHE_DIR="$PUSH_CACHE_B" test_run -v --dir "$PUSH_B" build pair
+  test_cmd_eq 0 count ' -> ' "$SERVER_LOG"
+  test_cmd cmp "$PUSH_B/.lake/build/b.out" "$PUSH_B/b.in"
+}
+
 run_cases case_push_queue case_push_upload case_push_tree_changed case_push_mismatch \
   case_push_missing case_push_custom_target case_push_githash case_push_deny case_push_invalid \
-  case_push_many case_push_staging case_push_concurrent case_push_stall case_push_pack_failure
+  case_push_many case_push_staging case_push_concurrent case_push_stall case_push_pack_failure \
+  case_push_repair_race case_push_mapping_overwrite case_push_unset

@@ -593,13 +593,6 @@ public def Cache.quarantine (cache : Cache) (file : FilePath) (name : String) : 
   IO.FS.createDirAll cache.quarantineDir
   quarantineAs cache.quarantineDir file name 0
 
-/-- Describes the outcome of `Cache.quarantine`; a failure to quarantine is reported, not thrown. -/
-public def describeQuarantine (cache : Cache) (file : FilePath) (name : String) : BaseIO String := do
-  match (← (cache.quarantine file name).toBaseIO) with
-  | .ok (some dest) => return s!"moved it to: {dest}"
-  | .ok none => return "it was already moved away by another process"
-  | .error e => return s!"could not move it into quarantine: {e}"
-
 /-- **For internal use only.** -/
 public class ResolveOutputs (α : Type) where
   /-- **For internal use only.** -/
@@ -692,13 +685,20 @@ public def resolveArtifact
     return {descr, path, mtime}
   | .error (.noFileOrDirectory ..) => withLogErrorPos do
     -- we redownload artifacts on any error
-    if let some service := service? then
+    if let some serviceName := service? then
       updateAction .fetch
-      if let some service := ws.findCacheService? service.toString then
+      if let some service := ws.findCacheService? serviceName.toString then
         let some scope := scope?
           | error s!"artifact with associated cache service but no scope"
         match sha256? with
         | some sha256s =>
+          -- A mapping of the shared remote cache. Its artifacts are read only while
+          -- `LAKE_REMOTE_CACHE` names that service: a mapping that an earlier build wrote stays
+          -- in the cache, and must not send a request after the user has opted out.
+          unless ws.lakeEnv.remoteCache? == some serviceName.toString do
+            error s!"artifact not found in cache:\n  {path}\n\
+              Its mapping reads it from the remote cache `{serviceName}`, which \
+              `LAKE_REMOTE_CACHE` does not name."
           let some sha256 := sha256s.get? descr.relPath.toString
             | error s!"remote mapping has no SHA-256 for artifact `{descr}`"
           let url := service.remoteArtifactUrl scope.toString sha256
@@ -727,7 +727,7 @@ public def resolveArtifact
         | .error e =>
           error s!"download succeeded, but artifact failed to resolve: {e}"
       else
-        error s!"artifact cache service is not configured: {service}"
+        error s!"artifact cache service is not configured: {serviceName}"
     else
       error s!"artifact not found in cache:\n  {path}"
   | .error e =>

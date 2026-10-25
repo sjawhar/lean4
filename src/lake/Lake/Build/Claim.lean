@@ -500,12 +500,13 @@ builtin_initialize buildPush : Std.Mutex BuildPush ← Std.Mutex.new {}
 def pushLogMaxBytes : UInt64 := 4 * 1024 * 1024
 
 /--
-The shell that starts a detached push: `/bin/bash`, the shell that can close every descriptor by
-number (`sh` cannot close those above 9). Without it, no push is detached: the build runs the push
-in the foreground at its end instead (see `runForegroundPush`), so no inherited descriptor can
-outlive the build.
+The shell that starts a detached push: `LAKE_PUSH_SHELL`, by default `/bin/bash` (see
+`Env.pushShell`). It must be able to close every descriptor by number, which `sh` cannot do above
+9. Where it does not exist (a machine without `/bin/bash` and without `LAKE_PUSH_SHELL`), no push
+is detached: the build runs the push in the foreground at its end instead (see
+`runForegroundPush`), so no inherited descriptor can outlive the build.
 -/
-def detachedPushShell : FilePath := "/bin/bash"
+def detachedPushShell (env : Env) : FilePath := env.pushShell
 
 /--
 The script that starts a detached `lake cache push`: `bash -c <script> sh <log> <lake> cache push …`.
@@ -535,6 +536,34 @@ def pushEnv (env : Env) (cache : Cache) : Array (String × Option String) :=
   #[("LAKE_CACHE_DIR", some cache.dir.toString)] ++
     (env.lakeConfig?.map (fun cfg => #[("LAKE_CONFIG", some cfg.toString)]) |>.getD #[])
 
+/-- How old a follow file of no build must be before a later build removes it: one day. -/
+def followFileMaxAgeSecs : Int := 24 * 60 * 60
+
+/--
+Removes the follow files of `Cache.pushFollowDir` that no build holds (their lock is free, the
+probe that `followedBuildRuns` makes) and that are older than `followFileMaxAgeSecs`, except
+`keep`. A push removes its own file in its last pass; these are the files of the pushes that
+never ran or were killed. The age keeps a build that has just made its file, and not yet locked
+it, from losing it.
+-/
+def reapFollowFiles (cache : Cache) (keep : FilePath) : BaseIO Unit := do
+  let .ok entries ← cache.pushFollowDir.readDir.toBaseIO
+    | return
+  let .ok now ← wallClockSecs.toBaseIO
+    | return
+  for entry in entries do
+    if entry.path == keep then
+      continue
+    let .ok md ← entry.path.metadata.toBaseIO
+      | continue
+    if now - md.modified.sec < followFileMaxAgeSecs then
+      continue
+    let .ok h ← (IO.FS.Handle.mk entry.path .read).toBaseIO
+      | continue
+    if let .ok true ← h.tryLock.toBaseIO then
+      discard <| h.unlock.toBaseIO
+      discard <| (removeFileIfExists entry.path).toBaseIO
+
 /--
 Starts this build's one detached push of `cache`'s queue, `lake cache push --wait --follow <file>`
 (see `pushRemoteCache`), unless it started one already or there is no `detachedPushShell`.
@@ -544,7 +573,9 @@ queues it, and ends once the build has ended (see `endBuildPush`) and the queue 
 
 The follow file, in `Cache.pushFollowDir`, is named with this process's ID and 64 random bits (see
 `uniqueTmpSuffix`), so a build of another process with the same ID (in a container that shares the
-cache) never holds it.
+cache) never holds it. A build that takes its own file also removes the files that no build holds
+and no push removed (see `reapFollowFiles`). A spawn that fails leaves no file and no state, so
+the build's next queued output starts a push again.
 
 The push runs in a session of its own, with the environment of this process and its cache, so it
 outlives the build and a Ctrl-C that stops it. Its output goes to `Cache.pushLogFile`.
@@ -553,7 +584,7 @@ public def startBuildPush (env : Env) (cache : Cache) : IO Bool :=
   buildPush.atomically do
     if (← get).started then
       return false
-    unless ← detachedPushShell.pathExists do
+    unless ← (detachedPushShell env).pathExists do
       return false
     let followFile := cache.pushFollowDir / s!"build{← uniqueTmpSuffix}"
     createParentDirs followFile
@@ -561,19 +592,28 @@ public def startBuildPush (env : Env) (cache : Cache) : IO Bool :=
     -- Nobody else has this name; a lock that is held anyway means no follow, so no push
     unless ← lock.tryLock do
       return false
-    set ({started := true, followLock? := some lock} : BuildPush)
+    modify ({· with followLock? := some lock})
+    reapFollowFiles cache followFile
     rotatePushLog cache
-    let child ← IO.Process.spawn {
-      cmd := detachedPushShell.toString
+    match (← (IO.Process.spawn {
+      cmd := (detachedPushShell env).toString
       args := #["-c", detachedPushScript, "sh", cache.pushLogFile.toString,
         env.lake.lake.toString, "cache", "push", "--wait", "--follow", followFile.toString]
       stdin := .null, stdout := .null, stderr := .null
       setsid := true
       env := pushEnv env cache
-    }
-    -- The shell ends as soon as the push runs in the background
-    discard <| child.wait
-    return true
+    }).toBaseIO) with
+    | .error e =>
+      -- No push follows this build: the next queued output tries again
+      discard <| lock.unlock.toBaseIO
+      discard <| (removeFileIfExists followFile).toBaseIO
+      set ({} : BuildPush)
+      throw e
+    | .ok child =>
+      -- The shell ends as soon as the push runs in the background
+      discard <| child.wait
+      modify ({· with started := true})
+      return true
 
 /--
 Ends the follow of this build's push (see `startBuildPush`), at the end of the build: the push
@@ -603,8 +643,8 @@ public def runForegroundPush (env : Env) (cache : Cache) : IO UInt32 := do
   return out.exitCode
 
 /-- Whether builds can start detached pushes (see `detachedPushShell`). -/
-public def canDetachPush : BaseIO Bool :=
-  detachedPushShell.pathExists
+public def canDetachPush (env : Env) : BaseIO Bool :=
+  (detachedPushShell env).pathExists
 
 /--
 Marks the claim at `url`, which this process held as `held` with generation `generation`,

@@ -427,7 +427,12 @@ public def getArtifact (cache : Cache) (descr : ArtifactDescr) : EIO String Arti
 @[inline] public def outputsFile (cache : Cache) (scope : String) (inputHash : Hash) : FilePath  :=
   cache.outputsDir / scope / s!"{inputHash}.json"
 
-/-- Cache the outputs corresponding to the given input for the package.  -/
+/--
+Cache the outputs corresponding to the given input for the package. With `overwrite`, the new
+mapping replaces any old one through a new temporary file that is renamed over it (see
+`writeFileAtomic`), so two processes that write the same mapping at once leave one of their two
+whole mappings, never a mix of both. Without `overwrite`, an existing mapping is kept.
+-/
 def writeOutputsCore
   (cache : Cache) (scope : String) (inputHash : Hash) (out : Json)
   (service? : Option CacheServiceName) (remoteScope? : Option CacheServiceScope)
@@ -445,7 +450,7 @@ def writeOutputsCore
   let out := {service?, scope? := remoteScope?, data := out, log?, sha256? : CacheOutput}
   let contents := (toJson out).pretty
   if overwrite then
-    IO.FS.writeFile file contents
+    writeFileAtomic file contents
   else
     writeFileIfNew file contents
 
