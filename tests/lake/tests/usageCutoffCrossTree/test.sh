@@ -345,7 +345,8 @@ case8() {
 
 # 9. A module's index keeps the 8 most recently written compiles, and a hit rewrites the file of the compile it
 # restores, which makes it recent again. t3's compile of `a := 1` is a new file, not the first compile's again: its
-# `.usage` records the provides digest of each import (`digested`), and t3's `X` provides another name.
+# `.usage` records the provides digest of each import (`digested`), and t3's `X` provides another name. The `a := 2`
+# compile is the oldest of the 8, so t2's hit restores the last candidate the lookup tries.
 case9() {
   local v names=()
   mkpkg t
@@ -364,6 +365,8 @@ case9() {
   edx t2
   lake_out -d t2 build -v Test.B
   jobhas Test.B "usage index: restored"
+  jobhas Test.B "(8 candidates,"
+  jobhas Test.B "at rank 8"
   mkpkg t3 1
   edx t3
   lake_out -d t3 build -v Test.B
