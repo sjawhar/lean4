@@ -124,76 +124,6 @@ test_exp $rc = 0
 test_cmd grep -qx planted "$PLANTED"
 test_cmd cmp input.txt "cache4/artifacts/$TEXT_ENTRY"
 
-# On Linux, force the hard-link fallback with a preload that returns EPERM from `uv_fs_link`.
-# Both writers load their bytes and wait before calling `writeBinFileIfNew`; the preload holds their
-# initial `pathExists` calls, so both take the fallback. It releases writer A first, holds writer B
-# until A creates the final path, and checks that A's bytes stay.
-if [ "$UNAME" = Linux ]; then
-  test_cmd cc -shared -fPIC -o no-hard-link.so NoHardLink.c
-  test_cmd env LEAN_PATH="$BUILD_DIR/lib/lean" "$BUILD_DIR/bin/lean" Fallback.lean -c Fallback.c
-  test_cmd "$BUILD_DIR/bin/leanc" -o fallback Fallback.c -L"$BUILD_DIR/lib/lean" -lLake_shared
-  FALLBACK=./fallback
-  head -c 65536 /dev/zero | tr '\0' A > first.bin
-
-  # After a forced hard-link failure, the temporary copy is gone before the fallback opens the
-  # final path. The preload records whether that temporary file still exists at that open.
-  rm -f space-ifnew space-ready space-start tmp-state.log
-  touch space-start
-  test_cmd env LD_LIBRARY_PATH="$BUILD_DIR/lib/lean" LD_PRELOAD="$PWD/no-hard-link.so" \
-    LAKE_TEST_TMP_STATE_LOG="$PWD/tmp-state.log" LAKE_TEST_STAT_PATH=space-ifnew \
-    "$FALLBACK" space-ifnew first.bin space-ready space-start
-  test_cmd grep -qx removed tmp-state.log
-  head -c 8388608 /dev/zero | tr '\0' B > second.bin
-  rm -f ifnew ready-a ready-b start link.log first.out second.out
-  mkdir stat-barrier
-  env LD_LIBRARY_PATH="$BUILD_DIR/lib/lean" LD_PRELOAD="$PWD/no-hard-link.so" \
-    LAKE_TEST_LINK_LOG="$PWD/link.log" \
-    LAKE_TEST_STAT_PATH=ifnew LAKE_TEST_STAT_BARRIER="$PWD/stat-barrier" \
-    "$FALLBACK" ifnew first.bin ready-a start > first.out 2>&1 &
-  a=$!
-  env LD_LIBRARY_PATH="$BUILD_DIR/lib/lean" LD_PRELOAD="$PWD/no-hard-link.so" \
-    LAKE_TEST_LINK_LOG="$PWD/link.log" \
-    LAKE_TEST_STAT_PATH=ifnew LAKE_TEST_STAT_BARRIER="$PWD/stat-barrier" \
-    "$FALLBACK" ifnew second.bin ready-b start > second.out 2>&1 &
-  b=$!
-  until [ -e ready-a ] && [ -e ready-b ]; do
-    if ! kill -0 $a 2> /dev/null || ! kill -0 $b 2> /dev/null; then
-      cat first.out second.out
-      echo "FAILURE: a fallback writer stopped before the start barrier"
-      exit 1
-    fi
-    sleep 1
-  done
-  touch start
-  while :; do
-    n=0
-    for f in stat-barrier/*; do
-      [ -e "$f" ] || continue
-      n=$((n + 1))
-    done
-    [ $n = 2 ] && break
-    if ! kill -0 $a 2> /dev/null || ! kill -0 $b 2> /dev/null; then
-      cat first.out second.out
-      echo "FAILURE: a fallback writer stopped before the stat barrier"
-      exit 1
-    fi
-    sleep 1
-  done
-  test_exp -e "stat-barrier/$a"
-  test_exp -e "stat-barrier/$b"
-  echo $a > stat-barrier/first
-  touch stat-barrier/release
-  rc=0
-  wait $a || rc=$?
-  wait $b || rc=$?
-  cat first.out second.out
-  test_exp $rc = 0
-  test_cmd cmp first.bin ifnew
-  test_exp "$(wc -l < link.log)" = 2
-else
-  echo "SKIPPED: the forced hard-link fallback uses Linux LD_PRELOAD"
-fi
-
 # `lake cache unstage` writes each entry from the staging directory (here the module's archive),
 # also when the limit stops it
 BIG=.lake/build/lib/lean/Big.olean
@@ -218,6 +148,96 @@ head -c 100 "staging/$BAD" > "staging-bad/$BAD"
 LAKE_CACHE_DIR="$PWD/cache3" test_err "staging-bad/$BAD: staged artifact does not match its content hash" \
   cache unstage staging-bad
 test_exp ! -e "cache3/artifacts/$BAD"
+
+# Where a hard link fails (e.g., the file system cannot hard-link), Lake caches nothing under the
+# name, because no other way publishes a whole file without replacing one: a file created and
+# written under the name holds part of it until the write ends, and keeps that part if the write
+# fails or stops. On Linux, a preload (NoHardLink.c) makes chosen hard links fail, and makes a write
+# into a chosen name that a process creates fail after 13 bytes. (Lake's output goes through a pipe,
+# which that file size limit does not cover.)
+if [ "$UNAME" = Linux ]; then
+  test_cmd cc -shared -fPIC -o no-hard-link.so NoHardLink.c
+  PRELOAD="$PWD/no-hard-link.so"
+  # A build caches its output again where the entry is gone but the mapping that names it stays.
+  # With the hard link failing, the build succeeds without the entry, and leaves nothing under its
+  # name; a fresh tree then builds the output, and caches it.
+  mkdir t5 t6 && cp lakefile.lean input.txt t5/ && cp lakefile.lean input.txt t6/
+  ENTRY5="$PWD/cache5/artifacts/$TEXT_ENTRY"
+  LAKE_CACHE_DIR="$PWD/cache5" test_run -d t5 build out
+  test_cmd rm -f "$ENTRY5"
+  echo "\$ (preload: links to and writes into $ENTRY5 fail; lake -v -d t5 build out)"
+  rc=0
+  out=$(env LD_PRELOAD="$PRELOAD" LAKE_TEST_FAIL_LINK="$ENTRY5" LAKE_TEST_FINAL_PATH="$ENTRY5" \
+    LAKE_TEST_OPEN_LOG="$PWD/final-open.log" LAKE_CACHE_DIR="$PWD/cache5" \
+    "$LAKE" -v -d t5 build out 2>&1) || rc=$?
+  printf '%s\n' "$out" > forced.out
+  cat forced.out
+  test_exp $rc = 0
+  match_text "$TEXT_ENTRY: not cached" forced.out
+  test_exp ! -e "$ENTRY5"
+  test_exp ! -e final-open.log
+  whole_entries cache5
+  LAKE_CACHE_DIR="$PWD/cache5" test_run -d t6 build out
+  test_cmd cmp input.txt "t6/$OUT"
+  test_cmd cmp input.txt "$ENTRY5"
+  # `lake cache unstage` fails for an artifact whose hard link fails, and leaves nothing under its name
+  ENTRY7="$PWD/cache7/artifacts/$BAD"
+  echo "\$ (preload: links to and writes into $ENTRY7 fail; lake cache unstage staging)"
+  rc=0
+  out=$(env LD_PRELOAD="$PRELOAD" LAKE_TEST_FAIL_LINK="$ENTRY7" LAKE_TEST_FINAL_PATH="$ENTRY7" \
+    LAKE_TEST_OPEN_LOG="$PWD/final-open.log" LAKE_CACHE_DIR="$PWD/cache7" \
+    "$LAKE" cache unstage staging 2>&1) || rc=$?
+  printf '%s\n' "$out" > forced.out
+  cat forced.out
+  test_exp $rc != 0
+  match_text "$BAD: not cached" forced.out
+  test_exp ! -e "$ENTRY7"
+  test_exp ! -e final-open.log
+  whole_entries cache7
+  # `writeBinFileIfNew` never replaces a file. Here another writer creates the name while the helper
+  # is between its check that the name is free and its hard link (the preload holds that check).
+  # It keeps the other file, and reports a file under the name if its hard link works, or that it
+  # cached nothing if its hard link fails.
+  test_cmd env LEAN_PATH="$BUILD_DIR/lib/lean" "$BUILD_DIR/bin/lean" Fallback.lean -c Fallback.c
+  test_cmd "$BUILD_DIR/bin/leanc" -o fallback Fallback.c -L"$BUILD_DIR/lib/lean" -lLake_shared
+  printf 'mine\n' > mine.bin
+  for fail in "" taken; do
+    rm -rf stat-barrier taken && mkdir stat-barrier
+    echo "\$ (preload: links to '$fail' fail; fallback taken mine.bin) &"
+    env LD_LIBRARY_PATH="$BUILD_DIR/lib/lean" LD_PRELOAD="$PRELOAD" LAKE_TEST_FAIL_LINK="$fail" \
+      LAKE_TEST_STAT_PATH=taken LAKE_TEST_STAT_BARRIER="$PWD/stat-barrier" \
+      ./fallback taken mine.bin > fallback.out 2>&1 &
+    pid=$!
+    until [ -e "stat-barrier/$pid" ]; do
+      if ! kill -0 $pid 2> /dev/null; then
+        cat fallback.out
+        echo "FAILURE: the helper stopped before its check that the name is free"
+        exit 1
+      fi
+      sleep 1
+    done
+    printf 'theirs\n' > taken
+    touch stat-barrier/release
+    rc=0
+    wait $pid || rc=$?
+    cat fallback.out
+    test_exp $rc = 0
+    test_cmd grep -qx theirs taken
+    if [ -z "$fail" ]; then
+      test_cmd grep -qx true fallback.out
+    else
+      test_cmd grep -qx false fallback.out
+    fi
+    for f in taken.*.tmp; do
+      if [ -e "$f" ]; then
+        echo "FAILURE: a temporary file stayed: $f"
+        exit 1
+      fi
+    done
+  done
+else
+  echo "SKIPPED: the cases with failing hard links need a Linux preload"
+fi
 
 # A module output with the cache on another file system, where the output cannot be hard-linked
 # into the cache and its entry is written
