@@ -23,6 +23,7 @@ a test picks one by pointing an endpoint at it (e.g. `.../corrupt/a0`):
             so a test can change it), and otherwise as `ok`
   redirect  302 to the same object path under the `--redirect` URL
   slow      as `ok`, but each `GET` is answered after 2 seconds
+  oversize  mappings are normal; an artifact advertises 119596321 bytes and no body
 
 A fault that does not apply to a request kind (e.g. `badcount` on a `GET`)
 behaves as `ok`. Like Cloud Storage, a `PUT` with the header
@@ -94,6 +95,7 @@ class Mode(StrEnum):
     BEARER = "bearer"
     REDIRECT = "redirect"
     SLOW = "slow"
+    OVERSIZE = "oversize"
 
 
 def content_type(path):
@@ -192,6 +194,16 @@ class Handler(BaseHTTPRequestHandler):
         self.log("reset")
 
     def serve(self, mode, path, ctype=None):
+        if mode == Mode.OVERSIZE and f"{os.sep}a{os.sep}" in path:
+            # curl checks --max-filesize against the header before receiving the
+            # body, so this exercises the reader's bound without allocating it.
+            self.send_response(200)
+            self.send_header("Content-Type", ctype or content_type(path))
+            self.send_header("Content-Length", "119596321")
+            self.end_headers()
+            self.close_connection = True
+            self.log("oversize")
+            return
         if mode == Mode.SLOW:
             time.sleep(2)
         try:

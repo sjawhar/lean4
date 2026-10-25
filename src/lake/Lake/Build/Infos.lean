@@ -83,6 +83,8 @@ builtin_facet imports : Module => Array Module
 /-- Dynamic information computed about a module before building. -/
 public structure ModulePreSetup where
   trace : BuildTrace
+  /-- The content hash of the module source as Lake read it. -/
+  srcHash : Hash
   irSigTrace : BuildTrace
   srcMTime : MTime
   srcFile : FilePath
