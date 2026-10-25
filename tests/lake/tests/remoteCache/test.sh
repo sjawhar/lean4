@@ -570,10 +570,11 @@ case_read_through() {
 
 case_read_404() {
   # A missing remote mapping is a normal cache miss: each target compiles after
-  # exactly one mapping request, without an artifact request.
+  # exactly one mapping request, without an artifact request, and the miss is
+  # visible at verbose level.
   fresh
   : > "$SERVER_LOG"
-  LAKE_REMOTE_CACHE=miss test_out 'Built Test' build Test native
+  LAKE_REMOTE_CACHE=miss test_out 'remote cache mapping miss' -v build Test native
   test_cmd_eq "$(remote_targets)" count_path /in/ "$SERVER_LOG"
   test_cmd_eq 0 count_path /a/ "$SERVER_LOG"
 }
@@ -647,13 +648,23 @@ assert "unknown" in status["lastError"], status
 ' "$CACHE_DIR/remote-status-read.json"
 }
 
+case_read_status_persistence() {
+  # A read-status write failure is diagnostic only: the remote denial is still
+  # a cache miss and Lake must keep the successful local build result. A
+  # directory at the status-file path makes the final atomic rename fail while
+  # the normal cache artifact paths remain writable.
+  fresh
+  test_cmd mkdir -p "$CACHE_DIR/remote-status-read.json"
+  LAKE_REMOTE_CACHE=deny test_out 'Built Test' build Test native
+}
+
 
 
 CASES="${REMOTE_CACHE_CASES:-case_roundtrip case_no_token case_second_put case_no_leak
   case_rotation case_token_cmd_fails case_other_host case_no_request case_download
   case_failing_cmd case_refused_token case_redirect case_cleartext case_read_through
   case_read_404 case_read_invalid_mapping case_read_bad_artifact case_read_bad_descriptor
-  case_read_transport case_read_status}"
+  case_read_transport case_read_status case_read_status_persistence}"
 for c in $CASES; do
   echo "# ${c#case_}"
   "$c"
