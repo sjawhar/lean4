@@ -498,155 +498,118 @@ public def Cache.quarantine (cache : Cache) (file : FilePath) (name : String) : 
   IO.FS.createDirAll cache.quarantineDir
   quarantineAs cache.quarantineDir file name 0
 
+/-- Describes where `Cache.quarantine` moved a file, given its result. -/
+def describeMoved : Option FilePath → String
+  | some dest => s!"moved it to: {dest}"
+  | none => "it was already moved away by another process"
+
 /-- Describes the outcome of `Cache.quarantine`; a failure to quarantine is reported, not thrown. -/
 def describeQuarantine (cache : Cache) (file : FilePath) (name : String) : BaseIO String := do
   match (← (cache.quarantine file name).toBaseIO) with
-  | .ok (some dest) => return s!"moved it to: {dest}"
-  | .ok none => return "it was already moved away by another process"
+  | .ok moved => return describeMoved moved
   | .error e => return s!"could not move it into quarantine: {e}"
 
 /-- Hashes `bytes` as `computeFileHash` does; text that is not valid UTF-8 has no hash. -/
 def hashBytes? (bytes : ByteArray) (text : Bool) : Option Hash :=
   if text then Hash.ofText <$> String.fromUTF8? bytes else some (Hash.ofByteArray bytes)
 
-/-- Writes `bytes` to the new file `path`, and fails unless all of them reach the file system. -/
-def writeNewFile (path : FilePath) (bytes : ByteArray) : IO Unit := do
-  let h ← IO.FS.Handle.mk path .writeNew
-  h.write bytes
-  h.flush
-
-/--
-Creates the cache entry `entry` with the contents `bytes` and the access rights `rights`, unless a
-file already has its name. The bytes go to a new temporary file next to the entry, which is then
-linked to the entry's name (or renamed onto it where the file system cannot link) and removed. A
-write that fails or stops part way (e.g., on a full disk, or when Lake is killed) therefore never
-leaves part of the bytes under the entry's name.
--/
-public def writeCacheEntry (entry : FilePath) (bytes : ByteArray) (rights : IO.AccessRight) : IO Unit := do
-  let tmp ← uniqueTmpPath entry
-  try
-    writeNewFile tmp bytes
-    match (← (IO.FS.hardLink tmp entry).toBaseIO) with
-    | .ok _ | .error (.alreadyExists ..) => pure () -- another process created the entry first
-    | .error _ => IO.FS.rename tmp entry
-  finally
-    discard <| (removeFileIfExists tmp).toBaseIO
-  IO.setAccessRights entry ⟨rights, rights, rights⟩
+/-- Performs `x`; an error fails with `failed to cache artifact: <error>`. -/
+@[inline] def cacheIO (x : IO α) : LogIO α := do
+  match (← x.toBaseIO) with
+  | .ok a => return a
+  | .error e => error s!"failed to cache artifact: {e}"
 
 /--
 Makes the entry of `cache` for the artifact `descr` hold the build output `file`, whose contents
-Lake has just hashed to `descr.hash` (`bytes` are what the entry holds: those contents, with
-normalized line endings if `text`).
+Lake has just hashed to `descr.hash`. `bytes` are what the entry holds: those contents, with
+normalized line endings if `text`.
 
-A file that already has the entry's name is kept if it is `file` itself (a hard link) or has the
-artifact's hash, or if it cannot be read. Any other file there (e.g., the first part of the
-output, left by a write that stopped part way) is moved into the quarantine directory and
-replaced, and the result describes this. Without this, the build would map its input to those
-bytes, and every later restore would serve them.
+A file that already has the entry's name is kept if it is `file` itself (e.g., `file` was restored
+from the entry as a hard link) or has the artifact's hash, or if it cannot be read. Any other file
+there (e.g., the first part of the output, left by a write that stopped part way) is moved into the
+quarantine directory, with a warning, and replaced. Without this, the build would map its input to
+those bytes, and every later restore would serve them. If that file cannot be moved, the insert
+fails, where a restore only reports it (`describeQuarantine`): the file would keep the entry's name,
+and the build would map its input to it.
 
-A new entry is a hard link to `file` if `link` is set and the file system allows it; otherwise it
-is written by `writeCacheEntry`.
+A new binary entry is a hard link to `file` where the file system allows it. A text entry is always
+written, because its normalized bytes can differ from those of `file` (e.g., in line endings).
+Entries are written by `writeBinFileIfNew`, so an entry's name never holds part of a file.
 -/
 def Cache.insertEntry
-  (cache : Cache) (descr : ArtifactDescr) (file : FilePath) (bytes : ByteArray)
-  (text link : Bool) (rights : IO.AccessRight)
-: IO (Option String) := do
+  (cache : Cache) (descr : ArtifactDescr) (file : FilePath) (bytes : ByteArray) (text : Bool)
+: LogIO Unit := do
   let entry := cache.artifactDir / descr.relPath
-  let mut replaced? : Option String := none
   if (← entry.pathExists) then
-    if link then
-      if (← (file.isSameFile entry).toBaseIO) matches .ok true then
-        return none
+    if (← (file.isSameFile entry).toBaseIO) matches .ok true then
+      return
     match (← (IO.FS.readBinFile entry).toBaseIO) with
     | .ok held =>
       if hashBytes? held text == some descr.hash then
-        return none
-      let moved := match (← cache.quarantine entry descr.relPath.toString) with
-        | some dest => s!"moved it to: {dest}"
-        | none => "it was already moved away by another process"
-      replaced? := some s!"{entry}: cached artifact does not match its content hash; {moved}, \
-        and cached {file} in its place"
+        return
+      match (← (cache.quarantine entry descr.relPath.toString).toBaseIO) with
+      | .ok moved =>
+        logWarning s!"{entry}: cached artifact does not match its content hash; \
+          {describeMoved moved}; caching {file} in its place"
+      | .error e =>
+        error s!"failed to cache artifact: {entry}: cached artifact does not match its content \
+          hash, and it could not be moved into quarantine: {e}"
     | .error (.noFileOrDirectory ..) => pure () -- removed since, e.g., by a garbage collection
-    | .error _ => return none
+    | .error _ => return
   else
-    createParentDirs entry
-  if link then
-    match (← (IO.FS.hardLink file entry).toBaseIO) with
-    | .ok _ | .error (.alreadyExists ..) => return replaced?
-    | .error _ => pure () -- e.g., the cache is on another file system: write the entry
-  writeCacheEntry entry bytes rights
-  return replaced?
+    cacheIO <| createParentDirs entry
+  cacheIO do
+    unless text do
+      match (← (IO.FS.hardLink file entry).toBaseIO) with
+      | .ok _ | .error (.alreadyExists ..) => return
+      | .error _ => pure () -- e.g., the cache is on another file system: write the entry
+    writeBinFileIfNew entry bytes
+
+/--
+Returns the bytes that the cache entry of `file` holds (its contents, with normalized line endings
+if `text`) and their hash, or `none` for text that is not valid UTF-8, which has no hash.
+-/
+def readEntryBytes? (file : FilePath) (text : Bool) : IO (Option (ByteArray × Hash)) := do
+  let contents ← IO.FS.readBinFile file
+  if text then
+    return String.fromUTF8? contents |>.map fun s =>
+      let normalized := s.crlfToLf
+      (normalized.toUTF8, Hash.ofString normalized)
+  else
+    return some (contents, Hash.ofByteArray contents)
 
 /--
 Like `Cache.saveArtifact`, but if `expected?` is a hash that `file`'s contents do not have,
 caches nothing, leaves `file` and its `.hash` untouched, and returns `file`'s actual hash (`none`
 for text that is not valid UTF-8, which has no hash).
-
-Also returns a description of the file with other bytes that the cache held under the artifact's
-name, if it replaced one (see `Cache.insertEntry`).
 -/
 public def Cache.saveArtifactIfMatches
   (cache : Cache) (file : FilePath) (expected? : Option Hash)
   (ext := "art") (text exe useLocalFile := false)
-: IO (Except (Option Hash) (Artifact × Option String)) := do
-  try
-    if text then
-      let bytes ← IO.FS.readBinFile file
-      let some contents := String.fromUTF8? bytes
-        | if expected?.isSome then return .error none else
-            throw <| IO.userError s!"Tried to read file '{file}' containing non UTF-8 data."
-      let normalized := contents.crlfToLf
-      let hash := Hash.ofString normalized
-      if let some expected := expected? then
-        if hash != expected then return .error (some hash)
-      let descr := artifactWithExt hash ext
-      let cacheFile := cache.artifactDir / descr.relPath
-      -- make the local file unwritable where possible to discourage users from
-      -- writing to such paths as this can corrupt the cache if the file was hard linked
-      let r := {read := true, write := false, execution := false}
-      IO.setAccessRights file ⟨r, r, r⟩
-      let replaced? ← cache.insertEntry descr file normalized.toUTF8 (text := true) (link := false) r
-      IO.setAccessRights cacheFile ⟨r, r, r⟩
-      writeFileHash file hash
-      let mtime ← getMTime cacheFile
-      let path := if useLocalFile then file else cacheFile
-      return .ok ({descr, name := file.toString, path, mtime}, replaced?)
-    else
-      let contents ← IO.FS.readBinFile file
-      let hash := Hash.ofByteArray contents
-      if let some expected := expected? then
-        if hash != expected then return .error (some hash)
-      let descr := artifactWithExt hash ext
-      let cacheFile := cache.artifactDir / descr.relPath
-      -- make the local file unwritable where possible to discourage users from
-      -- writing to such paths as this can corrupt the cache if the file is hard linked
-      let r := {read := true, write := false, execution := exe}
-      IO.setAccessRights file ⟨r, r, r⟩
-      let replaced? ← cache.insertEntry descr file contents (text := false) (link := true) r
-      IO.setAccessRights cacheFile ⟨r, r, r⟩
-      writeFileHash file hash
-      let mtime ← getMTime cacheFile
-      let path := if useLocalFile then file else cacheFile
-      return .ok ({descr, name := file.toString, path, mtime}, replaced?)
-  catch e =>
-    error s!"failed to cache artifact: {e}"
-
-/--
-`Cache.saveArtifact`, and a description of the file with other bytes that the cache held under
-the artifact's name, if it replaced one (see `Cache.insertEntry`).
--/
-public def Cache.saveArtifactCore
-  (cache : Cache) (file : FilePath) (ext := "art") (text exe useLocalFile := false)
-: IO (Artifact × Option String) := do
-  match (← cache.saveArtifactIfMatches file none ext text exe useLocalFile) with
-  | .ok r => return r
-  | .error _ => unreachable!
+: LogIO (Except (Option Hash) Artifact) := do
+  let some (bytes, hash) ← cacheIO <| readEntryBytes? file text
+    | if expected?.isSome then return .error none else
+        error s!"failed to cache artifact: Tried to read file '{file}' containing non UTF-8 data."
+  if let some expected := expected? then
+    if hash != expected then return .error (some hash)
+  let descr := artifactWithExt hash ext
+  let cacheFile := cache.artifactDir / descr.relPath
+  -- make the local file unwritable where possible to discourage users from
+  -- writing to such paths as this can corrupt the cache if the file is hard linked
+  let r := {read := true, write := false, execution := exe && !text}
+  cacheIO <| IO.setAccessRights file ⟨r, r, r⟩
+  cache.insertEntry descr file bytes text
+  cacheIO do
+    IO.setAccessRights cacheFile ⟨r, r, r⟩
+    writeFileHash file hash
+  let mtime ← cacheIO <| getMTime cacheFile
+  let path := if useLocalFile then file else cacheFile
+  return .ok {descr, name := file.toString, path, mtime}
 
 /--
 Copies `file` to the Lake cache with the file extension `ext`, and
 saves its hash in its `.hash` file. A file with other bytes under the artifact's name in the cache
-is moved into the quarantine directory and replaced (see `Cache.insertEntry`); `cacheArtifact`
-also logs a warning about it.
+is moved into the quarantine directory, with a warning, and replaced (see `Cache.insertEntry`).
 
 **Additional Options:**
 * `text`: the contents of `file` are hashed as text rather than as a binary blob.
@@ -656,16 +619,16 @@ the file in the cache.
 -/
 public def Cache.saveArtifact
   (cache : Cache) (file : FilePath) (ext := "art") (text exe useLocalFile := false)
-: IO Artifact := (·.1) <$> cache.saveArtifactCore file ext text exe useLocalFile
+: LogIO Artifact := do
+  match (← cache.saveArtifactIfMatches file none ext text exe useLocalFile) with
+  | .ok art => return art
+  | .error _ => unreachable!
 
 @[inline, inherit_doc Cache.saveArtifact]
 public def cacheArtifact
-  [MonadWorkspace m] [MonadLiftT IO m] [MonadLog m] [Monad m]
+  [MonadWorkspace m] [MonadLiftT LogIO m] [Monad m]
   (file : FilePath) (ext := "art") (text exe useLocalFile := false)
-: m Artifact := do
-  let (art, replaced?) ← (← getLakeCache).saveArtifactCore file ext text exe useLocalFile
-  if let some msg := replaced? then logWarning msg
-  return art
+: m Artifact := do (← getLakeCache).saveArtifact file ext text exe useLocalFile
 
 /--
 Caches `file` like `cacheArtifact`, unless its contents no longer hash to `expected`, the hash
@@ -681,9 +644,7 @@ public def recacheArtifact?
 : JobM (Option Artifact) := do
   let cache ← getLakeCache
   match (← cache.saveArtifactIfMatches file expected ext text exe useLocalFile) with
-  | .ok (art, replaced?) =>
-    if let some msg := replaced? then logWarning msg
-    return some art
+  | .ok art => return some art
   | .error actual? =>
     clearFileHash file
     let moved ← describeQuarantine cache file (artifactPath expected ext).toString

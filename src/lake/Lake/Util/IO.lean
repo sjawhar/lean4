@@ -29,33 +29,56 @@ public def removeFileIfExists (path : FilePath) : IO Unit := do
 builtin_initialize tmpPathCount : IO.Ref Nat ← IO.mkRef 0
 
 /--
-Returns a temporary path next to {lean}`path`, {lit}`<path>.<pid>.<n>.tmp`, that no concurrent
-call, in this process or in another, returns. It suits a file that is written, then renamed
-into place.
+Returns a new temporary path next to {lean}`path`, {lit}`<path>.<pid>.<n>.<random>.tmp`, where
+{lit}`<n>` counts the paths that this process returned, and {lit}`<random>` is 64 random bits in
+hexadecimal. No other call in this process returns the same path. A call in another process
+returns it only by chance, also in one with the same process ID (e.g., in another container that
+shares the directory, or on another host). A caller that must not use another process's file
+creates the file with {lean}`IO.FS.Mode.writeNew`.
 -/
-public def uniqueTmpPath (path : FilePath) : BaseIO FilePath := do
+public def uniqueTmpPath (path : FilePath) : IO FilePath := do
   let n ← tmpPathCount.modifyGet fun n => (n, n + 1)
-  return s!"{path}.{← IO.Process.getPID}.{n}.tmp"
+  let r := (← IO.getRandomBytes 8).foldl (init := 0) fun r b => r * 256 + b.toNat
+  return s!"{path}.{← IO.Process.getPID}.{n}.{String.ofList (Nat.toDigits 16 r)}.tmp"
 
 /--
-Write the UTF-8 encoded string {lean}`content` to {lean}`path`.
-If the file already exists, does nothing.
+Writes the bytes of {lean}`content` to the new file {lean}`path`. If a file already has that name,
+does nothing.
+
+The name never holds part of {lean}`content`. The bytes go to a new temporary file next to
+{lean}`path` (see {lean}`uniqueTmpPath`), which is then hard-linked to {lean}`path` and removed. A
+hard link never replaces a file. A write that fails (e.g., on a full disk) leaves no file; one that
+stops part way (e.g., when the process is killed) leaves only the temporary file.
+
+Where the file system cannot hard-link, the temporary file is renamed to {lean}`path` instead. A
+rename replaces a file that took the name in the meantime (e.g., the same bytes, written by
+another process), so there the last of two concurrent writers wins; each of their files is whole.
+
+The bytes are flushed to the operating system, not synced to the disk: after a power loss, the
+name can hold a file whose data the disk did not keep.
 -/
-public def writeFileIfNew (path : FilePath) (content : String) : IO Unit := do
-  let h ← try IO.FS.Handle.mk path IO.FS.Mode.writeNew catch
-    | .alreadyExists .. => return
+public partial def writeBinFileIfNew (path : FilePath) (content : ByteArray) : IO Unit := do
+  if (← path.pathExists) then return
+  let tmp ← uniqueTmpPath path
+  let h ← try IO.FS.Handle.mk tmp .writeNew catch
+    | .alreadyExists .. => return ← writeBinFileIfNew path content -- another process's file
     | e => throw e
-  h.putStr content
+  -- `tmp` is this call's own file, so it removes it on every path
+  try
+    h.write content
+    h.flush
+    match (← (IO.FS.hardLink tmp path).toBaseIO) with
+    | .ok _ | .error (.alreadyExists ..) => pure () -- another process created `path` first
+    | .error _ => IO.FS.rename tmp path
+  finally
+    discard <| (removeFileIfExists tmp).toBaseIO
 
 /--
-Write the bytes of {lean}`content` to {lean}`path`.
-If the file already exists, does nothing.
+Writes the UTF-8 encoded string {lean}`content` to the new file {lean}`path`, as
+{lean}`writeBinFileIfNew` writes bytes. If a file already has that name, does nothing.
 -/
-public def writeBinFileIfNew (path : FilePath) (content : ByteArray) : IO Unit := do
-  let h ← try IO.FS.Handle.mk path IO.FS.Mode.writeNew catch
-    | .alreadyExists .. => return
-    | e => throw e
-  h.write content
+public def writeFileIfNew (path : FilePath) (content : String) : IO Unit :=
+  writeBinFileIfNew path content.toUTF8
 
 /--
 Remove a directory and all its contents.

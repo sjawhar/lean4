@@ -13,7 +13,6 @@ public import Lake.CLI.Shake
 public import Lake.CLI.Check
 import Lake.Version
 import Lake.Build.Run
-import Lake.Build.Common
 import Lake.Build.Infos
 import Lake.Build.Targets
 import Lake.Build.Target.Fetch
@@ -832,26 +831,36 @@ protected def unstage : CliM PUnit := do
   let ok ← descrs.foldlM (init := true) fun ok descr => do
     let cachePath := artDir/ descr.relPath
     let stagingPath := stagingDir / descr.relPath
-    if (← cachePath.pathExists) then
-      if overwrite then
-        -- Cache artifacts are read-only, so the old artifact must be deleted first.
-        IO.FS.removeFile cachePath
-      else
-        return ok
-    -- Write the entry so that no part of it is ever under its name (e.g., if `unstage` stops)
-    let r : IO.AccessRight := {read := true, write := false, execution := false}
-    let write : IO Unit := do writeCacheEntry cachePath (← IO.FS.readBinFile stagingPath) r
-    match (← write.toBaseIO) with
-    | .ok _ =>
+    if !overwrite && (← cachePath.pathExists) then
       return ok
+    match (← IO.FS.readBinFile stagingPath |>.toBaseIO) with
     | .error (.noFileOrDirectory ..) =>
       logError s!"output artifact not found in staging directory: {stagingPath}"
       return false
     | .error e =>
-      logError s!"failed to copy artifact: {e}"
+      logError s!"failed to read staged artifact: {e}"
       return false
+    | .ok bytes =>
+      -- The name's hash is that of the entry's bytes, also for text: a text artifact's hash is the
+      -- hash of its normalized text, and a text entry holds that text's UTF-8 bytes. A staged file
+      -- without those bytes (e.g., one that a `stage` that stopped part way left) is not cached.
+      unless Hash.ofByteArray bytes == descr.hash do
+        logError s!"{stagingPath}: staged artifact does not match its content hash"
+        return false
+      let write : IO Unit := do
+        -- `writeBinFileIfNew` never replaces a file, so an artifact to overwrite is removed first
+        if overwrite then removeFileIfExists cachePath
+        writeBinFileIfNew cachePath bytes
+        let r : IO.AccessRight := {read := true, write := false, execution := false}
+        IO.setAccessRights cachePath ⟨r, r, r⟩
+      match (← write.toBaseIO) with
+      | .ok _ =>
+        return ok
+      | .error e =>
+        logError s!"failed to copy artifact: {e}"
+        return false
   unless ok do
-    logError "failed to copy all outputs to the staging directory"
+    logError "failed to copy all outputs from the staging directory"
     exit 1
   ws.lakeCache.writeMap localScope map service? opts.scope? overwrite
 
