@@ -520,9 +520,21 @@ def hashBytes? (bytes : ByteArray) (text : Bool) : Option Hash :=
   | .error e => error s!"failed to cache artifact: {e}"
 
 /--
+Whether `e`, the error of a hard link into a cache, means that the cache's file system cannot
+hard-link: `EPERM` (`osCode` 1), which Linux's `link` reports for such a file system. Lean decodes
+other errors as `permissionDenied` too, e.g., `EACCES` for a directory that Lake cannot write to, or
+`EROFS` for a read-only file system; those are not this. On Windows, libuv reports
+`ERROR_ACCESS_DENIED` (e.g., for such a directory) as `EPERM`, so there no error counts.
+-/
+def cannotHardLink (e : IO.Error) : Bool :=
+  !System.Platform.isWindows && match e with
+    | .permissionDenied _ code _ => code == 1
+    | _ => false
+
+/--
 The artifact directories of caches into which a hard link failed in this process because the file
-system cannot hard-link (`permissionDenied`, e.g., `EPERM`), each with that error.
-`Cache.insertEntry` tries no more hard links into them, and writes no temporary copies there.
+system cannot hard-link (`cannotHardLink`), each with that error. `Cache.insertEntry` tries no more
+hard links into them, and writes no temporary copies there.
 -/
 builtin_initialize noHardLinkDirs : IO.Ref (Array (FilePath × IO.Error)) ← IO.mkRef #[]
 
@@ -546,9 +558,11 @@ Entries are written by `writeBinFileIfNew`, so an entry's name never holds part 
 Returns whether the entry exists afterwards. Where a hard link into the cache fails (other than for
 an existing file), nothing publishes a whole entry without replacing a file, so this caches nothing
 and logs that at the verbose level; the build goes on with `file`. A hard link that fails because
-the file system cannot hard-link (`permissionDenied`) is remembered for the cache's artifact
-directory (`noHardLinkDirs`): later inserts into it in this process try no hard link, and write no
-temporary copy (which could not be linked either).
+the file system cannot hard-link (`cannotHardLink`, i.e., `EPERM`) is remembered for the cache's
+artifact directory (`noHardLinkDirs`): later inserts into it in this process try no hard link, and
+write no temporary copy (which could not be linked either). Another error of a hard link of `file`
+(e.g., `EACCES` for a directory that Lake cannot write to, or `EXDEV` for a cache on another file
+system) goes on to the temporary copy, whose write reports an error that prevents it.
 -/
 def Cache.insertEntry
   (cache : Cache) (descr : ArtifactDescr) (file : FilePath) (bytes : ByteArray) (text : Bool)
@@ -580,15 +594,14 @@ def Cache.insertEntry
     unless text do
       match (← (IO.FS.hardLink file entry).toBaseIO) with
       | .ok _ | .error (.alreadyExists ..) => return .ok ()
-      -- The file system cannot hard-link (`EPERM`), so the temporary copy cannot be linked either.
-      -- Another error (e.g., `EXDEV`: the cache is on another file system) leaves that way open.
-      | .error e@(.permissionDenied ..) => return .error e
-      | .error _ => pure ()
+      | .error e =>
+        -- The file system cannot hard-link, so the temporary copy cannot be linked either
+        if cannotHardLink e then return .error e
     writeBinFileIfNew entry bytes
   match linked with
   | .ok _ => return true
   | .error e =>
-    if e matches .permissionDenied .. then
+    if cannotHardLink e then
       noHardLinkDirs.modify (·.push (cache.artifactDir, e))
     logVerbose s!"{entry}: not cached: the cache's file system did not hard-link the entry: {e}"
     return false
