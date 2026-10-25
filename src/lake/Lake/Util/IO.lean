@@ -41,6 +41,20 @@ public def uniqueTmpPath (path : FilePath) : IO FilePath := do
   let r := (← IO.getRandomBytes 8).foldl (init := 0) fun r b => r * 256 + b.toNat
   return s!"{path}.{← IO.Process.getPID}.{n}.{String.ofList (Nat.toDigits 16 r)}.tmp"
 
+/-- Writes {lean}`content` to a new temporary file next to {lean}`path`, then releases its handle. -/
+partial def writeBinFileToNewTmp (path : FilePath) (content : ByteArray) : IO FilePath := do
+  let tmp ← uniqueTmpPath path
+  let h ← try IO.FS.Handle.mk tmp .writeNew catch
+    | .alreadyExists .. => return ← writeBinFileToNewTmp path content
+    | e => throw e
+  try
+    h.write content
+    h.flush
+  catch e =>
+    removeFileIfExists tmp
+    throw e
+  return tmp
+
 /--
 Writes the bytes of {lean}`content` to the new file {lean}`path`. If a file already has that name,
 does nothing.
@@ -61,17 +75,14 @@ name can hold a file whose data the disk did not keep.
 -/
 public partial def writeBinFileIfNew (path : FilePath) (content : ByteArray) : IO Unit := do
   if (← path.pathExists) then return
-  let tmp ← uniqueTmpPath path
-  let h ← try IO.FS.Handle.mk tmp .writeNew catch
-    | .alreadyExists .. => return ← writeBinFileIfNew path content -- another process's file
-    | e => throw e
+  let tmp ← writeBinFileToNewTmp path content
   -- `tmp` is this call's own file, so it removes it on every path
   try
-    h.write content
-    h.flush
     match (← (IO.FS.hardLink tmp path).toBaseIO) with
     | .ok _ | .error (.alreadyExists ..) => pure () -- another process created `path` first
     | .error _ =>
+      -- `writeBinFileToNewTmp` returned only after it released the temporary handle.
+      removeFileIfExists tmp
       let h ← try IO.FS.Handle.mk path .writeNew catch
         | .alreadyExists .. => return -- another process created `path` first
         | e => throw e
