@@ -485,16 +485,28 @@ public def waitForClaim
 
 /--
 What this process did about the push of the build that runs: whether it started one (see
-`startBuildPush`), and the lock it holds on that push's follow file (in `Cache.pushFollowDir`)
-while the build runs, which tells the push that the build still runs. The build releases the lock
-when it ends (`endBuildPush`); the lock also goes when the process ends, however it ends.
+`startBuildPush`), the lock it holds on that push's follow file (in `Cache.pushFollowDir`) while
+the build runs, which tells the push that the build still runs, and whether the build already
+reported a push that could not start. The build releases the lock when it ends (`endBuildPush`);
+the lock also goes when the process ends, however it ends.
 -/
 structure BuildPush where
   started : Bool := false
   followLock? : Option IO.FS.Handle := none
+  startFailed : Bool := false
   deriving Inhabited
 
 builtin_initialize buildPush : Std.Mutex BuildPush ← Std.Mutex.new {}
+
+/--
+Notes that this build's push could not start, and returns whether it is the first time in this
+build, so the build reports it once however many compiles try to start it again.
+-/
+def firstPushStartFailure : BaseIO Bool :=
+  buildPush.atomically do
+    let first := !(← get).startFailed
+    modify ({· with startFailed := true})
+    return first
 
 /-- The size above which a detached push moves `Cache.pushLogFile` to `push.log.1` first. -/
 def pushLogMaxBytes : UInt64 := 4 * 1024 * 1024
@@ -574,8 +586,9 @@ queues it, and ends once the build has ended (see `endBuildPush`) and the queue 
 The follow file, in `Cache.pushFollowDir`, is named with this process's ID and 64 random bits (see
 `uniqueTmpSuffix`), so a build of another process with the same ID (in a container that shares the
 cache) never holds it. A build that takes its own file also removes the files that no build holds
-and no push removed (see `reapFollowFiles`). A spawn that fails leaves no file and no state, so
-the build's next queued output starts a push again.
+and no push removed (see `reapFollowFiles`). A spawn that fails leaves no file and no push, so
+the build's next queued output starts a push again; the build reports the failure once, as a
+cache failure (see `queueCompiledOutputs`).
 
 The push runs in a session of its own, with the environment of this process and its cache, so it
 outlives the build and a Ctrl-C that stops it. Its output goes to `Cache.pushLogFile`.
@@ -607,7 +620,7 @@ public def startBuildPush (env : Env) (cache : Cache) : IO Bool :=
       -- No push follows this build: the next queued output tries again
       discard <| lock.unlock.toBaseIO
       discard <| (removeFileIfExists followFile).toBaseIO
-      set ({} : BuildPush)
+      modify ({· with started := false, followLock? := none})
       throw e
     | .ok child =>
       -- The shell ends as soon as the push runs in the background
@@ -676,7 +689,8 @@ input's claim, it stops rewriting it, marks it `queued` (see `markClaimQueued`),
 outputs with the claim's generation. When this build takes claims, it then starts its one detached
 `lake cache push` if it has not yet (see `startBuildPush`), which uploads the outputs and marks
 the claim `done`, so the builds that wait for the claim find the mapping. If the outputs could not
-be queued, the claim is marked `failed` instead.
+be queued, the claim is marked `failed` instead. A push that cannot start is a cache failure:
+the build reports it once, at verbose level, in its read status (see `recordClaimFailure`).
 -/
 public def queueCompiledOutputs
   (claim? : Option HeldClaim) (pkg : Package) (inputHash : Hash) (target : String)
@@ -699,6 +713,10 @@ public def queueCompiledOutputs
     | .ok true =>
       logVerbose s!"started `lake cache push --follow`, log: {ws.lakeCache.pushLogFile}"
     | .ok false => pure ()
-    | .error e => logWarning s!"could not start `lake cache push`: {e}"
+    | .error e =>
+      -- A cache failure, not a build failure (it is verbose, so `--wfail` builds compile), and
+      -- reported once per build, however many compiles try to start the push again
+      if ← firstPushStartFailure then
+        recordClaimFailure s!"could not start `lake cache push`: {e}"
 
 end Lake

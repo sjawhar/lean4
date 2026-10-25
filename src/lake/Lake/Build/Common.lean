@@ -593,6 +593,13 @@ public def Cache.quarantine (cache : Cache) (file : FilePath) (name : String) : 
   IO.FS.createDirAll cache.quarantineDir
   quarantineAs cache.quarantineDir file name 0
 
+/-- Describes the outcome of `Cache.quarantine`; a failure to quarantine is reported, not thrown. -/
+public def describeQuarantine (cache : Cache) (file : FilePath) (name : String) : BaseIO String := do
+  match (← (cache.quarantine file name).toBaseIO) with
+  | .ok (some dest) => return s!"moved it to: {dest}"
+  | .ok none => return "it was already moved away by another process"
+  | .error e => return s!"could not move it into quarantine: {e}"
+
 /-- **For internal use only.** -/
 public class ResolveOutputs (α : Type) where
   /-- **For internal use only.** -/

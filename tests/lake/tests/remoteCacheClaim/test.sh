@@ -515,6 +515,35 @@ case_claim_push_spawn_fails() {
   test_cmd_eq 0 claim_check count-files "$CACHE_A/push-follow"
 }
 
+case_claim_push_start_wfail() {
+  # A push that can never start (every spawn of its shell refused) is a cache failure, not a
+  # build failure: a `--wfail` build still succeeds, reports it once (at verbose level, not
+  # once per compile), and records it in its read status.
+  claim_fresh
+  test_cmd cc -shared -fPIC -o "$WORK_DIR/fail-spawn.so" "$TEST_DIR/FailSpawn.c" -ldl
+  PROBE_FAIL_SPAWN=/bin/bash PROBE_FAIL_SPAWN_ALWAYS=1 LAKE_PRELOAD="$WORK_DIR/fail-spawn.so" \
+    run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" --wfail Claim.A Claim.B
+  test_cmd_eq 2 claim_check built-by "$LOG_A"
+  test_cmd_eq 1 count 'could not start `lake cache push`' "$LOG_A"
+  no_match_text 'warning: could not start' "$LOG_A"
+  match_text 'could not start `lake cache push`' "$CACHE_A/remote-status-read.json"
+  test_exp ! -e "$CACHE_A/push.log"
+}
+
+case_claim_foreground_push() {
+  # Where the push's shell is missing (`LAKE_PUSH_SHELL` names no file), no push is detached:
+  # the build warns, and runs the push in the foreground at its end, so the queue is pushed,
+  # its status written and every claim `done` when the build exits.
+  claim_fresh
+  LAKE_PUSH_SHELL=/nonexistent/bash run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim claimexe
+  match_text '`/nonexistent/bash` is missing (see `LAKE_PUSH_SHELL`)' "$LOG_A"
+  no_match_text 'lake cache push: started' "$CACHE_A/push.log"
+  match_text 'lake cache push: ran in the foreground' "$CACHE_A/push.log"
+  test_cmd_eq 0 queued_lines "$CACHE_A"
+  test_cmd push_check status "$CACHE_A/remote-status-push.json" $CLAIM_COMPILES 0 0 0
+  claims_done $CLAIM_COMPILES
+}
+
 case_claim_follow_reap() {
   # A build removes the follow files that no build holds and that are a day old (what a killed
   # push leaves), and keeps a fresh one and one that a build still holds.
@@ -538,4 +567,5 @@ run_cases case_claim_two_builds case_claim_one_push case_claim_order case_claim_
   case_claim_takeover case_claim_dead_holder case_claim_stale case_claim_detached_push \
   case_claim_pool_slot case_claim_fail_fast case_claim_same_pid case_claim_queued \
   case_claim_exe_push case_claim_push_retry case_claim_push_spawn_fails \
-  case_claim_follow_reap case_claim_off case_claim_fail_open
+  case_claim_push_start_wfail case_claim_foreground_push case_claim_follow_reap \
+  case_claim_off case_claim_fail_open
