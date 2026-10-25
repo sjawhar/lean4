@@ -508,56 +508,6 @@ public structure RemoteUpload where
   /-- The Lake content hash that names the file in messages (for a mapping, its input hash). -/
   hash : Hash
 
-/--
-Outputs that a build compiled, queued for upload to the shared remote cache: one line of the
-write-back queue (`Cache.pushQueueFile`), which `lake cache push` empties.
--/
-public structure RemotePushEntry where
-  /-- The name of the cache service that `LAKE_REMOTE_CACHE` named for the build. -/
-  service : String
-  /-- The remote scope of the outputs (see `remoteCacheScope`). -/
-  remoteScope : String
-  /-- The input hash of the outputs. -/
-  inputHash : Hash
-  /-- The build key of the target (see `RemoteCacheMapping`). -/
-  target : String
-  /-- The source hash of a module, or `none` for any other target. -/
-  srcHash? : Option Hash
-  /-- The outputs, as the local mapping records them (for a module, its per-file descriptors). -/
-  data : Json
-  /-- The log of the build that produced the outputs. -/
-  log : Log
-
-namespace RemotePushEntry
-
-public protected def toJson (entry : RemotePushEntry) : Json :=
-  JsonObject.empty
-  |>.insert "service" entry.service
-  |>.insert "remoteScope" entry.remoteScope
-  |>.insert "inputHash" entry.inputHash
-  |>.insert "target" entry.target
-  |>.insert "srcHash" entry.srcHash?
-  |>.insert "data" entry.data
-  |>.insert "log" entry.log
-
-public instance : ToJson RemotePushEntry := ⟨RemotePushEntry.toJson⟩
-
-public protected def fromJson? (json : Json) : Except String RemotePushEntry := do
-  let obj ← JsonObject.fromJson? json
-  return {
-    service := ← obj.get "service"
-    remoteScope := ← obj.get "remoteScope"
-    inputHash := ← obj.get "inputHash"
-    target := ← obj.get "target"
-    srcHash? := ← obj.get "srcHash"
-    data := ← obj.get "data"
-    log := ← obj.get "log"
-  }
-
-public instance : FromJson RemotePushEntry := ⟨RemotePushEntry.fromJson?⟩
-
-end RemotePushEntry
-
 /-! ## Local Cache -/
 
 /-- The Lake cache directory. -/
@@ -662,47 +612,6 @@ public def readOutputs? (cache : Cache) (scope : String) (inputHash : Hash) : Lo
 /-- Returns path to the input-to-output mappings of a downloaded package revision. -/
 @[inline] public def revisionPath (cache : Cache) (scope : String) (rev : GitRev) : FilePath :=
   cache.revisionDir / scope / s!"{rev}.jsonl"
-
-/--
-The write-back queue of the shared remote cache: one `RemotePushEntry` per line, for the outputs
-that builds compiled, which `lake cache push` uploads and removes.
--/
-@[inline] public def pushQueueFile (cache : Cache) : FilePath :=
-  cache.dir / "push.jsonl"
-
-/-- The file whose exclusive lock guards each append to, and each rewrite of, `pushQueueFile`. -/
-@[inline] public def pushQueueLockFile (cache : Cache) : FilePath :=
-  cache.dir / "push.jsonl.lock"
-
-/-- The file whose exclusive lock the one running `lake cache push` holds. -/
-@[inline] public def pushLockFile (cache : Cache) : FilePath :=
-  cache.dir / "push.lock"
-
-/-- The queue entries that `lake cache push` refused, one JSON object per line, with the reason. -/
-@[inline] public def pushDroppedFile (cache : Cache) : FilePath :=
-  cache.dir / "push-dropped.jsonl"
-
-/-- The outcome of the last `lake cache push`. -/
-@[inline] public def pushStatusFile (cache : Cache) : FilePath :=
-  cache.dir / "remote-status-push.json"
-
-/--
-Appends `entry` to the write-back queue (`pushQueueFile`) under an exclusive lock on
-`pushQueueLockFile`, writing the whole line with one write of one buffer, so a reader that holds
-the lock never sees part of it. (A writer killed during that write can still leave part of a line,
-which `lake cache push` drops and records.)
--/
-public def appendPushQueue (cache : Cache) (entry : RemotePushEntry) : IO Unit := do
-  IO.FS.createDirAll cache.dir
-  let line := ((toJson entry).compress.push '\n').toUTF8
-  let lock ← IO.FS.Handle.mk cache.pushQueueLockFile .append
-  lock.lock
-  try
-    let h ← IO.FS.Handle.mk cache.pushQueueFile .append
-    h.write line
-    h.flush
-  finally
-    lock.unlock
 
 end Cache
 
@@ -1076,12 +985,12 @@ structure TransferState where
   refused : Bool := false
 
 /--
-Monitors the transfers of a `curl` run. With `withToken` (or `cfg.createOnly`), an upload that
-finds its object already present (HTTP 412) succeeds. With `retryUnauthorized`, a transfer
-refused with HTTP 401 is not reported but added to `unauthorized`.
+Monitors the transfers of a `curl` run. With `createOnly` (the uploads only create their
+objects), an upload that finds its object already present (HTTP 412) succeeds. With
+`retryUnauthorized`, a transfer refused with HTTP 401 is not reported but added to `unauthorized`.
 -/
 partial def monitorTransfer
-  (cfg : TransferConfig) (withToken retryUnauthorized : Bool)
+  (cfg : TransferConfig) (createOnly retryUnauthorized : Bool)
   (h hOut : IO.FS.Handle) (s : TransferState)
 : LoggerIO TransferState := do
   let line ← h.getLine
@@ -1103,7 +1012,7 @@ partial def monitorTransfer
           | .ok code@201 =>
             handleTransfer info code out line
           | .ok 412 =>
-            if (withToken || cfg.createOnly) && cfg.kind == .put then
+            if createOnly && cfg.kind == .put then
               discardResponse out
               logInfo s!"{cfg.scope}: {cfg.noun} {info.hash} already present\
                 \n  local path: {info.path}\
@@ -1129,7 +1038,7 @@ partial def monitorTransfer
       | .error e =>
         logError s!"curl produced invalid JSON: {e}; received: {line.trimAscii}"
         modify ({· with didError := true})
-    monitorTransfer cfg withToken retryUnauthorized h hOut s
+    monitorTransfer cfg createOnly retryUnauthorized h hOut s
 where
   getInfo? out :=
     match out.getAs Nat "urlnum" with
@@ -1222,6 +1131,8 @@ def runTransfer
     else
       return cfg.infos
   let cfg := {cfg with infos}
+  -- An upload with the token always only creates its object
+  let createOnly := token?.isSome || cfg.createOnly
   try
     IO.FS.withTempFile fun h path => do
       if let some token := token? then
@@ -1250,7 +1161,7 @@ def runTransfer
             else
               #["--aws-sigv4", "aws:amz:auto:s3", "--user", cfg.key]
           let auth :=
-            if token?.isSome || cfg.createOnly then
+            if createOnly then
               auth ++ #["-H", "x-goog-if-generation-match: 0"]
             else
               auth
@@ -1264,7 +1175,7 @@ def runTransfer
         cmd := ← Internal.getCurl, args
         stdout := .piped, stderr := .piped
       }
-      let s ← monitorTransfer cfg token?.isSome retryUnauthorized child.stderr child.stdout {}
+      let s ← monitorTransfer cfg createOnly retryUnauthorized child.stderr child.stdout {}
       let rc ← child.wait
       let stdout ← child.stdout.readToEnd
       unless stdout.isEmpty do

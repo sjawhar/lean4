@@ -1054,18 +1054,18 @@ public def ModuleOutputDescrs.ltarFiles
   return files
 
 /--
-The `leantar` arguments that pack a module's outputs `descrs` into the archive `ltar`: its trace,
-`fileName "trace"`, then the file `fileName ext` of each output (see `ltarFiles`), relative to
-`libDir` or `irDir`.
+The `leantar` arguments that pack a module's outputs into the archive `ltar`: its trace,
+`fileName "trace"`, then the file `fileName ext` of each output of `files` (see `ltarFiles`),
+relative to `libDir` or `irDir`.
 
 `-s` strips the trace's `depHash`, so that the archive's bytes depend only on the outputs.
 Consumers supply the hash again on unpack (see `Module.unpackLtar`).
 -/
-public def ModuleOutputDescrs.ltarPackArgs
-  (descrs : ModuleOutputDescrs) (fileName : String → String) (libDir irDir ltar : FilePath)
-: Except String (Array String) := do
+public def ltarPackArgs
+  (files : Array (ArtifactDescr × Bool)) (fileName : String → String) (libDir irDir ltar : FilePath)
+: Array String :=
   let args := #["-s", "-C", libDir.toString, "-C", irDir.toString, ltar.toString, fileName "trace"]
-  return (← descrs.ltarFiles).foldl (init := args) fun args (descr, inIrDir) =>
+  files.foldl (init := args) fun args (descr, inIrDir) =>
     args.push "-i" |>.push (if inIrDir then "1" else "0") |>.push (fileName descr.ext)
 
 def Module.packLtar
@@ -1075,9 +1075,10 @@ def Module.packLtar
     if (← self.checkArtifactsExist arts.isModule arts.c?.isNone) then
       return arts
     else self.restoreAllArtifacts arts
-  let args ← match arts.descrs.ltarPackArgs self.fileName self.leanLibDir self.irDir self.ltarFile with
-    | .ok args => pure args
+  let files ← match arts.descrs.ltarFiles with
+    | .ok files => pure files
     | .error e => error e
+  let args := ltarPackArgs files self.fileName self.leanLibDir self.irDir self.ltarFile
   proc (quiet := true) {cmd := (← getLeantar).toString, args}
   if (← self.pkg.isArtifactCacheWritable) then
     cacheArtifact self.ltarFile "ltar" (useLocalFile := ← self.pkg.restoreAllArtifacts)
@@ -1240,11 +1241,13 @@ where
           -- The trace holds the log of the action that produced the outputs: their replay,
           -- unpack or build
           let log := (← readTraceFile mod.traceFile).log
-          (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs (log := log)
+          -- Queued before the local mapping is written: once that exists, no later build
+          -- compiles (and queues) this input again. A crash in between queues it twice.
           if compiled then
             -- `lake cache push` packs the per-file outputs into the archive it uploads
             queueRemotePush mod.pkg depTrace.hash mod.name.toString (some presetup.srcHash)
               (toJson {arts.descrs with ltar? := none}) log
+          (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs (log := log)
           return arts
         else
           let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile

@@ -793,9 +793,11 @@ This command empties the queue without loading a workspace. For each entry, it
 hashes the cache artifacts again. An entry whose artifact is gone, or no longer
 matches its hash, is dropped and recorded in `push-dropped.jsonl`, and a
 changed artifact is moved to the cache's `quarantine` directory. A module's
-outputs are packed into one archive. Each artifact is uploaded under its
-SHA-256, then the entry's input-to-output mapping, each only if the object is
-not present yet. An entry that fails to upload stays in the queue.
+outputs are packed into one archive. The push copies the bytes it uploads into
+`push-staging` in the cache directory. Each artifact is uploaded under its
+SHA-256, then, once all of its artifacts are present, the entry's
+input-to-output mapping, each only if the object is not present yet. An entry
+that fails to upload stays in the queue.
 
 One push runs at a time. Another one exits at once (with status 0), unless
 `--wait` is set, and the running one also uploads any entry appended while it
