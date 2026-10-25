@@ -43,6 +43,22 @@ namespace ArtifactDescr
 @[inline] public def relPath (self : ArtifactDescr) : FilePath :=
   artifactPath self.hash self.ext
 
+/--
+Whether `ext` is one of the extensions Lake writes in its local artifact cache.
+
+Remote mappings are untrusted input. Keeping this list here ensures their descriptors cannot
+choose a path outside `Cache.artifactDir`.
+-/
+public def isCacheExtension (ext : String) : Bool :=
+  ext == "" || ext == "art" || ext == "olean" || ext == "olean.server" ||
+  ext == "olean.private" || ext == "ilean" || ext == "ir.sig" || ext == "ir" ||
+  ext == "c" || ext == "bc" || ext == "o" || ext == "a" || ext == "so" ||
+  ext == "dylib" || ext == "dll" || ext == "exe" || ext == "ltar"
+
+/-- Whether an artifact description from an untrusted mapping can name a cache artifact. -/
+public def isRemoteSafe (self : ArtifactDescr) : Bool :=
+  isCacheExtension self.ext && !self.ext.any (fun c => c == '/' || c == '\\')
+
 public instance : ToString ArtifactDescr := ⟨(·.relPath.toString)⟩
 public instance : ToJson ArtifactDescr := ⟨(toJson ·.relPath)⟩
 

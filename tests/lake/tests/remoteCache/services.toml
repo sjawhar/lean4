@@ -62,3 +62,22 @@ name = "slow"
 type = "s3"
 artifactEndpoint = "%URL%/slow/a0"
 revisionEndpoint = "%URL%/slow/r0"
+
+[[cache.service]]
+name = "reset"
+type = "s3"
+artifactEndpoint = "%URL%/reset/a0"
+revisionEndpoint = "%URL%/reset/r0"
+
+[[cache.service]]
+name = "oversize"
+type = "s3"
+artifactEndpoint = "%URL%/oversize/a0"
+revisionEndpoint = "%URL%/oversize/r0"
+
+# No mock fault mode selects this endpoint, so its GETs receive a 404.
+[[cache.service]]
+name = "miss"
+type = "s3"
+artifactEndpoint = "%URL%/miss/a0"
+revisionEndpoint = "%URL%/miss/r0"
