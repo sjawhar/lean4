@@ -397,18 +397,10 @@ def Workspace.startBuild
 
 /-- Atomically replace the status left by remote mapping reads in one build. -/
 def writeRemoteReadStatus (cache : Cache) (status : RemoteReadStatus) : IO Unit := do
-  let file := cache.dir / "remote-status-read.json"
-  let contents := (JsonObject.empty
-    |>.insert "at" (← IO.monoMsNow)
+  writeFileAtomic (cache.dir / "remote-status-read.json") <| (JsonObject.empty
+    |>.insert "at" (← wallClockSecs)
     |>.insert "failures" status.failures
     |>.insert "lastError" status.lastError : Json).pretty
-  createParentDirs file
-  let tmp ← uniqueTmpPath file
-  try
-    IO.FS.writeFile tmp contents
-    IO.FS.rename tmp file
-  finally
-    discard <| (removeFileIfExists tmp).toBaseIO
 
 def finalizeBuild
   (ws : Workspace) (cfg : BuildConfig) (bctx : BuildContext) (mctx : MonitorContext)

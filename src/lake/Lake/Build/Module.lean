@@ -1030,6 +1030,44 @@ where
 
 instance : ToOutputJson ModuleOutputArtifacts := ⟨(toJson ·.descrs)⟩
 
+/--
+The outputs that a module's archive (`.ltar`) holds after its trace, in archive order, each with
+the base directory it is relative to: `false` for the library directory (the `.olean` parts,
+`.ilean` and IR), `true` for the IR directory (the `.c` and `.bc`).
+-/
+public def ModuleOutputDescrs.ltarFiles
+  (descrs : ModuleOutputDescrs)
+: Except String (Array (ArtifactDescr × Bool)) := do
+  -- Note: oleans parts must be in the order of `.olean`, `.olean.server`, `.olean.private`
+  let mut files := descrs.oleanParts.map (·, false)
+  files := files.push (descrs.ilean, false)
+  if let some descr := descrs.irSig? then
+    files := files.push (descr, false)
+  if let some descr := descrs.ir? then
+    files := files.push (descr, false)
+  if let some descr := descrs.c? then
+    files := files.push (descr, true)
+  if Lean.Internal.hasLLVMBackend () then
+    let some descr := descrs.bc?
+      | throw "LLVM backend enabled but module outputs lack bitcode"
+    files := files.push (descr, true)
+  return files
+
+/--
+The `leantar` arguments that pack a module's outputs `descrs` into the archive `ltar`: its trace,
+`fileName "trace"`, then the file `fileName ext` of each output (see `ltarFiles`), relative to
+`libDir` or `irDir`.
+
+`-s` strips the trace's `depHash`, so that the archive's bytes depend only on the outputs.
+Consumers supply the hash again on unpack (see `Module.unpackLtar`).
+-/
+public def ModuleOutputDescrs.ltarPackArgs
+  (descrs : ModuleOutputDescrs) (fileName : String → String) (libDir irDir ltar : FilePath)
+: Except String (Array String) := do
+  let args := #["-s", "-C", libDir.toString, "-C", irDir.toString, ltar.toString, fileName "trace"]
+  return (← descrs.ltarFiles).foldl (init := args) fun args (descr, inIrDir) =>
+    args.push "-i" |>.push (if inIrDir then "1" else "0") |>.push (fileName descr.ext)
+
 def Module.packLtar
   (self : Module) (arts : ModuleOutputArtifacts)
 : JobM Artifact := do
@@ -1037,36 +1075,9 @@ def Module.packLtar
     if (← self.checkArtifactsExist arts.isModule arts.c?.isNone) then
       return arts
     else self.restoreAllArtifacts arts
-  let args ← id do
-    -- `-s` strips the `depHash` so archive bytes depend only on outputs.
-    -- Consumers reinject the hash on unpack (see `Module.unpackLtar`).
-    let mut args := #[
-      "-s",
-      "-C", self.leanLibDir.toString,
-      "-C", self.irDir.toString,
-      self.ltarFile.toString,
-      self.fileName "trace"
-    ]
-    let addArt args idx art :=
-      args.push "-i" |>.push idx |>.push (self.fileName art.ext)
-    -- Note: oleans parts must be in the order of `.olean`, `.olean.server`, `.olean.private`
-    args := addArt args "0" arts.olean
-    if let some art := arts.oleanServer? then
-      args := addArt args "0" art
-    if let some art := arts.oleanPrivate? then
-      args := addArt args "0" art
-    args := addArt args "0" arts.ilean
-    if let some art := arts.irSig? then
-      args := addArt args "0" art
-    if let some art := arts.ir? then
-      args := addArt args "0" art
-    if let some art := arts.c? then
-      args := addArt args "1" art
-    if Lean.Internal.hasLLVMBackend () then
-      let some art := arts.bc?
-        | error "LLVM backend enabled but module outputs lack bitcode"
-      args := addArt args "1" art
-    return args
+  let args ← match arts.descrs.ltarPackArgs self.fileName self.leanLibDir self.irDir self.ltarFile with
+    | .ok args => pure args
+    | .error e => error e
   proc (quiet := true) {cmd := (← getLeantar).toString, args}
   if (← self.pkg.isArtifactCacheWritable) then
     cacheArtifact self.ltarFile "ltar" (useLocalFile := ← self.pkg.restoreAllArtifacts)
@@ -1208,6 +1219,8 @@ where
         return arts
       | .incomplete savedTrace ltar? =>
         let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
+        -- Whether `lean` ran here (the job's action also merges the actions of its dependencies)
+        let mut compiled := false
         if status.isUpToDate then
           unless (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) do
             -- Restoring from the archive stamps the trace with the current input
@@ -1217,8 +1230,10 @@ where
               mod.unpackLtar mod.ltarFile depTrace.hash
             else
               discard <| mod.buildLean presetup
+              compiled := true
         else
           discard <| mod.buildLean presetup
+          compiled := true
         if status.isCacheable then
           let arts ← mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile
           let arts := {arts with ltar? := arts.ltar? <|> ltar?}
@@ -1226,6 +1241,10 @@ where
           -- unpack or build
           let log := (← readTraceFile mod.traceFile).log
           (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs (log := log)
+          if compiled then
+            -- `lake cache push` packs the per-file outputs into the archive it uploads
+            queueRemotePush mod.pkg depTrace.hash mod.name.toString (some presetup.srcHash)
+              (toJson {arts.descrs with ltar? := none}) log
           return arts
         else
           let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
