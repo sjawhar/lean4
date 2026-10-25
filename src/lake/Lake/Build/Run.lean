@@ -400,8 +400,8 @@ def mkBuildContext
     else
       return none
   registeredJobs := jobs
-  sidecarCache := ← Std.Mutex.new {}
-  fileDigests := ← Std.Mutex.new {}
+  sidecarCache := ← Shards.new {}
+  fileDigests := ← Shards.new {}
   kernelProviders := ← Std.Mutex.new {}
   usageViews := ← Shards.new 1024 {}
   leanTrace := .ofHash (pureHash ws.lakeEnv.leanGithash)
