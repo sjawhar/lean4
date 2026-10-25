@@ -847,19 +847,23 @@ protected def unstage : CliM PUnit := do
       unless Hash.ofByteArray bytes == descr.hash do
         logError s!"{stagingPath}: staged artifact does not match its content hash"
         return false
-      let write : IO Bool := do
-        -- `writeBinFileIfNew` never replaces a file, so an artifact to overwrite is removed first
-        if overwrite then removeFileIfExists cachePath
-        let cached ← writeBinFileIfNew cachePath bytes
-        if cached then
+      let write : IO (Except IO.Error Unit) := do
+        -- With `overwrite`, a rename replaces the old artifact with the whole staged file at once
+        -- (without a hard link); otherwise `writeBinFileIfNew` publishes the new artifact.
+        let written : Except IO.Error Unit ← id do
+          if overwrite then
+            writeBinFileReplacing cachePath bytes
+            return .ok ()
+          writeBinFileIfNew cachePath bytes
+        if written matches .ok _ then
           let r : IO.AccessRight := {read := true, write := false, execution := false}
           IO.setAccessRights cachePath ⟨r, r, r⟩
-        return cached
+        return written
       match (← write.toBaseIO) with
-      | .ok true =>
+      | .ok (.ok _) =>
         return ok
-      | .ok false =>
-        logError s!"{cachePath}: not cached: the cache's file system did not hard-link the entry"
+      | .ok (.error e) =>
+        logError s!"{cachePath}: not cached: the cache's file system did not hard-link the entry: {e}"
         return false
       | .error e =>
         logError s!"failed to copy artifact: {e}"

@@ -520,6 +520,13 @@ def hashBytes? (bytes : ByteArray) (text : Bool) : Option Hash :=
   | .error e => error s!"failed to cache artifact: {e}"
 
 /--
+The artifact directories of caches into which a hard link failed in this process because the file
+system cannot hard-link (`permissionDenied`, e.g., `EPERM`), each with that error.
+`Cache.insertEntry` tries no more hard links into them, and writes no temporary copies there.
+-/
+builtin_initialize noHardLinkDirs : IO.Ref (Array (FilePath × IO.Error)) ← IO.mkRef #[]
+
+/--
 Makes the entry of `cache` for the artifact `descr` hold the build output `file`, whose contents
 Lake has just hashed to `descr.hash`. `bytes` are what the entry holds: those contents, with
 normalized line endings if `text`.
@@ -536,9 +543,12 @@ A new binary entry is a hard link to `file` where the file system allows it. A t
 written, because its normalized bytes can differ from those of `file` (e.g., in line endings).
 Entries are written by `writeBinFileIfNew`, so an entry's name never holds part of a file.
 
-Returns whether the entry exists afterwards. Where the cache's file system does not hard-link,
-nothing publishes a whole entry without replacing a file, so this caches nothing and logs that at
-the verbose level; the build goes on with `file`.
+Returns whether the entry exists afterwards. Where a hard link into the cache fails (other than for
+an existing file), nothing publishes a whole entry without replacing a file, so this caches nothing
+and logs that at the verbose level; the build goes on with `file`. A hard link that fails because
+the file system cannot hard-link (`permissionDenied`) is remembered for the cache's artifact
+directory (`noHardLinkDirs`): later inserts into it in this process try no hard link, and write no
+temporary copy (which could not be linked either).
 -/
 def Cache.insertEntry
   (cache : Cache) (descr : ArtifactDescr) (file : FilePath) (bytes : ByteArray) (text : Bool)
@@ -562,15 +572,26 @@ def Cache.insertEntry
     | .error _ => return true
   else
     cacheIO <| createParentDirs entry
-  let cached ← cacheIO do
+  if let some (_, e) := (← noHardLinkDirs.get).find? (·.1 == cache.artifactDir) then
+    logVerbose s!"{entry}: not cached: the cache's file system did not hard-link an earlier \
+      entry: {e}"
+    return false
+  let linked : Except IO.Error Unit ← cacheIO do
     unless text do
       match (← (IO.FS.hardLink file entry).toBaseIO) with
-      | .ok _ | .error (.alreadyExists ..) => return true
-      | .error _ => pure () -- e.g., the cache is on another file system: write the entry
+      | .ok _ | .error (.alreadyExists ..) => return .ok ()
+      -- The file system cannot hard-link (`EPERM`), so the temporary copy cannot be linked either.
+      -- Another error (e.g., `EXDEV`: the cache is on another file system) leaves that way open.
+      | .error e@(.permissionDenied ..) => return .error e
+      | .error _ => pure ()
     writeBinFileIfNew entry bytes
-  unless cached do
-    logVerbose s!"{entry}: not cached: the cache's file system did not hard-link the entry"
-  return cached
+  match linked with
+  | .ok _ => return true
+  | .error e =>
+    if e matches .permissionDenied .. then
+      noHardLinkDirs.modify (·.push (cache.artifactDir, e))
+    logVerbose s!"{entry}: not cached: the cache's file system did not hard-link the entry: {e}"
+    return false
 
 /--
 Returns the bytes that the cache entry of `file` holds (its contents, with normalized line endings
@@ -611,14 +632,14 @@ public def Cache.saveArtifactIfMatches
     writeFileHash file hash
   let mtime ← cacheIO <| getMTime (if cached then cacheFile else file)
   let path := if useLocalFile || !cached then file else cacheFile
-  return .ok {descr, name := file.toString, path, mtime}
+  return .ok {descr, name := file.toString, path, mtime, cacheSkipped := !cached}
 
 /--
 Copies `file` to the Lake cache with the file extension `ext`, and
 saves its hash in its `.hash` file. A file with other bytes under the artifact's name in the cache
 is moved into the quarantine directory, with a warning, and replaced (see `Cache.insertEntry`).
-Where the cache's file system does not hard-link, nothing is cached, and the artifact's path is
-`file`.
+Where the cache's file system does not hard-link, nothing is cached: the artifact's path is `file`,
+and its `cacheSkipped` is set.
 
 **Additional Options:**
 * `text`: the contents of `file` are hashed as text rather than as a binary blob.
@@ -934,7 +955,9 @@ public def buildArtifactUnlessUpToDate
                     return art
                 discard <| doBuild depTrace traceFile
               cacheArtifact file ext text exe restore
-            (← getLakeCache).writeOutputs pkg.cacheScope inputHash art.descr
+            -- a mapping would name an artifact that the cache does not hold
+            unless art.cacheSkipped do
+              (← getLakeCache).writeOutputs pkg.cacheScope inputHash art.descr
             return art
           else
             computeArtifact file ext text
