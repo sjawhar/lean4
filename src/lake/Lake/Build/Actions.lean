@@ -199,7 +199,11 @@ public def download
     let token? ← if cacheToken then cacheTokenFor? url else pure none
     let (out, code) ← fetch token?
     let (out, code) ← match code, token? with
-      | 401, some token => do fetch (← CacheToken.renew token)
+      | 401, some token => do
+        let token? ← CacheToken.renew token
+        let (out, code) ← fetch token?
+        if code == 401 then if let some token := token? then CacheToken.refused token
+        pure (out, code)
       | _, _ => pure (out, code)
     -- The standard output is the status code that `-w` reports
     let out := {out with stdout := ""}
@@ -210,8 +214,12 @@ public def download
       error s!"external command '{← Internal.getCurl}' exited with code {out.exitCode}"
     -- Without `-L`, `curl` succeeds on a redirect, having written the redirect's body
     if 300 ≤ code && code < 400 then
-      error s!"{url}: the server redirected the download (status {code}), and a request \
-        that carries the token of `{CacheToken.cmdVar}` does not follow redirects"
+      if token?.isSome then
+        error s!"{url}: the server redirected the download (status {code}), and a request \
+          that carries the token of `{CacheToken.cmdVar}` does not follow redirects"
+      else
+        error s!"{url}: the server answered the download with a redirect (status {code}) \
+          that `curl` could not follow"
     check tmp
     IO.FS.rename tmp file
   finally

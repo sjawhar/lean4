@@ -434,6 +434,25 @@ case_failing_cmd() {
   test_artifacts 0
 }
 
+case_refused_token() {
+  # A service that refuses every token the command prints: once the new token is refused
+  # as well, the refusal is reported for a while instead of running the command again for
+  # each download (the two modules of `Two` are fetched independently)
+  LAKE_CACHE_DIR="$BUILD_CACHE_DIR" LAKE_CACHE_KEY=mock:key \
+    test_run cache put two.jsonl --scope=refused --service=ok
+  fresh
+  test_run cache add two.jsonl --scope=refused --service=bearer
+  COUNTER="$WORK_DIR/counter"
+  ROTATE_CMD="n=\$((\$(cat '$COUNTER' 2> /dev/null || echo 0) + 1)); echo \$n > '$COUNTER'; echo test-token-\$n"
+  rm -f "$COUNTER"
+  echo test-token-0 > "$TOKENS"
+  LAKE_REMOTE_CACHE=bearer LAKE_CACHE_TOKEN_CMD="$ROTATE_CMD" \
+    test_err '401' -v build Two --no-build
+  test_cmd_eq 2 cat "$COUNTER"
+  test_artifacts 0
+  echo test-token-1 > "$TOKENS"
+}
+
 case_redirect() {
   # A request that carries the token follows no redirect, even when the user's `.curlrc`
   # asks `curl` to: the redirect is an error that names it, and the other host sees nothing
@@ -474,7 +493,7 @@ case_cleartext() {
 
 CASES="${REMOTE_CACHE_CASES:-case_roundtrip case_no_token case_second_put case_no_leak
   case_rotation case_token_cmd_fails case_other_host case_no_request case_download
-  case_failing_cmd case_redirect case_cleartext}"
+  case_failing_cmd case_refused_token case_redirect case_cleartext}"
 for c in $CASES; do
   echo "# ${c#case_}"
   "$c"
