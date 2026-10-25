@@ -123,6 +123,9 @@ instance : FromJson UsageSidecar where
 structure UsageImport where
   moduleDigest : ModuleUsage.Digest
   closure : ModuleUsage.Digest
+  /-- Each direct import's `closure` as the module's compile imported it (`UsageSidecar.importedClosures`):
+  `closureEdgesCurrent` compares them with the imports' current ones. -/
+  importedClosures : Array (Name × ModuleUsage.Digest)
   own : NameMap ModuleUsage.Digest
   providesDigest : ModuleUsage.Digest
   provides : Array Name × Array Name
@@ -143,6 +146,8 @@ instance : FromJson UsageImport where
     return {
       moduleDigest := ← j.getObjValAs? ModuleUsage.Digest "moduleDigest"
       closure := ← j.getObjValAs? ModuleUsage.Digest "closure"
+      importedClosures := (← j.getObjValAs? (Array (SidecarName × ModuleUsage.Digest)) "importedClosures").map
+        fun (n, d) => (n.name, d)
       own := own.foldl (init := {}) fun m (n, d) => m.insert n.name d
       providesDigest := ← j.getObjValAs? ModuleUsage.Digest "providesDigest"
       provides
@@ -157,6 +162,8 @@ def UsageSidecar.importerJson (u : UsageSidecar) : Json :=
   let names (ns : Array Name) := Json.arr (ns.map ModuleUsage.nameToJson)
   Json.mkObj [
     ("closure", toJson u.closure),
+    ("importedClosures", Json.arr <| u.importedClosures.foldl (init := #[]) fun (a : Array Json) n d =>
+      a.push (Json.arr #[ModuleUsage.nameToJson n, toJson d])),
     ("indirect", names u.indirect),
     ("moduleDigest", toJson u.moduleDigest),
     ("own", Json.arr <| u.own.foldl (init := #[]) fun (a : Array Json) n d =>
@@ -166,7 +173,7 @@ def UsageSidecar.importerJson (u : UsageSidecar) : Json :=
     ("specKeys", Json.arr (u.specKeys.map fun (d, n) => Json.arr #[toJson d, ModuleUsage.nameToJson n]))]
 
 /-- The format version of Lake's `.usekey` sidecar; Lake reads a key of any other version as absent. -/
-def usekeyVersion : Nat := 15
+def usekeyVersion : Nat := 16
 
 /-- A module's `.usekey` sidecar: what Lake saw of the module's build when Lean wrote its `.usage`, and the parts of
 that `.usage` its importers read. -/
@@ -452,9 +459,9 @@ A digest of the recorded `closure` digest of each direct workspace import, with 
 if `importUsage?` accepts nothing for one, or, given `importedClosures?` (`UsageSidecar.importedClosures`), if
 one's `closure` is not the one the compile imported. A module's closure is its direct imports plus their
 closures; a direct toolchain import is pinned by the source text and the Lean githash (local
-trace). A module is replayed only if this digest is unchanged, so every workspace module's recorded
-closure digest stays equal to its current closure, and this digest covers the importer's whole
-closure.
+trace). A module is replayed only if this digest is unchanged and every edge of its closure is current
+(`closureEdgesCurrent`), so every workspace module's recorded closure digest is its current closure, and
+this digest covers the importer's whole closure.
 -/
 def closureHash (hashes : ContentHashes) (reads : ImportReads) (presetup : ModulePreSetup)
     (importArts : NameMap ImportArtifacts)
@@ -469,6 +476,29 @@ def closureHash (hashes : ContentHashes) (reads : ImportReads) (presetup : Modul
       unless imported.find? m == some imp.closure do return none
     e := e.name m |>.digest imp.closure
   return some e.finish
+
+/--
+Whether every edge of the closure is current: for every module `x` of the closure that is not a module-system file
+(`keyedModules`) and every direct import `y` of `x` recorded with a closure (`UsageImport.importedClosures`), `y`'s
+current `closure`, read through `importUsage?`, is the one `x`'s compile imported. `closureHash` reads only the direct
+imports' records of their closures, and such a record names the closures its compile read: another workspace can
+rewrite a shared dependency after this build kept or compiled an intermediate module, which then still records the
+dependency's old closure. With every edge current, every recorded closure describes the current files. A module-system
+file imports only module-system files, whose bytes `modsysHash` pins, so no edge into a keyed module starts at one.
+An `x` whose `y` is a toolchain module or a module-system file, or has no digests, records no closure for it, or one
+pinned as above: only `y`s that `importUsage?` reads are compared, and one it cannot read fails the check.
+-/
+def closureEdgesCurrent (hashes : ContentHashes) (reads : ImportReads)
+    (importArts : NameMap ImportArtifacts) : JobM Bool := do
+  let mods := keyedModules importArts
+  readImports hashes reads importArts mods
+  for x in mods do
+    let some (_, imp) ← importUsage? hashes reads importArts x | return false
+    for (y, recorded) in imp.importedClosures do
+      unless importArts.contains y do continue
+      let some (_, cur) ← importUsage? hashes reads importArts y | return false
+      unless cur.closure == recorded do return false
+  return true
 
 /--
 Whether every workspace module of the closure (`importArts`) carried digests when Lean compiled the
@@ -735,7 +765,8 @@ public def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
 Whether nothing the module used changed meaning since Lean wrote its `.usage`: its `.usekey` (read first) was written
 from its current `.usage` (`UsekeySidecar.usage`) and `.olean`, its `.usage` covers its closure (`importArts`,
 `UsageSidecar.coversClosure`), its local inputs are unchanged, no module-system module in its closure changed
-(`modsysHash`), its closure is unchanged (`closureHash`), every constant it used from a workspace module has the
+(`modsysHash`), its closure is unchanged (`closureHash`, with every edge of it current: `closureEdgesCurrent`),
+every constant it used from a workspace module has the
 same digest in that module's `own` (which its key binds to its current `.olean`, `importUsage?`), every
 workspace `extra` module has the same `.olean` hash and `moduleDigest`, every name whose defining module it looked up,
 used or referred to resolves as before (`UsageSidecar.resolvedUnchanged`), and every specialization-cache key it
@@ -768,5 +799,6 @@ public def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
     let some (olean, imp) ← importUsage? hashes reads importArts m | return false
     unless (← contentHash hashes olean) == oleanHash do return false
     unless imp.moduleDigest == digest do return false
+  unless (← closureEdgesCurrent hashes reads importArts) do return false
   unless (← usage.resolvedUnchanged presetup mod.resolvedFile hashes reads importArts) do return false
   usage.specProvidersUnchanged hashes reads importArts
