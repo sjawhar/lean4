@@ -213,9 +213,29 @@ def flip(args):
         f.write(bytes([byte ^ 0xFF]))
 
 
+def mappings(args):
+    """Checks that every mapping of a cache parses as JSON, and prints how many there are."""
+    n = 0
+    for root, _, files in os.walk(os.path.join(args.cache, "outputs")):
+        for name in files:
+            path = os.path.join(root, name)
+            try:
+                with open(path) as f:
+                    json.load(f)
+            except Exception as e:
+                sys.exit(f"{path} is not whole JSON: {e}")
+            n += 1
+    if n == 0:
+        sys.exit(f"{args.cache} holds no mapping")
+    print(n)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(required=True)
+    p = sub.add_parser("mappings")
+    p.add_argument("cache")
+    p.set_defaults(run=mappings)
     p = sub.add_parser("order")
     p.add_argument("log")
     p.add_argument("store")

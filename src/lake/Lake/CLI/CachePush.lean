@@ -29,8 +29,11 @@ with `LAKE_REMOTE_CACHE_QUEUE` append the outputs that they compiled (see `queue
 
 For each queue entry, the pusher hashes the cache artifacts that the entry names again. It drops
 an entry with an artifact whose bytes no longer match its descriptor, and moves that artifact into
-the cache's quarantine directory so that no local build restores it again. It also drops an entry
-whose artifact is gone. `Cache.pushDroppedFile` records each drop with its reason.
+the cache's quarantine directory so that no local build restores it again: it first renames the
+entry into the quarantine directory, which takes exactly the file that is there at that moment,
+and then hashes what it took, so it only ever quarantines bytes that it hashed as wrong (see
+`quarantineUnlessReplaced`). It also drops an entry whose artifact is gone.
+`Cache.pushDroppedFile` records each drop with its reason.
 
 A module's outputs go up as one archive (`.ltar`), which the pusher packs from the bytes it
 verified and a trace that it writes from the entry alone: it never reads a file of a workspace.
@@ -200,68 +203,119 @@ def bytesIfHash (file : FilePath) (hash : Hash) : BaseIO (Option ByteArray) := d
   | .ok bytes => return if Hash.ofByteArray bytes == hash then some bytes else none
   | .error _ => return none
 
+/-- What `quarantineUnlessReplaced` found when it took a cache artifact with wrong bytes. -/
+inductive Captured
+/-- Another process put the right bytes there (e.g., a build that repairs the entry). -/
+| good (bytes : ByteArray)
+/-- The wrong bytes are in the quarantine directory (or could not be moved; the message says). -/
+| quarantined (msg : String)
+/-- The entry was gone when the push took it: another process removes or repairs it. -/
+| gone
+
 /--
 Moves the cache artifact of `descr`, whose bytes did not hash to its name, into the cache's
-quarantine directory, unless another process (e.g., a build that inserts the same entry) has
-replaced it with the right bytes meanwhile: then returns those bytes and keeps the file. The
-bytes are checked again right before the move, and the moved file right after it, which it puts
-back if it has the right bytes, so a replacement between the check and the move is never lost.
+quarantine directory, so that no local build restores it again, and never moves bytes that are
+right: another process (e.g., a build that repairs the entry) can replace the entry at any moment,
+and takes no lock that this push could share.
+
+The push first renames the entry to a name of its own in the quarantine directory, which takes
+exactly the file that is at the entry's name at that moment, and then hashes the file that it
+took. Wrong bytes stay in quarantine (as `<name>.<n>`). Right bytes (a replacement that came after
+the first read) go back to the entry's name, unless another process put an entry there meanwhile,
+and the push uses them. From the rename until the right bytes are back, the entry is absent: a
+build that looks for it then misses and compiles the target again, and never reads wrong bytes.
+A file of the push's own name that a killed push left in quarantine is never read.
 -/
-def quarantineUnlessReplaced
-  (cache : Cache) (target : String) (descr : ArtifactDescr)
-: LoggerIO (Option ByteArray) := do
+def quarantineUnlessReplaced (cache : Cache) (descr : ArtifactDescr) : BaseIO Captured := do
   let path := cache.artifactDir / descr.relPath
+  let name := descr.relPath.toString
+  -- Repaired since the first read: nothing to take
   if let some bytes ← bytesIfHash path descr.hash then
-    return some bytes
-  let moved ← match (← (cache.quarantine path descr.relPath.toString).toBaseIO) with
-    | .ok (some dest) =>
-      if let some bytes ← bytesIfHash dest descr.hash then
-        -- Replaced between the check and the move: the right file goes back
-        discard <| (IO.FS.hardLink dest path).toBaseIO
-        discard <| (removeFileIfExists dest).toBaseIO
-        return some bytes
-      pure s!"moved it to: {dest}"
-    | .ok none => pure "it was already moved away by another process"
-    | .error e => pure s!"could not move it into quarantine: {e}"
-  logWarning s!"{target}: dropped from the queue: cache artifact {path} changed after the \
-    build (it no longer has the hash in its name); {moved}"
-  return none
+    return .good bytes
+  let took : IO (Option FilePath) := do
+    IO.FS.createDirAll cache.quarantineDir
+    let captured ← uniqueTmpPath (cache.quarantineDir / name)
+    try
+      IO.FS.rename path captured
+      return some captured
+    catch
+      | .noFileOrDirectory .. => return none
+      | e => throw e
+  match (← took.toBaseIO) with
+  | .error e =>
+    return .quarantined s!"could not move it into quarantine: {e}"
+  | .ok none =>
+    if let some bytes ← bytesIfHash path descr.hash then
+      return .good bytes
+    return .gone
+  | .ok (some captured) =>
+    if let some bytes ← bytesIfHash captured descr.hash then
+      -- A replacement came between the first read and the rename: its bytes go back
+      match (← (IO.FS.hardLink captured path).toBaseIO) with
+      | .ok _ | .error (.alreadyExists ..) => discard <| (removeFileIfExists captured).toBaseIO
+      | .error _ => discard <| (IO.FS.rename captured path).toBaseIO
+      return .good bytes
+    match (← (cache.quarantine captured name).toBaseIO) with
+    | .ok (some dest) => return .quarantined s!"moved it to: {dest}"
+    | .ok none => return .quarantined s!"moved it to: {captured}"
+    | .error e => return .quarantined s!"moved it to: {captured} ({e})"
+
+/-- The outcome of `verifyArtifacts`. -/
+inductive Verified
+/-- The bytes of each artifact, which hash to its descriptor. -/
+| ok (contents : Array ByteArray)
+/-- The entry is dropped from the queue (and recorded in `Cache.pushDroppedFile`). -/
+| dropped
+/-- Another process removes or repairs an artifact right now: the entry stays in the queue. -/
+| retry
 
 /--
 Reads the cache artifact of each descriptor, if its bytes still hash to the descriptor.
-If they do not, records the entry as dropped with reason `mismatch` and moves each such artifact
-into the cache's quarantine directory (see `quarantineUnlessReplaced`), so that no local build
-restores it again. If an artifact is gone (e.g., deleted from the cache to save space), records
-the entry as dropped with reason `missing`.
+If they do not, moves each such artifact into the cache's quarantine directory (see
+`quarantineUnlessReplaced`), so that no local build restores it again, and records the entry as
+dropped with reason `mismatch`; but uses the right bytes that another process put there meanwhile,
+and keeps the entry in the queue (as failed, for a later pass) if the artifact vanished while it
+was moved. If an artifact is gone (e.g., deleted from the cache to save space), records the entry
+as dropped with reason `missing`.
 -/
 def verifyArtifacts
   (cache : Cache) (target : String) (json : Json) (descrs : Array ArtifactDescr)
-: LoggerIO (Option (Array ByteArray)) := do
+: LoggerIO Verified := do
   let mut contents := #[]
   let mut missing := #[]
   let mut mismatched := #[]
+  let mut vanished := #[]
   for descr in descrs do
-    match (← IO.FS.readBinFile (cache.artifactDir / descr.relPath) |>.toBaseIO) with
+    let path := cache.artifactDir / descr.relPath
+    match (← IO.FS.readBinFile path |>.toBaseIO) with
     | .ok bytes =>
       if Hash.ofByteArray bytes == descr.hash then
         contents := contents.push bytes
-      else if let some bytes ← quarantineUnlessReplaced cache target descr then
-        contents := contents.push bytes
-      else
-        mismatched := mismatched.push descr
+      else match ← quarantineUnlessReplaced cache descr with
+        | .good bytes => contents := contents.push bytes
+        | .gone => vanished := vanished.push descr
+        | .quarantined msg =>
+          logWarning s!"{target}: dropped from the queue: cache artifact {path} changed after \
+            the build (it no longer has the hash in its name); {msg}"
+          mismatched := mismatched.push descr
     | .error (.noFileOrDirectory ..) =>
       missing := missing.push descr
     | .error e =>
       error s!"{target}: could not read cache artifact {descr}: {e}"
   if !mismatched.isEmpty then
     recordDrop cache "mismatch" json mismatched
-    return none
+    return .dropped
+  if !vanished.isEmpty then
+    let names := ", ".intercalate (vanished.map (·.relPath.toString)).toList
+    logWarning s!"{target}: kept in the queue: another process removes or repairs the cache \
+      artifacts {names}"
+    return .retry
   if !missing.isEmpty then
     let names := ", ".intercalate (missing.map (·.relPath.toString)).toList
     logWarning s!"{target}: dropped from the queue: artifacts no longer in the cache: {names}"
     recordDrop cache "missing" json missing
-    return none
-  return some contents
+    return .dropped
+  return .ok contents
 
 /-- Writes the remote mapping of `entry` into `dir`, and makes the entry ready for upload. -/
 def stageMapping
@@ -286,8 +340,10 @@ def stageOutputs
   (ctx : PushContext) (dir : FilePath) (idx : Nat) (entry : RemotePushEntry) (json : Json)
   (service : CacheService) (descrs : Array ArtifactDescr)
 : LoggerIO StagedEntry := do
-  let some contents ← verifyArtifacts ctx.cache entry.target json descrs
-    | return .dropped
+  let contents ← match ← verifyArtifacts ctx.cache entry.target json descrs with
+    | .ok contents => pure contents
+    | .dropped => return .dropped
+    | .retry => return .failed
   let mut sha256 : Sha256Map := {}
   let mut artifacts := #[]
   for descr in descrs, bytes in contents do
@@ -312,8 +368,10 @@ def stageModule
   (service : CacheService) (stem : String) (descrs : ModuleOutputDescrs)
   (files : Array (ArtifactDescr × Bool))
 : LoggerIO StagedEntry := do
-  let some contents ← verifyArtifacts ctx.cache entry.target json (files.map (·.1))
-    | return .dropped
+  let contents ← match ← verifyArtifacts ctx.cache entry.target json (files.map (·.1)) with
+    | .ok contents => pure contents
+    | .dropped => return .dropped
+    | .retry => return .failed
   -- As `Module.fileName`, for the module's own directories, which are the archive's bases
   let fileName (ext : String) := FilePath.mk stem |>.addExtension ext |>.toString
   let libDir := dir / "lib"
