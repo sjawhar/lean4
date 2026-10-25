@@ -341,47 +341,10 @@ def monitorJob (ctx : MonitorContext) (job : Job α) : BaseIO (BuildResult α) :
   else
     return {toMonitorResult := result, out := .error "build failed"}
 
-/--
-The kept-module check settings from the environment: the checker command `LAKE_KEPT_CHECKER`, with
-`LAKE_KEPT_CHECKER_TIMEOUT` (seconds without a reply, while requests are outstanding, before the
-checker is killed; positive, default 900), and `LAKE_KEPT_EXCLUDE`, a file of module names, one per
-line. The checker runs with the workspace toolchain's sysroot as `LEAN_SYSROOT`. It needs the usage
-cutoff, which is off unless `LAKE_USAGE_CUTOFF` turns it on; its records say which modules may be
-re-checked instead of compiled (`Module.usageVerdict`).
--/
-def mkKeptCheck (ws : Workspace) : IO (Option KeptChecker × Lean.NameSet) := do
-  let checker? ← do
-    let some cmd := (← IO.getEnv "LAKE_KEPT_CHECKER") | pure none
-    if cmd.isEmpty then pure none else
-    unless ws.lakeEnv.usageCutoff do
-      throw <| IO.userError "LAKE_KEPT_CHECKER needs the usage cutoff (LAKE_USAGE_CUTOFF=1), whose \
-        records say which modules may be re-checked instead of compiled"
-    let timeout ← do
-      let some s := (← IO.getEnv "LAKE_KEPT_CHECKER_TIMEOUT") | pure 900
-      let some n := s.toNat?
-        | throw <| IO.userError s!"LAKE_KEPT_CHECKER_TIMEOUT: expected seconds, got '{s}'"
-      if n == 0 then
-        throw <| IO.userError "LAKE_KEPT_CHECKER_TIMEOUT: must be at least 1 second, got '0'"
-      pure n
-    some <$> KeptChecker.new cmd ws.lakeEnv.lean.sysroot (timeout * 1000)
-  let mut exclude : Lean.NameSet := {}
-  if let some file := (← IO.getEnv "LAKE_KEPT_EXCLUDE") then
-    for line in (← IO.FS.lines file) do
-      let line := line.trimAscii.copy
-      if line.isEmpty then continue
-      let name := line.toName
-      if name.isAnonymous then
-        throw <| IO.userError s!"LAKE_KEPT_EXCLUDE: {file}: '{line}' is not a module name"
-      exclude := exclude.insert name
-  return (checker?, exclude)
-
 def mkBuildContext
   (ws : Workspace) (cfg : BuildConfig) (jobs : JobQueue)
   (cancelTk? : Option IO.CancelToken := none)
-  (kept : Option KeptChecker × Lean.NameSet := (none, {}))
 : BaseIO BuildContext := return {
-  keptChecker? := kept.1
-  keptExclude := kept.2
   opaqueWs := ws
   toBuildConfig := {cfg with
     macosxDeploymentTarget? := ← id do
@@ -403,7 +366,6 @@ def mkBuildContext
   sidecarCache := ← Shards.new {}
   fileDigests := ← Shards.new {}
   kernelProviders := ← Std.Mutex.new {}
-  usageViews := ← Shards.new 1024 {}
   leanTrace := .ofHash (pureHash ws.lakeEnv.leanGithash)
     s!"Lean {Lean.versionStringCore}, commit {ws.lakeEnv.leanGithash}"
   cancelTk?
@@ -452,11 +414,9 @@ def finalizeBuild
 Runs `act` holding an exclusive `flock` on the workspace's `.lake/build.lock`, so that two Lake
 processes never build the same workspace at once (they would delete, rewrite, and cache each
 other's outputs mid-build). The lock is released when `act` finishes, or by the OS when the
-process dies. On Unix-like systems, the processes spawned while it is held inherit it (`spawnProc`,
-which registers it as `buildLockHandle`), so if Lake is killed, the lock is held until they exit
-too: the compiler of a killed Lake cannot write into the workspace while another Lake builds it.
-The kept-module checker, which runs in a session of its own, does not inherit it. (Windows releases
-the lock with the process.)
+process dies. On Unix-like systems, the processes spawned while it is held inherit it, so if Lake
+is killed, the lock is held until they exit too: the compiler of a killed Lake cannot write into
+the workspace while another Lake builds it. (Windows releases the lock with the process.)
 Setting `LAKE_NO_BUILD_LOCK=1` disables it.
 -/
 public def Workspace.withBuildLock (ws : Workspace) (act : IO α) : IO α := do
@@ -475,10 +435,7 @@ public def Workspace.withBuildLock (ws : Workspace) (act : IO α) : IO α := do
       (lock: {lockFile})"
     h.lock
   h.setInheritable true
-  buildLockHandle.set (some h)
-  try act finally
-    buildLockHandle.set none
-    h.unlock
+  try act finally h.unlock
 
 /--
 Run a build function in the Workspace's context using the provided configuration.
@@ -491,10 +448,9 @@ public def Workspace.runFetchM
   let jobs ← mkJobQueue
   let cancelTk? ← if cfg.failFast then some <$> IO.CancelToken.new else pure none
   let mctx ← mkMonitorContext cfg jobs cancelTk?
-  let bctx ← mkBuildContext ws cfg jobs cancelTk? (← mkKeptCheck ws)
+  let bctx ← mkBuildContext ws cfg jobs cancelTk?
   let job ← startBuild bctx build caption
   let result ← monitorJob mctx job
-  if let some checker := bctx.keptChecker? then checker.close
   finalizeBuild cfg bctx mctx result
 
 def monitorBuild (mctx : MonitorContext) (job : Job (Job α)) : BaseIO (BuildResult α) := do
@@ -513,21 +469,17 @@ def monitorBuild (mctx : MonitorContext) (job : Job (Job α)) : BaseIO (BuildRes
 /--
 Returns whether a build is needed to validate `build`. Does not report on the attempted build.
 
-This is equivalent to checking whether `lake build --no-build` exits with code 0: it reads the same
-kept-module settings (`mkKeptCheck`), so a module `LAKE_KEPT_EXCLUDE` lists needs a build when its
-outputs were kept. Invalid settings, which fail that build, throw their error.
+This is equivalent to checking whether `lake build --no-build` exits with code 0.
 -/
 public def Workspace.checkNoBuild
   (ws : Workspace) (build : FetchM (Job α))
-: IO Bool := do
-  let kept ← mkKeptCheck ws
+: BaseIO Bool := do
   let jobs ← mkJobQueue
   let cfg := {noBuild := true}
   let mctx ← mkMonitorContext cfg jobs
-  let bctx ← mkBuildContext ws cfg jobs (kept := kept)
+  let bctx ← mkBuildContext ws cfg jobs
   let job ← startBuild bctx build
   let result ← monitorBuild mctx job
-  if let some checker := bctx.keptChecker? then discard <| checker.close.toBaseIO
   return result.isOk -- `isOk` means no failures, and thus no `--no-build` failures
 
 /-- Run a build function in the Workspace's context and await the result. -/
@@ -537,10 +489,10 @@ public def Workspace.runBuild
   let jobs ← mkJobQueue
   let cancelTk? ← if cfg.failFast then some <$> IO.CancelToken.new else pure none
   let mctx ← mkMonitorContext cfg jobs cancelTk?
-  let bctx ← mkBuildContext ws cfg jobs cancelTk? (← mkKeptCheck ws)
+  let bctx ← mkBuildContext ws cfg jobs cancelTk?
   let job ← startBuild bctx build
   let result ← monitorBuild mctx job
-  if let some checker := bctx.keptChecker? then checker.close
+  if cfg.forgetContext then Runtime.forget bctx
   finalizeBuild cfg bctx mctx result
 
 /-- Produce a build job in the Lake monad's workspace and await the result. -/
