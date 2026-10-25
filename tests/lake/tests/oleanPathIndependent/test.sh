@@ -59,8 +59,7 @@ test_exp "$failed" = 0
 # `lake lint` names the source file of the tree it runs in.
 for tree in "$P1" "$P2"; do
   pushd "$tree"
-  lake_out lint --builtin-only Test || true
-  match_pat 'Variable name `unusedLocal` is not explicitly referenced' produced.out
+  test_status_out 1 'Variable name `unusedLocal` is not explicitly referenced' lint --builtin-only Test
   match_text "$tree/" produced.out
   match_pat 'Test/Lint\.lean:4:6: warning:' produced.out
   popd

@@ -98,15 +98,20 @@ def printWarnings (results : Std.HashMap Name MessageData) (filePath : System.Fi
       printWarning declName warning (useErrorFormat := useErrorFormat) (filePath := filePath)
 
 /--
+Finds the source file of `mod` through `getSrcSearchPath`, by the module's root: the default file
+lookup of `groupedByFilename` and `formatLinterResults`.
+-/
+def findSrcFileOnSrcSearchPath (mod : Name) : IO (Option System.FilePath) := do
+  (← getSrcSearchPath).findWithExt "lean" mod
+
+/--
 Formats a map of linter warnings grouped by filename with `-- filename` comments.
 
-With `useErrorFormat`, each module's file is found by `findSrcFile?`, or, when it is `none`, through
-`getSrcSearchPath`.
+With `useErrorFormat`, each module's file is found by `findSrcFile`.
 -/
 def groupedByFilename (results : Std.HashMap Name MessageData) (useErrorFormat : Bool := false)
-    (findSrcFile? : Option (Name → IO (Option System.FilePath)) := none) : CoreM MessageData := do
-  let sp ← if useErrorFormat && findSrcFile?.isNone then getSrcSearchPath else pure {}
-  let findSrcFile := findSrcFile?.getD (sp.findWithExt "lean")
+    (findSrcFile : Name → IO (Option System.FilePath) := findSrcFileOnSrcSearchPath) :
+    CoreM MessageData := do
   let grouped : Std.HashMap Name (System.FilePath × Std.HashMap Name MessageData) ←
     results.foldM (init := {}) fun grouped declName msg => do
       let mod ← findModuleOf? declName
@@ -127,7 +132,7 @@ def groupedByFilename (results : Std.HashMap Name MessageData) (useErrorFormat :
 /--
 Formats the linter results as Lean code with comments and `#check` commands.
 
-`findSrcFile?` finds each module's file when grouping by filename in the error format (see
+`findSrcFile` finds each module's file when grouping by filename in the error format (see
 `groupedByFilename`).
 -/
 def formatLinterResults
@@ -136,14 +141,14 @@ def formatLinterResults
     (groupByFilename : Bool)
     (whereDesc : String)
     (numLinters : Nat) (useErrorFormat : Bool := false)
-    (findSrcFile? : Option (Name → IO (Option System.FilePath)) := none) :
+    (findSrcFile : Name → IO (Option System.FilePath) := findSrcFileOnSrcSearchPath) :
     CoreM MessageData := do
   let formattedResults ← results.filterMapM fun (linter, results) => do
     if !results.isEmpty then
       let warnings ←
         if groupByFilename || useErrorFormat then
           groupedByFilename results (useErrorFormat := useErrorFormat)
-            (findSrcFile? := findSrcFile?)
+            (findSrcFile := findSrcFile)
         else
           printWarnings results
       pure $ some m!"/- The `{linter.optName}` linter reports:\n{linter.errorsFound} -/\n{warnings}\n"

@@ -8,6 +8,9 @@ path = "dep"
 [[lean_lib]]
 name = "Linters"
 
+[[lean_lib]]
+name = "Checks"
+
 [[lean_exe]]
 name = "main"
 root = "Main"
