@@ -287,9 +287,10 @@ The hashes of the files one usage-cutoff check (`Module.usageUpToDate`, `Module.
 read, so that every `importUsage?` binding of the check is to one hash of each file, also in the check's parallel
 tasks (`parallelRuns`), which share it. A check never reuses another's: another workspace's build can
 rebuild a shared dependency between two checks. Across checks, a file's hash is reused only while its stamp shows its
-bytes unchanged (`BuildContext.fileDigests`).
+bytes unchanged (`BuildContext.fileDigests`). Persistent, because the tasks share it: an insert into a hash map that
+other threads can reach copies the whole map.
 -/
-public abbrev ContentHashes := Std.Mutex (Std.HashMap FilePath ModuleUsage.Digest)
+public abbrev ContentHashes := Std.Mutex (PHashMap FilePath ModuleUsage.Digest)
 
 /--
 The hash of `file`'s current bytes (`Lean.ModuleUsage.fileDigest`, 128 bits), never read from a
@@ -299,10 +300,10 @@ records. Taken from an earlier check of the build only if the file's stamp (`Lea
 recorded when those bytes were read (`BuildContext.fileDigests`).
 -/
 def contentHash (hashes : ContentHashes) (file : FilePath) : JobM ModuleUsage.Digest := do
-  if let some hash ← hashes.atomically (return (← get)[file]?) then return hash
+  if let some hash ← hashes.atomically (return (← get).find? file) then return hash
   let hash ← stampedDigest
   -- another task of the check may have hashed the file meanwhile: the first hash binds it
-  hashes.atomically <| modifyGet fun all => match all[file]? with
+  hashes.atomically <| modifyGet fun all => match all.find? file with
     | some first => (first, all)
     | none => (hash, all.insert file hash)
 where
