@@ -8,7 +8,6 @@ module
 prelude
 public import Init.System.IO
 import Init.Data.ToString.Macro
-import Std.Time.DateTime.Timestamp
 
 open System
 
@@ -26,59 +25,17 @@ public def removeFileIfExists (path : FilePath) : IO Unit := do
     | .noFileOrDirectory .. => pure ()
     | e => throw e
 
-/-- Counts the temporary names returned in this process, so that each is new. -/
+/-- Counts the temporary paths returned in this process, so that each is new. -/
 builtin_initialize tmpPathCount : IO.Ref Nat ← IO.mkRef 0
 
 /--
-Returns a new suffix for a temporary file, {lit}`.<pid>.<n>.<random>.tmp`, where {lit}`<n>` counts
-the suffixes that this process returned, and {lit}`<random>` is 64 random bits in hexadecimal.
-Appended to a path, it names a temporary file next to it (see {lit}`uniqueTmpPath`). No other call
-in this process returns the same suffix. A call in another process returns it only by chance, also
-in one with the same process ID (e.g., in another container that shares the directory, or on
-another host). A caller that must not use another process's file creates the file with
-{lean}`IO.FS.Mode.writeNew`.
+Returns a temporary path next to {lean}`path`, {lit}`<path>.<pid>.<n>.tmp`, that no concurrent
+call, in this process or in another, returns. It suits a file that is written, then renamed
+into place.
 -/
-public def uniqueTmpSuffix : IO String := do
+public def uniqueTmpPath (path : FilePath) : BaseIO FilePath := do
   let n ← tmpPathCount.modifyGet fun n => (n, n + 1)
-  let r := (← IO.getRandomBytes 8).foldl (init := 0) fun r b => r * 256 + b.toNat
-  return s!".{← IO.Process.getPID}.{n}.{String.ofList (Nat.toDigits 16 r)}.tmp"
-
-/--
-Returns a new temporary path next to {lean}`path`, {lit}`<path>.<pid>.<n>.<random>.tmp`: the path
-followed by {lean}`uniqueTmpSuffix`, with the same uniqueness.
--/
-public def uniqueTmpPath (path : FilePath) : IO FilePath :=
-  return path.toString ++ (← uniqueTmpSuffix)
-
-/-- The wall-clock time, in whole seconds since the Unix epoch (e.g., for the `at` of a status file). -/
-public def wallClockSecs : IO Int := do
-  return Std.Time.Internal.UnitVal.val (α := 1) (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch
-
-/--
-Waits until {lean}`task` has finished or the monotonic clock reaches {lean}`deadline` (in
-milliseconds), looking every 20 ms. Returns whether the task finished.
--/
-public partial def waitUntil (task : Task α) (deadline : Nat) : BaseIO Bool := do
-  if ← IO.hasFinished task then
-    return true
-  if (← IO.monoMsNow) ≥ deadline then
-    return false
-  IO.sleep 20
-  waitUntil task deadline
-
-/--
-Replaces the contents of {lean}`path` with {lean}`content`: writes a temporary file next to it
-(see {lean}`uniqueTmpPath`) and renames it into place, so that a reader sees either the old or
-the new contents, never a part.
--/
-public def writeFileAtomic (path : FilePath) (content : String) : IO Unit := do
-  createParentDirs path
-  let tmp ← uniqueTmpPath path
-  try
-    IO.FS.writeFile tmp content
-    IO.FS.rename tmp path
-  finally
-    discard <| (removeFileIfExists tmp).toBaseIO
+  return s!"{path}.{← IO.Process.getPID}.{n}.tmp"
 
 /--
 Write the UTF-8 encoded string {lean}`content` to {lean}`path`.
