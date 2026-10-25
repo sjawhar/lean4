@@ -41,3 +41,17 @@ name = "deny"
 type = "s3"
 artifactEndpoint = "%URL%/deny/a0"
 revisionEndpoint = "%URL%/deny/r0"
+
+# Redirects every request to the second server's `ok` store
+[[cache.service]]
+name = "redirect"
+type = "s3"
+artifactEndpoint = "%URL%/redirect/a0"
+revisionEndpoint = "%URL%/redirect/r0"
+
+# Unencrypted HTTP to a host that is not a loopback one (and that does not resolve)
+[[cache.service]]
+name = "cleartext"
+type = "s3"
+artifactEndpoint = "http://cache.invalid/a0"
+revisionEndpoint = "http://cache.invalid/r0"

@@ -73,12 +73,14 @@ public structure Env where
   /--
   The shell command that prints the bearer token of the remote cache service
   (i.e., `LAKE_CACHE_TOKEN_CMD`; see `CacheToken.get?`).
-  Like the token, it is not added to the environment of processes Lake starts.
+  Lake does not add it to `baseVars`; a process Lake starts inherits it from Lake's own
+  environment, as it does `LAKE_CACHE_KEY`. The token itself is never passed on.
   -/
   cacheTokenCmd? : Option String := none
   /--
   The name of the `s3` cache service that the cache token is sent to (i.e., `LAKE_REMOTE_CACHE`).
-  It is not added to the environment of processes Lake starts.
+  Lake does not add it to `baseVars`; a process Lake starts inherits it from Lake's own
+  environment.
   -/
   remoteCache? : Option String := none
   /-- The initial Lean library search path of the environment (i.e., `LEAN_PATH`). -/

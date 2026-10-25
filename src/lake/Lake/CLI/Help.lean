@@ -812,12 +812,23 @@ Cloud Storage bucket without HMAC keys) can carry a token:
   LAKE_REMOTE_CACHE=<name>      the service that receives the token
   LAKE_CACHE_TOKEN_CMD=<cmd>    a shell command that prints the token
 
+The command must print the bare token (not `Bearer <token>` or a JSON
+document), which may contain only the characters RFC 6750 allows: letters,
+digits, and `-._~+/=`. Lake refuses any other output, without showing it.
+
 Lake runs the command (with `sh -c`) when it first sends such a request, not
 at startup. It reuses the token for up to 45 minutes, and it runs the command
 again and retries the request once if the service refuses the token (HTTP
-401). The token goes only to the host of the service's artifact endpoint, as
+401). If the command fails, Lake reports the same error for 60 seconds
+without running it again.
+
+The token goes only to the host of the service's artifact endpoint, as
 `Authorization: Bearer <token>`, and only through a temporary file that `curl`
-reads: never on a command line or in the environment of a process Lake starts."
+reads: never on a command line. That endpoint must use HTTPS, unless its host
+is a loopback address (`localhost`, `127.x.x.x`, `[::1]`). A request that
+carries the token follows no redirect (a redirect is an error) and ignores
+the user's `.curlrc`. A process Lake starts does not get the token, though
+it inherits both variables from Lake's environment."
 
 def helpScriptCli :=
 "Manage Lake scripts
