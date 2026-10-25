@@ -1210,8 +1210,8 @@ where
           return .complete {arts with ltar? := some ltar}
       return .complete arts
   fetchCore (presetup : ModulePreSetup) : JobM ModuleOutputArtifacts := do
-    -- Cleared on entry: a job's state carries the flag of the jobs it continues (`JobState.built`)
-    modify ({· with built := false})
+    -- Whether this call compiles the module (not an earlier action of the job it continues)
+    let compiledHere ← trackBuilds
     let depTrace ← getTrace
     have : GetMTime Module := ⟨(·.getMTime presetup.isModule presetup.postponeCompile)⟩
     have : CheckExists Module := ⟨(·.checkExists presetup.isModule presetup.postponeCompile)⟩
@@ -1243,7 +1243,7 @@ where
           -- Queued before the local mapping is written: a build that finds the mapping never
           -- compiles (or queues) this input. After a crash between the two, the next build
           -- restores the outputs through the trace without queueing them, so they stay queued once.
-          if (← getThe JobState).built then
+          if (← compiledHere) then
             -- `lake cache push` packs the per-file outputs into the archive it uploads
             queueRemotePush mod.pkg depTrace.hash mod.name.toString (some presetup.srcHash)
               (toJson {arts.descrs with ltar? := none}) log

@@ -79,7 +79,9 @@ public structure Env where
   The shell command that prints the bearer token of the remote cache service
   (i.e., `LAKE_CACHE_TOKEN_CMD`; see `CacheToken.get?`).
   Lake does not add it to `baseVars`; a process Lake starts inherits it from Lake's own
-  environment, as it does `LAKE_CACHE_KEY`. The token itself is never passed on.
+  environment, as it does `LAKE_CACHE_KEY`. The token itself is never passed on. The command runs
+  in a session of its own (so a Ctrl-C that stops Lake does not stop it), and Lake kills it after
+  60 seconds.
   -/
   cacheTokenCmd? : Option String := none
   /--
