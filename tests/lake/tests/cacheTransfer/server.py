@@ -21,6 +21,7 @@ a test picks one by pointing an endpoint at it (e.g. `.../corrupt/a0`):
   bearer    401 unless the request carries `Authorization: Bearer <token>`
             for a token listed in the `--tokens` file (read on each request,
             so a test can change it), and otherwise as `ok`
+  redirect  302 to the same object path under the `--redirect` URL
 
 A fault that does not apply to a request kind (e.g. `badcount` on a `GET`)
 behaves as `ok`. Like Cloud Storage, a `PUT` with the header
@@ -73,6 +74,9 @@ STORE = "."
 # The file listing the bearer tokens that `bearer` mode accepts, one per line
 TOKENS = None
 
+# The URL that `redirect` mode sends every request to, followed by the object path
+REDIRECT = None
+
 
 class Mode(StrEnum):
     """A fault mode, named by the first segment of a request path."""
@@ -86,6 +90,7 @@ class Mode(StrEnum):
     BAD_COUNT = "badcount"
     API_ERROR = "apierror"
     BEARER = "bearer"
+    REDIRECT = "redirect"
 
 
 def content_type(path):
@@ -169,6 +174,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def unauthorized(self):
         self.respond(401, UNAUTHORIZED_BODY, "application/xml")
+
+    def redirect(self, parts):
+        self.send_response(302)
+        self.send_header("Location", "%s/%s" % (REDIRECT, "/".join(parts)))
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        self.log(302)
 
     def reset(self):
         # Neither a response nor a body: `curl` reports an empty reply and,
@@ -258,6 +270,8 @@ class Handler(BaseHTTPRequestHandler):
             self.not_found("no fault mode in path: %s" % self.path)
         elif mode == Mode.BEARER and not self.authorized():
             self.unauthorized()
+        elif mode == Mode.REDIRECT:
+            self.redirect(parts)
         elif mode == Mode.RESET:
             self.reset()
         elif mode == Mode.DENY:
@@ -291,6 +305,8 @@ class Handler(BaseHTTPRequestHandler):
             self.not_found("no fault mode in path: %s" % self.path)
         elif mode == Mode.BEARER and not self.authorized():
             self.unauthorized()
+        elif mode == Mode.REDIRECT:
+            self.redirect(parts)
         elif mode == Mode.RESET:
             self.reset()
         elif mode == Mode.DENY:
@@ -332,11 +348,13 @@ def main():
     parser.add_argument(
         "--tokens", help="file listing the bearer tokens that `bearer` mode accepts"
     )
+    parser.add_argument("--redirect", help="the URL that `redirect` mode redirects to")
     args = parser.parse_args()
 
-    global STORE, TOKENS
+    global STORE, TOKENS, REDIRECT
     STORE = args.store
     TOKENS = args.tokens
+    REDIRECT = args.redirect
     os.makedirs(STORE, exist_ok=True)
 
     # Port 0 lets the OS pick a free port, so parallel tests cannot collide
