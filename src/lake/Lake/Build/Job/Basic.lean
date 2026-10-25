@@ -80,6 +80,12 @@ public structure JobState where
   trace : BuildTrace := .nil
   /-- How long the job spent building (in milliseconds). -/
   buildTime : Nat := 0
+  /--
+  Whether a build action of this job (see `buildAction`) completed: this process ran the compiler
+  or linker. It is merged from the jobs this job continues, so a site that reads it clears it first
+  (see `queueRemotePush`).
+  -/
+  built : Bool := false
   deriving Inhabited
 
 public def JobState.merge (a b : JobState) : JobState where
@@ -89,6 +95,7 @@ public def JobState.merge (a b : JobState) : JobState where
   canceled := a.canceled || b.canceled
   trace := mixTrace a.trace b.trace
   buildTime := a.buildTime + b.buildTime
+  built := a.built || b.built
 
 @[inline] public def JobState.modifyLog (f : Log → Log) (s : JobState) : JobState :=
   {s with log := f s.log}

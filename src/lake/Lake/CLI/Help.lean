@@ -851,8 +851,9 @@ digits, and `-._~+/=`. Lake refuses any other output, without showing it.
 Lake runs the command (with `sh -c`) when it first sends such a request, not
 at startup. It reuses the token for up to 45 minutes, and it runs the command
 again and retries the request once if the service refuses the token (HTTP
-401). If the command fails, Lake reports the same error for 60 seconds
-without running it again.
+401). A command that has not ended after 60 seconds is stopped, with every
+process it started, and fails. If the command fails, Lake reports the same
+error for 60 seconds without running it again.
 
 The token goes only to the host of the service's artifact endpoint, as
 `Authorization: Bearer <token>`, and only through a temporary file that `curl`
