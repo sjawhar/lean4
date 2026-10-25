@@ -8,6 +8,7 @@ module
 prelude
 public import Init.System.IO
 import Init.Data.ToString.Macro
+import Std.Time.DateTime.Timestamp
 
 open System
 
@@ -36,6 +37,24 @@ into place.
 public def uniqueTmpPath (path : FilePath) : BaseIO FilePath := do
   let n ← tmpPathCount.modifyGet fun n => (n, n + 1)
   return s!"{path}.{← IO.Process.getPID}.{n}.tmp"
+
+/-- The wall-clock time, in whole seconds since the Unix epoch (e.g., for the `at` of a status file). -/
+public def wallClockSecs : IO Int := do
+  return Std.Time.Internal.UnitVal.val (α := 1) (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch
+
+/--
+Replaces the contents of {lean}`path` with {lean}`content`: writes a temporary file next to it
+(see {lean}`uniqueTmpPath`) and renames it into place, so that a reader sees either the old or
+the new contents, never a part.
+-/
+public def writeFileAtomic (path : FilePath) (content : String) : IO Unit := do
+  createParentDirs path
+  let tmp ← uniqueTmpPath path
+  try
+    IO.FS.writeFile tmp content
+    IO.FS.rename tmp path
+  finally
+    discard <| (removeFileIfExists tmp).toBaseIO
 
 /--
 Write the UTF-8 encoded string {lean}`content` to {lean}`path`.
