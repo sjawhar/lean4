@@ -574,9 +574,13 @@ case_read_404() {
   # visible at verbose level.
   fresh
   : > "$SERVER_LOG"
-  LAKE_REMOTE_CACHE=miss test_out 'remote cache mapping miss' -v build Test native
+  LAKE_REMOTE_CACHE=miss test_out 'Built Test' build Test native
+  match_text 'Built Test' produced.out
+  match_text 'Built native' produced.out
   test_cmd_eq "$(remote_targets)" count_path /in/ "$SERVER_LOG"
   test_cmd_eq 0 count_path /a/ "$SERVER_LOG"
+  fresh
+  LAKE_REMOTE_CACHE=miss test_out 'remote cache mapping miss' -v build Test native
 }
 
 case_read_invalid_mapping() {
