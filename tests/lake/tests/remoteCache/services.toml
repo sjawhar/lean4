@@ -127,3 +127,24 @@ name = "denyartonce"
 type = "s3"
 artifactEndpoint = "%URL%/denyartonce/a0"
 revisionEndpoint = "%URL%/denyartonce/r0"
+
+# As `ok`, but every claim exists and is unreadable, and nothing rewrites it
+[[cache.service]]
+name = "badclaim"
+type = "s3"
+artifactEndpoint = "%URL%/badclaim/a0"
+revisionEndpoint = "%URL%/badclaim/r0"
+
+# As `ok`, but the answer to a claim's create never ends
+[[cache.service]]
+name = "streamclaim"
+type = "s3"
+artifactEndpoint = "%URL%/streamclaim/a0"
+revisionEndpoint = "%URL%/streamclaim/r0"
+
+# As `ok`, but the answers to reads of a claim carry no times
+[[cache.service]]
+name = "notimes"
+type = "s3"
+artifactEndpoint = "%URL%/notimes/a0"
+revisionEndpoint = "%URL%/notimes/r0"

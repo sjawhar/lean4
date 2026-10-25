@@ -563,7 +563,54 @@ case_push_unset() {
   test_cmd cmp "$PUSH_B/.lake/build/b.out" "$PUSH_B/b.in"
 }
 
+case_push_local_pruned() {
+  # A local mapping whose artifacts were pruned from the cache does not hide the remote cache:
+  # the build reads the remote mapping, replaces the local one with it, and restores the modules
+  # instead of compiling them.
+  push_fresh
+  build_a
+  on_a test_run cache push
+  test_exp -d "$PUSH_CACHE/outputs"
+  test_cmd rm -rf "$PUSH_CACHE/artifacts" "$PUSH_A/.lake/build"
+  : > "$SERVER_LOG"
+  on_a test_not_out 'Built Push.Basic' -v --dir "$PUSH_A" build Push
+  test_exp "$(count '^GET .*/in/.* -> 200' "$SERVER_LOG")" -ge 1
+}
+
+case_push_bad_archive() {
+  # A downloaded archive whose digests match but which does not unpack is a cache miss: the
+  # build compiles the module, moves the archive into the cache's quarantine and records the
+  # failure. Here `Push.Basic`'s archive in the bucket is replaced by bytes that are not an
+  # archive, and both of its hashes in the remote mapping name those bytes.
+  push_fresh
+  build_a
+  local input bad lakehash sha mapping
+  input="$(push_check inputs "$PUSH_QUEUE" Push.Basic)"
+  on_a test_run cache push
+  mapping="$STORE_DIR/a0/$PUSH_SCOPE/in/$input.json"
+  test_exp -f "$mapping"
+  bad="$WORK_DIR/not-an-archive"
+  echo 'this is not a Lean archive' > "$bad"
+  lakehash="$(LEAN_PATH="$BUILD_DIR/lib/lean" "$BUILD_DIR/bin/lean" --run "$TEST_DIR/HashFile.lean" "$bad")"
+  sha="$(sha256sum "$bad" | cut -d' ' -f1)"
+  test_cmd cp "$bad" "$STORE_DIR/a0/$PUSH_SCOPE/a/$sha.art"
+  "$PYTHON" -c 'import json,sys
+m = json.load(open(sys.argv[1]))
+m["data"] = sys.argv[2] + ".ltar"
+m["sha256"] = {sys.argv[2] + ".ltar": sys.argv[3]}
+json.dump(m, open(sys.argv[1], "w"))' "$mapping" "$lakehash" "$sha"
+  test_cmd rm -rf "$PUSH_B" "$PUSH_CACHE_B"
+  test_cmd cp -r "$TEST_DIR/push" "$PUSH_B"
+  test_cmd chmod -R u+w "$PUSH_B"
+  LAKE_CACHE_DIR="$PUSH_CACHE_B" LAKE_REMOTE_CACHE=ok \
+    test_out 'Built Push.Basic' -v --dir "$PUSH_B" build Push
+  match_text 'did not unpack' produced.out
+  test_cmd_eq 1 count_files "$PUSH_CACHE_B/quarantine"
+  match_text 'did not unpack' "$PUSH_CACHE_B/remote-status-read.json"
+}
+
 run_cases case_push_queue case_push_upload case_push_tree_changed case_push_mismatch \
   case_push_missing case_push_custom_target case_push_githash case_push_deny case_push_invalid \
   case_push_many case_push_staging case_push_concurrent case_push_stall case_push_pack_failure \
-  case_push_repair_race case_push_mapping_overwrite case_push_unset
+  case_push_repair_race case_push_mapping_overwrite case_push_unset case_push_local_pruned \
+  case_push_bad_archive
