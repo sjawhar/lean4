@@ -26,23 +26,28 @@ public def removeFileIfExists (path : FilePath) : IO Unit := do
     | .noFileOrDirectory .. => pure ()
     | e => throw e
 
-/-- Counts the temporary paths returned in this process, so that each is new. -/
+/-- Counts the temporary names returned in this process, so that each is new. -/
 builtin_initialize tmpPathCount : IO.Ref Nat ← IO.mkRef 0
 
 /--
-Returns a suffix, {lit}`.<pid>.<n>.tmp`, that no concurrent call, in this process or in another,
-returns. Appended to a path, it names a temporary file next to it (see {lit}`uniqueTmpPath`).
+Returns a new suffix for a temporary file, {lit}`.<pid>.<n>.<random>.tmp`, where {lit}`<n>` counts
+the suffixes that this process returned, and {lit}`<random>` is 64 random bits in hexadecimal.
+Appended to a path, it names a temporary file next to it (see {lit}`uniqueTmpPath`). No other call
+in this process returns the same suffix. A call in another process returns it only by chance, also
+in one with the same process ID (e.g., in another container that shares the directory, or on
+another host). A caller that must not use another process's file creates the file with
+{lean}`IO.FS.Mode.writeNew`.
 -/
-public def uniqueTmpSuffix : BaseIO String := do
+public def uniqueTmpSuffix : IO String := do
   let n ← tmpPathCount.modifyGet fun n => (n, n + 1)
-  return s!".{← IO.Process.getPID}.{n}.tmp"
+  let r := (← IO.getRandomBytes 8).foldl (init := 0) fun r b => r * 256 + b.toNat
+  return s!".{← IO.Process.getPID}.{n}.{String.ofList (Nat.toDigits 16 r)}.tmp"
 
 /--
-Returns a temporary path next to {lean}`path`, {lit}`<path>.<pid>.<n>.tmp`, that no concurrent
-call, in this process or in another, returns. It suits a file that is written, then renamed
-into place.
+Returns a new temporary path next to {lean}`path`, {lit}`<path>.<pid>.<n>.<random>.tmp`: the path
+followed by {lean}`uniqueTmpSuffix`, with the same uniqueness.
 -/
-public def uniqueTmpPath (path : FilePath) : BaseIO FilePath := do
+public def uniqueTmpPath (path : FilePath) : IO FilePath :=
   return path.toString ++ (← uniqueTmpSuffix)
 
 /-- The wall-clock time, in whole seconds since the Unix epoch (e.g., for the `at` of a status file). -/
