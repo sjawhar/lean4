@@ -69,7 +69,7 @@ builtin_initialize linterSetsExt :
       return { merged, localEntries := #[] }
     addEntryFn := fun st (n, ms) =>
       { merged := insertLinterSetEntry st.merged n ms, localEntries := st.localEntries.push (n, ms) }
-    ofOLeanEntry? := some fun _ entry => pure entry
+    oleanEntryIsEntry? := some ⟨rfl⟩
     exportEntriesFn := fun st => st.localEntries
   }
 

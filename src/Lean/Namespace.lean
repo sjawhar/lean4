@@ -41,7 +41,7 @@ builtin_initialize namespacesExt : PersistentEnvExtension Name Name State ←
       return SMap.fromHashMap map |>.switch
     -- local entries are not from private imports, so mark public
     addEntryFn      := fun s n => s.insert n .public
-    ofOLeanEntry?  := some fun _ entry => pure entry
+    oleanEntryIsEntry? := some ⟨rfl⟩
     -- local entries live in the persistent stage and are always `.public` (`addEntryFn`)
     stateDelta?    := some fun s₀ s₁ =>
       match s₀.sharedDiff? s₁ with

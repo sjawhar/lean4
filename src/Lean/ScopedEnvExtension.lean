@@ -70,6 +70,13 @@ structure Descr (α : Type) (β : Type) (σ : Type) where
   name           : Name := by exact decl_name%
   mkInitial      : IO σ
   ofOLeanEntry   : σ → α → ImportM β
+  /-- That the `.olean` entry is the entry (`α = β`). With it, neither `toOLeanEntry` nor `ofOLeanEntry` is ever
+  called: the entry a command adds is the one its `.olean` holds (`Descr.oleanEntry`), and the import and a reuse run's
+  replay of the command's entry operations (`replayOps`) add that entry as it is (`Descr.entryOfOLean`), so both give
+  the state the command's elaboration gave, whatever the two functions compute. Without it, a reuse run keeps no
+  command with an entry operation of the extension (`CommandEntries.firstUnadmittedConversion`): the conversion is an
+  `ImportM` action, which may do any `IO`. `registerSimpleScopedEnvExtension` sets it. -/
+  oleanEntryIsEntry? : Option (PLift (α = β)) := none
   toOLeanEntry   : β → α
   addEntry       : σ → β → σ
   finalizeImport : σ → σ := id
@@ -102,6 +109,19 @@ def Descr.noteScopeChange (descr : Descr α β σ) (s : State σ) (b : β) : Sta
   else
     s
 
+/-- The `.olean` entry of the entry `b`: `b` itself with `oleanEntryIsEntry?`, else `toOLeanEntry b`. -/
+def Descr.oleanEntry (descr : Descr α β σ) (b : β) : α :=
+  match descr.oleanEntryIsEntry? with
+  | some ⟨h⟩ => cast h.symm b
+  | none => descr.toOLeanEntry b
+
+/-- The entry the `.olean` entry `a` stands for, on the state `s`: `a` itself with `oleanEntryIsEntry?`, else
+`ofOLeanEntry s a`. -/
+def Descr.entryOfOLean (descr : Descr α β σ) (s : σ) (a : α) : ImportM β :=
+  match descr.oleanEntryIsEntry? with
+  | some ⟨h⟩ => pure (cast h a)
+  | none => descr.ofOLeanEntry s a
+
 instance [Inhabited α] : Inhabited (Descr α β σ) where
   default := {
     name         := default
@@ -126,10 +146,10 @@ def addImportedFn (descr : Descr α β σ) (as : Array (Array (Entry α))) : Imp
     for e in a do
       match e with
       | Entry.global a =>
-        let b ← descr.ofOLeanEntry s a
+        let b ← descr.entryOfOLean s a
         s := descr.addEntry s b
       | Entry.scoped ns a =>
-        let b ← descr.ofOLeanEntry s a
+        let b ← descr.entryOfOLean s a
         scopedEntries := scopedEntries.insert ns b
   s := descr.finalizeImport s
   return { stateStack := [ { state := s } ], scopedEntries := scopedEntries }
@@ -137,13 +157,13 @@ def addImportedFn (descr : Descr α β σ) (as : Array (Array (Entry α))) : Imp
 def addEntryFn (descr : Descr α β σ) (s : StateStack α β σ) (e : Entry β) : StateStack α β σ :=
   match e with
   | Entry.global b =>
-    let a := Entry.global (descr.toOLeanEntry b)
+    let a := Entry.global (descr.oleanEntry b)
     { s with
       newEntries := a :: s.newEntries
       stateStack := s.stateStack.map fun l => { l with state := descr.addEntry l.state b }
       ops := .entry a :: s.ops }
   | Entry.«scoped» ns b =>
-    let a := Entry.«scoped» ns (descr.toOLeanEntry b)
+    let a := Entry.«scoped» ns (descr.oleanEntry b)
     { s with
       scopedEntries := s.scopedEntries.insert ns b
       newEntries    := a :: s.newEntries
@@ -281,21 +301,27 @@ def modifyTop (descr : Descr α β σ) (s : StateStack α β σ) (f : σ → σ)
 
 end StateStack
 
-/-- Applies `ops` (from `stackDelta`) to `s`, converting each entry with `descr.ofOLeanEntry` on the top state. -/
-def replayOps (descr : Descr α β σ) (s : StateStack α β σ) (ops : Array (Op α)) : ImportM (StateStack α β σ) := do
+/-- Applies `ops` (from `stackDelta`) to `s`, each entry taken as the import takes it (`Descr.entryOfOLean`, on the top
+state); `admittedOnly` refuses a descriptor without `oleanEntryIsEntry?`, whose conversion it would run. -/
+def replayOps (descr : Descr α β σ) (s : StateStack α β σ) (ops : Array (Op α)) (admittedOnly := false) :
+    ImportM (StateStack α β σ) := do
   let mut s := s
   for op in ops do
     let top : σ ← match s.stateStack with
       | top :: _ => pure top.state
       | [] => throw <| IO.userError s!"replaying an operation of {descr.name} on an empty stack"
+    let convert (a : α) : ImportM β := do
+      if admittedOnly && descr.oleanEntryIsEntry?.isNone then
+        throw <| IO.userError s!"entry conversion of {descr.name} is not admitted"
+      descr.entryOfOLean top a
     match op with
     | .push => s := s.push
     | .pop => s := s.pop
     | .setDelimitsLocal depth => s := s.setDelimitsLocal depth
     | .activate ns => s := s.activate descr ns
-    | .localEntry a => s := s.addLocal descr a (← descr.ofOLeanEntry top a)
-    | .entry (.global a) => s := addEntryFn descr s (.global (← descr.ofOLeanEntry top a))
-    | .entry (.scoped ns a) => s := addEntryFn descr s (.scoped ns (← descr.ofOLeanEntry top a))
+    | .localEntry a => s := s.addLocal descr a (← convert a)
+    | .entry (.global a) => s := addEntryFn descr s (.global (← convert a))
+    | .entry (.scoped ns a) => s := addEntryFn descr s (.scoped ns (← convert a))
     | .modify => throw <| IO.userError s!"an operation of {descr.name} that no entry expresses cannot be replayed"
   return s
 
@@ -402,7 +428,7 @@ def ScopedEnvExtension.addScopedEntry (ext : ScopedEnvExtension α β σ) (env :
   ext.ext.addEntry (log := ext.writeLog b) env (Entry.«scoped» namespaceName b)
 
 def ScopedEnvExtension.addLocalEntry (ext : ScopedEnvExtension α β σ) (env : Environment) (b : β) : Environment :=
-  modifyStack ext env (bumpGen := true) (log := ext.writeLog b) (·.addLocal ext.descr (ext.descr.toOLeanEntry b) b)
+  modifyStack ext env (bumpGen := true) (log := ext.writeLog b) (·.addLocal ext.descr (ext.descr.oleanEntry b) b)
 
 def ScopedEnvExtension.addCore (env : Environment) (ext : ScopedEnvExtension α β σ) (b : β) (kind : AttributeKind) (namespaceName : Name) : Environment :=
   match kind with
@@ -440,10 +466,11 @@ def ScopedEnvExtension.modifyState (ext : ScopedEnvExtension α β σ) (env : En
   modifyStack ext env (asyncMode := ext.ext.toEnvExtension.asyncMode) (bumpGen := true) (log := .missing)
     (·.modifyTop ext.descr f)
 
-/-- Replays `ops` (`ScopedEnvExtension.stackDelta`) onto `ext`'s stack in `view` of `env`, as a sanctioned writer. -/
+/-- Replays `ops` (`ScopedEnvExtension.stackDelta`) onto `ext`'s stack in `view` of `env`, as a sanctioned writer;
+`admittedOnly` as in `replayOps`. -/
 def ScopedEnvExtension.replayOpsIn (ext : ScopedEnvExtension α β σ) (env : Environment)
-    (view : EnvExtension.View) (ops : Array (Op α)) : ImportM Environment := do
-  let s ← replayOps ext.descr (ext.ext.toEnvExtension.getStateIn env view).state ops
+    (view : EnvExtension.View) (ops : Array (Op α)) (admittedOnly := false) : ImportM Environment := do
+  let s ← replayOps ext.descr (ext.ext.toEnvExtension.getStateIn env view).state ops admittedOnly
   return ext.ext.toEnvExtension.writeView env view (.accounted (descrIdentity ext)) fun ps => { ps with state := s }
 
 /-- Starts every scoped extension's operation log afresh in the main-branch view, so that it holds the operations of
@@ -495,8 +522,10 @@ def registerSimpleScopedEnvExtension (descr : SimpleScopedEnvExtension.Descr α 
     name           := descr.name
     mkInitial      := return descr.initial
     addEntry       := descr.addEntry
+    -- never called: `oleanEntryIsEntry?` stands for both
     toOLeanEntry   := id
     ofOLeanEntry   := fun _ a => return a
+    oleanEntryIsEntry? := some ⟨rfl⟩
     finalizeImport := descr.finalizeImport
     exportEntry?   := descr.exportEntry?
     trackGen       := descr.trackGen

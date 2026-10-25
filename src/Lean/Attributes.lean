@@ -223,7 +223,7 @@ def registerTagAttribute (name : Name) (descr : String)
     mkInitial       := pure {}
     addImportedFn   := fun _ _ => pure {}
     addEntryFn      := fun (s : NameSet) n => s.insert n
-    ofOLeanEntry?  := some fun _ entry => pure entry
+    oleanEntryIsEntry? := some ⟨rfl⟩
     stateDelta?    := some StateDelta.ofNameSet
     stateDeltaSeesDirectWrites := true
     exportEntriesFnEx := fun env es =>
@@ -323,7 +323,7 @@ def registerParametricAttributeExt (ref : Name) (preserveOrder : Bool := false)
     mkInitial       := pure ([], {})
     addImportedFn   := fun _ => pure ([], {})
     addEntryFn      := fun (decls, m) (p : Name × α) => (p.1 :: decls, m.insert p.1 p.2)
-    ofOLeanEntry?  := some fun _ entry => pure entry
+    oleanEntryIsEntry? := some ⟨rfl⟩
     stateDelta?    := some keyLogDelta
     exportEntriesFnEx := fun env (decls, m) => Id.run do
       let all := if preserveOrder then
@@ -408,7 +408,7 @@ def registerEnumAttributes (attrDescrs : List (Name × String × α))
     mkInitial       := pure {}
     addImportedFn   := fun _ _ => pure {}
     addEntryFn      := fun (s : NameMap α) (p : Name × α) => s.insert p.1 p.2
-    ofOLeanEntry?  := some fun _ entry => pure entry
+    oleanEntryIsEntry? := some ⟨rfl⟩
     stateDelta?    := some StateDelta.ofNameMap
     stateDeltaSeesDirectWrites := true
     exportEntriesFnEx := fun env m =>

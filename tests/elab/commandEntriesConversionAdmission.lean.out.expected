@@ -1,0 +1,21 @@
+command 0: refusals 0, first unadmitted conversion (some identExt)
+command 1: refusals 0, first unadmitted conversion (some countExt)
+command 2: refusals 0, first unadmitted conversion none
+command 3: refusals 0, first unadmitted conversion none
+command 4: refusals 0, first unadmitted conversion none
+command 5: refusals 0, first unadmitted conversion (some Lean.PrettyPrinter.Delaborator.delabAttribute)
+command 6: refusals 0, first unadmitted conversion none
+command 7: refusals 1, first unadmitted conversion none
+command 8: refusals 0, first unadmitted conversion none
+command 9: refusals 0, first unadmitted conversion none
+command 0 kept with admittedOnly: threw: entry conversion of identExt is not admitted
+command 2 kept with admittedOnly: kept
+command 3 kept with admittedOnly: kept
+command 4 kept with admittedOnly: kept
+conversion runs of the full run: 0
+command 1 kept with admittedOnly: threw: entry conversion of countExt is not admitted, conversion runs 0
+command 1 kept without admittedOnly: kept, conversion runs 1
+full run: f.count (some 1)
+rebuild fails: keep threw true, f.count (some 2)
+fails after the rebuild: keep threw true, f.count (some 3)
+command 8 kept with admittedOnly: flagExt 5, in the full run 5, conversion runs 0

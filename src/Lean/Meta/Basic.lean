@@ -3013,6 +3013,18 @@ where
       }⟩
       unreachable!
 
+/-- The snapshot a `realizeConst` realization reported, if `dyn` is the value its `realize` returned
+(`Environment.realizeConst`) and that `realize` threw no exception: `some none` when it reported nothing. -/
+def realizeConstSnapshot? (dyn : Dynamic) : Option (Option SnapshotTree) := do
+  let res ← dyn.get? RealizeConstantResult
+  if res.error?.isSome then none
+  return res.snap?
+
+/-- The value `realizeConst`'s `realize` returns for a realization that threw no exception and reported `snap?`
+(`realizeConstSnapshot?`). -/
+def mkRealizeConstResult (snap? : Option SnapshotTree) : Dynamic :=
+  .mk { snap?, error? := none : RealizeConstantResult }
+
 end Meta
 
 open Meta

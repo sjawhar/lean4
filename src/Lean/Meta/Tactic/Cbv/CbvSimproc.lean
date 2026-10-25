@@ -113,7 +113,7 @@ builtin_initialize cbvSimprocDeclExt :
     addImportedFn   := fun _ => return { builtin := (← builtinCbvSimprocDeclsRef.get).keys }
     addEntryFn      := fun s d =>
       { s with newEntries := s.newEntries.insert d.declName d.keys }
-    ofOLeanEntry? := some fun _ entry => pure entry
+    oleanEntryIsEntry? := some ⟨rfl⟩
     -- `builtin` is fixed at import
     stateDelta? := some fun s₀ s₁ =>
       if SharedDiff.sameObject s₀.builtin s₁.builtin then

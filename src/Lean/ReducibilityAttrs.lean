@@ -55,7 +55,7 @@ builtin_initialize reducibilityCoreExt : PersistentEnvExtension (Name × Reducib
     mkInitial       := pure {}
     addImportedFn   := fun _ _ => pure {}
     addEntryFn      := fun (s : NameMap ReducibilityStatus) (p : Name × ReducibilityStatus) => s.insert p.1 p.2
-    ofOLeanEntry?  := some fun _ entry => pure entry
+    oleanEntryIsEntry? := some ⟨rfl⟩
     stateDelta?    := some StateDelta.ofNameMap
     stateDeltaSeesDirectWrites := true
     exportEntriesFn := fun m =>

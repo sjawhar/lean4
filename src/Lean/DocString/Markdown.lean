@@ -515,7 +515,7 @@ public builtin_initialize docInlineMdExt :
     mkInitial := pure {}
     addImportedFn := fun es => return { imported := foldEntries {} es }
     addEntryFn := fun s (tag, w) => { s with current := s.current.insert tag w }
-    ofOLeanEntry? := some fun _ entry => pure entry
+    oleanEntryIsEntry? := some ⟨rfl⟩
     exportEntriesFn := fun s => s.current.toArray
   }
 
@@ -526,7 +526,7 @@ public builtin_initialize docBlockMdExt :
     mkInitial := pure {}
     addImportedFn := fun es => return { imported := foldEntries {} es }
     addEntryFn := fun s (tag, w) => { s with current := s.current.insert tag w }
-    ofOLeanEntry? := some fun _ entry => pure entry
+    oleanEntryIsEntry? := some ⟨rfl⟩
     exportEntriesFn := fun s => s.current.toArray
   }
 

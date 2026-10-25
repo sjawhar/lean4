@@ -2160,8 +2160,9 @@ How one top-level command changed a persistent extension's state, as computed by
 `PersistentEnvExtension.stateDelta?` from the states before and after the command.
 -/
 inductive StateDelta (α : Type) where
-  /-- Replaying these entries, oldest first, through `ofOLeanEntry?` and `addEntryFn` onto the first state
-  yields the second. -/
+  /-- Replaying these entries, oldest first, through the entry conversion (none with
+  `PersistentEnvExtension.oleanEntryIsEntry?`, else `ofOLeanEntry?`) and `addEntryFn` onto the first state yields the
+  second. -/
   | entries (es : Array α)
   /-- The states differ in a way no entry sequence expresses: a removal, or a write that bypassed
   `addEntry`. A command with such a change is not replayed from its recorded entries. -/
@@ -2268,13 +2269,21 @@ structure PersistentEnvExtension (α : Type) (β : Type) (σ : Type) where
   addImportedFn   : Array (Array α) → ImportM σ
   addEntryFn      : σ → β → σ
   /-- Converts an entry as exported to the `.olean` back to the entry `addEntryFn` accepts, for replaying a
-  command's recorded entries. `none` when the extension has no such conversion. -/
+  command's recorded entries. `none` when the extension has no such conversion. The import never calls it (it hands
+  the `.olean` entries to `addImportedFn`), and a reuse run never does: a command with entries for an extension without
+  `oleanEntryIsEntry?` is elaborated instead of kept (`CommandEntries.firstUnadmittedConversion`). -/
   ofOLeanEntry?   : Option (σ → α → ImportM β)
+  /-- That the `.olean` entry is the entry (`α = β`). With it, `ofOLeanEntry?` is never called: the import hands the
+  `.olean` entries to `addImportedFn`, and a reuse run's replay adds a command's recorded entries to `addEntryFn` as they
+  are, so that a kept command's entries are those its elaboration added (`stateDelta?`), whatever `ofOLeanEntry?`
+  computes. Core sets it where it wrote the identity conversion itself (`registerSimplePersistentEnvExtension`, the
+  attribute helpers, `mkMapDeclarationExtension`); a user extension may set it too. -/
+  oleanEntryIsEntry? : Option (PLift (α = β))
   /--
   Computes what one top-level command did to the state, from the states before and after it (each read in the
-  mode the `.olean` export reads it). The result must be either entries whose replay through `ofOLeanEntry?` and
-  `addEntryFn` turns the first state into the second, or `stateOnly`. `none` when the extension has no such
-  function: any change of its state then makes the command unreplayable.
+  mode the `.olean` export reads it). The result must be either entries whose replay through the entry conversion
+  (`oleanEntryIsEntry?`, `ofOLeanEntry?`) and `addEntryFn` turns the first state into the second, or `stateOnly`.
+  `none` when the extension has no such function: any change of its state then makes the command unreplayable.
 
   The registration helpers set it: entry logs (`registerSimplePersistentEnvExtension`, parametric attributes,
   scoped extensions) take the cells added in front of the old log, map states (`NameMap`, `NameSet`, `PHashMap`)
@@ -2318,6 +2327,7 @@ instance {α β σ} [Inhabited σ] : Inhabited (PersistentEnvExtension α β σ)
      addImportedFn := fun _ => default,
      addEntryFn := fun s _ => s,
      ofOLeanEntry? := none,
+     oleanEntryIsEntry? := none,
      stateDelta? := none,
      stateDeltaSeesDirectWrites := false,
      perCommand := .recorded,
@@ -2411,9 +2421,11 @@ structure PersistentEnvExtensionDescrCore (α β σ : Type) where
   mkInitial         : IO σ
   addImportedFn     : Array (Array α) → ImportM σ
   addEntryFn        : σ → β → σ
-  /-- See `PersistentEnvExtension.ofOLeanEntry?`. Commands that add entries to an extension without it cannot
-  be replayed from their recorded entries. -/
+  /-- See `PersistentEnvExtension.ofOLeanEntry?`. Commands that add entries to an extension without it or
+  `oleanEntryIsEntry?` cannot be replayed from their recorded entries. -/
   ofOLeanEntry?     : Option (σ → α → ImportM β) := none
+  /-- See `PersistentEnvExtension.oleanEntryIsEntry?`. -/
+  oleanEntryIsEntry? : Option (PLift (α = β)) := none
   /-- See `PersistentEnvExtension.stateDelta?`. -/
   stateDelta?       : Option (σ → σ → StateDelta α) := none
   /-- See `PersistentEnvExtension.stateDeltaSeesDirectWrites`. -/
@@ -2480,6 +2492,7 @@ unsafe def registerPersistentEnvExtensionUnsafe {α β σ : Type} [Inhabited σ]
     addImportedFn   := descr.addImportedFn,
     addEntryFn      := descr.addEntryFn,
     ofOLeanEntry?   := descr.ofOLeanEntry?,
+    oleanEntryIsEntry? := descr.oleanEntryIsEntry?,
     stateDelta?     := descr.stateDelta?,
     stateDeltaSeesDirectWrites := descr.stateDeltaSeesDirectWrites,
     perCommand      := descr.perCommand,
@@ -3413,6 +3426,16 @@ def hasUnsafe (env : Environment) (e : Expr) : Bool :=
     | _ => false;
   c?.isSome
 
+/-- The environment a realization for `forConst` starts from in `ctx`, the realization context `env` holds for it. -/
+private def realizationEnv (env : Environment) (ctx : RealizationContext) (forConst : Name) : Environment :=
+  -- safety: `RealizationContext` is private
+  let realizeEnv : Environment := unsafe unsafeCast ctx.env
+  { realizeEnv with
+    -- allow realizations to recursively realize other constants for `forConst`. Do note that
+    -- this allows for recursive realization of `α` itself, which will deadlock.
+    localRealizationCtxMap := realizeEnv.localRealizationCtxMap.insert forConst ctx
+    importRealizationCtx? := env.importRealizationCtx? }
+
 /-- Plumbing function for `Lean.Meta.realizeValue`; see documentation there. -/
 def realizeValue [BEq α] [Hashable α] [TypeName α] (env : Environment) (forConst : Name) (key : α)
     (realize : Environment → Options → BaseIO Dynamic) : IO Dynamic := do
@@ -3449,15 +3472,7 @@ def realizeValue [BEq α] [Hashable α] [TypeName α] (env : Environment) (forCo
     if let some t := existingConsts? then
       pure t.get
     else
-      -- safety: `RealizationContext` is private
-      let realizeEnv : Environment := unsafe unsafeCast ctx.env
-      let realizeEnv := { realizeEnv with
-        -- allow realizations to recursively realize other constants for `forConst`. Do note that
-        -- this allows for recursive realization of `α` itself, which will deadlock.
-        localRealizationCtxMap := realizeEnv.localRealizationCtxMap.insert forConst ctx
-        importRealizationCtx? := env.importRealizationCtx?
-      }
-      let res ← realize realizeEnv ctx.opts
+      let res ← realize (env.realizationEnv ctx forConst) ctx.opts
       prom.resolve res
       pure res)
   IO.setNumHeartbeats heartbeats
@@ -3566,60 +3581,86 @@ def realizeConst (env : Environment) (forConst : Name) (constName : Name)
   let (env, ex) ← mergeRealizeConstResult env res (replayExts := true)
   return (env, ex, res.dyn)
 
-private structure ReaddRealizationFailure where
-  message : String
-deriving TypeName
+/-- The realization results a keep built (`readdRealizeConst`), each with the cache of its realization context and its
+key, held back from the caches until the whole keep succeeded (`publish`): a failed keep leaves no result behind that
+the command's elaboration, or a later one, would merge instead of running `realize`. -/
+private structure PendingRealizations where
+  results : Array (IO.Ref (NameMap NonScalar) × Name × RealizeConstResult) := #[]
 
-/-- The value a re-added realization reports in place of `realize`'s; `Meta.realizeConst` ignores values of other
-types. -/
-private structure ReaddedRealization where
-deriving TypeName
+private unsafe def cachedRealizationImpl (ctx : RealizationContext) (constName : Name) :
+    BaseIO (Option RealizeConstResult) := do
+  let some m := (← ctx.realizeMapRef.get).find? (TypeName.typeName RealizeConstKey) | return none
+  let m : PHashMap RealizeConstKey (Task Dynamic) := unsafeCast m
+  let some t := m[({ constName } : RealizeConstKey)] | return none
+  return t.get.get? RealizeConstResult
+
+/-- The result `ctx` caches for the realization `constName`, waiting for one in progress. -/
+@[implemented_by cachedRealizationImpl]
+private opaque cachedRealization (ctx : RealizationContext) (constName : Name) : BaseIO (Option RealizeConstResult)
+
+/-- The result of the realization `constName` for `forConst`: the one the realization context `env` holds for
+`forConst` caches, or else the one `pending` holds for that context. -/
+private def findRealization? (env : Environment) (pending : PendingRealizations) (forConst constName : Name) :
+    BaseIO (Option RealizeConstResult) := do
+  let some ctx := env.realizationContext? forConst | return none
+  if let some res ← cachedRealization ctx constName then return some res
+  return pending.results.findSome? fun (ref, n, res) =>
+    if n == constName && SharedDiff.sameObject ref ctx.realizeMapRef then some res else none
 
 /--
-Re-adds a realization a kept command made: `realizeConst forConst constName` with `realize` replaced by `build`,
+Re-adds a realization a kept command made: as `realizeConst forConst constName` with `realize` replaced by `build`,
 which re-creates the realization's constants and recorded extension states in the realization's environment (the
-realization context's, inside the realization's async context). The result is cached as `realizeConst` caches it,
-so a later request elsewhere merges it as a full run's would. The merge into a kept command's `env` adds the constants
-only, because its recorded checked view already holds the extension writes a merge replays; a merge into another
-realization's environment (`replayExts`) replays them as `realizeConst` does. When the context already holds a result
-for the key, `build` does not run and that result is merged, as `realizeConst` does. Throws when `build` does; the
-task holds the kernel's exception, if any. A failed `build` stays cached in the context, and a later
-`Meta.realizeConst` of the key then fails (`unreachable!`): a caller aborts on a failed keep.
+realization context's, inside the realization's async context), and `dyn` the value `realize` returned in the full run,
+rebuilt from the kept command's record, which a later request reports as a full run's does. The result is merged into
+`env` and added to `pending`, not cached: `PendingRealizations.publish` caches it once the keep succeeded, so that a
+later request elsewhere merges it as a full run's would. When the context caches a result for the key, or `pending`
+holds one, `build` does not run and that result is merged, as `realizeConst` does. The merge adds the constants only,
+because the kept command's recorded checked view already holds the extension writes a merge replays. Throws when
+`build` does, caching nothing; the task holds the kernel's exception, if any.
 -/
-private def readdRealizeConst (env : Environment) (forConst constName : Name)
-    (build : Environment → Options → IO Environment) (replayExts := false) :
-    IO (Environment × Task (Option Kernel.Exception)) := do
-  let res ← env.realizeValue forConst { constName : RealizeConstKey } fun realizeEnv realizeOpts => do
-    let realizeEnv := realizeEnv.enterAsyncRealizing constName
-    match ← (build realizeEnv realizeOpts).toBaseIO with
-    | .ok realizeEnv' =>
-      return .mk (← RealizeConstResult.ofRealization forConst constName realizeEnv realizeEnv'
-        (.mk ({} : ReaddedRealization)))
-    | .error e => return .mk { message := toString e : ReaddRealizationFailure }
-  if let some failure := res.get? ReaddRealizationFailure then
-    throw <| .userError s!"re-adding the realization of {constName} for {forConst}: {failure.message}"
-  let some res := res.get? RealizeConstResult | unreachable!
-  mergeRealizeConstResult env res replayExts
+private def readdRealizeConst (env : Environment) (pending : PendingRealizations) (forConst constName : Name)
+    (dyn : Dynamic) (build : Environment → Options → IO Environment) :
+    IO (Environment × Task (Option Kernel.Exception) × PendingRealizations) := do
+  let some ctx := env.realizationContext? forConst |
+    throw <| .userError s!"reuse: no realization context for {forConst}, which {constName}'s realization ran in"
+  if let some res := (← env.findRealization? pending forConst constName) then
+    let (env, ex) ← mergeRealizeConstResult env res (replayExts := false)
+    return (env, ex, pending)
+  -- as in `realizeValue`
+  let heartbeats ← IO.getNumHeartbeats
+  let realizeEnv := (env.realizationEnv ctx forConst).enterAsyncRealizing constName
+  let realizeEnv' ← tryFinally (build realizeEnv ctx.opts) (monadLift (IO.setNumHeartbeats heartbeats) : IO Unit)
+  let res ← RealizeConstResult.ofRealization forConst constName realizeEnv realizeEnv' dyn
+  let (env, ex) ← mergeRealizeConstResult env res (replayExts := false)
+  return (env, ex, { results := pending.results.push (ctx.realizeMapRef, constName, res) })
 
-private unsafe def realizationMergesImpl (env : Environment) (forConst constName : Name) :
-    BaseIO (Array (Name × Name)) := do
-  let some ctx := env.realizationContext? forConst | return #[]
-  let some m := (← ctx.realizeMapRef.get).find? (TypeName.typeName RealizeConstKey) | return #[]
-  let m : PHashMap RealizeConstKey (Task Dynamic) := unsafeCast m
-  let some t := m[({ constName } : RealizeConstKey)] | return #[]
-  let some res := t.get.get? RealizeConstResult | return #[]
+private unsafe def PendingRealizations.publishImpl (pending : PendingRealizations) : BaseIO Unit := do
+  for (ref, constName, res) in pending.results do
+    let key : RealizeConstKey := { constName }
+    ref.modify fun m =>
+      let m' : PHashMap RealizeConstKey (Task Dynamic) := match m.find? (TypeName.typeName RealizeConstKey) with
+        | some m' => unsafeCast m'
+        | none    => {}
+      match m'[key] with
+      | some _ => m
+      | none => m.insert (TypeName.typeName RealizeConstKey) (unsafeCast (m'.insert key (.pure (.mk res))))
+
+/-- Caches each result of `pending` in its realization context, as `realizeValue` caches a result, unless the context
+has one for the key by now (another branch realized it meanwhile, and requests merge that one). -/
+@[implemented_by PendingRealizations.publishImpl]
+private opaque PendingRealizations.publish (pending : PendingRealizations) : BaseIO Unit
+
+/-- The realizations, as `(forConst, constName)`, whose results the realization `constName` for `forConst`, with the
+result `res`, merged while it ran (requested inside it), in the order their constants entered it: its new constants that
+another realization added (`RealizationInfo`). -/
+private def RealizeConstResult.merges (res : RealizeConstResult) (forConst constName : Name) :
+    Array (Name × Name) := Id.run do
   let mut out := #[]
   for c in res.newConsts.private do
     if let some info := c.realization? then
       let key := (info.forConst, info.constName)
       unless key == (forConst, constName) || out.contains key do out := out.push key
   return out
-
-/-- The realizations, as `(forConst, constName)`, whose results the cached realization `constName` for `forConst`
-merged while it ran (requested inside it), in the order their constants entered it: its new constants that another
-realization added (`RealizationInfo`). Empty when the context caches no result for the key. -/
-@[implemented_by realizationMergesImpl]
-private opaque realizationMerges (env : Environment) (forConst constName : Name) : BaseIO (Array (Name × Name))
 
 /-- Registers `ctxEnv` and `opts` as the realization context of the local constant `c` in `env`, with an empty cache,
 as `enableRealizationsForConst` does with the environment and options at that point: a kept command re-creates each

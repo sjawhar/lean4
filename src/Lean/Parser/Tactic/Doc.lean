@@ -37,7 +37,7 @@ builtin_initialize tacticAlternativeExt
     mkInitial := pure {},
     addImportedFn := fun _ => pure {},
     addEntryFn := fun as (src, tgt) => as.insert src tgt,
-    ofOLeanEntry? := some fun _ entry => pure entry
+    oleanEntryIsEntry? := some ⟨rfl⟩
     exportEntriesFn := fun es =>
       es.foldl (fun a src tgt => a.push (src, tgt)) #[] |>.qsort (Name.quickLt ·.1 ·.1)
   }
@@ -120,7 +120,7 @@ builtin_initialize knownTacticTagExt
     mkInitial := pure {},
     addImportedFn := fun _ => pure {},
     addEntryFn := fun as (src, tgt) => as.insert src tgt,
-    ofOLeanEntry? := some fun _ entry => pure entry
+    oleanEntryIsEntry? := some ⟨rfl⟩
     exportEntriesFn := fun es =>
       es.foldl (fun a src tgt => a.push (src, tgt)) #[] |>.qsort (Name.quickLt ·.1 ·.1)
   }
@@ -176,7 +176,7 @@ builtin_initialize tacticTagExt
     mkInitial := pure {},
     addImportedFn := fun _ => pure {},
     addEntryFn := fun tags (decl, newTag) => tags.insert decl (tags.getD decl {} |>.insert newTag)
-    ofOLeanEntry? := some fun _ entry => pure entry
+    oleanEntryIsEntry? := some ⟨rfl⟩
     exportEntriesFn := fun tags => Id.run do
       let mut exported := #[]
       for (decl, dTags) in tags do
@@ -289,7 +289,7 @@ builtin_initialize tacticNameExt
     mkInitial := pure {},
     addImportedFn := fun _ => pure {},
     addEntryFn := fun as (src, tgt) => as.insert src tgt,
-    ofOLeanEntry? := some fun _ entry => pure entry
+    oleanEntryIsEntry? := some ⟨rfl⟩
     exportEntriesFn := fun es =>
       es.foldl (fun a src tgt => a.push (src, tgt)) #[] |>.qsort (Name.quickLt ·.1 ·.1)
   }

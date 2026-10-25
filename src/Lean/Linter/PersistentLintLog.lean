@@ -28,7 +28,7 @@ builtin_initialize lintLogExt :
     mkInitial     := pure #[]
     addImportedFn := fun _ => pure #[]
     addEntryFn    := Array.push
-    ofOLeanEntry? := some fun _ entry => pure entry
+    oleanEntryIsEntry? := some ⟨rfl⟩
     exportEntriesFnEx := fun _ entries =>
       { exported := #[], server := entries, «private» := entries }
   }

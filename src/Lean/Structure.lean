@@ -90,7 +90,7 @@ private builtin_initialize structureExt : PersistentEnvExtension StructureInfo S
   mkInitial       := pure ((), {})
   addImportedFn   := fun _ => pure ((), {})
   addEntryFn      := fun (_, s) e => ((), { s with map := s.map.insert e.structName e })
-  ofOLeanEntry?   := some fun _ entry => pure entry
+  oleanEntryIsEntry? := some ⟨rfl⟩
   stateDelta?     := some fun (_, s₀) (_, s₁) =>
     StateDelta.ofPHashMap Name.quickLt (fun _ info => info) s₀.map s₁.map
   stateDeltaSeesDirectWrites := true

@@ -48,7 +48,7 @@ builtin_initialize recommendedSpellingExt
     mkInitial := pure {},
     addImportedFn := fun _ => pure {},
     addEntryFn := Array.push,
-    ofOLeanEntry? := some fun _ entry => pure entry
+    oleanEntryIsEntry? := some ⟨rfl⟩
     exportEntriesFn := id
   }
 

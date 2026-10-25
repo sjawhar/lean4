@@ -52,7 +52,7 @@ builtin_initialize simprocDeclExt : PersistentEnvExtension SimprocDecl SimprocDe
     mkInitial       := return { builtin := (← builtinSimprocDeclsRef.get).keys }
     addImportedFn   := fun _ => return { builtin := (← builtinSimprocDeclsRef.get).keys }
     addEntryFn      := fun s d => { s with newEntries := s.newEntries.insert d.declName d.keys }
-    ofOLeanEntry? := some fun _ entry => pure entry
+    oleanEntryIsEntry? := some ⟨rfl⟩
     -- `builtin` is fixed at import
     stateDelta? := some fun s₀ s₁ =>
       if SharedDiff.sameObject s₀.builtin s₁.builtin then

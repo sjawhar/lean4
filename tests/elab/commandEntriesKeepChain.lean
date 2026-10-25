@@ -224,7 +224,7 @@ unsafe def runChain (dir : System.FilePath) (src : String) (tamper : CommandEntr
         r := { r with kept := r.kept + 1 }
       catch e =>
         r := { r with threw := r.threw.push o.i, lines := r.lines.push s!"  command {o.i}: keep threw: {e}" }
-        -- a failed keep leaves its realizations' failures in the caches it shares
+        -- elaborated on a fresh copy of the realization caches, as each command of a full run starts from them
         st := (← elabOn src st (← fresh chainBefore) o.stx (asFrontend := true)).1
     unless waits do continue
     for d in constDiffs "constants" infos (newConsts chainBefore st.env) do

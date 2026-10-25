@@ -1,0 +1,12 @@
+command 1: f.s snapshot ⟨#[], #[⟨#[], #[]⟩]⟩
+  rejected for M.lean: none; for another file: none
+command 2: f.k silent
+  rejected for M.lean: none; for another file: none
+command 3: f.w snapshot ⟨#[realized w], #[⟨#[], #[]⟩]⟩
+  rejected for M.lean: none; for another file: (some f.w)
+command 4: f.x unrebuildable
+  rejected for M.lean: (some f.x); for another file: (some f.x)
+command 5: f.v snapshot ⟨#[realized v], #[⟨#[], #[]⟩]⟩; f.o snapshot ⟨#[], #[⟨#[], #[]⟩, ⟨#[realized v], #[⟨#[], #[]⟩]⟩, ⟨#[], #[]⟩]⟩
+  rejected for M.lean: none; for another file: (some f.v)
+command 6: f.y unrebuildable
+  rejected for M.lean: (some f.y); for another file: (some f.y)
