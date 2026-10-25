@@ -112,3 +112,11 @@ name = "stallput"
 type = "s3"
 artifactEndpoint = "%URL%/stallput/a0"
 revisionEndpoint = "%URL%/stallput/r0"
+
+# As `ok`, but every upload of an artifact or a mapping takes 4 seconds (a claim's does not),
+# so that a detached push outlives the build that started it
+[[cache.service]]
+name = "slowobj"
+type = "s3"
+artifactEndpoint = "%URL%/slowobj/a0"
+revisionEndpoint = "%URL%/slowobj/r0"
