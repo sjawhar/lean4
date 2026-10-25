@@ -211,7 +211,11 @@ public def getUrl?
   let token? ← if cacheToken then cacheTokenFor? url else pure none
   let (code, out) ← request token?
   let (code, out) ← match code, token? with
-    | 401, some token => do request (← CacheToken.renew token)
+    | 401, some token => do
+      let token? ← CacheToken.renew token
+      let (code, out) ← request token?
+      if code == 401 then if let some token := token? then CacheToken.refused token
+      pure (code, out)
     | _, _ => pure (code, out)
   if code == 200 then
     return some out.stdout.trimAscii.copy
