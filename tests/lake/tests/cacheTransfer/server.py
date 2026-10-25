@@ -29,11 +29,19 @@ a test picks one by pointing an endpoint at it (e.g. `.../corrupt/a0`):
             shared remote cache), and otherwise as `ok`
   stallput  as `ok`, but each `PUT` reads its body and then sends no answer for
             15 minutes
+  slowobj   as `ok`, but each `PUT` of an object outside a `claim` directory
+            (an artifact or a mapping, not a claim of the shared remote cache)
+            is answered after 4 seconds
 
 A fault that does not apply to a request kind (e.g. `badcount` on a `GET`)
-behaves as `ok`. Like Cloud Storage, a `PUT` with the header
-`x-goog-if-generation-match: 0` only creates an object: if the object exists,
-it is left untouched and the response is 412.
+behaves as `ok`. Like Cloud Storage, each object has a generation, which a new
+write of the object changes and which responses to a `GET`, a `HEAD` or a
+`PUT` report in `x-goog-generation` (`GET` and `HEAD` also report
+`Last-Modified`). A `PUT` with the header `x-goog-if-generation-match: 0`
+only creates an object: if the object exists, it is left untouched and the
+response is 412. A `PUT` with `x-goog-if-generation-match: <generation>`
+replaces the object only if it has that generation, and is otherwise answered
+with 412.
 
 Each request is logged to stdout as
 `<method> <path> -> <status> auth=<bearer|none|other> gen=<value|->`, where
@@ -54,6 +62,7 @@ import os
 import sys
 import threading
 import time
+from email.utils import formatdate
 from enum import StrEnum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
@@ -89,6 +98,42 @@ REDIRECT = None
 # Serializes the request records that the handler threads write to stdout
 LOG_LOCK = threading.Lock()
 
+# The generation of each object of the store that a request has seen, by path
+GENERATIONS = {}
+# Serializes the generations, and each check of a precondition with its write
+STORE_LOCK = threading.Lock()
+# The last generation given out, of the size of Cloud Storage's generations
+LAST_GENERATION = [1792925620545348]
+
+
+def new_generation(path):
+    """Gives the object at `path` a new generation; the caller holds `STORE_LOCK`."""
+    LAST_GENERATION[0] += 1
+    GENERATIONS[path] = LAST_GENERATION[0]
+    return LAST_GENERATION[0]
+
+
+def generation(path):
+    """The generation of the object at `path`, or `None` if there is none.
+
+    An object that a test put into the store directly gets one when it is first
+    seen. The caller holds `STORE_LOCK`.
+    """
+    if not os.path.isfile(path):
+        GENERATIONS.pop(path, None)
+        return None
+    return GENERATIONS.get(path) or new_generation(path)
+
+
+def object_headers(path):
+    """The headers of a `GET` or `HEAD` response for the object at `path`."""
+    with STORE_LOCK:
+        gen = generation(path)
+    headers = {"Last-Modified": formatdate(os.path.getmtime(path), usegmt=True)}
+    if gen is not None:
+        headers["x-goog-generation"] = str(gen)
+    return headers
+
 
 class Mode(StrEnum):
     """A fault mode, named by the first segment of a request path."""
@@ -108,6 +153,7 @@ class Mode(StrEnum):
     SLOW_PUT = "slowput"
     DENY_ART = "denyart"
     STALL_PUT = "stallput"
+    SLOW_OBJ = "slowobj"
 
 
 def content_type(path):
@@ -175,13 +221,15 @@ class Handler(BaseHTTPRequestHandler):
             return None, [], {}
         return mode, parts[1:], parse_qs(url.query)
 
-    def respond(self, status, body, ctype):
+    def respond(self, status, body, ctype, headers=None):
         # Logged before the response is sent, so that a request the client sends
         # after it has the response is always logged after this one
         self.log(status)
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -238,9 +286,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.not_found("no such object: %s" % self.path)
             return
         ctype = ctype or content_type(path)
+        headers = object_headers(path)
         if mode == Mode.CORRUPT:
             data = data[:-1] + bytes([data[-1] ^ 0xFF]) if data else b"corrupt"
-            self.respond(200, data, ctype)
+            self.respond(200, data, ctype, headers)
         elif mode == Mode.TRUNCATE:
             self.send_response(200)
             self.send_header("Content-Type", ctype)
@@ -250,7 +299,7 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             self.log("truncated")
         else:
-            self.respond(200, data, ctype)
+            self.respond(200, data, ctype, headers)
 
     def find_revision(self, scope, rev):
         """Locate a revision's outputs, ignoring any platform/toolchain path."""
@@ -328,6 +377,30 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.not_found("no such endpoint: %s" % self.path)
 
+    def do_HEAD(self):
+        mode, parts, _ = self.parse()
+        if mode is None:
+            self.not_found("no fault mode in path: %s" % self.path)
+        elif mode == Mode.BEARER and not self.authorized():
+            self.unauthorized()
+        elif mode == Mode.RESET:
+            self.reset()
+        elif mode == Mode.DENY:
+            self.deny()
+        else:
+            path = os.path.join(STORE, *parts)
+            if not os.path.isfile(path):
+                self.not_found("no such object: %s" % self.path)
+                return
+            size = os.path.getsize(path)
+            self.log(200)
+            self.send_response(200)
+            self.send_header("Content-Type", content_type(path))
+            self.send_header("Content-Length", str(size))
+            for name, value in object_headers(path).items():
+                self.send_header(name, value)
+            self.end_headers()
+
     def do_PUT(self):
         mode, parts, _ = self.parse()
         # The body is always consumed so that `curl` sees a complete exchange
@@ -348,21 +421,34 @@ class Handler(BaseHTTPRequestHandler):
                 time.sleep(2)
             elif mode == Mode.STALL_PUT:
                 time.sleep(900)
+            # A claim is `<endpoint>/claim/...`; any `claim` deeper in the path is a package
+            elif mode == Mode.SLOW_OBJ and parts[1:2] != ["claim"]:
+                time.sleep(4)
             path = os.path.join(STORE, *parts)
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            if self.headers.get("x-goog-if-generation-match") == "0":
-                # Create only: an existing object, even one being written by
-                # another request, keeps its bytes and its modification time
-                try:
-                    f = open(path, "xb")
-                except FileExistsError:
-                    self.respond(412, PRECONDITION_BODY, "application/xml")
-                    return
-            else:
-                f = open(path, "wb")
-            with f:
-                f.write(body)
-            self.respond(200, b"", "application/xml")
+            want = self.headers.get("x-goog-if-generation-match")
+            # The precondition and the write are one step, as Cloud Storage makes them
+            with STORE_LOCK:
+                if want == "0":
+                    # Create only: an existing object, even one being written by
+                    # another request, keeps its bytes and its modification time
+                    try:
+                        f = open(path, "xb")
+                    except FileExistsError:
+                        self.respond(412, PRECONDITION_BODY, "application/xml")
+                        return
+                elif want is not None:
+                    # Replace only the generation the request names
+                    if str(generation(path) or 0) != want:
+                        self.respond(412, PRECONDITION_BODY, "application/xml")
+                        return
+                    f = open(path, "wb")
+                else:
+                    f = open(path, "wb")
+                with f:
+                    f.write(body)
+                gen = new_generation(path)
+            self.respond(200, b"", "application/xml", {"x-goog-generation": str(gen)})
 
 
 class Server(ThreadingHTTPServer):
