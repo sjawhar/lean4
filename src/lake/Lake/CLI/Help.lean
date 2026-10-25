@@ -582,6 +582,7 @@ USAGE:
 COMMANDS:
   get [<mappings>]      download build outputs into the local Lake cache
   put <mappings>        upload build outputs to a remote cache
+  push                  upload the outputs that builds queued for the remote cache
   add <mappings>        add input-to-output mappings to the Lake cache
   clean                 removes ALL from the local Lake cache
   services              print configured remote cache services
@@ -771,6 +772,35 @@ code. However, because of this, the package's platform and toolchain settings
 will not be automatically detected for `--repo` and must be specified manually
 via `--platform` and `--toolchain` (if needed). Similarly, the source revision
 the outputs correspond to must be manually specified via `--rev`."
+
+def helpCachePush :=
+"Upload the outputs that builds queued for the shared remote cache
+
+USAGE:
+  lake cache push [--wait]
+
+OPTIONS:
+  --wait                          wait for a push that is running, then push
+
+With `LAKE_REMOTE_CACHE_QUEUE` set to true and `LAKE_REMOTE_CACHE` naming an
+`s3` service (see `lake cache services`), a build appends each output that it
+compiled (not one it replayed or restored) to the queue `push.jsonl` in the
+Lake cache directory. It uploads nothing itself. It queues nothing while
+`LEAN_GITHASH` names a Lean other than the one it runs, or while
+`LAKE_USAGE_CUTOFF` is true.
+
+This command empties the queue without loading a workspace. For each entry, it
+hashes the cache artifacts again. An entry whose artifact is gone, or no longer
+matches its hash, is dropped and recorded in `push-dropped.jsonl`, and a
+changed artifact is moved to the cache's `quarantine` directory. A module's
+outputs are packed into one archive. Each artifact is uploaded under its
+SHA-256, then the entry's input-to-output mapping, each only if the object is
+not present yet. An entry that fails to upload stays in the queue.
+
+One push runs at a time. Another one exits at once (with status 0), unless
+`--wait` is set, and the running one also uploads any entry appended while it
+runs. At the end, the push writes its counts to `remote-status-push.json` in the
+cache directory. It exits with status 1 if entries remain in the queue."
 
 def helpCacheClean :=
 "Removes ALL files from the local Lake cache
@@ -996,6 +1026,7 @@ public def helpCache : (cmd : String) → String
 | "unstage"             => helpCacheUnstage
 | "put-staged"          => helpCachePutStaged
 | "clean"               => helpCacheClean
+| "push"                => helpCachePush
 | "services"            => helpCacheServices
 | _                     => helpCacheCli
 

@@ -27,6 +27,7 @@ import Lake.CLI.Init
 import Lake.CLI.Help
 import Lake.CLI.Build
 import LeanExport.Basic
+import Lake.CLI.CachePush
 import Lake.CLI.Actions
 import Lake.CLI.Translate
 import Lake.CLI.Serve
@@ -80,6 +81,8 @@ public structure LakeOptions where
   toolchain? : Option CacheToolchain := none
   rev? : Option GitRev := none
   maxRevs : Nat := 100
+  /-- Whether `lake cache push` waits for a push that is running (via `--wait`). -/
+  wait : Bool := false
   shake : Shake.Args := {}
   comparatorConfig? : Option FilePath := none
   /-- File received via `lake check --from-export` -/
@@ -321,6 +324,7 @@ def lakeLongOption : (opt : String) → CliM PUnit
 | "--force-download" => modifyThe LakeOptions ({· with forceDownload := true})
 | "--download-arts" => modifyThe LakeOptions ({· with mappingsOnly := false})
 | "--mappings-only" => modifyThe LakeOptions ({· with mappingsOnly := true})
+| "--wait"        => modifyThe LakeOptions ({· with wait := true})
 | "--package" => do
   let pkgName ← takeOptArg "--package" "package name"
   modifyThe LakeOptions ({· with package? := some pkgName})
@@ -887,6 +891,20 @@ protected def services : CliM PUnit := do
   let cfg  ← loadLakeConfig lakeEnv
   cfg.config.cache.services.forM (IO.println ·.name)
 
+protected def push : CliM PUnit := do
+  processOptions lakeOption
+  let opts ← getThe LakeOptions
+  noArgsRem do
+  let lakeEnv ← opts.computeEnv
+  -- No workspace is loaded: the queue names everything the push needs
+  let some cache := lakeEnv.lakeCache?
+    | error "no system cache detected; set `LAKE_CACHE_DIR` to the cache that holds the queue"
+  let lakeCfg ← loadLakeConfig lakeEnv
+  let left ← pushRemoteCache lakeEnv lakeCfg cache opts.wait
+  if left > 0 then
+    logError s!"{left} queue entries could not be uploaded; they remain in {cache.pushQueueFile}"
+    exit 1
+
 protected def clean : CliM PUnit := do
   processOptions lakeOption
   let opts ← getThe LakeOptions
@@ -915,6 +933,7 @@ def cacheCli : (cmd : String) → CliM PUnit
 | "put-staged"  => cache.putStaged
 | "clean"       => cache.clean
 | "services"    => cache.services
+| "push"        => cache.push
 | "help"        => cache.help
 | cmd           => throw <| CliError.unknownCommand cmd
 
