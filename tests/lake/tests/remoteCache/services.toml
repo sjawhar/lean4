@@ -1,6 +1,7 @@
 # Cache services for `test.sh`, served by `../cacheTransfer/server.py`.
-# `test.sh` replaces `%URL%` with the URL of one mock server
-# and `%URL2%` with the URL of a second one, which listens on another port.
+# `test.sh` replaces `%URL%` with the URL of one mock server,
+# `%URL2%` with the URL of a second one, which listens on another port,
+# and `%FLAKY%` with a fault mode of the first server.
 
 # Accepts only bearer tokens, as a Cloud Storage bucket without HMAC keys does
 [[cache.service]]
@@ -81,3 +82,19 @@ name = "miss"
 type = "s3"
 artifactEndpoint = "%URL%/miss/a0"
 revisionEndpoint = "%URL%/miss/r0"
+
+# Uploads through `lake cache push`: denied (403) while `%FLAKY%` is `deny`,
+# accepted when a copy of this file replaces it with `ok`
+[[cache.service]]
+name = "flaky"
+type = "s3"
+artifactEndpoint = "%URL%/%FLAKY%/a0"
+revisionEndpoint = "%URL%/%FLAKY%/r0"
+
+# As `ok`, but every upload takes 2 seconds, so that a push runs long enough
+# for a test to act while it runs
+[[cache.service]]
+name = "slowput"
+type = "s3"
+artifactEndpoint = "%URL%/slowput/a0"
+revisionEndpoint = "%URL%/slowput/r0"
