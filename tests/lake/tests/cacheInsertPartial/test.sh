@@ -17,7 +17,7 @@ if [ "$OS" = Windows_NT ]; then
   exit 0
 fi
 
-copy_to_work lakefile.lean
+copy_to_work lakefile.lean Fallback.lean NoHardLink.c
 export LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true
 LIMIT_KB=16
 # Larger than the limit: 128 KiB of text, and a module whose `.olean` holds a string of 64 KiB of
@@ -123,6 +123,67 @@ cat planted.out
 test_exp $rc = 0
 test_cmd grep -qx planted "$PLANTED"
 test_cmd cmp input.txt "cache4/artifacts/$TEXT_ENTRY"
+
+# On Linux, force the hard-link fallback with a preload that returns EPERM from `uv_fs_link`.
+# Both writers load their bytes and wait before calling `writeBinFileIfNew`; the preload holds their
+# initial `pathExists` calls, so both take the fallback. It releases writer A first, holds writer B
+# until A creates the final path, and checks that A's bytes stay.
+if [ "$UNAME" = Linux ]; then
+  test_cmd cc -shared -fPIC -o no-hard-link.so NoHardLink.c
+  test_cmd env LEAN_PATH="$BUILD_DIR/lib/lean" "$BUILD_DIR/bin/lean" Fallback.lean -c Fallback.c
+  test_cmd "$BUILD_DIR/bin/leanc" -o fallback Fallback.c -L"$BUILD_DIR/lib/lean" -lLake_shared
+  FALLBACK=./fallback
+  head -c 65536 /dev/zero | tr '\0' A > first.bin
+  head -c 8388608 /dev/zero | tr '\0' B > second.bin
+  rm -f ifnew ready-a ready-b start link.log first.out second.out
+  mkdir stat-barrier
+  env LD_LIBRARY_PATH="$BUILD_DIR/lib/lean" LD_PRELOAD="$PWD/no-hard-link.so" \
+    LAKE_TEST_LINK_LOG="$PWD/link.log" \
+    LAKE_TEST_STAT_PATH=ifnew LAKE_TEST_STAT_BARRIER="$PWD/stat-barrier" \
+    "$FALLBACK" ifnew first.bin ready-a start > first.out 2>&1 &
+  a=$!
+  env LD_LIBRARY_PATH="$BUILD_DIR/lib/lean" LD_PRELOAD="$PWD/no-hard-link.so" \
+    LAKE_TEST_LINK_LOG="$PWD/link.log" \
+    LAKE_TEST_STAT_PATH=ifnew LAKE_TEST_STAT_BARRIER="$PWD/stat-barrier" \
+    "$FALLBACK" ifnew second.bin ready-b start > second.out 2>&1 &
+  b=$!
+  until [ -e ready-a ] && [ -e ready-b ]; do
+    if ! kill -0 $a 2> /dev/null || ! kill -0 $b 2> /dev/null; then
+      cat first.out second.out
+      echo "FAILURE: a fallback writer stopped before the start barrier"
+      exit 1
+    fi
+    sleep 1
+  done
+  touch start
+  while :; do
+    n=0
+    for f in stat-barrier/*; do
+      [ -e "$f" ] || continue
+      n=$((n + 1))
+    done
+    [ $n = 2 ] && break
+    if ! kill -0 $a 2> /dev/null || ! kill -0 $b 2> /dev/null; then
+      cat first.out second.out
+      echo "FAILURE: a fallback writer stopped before the stat barrier"
+      exit 1
+    fi
+    sleep 1
+  done
+  test_exp -e "stat-barrier/$a"
+  test_exp -e "stat-barrier/$b"
+  echo $a > stat-barrier/first
+  touch stat-barrier/release
+  rc=0
+  wait $a || rc=$?
+  wait $b || rc=$?
+  cat first.out second.out
+  test_exp $rc = 0
+  test_cmd cmp first.bin ifnew
+  test_exp "$(wc -l < link.log)" = 2
+else
+  echo "SKIPPED: the forced hard-link fallback uses Linux LD_PRELOAD"
+fi
 
 # `lake cache unstage` writes each entry from the staging directory (here the module's archive),
 # also when the limit stops it

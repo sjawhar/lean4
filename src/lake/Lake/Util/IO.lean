@@ -45,14 +45,16 @@ public def uniqueTmpPath (path : FilePath) : IO FilePath := do
 Writes the bytes of {lean}`content` to the new file {lean}`path`. If a file already has that name,
 does nothing.
 
-The name never holds part of {lean}`content`. The bytes go to a new temporary file next to
-{lean}`path` (see {lean}`uniqueTmpPath`), which is then hard-linked to {lean}`path` and removed. A
-hard link never replaces a file. A write that fails (e.g., on a full disk) leaves no file; one that
-stops part way (e.g., when the process is killed) leaves only the temporary file.
+The name never holds part of {lean}`content` where the file system supports hard links. The bytes
+go to a new temporary file next to {lean}`path` (see {lean}`uniqueTmpPath`), which is then
+hard-linked to {lean}`path` and removed. A hard link never replaces a file. A write that fails
+(e.g., on a full disk) leaves no file; one that stops part way (e.g., when the process is killed)
+leaves only the temporary file.
 
-Where the file system cannot hard-link, the temporary file is renamed to {lean}`path` instead. A
-rename replaces a file that took the name in the meantime (e.g., the same bytes, written by
-another process), so there the last of two concurrent writers wins; each of their files is whole.
+Where the file system cannot hard-link, the helper creates {lean}`path` exclusively and writes
+{lean}`content` into it, as it did before it used a temporary file. The first of two concurrent
+writers wins. The temporary copy is removed. On this fallback, a write that fails or stops can
+leave a partial file under {lean}`path`; atomicity needs hard links.
 
 The bytes are flushed to the operating system, not synced to the disk: after a power loss, the
 name can hold a file whose data the disk did not keep.
@@ -69,7 +71,12 @@ public partial def writeBinFileIfNew (path : FilePath) (content : ByteArray) : I
     h.flush
     match (← (IO.FS.hardLink tmp path).toBaseIO) with
     | .ok _ | .error (.alreadyExists ..) => pure () -- another process created `path` first
-    | .error _ => IO.FS.rename tmp path
+    | .error _ =>
+      let h ← try IO.FS.Handle.mk path .writeNew catch
+        | .alreadyExists .. => return -- another process created `path` first
+        | e => throw e
+      h.write content
+      h.flush
   finally
     discard <| (removeFileIfExists tmp).toBaseIO
 
