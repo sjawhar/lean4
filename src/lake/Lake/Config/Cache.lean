@@ -457,6 +457,17 @@ public def fromJson? (json : Json) : Except String RemoteCacheMapping := do
   let log ← obj.get "log"
   return {inputHash, target, srcHash?, data, sha256, log}
 
+/-- The JSON of the mapping as `lake cache push` uploads it, which `fromJson?` reads back. -/
+public protected def toJson (mapping : RemoteCacheMapping) : Json :=
+  JsonObject.empty
+  |>.insert "schemaVersion" remoteCacheSchemaVersion
+  |>.insert "inputHash" mapping.inputHash
+  |>.insert "target" mapping.target
+  |>.insert "srcHash" mapping.srcHash?
+  |>.insert "data" mapping.data
+  |>.insert "sha256" mapping.sha256
+  |>.insert "log" mapping.log
+
 def isLowerHex (c : Char) : Bool :=
   c.isDigit || c == 'a' || c == 'b' || c == 'c' || c == 'd' || c == 'e' || c == 'f'
 
@@ -487,6 +498,65 @@ public def checkedArtifactDescrs (mapping : RemoteCacheMapping) : Except String 
   return descrs
 
 end RemoteCacheMapping
+
+/-- A file to upload to the shared remote cache (see `CacheService.putRemoteObjects`). -/
+public structure RemoteUpload where
+  /-- The file to upload. -/
+  path : FilePath
+  /-- The URL of the object to create. -/
+  url : String
+  /-- The Lake content hash that names the file in messages (for a mapping, its input hash). -/
+  hash : Hash
+
+/--
+Outputs that a build compiled, queued for upload to the shared remote cache: one line of the
+write-back queue (`Cache.pushQueueFile`), which `lake cache push` empties.
+-/
+public structure RemotePushEntry where
+  /-- The name of the cache service that `LAKE_REMOTE_CACHE` named for the build. -/
+  service : String
+  /-- The remote scope of the outputs (see `remoteCacheScope`). -/
+  remoteScope : String
+  /-- The input hash of the outputs. -/
+  inputHash : Hash
+  /-- The build key of the target (see `RemoteCacheMapping`). -/
+  target : String
+  /-- The source hash of a module, or `none` for any other target. -/
+  srcHash? : Option Hash
+  /-- The outputs, as the local mapping records them (for a module, its per-file descriptors). -/
+  data : Json
+  /-- The log of the build that produced the outputs. -/
+  log : Log
+
+namespace RemotePushEntry
+
+public protected def toJson (entry : RemotePushEntry) : Json :=
+  JsonObject.empty
+  |>.insert "service" entry.service
+  |>.insert "remoteScope" entry.remoteScope
+  |>.insert "inputHash" entry.inputHash
+  |>.insert "target" entry.target
+  |>.insert "srcHash" entry.srcHash?
+  |>.insert "data" entry.data
+  |>.insert "log" entry.log
+
+public instance : ToJson RemotePushEntry := ⟨RemotePushEntry.toJson⟩
+
+public protected def fromJson? (json : Json) : Except String RemotePushEntry := do
+  let obj ← JsonObject.fromJson? json
+  return {
+    service := ← obj.get "service"
+    remoteScope := ← obj.get "remoteScope"
+    inputHash := ← obj.get "inputHash"
+    target := ← obj.get "target"
+    srcHash? := ← obj.get "srcHash"
+    data := ← obj.get "data"
+    log := ← obj.get "log"
+  }
+
+public instance : FromJson RemotePushEntry := ⟨RemotePushEntry.fromJson?⟩
+
+end RemotePushEntry
 
 /-! ## Local Cache -/
 
@@ -592,6 +662,47 @@ public def readOutputs? (cache : Cache) (scope : String) (inputHash : Hash) : Lo
 /-- Returns path to the input-to-output mappings of a downloaded package revision. -/
 @[inline] public def revisionPath (cache : Cache) (scope : String) (rev : GitRev) : FilePath :=
   cache.revisionDir / scope / s!"{rev}.jsonl"
+
+/--
+The write-back queue of the shared remote cache: one `RemotePushEntry` per line, for the outputs
+that builds compiled, which `lake cache push` uploads and removes.
+-/
+@[inline] public def pushQueueFile (cache : Cache) : FilePath :=
+  cache.dir / "push.jsonl"
+
+/-- The file whose exclusive lock guards each append to, and each rewrite of, `pushQueueFile`. -/
+@[inline] public def pushQueueLockFile (cache : Cache) : FilePath :=
+  cache.dir / "push.jsonl.lock"
+
+/-- The file whose exclusive lock the one running `lake cache push` holds. -/
+@[inline] public def pushLockFile (cache : Cache) : FilePath :=
+  cache.dir / "push.lock"
+
+/-- The queue entries that `lake cache push` refused, one JSON object per line, with the reason. -/
+@[inline] public def pushDroppedFile (cache : Cache) : FilePath :=
+  cache.dir / "push-dropped.jsonl"
+
+/-- The outcome of the last `lake cache push`. -/
+@[inline] public def pushStatusFile (cache : Cache) : FilePath :=
+  cache.dir / "remote-status-push.json"
+
+/--
+Appends `entry` to the write-back queue (`pushQueueFile`) under an exclusive lock on
+`pushQueueLockFile`, writing the whole line with one write of one buffer, so a reader that holds
+the lock never sees part of it. (A writer killed during that write can still leave part of a line,
+which `lake cache push` drops and records.)
+-/
+public def appendPushQueue (cache : Cache) (entry : RemotePushEntry) : IO Unit := do
+  IO.FS.createDirAll cache.dir
+  let line := ((toJson entry).compress.push '\n').toUTF8
+  let lock ← IO.FS.Handle.mk cache.pushQueueLockFile .append
+  lock.lock
+  try
+    let h ← IO.FS.Handle.mk cache.pushQueueFile .append
+    h.write line
+    h.flush
+  finally
+    lock.unlock
 
 end Cache
 
@@ -943,19 +1054,31 @@ structure TransferConfig where
   key : String := ""
   /-- Whether the transfers carry the cache token (see `CacheToken.get?`). -/
   cacheToken : Bool := false
+  /--
+  Whether uploads only create their objects (`x-goog-if-generation-match: 0`), so that an
+  object already present (HTTP 412) is left as it is, which is not an error.
+  Uploads that carry the cache token always do.
+  -/
+  createOnly : Bool := false
+  /-- The MIME type of uploaded files. -/
+  contentType : String := artifactContentType
+  /-- What the transferred files are, for messages. -/
+  noun : String := "artifact"
 
 structure TransferState where
   didError : Bool := false
   numSuccesses : Nat := 0
+  /-- The URLs of the successful uploads, objects already present included. -/
+  uploaded : Array String := #[]
   /-- The transfers refused with HTTP 401, to retry with a new token. -/
   unauthorized : Array TransferInfo := #[]
   /-- Whether a transfer was refused with HTTP 401 and reported as a failure. -/
   refused : Bool := false
 
 /--
-Monitors the transfers of a `curl` run. With `withToken`, an upload that finds its object already
-present (HTTP 412) succeeds. With `retryUnauthorized`, a transfer refused with HTTP 401 is not
-reported but added to `unauthorized`.
+Monitors the transfers of a `curl` run. With `withToken` (or `cfg.createOnly`), an upload that
+finds its object already present (HTTP 412) succeeds. With `retryUnauthorized`, a transfer
+refused with HTTP 401 is not reported but added to `unauthorized`.
 -/
 partial def monitorTransfer
   (cfg : TransferConfig) (withToken retryUnauthorized : Bool)
@@ -980,12 +1103,13 @@ partial def monitorTransfer
           | .ok code@201 =>
             handleTransfer info code out line
           | .ok 412 =>
-            if withToken && cfg.kind == .put then
+            if (withToken || cfg.createOnly) && cfg.kind == .put then
               discardResponse out
-              logInfo s!"{cfg.scope}: artifact {info.hash} already present\
+              logInfo s!"{cfg.scope}: {cfg.noun} {info.hash} already present\
                 \n  local path: {info.path}\
                 \n  remote URL: {info.url}"
-              modify fun s => {s with numSuccesses := s.numSuccesses + 1}
+              modify fun s => {s with
+                numSuccesses := s.numSuccesses + 1, uploaded := s.uploaded.push info.url}
             else
               handleFailure info (.ok 412) out line
               modify ({· with didError := true})
@@ -1045,10 +1169,10 @@ where
         logError s!"{tmpPath}: failed to read downloaded artifact: {e}"
         modify ({· with didError := true})
     | .put =>
-      logInfo s!"{cfg.scope}: uploaded artifact {hash}\
+      logInfo s!"{cfg.scope}: uploaded {cfg.noun} {hash}\
         \n  local path: {path}\
         \n  remote URL: {url}"
-      modify fun s => {s with numSuccesses := s.numSuccesses + 1}
+      modify fun s => {s with numSuccesses := s.numSuccesses + 1, uploaded := s.uploaded.push url}
   /- Skips the body of a response (an upload's is on `curl`'s standard output) -/
   discardResponse out : LoggerIO Unit := do
     if cfg.kind == .put then
@@ -1057,7 +1181,7 @@ where
           discard <| hOut.read size.toUSize
   handleFailure info code? out line : LoggerIO Unit := do
     let action := match cfg.kind with | .get => "download" | .put => "upload"
-    let mut msg := s!"{cfg.scope}: failed to {action} artifact {info.hash}"
+    let mut msg := s!"{cfg.scope}: failed to {action} {cfg.noun} {info.hash}"
     if let .ok code := code? then
       msg := s!"{msg} (status code: {code})"
     if let .ok errMsg := out.getAs String "errormsg" then
@@ -1085,7 +1209,8 @@ where
 /--
 Runs one `curl` process for the transfers of `cfg`, sending `token?` if it is set.
 With a token, redirects are not followed (so the token goes only to the hosts of the transfers),
-and uploads only create their objects (`x-goog-if-generation-match: 0`).
+and uploads only create their objects (`x-goog-if-generation-match: 0`), as they do with
+`cfg.createOnly`.
 Downloads go to temporary files unique to the run, which are gone when it returns.
 -/
 def runTransfer
@@ -1121,11 +1246,16 @@ def runTransfer
           h.flush
           let auth :=
             if token?.isSome then
-              #["-H", "x-goog-if-generation-match: 0"]
+              #[]
             else
               #["--aws-sigv4", "aws:amz:auto:s3", "--user", cfg.key]
+          let auth :=
+            if token?.isSome || cfg.createOnly then
+              auth ++ #["-H", "x-goog-if-generation-match: 0"]
+            else
+              auth
           return curlLeadArgs token? ++ #["-Z", "-X", "PUT"] ++ follow ++ #[
-            "-H", s!"Content-Type: {artifactContentType}",
+            "-H", s!"Content-Type: {cfg.contentType}",
             "--retry", "3" -- intermittent network errors can occur
           ] ++ auth ++ #[
             "-s", "-w", "%{stderr}%{json}\n", "--config", path.toString
@@ -1150,12 +1280,13 @@ def runTransfer
         discard <| (removeFileIfExists info.tmpPath).toBaseIO
 
 /--
-Transfers the artifacts of `cfg` with one `curl` run. If the cache token is sent and refused
+Transfers the files of `cfg` with one `curl` run. If the cache token is sent and refused
 (HTTP 401), the refused transfers are retried once in another run with a new token.
+Reports each failed transfer, and returns the state of both runs.
 -/
-def transferArtifacts
+def transferFiles
   (cfg : TransferConfig)
-: LoggerIO Unit := do
+: LoggerIO TransferState := do
   let token? ← id do
     if cfg.cacheToken then
       -- Refused if any transfer would send the token unencrypted (they all share one host)
@@ -1163,16 +1294,27 @@ def transferArtifacts
       cacheTokenFor? (info?.map (·.url) |>.getD "")
     else
       pure none
-  let mut s ← runTransfer cfg token? (retryUnauthorized := token?.isSome)
+  let s ← runTransfer cfg token? (retryUnauthorized := token?.isSome)
   if let some token := token? then
     unless s.unauthorized.isEmpty do
       let token? ← CacheToken.renew token
       let retry ← runTransfer {cfg with infos := s.unauthorized} token? (retryUnauthorized := false)
       if retry.refused then if let some token := token? then CacheToken.refused token
-      s := {
+      return {
         didError := s.didError || retry.didError
         numSuccesses := s.numSuccesses + retry.numSuccesses
+        uploaded := s.uploaded ++ retry.uploaded
       }
+  return s
+
+/--
+Transfers the artifacts of `cfg` with one `curl` run (see `transferFiles`), and fails if any
+transfer failed.
+-/
+def transferArtifacts
+  (cfg : TransferConfig)
+: LoggerIO Unit := do
+  let mut s ← transferFiles cfg
   if s.numSuccesses < cfg.infos.size then
     let action := match cfg.kind with | .get => "download" | .put => "upload"
     logError s!"{cfg.scope}: failed to {action} some artifacts"
@@ -1306,6 +1448,32 @@ public def uploadArtifacts
     return s.addIfNew url hash paths[i]
   let cacheToken := infos.all (service.sendsCacheToken ·.url)
   transferArtifacts {scope, infos, kind := .put, key := service.impl.key, cacheToken}
+
+/--
+Uploads each file of `uploads` with one `curl` run, only creating each object
+(`x-goog-if-generation-match: 0`): an object that is already present (HTTP 412) is left as it is,
+which is not an error. The requests carry the cache token if the service sends it to their host
+(see `sendsCacheToken`), and are otherwise signed with the service's key.
+
+Reports each failed upload, and returns the URLs of the uploads that succeeded.
+-/
+public def putRemoteObjects
+  (service : CacheService) (uploads : Array RemoteUpload) (contentType noun : String)
+: LoggerIO (Array String) := do
+  if uploads.isEmpty then
+    return #[]
+  let infos := uploads.map fun {path, url, hash} => ({url, hash, path} : TransferInfo)
+  let cacheToken := infos.all (service.sendsCacheToken ·.url)
+  let name := service.name?.map (·.toString) |>.getD "the remote cache"
+  if !cacheToken && service.impl.key.isEmpty then
+    error s!"uploading to `{name}` requires a token command configured through \
+      `LAKE_CACHE_TOKEN_CMD` (if `LAKE_REMOTE_CACHE` names it) or a key configured through \
+      `LAKE_CACHE_KEY`"
+  let s ← transferFiles {
+    kind := .put, scope := .ofString name, infos, key := service.impl.key
+    cacheToken, createOnly := true, contentType, noun
+  }
+  return s.uploaded
 
 /-! ### Output Transfer -/
 

@@ -83,6 +83,12 @@ public structure Env where
   environment.
   -/
   remoteCache? : Option String := none
+  /--
+  Whether builds queue the outputs they compile for upload to the `LAKE_REMOTE_CACHE` service by
+  `lake cache push` (i.e., `LAKE_REMOTE_CACHE_QUEUE`; see `Cache.pushQueueFile`). Lake does not
+  add it to `baseVars`.
+  -/
+  remoteCacheQueue : Bool := false
   /-- The initial Lean library search path of the environment (i.e., `LEAN_PATH`). -/
   initLeanPath : SearchPath
   /-- The initial Lean source search path of the environment (i.e., `LEAN_SRC_PATH`). -/
@@ -196,6 +202,7 @@ public def compute
     cacheService? := (← IO.getEnv "LAKE_CACHE_SERVICE").map (.ofString ·.trimAscii.copy)
     cacheTokenCmd? := (← IO.getEnv "LAKE_CACHE_TOKEN_CMD").filter (!·.trimAscii.isEmpty)
     remoteCache? := (← IO.getEnv "LAKE_REMOTE_CACHE").map (·.trimAscii.copy) |>.filter (!·.isEmpty)
+    remoteCacheQueue := ((← IO.getEnv "LAKE_REMOTE_CACHE_QUEUE").bind envToBool?).getD false
     githashOverride := (← IO.getEnv "LEAN_GITHASH").getD ""
     toolchain
     initLeanPath := ← getSearchPath "LEAN_PATH",
@@ -236,6 +243,20 @@ the one `LAKE_REMOTE_CACHE` names, if `LAKE_CACHE_TOKEN_CMD` is set.
 -/
 public def cacheTokenService? (env : Env) : Option String :=
   if env.cacheTokenCmd?.isSome then env.remoteCache? else none
+
+/--
+The name of the cache service whose write-back queue builds append to, if any: the one
+`LAKE_REMOTE_CACHE` names, if `LAKE_REMOTE_CACHE_QUEUE` is set, and only while the githash that
+names the remote scope (`leanGithash`) is that of the `lean` Lake runs. A `LEAN_GITHASH` that
+names another Lean would publish this Lean's outputs in that Lean's scope. (Lake passes the true
+githash to the processes it starts, so a build under `lake env` still queues.)
+-/
+public def remoteCacheQueueService? (env : Env) : Option String :=
+  if env.remoteCacheQueue && !env.lean.githash.isEmpty &&
+      (env.githashOverride.isEmpty || env.githashOverride == env.lean.githash) then
+    env.remoteCache?
+  else
+    none
 
 /-- The toolchain identifier for the Lake cache corresponding to the environment's toolchain. -/
 @[inline] public def cacheToolchain (env : Env) : CacheToolchain :=

@@ -23,6 +23,7 @@ a test picks one by pointing an endpoint at it (e.g. `.../corrupt/a0`):
             so a test can change it), and otherwise as `ok`
   redirect  302 to the same object path under the `--redirect` URL
   slow      as `ok`, but each `GET` is answered after 2 seconds
+  slowput   as `ok`, but each `PUT` is answered after 2 seconds
   oversize  mappings are normal; an artifact advertises 119596321 bytes and no body
 
 A fault that does not apply to a request kind (e.g. `badcount` on a `GET`)
@@ -47,6 +48,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from enum import StrEnum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -80,6 +82,9 @@ TOKENS = None
 # The URL that `redirect` mode sends every request to, followed by the object path
 REDIRECT = None
 
+# Serializes the request records that the handler threads write to stdout
+LOG_LOCK = threading.Lock()
+
 
 class Mode(StrEnum):
     """A fault mode, named by the first segment of a request path."""
@@ -96,6 +101,7 @@ class Mode(StrEnum):
     REDIRECT = "redirect"
     SLOW = "slow"
     OVERSIZE = "oversize"
+    SLOW_PUT = "slowput"
 
 
 def content_type(path):
@@ -127,10 +133,11 @@ class Handler(BaseHTTPRequestHandler):
         else:
             scheme = "other"
         gen = self.headers.get("x-goog-if-generation-match", "-")
-        print(
-            "%s %s -> %s auth=%s gen=%s" % (self.command, self.path, status, scheme, gen),
-            flush=True,
-        )
+        record = "%s %s -> %s auth=%s gen=%s\n" % (self.command, self.path, status, scheme, gen)
+        # One record per line: requests on other threads log their records whole
+        with LOG_LOCK:
+            sys.stdout.write(record)
+            sys.stdout.flush()
 
     def authorized(self):
         """Whether the request carries a bearer token that `--tokens` lists."""
@@ -163,12 +170,14 @@ class Handler(BaseHTTPRequestHandler):
         return mode, parts[1:], parse_qs(url.query)
 
     def respond(self, status, body, ctype):
+        # Logged before the response is sent, so that a request the client sends
+        # after it has the response is always logged after this one
+        self.log(status)
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
-        self.log(status)
 
     def not_found(self, message):
         body = json.dumps({"error": {"status": 404, "message": message}})
@@ -329,6 +338,8 @@ class Handler(BaseHTTPRequestHandler):
         elif mode == Mode.DENY:
             self.deny()
         else:
+            if mode == Mode.SLOW_PUT:
+                time.sleep(2)
             path = os.path.join(STORE, *parts)
             os.makedirs(os.path.dirname(path), exist_ok=True)
             if self.headers.get("x-goog-if-generation-match") == "0":
