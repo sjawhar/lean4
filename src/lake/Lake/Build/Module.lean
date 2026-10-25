@@ -1294,7 +1294,8 @@ where
           let arts ← mod.cacheOutputArtifacts presetup.isModule restoreAll presetup.postponeCompile
           -- Note: Cache service metadata is not preserved on an output update because it would
           -- result in downloading module outputs that are not available on the remote.
-          (← getLakeCache).writeOutputs mod.pkg.cacheScope inputHash arts.descrs (overwrite := true)
+          unless arts.cacheSkipped do
+            (← getLakeCache).writeOutputs mod.pkg.cacheScope inputHash arts.descrs (overwrite := true)
           return .complete arts
         else
           return .complete arts
@@ -1354,7 +1355,9 @@ where
               discard <| mod.buildLean presetup
             mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile
           let arts := {arts with ltar? := arts.ltar? <|> ltar?}
-          (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs
+          -- a mapping would name artifacts that the cache does not hold
+          unless arts.cacheSkipped do
+            (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs
           return arts
         else
           let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
