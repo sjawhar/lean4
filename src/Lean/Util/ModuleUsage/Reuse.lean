@@ -180,7 +180,10 @@ structure KeepRecord where
   importedClosures : Array (Name × Digest)
   /-- Each `extra` module's `moduleDigest` as the compile imported it. -/
   importedDigests : Array (Name × Digest)
-  resolved : Array (Option Name × Array (Name × UInt8))
+  /-- The imported part of the closure digest the compile computed (`importedTablesDigest`). -/
+  importedTables : Digest
+  /-- The digest of the bytes of the `.resolved` sidecar written with the `.usage` (`writeUsage`). -/
+  resolvedDigest : Digest
   resolvedAll : Bool
   specLookups : Array (Digest × Digest)
   /-- The process values the compile read, with their digests (`writeUsage`'s `values`). -/
@@ -199,7 +202,8 @@ def KeepRecord.ofUsage (j : Json) : Except String KeepRecord := do
     untracked := ← pairs "untracked"
     importedClosures := ← pairs "importedClosures"
     importedDigests := ← pairs "importedDigests"
-    resolved := ← resolvedOfJson (← j.getObjVal? "resolved")
+    importedTables := ← j.getObjValAs? Digest "importedTables"
+    resolvedDigest := ← j.getObjValAs? Digest "resolvedDigest"
     resolvedAll := ← j.getObjValAs? Bool "resolvedAll"
     specLookups := ← j.getObjValAs? (Array (Digest × Digest)) "specLookups"
     values := ← j.getObjValAs? (Array (String × Option Digest)) "values"
@@ -210,8 +214,17 @@ a check of what the module's compile resolved must not add to what this one's re
 private def moduleIdxUnrecorded? (env : Environment) (n : Name) : Option ModuleIdx :=
   env.base.get env |>.const2ModIdx[n]?
 
-/-- The reason the closure checks of `keepPermit` fail for `r` in `env`, if one does. -/
-private def closureChanged? (env : Environment) (r : KeepRecord) : IO (Option String) := do
+/-- The `.resolved` sidecar at `file` (`encodeResolved`) if its bytes have the digest `recorded` (`writeUsage`'s
+`resolvedDigest`) and decode (`ResolvedTable.decode?`), as Lake reads it (`readResolvedSidecar`). -/
+private def readResolved? (file : System.FilePath) (recorded : Digest) : IO (Option ResolvedTable) := do
+  let .ok bytes ← (IO.FS.readBinFile file).toBaseIO | return none
+  if Digest.ofBytes bytes != recorded then return none
+  return (ResolvedTable.decode? bytes).toOption
+
+/-- The reason the closure checks of `keepPermit` fail for `r` in `env`, if one does. `resolvedFile` is the `.resolved`
+sidecar written with the `.usage`. -/
+private def closureChanged? (env : Environment) (r : KeepRecord) (resolvedFile : System.FilePath) :
+    IO (Option String) := do
   let s := state env
   let lib := toString (← getLibDir (← getBuildDir))
   let recordedDigested : NameSet := r.digested.foldl (·.insert ·.1) {}
@@ -245,17 +258,40 @@ private def closureChanged? (env : Environment) (r : KeepRecord) : IO (Option St
       let now? := (env.getModuleIdx? m).bind s.importedDigests?
       unless now?.map sel == some d do
         return some s!"the {field} of `{m}` is not what the module was compiled against"
-  -- every name resolution, unrecorded
+  -- every closure module's tables, as this environment holds them: an import's recorded closure can describe a
+  -- dependency that another workspace rewrote after the import was compiled (Lake's `closureEdgesCurrent`)
+  unless importedTablesDigest env == r.importedTables do
+    return some "the cross-module compiler tables of the import closure are not what the module was compiled against"
+  -- every name the compile resolved that an import whose provides changed provides now resolves as it did, unrecorded,
+  -- and every name it resolved to such an import is still provided by it (Lake's `ResolvedTable.providerUnchanged`); an
+  -- import whose provides are unchanged gives no name another resolution
   let describe (m? : Option Name) (k : UInt8) : String :=
     m?.elim "the module itself or no module" fun m => s!"`{m}` (kinds {k})"
-  for (m?, ns) in r.resolved do
-    for (n, k) in ns do
+  let mut table? : Option ResolvedTable := none
+  for (m, i) in env.header.moduleNames.zipIdx do
+    let some (_, recorded) := r.digested.binSearch (m, default) (Name.quickLt ·.1 ·.1) | continue
+    if s.importedProvides? i == some recorded then continue
+    if table?.isNone then
+      table? ← readResolved? resolvedFile r.resolvedDigest
+    let some t := table? | return some "the `.resolved` sidecar is missing or is not the one the `.usage` records"
+    let g? := t.modules.findIdx? (· == some m)
+    let (kernel, extra) := importedOwnProvides env i
+    let mut seen : NameHashSet := {}
+    let mut found := 0
+    for n in kernel ++ extra do
+      if seen.contains n then continue
+      seen := seen.insert n
+      let some (g, k) := t.entries[resolvedId n]? | continue
+      let m? := t.modules[g]!
       let i? := moduleIdxUnrecorded? env n
       let now? := i?.map (env.header.moduleNames[·.toNat]!)
       let k' := i?.elim 0 (providedKinds env · n)
       unless now? == m? && k' == k do
         return some s!"resolution changed: `{n}` resolved to {describe m? k} when the module was compiled, and \
           resolves to {describe now? k'} here"
+      if some g == g? && k != 0 then found := found + 1
+    unless found == g?.elim 0 (t.provided[·]!) do
+      return some s!"resolution changed: `{m}` no longer provides a name the module resolved to it"
   if r.resolvedAll && digestedModules env != r.digested then
     return some "resolution changed: the compile read the defining module of every name, and the imported modules' \
       provides differ here"
@@ -284,7 +320,7 @@ private def keepPermitCore (env : Environment) (module : Name) (olean usage : Sy
   unless r.githash == Lean.githash do return .error s!"the `.usage` was written by another Lean ({r.githash})"
   if checkNoreuse && r.noreuse then return .error "the module's commands cannot be kept (`noreuse`)"
   unless (← fileDigest olean) == r.olean do return .error "the `.usage` was not written with this `.olean`"
-  if let some reason ← closureChanged? env r then return .error reason
+  if let some reason ← closureChanged? env r (usage.withExtension "resolved") then return .error reason
   if let some reason ← valuesChanged? r then return .error reason
   let (data, _) ← readModuleData olean
   let payloads ← match CommandEntries.ofModuleData? data with
@@ -302,9 +338,12 @@ skips the module (`Module.usageUpToDate`), asked of `env` directly:
   them outside the toolchain is the same `.olean` (`untrackedImports`; Lake's `modsysHash`);
 - every direct import's `closureDigest` (`closureHash`) and every `extra` module's `moduleDigest` are as the compile
   imported them (Lake also compares an extra module's `.olean` bytes, through the `.usekey`, which the compile does not
-  record);
-- every recorded name resolves to the same module, which provides it with the same kinds, and, where the compile read
-  the resolver's whole map, every import with digests provides the same names (`UsageSidecar.resolvedUnchanged`); these
+  record), and the cross-module compiler tables of every closure module are as the compile read them
+  (`importedTablesDigest`, where Lake checks that every edge of the closure is current: `closureEdgesCurrent`);
+- for every import whose provides changed, every name the compile resolved (the `.resolved` sidecar beside the
+  `.usage`, bound to it by its digest) that the import provides now resolves to the same module, which provides it with
+  the same kinds, and every name the compile resolved to the import is still provided by it; where the compile read the
+  resolver's whole map, every import with digests provides the same names (`UsageSidecar.resolvedUnchanged`); these
   lookups are not recorded (`moduleIdxUnrecorded?`);
 - every specialization-cache key the compile looked up has the same providers (`UsageSidecar.specProvidersUnchanged`).
 Then every process value the compile read (an environment variable, the working directory, the executable's path, the

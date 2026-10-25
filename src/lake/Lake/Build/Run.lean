@@ -363,8 +363,8 @@ def mkBuildContext
     else
       return none
   registeredJobs := jobs
-  sidecarCache := ← Std.Mutex.new {}
-  fileDigests := ← Std.Mutex.new {}
+  sidecarCache := ← Shards.new {}
+  fileDigests := ← Shards.new {}
   kernelProviders := ← Std.Mutex.new {}
   leanTrace := .ofHash (pureHash ws.lakeEnv.leanGithash)
     s!"Lean {Lean.versionStringCore}, commit {ws.lakeEnv.leanGithash}"
@@ -492,6 +492,7 @@ public def Workspace.runBuild
   let bctx ← mkBuildContext ws cfg jobs cancelTk?
   let job ← startBuild bctx build
   let result ← monitorBuild mctx job
+  if cfg.forgetContext then Runtime.forget bctx
   finalizeBuild cfg bctx mctx result
 
 /-- Produce a build job in the Lake monad's workspace and await the result. -/

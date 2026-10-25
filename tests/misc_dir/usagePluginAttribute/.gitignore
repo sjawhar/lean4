@@ -2,3 +2,4 @@
 *.so
 *.olean
 *.usage
+*.resolved
