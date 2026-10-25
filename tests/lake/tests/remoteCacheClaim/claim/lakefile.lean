@@ -18,6 +18,10 @@ lean_lib Claim
 lean_lib Extra where
   roots := #[`Claim.Flaky, `Claim.Slow]
 
+/-- Two roots that import `Claim.A` and `Claim.B` in opposite orders, built only when named. -/
+lean_lib Order where
+  roots := #[`Order.AB, `Order.BA]
+
 lean_exe claimexe where
   root := `Main
 
