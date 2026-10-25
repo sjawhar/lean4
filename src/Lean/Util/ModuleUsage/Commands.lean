@@ -342,14 +342,13 @@ private inductive UseDigests where
   /-- no digest stands for the name; `commandRecords` writes no records -/
   | unattributed (reason : String)
 
-/-- The constants the transient declaration `n` stands for: what it used, each transient declaration among
-those replaced in turn. -/
-private partial def transientDeps (transient : Std.HashMap Name NameSet) (seen out : NameSet) :
-    List Name → NameSet
+/-- The constants the transient declaration `n` stands for: what it used (`transient`), each transient declaration
+among those replaced in turn. -/
+private partial def transientDeps (transient : Name → Option NameSet) (seen out : NameSet) : List Name → NameSet
   | [] => out
   | c :: cs =>
     if seen.contains c then transientDeps transient seen out cs
-    else match transient[c]? with
+    else match transient c with
       | some ds => transientDeps transient (seen.insert c) out (ds.toList ++ cs)
       | none => transientDeps transient (seen.insert c) (out.insert c) cs
 
@@ -369,10 +368,16 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
     stmt.foldl (fun m (n, d, a) => m.insert n (d, a)) {}
   let fs := state env
   -- A declaration this module elaborated in an environment it then discarded (`example`, `#eval`, or a
-  -- realization first requested inside one) has no digest; a use of it stands for the uses of what it used.
-  let transient : Std.HashMap Name NameSet := declEntries.foldl (init := {}) fun m (_, ns, used) =>
+  -- realization first requested inside one) has no digest; a use of it stands for the uses of what it used. A command
+  -- uses its own such declaration under a name another command may declare too (every `#eval` declares `_eval`), so
+  -- its own come first.
+  let addTransient (m : Std.HashMap Name NameSet) (ns : Array Name) (used : NameSet) :=
     ns.foldl (init := m) fun m n =>
       if env.contains n then m else m.insert n (used.foldl (·.insert ·) (m.getD n {}))
+  let transient : Std.HashMap Name NameSet :=
+    declEntries.foldl (init := {}) fun m (_, ns, used) => addTransient m ns used
+  let transientByCmd : Std.HashMap Nat (Std.HashMap Name NameSet) :=
+    declEntries.foldl (init := {}) fun m (i, ns, used) => m.insert i (addTransient (m.getD i {}) ns used)
   let digestsOf (i : Nat) (n : Name) : Except String UseDigests := do
     if !env.contains n then
       return .unattributed s!"command {i} uses `{n}`, which names no constant of this module or its imports"
@@ -448,10 +453,12 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
       if let some ci := env.find? n then
         if !isStmtOnly ci then full := full.insert n
     -- a transient declaration's uses count as full: it may have been evaluated
+    let ownTransient := transientByCmd.getD obs.i {}
+    let transientOf (n : Name) : Option NameSet := ownTransient[n]? <|> transient[n]?
     let mut usedAll : NameSet := {}
     for n in refsSet.foldl (·.insert ·) full do
-      if transient.contains n then
-        for d in transientDeps transient {} {} [n] do
+      if (transientOf n).isSome then
+        for d in transientDeps transientOf {} {} [n] do
           usedAll := usedAll.insert d
           full := full.insert d
       else

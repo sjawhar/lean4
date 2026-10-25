@@ -1,0 +1,7 @@
+M: exit 0
+1
+5
+command 0: uses `later`: false
+command 1: uses `later`: false
+command 2: uses `later`: true
+command 3: uses `later`: false
