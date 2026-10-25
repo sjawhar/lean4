@@ -867,6 +867,19 @@ inductive TransferKind
   | put
   deriving DecidableEq
 
+/--
+Writes `contents` as the cache artifact `path`: to a new temporary file next to it (see
+`uniqueTmpPath`), which is then renamed to `path`. A process that reads `path` meanwhile (e.g., a
+build that inserts the same entry) sees the old file or the whole new one, never a part.
+-/
+def writeArtifactCopy (path : FilePath) (contents : ByteArray) : IO Unit := do
+  let tmp ← uniqueTmpPath path
+  try
+    IO.FS.writeBinFile tmp contents
+    IO.FS.rename tmp path
+  finally
+    discard <| (removeFileIfExists tmp).toBaseIO
+
 structure TransferInfo where
   url : String
   hash : Hash
@@ -1015,7 +1028,7 @@ where
           unless extraPaths.isEmpty do
             -- Note: No intra-cache hard links (breaks permissions/pruning), so we copy
             for extraPath in extraPaths do
-              if let .error e ← IO.FS.writeBinFile extraPath contents |>.toBaseIO then
+              if let .error e ← (writeArtifactCopy extraPath contents).toBaseIO then
                 logError s!"{extraPath}: failed to copy artifact: {e}"
                 modify ({· with didError := true})
           modify fun s => {s with numSuccesses := s.numSuccesses + 1}
@@ -1228,7 +1241,7 @@ where
     -- Note: No intra-cache hard links (breaks permissions/pruning), so we copy
     let contents ← IO.FS.readBinFile path
     for extraPath in extraPaths do
-      IO.FS.writeBinFile extraPath contents
+      writeArtifactCopy extraPath contents
   fetchUrls url infos := IO.FS.withTempFile fun h path => do
     let body := Json.arr <| infos.map (toJson ·.hash)
     h.putStr body.compress

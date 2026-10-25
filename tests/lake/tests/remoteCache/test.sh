@@ -247,12 +247,14 @@ case_token_cmd_time_limit() {
   # report it without running the command again, and the build compiles locally as soon as
   # the command is stopped
   fresh
-  rm -f "$TOKEN_RUNS"
+  rm -f "$TOKEN_RUNS" token-sid
   : > "$SERVER_LOG"
   local start elapsed rc
   start="$(date +%s)"
+  # The command records its session (Lake starts it in a session of its own), so that the check
+  # below sees only this test's processes, not those of another copy of the suite on the machine
   if LAKE_REMOTE_CACHE=bearer \
-      LAKE_CACHE_TOKEN_CMD="echo run >> '$TOKEN_RUNS'; echo printed-by-the-command; sleep 7531" \
+      LAKE_CACHE_TOKEN_CMD="echo \$\$ > '$WORK_DIR/token-sid'; echo run >> '$TOKEN_RUNS'; echo printed-by-the-command; sleep 7531" \
       timeout 300 "$LAKE" -v build Test native > produced.out 2>&1; then rc=0; else rc=$?; fi
   elapsed=$(($(date +%s) - start))
   cat produced.out
@@ -264,8 +266,11 @@ case_token_cmd_time_limit() {
   test_cmd_eq 1 token_runs
   test_cmd_eq 0 count ' -> ' "$SERVER_LOG"
   test_exp "$elapsed" -lt 90
-  ps -eo args > processes
-  test_cmd_eq 0 count '^sleep 7531$' processes
+  # No process of the command's session is left
+  test_exp -s token-sid
+  ps -o pid=,args= -s "$(cat token-sid)" > processes || true
+  cat processes
+  test_cmd_eq 0 count . processes
 }
 
 case_token_cmd_time_limit_cache() {

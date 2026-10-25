@@ -50,10 +50,11 @@ def built_by(args):
 
 
 def state(args):
-    """Checks the state of a claim object, and that its holder and time are well-formed."""
+    """Checks the state of a claim object (one of `expect`, separated by commas), and that its
+    holder and time are well-formed."""
     with open(args.file) as f:
         claim = json.load(f)
-    if claim.get("state") != args.expect:
+    if claim.get("state") not in args.expect.split(","):
         sys.exit(f"claim {claim}, expected state {args.expect!r}")
     if not re.fullmatch(r"[^\s:]+:[0-9]+", claim.get("holder", "")):
         sys.exit(f"claim {claim} has no `<host>:<pid>` holder")
@@ -83,6 +84,16 @@ def wait_entries(args):
             return
         time.sleep(0.05)
     sys.exit(f"{args.dir} holds {n} entries after {args.timeout} s, expected {args.n}")
+
+
+def wait_file(args):
+    """Waits until a path exists."""
+    deadline = time.time() + args.timeout
+    while time.time() < deadline:
+        if os.path.exists(args.file):
+            return
+        time.sleep(0.05)
+    sys.exit(f"{args.file} does not exist after {args.timeout} s")
 
 
 def fds(args):
@@ -141,6 +152,11 @@ def main():
     p.add_argument("n", type=int)
     p.add_argument("--timeout", type=float, default=60)
     p.set_defaults(run=wait_entries)
+
+    p = sub.add_parser("wait-file", help=wait_file.__doc__)
+    p.add_argument("file")
+    p.add_argument("--timeout", type=float, default=60)
+    p.set_defaults(run=wait_file)
 
     p = sub.add_parser("fds", help=fds.__doc__)
     p.add_argument("pid", type=int)

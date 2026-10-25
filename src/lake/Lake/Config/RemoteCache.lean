@@ -131,6 +131,11 @@ public def remoteClaimScope (remoteScope : String) : String :=
 public inductive RemoteClaimState
 /-- The holder compiles the input. -/
 | building
+/--
+The holder compiled the input and queued its outputs for its `lake cache push`, which uploads
+them after the holder's build may have ended.
+-/
+| queued
 /-- The compile failed, or ended with nothing to publish: a waiting build compiles the input. -/
 | failed
 /-- The mapping of the input is in the remote cache. -/
@@ -141,6 +146,7 @@ namespace RemoteClaimState
 
 public def toString : RemoteClaimState → String
 | .building => "building"
+| .queued => "queued"
 | .failed => "failed"
 | .done => "done"
 
@@ -150,6 +156,7 @@ public instance : ToJson RemoteClaimState := ⟨(toJson ·.toString)⟩
 public instance : FromJson RemoteClaimState := ⟨fun json => do
   match (← fromJson? json : String) with
   | "building" => return .building
+  | "queued" => return .queued
   | "failed" => return .failed
   | "done" => return .done
   | s => throw s!"unknown claim state: {s}"⟩
