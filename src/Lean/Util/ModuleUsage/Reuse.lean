@@ -186,6 +186,24 @@ def startModuleRecords (env : Environment) (sessionChanged : Bool) (kept : Array
 def PendingRecords.payloads (p : PendingRecords) : IO (Array CommandEntries) :=
   return (← IO.ofExcept (← IO.wait p.payloadsTask)).map (·.1)
 
+/-- The first kept command whose context over the final payloads of the commands before it (`CtxChain`, as
+`commandRecords` computes it) is not the one it was kept in, its record's: the runtime noted an effect of an elaborated
+command after the keep compared that command's payload. Its outputs would not be a fresh build's. -/
+def PendingRecords.keptContextChanged? (p : PendingRecords) : IO (Option Nat) := do
+  if p.kept.isEmpty || p.done?.isSome then return none
+  let byIdx : Std.HashMap Nat (CommandEntries × Digest) :=
+    (← IO.ofExcept (← IO.wait p.payloadsTask)).foldl (fun m (ce, d) => m.insert ce.idx (ce, d)) {}
+  let steps := (p.observations.map fun o => (o.i, o.stx, o.before, (none : Option Digest))) ++
+    p.kept.map fun k => (k.i, k.stx, k.before, some k.record.ctx)
+  let mut chain : CtxChain := {}
+  for (i, stx, before, kept?) in steps.qsort (·.1 < ·.1) do
+    let (ctx, chain') := chain.ctx before
+    chain := chain'
+    if kept?.any (· != ctx) then return some i
+    if let some (ce, d) := byIdx[i]? then
+      chain := chain.push ce d (textDigest stx) ctx
+  return none
+
 /-- The module's records and `noreuse` reason, from `p`, the digests of the module's constants (`own`, `stmt`) and its
 nodes (`ownNodes`, whose refs include what compiled code mentions):
 - a command that used a name no digest stands for: no records, `noreuse` (`commandRecords`);
@@ -207,6 +225,8 @@ structure KeepRecord where
   module : Name
   /-- The digest of the `.olean` written with the `.usage`. -/
   olean : Digest
+  /-- The digest of the `.ilean` written with the `.usage`, if one was. -/
+  ilean : Option Digest
   githash : String
   /-- The imports with digests, each with its provides digest (`digestedModules`). -/
   digested : Array (Name × Digest)
@@ -230,6 +250,7 @@ def KeepRecord.ofUsage (j : Json) : Except String KeepRecord := do
   return {
     module := ← nameOfJson? (← j.getObjVal? "module")
     olean := ← j.getObjValAs? Digest "olean"
+    ilean := ← j.getObjValAs? (Option Digest) "ilean"
     githash := ← j.getObjValAs? String "githash"
     digested := ← pairs "digested"
     untracked := ← pairs "untracked"
@@ -368,6 +389,10 @@ private def keepPermitCore (env : Environment) (module : Name) (files : PermitFi
   if let some reason ← valuesChanged? r then return .error reason
   let some data? := files.data? | throw <| IO.userError "the `.olean` was not read"
   let (data, payloads?) ← MonadExcept.ofExcept data?
+  -- the order of the imports decides, for example, which of two instances of equal priority is found first; the
+  -- closure checks compare the imported modules one by one, not their order
+  unless data.imports == env.header.imports do
+    return .error "the module's imports are not those it was compiled with, in the same order"
   let payloads ← match payloads? with
     | .ok payloads => pure payloads
     | .error e => return .error s!"the `.olean`'s command payloads cannot be read: {e}"
@@ -391,7 +416,7 @@ skips the module (`Module.usageUpToDate`), asked of `env` directly:
 - every specialization-cache key the compile looked up has the same providers (`UsageSidecar.specProvidersUnchanged`).
 Then every process value the compile read (an environment variable, the working directory, the executable's path, the
 toolchain root of a toolchain file a command read) is the same in this process (`valuesChanged?`), which Lake's checks
-do not cover.
+do not cover. Last, the module's imports are those of the `.olean`, in the same order and with the same modifiers.
 The module's own inputs, and what each command used (its record's uses), are its caller's to check. `lib?` is the
 toolchain's library directory, which a run that records usage reads before recording starts (`getLibDir`, through the
 executable's path): read here, it would be one of the run's process values. -/

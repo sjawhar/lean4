@@ -845,6 +845,11 @@ def untrackedImports (env : Environment) : IO (Array (Name × Digest)) := do
 def valueDigest? (v? : Option String) : Option Digest :=
   v?.map fun v => (({} : Enc).str v).finish
 
+/-- What a command record's `fileContext` compares, by what the command read (`FileContextRead`): the digest of the
+module's file name `fileName` (`fileName`) and of its whole source `source` (`source`). -/
+def fileContextDigests (fileName source : String) : Array (String × Digest) :=
+  #[("fileName", (({} : Enc).str fileName).finish), ("source", (({} : Enc).str source).finish)]
+
 /-- `s` as the runtime writes a file's stamp: its fields in decimal, separated by `:`. -/
 def FileStamp.toRecorded (s : FileStamp) : String :=
   s!"{s.dev}:{s.ino}:{s.size}:{s.mtimeSec}:{s.mtimeNsec}:{s.ctimeSec}:{s.ctimeNsec}"
@@ -903,12 +908,13 @@ private def addValueReads (reads : Std.HashMap Nat (Array String)) (c : Json) : 
 
 /-- What a reuse run (`Lean.Elab.Reuse`) takes into a module's `.usage` from the previous build's for the commands it
 kept, which it did not elaborate and so did not observe: the kept records' extra module uses and process values (with
-the previous `.usage`'s digests, which the keep permit found equal to this process's), and the observations of the
-previous `.usage` that no record attributes to a command (the names it resolved, whether it read the resolver's whole
-map, the specialization-cache keys it looked up, whether a compile made every import an extra use). -/
+the previous `.usage`'s digests, which the keep permit found equal to this process's, and the first kept command that
+read each), and the observations of the previous `.usage` that no record attributes to a command (the names it
+resolved, whether it read the resolver's whole map, the specialization-cache keys it looked up, whether a compile made
+every import an extra use). -/
 structure Carried where
   extra : Array (Name × Bool) := #[]
-  values : Array (String × Option Digest) := #[]
+  values : Array (String × Option Digest × Nat) := #[]
   resolved : Array Name := #[]
   resolvedAll : Bool := false
   specKeys : Array Digest := #[]
@@ -934,7 +940,8 @@ is set when the run reused commands from an `--incr-load` snapshot, since reused
 this process and `used` may miss constants they used.
 
 The fields for keeping the module's commands one by one (`ModuleUsage.keepPermit`): `module`, the module's name; `olean`,
-the digest of the `.olean` written beside it (`oleanDigest`, `fileDigest`), which holds the command payloads;
+the digest of the `.olean` written beside it (`oleanDigest`, `fileDigest`), which holds the command payloads; `ilean`,
+the digest of the `.ilean` written beside it, if one was (`ileanDigest?`), which holds the kept commands' references;
 `githash`, the Lean that wrote both; `untracked`, the imports without digests outside the toolchain with their `.olean`
 digests (`untrackedImports`); `values`, each process value the run read (`takeValueReads`, taken before this
 function's own lookups, such as `untrackedImports`' of the toolchain's path) with the digest of its value
@@ -955,7 +962,7 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
     (provides : Array Name × Array Name) (indirect : Array Name) (used : NameSet) (lookups : Array Expr)
     (stmt : Array (Name × Digest × Digest)) (commands : Array Json) (incrLoaded : Bool) (path : System.FilePath)
     (oleanDigest : Digest) (noreuseReason? : Option String := none) (carried : Carried := {})
-    (reuse? : Option Json := none) : IO Unit := do
+    (reuse? : Option Json := none) (ileanDigest? : Option Digest := none) : IO Unit := do
   let s := state env
   let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecks)
   let allExtra := carried.extra.foldl (init := allExtra) fun es (m, isMeta) =>
@@ -993,16 +1000,29 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
   let names := (names : Std.HashSet Name).fold addInternalPrefixes names
   let reads ← takeValueReads
   let readers ← commandValueKeys reads (commands.filterMap fun c => (c.getObjValAs? Nat "i").toOption)
+  -- per value, the first command that read it, itself or through a realization it used
+  let firstReader : Std.HashMap String Nat := readers.fold (init := {}) fun m i ks =>
+    ks.foldl (fun m k => if m[k]?.any (· ≤ i) then m else m.insert k i) m
   -- a value `recordedValue?` cannot give (the SAT solver's bytes) leaves nothing a keep could compare
   let values ← reads.mapM fun (k, v?, changed, _) => do
-    try return (k, ← recordedValue? k v?, changed, none)
-    catch e => return (k, none, changed, some s!"the process value {k} cannot be recorded: {e}")
+    try return (k, valueDigest? (← recordedValue? k v?), changed, firstReader[k]?, none)
+    catch e => return (k, none, changed, firstReader[k]?, some s!"the process value {k} cannot be recorded: {e}")
+  -- a kept command read its values in the previous build: they join this run's reads in command order (a read outside
+  -- any command, `none`, comes first), and one this run read with another digest changed while the module was compiled
+  let kept : Std.HashMap String (Option Digest × Nat) := carried.values.foldl (fun m (k, d?, i) => m.insert k (d?, i)) {}
+  let values : Array (String × Option Digest × Bool × Option String) :=
+    values.map fun (k, d?, changed, first?, err?) => match kept[k]? with
+      | none => (k, d?, changed, err?)
+      | some (c?, i) =>
+        let carriedFirst := first?.any (i < ·)
+        (k, if carriedFirst then c? else d?, changed || c? != d?, err?)
+  let readKeys : Std.HashSet String := values.foldl (·.insert ·.1) {}
+  let carriedOnly : Array (String × Option Digest × Bool × Option String) :=
+    carried.values.filterMap fun (k, d?, _) => if readKeys.contains k then none else some (k, d?, false, none)
+  let values := (values ++ carriedOnly).qsort (·.1 < ·.1)
   let untracked ← untrackedImports env
   let noreuseReason? := noreuseReason? <|> values.findSome? (·.2.2.2) <|> values.findSome? fun (k, _, changed, _) =>
     guard changed *> some s!"the process value {k} changed while the module was compiled"
-  let readKeys : Std.HashSet String := values.foldl (·.insert ·.1) {}
-  let readDigests : Array (String × Option Digest) := values.map fun (k, v?, _, _) => (k, valueDigest? v?)
-  let valueDigests := (readDigests ++ carried.values.filter (!readKeys.contains ·.1)).qsort (·.1 < ·.1)
   let commands := if readers.isEmpty then commands else commands.map (addValueReads readers)
   let fields : List (String × Json) := [("version", usageVersion), ("noskip", incrLoaded),
     ("moduleDigest", toJson (moduleDigestOf own)),
@@ -1028,9 +1048,10 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
       Json.arr #[toJson k, toJson p])),
     ("module", nameToJson env.mainModule),
     ("olean", toJson oleanDigest),
+    ("ilean", toJson ileanDigest?),
     ("githash", toJson Lean.githash),
     ("untracked", Json.arr (untracked.map fun (m, d) => pair m d)),
-    ("values", Json.arr (valueDigests.map fun (k, d?) => Json.arr #[toJson k, toJson d?])),
+    ("values", Json.arr (values.map fun (k, d?, _) => Json.arr #[toJson k, toJson d?])),
     ("noreuse", noreuseReason?.isSome)]
   let fields := match noreuseReason? with
     | some reason => fields ++ [("noreuseReason", toJson reason)]

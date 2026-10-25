@@ -1,0 +1,10 @@
+IO.Ref: exit codes: reuse 0, fresh 0; output equal: true
+IO.Ref: olean equal to the fresh build's: true; ilean equal: true
+IO.Ref: usage fields differing from the fresh build's but `reuse`: []
+IO.Ref: reuse run keeps d: false
+IO.Ref: d: reuse run "B", fresh "B"
+env var: exit codes: reuse 0, fresh 0; output equal: true
+env var: olean equal to the fresh build's: true; ilean equal: true
+env var: usage fields differing from the fresh build's but `reuse`: []
+env var: reuse run keeps d: false
+env var: d: reuse run "B", fresh "B"

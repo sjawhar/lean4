@@ -219,6 +219,18 @@ structure CommandRecord where
   caches : CommandCachesRecord
   /-- The process values the command read (`takeValueReads`), sorted: `writeUsage` adds those of the run. -/
   values : Array String := #[]
+  /-- The messages the command reported, in reporting order (`SerialMessage` as JSON); `none` if a build cannot show
+  them again as the command would: a message whose text is made when it is printed (an expression, a goal, a trace)
+  or that is positioned outside the command's span. Filled by `runFrontend`. -/
+  messages? : Option (Array Json) := some #[]
+  /-- How many entries the command added to the persistent lint log (`Linter.lintLogExt`), which lists each command's
+  entries together. Filled by `runFrontend`. -/
+  lints : Nat := 0
+  /-- Whether the state of a stateful linter changed in the command (`Command.State.prevLinterStates`). -/
+  linterState : Bool := false
+  /-- What the command read of its file beyond its own source (`getFileName`: `fileName`; `getFileMap`: `source`), with
+  the digest of the file name or of the whole source then. Filled by `runFrontend`. -/
+  fileContext : Array (String × Digest) := #[]
   deriving Inhabited, BEq
 
 instance : ToJson CommandRecord := ⟨fun r => Json.mkObj [
@@ -228,7 +240,9 @@ instance : ToJson CommandRecord := ⟨fun r => Json.mkObj [
   ("usesStmt", .arr (r.usesStmt.map fun (n, d) => .arr #[nameToJson n, toJson d])),
   ("usesFull", .arr (r.usesFull.map fun (n, d, a) => .arr #[nameToJson n, toJson d, toJson a])),
   ("extra", .arr (r.extra.map fun (m, isMeta) => .arr #[nameToJson m, isMeta])),
-  ("post", toJson r.post), ("caches", toJson r.caches), ("values", toJson r.values)]⟩
+  ("post", toJson r.post), ("caches", toJson r.caches), ("values", toJson r.values),
+  ("messages", toJson r.messages?), ("lints", r.lints), ("linterState", r.linterState),
+  ("fileContext", toJson r.fileContext)]⟩
 
 instance : FromJson CommandRecord := ⟨fun j => return {
   i := ← j.getObjValAs? Nat "i"
@@ -248,7 +262,11 @@ instance : FromJson CommandRecord := ⟨fun j => return {
   extra := (← j.getObjValAs? (Array (JName × Bool)) "extra").map fun (m, b) => (m.name, b)
   post := ← j.getObjValAs? CommandPost "post"
   caches := ← j.getObjValAs? CommandCachesRecord "caches"
-  values := ← j.getObjValAs? (Array String) "values" }⟩
+  values := ← j.getObjValAs? (Array String) "values"
+  messages? := ← j.getObjValAs? (Option (Array Json)) "messages"
+  lints := ← j.getObjValAs? Nat "lints"
+  linterState := ← j.getObjValAs? Bool "linterState"
+  fileContext := ← j.getObjValAs? (Array (String × Digest)) "fileContext" }⟩
 
 private def matcherKeyDigest (value : Expr) (compile isPrivate : Bool) : Digest :=
   (({} : Enc).digest (exprDigest .namesInfos .eqv value) |>.bool compile |>.bool isPrivate).finish
@@ -452,6 +470,17 @@ private partial def transientDeps (transient : Name → Option NameSet) (seen ou
       | some ds => transientDeps transient (seen.insert c) out (ds.toList ++ cs)
       | none => transientDeps transient (seen.insert c) (out.insert c) cs
 
+private unsafe def linterStateChangedImpl (inits : Array Elab.Command.LinterState) (before after : Elab.Command.State) :
+    Bool :=
+  let states (s : Elab.Command.State) := s.prevLinterStates.elim inits Task.get
+  let (b, a) := (states before, states after)
+  b.size != a.size || (b.zip a).any fun (x, y) => !ptrEq x y
+
+/-- Whether the state of a stateful linter changed from `before` to `after` (`Command.State.prevLinterStates`, whose
+`none` stands for the initial states `inits`). A state the linter returned unchanged is the same object. -/
+@[implemented_by linterStateChangedImpl]
+private opaque linterStateChanged (inits : Array Elab.Command.LinterState) (before after : Elab.Command.State) : Bool
+
 /-- The per-command records of `observations` and `kept` (each in command order), or why there are none: a command
 used a name no digest stands for, one that names no constant (a declaration the kernel or the elaborator rejected
 referred to it; an IR-only name) or a constant of this module the kernel environment does not hold. None of the
@@ -469,6 +498,7 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
     (stmt : Array (Name × Digest × Digest)) (payloads : Array (CommandEntries × Digest)) (lanes : Nat := 4)
     (kept : Array KeptCommand := #[]) (nodes : Array Node := #[]) : IO (Except String (Array CommandRecord)) := do
   let declEntries ← declsByContext
+  let linterInits ← Elab.Command.initialLinterStates
   let ctxsByIdx : Std.HashMap Nat (Array UInt32) ←
     observations.foldlM (init := {}) fun m o => return m.insert o.i (← commandContexts o.i)
   let fullLocal : Std.HashMap Name Digest := own.foldl (fun m (n, d) => m.insert n d) {}
@@ -573,6 +603,7 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
       decls, aux, usesStmt := #[], usesFull := #[], extra := #[]
       post := CommandPost.ofStates before after
       caches := { matcher, auxLemma, eqnsInv, sparseCasesOn, structRes }
+      linterState := linterStateChanged linterInits before after
     })
   -- each command's record but for what chains through the commands before it (a non-declaration's `key`, `ctx`)
   let part (obs : CommandObservation) : CommandPart := Id.run do
@@ -643,8 +674,10 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
     let (usesStmt, usesFull) ← match usesOf k.i used full compiled with
       | .ok uses => pure uses
       | .error p => return p
-    -- the command did not run here: the process values it read are those of its previous run
-    return .record { r with usesStmt, usesFull, extra := k.record.extra, values := k.record.values }
+    -- the command did not run here: what it read and did beyond its payload is its previous run's
+    return .record { r with
+      usesStmt, usesFull, extra := k.record.extra, values := k.record.values, linterState := k.record.linterState
+      fileContext := k.record.fileContext }
   let parts ← CommandEntries.parallelMap observations (lanes := lanes) fun obs =>
     pure (obs.i, obs.stx, obs.before, (none : Option Digest), part obs)
   let parts := (parts ++ kept.map fun k => (k.i, k.stx, k.before, some k.record.ctx, keptPart k)).qsort (·.1 < ·.1)

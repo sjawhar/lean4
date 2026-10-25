@@ -1,0 +1,8 @@
+first build: exit 0
+usage lines tampered: 1
+exit codes: reuse 0, fresh 0
+reuse run output: ""
+output equal to the fresh build's: true
+olean equal to the fresh build's: true
+ilean equal to the fresh build's: true
+usage equal to the fresh build's but `reuse`: true

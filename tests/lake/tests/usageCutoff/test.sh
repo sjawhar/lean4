@@ -702,6 +702,12 @@ rm -f $M.olean && cp .lake/build/lib/lean/Test/A.olean $M.olean
 printf 'theorem L : 1 = 1 := by rfl\ndef v := 10\n' > Test/A.lean
 test_out "Built Test.M" build -v Test.N
 match_text '"reuse":{"declined":"olean-hash-mismatch"}' $M.usage
+# an `.ilean` that is not the previous build's (here A's, which parses) cannot give the kept commands' references:
+# the module is compiled in full
+rm -f $M.ilean && cp .lake/build/lib/lean/Test/A.ilean $M.ilean
+printf 'theorem L : 1 = 1 := by rfl\ndef v := 20\n' > Test/A.lean
+test_out "Built Test.M" build -v Test.N
+match_text '"reuse":{"declined":' $M.usage
 # a module-system file is never partially compiled again
 printf 'module\n\npublic def ms := 1\n' > Test/MS.lean
 test_run build Test.MS

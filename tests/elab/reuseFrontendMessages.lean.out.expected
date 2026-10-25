@@ -1,0 +1,5 @@
+messages: kept 3
+messages: output equal to the fresh build's: true
+messages: exit codes: reuse 0, fresh 0
+unused variable as an error: output equal to the fresh build's: true
+unused variable as an error: exit codes: reuse 1, fresh 1

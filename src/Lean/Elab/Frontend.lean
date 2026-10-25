@@ -163,27 +163,78 @@ private unsafe def previousLintsImpl (md : ModuleData) : Array Linter.LintEntry 
 private opaque previousLints (md : ModuleData) : Array Linter.LintEntry
 
 /--
-`Linter.recordLints` for a reuse run that kept the commands `kept`: a kept command has no diagnostics, so its entries are
-those of the previous `.olean` (`previous`) whose messages are in its span, each command's in its place. The snapshot
-tree lists the header's nodes, then each command's node with its elaboration's nodes, in command order.
+`Linter.recordLints`, command by command, for a run that kept the commands `kept`; with how many entries each command
+added. The snapshot tree lists the header's nodes, then each command's node with its elaboration's nodes, in command
+order, and the log lists each command's entries together. A kept command has no diagnostics: its entries are those it
+added in the previous build (`previous`, after the header's and those of the commands before it, as their counts
+`previousCounts` say), shown for the file `fileName`. A keep requires the previous `.olean`, so `previous` is given
+whenever a command is kept.
 -/
-private def recordLintsWithKept (fileMap : FileMap) (env : Environment) (snap : Language.Lean.InitialSnapshot)
-    (snaps : Language.SnapshotTree) (kept : Array ModuleUsage.KeptCommand) (previous : Array Linter.LintEntry) :
-    BaseIO Environment := do
+private def recordLintsByCommand (fileMap : FileMap) (fileName : String) (env : Environment)
+    (snap : Language.Lean.InitialSnapshot) (snaps : Language.SnapshotTree) (kept : Array ModuleUsage.KeptCommand)
+    (previous : Array Linter.LintEntry) (previousCounts : Array Nat) : BaseIO (Environment × Std.HashMap Nat Nat) := do
+  let logSize (env : Environment) := (Linter.lintLogExt.getState env).size
   let all := collectCommandLints snaps none #[]
   let cmds := (Language.Lean.foldCmdSnaps? snap #[] (·.push ·)).getD #[]
   let sizes := cmds.map fun c => (collectCommandLints (Language.toSnapshotTree c.elabSnap) none #[]).size + 1
   let mut start := all.size - sizes.foldl (· + ·) 0
   let mut env ← Linter.recordLints fileMap env (all.extract 0 start)
-  let keptSpans : Std.HashMap Nat ModuleUsage.CommandSpan := kept.foldl (fun m k => m.insert k.i k.span) {}
+  let keptIdxs : Std.HashSet Nat := kept.foldl (·.insert ·.i) {}
+  let mut counts : Std.HashMap Nat Nat := {}
+  -- where command `i`'s entries start in `previous`
+  let mut previousStart := previous.size - previousCounts.foldl (· + ·) 0
   for size in sizes, i in [0:sizes.size] do
-    if let some span := keptSpans[i]? then
-      for e in previous do
-        if span.contains e.message.pos then env := Linter.lintLogExt.addEntry env e
+    let before := logSize env
+    if keptIdxs.contains i then
+      for e in previous.extract previousStart (previousStart + previousCounts.getD i 0) do
+        env := Linter.lintLogExt.addEntry env { e with file := fileName, message := { e.message with fileName } }
     else
       env ← Linter.recordLints fileMap env (all.extract start (start + size))
+    counts := counts.insert i (logSize env - before)
+    previousStart := previousStart + previousCounts.getD i 0
     start := start + size
-  return env
+  return (env, counts)
+
+/--
+The messages a build reports for each command but its parse messages (`SnapshotTree.runAndReport` prints the messages
+that are not marked reported, node by node, and a command's nodes are together), each with its position and end
+position: `none` for a command whose messages a later build cannot show again as it would, because one's text is made
+when it is printed (`MessageData.hasFixedText`) or its info trees are reported (`trace.Elab.info`).
+-/
+private def commandMessages (snap : Language.Lean.InitialSnapshot) :
+    BaseIO (Array (Option (Array (Position × Option Position × Json)))) := do
+  let cmds := (Language.Lean.foldCmdSnaps? snap #[] (·.push ·)).getD #[]
+  cmds.mapM fun c => do
+    unless c.elabSnap.infoTreeSnap.get.diagnostics.msgLog.unreported.isEmpty do return none
+    let mut out := #[]
+    for node in (Language.toSnapshotTree c.elabSnap).getAll do
+      for m in node.diagnostics.msgLog.unreported do
+        unless m.data.hasFixedText do return none
+        out := out.push (m.pos, m.endPos, toJson (← m.serialize))
+    return some out
+
+/-- The command records `commands` (`CommandRecord` as JSON) with what the run observed of each command after its
+records were made: its reported messages (`commandMessages`), which its record holds only if they all lie in its span
+(`CommandRecord.messages?`), its lint log entries (`lints`), and, for an elaborated command, what it read of its file
+beyond its source (`reads`, `FileContextRead` bits by command index: `commandFileContextReads`) with the digests
+`fileContext` (`ModuleUsage.fileContextDigests`). A kept command (`keptIdxs`) read what its previous record says. -/
+private def withRunRecords (commands : Array Json)
+    (messages : Array (Option (Array (Position × Option Position × Json)))) (lints : Std.HashMap Nat Nat)
+    (reads : Std.HashMap Nat UInt8) (fileContext : Array (String × ModuleUsage.Digest))
+    (keptIdxs : Std.HashSet Nat) : Array Json :=
+  commands.map fun c => Id.run do
+    let .ok i := c.getObjValAs? Nat "i" | return c
+    let inSpan (ms : Array (Position × Option Position × Json)) : Option (Array Json) := do
+      let span ← (c.getObjValAs? ModuleUsage.CommandSpan "span").toOption
+      guard <| ms.all fun (pos, endPos?, _) => span.contains pos && endPos?.all span.contains
+      return ms.map (·.2.2)
+    let recorded := (messages[i]?.getD (some #[])).bind inSpan
+    let c := (c.setObjVal! "messages" (toJson recorded)).setObjVal! "lints" (toJson (lints.getD i 0))
+    if keptIdxs.contains i then return c
+    let bits := reads.getD i 0
+    let read (k : String) := (k == "fileName" && bits &&& FileContextRead.fileName != 0) ||
+      (k == "source" && bits &&& FileContextRead.source != 0)
+    return c.setObjVal! "fileContext" (toJson (fileContext.filter (read ·.1)))
 
 /--
 The `.ilean` references and declarations for a reuse run that kept the commands `kept`, from those of its elaborated
@@ -405,7 +456,9 @@ def runFrontend
       unsafe enableInitializersExecution
     return snap
   -- a reuse run keeps commands from the module's previous build (`Elab.Reuse`); it needs the `.usage` it writes
-  let reuseReq? ← if usageFileName?.isSome then reuse?.mapM (liftM <| Reuse.Request.new · reuseLib? opts) else pure none
+  let reuseReq? ← if usageFileName?.isSome then
+      reuse?.mapM fun reuse => do Reuse.Request.new reuse reuseLib? ileanFileName?.isSome fileName input opts
+    else pure none
   let snap ← Language.Lean.process setup old? reuseReq? ctx
   let snaps := Language.toSnapshotTree snap
   let severityOverrides := errorOnKinds.foldl (·.insert · .error) {}
@@ -461,6 +514,7 @@ def runFrontend
   let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])
   let reused? ← reuseReq?.mapM (·.finish)
   let kept := reused?.elim #[] (·.kept)
+  let lintCounts ← IO.mkRef ({} : Std.HashMap Nat Nat)
   let usage? ← oleanFileName?.bindM fun oleanFileName => do
     let recorded ← recordedDeclConsts
     -- the digests cover the exported axioms, so both take the stored ones
@@ -473,6 +527,9 @@ def runFrontend
       let own := ModuleUsage.localDigests env nodes
       let stmt := ModuleUsage.computeStmt env (ModuleUsage.stmtState env) own consts
       let payloads ← pending.payloads
+      -- a command is kept only after commands whose payloads were final (`Reuse.catchUp`)
+      if let some i ← pending.keptContextChanged? then
+        throw <| IO.userError s!"reuse: internal error: the context of kept command {i} changed after it was kept"
       -- the `.usage` command records build while the `.olean`, which holds none of them, is written
       let recs ← IO.asTask do
         let recs ← pending.finish env own stmt nodes
@@ -482,10 +539,9 @@ def runFrontend
       return (usageFileName, oleanFileName, nodes, own, ModuleUsage.closureDigest env own provides, provides, indirect,
         stmt, payloads, recs)
     profileitIO ".olean serialization" finalOpts do
-      let env ← match reused?.bind (·.previous?) with
-        | some previous =>
-          recordLintsWithKept inputCtx.fileMap env snap snaps kept (previousLints previous)
-        | none => Linter.recordLints inputCtx.fileMap env (collectCommandLints snaps none #[])
+      let (env, counts) ← recordLintsByCommand inputCtx.fileMap fileName env snap snaps kept
+        (reused?.bind (·.previous?) |>.elim #[] previousLints) (reused?.elim #[] (·.previousLintCounts))
+      lintCounts.set counts
       let env := usage?.elim env fun (_, _, _, own, closure, provides, indirect, stmt, payloads, _) =>
         let env := ModuleUsage.setLocalStmt (ModuleUsage.setLocalDigests env own closure provides indirect) stmt
         setCommandEntries env payloads
@@ -495,10 +551,11 @@ def runFrontend
   if let some ileanFileName := ileanFileName? then
     let references := Lean.Server.findModuleRefs inputCtx.fileMap trees (localVars := false)
     let (moduleRefs, decls) ← references.toLspModuleRefs
+    -- the keep permit bound the previous `.ilean` to the previous `.usage` (`Reuse.Previous.ilean?`)
     let previousIlean? ← if kept.isEmpty then pure none else
-      (reuseReq?.bind (·.inputs.ilean?)).bindM fun f => do
-        try return (Json.parse (← IO.FS.readFile f) >>= fromJson? (α := Server.Ilean)).toOption
-        catch _ => return none
+      (reused?.bind (·.previousIlean?)).mapM fun text =>
+        IO.ofExcept <| (Json.parse text >>= fromJson? (α := Server.Ilean)).mapError
+          (s!"reuse: the previous `.ilean` cannot be read: {·}")
     let (moduleRefs, decls) := previousIlean?.elim (moduleRefs, decls) fun previous =>
       mergeKeptRefs inputCtx.fileMap kept previous moduleRefs decls
     let ilean := {
@@ -529,10 +586,16 @@ def runFrontend
     let used := kept.foldl (init := used) fun s k =>
       k.record.usesFull.foldl (·.insert ·.1) (k.record.usesStmt.foldl (·.insert ·.1) s)
     let used := (reused?.elim #[] (·.usedUnattributed)).foldl (·.insert ·) used
+    let mut reads : Std.HashMap Nat UInt8 := {}
+    for c in commands do
+      let .ok i := c.getObjValAs? Nat "i" | continue
+      reads := reads.insert i (← commandFileContextReads i)
+    let commands := withRunRecords commands (← commandMessages snap) (← lintCounts.get) reads
+      (ModuleUsage.fileContextDigests fileName input) (kept.foldl (·.insert ·.i) {})
     ModuleUsage.writeUsage env nodes own closure provides indirect used (← lookedUpSpecKeys) stmt commands
       (incrLoaded := incrLoadFileName?.isSome) usageFileName (← ModuleUsage.fileDigest oleanFileName)
       (noreuseReason? := recs.noreuseReason?) (carried := reused?.elim {} (·.carried))
-      (reuse? := reused?.map (·.field))
+      (reuse? := reused?.map (·.field)) (ileanDigest? := ← ileanFileName?.mapM ModuleUsage.fileDigest)
 
   -- no point in freeing the snapshot graph and all referenced data this close to process exit
   Runtime.forget snaps

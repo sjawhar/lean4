@@ -767,20 +767,15 @@ where
     let ctx ← read
     let recording ← usageRecordingEnabled
     let span := ModuleUsage.CommandSpan.of ctx.fileMap stx
-    -- a reuse run keeps the command from the module's previous build where its records allow it; a keep that fails is
-    -- an error of the command, which is elaborated instead
-    let mut reuseError? : Option String := none
+    -- a reuse run keeps the command from the module's previous build where its records allow it; a keep that fails
+    -- leaves the command to be elaborated as in a build without reuse
     if let some req := ctx.reuse? then
-      let error (e : IO.Error) := let s := toString e; if s.startsWith "reuse: " then s else s!"reuse: {s}"
-      match ← (req.decide cmdIdx stx span cmdState).toBaseIO with
-      | .ok (some plan) =>
-        match ← withCommandContext cmdIdx (req.keep plan cmdState ctx.fileMap).toBaseIO with
+      if let some plan ← req.decide cmdIdx stx span cmdState then
+        match ← withCommandContext cmdIdx (req.keep plan cmdState ctx.fileMap ctx.fileName).toBaseIO with
         | .ok kept =>
           snap.new.resolve <| .ofTyped { diagnostics := .empty : SnapshotLeaf }
           return (kept, .pure kept.infoState)
-        | .error e => reuseError? := some (error e)
-      | .ok none => pure ()
-      | .error e => reuseError? := some (error e)
+        | .error e => req.keepFailed cmdIdx (toString e)
     -- what the elaboration and its tasks do is attributed to the command; promises the frontend created for the
     -- command's snapshots are resolved outside it
     let (cmdState, info) ← withCommandContext cmdIdx do
@@ -807,13 +802,6 @@ where
             withLoggingExceptions act cmdCtx cmdStateRef
       let cmdState ← cmdStateRef.get
       let mut messages := cmdState.messages
-      if let some e := reuseError? then
-        messages := messages.add {
-          fileName := ctx.fileName
-          severity := MessageSeverity.error
-          pos      := ctx.fileMap.toPosition beginPos
-          data     := e
-        }
       if !output.isEmpty then
         messages := messages.add {
           fileName := ctx.fileName
@@ -827,7 +815,7 @@ where
       if recording then
         ModuleUsage.recordCommandObservation cmdIdx stx span cmdStateBefore cmdState info
       if let some req := ctx.reuse? then
-        req.elaborated cmdIdx stx cmdStateBefore cmdState
+        req.elaborated cmdIdx stx span cmdStateBefore cmdState info
       return (cmdState, info)
     -- definitely resolve eventually
     snap.new.resolve <| .ofTyped { diagnostics := .empty : SnapshotLeaf }

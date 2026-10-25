@@ -1,0 +1,9 @@
+setter edited, FOO=A: exit codes: reuse 0, fresh 0; output equal: true
+setter edited, FOO=A: olean equal to the fresh build's: true; ilean equal: true
+setter edited, FOO=A: noreuse: reuse run ((some true), (some (the process value env:FOO changed while the module was compiled))), fresh ((some true), (some (the process value env:FOO changed while the module was compiled)))
+setter edited, FOO=A: usage fields differing from the fresh build's but `reuse`: []
+next run, FOO=B: exit codes: reuse 0, fresh 0; output equal: true
+next run, FOO=B: olean equal to the fresh build's: true; ilean equal: true
+next run, FOO=B: noreuse: reuse run ((some false), none), fresh ((some false), none)
+next run, FOO=B: usage fields differing from the fresh build's but `reuse`: []
+next run, FOO=B: reuse run kept none

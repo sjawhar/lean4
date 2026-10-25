@@ -1,0 +1,27 @@
+R7a log: reuse run fell back: false
+R7a log: exit codes: reuse 0, fresh 0
+R7a log: output equal to the fresh build's: true
+R7a log: log.txt lines: reuse 2, fresh 2
+R7a log: olean equal to the fresh build's: true
+R7a log: ilean equal to the fresh build's: true
+R7a log: usage equal to the fresh build's but `reuse`: true
+R7b stdin: reuse run fell back: false
+R7b stdin: exit codes: reuse 0, fresh 0
+R7b stdin: output equal to the fresh build's: true
+R7b stdin: olean equal to the fresh build's: true
+R7b stdin: ilean equal to the fresh build's: true
+R7b stdin: usage equal to the fresh build's but `reuse`: true
+R8 stats: reuse run fell back: false
+R8 stats: exit codes: reuse 0, fresh 0
+R8 stats: output equal to the fresh build's: true
+R8 stats: statistics printed: reuse 1, fresh 1
+R8 stats: olean equal to the fresh build's: true
+R8 stats: ilean equal to the fresh build's: true
+R8 stats: usage equal to the fresh build's but `reuse`: true
+R9 abbreviations without fallback: exit 0, output "", kept 2
+R9 abbreviations: reuse run fell back: false
+R9 abbreviations: exit codes: reuse 0, fresh 0
+R9 abbreviations: output equal to the fresh build's: true
+R9 abbreviations: olean equal to the fresh build's: true
+R9 abbreviations: ilean equal to the fresh build's: true
+R9 abbreviations: usage equal to the fresh build's but `reuse`: true

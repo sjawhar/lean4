@@ -1,0 +1,14 @@
+first build: exit 0, output "M.lean:2:0: warning: first command\n\nNote: This linter can be disabled with `set_option linter.firstCmd false`"
+first build: lint log entries: 1
+unchanged: exit codes: reuse 0, fresh 0
+unchanged: kept: 2
+unchanged: output equal to the fresh build's: true
+unchanged: lint log entries: reuse 1, fresh 1
+unchanged: olean equal to the fresh build's: true
+unchanged: ilean equal to the fresh build's: true
+b edited: exit codes: reuse 0, fresh 0
+b edited: kept: 1
+b edited: output equal to the fresh build's: true
+b edited: lint log entries: reuse 1, fresh 1
+b edited: olean equal to the fresh build's: true
+b edited: ilean equal to the fresh build's: true

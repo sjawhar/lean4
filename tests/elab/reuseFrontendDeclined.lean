@@ -28,10 +28,10 @@ def run (dir : System.FilePath) (label : String) (args : Array String) : IO Unit
   discard <| lean dir #["-o", "X.olean", "--usage=X.usage", "X.lean"]
   IO.FS.writeFile (dir / "M.lean") "import X\ndef b := v + 1\ntheorem t : b = 6 := rfl\n"
   run dir "first build" #[]
-  for ext in ["olean", "usage"] do
+  for ext in ["olean", "usage", "ilean"] do
     IO.FS.writeBinFile (dir / s!"M.{ext}.old") (← IO.FS.readBinFile (dir / s!"M.{ext}"))
   run dir "Lake's reason" #["--reuse-declined=no-saved-trace"]
-  run dir "previous outputs" #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old"]
+  run dir "previous outputs" #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old", "--reuse-ilean=M.ilean.old"]
   let usage ← IO.FS.readFile (dir / "M.usage.old")
   IO.FS.writeFile (dir / "M.usage.old") (usage.take 40).copy
   run dir "truncated .usage" #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old"]

@@ -1,0 +1,7 @@
+first build: exit 0, output ""
+reuse run: exit 0, output ""
+reuse field: {"elabReasons":{"nonconst":2,"unsettled":1},"kept":0,"reElab":[0,1,2],"total":3}
+fresh build: exit 0
+olean equal to the fresh build's: true
+ilean equal to the fresh build's: true
+usage equal to the fresh build's but `reuse`: true

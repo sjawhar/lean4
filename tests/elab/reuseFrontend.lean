@@ -2,10 +2,11 @@ import Lean
 /-! The reuse run (`lean --reuse-olean=F --reuse-usage=F`): a module is compiled, then compiled again after an edit,
 keeping commands from its previous `.olean` and `.usage`, in a directory of its own (`r`), step after step, each on the
 previous step's outputs; every step also compiles the same sources without reuse (`f`), and the two `.olean` files
-(`cmpSource`), `.usage` files (`usageDiff`) and `.ilean` files are compared. Each step prints the `reuse` field of the
-reuse run's `.usage` (which commands were elaborated, and the first reason each was not kept) and whether its output
-mentions reuse. A command's context digests the quotation contexts used before it, one per earlier command and a digest
-of its syntax, and the payloads before it, which hold their declaration ranges: so a command is kept only after
+(`cmpSource`), `.usage` files (`usageDiff`) and `.ilean` files are compared, as are the two runs' outputs (messages
+included; child processes run with the default options, linters on) and exit codes. Each step prints the `reuse` field
+of the reuse run's `.usage` (which commands were elaborated, and the first reason each was not kept) and whether its
+output mentions reuse. A command's context digests the quotation contexts used before it, one per earlier command and a
+digest of its syntax, and the payloads before it, which hold their declaration ranges: so a command is kept only after
 commands with the previous build's text and positions, and every command after an edited or moved one is elaborated. -/
 open Lean
 
@@ -116,12 +117,16 @@ def step (r f : System.FilePath) (label x m : String) : IO Unit := do
     IO.FS.writeFile (d / "M.lean") m
   for ext in ["olean", "usage", "ilean"] do
     IO.FS.writeBinFile (r / s!"M.{ext}.old") (← IO.FS.readBinFile (r / s!"M.{ext}"))
-  let out ← build r "M" #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old", "--reuse-ilean=M.ilean.old"]
-  discard <| build f "M"
+  let args := #["-o", "M.olean", "--usage=M.usage", "-i", "M.ilean"]
+  let (rcR, out) ← lean r (args ++ #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old",
+    "--reuse-ilean=M.ilean.old", "M.lean"])
+  let (rcF, outF) ← lean f (args ++ #["M.lean"])
+  let same := out.replace r.toString "DIR" == outF.replace f.toString "DIR"
   let reuse := ((← usageOf (r / "M.usage")).getObjValD "reuse").compress
   let (_, olean) ← lean r #["--run", "Cmp.lean", "M.olean", (f / "M.olean").toString]
   let ilean := (← IO.FS.readFile (r / "M.ilean")) == (← IO.FS.readFile (f / "M.ilean"))
   IO.println s!"{label}: reuse {reuse}; output mentions reuse: {decide ((out.splitOn "reuse").length > 1)}; \
+    output equal to the fresh build's: {same}; exit codes: reuse {rcR}, fresh {rcF}; \
     olean {olean.trimAscii}; usage fields differing: {← usageDiff (r / "M.usage") (f / "M.usage")}; ilean equal: {ilean}"
 
 #eval IO.FS.withTempDir fun r => IO.FS.withTempDir fun f => do
