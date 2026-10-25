@@ -103,6 +103,16 @@ opaque resolvedNames : BaseIO (Array Name)
 @[extern "lean_usage_all_resolved"]
 opaque allResolved : BaseIO Bool
 
+@[extern "lean_usage_set_resolved_unrecorded"]
+private opaque setResolvedUnrecorded (b : Bool) : BaseIO Bool
+
+/-- Runs `act` without recording the lookups it makes on the running thread (`noteResolved`, `noteAllResolved`; a task
+it starts records its own): a run's check of what a previous run resolved is no lookup of the run's own. Nested uses
+restore the setting of the enclosing one. -/
+def withoutResolvedNotes [Monad m] [MonadFinally m] [MonadLiftT BaseIO m] (act : m α) : m α := do
+  let prev ← (setResolvedUnrecorded true : BaseIO Bool)
+  try act finally (discard (setResolvedUnrecorded prev) : BaseIO Unit)
+
 /-- See `recordCompilerCode`. -/
 private builtin_initialize compilerCodeRef : IO.Ref Bool ← mkAccountedRef false
 

@@ -764,14 +764,24 @@ static mutex g_resolved_mutex;
 // Never freed, like the runtime's other process-wide name tables: no destructor runs on Lean objects at exit.
 static resolved_set * g_resolved = new resolved_set();
 MK_THREAD_LOCAL_GET_DEF(resolved_set, get_seen_resolved);
+// while set, the thread's lookups are not recorded (`lean_usage_set_resolved_unrecorded`)
+static thread_local bool t_resolved_unrecorded = false;
 
 extern "C" LEAN_EXPORT obj_res lean_usage_enable_resolved() {
     g_resolved_on.store(true);
     return box(0);
 }
 
+/* setResolvedUnrecorded (b : Bool) : BaseIO Bool: while `b`, the running thread's lookups are not recorded; returns the
+   previous setting */
+extern "C" LEAN_EXPORT uint8 lean_usage_set_resolved_unrecorded(uint8 b) {
+    bool prev = t_resolved_unrecorded;
+    t_resolved_unrecorded = b;
+    return prev;
+}
+
 extern "C" LEAN_EXPORT obj_res lean_usage_note_resolved(b_obj_arg n, obj_arg x) {
-    if (!atomic_load_explicit(&g_resolved_on, memory_order_relaxed)) return x;
+    if (!atomic_load_explicit(&g_resolved_on, memory_order_relaxed) || t_resolved_unrecorded) return x;
     if (!get_seen_resolved().insert(n)) return x;
     lock_guard<mutex> lock(g_resolved_mutex);
     if (g_resolved->insert(n)) lean_mark_mt(n);
@@ -779,7 +789,7 @@ extern "C" LEAN_EXPORT obj_res lean_usage_note_resolved(b_obj_arg n, obj_arg x) 
 }
 
 extern "C" LEAN_EXPORT obj_res lean_usage_note_all_resolved(obj_arg x) {
-    if (atomic_load_explicit(&g_resolved_on, memory_order_relaxed)) g_all_resolved.store(true);
+    if (atomic_load_explicit(&g_resolved_on, memory_order_relaxed) && !t_resolved_unrecorded) g_all_resolved.store(true);
     return x;
 }
 
