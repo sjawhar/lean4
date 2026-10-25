@@ -13,6 +13,7 @@ public import Lake.CLI.Shake
 public import Lake.CLI.Check
 import Lake.Version
 import Lake.Build.Run
+import Lake.Build.Common
 import Lake.Build.Infos
 import Lake.Build.Targets
 import Lake.Build.Target.Fetch
@@ -837,7 +838,10 @@ protected def unstage : CliM PUnit := do
         IO.FS.removeFile cachePath
       else
         return ok
-    match (← copyFile stagingPath cachePath |>.toBaseIO) with
+    -- Write the entry so that no part of it is ever under its name (e.g., if `unstage` stops)
+    let r : IO.AccessRight := {read := true, write := false, execution := false}
+    let write : IO Unit := do writeCacheEntry cachePath (← IO.FS.readBinFile stagingPath) r
+    match (← write.toBaseIO) with
     | .ok _ =>
       return ok
     | .error (.noFileOrDirectory ..) =>
