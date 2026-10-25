@@ -33,7 +33,8 @@ head -c 100 x.genuine > "$ENTRY"
 test_cmd chmod 444 "$ENTRY"
 test_cmd rm -rf "$LAKE_CACHE_DIR/outputs"
 mkp t2
-test_out 'cached artifact does not match its content hash' -d t2 build
+# (the restore path warns with the same first words, so match the insert's own last words)
+test_out_pat "does not match its content hash; moved it to: .*; caching .*/X\.olean in its place" -d t2 build
 test_cmd cmp x.genuine "$ENTRY"
 test_exp -f "$LAKE_CACHE_DIR/quarantine/$(basename "$ENTRY").0"
 # A fresh tree restores the output's bytes
