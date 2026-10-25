@@ -344,11 +344,11 @@ def minRunsPerTask : Nat := 64
 /--
 Runs `f` on each element of `xs` on its own (`LoggedRun`), so that the caller replays the runs it needs, in order
 (`replayRun`). Many elements run in parallel tasks, each over a slice of `xs` with its own `ContentHashes`, which are
-added to `hashes` when the tasks end (`joinHashes`): `none` if two runs hashed a file differently. A task never reads
-`hashes`, so the check's map stays its own and is updated in place.
+added to `hashes` when the tasks end (`joinHashes`). Returns the runs, and `false` if two runs hashed a file
+differently. A task never reads `hashes`, so the check's map stays its own and is updated in place.
 -/
 def parallelRuns (hashes : ContentHashes) (xs : Array α) (f : ContentHashes → α → JobM β) :
-    JobM (Option (Array (LoggedRun β))) := JobM.ofFn fun fetch pkg? stack store ctx s => do
+    JobM (Array (LoggedRun β) × Bool) := JobM.ofFn fun fetch pkg? stack store ctx s => do
   let run (hashes : ContentHashes) (x : α) : BaseIO (LoggedRun β) := do
     return match ← (f hashes x).toFn fetch pkg? stack store ctx {} with
       | .ok b s' => (s'.log.entries, .ok b)
@@ -356,7 +356,7 @@ def parallelRuns (hashes : ContentHashes) (xs : Array α) (f : ContentHashes →
   let tasks := 2 * max 1 (System.Platform.Internal.getHardwareConcurrency ()).toNat
   let size := max minRunsPerTask ((xs.size + tasks - 1) / tasks)
   if xs.size ≤ size then
-    return .ok (some (← xs.mapM (run hashes))) s
+    return .ok (← xs.mapM (run hashes), true) s
   let chunks ← (Array.range ((xs.size + size - 1) / size)).mapM fun i => BaseIO.asTask do
     let own ← IO.mkRef {}
     return (← (xs.extract (i * size) ((i + 1) * size)).mapM (run own), ← own.get)
@@ -366,7 +366,7 @@ def parallelRuns (hashes : ContentHashes) (xs : Array α) (f : ContentHashes →
     let (rs, fork) ← IO.wait chunk
     runs := runs ++ rs
     forks := forks.push fork
-  return .ok (if ← joinHashes hashes forks then some runs else none) s
+  return .ok (runs, ← joinHashes hashes forks) s
 
 /--
 A hash of every artifact of every module-system module in an import closure, with its name.
@@ -415,14 +415,16 @@ abbrev ImportReads := IO.Ref (Std.HashMap Name (LoggedRun (Option (FilePath × U
 
 /--
 Reads (`readImportUsage?`) each module of `mods` that `reads` lacks into `reads`, many in parallel (`parallelRuns`). If
-a file changed while they ran, records every one as unbound (`none`), so the check fails.
+a file changed while they ran, records each read that succeeded as unbound (`none`), so the check fails; the reads'
+logs and errors are kept.
 -/
 def readImports (hashes : ContentHashes) (reads : ImportReads) (importArts : NameMap ImportArtifacts)
     (mods : Array Name) : JobM Unit := do
   let known ← reads.get
   let mods := mods.filter (!known.contains ·)
   if mods.isEmpty then return
-  let runs := (← parallelRuns hashes mods (readImportUsage? · importArts ·)).getD (mods.map fun _ => (#[], .ok none))
+  let (runs, consistent) ← parallelRuns hashes mods (readImportUsage? · importArts ·)
+  let runs := if consistent then runs else runs.map fun (log, r) => (log, r.map fun _ => none)
   reads.modify fun reads => Id.run do
     let mut reads := reads
     for m in mods, r in runs do
@@ -552,8 +554,8 @@ every new duplicate has a declarer this checks.
 
 Names are compared by `Name.hash`, so a hash collision only rebuilds. The `.olean` reads assume the data layout of
 the Lean that Lake was built with, so with another Lean, or if a read fails, the check fails. A `module` file's kernel
-constants are read once per build and module state, a toolchain module's once per build
-(`BuildContext.kernelProviders`). The workspace modules are checked in parallel (`parallelRuns`).
+constants are kept per build and module state, a toolchain module's per build (`BuildContext.kernelProviders`), so a
+later check does not read them again. The workspace modules are checked in parallel (`parallelRuns`).
 -/
 def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetup) (hashes : ContentHashes)
     (reads : ImportReads) (importArts : NameMap ImportArtifacts) (changed : Array (Name × UsageImport)) :
@@ -602,11 +604,12 @@ def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetu
   let mut closure := #[]
   for x in importArts do
     closure := closure.push x
-  let some runs ← parallelRuns hashes closure check | return false
+  let (runs, consistent) ← parallelRuns hashes closure check
   let mut toolchain := presetup.directImports.foldl outside #[]
   for r in runs do
     let some imports ← replayRun r | return false
     toolchain := toolchain ++ imports
+  unless consistent do return false
   let searchPath := (← getLeanPath) ++ [← getLeanLibDir]
   let mut seen : NameSet := {}
   while h : 0 < toolchain.size do
