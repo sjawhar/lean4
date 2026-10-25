@@ -847,15 +847,20 @@ protected def unstage : CliM PUnit := do
       unless Hash.ofByteArray bytes == descr.hash do
         logError s!"{stagingPath}: staged artifact does not match its content hash"
         return false
-      let write : IO Unit := do
+      let write : IO Bool := do
         -- `writeBinFileIfNew` never replaces a file, so an artifact to overwrite is removed first
         if overwrite then removeFileIfExists cachePath
-        writeBinFileIfNew cachePath bytes
-        let r : IO.AccessRight := {read := true, write := false, execution := false}
-        IO.setAccessRights cachePath ⟨r, r, r⟩
+        let cached ← writeBinFileIfNew cachePath bytes
+        if cached then
+          let r : IO.AccessRight := {read := true, write := false, execution := false}
+          IO.setAccessRights cachePath ⟨r, r, r⟩
+        return cached
       match (← write.toBaseIO) with
-      | .ok _ =>
+      | .ok true =>
         return ok
+      | .ok false =>
+        logError s!"{cachePath}: not cached: the cache's file system did not hard-link the entry"
+        return false
       | .error e =>
         logError s!"failed to copy artifact: {e}"
         return false

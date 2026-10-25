@@ -535,18 +535,22 @@ and the build would map its input to it.
 A new binary entry is a hard link to `file` where the file system allows it. A text entry is always
 written, because its normalized bytes can differ from those of `file` (e.g., in line endings).
 Entries are written by `writeBinFileIfNew`, so an entry's name never holds part of a file.
+
+Returns whether the entry exists afterwards. Where the cache's file system does not hard-link,
+nothing publishes a whole entry without replacing a file, so this caches nothing and logs that at
+the verbose level; the build goes on with `file`.
 -/
 def Cache.insertEntry
   (cache : Cache) (descr : ArtifactDescr) (file : FilePath) (bytes : ByteArray) (text : Bool)
-: LogIO Unit := do
+: LogIO Bool := do
   let entry := cache.artifactDir / descr.relPath
   if (← entry.pathExists) then
     if (← (file.isSameFile entry).toBaseIO) matches .ok true then
-      return
+      return true
     match (← (IO.FS.readBinFile entry).toBaseIO) with
     | .ok held =>
       if hashBytes? held text == some descr.hash then
-        return
+        return true
       match (← (cache.quarantine entry descr.relPath.toString).toBaseIO) with
       | .ok moved =>
         logWarning s!"{entry}: cached artifact does not match its content hash; \
@@ -555,15 +559,18 @@ def Cache.insertEntry
         error s!"failed to cache artifact: {entry}: cached artifact does not match its content \
           hash, and it could not be moved into quarantine: {e}"
     | .error (.noFileOrDirectory ..) => pure () -- removed since, e.g., by a garbage collection
-    | .error _ => return
+    | .error _ => return true
   else
     cacheIO <| createParentDirs entry
-  cacheIO do
+  let cached ← cacheIO do
     unless text do
       match (← (IO.FS.hardLink file entry).toBaseIO) with
-      | .ok _ | .error (.alreadyExists ..) => return
+      | .ok _ | .error (.alreadyExists ..) => return true
       | .error _ => pure () -- e.g., the cache is on another file system: write the entry
     writeBinFileIfNew entry bytes
+  unless cached do
+    logVerbose s!"{entry}: not cached: the cache's file system did not hard-link the entry"
+  return cached
 
 /--
 Returns the bytes that the cache entry of `file` holds (its contents, with normalized line endings
@@ -598,18 +605,20 @@ public def Cache.saveArtifactIfMatches
   -- writing to such paths as this can corrupt the cache if the file is hard linked
   let r := {read := true, write := false, execution := exe && !text}
   cacheIO <| IO.setAccessRights file ⟨r, r, r⟩
-  cache.insertEntry descr file bytes text
+  let cached ← cache.insertEntry descr file bytes text
   cacheIO do
-    IO.setAccessRights cacheFile ⟨r, r, r⟩
+    if cached then IO.setAccessRights cacheFile ⟨r, r, r⟩
     writeFileHash file hash
-  let mtime ← cacheIO <| getMTime cacheFile
-  let path := if useLocalFile then file else cacheFile
+  let mtime ← cacheIO <| getMTime (if cached then cacheFile else file)
+  let path := if useLocalFile || !cached then file else cacheFile
   return .ok {descr, name := file.toString, path, mtime}
 
 /--
 Copies `file` to the Lake cache with the file extension `ext`, and
 saves its hash in its `.hash` file. A file with other bytes under the artifact's name in the cache
 is moved into the quarantine directory, with a warning, and replaced (see `Cache.insertEntry`).
+Where the cache's file system does not hard-link, nothing is cached, and the artifact's path is
+`file`.
 
 **Additional Options:**
 * `text`: the contents of `file` are hashed as text rather than as a binary blob.

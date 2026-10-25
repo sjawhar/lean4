@@ -56,47 +56,43 @@ partial def writeBinFileToNewTmp (path : FilePath) (content : ByteArray) : IO Fi
   return tmp
 
 /--
-Writes the bytes of {lean}`content` to the new file {lean}`path`. If a file already has that name,
-does nothing.
+Writes the bytes of {lean}`content` to the new file {lean}`path`, unless a file already has that
+name. Returns whether a file has the name afterwards: {lean}`true` if this call wrote it or a file
+already had the name (it is kept), {lean}`false` if the call wrote nothing because the file system
+did not hard-link the bytes to the name.
 
-The name never holds part of {lean}`content` where the file system supports hard links. The bytes
-go to a new temporary file next to {lean}`path` (see {lean}`uniqueTmpPath`), which is then
-hard-linked to {lean}`path` and removed. A hard link never replaces a file. A write that fails
-(e.g., on a full disk) leaves no file; one that stops part way (e.g., when the process is killed)
-leaves only the temporary file.
+The name never holds part of {lean}`content`. The bytes go to a new temporary file next to
+{lean}`path` (see {lean}`uniqueTmpPath`), which is then hard-linked to {lean}`path` and removed. A
+hard link publishes a whole file, and never replaces one, so the first of two concurrent writers
+wins. A write that fails (e.g., on a full disk) leaves no file; one that stops part way (e.g., when
+the process is killed) leaves only the temporary file.
 
-Where the file system cannot hard-link, the helper creates {lean}`path` exclusively and writes
-{lean}`content` into it, as it did before it used a temporary file. The first of two concurrent
-writers wins. The temporary copy is removed. On this fallback, a write that fails or stops can
-leave a partial file under {lean}`path`; atomicity needs hard links.
+If the hard link fails for another reason than an existing file (e.g., the file system cannot
+hard-link), nothing else here publishes a whole file without replacing one: a file created under
+the name holds part of the bytes until the write ends, and keeps that part if the write fails or
+stops. So the call then removes the temporary file and returns {lean}`false`.
 
 The bytes are flushed to the operating system, not synced to the disk: after a power loss, the
 name can hold a file whose data the disk did not keep.
 -/
-public partial def writeBinFileIfNew (path : FilePath) (content : ByteArray) : IO Unit := do
-  if (← path.pathExists) then return
+public def writeBinFileIfNew (path : FilePath) (content : ByteArray) : IO Bool := do
+  if (← path.pathExists) then return true
   let tmp ← writeBinFileToNewTmp path content
   -- `tmp` is this call's own file, so it removes it on every path
   try
     match (← (IO.FS.hardLink tmp path).toBaseIO) with
-    | .ok _ | .error (.alreadyExists ..) => pure () -- another process created `path` first
-    | .error _ =>
-      -- `writeBinFileToNewTmp` returned only after it released the temporary handle.
-      removeFileIfExists tmp
-      let h ← try IO.FS.Handle.mk path .writeNew catch
-        | .alreadyExists .. => return -- another process created `path` first
-        | e => throw e
-      h.write content
-      h.flush
+    | .ok _ | .error (.alreadyExists ..) => return true -- or another process created `path` first
+    | .error _ => return false
   finally
     discard <| (removeFileIfExists tmp).toBaseIO
 
 /--
 Writes the UTF-8 encoded string {lean}`content` to the new file {lean}`path`, as
-{lean}`writeBinFileIfNew` writes bytes. If a file already has that name, does nothing.
+{lean}`writeBinFileIfNew` writes bytes: if a file already has that name, or the file system does not
+hard-link, writes nothing.
 -/
 public def writeFileIfNew (path : FilePath) (content : String) : IO Unit :=
-  writeBinFileIfNew path content.toUTF8
+  discard <| writeBinFileIfNew path content.toUTF8
 
 /--
 Remove a directory and all its contents.
