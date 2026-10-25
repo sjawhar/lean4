@@ -1111,6 +1111,20 @@ protected def checkTest : CliM PUnit := do
   let pkg ← loadPackage (← mkLoadConfig (← getThe LakeOptions))
   noArgsRem do exit <| if pkg.testDriver.isEmpty then 1 else 0
 
+/--
+The artifacts Lake built for `mods` and every module of the workspace they transitively import,
+as `Lean.importModules` takes them, so that `lake lint` imports exactly these files: each module's
+widest set (`.olean` parts and IR), which is what an import without artifacts loads from disk.
+-/
+def lintImportArts (mods : Array Module) : FetchM (Job (NameMap Lean.ImportArtifacts)) :=
+  Job.async do
+    let mut arts : NameMap Lean.ImportArtifacts := {}
+    for mod in mods do
+      for m in #[mod] ++ (← (← mod.transImports.fetch).await) do
+        unless arts.contains m.name do
+          arts := arts.insert m.name (← (← m.metaExportInfo.fetch).await).allArts
+    return arts
+
 def runBuiltinLint
     (opts : LakeOptions) (ws : Workspace) (specifiedMods : Array Lean.Name)
     : CliM UInt32 := do
@@ -1123,10 +1137,9 @@ def runBuiltinLint
   for c in checks do
     unless (ws.findTargetModule? c).isSome do
       error s!"unknown checks module `{c}`; it must be a module of a package in the workspace"
-  -- Lint loads and resolves modules as Lake built them: root package first, as
-  -- `Workspace.findModule?` does. (`Workspace.leanPath` and `leanSrcPath` list dependencies first.)
-  let lintLeanPath :=
-    ws.packages.foldr (fun pkg dirs => pkg.leanLibDir :: dirs) [] ++ ws.lakeEnv.leanPath
+  -- Package checks, and the lookup of the source of a module Lake does not know, get the
+  -- libraries' source directories root package first (`Workspace.leanSrcPath` lists dependencies
+  -- first), so that the root's module wins a name both packages use.
   let lintSrcPath : SearchPath := ws.packages.foldr (init := []) fun pkg dirs =>
     pkg.leanLibs.foldr (fun lib dirs => lib.srcDir :: dirs) dirs
   -- Lint output names the source file Lake compiles for each module (as `+mod` resolves it).
@@ -1150,9 +1163,17 @@ def runBuiltinLint
     outLv := .error
     leanOptOverrides := overrides
   }
-  ws.runBuild (buildSpecs specs) buildCfg
-  Lean.searchPathRef.set lintLeanPath
-  BuiltinLint.run args
+  -- Lint imports each module Lake knows from the artifacts Lake built for it (as Lake passes them
+  -- to `lean` in a module's setup), so no `.olean` search order decides which file is loaded. Other
+  -- modules (the toolchain's, or ones Lake does not know) resolve through the same `LEAN_PATH` as
+  -- the `lean` processes Lake ran.
+  let lintMods := buildMods.filterMap ws.findTargetModule?
+  let importArts ← ws.runBuild (do
+    let built ← buildSpecs specs
+    let arts ← lintImportArts lintMods
+    return built.zipWith (fun _ arts => arts) arts) buildCfg
+  Lean.searchPathRef.set ws.augmentedLeanPath
+  BuiltinLint.run { args with importArts }
 
 protected def lint : CliM PUnit := do
   processOptions lakeOption
