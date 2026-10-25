@@ -501,6 +501,17 @@ the usage cutoff's check against its current imports.
 @[inline] public def usageIndexDir (cache : Cache) (scope : String) (localHash : Hash) : FilePath :=
   cache.dir / "usage-index" / scope / localHash.toString
 
+/-- The usage-index file (`usageIndexDir`) of the compile whose `.usekey` has the content hash `usekey`. -/
+@[inline] public def usageIndexFile (cache : Cache) (scope : String) (localHash usekey : Hash) : FilePath :=
+  cache.usageIndexDir scope localHash / s!"{usekey}.json"
+
+/--
+The compact record of the `.usage` of the compile that the usage-index file `file` records (`writeUsageIndex`), which
+a lookup's pre-filter reads instead of parsing the `.usage` (`Lake.PrefilterUsage`), beside it.
+-/
+@[inline] public def usageIndexCompactFile (file : FilePath) : FilePath :=
+  file.withExtension "pre"
+
 /--
 How many compiles of a module with one set of local inputs the usage index keeps, the most recently written: a
 lookup checks at most these.
@@ -531,27 +542,38 @@ def usageIndexFiles (dir : FilePath) (select : String → Bool) : IO (Array (Fil
 
 /--
 Records a compile in the usage index (`usageIndexDir`): `out`, its outputs entry, as the file named by the content
-hash of its `.usekey` (`usekey`), with no cache service, so that it resolves only against this cache. The file is
-written whole under a temporary name and renamed onto its own: a reader sees the old complete file or the new one,
-and two writers of one name write the outputs of compiles with the same `.usekey`, either of which is valid. A
-rewrite makes the file recent again. Then removes the files beyond the `usageIndexSize` most recently written, and
-temporary files an hour older than this one (left by a writer that stopped). Two writers that trim at once can
-remove more than needed, which loses a candidate and never adds one. Nothing else removes them: a file whose
-artifacts were pruned from the cache no longer resolves and ages out.
+hash of its `.usekey` (`usekey`), with no cache service, so that it resolves only against this cache, and
+`compact?`, if given, as its compact usage record (`usageIndexCompactFile`), written first, so that a lookup that
+finds the entry finds the record too. Each file is written whole under a temporary name and renamed onto its own: a
+reader sees the old complete file or the new one, and two writers of one name write the outputs of compiles with
+the same `.usekey`, either of which is valid. A rewrite makes the file recent again. Then removes the files beyond
+the `usageIndexSize` most recently written with their records, temporary files an hour older than this one (left by
+a writer that stopped), and records as old whose file is gone. Two writers that trim at once can remove more than
+needed, which loses a candidate or its record (the lookup then reads the `.usage`) and never adds one. Nothing else
+removes them: a file whose artifacts were pruned from the cache no longer resolves and ages out.
 -/
-public def writeUsageIndex (cache : Cache) (scope : String) (localHash usekey : Hash) (out : Json) : IO Unit := do
+public def writeUsageIndex (cache : Cache) (scope : String) (localHash usekey : Hash) (out : Json)
+    (compact? : Option ByteArray := none) : IO Unit := do
   let dir := cache.usageIndexDir scope localHash
   IO.FS.createDirAll dir
-  let tmp := dir / s!"{usekey}.tmp-{← IO.Process.getPID}-{← IO.monoNanosNow}"
-  IO.FS.writeFile tmp (toJson (CacheOutput.ofData out)).pretty
-  let file := dir / s!"{usekey}.json"
-  IO.FS.rename tmp file
+  let file := cache.usageIndexFile scope localHash usekey
+  let tmp (ext : String) : IO FilePath :=
+    return dir / s!"{usekey}.{ext}.tmp-{← IO.Process.getPID}-{← IO.monoNanosNow}"
+  if let some compact := compact? then
+    let t ← tmp "pre"
+    IO.FS.writeBinFile t compact
+    IO.FS.rename t (usageIndexCompactFile file)
+  let t ← tmp "json"
+  IO.FS.writeFile t (toJson (CacheOutput.ofData out)).pretty
+  IO.FS.rename t file
   let files ← usageIndexFiles dir (·.endsWith ".json")
   for (old, _) in files.extract usageIndexSize files.size do
     removeFileIfExists old
+    removeFileIfExists (usageIndexCompactFile old)
   let .ok written ← file.metadata.toBaseIO | return
   for (stale, mtime) in ← usageIndexFiles dir (!·.endsWith ".json") do
     if written.modified.sec - mtime.sec > 3600 then
+      if stale.extension == some "pre" && (← (stale.withExtension "json").pathExists) then continue
       removeFileIfExists stale
 
 /--
