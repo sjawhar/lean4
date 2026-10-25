@@ -267,7 +267,7 @@ case6b() {
   test_exp -d "$d"
   n=$(find "$d" -maxdepth 1 -name '*.json' | wc -l)
   test_exp "$n" -ge 1
-  test_exp "$n" -le 8
+  test_exp "$n" -le 3
   test_exp -z "$(find "$d" -name '*.tmp-*')"
   # every file is complete (when python3 can parse it) and names only artifacts in the cache
   for f in "$d"/*.json; do
@@ -343,14 +343,14 @@ case8() {
   no_match_text "Built Test.E" produced.out
 }
 
-# 9. A module's index keeps the 8 most recently written compiles, and a hit rewrites the file of the compile it
-# restores, which makes it recent again. t3's compile of `a := 1` is a new file, not the first compile's again: its
-# `.usage` records the provides digest of each import (`digested`), and t3's `X` provides another name. The `a := 2`
-# compile is the oldest of the 8, so t2's hit restores the last candidate the lookup tries.
+# 9. A module's index keeps the 3 most recently written compiles (`usageIndexSize`), and a hit rewrites the file of the
+# compile it restores, which makes it recent again. t3's compile of `a := 1` is a new file, not the first compile's
+# again: its `.usage` records the provides digest of each import (`digested`), and t3's `X` provides another name. The
+# `a := 2` compile is the oldest of the 3, so t2's hit restores the last candidate the lookup tries.
 case9() {
   local v names=()
   mkpkg t
-  for v in $(seq 9); do
+  for v in $(seq 4); do
     seta t $v
     test_run -d t build Test.B
     names[$v]=$(idxname t B)
@@ -358,26 +358,26 @@ case9() {
   local d
   d=$(idxdir t B)
   test_exp -d "$d"
-  test_exp "$(find "$d" -maxdepth 1 -name '*.json' | wc -l)" = 8
+  test_exp "$(find "$d" -maxdepth 1 -name '*.json' | wc -l)" = 3
   test_exp ! -e "$d/${names[1]}"
   test_exp ! -e "$d/${names[1]%.json}.pre"
-  test_exp -f "$d/${names[9]%.json}.pre"
-  test_exp -f "$d/${names[9]}"
+  test_exp -f "$d/${names[4]%.json}.pre"
+  test_exp -f "$d/${names[4]}"
   mkpkg t2 2
   edx t2
   lake_out -d t2 build -v Test.B
   jobhas Test.B "usage index: restored"
-  jobhas Test.B "(8 candidates,"
-  jobhas Test.B "at rank 8"
+  jobhas Test.B "(3 candidates,"
+  jobhas Test.B "at rank 3"
   mkpkg t3 1
   edx t3
   lake_out -d t3 build -v Test.B
-  jobhas Test.B "usage index: no match (8 candidates"
+  jobhas Test.B "usage index: no match (3 candidates"
   jobhas Test.B "Built Test.B"
   test_exp -f "$d/${names[2]}"
   test_exp ! -e "$d/${names[3]}"
   test_exp -f "$d/$(idxname t3 B)"
-  test_exp "$(find "$d" -maxdepth 1 -name '*.json' | wc -l)" = 8
+  test_exp "$(find "$d" -maxdepth 1 -name '*.json' | wc -l)" = 3
 }
 
 # 10. No lookup and no index write without a writable cache and restored artifacts (each tree has its own value of
