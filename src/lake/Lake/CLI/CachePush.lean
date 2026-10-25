@@ -484,17 +484,43 @@ def writePushStatus (cache : Cache) (stats : PushStats) (queued : Nat) : IO Unit
     |>.insert "queued" queued : Json).pretty
 
 /--
+Whether the build that holds the lock file `file` (see `Cache.pushFollowLockFile`) still runs: it
+holds the lock for as long as its process lives. A missing file is a build that has ended.
+-/
+def followedBuildRuns (file : FilePath) : IO Bool := do
+  let h ← match (← IO.FS.Handle.mk file .read |>.toBaseIO) with
+    | .ok h => pure h
+    | .error (.noFileOrDirectory ..) => return false
+    | .error e => throw e
+  if ← h.tryLock then
+    h.unlock
+    return false
+  return true
+
+/-- How often a push that follows a build looks at the queue again while the build runs. -/
+def followPollMs : UInt32 := 1000
+
+/--
 Runs passes of the push until a pass finds no queue line that this push has not tried, then
 releases `pushLock` (see the module docs). `done` counts the lines that the last pass pushed or
 dropped, which this pass removes from the queue. `failed` holds the lines whose upload failed:
 they stay in the queue, and this push does not try them again. Returns the number of lines left
 in the queue.
+
+With `follow?` (the lock file of a build; see `Cache.pushFollowLockFile`), a pass that finds
+nothing to push waits `followPollMs` and looks again while that build runs, so the build's one
+push uploads every output the build queues. Whether the build runs is read before the queue, so
+the pass that sees it ended also sees every line it queued.
 -/
 partial def pushLoop
   (ctx : PushContext) (pushLock queueLock : IO.FS.Handle)
   (stats : PushStats) (failed : Std.HashSet String) (done : Std.HashMap String Nat)
+  (follow? : Option FilePath := none)
 : LoggerIO Nat := do
   let cache := ctx.cache
+  let following ← match follow? with
+    | some file => followedBuildRuns file
+    | none => pure false
   queueLock.lock
   let (lines, invalid) ← try readQueueLines cache catch e => queueLock.unlock; throw e
   let lines := removeDone lines done
@@ -503,11 +529,17 @@ partial def pushLoop
   let stats := {stats with dropped := stats.dropped + invalid}
   let todo := lines.filter (!failed.contains ·)
   if todo.isEmpty then
+    if following then
+      queueLock.unlock
+      IO.sleep followPollMs
+      return ← pushLoop ctx pushLock queueLock stats failed {} follow?
     if let .error e ← (writePushStatus cache stats lines.size).toBaseIO then
       logWarning s!"could not write {cache.pushStatusFile}: {e}"
     -- Released while the queue is locked: a line appended after this is the next push's
     pushLock.unlock
     queueLock.unlock
+    if let some file := follow? then
+      discard <| (removeFileIfExists file).toBaseIO
     return lines.size
   queueLock.unlock
   logInfo s!"pushing {todo.size} queue entries to the remote cache"
@@ -530,7 +562,7 @@ partial def pushLoop
         stats := {stats with failed := stats.failed + 1}
         failed := failed.insert line
     start := start + max 1 outcomes.size
-  pushLoop ctx pushLock queueLock stats failed done
+  pushLoop ctx pushLock queueLock stats failed done follow?
 
 /--
 Uploads the write-back queue of `cache` to the shared remote cache (see the module docs).
@@ -538,9 +570,14 @@ Returns the number of entries left in the queue, which only failed uploads leave
 
 If another `lake cache push` holds the push lock, returns `0` at once and changes nothing, since
 that push uploads the queue. With `wait`, waits for that push to end instead, then pushes.
+
+With `follow?`, the process ID of a build that started this push (see `startBuildPush`), the push
+keeps looking for new queue lines while that build runs, and ends after the build has ended and
+the queue holds nothing this push has not tried.
 -/
 public def pushRemoteCache
   (env : Env) (lakeCfg : LoadedLakeConfig) (cache : Cache) (wait : Bool)
+  (follow? : Option Nat := none)
 : LoggerIO Nat := do
   IO.FS.createDirAll cache.dir
   let pushLock ← IO.FS.Handle.mk cache.pushLockFile .append
@@ -562,6 +599,7 @@ public def pushRemoteCache
   let workers ← pushWorkers
   logVerbose s!"staging with {workers} workers"
   let queueLock ← IO.FS.Handle.mk cache.pushQueueLockFile .append
-  pushLoop {cache, env, lakeCfg, stagingDir, workers} pushLock queueLock {} {} {}
+  let follow? := follow?.map cache.pushFollowLockFile
+  pushLoop {cache, env, lakeCfg, stagingDir, workers} pushLock queueLock {} {} {} follow?
 
 end Lake
