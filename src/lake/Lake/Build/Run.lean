@@ -405,33 +405,28 @@ def writeRemoteReadStatus (cache : Cache) (status : RemoteReadStatus) : IO Unit 
     |>.insert "lastError" status.lastError : Json).pretty
 
 /--
-At the end of a build that takes claims (see `Env.remoteCacheClaimService?`), starts a detached
-`lake cache push` if the queue still holds lines and none runs, so that the outputs of the
-build's last compiles are uploaded even if the push that its compiles started had ended before
-they were queued (see `startDetachedPush`). Without the shell that a detached push needs, it runs
-the push in the foreground instead, with a warning (see `runForegroundPush`).
+At the end of a build that takes claims (see `Env.remoteCacheClaimService?`) on a machine without
+the shell that a detached push needs (see `canDetachPush`), runs `lake cache push` in the
+foreground if the queue holds lines, with a warning (see `runForegroundPush`). With that shell,
+the build's one detached push follows the build and uploads its last outputs (see
+`startBuildPush`), so nothing is left to do here.
 -/
-def startQueuedPush (ws : Workspace) (logger : MonadLog BaseIO) : BaseIO Unit := do
+def runQueuedPush (ws : Workspace) (logger : MonadLog BaseIO) : BaseIO Unit := do
   unless ws.lakeEnv.remoteCacheClaimService?.isSome do
+    return
+  if ← canDetachPush then
     return
   let cache := ws.lakeCache
   let .ok md ← cache.pushQueueFile.metadata.toBaseIO
     | return
   if md.byteSize == 0 then
     return
-  if !(← canDetachPush) then
-    logger.logEntry (.warning s!"`/bin/bash` is missing, so `lake cache push` runs before the \
-      build ends; log: {cache.pushLogFile}")
-    match (← (runForegroundPush ws.lakeEnv cache).toBaseIO) with
-    | .ok 0 => pure ()
-    | .ok rc => logger.logEntry (.warning s!"`lake cache push` exited with code {rc}")
-    | .error e => logger.logEntry (.warning s!"could not run `lake cache push`: {e}")
-    return
-  match (← (startDetachedPush ws.lakeEnv cache).toBaseIO) with
-  | .ok (some pid) =>
-    logger.logEntry (.trace s!"started `lake cache push` (pid {pid}), log: {cache.pushLogFile}")
-  | .ok none => pure ()
-  | .error e => logger.logEntry (.warning s!"could not start `lake cache push`: {e}")
+  logger.logEntry (.warning s!"`/bin/bash` is missing, so `lake cache push` runs before the \
+    build ends; log: {cache.pushLogFile}")
+  match (← (runForegroundPush ws.lakeEnv cache).toBaseIO) with
+  | .ok 0 => pure ()
+  | .ok rc => logger.logEntry (.warning s!"`lake cache push` exited with code {rc}")
+  | .error e => logger.logEntry (.warning s!"could not run `lake cache push`: {e}")
 
 def finalizeBuild
   (cfg : BuildConfig) (bctx : BuildContext) (mctx : MonitorContext) (result : BuildResult α)
@@ -441,7 +436,7 @@ def finalizeBuild
   if remoteStatus.failures > 0 then
     if let .error e ← (writeRemoteReadStatus bctx.workspace.lakeCache remoteStatus).toBaseIO then
       mctx.logger.logEntry (.trace s!"could not write remote cache read status: {e}")
-  startQueuedPush bctx.workspace mctx.logger
+  runQueuedPush bctx.workspace mctx.logger
   if let some outputsFile := cfg.outputsFile? then
     bctx.saveOutputs (logger := mctx.logger) mctx.out outputsFile
   match result.out with

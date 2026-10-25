@@ -98,9 +98,10 @@ public structure Env where
   remoteCacheQueue : Bool := false
   /--
   Whether a build that queues its outputs (see `remoteCacheQueue`) also claims each input before it
-  compiles it and waits while another build holds the input's claim, and starts a detached
-  `lake cache push` after it queues outputs (i.e., `LAKE_REMOTE_CACHE_CLAIMS`, on unless set to a
-  false value; see `Lake.Build.Claim`). Lake does not add it to `baseVars`.
+  compiles it and waits while another build holds the input's claim, and starts one detached
+  `lake cache push` that follows the build after its first queued output (i.e.,
+  `LAKE_REMOTE_CACHE_CLAIMS`, on unless set to a false value; see `Lake.Build.Claim`). Lake does
+  not add it to `baseVars`.
   -/
   remoteCacheClaims : Bool := true
   /--
