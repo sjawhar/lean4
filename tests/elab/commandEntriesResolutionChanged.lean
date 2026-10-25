@@ -3,7 +3,7 @@ import Lean
 no per-command resolution: `C`'s `theorem t : wv = 7 := by with_reducible rfl` reads the reducibility of `ru`
 through the module `getModuleIdxFor?` picks for `ru`, and no term of `t` mentions `ru`. Once `Z`, which `C` imports
 before `W`, claims the name `ru` with an IR declaration, `ru` resolves to `Z` and reads as semireducible, so `C` no
-longer elaborates; `t`'s uses (`wv`) are unchanged, and only the module's recorded resolutions (`resolved` in
+longer elaborates; `t`'s uses (`wv`) are unchanged, and only the module's recorded resolutions (`C.resolved`, beside
 `C.usage`) show the change. The reuse run (`reuseSource`, a process of its own) asks for a keep permit
 (`ModuleUsage.keepPermit`) before it keeps any command: granted while `Z` claims nothing, refused with
 `resolution changed` once it claims `ru`. The same holds for the specialization cache (Lake's

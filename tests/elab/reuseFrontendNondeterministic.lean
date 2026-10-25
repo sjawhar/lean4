@@ -39,12 +39,12 @@ def src (z : String) : String :=
   let (r, f) := (dir / "r", dir / "f")
   for d in [r, f] do
     IO.FS.createDirAll d
-    for ext in ["olean", "usage"] do
+    for ext in ["olean", "usage", "resolved"] do
       IO.FS.writeBinFile (d / s!"E.{ext}") (← IO.FS.readBinFile (dir / s!"E.{ext}"))
   IO.FS.writeFile (r / "M.lean") (src "1")
   let (rc, _, _) ← lean r (outputs "M" ++ #["M.lean"])
   IO.println s!"first build: exit {rc}"
-  for ext in ["olean", "usage", "ilean"] do
+  for ext in ["olean", "usage", "resolved", "ilean"] do
     IO.FS.rename (r / s!"M.{ext}") (r / s!"M.{ext}.old")
   for d in [r, f] do
     IO.FS.writeFile (d / "M.lean") (src "2")

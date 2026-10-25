@@ -43,12 +43,12 @@ def xOf (dir : System.FilePath) : IO String := do
     IO.FS.writeFile (dir / s!"{m}.lean") src
     let (rc, out) ← lean dir #["-o", s!"{m}.olean", s!"--usage={m}.usage", s!"{m}.lean"]
     unless rc == 0 do throw <| IO.userError s!"lean {m} failed ({rc}):\n{out}"
-    for ext in ["olean", "usage"] do
+    for ext in ["olean", "usage", "resolved"] do
       IO.FS.writeBinFile (dir / "f" / s!"{m}.{ext}") (← IO.FS.readBinFile (dir / s!"{m}.{ext}"))
   IO.FS.writeFile (dir / "M.lean") (mSource "A" "B")
   let (rc, _) ← lean dir (outputs "M" ++ #["M.lean"])
   IO.println s!"first build (import A, import B): exit {rc}, x {← xOf dir}"
-  for ext in ["olean", "usage", "ilean"] do
+  for ext in ["olean", "usage", "resolved", "ilean"] do
     IO.FS.rename (dir / s!"M.{ext}") (dir / s!"M.{ext}.old")
   IO.FS.writeFile (dir / "M.lean") (mSource "B" "A")
   IO.FS.writeFile (dir / "f" / "M.lean") (mSource "B" "A")

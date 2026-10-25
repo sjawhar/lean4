@@ -6,9 +6,9 @@ gave, whatever the conversions compute. `E` registers a scoped extension `sumExt
 adds 1000; both set the flag, and both conversions count their runs in `convRuns`. The command `def_sum x 5` adds the
 entry 5 to each and defines `x`. `M` is `def_sum x 5`, then `y`, which reads both states and `convRuns`, then `z`; the
 reuse run edits only `y`, so `def_sum x 5` is kept. The test compares the exit codes, stdout and stderr, the `.olean`
-and `.ilean` bytes and the `.usage` fields but `reuse` and `resolved` (which must hold the fresh build's) with a fresh
-build's, prints the reuse run's `reuse` field, the value of `y` an importer of each build sees, and what an importer of
-each reads of the two states and of `convRuns`. -/
+and `.ilean` bytes and the `.usage` fields but `reuse` and `resolvedDigest` (the `.resolved` sidecar's entries must
+hold the fresh build's) with a fresh build's, prints the reuse run's `reuse` field, the value of `y` an importer of
+each build sees, and what an importer of each reads of the two states and of `convRuns`. -/
 open Lean
 
 /-- `timeout 120 lean ARGS` in `dir`, with `dir` the search path: its exit code, stdout and stderr. -/
@@ -20,17 +20,18 @@ def lean (dir : System.FilePath) (args : Array String) : IO (UInt32 × String ×
 
 def outputs (m : String) : Array String := #["-o", s!"{m}.olean", s!"--usage={m}.usage", "-i", s!"{m}.ilean"]
 
-/-- A `.usage`, one JSON object per line, as one object without `reuse` and `resolved`, its `reuse` field, and the
-entries of its `resolved` field (module, name and kind). -/
+/-- A `.usage`, one JSON object per line, as one object without `reuse` and `resolvedDigest`, its `reuse` field, and the
+entries of the `.resolved` sidecar beside it (module, name digest and kind). -/
 def usageOf (file : System.FilePath) : IO (Json × Json × Array String) := do
   let mut j := Json.mkObj []
   for line in (← IO.FS.readFile file).splitOn "\n" do
     unless line.isEmpty do j := j.mergeObj (← IO.ofExcept (Json.parse line))
-  let fields := ((j.getObj?.toOption.map (·.toList)).getD []).filter fun (k, _) => k != "reuse" && k != "resolved"
+  let fields := ((j.getObj?.toOption.map (·.toList)).getD []).filter fun (k, _) => k != "reuse" && k != "resolvedDigest"
   let mut resolved := #[]
-  for g in ((j.getObjValD "resolved").getArr?.toOption.getD #[]) do
-    for n in ((g.getArrVal? 1 >>= Json.getArr?).toOption.getD #[]) do
-      resolved := resolved.push (Json.arr #[(g.getArrVal? 0).toOption.getD .null, n]).compress
+  if let .ok bytes ← (IO.FS.readBinFile (file.withExtension "resolved")).toBaseIO then
+    if let .ok t := ModuleUsage.ResolvedTable.decode? bytes then
+      for (d, g, k) in t.entries.toArray do
+        resolved := resolved.push s!"{t.modules[g]!}:{d.hex}:{k}"
   return (Json.mkObj fields, j.getObjValD "reuse", resolved)
 
 def eSource : String := "import Lean
@@ -88,12 +89,12 @@ def importerView (dir : System.FilePath) : IO String := do
   let (r, f) := (dir / "r", dir / "f")
   for d in [r, f] do
     IO.FS.createDirAll d
-    for ext in ["olean", "usage"] do
+    for ext in ["olean", "usage", "resolved"] do
       IO.FS.writeBinFile (d / s!"E.{ext}") (← IO.FS.readBinFile (dir / s!"E.{ext}"))
   IO.FS.writeFile (r / "M.lean") (src "0")
   let (rc, _, _) ← lean r (outputs "M" ++ #["M.lean"])
   IO.println s!"first build: exit {rc}"
-  for ext in ["olean", "usage", "ilean"] do
+  for ext in ["olean", "usage", "resolved", "ilean"] do
     IO.FS.rename (r / s!"M.{ext}") (r / s!"M.{ext}.old")
   for d in [r, f] do
     IO.FS.writeFile (d / "M.lean") (src "1")

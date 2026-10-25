@@ -4,8 +4,8 @@ command, not fail when it writes the `.ilean`. `M` is built with `-i`, then comm
 previous `.usage` is tampered with (the `.olean` is untouched): (i) set to `[0]`, not in fours; (ii) its first
 identifier index set past `idents`; (iii) its first length set to `-1`. The reuse run edits only `z`. It must write
 what a build without reuse writes: the test compares the exit codes, the stdout and the stderr, the `.olean` and
-`.ilean` bytes, the `.usage` fields but `reuse` and `resolved`, which must hold the fresh build's, and prints the
-reuse run's `reElab`. -/
+`.ilean` bytes, the `.usage` fields but `reuse` and `resolvedDigest`, and the `.resolved` sidecar's entries, which must
+hold the fresh build's, and prints the reuse run's `reElab`. -/
 open Lean
 
 /-- `timeout 120 lean ARGS` in `dir`, with `dir` the search path: its exit code, stdout and stderr. -/
@@ -21,18 +21,19 @@ def outputs (m : String) : Array String := #["-o", s!"{m}.olean", s!"--usage={m}
 def bytesOf (file : System.FilePath) : IO ByteArray := do
   if ← file.pathExists then IO.FS.readBinFile file else return .empty
 
-/-- A `.usage`, one JSON object per line, as one object without `reuse` and `resolved`, its `reuse` field, and the
-entries of its `resolved` field (module, name and kind). -/
+/-- A `.usage`, one JSON object per line, as one object without `reuse` and `resolvedDigest`, its `reuse` field, and the
+entries of the `.resolved` sidecar beside it (module, name digest and kind). -/
 def usageOf (file : System.FilePath) : IO (Json × Json × Array String) := do
   let mut j := Json.mkObj []
   unless ← file.pathExists do return (j, j, #[])
   for line in (← IO.FS.readFile file).splitOn "\n" do
     unless line.isEmpty do j := j.mergeObj (← IO.ofExcept (Json.parse line))
-  let fields := ((j.getObj?.toOption.map (·.toList)).getD []).filter fun (k, _) => k != "reuse" && k != "resolved"
+  let fields := ((j.getObj?.toOption.map (·.toList)).getD []).filter fun (k, _) => k != "reuse" && k != "resolvedDigest"
   let mut resolved := #[]
-  for g in ((j.getObjValD "resolved").getArr?.toOption.getD #[]) do
-    for n in ((g.getArrVal? 1 >>= Json.getArr?).toOption.getD #[]) do
-      resolved := resolved.push (Json.arr #[(g.getArrVal? 0).toOption.getD .null, n]).compress
+  if let .ok bytes ← (IO.FS.readBinFile (file.withExtension "resolved")).toBaseIO then
+    if let .ok t := ModuleUsage.ResolvedTable.decode? bytes then
+      for (d, g, k) in t.entries.toArray do
+        resolved := resolved.push s!"{t.modules[g]!}:{d.hex}:{k}"
   return (Json.mkObj fields, j.getObjValD "reuse", resolved)
 
 /-- The `.usage` line with `commands`, command 1's `refs.refs` replaced by `f idents.size refs`. -/
@@ -69,6 +70,7 @@ def case (dir : System.FilePath) (label : String) (f : Nat → Array Int → Arr
   IO.println s!"{label}: usage lines tampered: {tampered}"
   IO.FS.writeFile (r / "M.usage.old") ("\n".intercalate out.toList)
   IO.FS.removeFile (r / "M.usage")
+  IO.FS.rename (r / "M.resolved") (r / "M.resolved.old")
   for d in [r, fr] do
     IO.FS.writeFile (d / "M.lean") (src "2")
   let (rcR, outR, errR) ← lean r (outputs "M" ++ #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old",

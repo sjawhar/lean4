@@ -1,0 +1,21 @@
+same: true agrees
+lost a: false agrees
+b now kernel: false agrees
+c lost extra: false agrees
+gains d: false agrees
+gains l.x: false agrees
+gains z: false agrees
+gains unrelated: true agrees
+duplicates: true agrees
+declares used d: true agrees
+declares used own: true agrees
+compiles used d: false agrees
+declares used z: false agrees
+P unrelated: true P gains a: false
+truncated: truncated
+trailing: trailing bytes
+duplicate: two entries of the identity ced2a81aec1f310df34ddf3620430fc4
+resolvedId = Enc.name: true
+version (some 16) resolved field false
+digest matches true none group true
+own name true

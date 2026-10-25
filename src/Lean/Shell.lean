@@ -142,6 +142,7 @@ def displayHelp (useStderr : Bool) : IO Unit := do
   out.putStrLn    "      --usage=file       with -o, add usage-cutoff digests to the olean and write its sidecar to file"
   out.putStrLn    "      --reuse-olean=file, --reuse-usage=file"
   out.putStrLn    "                         with --usage, keep commands from the module's previous .olean and .usage"
+  out.putStrLn    "                         (and the .resolved beside it: M.usage.old's is M.resolved.old)"
   out.putStrLn    "      --reuse-changed-extra=module"
   out.putStrLn    "                         with --reuse-olean, elaborate the commands that used the module whole"
   out.putStrLn    "      --reuse-declined=reason"

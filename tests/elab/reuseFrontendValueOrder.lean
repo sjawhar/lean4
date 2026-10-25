@@ -7,7 +7,8 @@ live reads in command order, and it must record the first value a fresh build re
 keeps `a`, which carries `A`, and only the message rendering reads `B`; a fresh build first reads `A` (in `a`), so the
 reuse run's first value of `env:FOO` must be `A` too. The `.usage` `values` and `noreuse` fields, the whole `.usage`
 but `reuse`, the `.olean`/`.ilean` bytes, the exit codes and stdout/stderr are compared with a fresh build's; a reuse
-run's `resolved` must hold the fresh build's (it also carries the names its previous build resolved). -/
+run's `.resolved` sidecar must hold the fresh build's entries (it also carries the names its previous build resolved),
+so its `resolvedDigest` may differ. -/
 open Lean
 
 /-- `timeout 120 lean ARGS` in `dir`, with `dir` the search path and `FOO=foo`: its exit code, stdout and stderr. -/
@@ -32,13 +33,14 @@ def usageOf (file : System.FilePath) : IO Json := do
     unless line.isEmpty do j := j.mergeObj (← IO.ofExcept (Json.parse line))
   return Json.mkObj <| ((j.getObj?.toOption.map (·.toList)).getD []).filter (·.1 != "reuse")
 
-/-- The entries (module, name and kind) of a `.usage`'s `resolved` field. -/
-def resolvedOf (j : Json) : Array String := Id.run do
-  let mut out := #[]
-  for g in ((j.getObjValD "resolved").getArr?.toOption.getD #[]) do
-    for n in ((g.getArrVal? 1 >>= Json.getArr?).toOption.getD #[]) do
-      out := out.push (Json.arr #[(g.getArrVal? 0).toOption.getD .null, n]).compress
-  return out
+/-- The entries (module, name digest and kind) of the `.resolved` sidecar beside a `.usage`. -/
+def resolvedOf (file : System.FilePath) : IO (Array String) := do
+  let mut resolved := #[]
+  if let .ok bytes ← (IO.FS.readBinFile (file.withExtension "resolved")).toBaseIO then
+    if let .ok t := ModuleUsage.ResolvedTable.decode? bytes then
+      for (d, g, k) in t.entries.toArray do
+        resolved := resolved.push s!"{t.modules[g]!}:{d.hex}:{k}"
+  return resolved
 
 def eSource : String := "import Lean
 open Lean Elab Term Command
@@ -62,7 +64,7 @@ def z : Nat := 1
   IO.FS.writeFile (dir / "M.lean") (mSource "A")
   let (rc, so, se) ← lean dir (outputs "M" ++ #["M.lean"]) "A"
   unless rc == 0 do throw <| IO.userError s!"the first build failed: {so}{se}"
-  for ext in ["olean", "usage", "ilean"] do
+  for ext in ["olean", "usage", "resolved", "ilean"] do
     IO.FS.writeBinFile (dir / s!"M.{ext}.old") (← IO.FS.readBinFile (dir / s!"M.{ext}"))
   IO.FS.writeFile (dir / "M.lean") (mSource "B")
   let (rr, rso, rse) ← lean dir reuseArgs "A"
@@ -84,7 +86,8 @@ def z : Nat := 1
   let cmdLen (j : Json) : Option Nat := ((j.getObjValD "commands").getArr?.toOption.map Array.size)
   IO.println s!"commands lengths equal: {cmdLen ur == cmdLen uf}"
   let keys (j : Json) : List String := (fieldsOf j).map Prod.fst
+  let covers := (← resolvedOf (f / "M.usage")).all (← resolvedOf (dir / "M.usage")).contains
   let differing := ((keys ur ++ keys uf).eraseDups).filter fun k =>
-    if k == "resolved" then !(resolvedOf uf).all (resolvedOf ur).contains
+    if k == "resolvedDigest" then !covers
     else field ur k != field uf k
   IO.println s!"usage fields differing from the fresh build's but `reuse`: {differing}"

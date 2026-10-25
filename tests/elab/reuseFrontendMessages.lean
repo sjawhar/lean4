@@ -37,7 +37,7 @@ def case (r f : System.FilePath) (label : String) (extra : Array String) : IO Un
   IO.FS.writeFile (r / "M.lean") (mSource 1)
   let (rc, out) ← lean r (outputs ++ #["M.lean"])
   unless rc == 0 do throw <| IO.userError s!"first build failed ({rc}):\n{out}"
-  for ext in ["olean", "usage", "ilean"] do
+  for ext in ["olean", "usage", "resolved", "ilean"] do
     IO.FS.writeBinFile (r / s!"M.{ext}.old") (← IO.FS.readBinFile (r / s!"M.{ext}"))
   IO.FS.writeFile (r / "M.lean") (mSource 2)
   let (rcR, outR) ← lean r (outputs ++ extra ++ #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old",

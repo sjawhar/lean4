@@ -1,8 +1,8 @@
 import Lean
-/-! The reuse run's declines and flag errors: `--reuse-declined=REASON` (Lake's reason) and a previous `.usage` or
-`.olean` that cannot be read record why no command was kept in the `.usage` `reuse` field, elaborate every command and
-print nothing about it; `--reuse-declined` with `--reuse-olean`/`--reuse-usage`, or one of these without the other, is
-an error. -/
+/-! The reuse run's declines and flag errors: `--reuse-declined=REASON` (Lake's reason) and a previous `.usage`,
+`.resolved` or `.olean` that cannot be read (a `.resolved` missing beside the `.usage`, or with other bytes than the
+`.usage` records) record why no command was kept in the `.usage` `reuse` field, elaborate every command and print nothing
+about it; `--reuse-declined` with `--reuse-olean`/`--reuse-usage`, or one of these without the other, is an error. -/
 open Lean
 
 def lean (dir : System.FilePath) (args : Array String) : IO (UInt32 × String) := do
@@ -29,7 +29,7 @@ def run (dir : System.FilePath) (label : String) (args : Array String) : IO Unit
   discard <| lean dir #["-o", "X.olean", "--usage=X.usage", "X.lean"]
   IO.FS.writeFile (dir / "M.lean") "import X\ndef b := v + 1\ntheorem t : b = 6 := rfl\n"
   run dir "first build" #[]
-  for ext in ["olean", "usage", "ilean"] do
+  for ext in ["olean", "usage", "resolved", "ilean"] do
     IO.FS.writeBinFile (dir / s!"M.{ext}.old") (← IO.FS.readBinFile (dir / s!"M.{ext}"))
   run dir "Lake's reason" #["--reuse-declined=no-saved-trace"]
   run dir "previous outputs" #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old"]
@@ -38,6 +38,11 @@ def run (dir : System.FilePath) (label : String) (args : Array String) : IO Unit
   run dir "truncated .usage" #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old"]
   IO.FS.writeFile (dir / "M.usage.old") usage
   run dir "missing .olean" #["--reuse-olean=M.missing.olean", "--reuse-usage=M.usage.old"]
+  IO.FS.rename (dir / "M.resolved.old") (dir / "M.resolved.kept")
+  run dir "missing .resolved" #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old"]
+  IO.FS.writeBinFile (dir / "M.resolved.old") ((← IO.FS.readBinFile (dir / "M.resolved.kept")).push 0)
+  run dir "other .resolved" #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old"]
+  IO.FS.rename (dir / "M.resolved.kept") (dir / "M.resolved.old")
   run dir "declined with the reuse flags" #["--reuse-declined=noskip", "--reuse-olean=M.olean.old",
     "--reuse-usage=M.usage.old"]
   run dir "one reuse flag" #["--reuse-olean=M.olean.old"]

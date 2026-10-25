@@ -64,7 +64,7 @@ def attempts : Nat := 20
     let r := dir / s!"reuse{k}"
     IO.FS.createDirAll r
     for n in ["E.olean", "E.usage"] do copy (dir / n) (r / n)
-    for ext in ["olean", "usage"] do copy (first / s!"M.{ext}") (r / s!"M.{ext}.old")
+    for ext in ["olean", "usage", "resolved"] do copy (first / s!"M.{ext}") (r / s!"M.{ext}.old")
     IO.FS.writeFile (r / "M.lean") (src "1")
     let (rc, out, err) ← lean r (outputs "M" ++ #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old",
       "M.lean"])

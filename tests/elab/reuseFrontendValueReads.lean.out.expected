@@ -5,5 +5,5 @@ z edited: usage fields differing from the fresh build's but `reuse`: []
 b reads nothing: reuse run exit 0, output "stdout \"\", stderr \"\"", reuse {"elabReasons":{"position":2,"text":1},"kept":1,"reElab":[1,2,3],"total":4}
 b reads nothing: fresh build exit 0; values: reuse run [env:FOO], fresh [env:FOO]
 b reads nothing: command values: reuse run [[env:FOO], [], [], [], []], fresh [[env:FOO], [], [], [], []]
-b reads nothing: usage fields differing from the fresh build's but `reuse`: [resolved]
+b reads nothing: usage fields differing from the fresh build's but `reuse`: [resolvedDigest]
 FOO changed after the z edit: exit 0, reuse {"declined":"the process value env:FOO is not what it was when the module was compiled"}

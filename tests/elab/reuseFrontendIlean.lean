@@ -37,7 +37,7 @@ prints the reuse run's `kept` and `elabReasons` and whether its `.ilean` is the 
 def check (label : String) (prevIlean ilean : Bool) : IO Unit :=
   IO.FS.withTempDir fun r => IO.FS.withTempDir fun f => do
     build r (source "rfl") prevIlean
-    for ext in ["olean", "usage"] do
+    for ext in ["olean", "usage", "resolved"] do
       IO.FS.rename (r / s!"M.{ext}") (r / s!"M.{ext}.prev")
     if prevIlean then IO.FS.removeFile (r / "M.ilean")
     build r (source "by rfl") ilean #["--reuse-olean=M.olean.prev", "--reuse-usage=M.usage.prev"]

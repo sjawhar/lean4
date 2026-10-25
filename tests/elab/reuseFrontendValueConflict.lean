@@ -5,8 +5,8 @@ build records. `M`'s `a` and `c` read `FOO`, and the `#eval` between them sets i
 it to `A`; the edit sets it to `B` (same length, later spans unchanged). The reuse run keeps `a`, which carries `A`, and
 `c` reads `B`; a fresh build reads `A` then `B` and is `noreuse`, as the reuse run must be. A later reuse run of those
 outputs with `FOO=B` must not keep `a`, whose value `"A"` came from another `FOO`. The `.usage` fields but `reuse` are
-compared with a fresh build's; a reuse run's `resolved` must hold the fresh build's (it also carries the names its
-previous build resolved). -/
+compared with a fresh build's but `resolvedDigest`, which may differ when the reuse run's `.resolved` sidecar holds the
+fresh build's entries (it also carries the names its previous build resolved). -/
 open Lean
 
 /-- `lean ARGS` in `dir`, with `dir` the search path and `FOO=foo`: its exit code and output. -/
@@ -29,13 +29,14 @@ def usageOf (file : System.FilePath) : IO (Json × Json) := do
   let fields := ((j.getObj?.toOption.map (·.toList)).getD []).filter (·.1 != "reuse")
   return (Json.mkObj fields, j.getObjValD "reuse")
 
-/-- The entries (module, name and kind) of a `.usage`'s `resolved` field. -/
-def resolvedOf (j : Json) : Array String := Id.run do
-  let mut out := #[]
-  for g in ((j.getObjValD "resolved").getArr?.toOption.getD #[]) do
-    for n in ((g.getArrVal? 1 >>= Json.getArr?).toOption.getD #[]) do
-      out := out.push (Json.arr #[(g.getArrVal? 0).toOption.getD .null, n]).compress
-  return out
+/-- The entries (module, name digest and kind) of the `.resolved` sidecar beside a `.usage`. -/
+def resolvedOf (file : System.FilePath) : IO (Array String) := do
+  let mut resolved := #[]
+  if let .ok bytes ← (IO.FS.readBinFile (file.withExtension "resolved")).toBaseIO then
+    if let .ok t := ModuleUsage.ResolvedTable.decode? bytes then
+      for (d, g, k) in t.entries.toArray do
+        resolved := resolved.push s!"{t.modules[g]!}:{d.hex}:{k}"
+  return resolved
 
 def eSource : String := "import Lean
 open Lean Elab Term
@@ -50,7 +51,7 @@ def c : String := foo_term
 "
 
 def keepOld (dir : System.FilePath) : IO Unit := do
-  for ext in ["olean", "usage", "ilean"] do
+  for ext in ["olean", "usage", "resolved", "ilean"] do
     IO.FS.writeBinFile (dir / s!"M.{ext}.old") (← IO.FS.readBinFile (dir / s!"M.{ext}"))
 
 /-- Builds `mSource "B"` fresh in `f` with `FOO=foo`, and prints how `dir`'s reuse run, which exited with `rr` and
@@ -64,8 +65,9 @@ def compare (dir f : System.FilePath) (label foo : String) (rr : UInt32) (ro : S
   let (ur, reuse) ← usageOf (dir / "M.usage")
   let (uf, _) ← usageOf (f / "M.usage")
   let fields (j : Json) : List (String × Json) := (j.getObj?.toOption.map (·.toList)).getD []
+  let covers := (← resolvedOf (f / "M.usage")).all (← resolvedOf (dir / "M.usage")).contains
   let differing := (fields ur).filterMap fun (k, v) =>
-    if k == "resolved" && (resolvedOf uf).all (resolvedOf ur).contains then none
+    if k == "resolvedDigest" && covers then none
     else if ((fields uf).lookup k).map Json.compress == some (Json.compress v) then none else some k
   let same (n : String) : IO Bool := return (← IO.FS.readBinFile (dir / n)) == (← IO.FS.readBinFile (f / n))
   let noreuse (j : Json) := ((j.getObjValAs? Bool "noreuse").toOption, (j.getObjValAs? String "noreuseReason").toOption)

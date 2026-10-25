@@ -90,7 +90,7 @@ def buildE (base : System.FilePath) (init : String) : IO Unit := do
   unless rc == 0 do throw <| IO.userError s!"lean E failed ({rc}):\n{out}{err}"
 
 def reuseRun (r first : System.FilePath) : IO (UInt32 × String × String) := do
-  for ext in ["olean", "usage"] do copy (first / s!"M.{ext}") (r / s!"M.{ext}.old")
+  for ext in ["olean", "usage", "resolved"] do copy (first / s!"M.{ext}") (r / s!"M.{ext}.old")
   lean r (outputs "M" ++ #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old", "M.lean"])
 
 /-- `a` and `b` of the `M` built in `dir`, as an importer reads them. -/

@@ -107,7 +107,7 @@ def runCase (c : Case) : IO Unit := IO.FS.withTempDir fun dir => do
   IO.FS.writeFile (dir / "M.lean") (mSource "#eval show IO Unit from pure ()" extra)
   let (rc, out) ← compile c dir false
   unless rc == 0 do throw <| IO.userError s!"{l}: first build failed: {out}"
-  for ext in ["olean", "usage", "ilean"] do
+  for ext in ["olean", "usage", "resolved", "ilean"] do
     IO.FS.writeBinFile (dir / s!"M.{ext}.old") (← IO.FS.readBinFile (dir / s!"M.{ext}"))
   IO.FS.writeFile (dir / "M.lean") (mSource trigger extra)
   for n in ["I.olean", "I.usage", "M.lean"] do
@@ -139,7 +139,7 @@ def runCase (c : Case) : IO Unit := IO.FS.withTempDir fun dir => do
 def abbrevAccepted : IO Unit := IO.FS.withTempDir fun dir => do
   IO.FS.writeFile (dir / "M.lean") "def a : Nat := 1\ndef b : Nat := 2\n"
   discard <| lean dir (outputs "M" ++ #["M.lean"])
-  for ext in ["olean", "usage", "ilean"] do
+  for ext in ["olean", "usage", "resolved", "ilean"] do
     IO.FS.writeBinFile (dir / s!"M.{ext}.old") (← IO.FS.readBinFile (dir / s!"M.{ext}"))
   let (rc, out) ← lean dir (outputs "M" ++
     #["--reuse-ole=M.olean.old", "--reuse-usa=M.usage.old", "M.lean"])

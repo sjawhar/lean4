@@ -8,8 +8,8 @@ directory to 8 distinct directories and back, then sets `cfgRef` to `config.txt`
 `#eval` only sets `FOO`; only `z`
 changes; `d` is kept. (d) As (c), but the edit changes the value set from `A` to `B` and `d` reads `FOO`. Each case
 compares the reuse run with a fresh build (exit codes, stdout, stderr, `.olean`, `.ilean`, `.usage` but `reuse`, with
-`resolved` holding the fresh build's) and prints the `d` an importer sees and the reuse field's `kept` and
-`elabReasons`. In (a) the outputs depend on the free memory and are not compared with the fresh build's. -/
+the `.resolved` sidecar's entries holding the fresh build's) and prints the `d` an importer sees and the reuse field's
+`kept` and `elabReasons`. In (a) the outputs depend on the free memory and are not compared with the fresh build's. -/
 open Lean
 
 /-- `timeout 120 lean ARGS` in `dir`, with `dir` the search path and `FOO` unset: its exit code, stdout and stderr. -/
@@ -26,18 +26,19 @@ def outputs (m : String) : Array String := #["-o", s!"{m}.olean", s!"--usage={m}
 def bytesOf (file : System.FilePath) : IO ByteArray := do
   if ← file.pathExists then IO.FS.readBinFile file else return .empty
 
-/-- A `.usage`, one JSON object per line, as one object without `reuse` and `resolved`, its `reuse` field, and the
-entries of its `resolved` field (module, name and kind). -/
+/-- A `.usage`, one JSON object per line, as one object without `reuse` and `resolvedDigest`, its `reuse` field, and the
+entries of the `.resolved` sidecar beside it (module, name digest and kind). -/
 def usageOf (file : System.FilePath) : IO (Json × Json × Array String) := do
   let mut j := Json.mkObj []
   unless ← file.pathExists do return (j, j, #[])
   for line in (← IO.FS.readFile file).splitOn "\n" do
     unless line.isEmpty do j := j.mergeObj (← IO.ofExcept (Json.parse line))
-  let fields := ((j.getObj?.toOption.map (·.toList)).getD []).filter fun (k, _) => k != "reuse" && k != "resolved"
+  let fields := ((j.getObj?.toOption.map (·.toList)).getD []).filter fun (k, _) => k != "reuse" && k != "resolvedDigest"
   let mut resolved := #[]
-  for g in ((j.getObjValD "resolved").getArr?.toOption.getD #[]) do
-    for n in ((g.getArrVal? 1 >>= Json.getArr?).toOption.getD #[]) do
-      resolved := resolved.push (Json.arr #[(g.getArrVal? 0).toOption.getD .null, n]).compress
+  if let .ok bytes ← (IO.FS.readBinFile (file.withExtension "resolved")).toBaseIO then
+    if let .ok t := ModuleUsage.ResolvedTable.decode? bytes then
+      for (d, g, k) in t.entries.toArray do
+        resolved := resolved.push s!"{t.modules[g]!}:{d.hex}:{k}"
   return (Json.mkObj fields, j.getObjValD "reuse", resolved)
 
 def eSource : String := "import Lean
@@ -61,20 +62,20 @@ def case (dir : System.FilePath) (label src cfg src' cfg' : String) (volatile :=
   let (b, k) := (dir / s!"{label}-b", dir / s!"{label}-k")
   for d in [b, k] do
     IO.FS.createDirAll d
-    for ext in ["olean", "usage"] do
+    for ext in ["olean", "usage", "resolved"] do
       IO.FS.writeBinFile (d / s!"E.{ext}") (← IO.FS.readBinFile (dir / s!"E.{ext}"))
   IO.FS.writeFile (b / "config.txt") cfg
   IO.FS.writeFile (b / "M.lean") src
   let (rc, _, _) ← lean b (outputs "M" ++ #["M.lean"])
   let first ← valueOf b
   IO.println s!"{label}: first build: exit {rc}{if volatile then "" else s!", d {first}"}"
-  for ext in ["olean", "usage", "ilean"] do
+  for ext in ["olean", "usage", "resolved", "ilean"] do
     IO.FS.rename (b / s!"M.{ext}") (b / s!"M.{ext}.old")
   IO.FS.writeFile (b / "config.txt") cfg'
   IO.FS.writeFile (b / "M.lean") src'
   let (rcR, outR, errR) ← lean b (outputs "M" ++ #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old",
     "M.lean"])
-  for ext in ["olean", "usage", "ilean"] do
+  for ext in ["olean", "usage", "resolved", "ilean"] do
     if ← (b / s!"M.{ext}").pathExists then IO.FS.rename (b / s!"M.{ext}") (k / s!"M.{ext}")
   let (rcF, outF, errF) ← lean b (outputs "M" ++ #["M.lean"])
   IO.println s!"{label}: exit codes: reuse {rcR}, fresh {rcF}"

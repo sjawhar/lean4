@@ -4,7 +4,8 @@ before the run settles the previous elaborated command, which is where an unchan
 to have the same constants. `a` uses a deprecated constant, so its warning holds an expression and `a` is always
 elaborated again, with the same constant; `b` uses `a` and `c` uses `b`. The reuse run edits only the last
 declaration `z`: `b` and `c` must be kept, and the run must write what a build without reuse writes (exit codes,
-stdout and stderr, `.olean` and `.ilean` bytes, `.usage` fields but `reuse`, with `resolved` holding the fresh
+stdout and stderr, `.olean` and `.ilean` bytes, `.usage` fields but `reuse` and `resolvedDigest`, with the `.resolved`
+sidecar's entries holding the fresh
 build's). -/
 open Lean
 
@@ -20,17 +21,19 @@ def outputs (m : String) : Array String := #["-o", s!"{m}.olean", s!"--usage={m}
 def bytesOf (file : System.FilePath) : IO ByteArray := do
   if ← file.pathExists then IO.FS.readBinFile file else return .empty
 
-/-- A `.usage` as one object without `reuse` and `resolved`, its `reuse` field, and its `resolved` entries. -/
+/-- A `.usage` as one object without `reuse` and `resolvedDigest`, its `reuse` field, and the entries of the `.resolved`
+sidecar beside it. -/
 def usageOf (file : System.FilePath) : IO (Json × Json × Array String) := do
   let mut j := Json.mkObj []
   unless ← file.pathExists do return (j, j, #[])
   for line in (← IO.FS.readFile file).splitOn "\n" do
     unless line.isEmpty do j := j.mergeObj (← IO.ofExcept (Json.parse line))
-  let fields := ((j.getObj?.toOption.map (·.toList)).getD []).filter fun (k, _) => k != "reuse" && k != "resolved"
+  let fields := ((j.getObj?.toOption.map (·.toList)).getD []).filter fun (k, _) => k != "reuse" && k != "resolvedDigest"
   let mut resolved := #[]
-  for g in ((j.getObjValD "resolved").getArr?.toOption.getD #[]) do
-    for n in ((g.getArrVal? 1 >>= Json.getArr?).toOption.getD #[]) do
-      resolved := resolved.push (Json.arr #[(g.getArrVal? 0).toOption.getD .null, n]).compress
+  if let .ok bytes ← (IO.FS.readBinFile (file.withExtension "resolved")).toBaseIO then
+    if let .ok t := ModuleUsage.ResolvedTable.decode? bytes then
+      for (d, g, k) in t.entries.toArray do
+        resolved := resolved.push s!"{t.modules[g]!}:{d.hex}:{k}"
   return (Json.mkObj fields, j.getObjValD "reuse", resolved)
 
 def src (z : String) : String :=
@@ -43,7 +46,7 @@ def src (z : String) : String :=
   IO.FS.writeFile (r / "M.lean") (src "1")
   let (rc, _, _) ← lean r (outputs "M" ++ #["M.lean"])
   IO.println s!"first build: exit {rc}"
-  for ext in ["olean", "usage", "ilean"] do
+  for ext in ["olean", "usage", "resolved", "ilean"] do
     IO.FS.rename (r / s!"M.{ext}") (r / s!"M.{ext}.old")
   IO.FS.writeFile (r / "M.lean") (src "2")
   IO.FS.writeFile (f / "M.lean") (src "2")

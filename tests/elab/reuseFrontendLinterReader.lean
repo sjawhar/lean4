@@ -51,7 +51,7 @@ def mSource (z : String) : String := s!"import L\ndef a : Nat := 1\ndef b : Nat 
   IO.FS.writeFile (dir / "M.lean") (mSource "1")
   let (rc, out, _) ← lean dir (outputs "M" ++ #["M.lean"])
   IO.println s!"first build: exit {rc}, stdout {out.trimAscii.copy.quote}"
-  for ext in ["olean", "usage", "ilean"] do
+  for ext in ["olean", "usage", "resolved", "ilean"] do
     IO.FS.rename (dir / s!"M.{ext}") (dir / s!"M.{ext}.old")
   IO.FS.writeFile (dir / "M.lean") (mSource "12345")
   let (rcR, outR, errR) ← lean dir (outputs "M" ++ #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old",

@@ -1,5 +1,5 @@
 M: exit 0
 N: exit 0
 foo found: true, bar found: true
-N.usage resolved names `foo`: false
-N.usage resolved names `bar`: true
+N.resolved records `foo`: false
+N.resolved records `bar`: true

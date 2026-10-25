@@ -56,6 +56,7 @@ def tamper (line : String) : Except String String := do
   IO.println s!"usage lines tampered: {tampered}"
   IO.FS.writeFile (dir / "M.usage.old") ("\n".intercalate out.toList)
   IO.FS.removeFile (dir / "M.usage")
+  IO.FS.rename (dir / "M.resolved") (dir / "M.resolved.old")
   IO.FS.createDirAll (dir / "f")
   IO.FS.writeFile (dir / "f" / "M.lean") src
   let (rcR, outR) ← lean dir (outputs "M" ++ #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old",

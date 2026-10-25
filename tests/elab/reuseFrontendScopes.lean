@@ -6,9 +6,9 @@ declaration `z`, and every declaration before it is kept; in (b) it edits only `
 `B.v`, and every declaration after the `open` is elaborated (the `open`'s payload differs); in (c) it edits only
 `variable (n : Nat)` to `variable (n : Int)`, whose payload is the previous one, and every declaration after it is
 elaborated (its context holds the other scopes). Each case compares the exit codes, the stdout and the stderr, the
-`.olean` and `.ilean` bytes and the `.usage` fields but `reuse` and `resolved`, which must hold the fresh build's (a
-reuse run also carries what its previous build resolved), with a fresh build's, and prints the reuse run's `kept`,
-`reElab` and `elabReasons`. -/
+`.olean` and `.ilean` bytes and the `.usage` fields but `reuse` and `resolvedDigest`, with the `.resolved` sidecar's
+entries holding the fresh build's (a reuse run also carries what its previous build resolved), with a fresh build's,
+and prints the reuse run's `kept`, `reElab` and `elabReasons`. -/
 open Lean
 
 /-- `timeout 120 lean ARGS` in `dir`, with `dir` the search path: its exit code, stdout and stderr. -/
@@ -20,17 +20,18 @@ def lean (dir : System.FilePath) (args : Array String) : IO (UInt32 × String ×
 
 def outputs (m : String) : Array String := #["-o", s!"{m}.olean", s!"--usage={m}.usage", "-i", s!"{m}.ilean"]
 
-/-- A `.usage`, one JSON object per line, as one object without `reuse` and `resolved`, its `reuse` field, and the
-entries of its `resolved` field (module, name and kind). -/
+/-- A `.usage`, one JSON object per line, as one object without `reuse` and `resolvedDigest`, its `reuse` field, and the
+entries of the `.resolved` sidecar beside it (module, name digest and kind). -/
 def usageOf (file : System.FilePath) : IO (Json × Json × Array String) := do
   let mut j := Json.mkObj []
   for line in (← IO.FS.readFile file).splitOn "\n" do
     unless line.isEmpty do j := j.mergeObj (← IO.ofExcept (Json.parse line))
-  let fields := ((j.getObj?.toOption.map (·.toList)).getD []).filter fun (k, _) => k != "reuse" && k != "resolved"
+  let fields := ((j.getObj?.toOption.map (·.toList)).getD []).filter fun (k, _) => k != "reuse" && k != "resolvedDigest"
   let mut resolved := #[]
-  for g in ((j.getObjValD "resolved").getArr?.toOption.getD #[]) do
-    for n in ((g.getArrVal? 1 >>= Json.getArr?).toOption.getD #[]) do
-      resolved := resolved.push (Json.arr #[(g.getArrVal? 0).toOption.getD .null, n]).compress
+  if let .ok bytes ← (IO.FS.readBinFile (file.withExtension "resolved")).toBaseIO then
+    if let .ok t := ModuleUsage.ResolvedTable.decode? bytes then
+      for (d, g, k) in t.entries.toArray do
+        resolved := resolved.push s!"{t.modules[g]!}:{d.hex}:{k}"
   return (Json.mkObj fields, j.getObjValD "reuse", resolved)
 
 def src (opened ty z : String) : String := s!"namespace A
@@ -55,7 +56,7 @@ def case (dir : System.FilePath) (label : String) (before after : String × Stri
   IO.FS.writeFile (r / "M.lean") (src before.1 before.2.1 before.2.2)
   let (rc, _, _) ← lean r (outputs "M" ++ #["M.lean"])
   IO.println s!"{label}: first build: exit {rc}"
-  for ext in ["olean", "usage", "ilean"] do
+  for ext in ["olean", "usage", "resolved", "ilean"] do
     IO.FS.rename (r / s!"M.{ext}") (r / s!"M.{ext}.old")
   for d in [r, f] do
     IO.FS.writeFile (d / "M.lean") (src after.1 after.2.1 after.2.2)

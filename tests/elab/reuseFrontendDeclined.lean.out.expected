@@ -3,6 +3,8 @@ Lake's reason: exit 0, reuse {"declined":"no-saved-trace"}, output "stdout \"\",
 previous outputs: exit 0, reuse {"elabReasons":{},"kept":2,"reElab":[],"total":2}, output "stdout \"\", stderr \"\""
 truncated .usage: exit 0, reuse {"declined":"the previous `.usage` cannot be read: offset 40: unexpected end of input"}, output "stdout \"\", stderr \"\""
 missing .olean: exit 0, reuse {"declined":"the previous outputs cannot be read: no such file or directory (error code: 2)\n  file: M.missing.olean"}, output "stdout \"\", stderr \"\""
+missing .resolved: exit 0, reuse {"declined":"the previous `.resolved` is missing or is not the one the previous `.usage` records"}, output "stdout \"\", stderr \"\""
+other .resolved: exit 0, reuse {"declined":"the previous `.resolved` is missing or is not the one the previous `.usage` records"}, output "stdout \"\", stderr \"\""
 declined with the reuse flags: exit 1, reuse -, output "stdout \"\", stderr \"error: --reuse-declined cannot be combined with --reuse-olean/--reuse-usage\\n\""
 one reuse flag: exit 1, reuse -, output "stdout \"\", stderr \"error: --reuse-olean and --reuse-usage must be given together\\n\""
 without --usage: exit 1, output "stdout \"\", stderr \"error: --reuse-olean, --reuse-usage and --reuse-declined need -o and --usage\\n\""

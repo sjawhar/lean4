@@ -12,11 +12,11 @@ public import Lean.Parser.Module
 public section
 
 /-!
-A reuse run (`lean --reuse-olean=F --reuse-usage=F`): the frontend reads the module's previous `.olean` and `.usage`
-while its header is processed (`Request.new`), takes a keep permit for them once the header is processed
-(`Request.start`), then decides for each command in order whether to keep it from its previous payload or to elaborate
-it (`Request.decide`), keeps it (`Request.keep`), and at the end hands what it kept to the module's records
-(`Request.finish`).
+A reuse run (`lean --reuse-olean=F --reuse-usage=F`): the frontend reads the module's previous `.olean`, `.usage` and
+the `.resolved` beside the `.usage` (`ModuleUsage.resolvedFileOf`) while its header is processed (`Request.new`), takes
+a keep permit for them once the header is processed (`Request.start`), then decides for each command in order whether
+to keep it from its previous payload or to elaborate it (`Request.decide`), keeps it (`Request.keep`), and at the end
+hands what it kept to the module's records (`Request.finish`).
 
 The rule, in terms of the previous build's records: no command is kept when the run's import context read a value
 tied to the run, had an effect or still runs a task (`Request.start`). Otherwise command `i` is kept iff the previous
@@ -74,8 +74,6 @@ structure PreviousUsage where
   used : NameMap (Array (Name × Digest))
   /-- The names of `used` that no record lists among its uses. -/
   usedUnattributed : Array Name
-  /-- Every name of the previous `.usage`'s `resolved`. -/
-  resolved : Array Name
   resolvedAll : Bool
   /-- The specialization-cache keys of the previous `.usage`'s `specLookups`. -/
   specKeys : Array Digest
@@ -93,6 +91,9 @@ structure Previous extends PreviousUsage where
   consts : NameMap ConstantInfo
   /-- The command of the previous build that added each constant of the module. -/
   ownerCmd : NameMap Nat
+  /-- The groups of the previous `.resolved` (`ResolvedTable.groups`): the names the previous compile resolved, kept
+  commands' among them, by their identities. -/
+  resolved : Array (Option Name × Array ResolvedEntry)
 
 /-- A keep `Request.decide` allows. -/
 structure Plan where
@@ -185,7 +186,6 @@ where
     return {
       records, used
       usedUnattributed := used.foldl (init := #[]) fun out n _ => if recorded.contains n then out else out.push n
-      resolved := record.resolved.flatMap fun (_, ns) => ns.map (·.1)
       resolvedAll := record.resolvedAll
       specKeys := record.specLookups.map (·.1)
       allExtra := ← j.getObjValAs? Bool "allExtra"
@@ -241,12 +241,14 @@ private def readPrevious (env : Environment) (pre : Prefetched) (lib? : Option S
   -- say which command logged them
   if permit.data.entries.any fun (n, es) => n == `Lean.Linter.codeQualityLogExt && !es.isEmpty then
     return .error "the previous build logged code quality entries"
+  let some resolved := pre.files.resolved? |
+    return .error "the previous `.resolved` is missing or is not the one the previous `.usage` records"
   let usage ← match pre.usage with
     | .ok usage => pure usage
     | .error e => return .error s!"the previous `.usage` cannot be read: {e}"
   let md := permit.data
   let prev : Previous := {
-    toPreviousUsage := usage, permit
+    toPreviousUsage := usage, permit, resolved := resolved.groups
     payloads := permit.payloads.foldl (fun m ce => m.insert ce.idx ce) {}
     consts := (md.constNames.zip md.constants).foldl (fun m (n, c) => m.insert n c) {}
     ownerCmd := permit.payloads.foldl (init := {}) fun m ce =>

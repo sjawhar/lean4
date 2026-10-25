@@ -69,7 +69,7 @@ def variant (dir : System.FilePath) (label e m : String) (env : Array (String ×
   build dir "X"
   IO.FS.writeFile (dir / "M.lean") m
   build dir "M"
-  for ext in ["olean", "usage", "ilean"] do
+  for ext in ["olean", "usage", "resolved", "ilean"] do
     IO.FS.writeBinFile (dir / s!"M.{ext}.old") (← IO.FS.readBinFile (dir / s!"M.{ext}"))
   IO.FS.writeFile (dir / "X.lean") (xSource "B")
   build dir "X"

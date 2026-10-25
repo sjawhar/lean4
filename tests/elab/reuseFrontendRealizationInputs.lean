@@ -15,11 +15,12 @@ what `realize` observed, the transient declarations among it, and the elaborated
 `a` and definition `b` request `val_src`'s realization and the run edits only a later definition, which changes the
 source (`source`, without asynchronous elaboration, so that `a` runs `realize`): `a` and `b` both read the source, so
 both are elaborated, and `b`'s value, read through an importer, is the fresh build's. Each compares the exit codes,
-stdout, stderr, the `.olean` and `.ilean` bytes and the `.usage` fields but `reuse` and `resolved` (which must hold the
-fresh build's) with a fresh build's, and prints what the records of `a` and `b` say they observed and the reuse run's
-`kept`, `reElab` and `elabReasons`. In `eval`, the records of `a` and `b` use `C.val`; then `C.val` changes and `M` is
-built again from the reuse run's outputs (`stale`): `a`'s payload is the same, so the commands after it may still be
-kept, but no command that used `C.val` is, and the `.usage` is a fresh build's.
+stdout, stderr, the `.olean` and `.ilean` bytes and the `.usage` fields but `reuse` and `resolvedDigest` (the
+`.resolved` sidecar's entries must hold the fresh build's) with a fresh build's, and prints what the records of `a`
+and `b` say they observed and the reuse run's `kept`, `reElab` and `elabReasons`. In `eval`, the records of `a` and
+`b` use `C.val`; then `C.val` changes and `M` is built again from the reuse run's outputs (`stale`): `a`'s payload is
+the same, so the commands after it may still be kept, but no command that used `C.val` is, and the `.usage` is a
+fresh build's.
 
 In the fresh builds, `a` and `b` both request a realization with every kind of observation and `b` alone requests it:
 `b`'s record and payload refusals must be the same either way, and `a`'s as well. -/
@@ -40,18 +41,19 @@ def outputs (m : String) : Array String := #["-o", s!"{m}.olean", s!"--usage={m}
 def bytesOf (file : System.FilePath) : IO ByteArray := do
   if ← file.pathExists then IO.FS.readBinFile file else return .empty
 
-/-- A `.usage`, one JSON object per line, as one object without `reuse` and `resolved`, its `reuse` field, and the
-entries of its `resolved` field (module, name and kind). -/
+/-- A `.usage`, one JSON object per line, as one object without `reuse` and `resolvedDigest`, its `reuse` field, and the
+entries of the `.resolved` sidecar beside it (module, name digest and kind). -/
 def usageOf (file : System.FilePath) : IO (Json × Json × Array String) := do
   let mut j := Json.mkObj []
   unless ← file.pathExists do return (j, j, #[])
   for line in (← IO.FS.readFile file).splitOn "\n" do
     unless line.isEmpty do j := j.mergeObj (← IO.ofExcept (Json.parse line))
-  let fields := ((j.getObj?.toOption.map (·.toList)).getD []).filter fun (k, _) => k != "reuse" && k != "resolved"
+  let fields := ((j.getObj?.toOption.map (·.toList)).getD []).filter fun (k, _) => k != "reuse" && k != "resolvedDigest"
   let mut resolved := #[]
-  for g in ((j.getObjValD "resolved").getArr?.toOption.getD #[]) do
-    for n in ((g.getArrVal? 1 >>= Json.getArr?).toOption.getD #[]) do
-      resolved := resolved.push (Json.arr #[(g.getArrVal? 0).toOption.getD .null, n]).compress
+  if let .ok bytes ← (IO.FS.readBinFile (file.withExtension "resolved")).toBaseIO then
+    if let .ok t := ModuleUsage.ResolvedTable.decode? bytes then
+      for (d, g, k) in t.entries.toArray do
+        resolved := resolved.push s!"{t.modules[g]!}:{d.hex}:{k}"
   return (Json.mkObj fields, j.getObjValD "reuse", resolved)
 
 /-- What command `i`'s record in the `.usage` `file` says it observed: the process values it read, what it read of its
@@ -146,7 +148,7 @@ def sourceReaders (v : String) : String :=
 def copyImports (dir d : System.FilePath) : IO Unit := do
   IO.FS.createDirAll d
   for m in ["C", "E", "Z"] do
-    for ext in ["olean", "usage"] do
+    for ext in ["olean", "usage", "resolved"] do
       IO.FS.writeBinFile (d / s!"{m}.{ext}") (← IO.FS.readBinFile (dir / s!"{m}.{ext}"))
 
 /-- Builds `M` from `first` in `label-r`, then from `second` there with the first build's outputs to reuse and in
@@ -157,7 +159,7 @@ def case (dir : System.FilePath) (label first second : String) (opts : Array Str
   IO.FS.writeFile (r / "M.lean") first
   let (rc, _, _) ← lean r (opts ++ outputs "M" ++ #["M.lean"])
   IO.println s!"{label}: first build: exit {rc}"
-  for ext in ["olean", "usage", "ilean"] do
+  for ext in ["olean", "usage", "resolved", "ilean"] do
     IO.FS.rename (r / s!"M.{ext}") (r / s!"M.{ext}.old")
   for d in [r, fr] do
     IO.FS.writeFile (d / "M.lean") second
@@ -195,7 +197,7 @@ def staleCase (dir : System.FilePath) : IO Unit := do
     IO.FS.writeFile (d / "C.lean") "def C.val : Nat := 8\n"
     let (rc, out, err) ← lean d #["-o", "C.olean", "--usage=C.usage", "C.lean"]
     unless rc == 0 do throw <| IO.userError s!"lean C failed ({rc}):\n{out}{err}"
-  for ext in ["olean", "usage", "ilean"] do
+  for ext in ["olean", "usage", "resolved", "ilean"] do
     IO.FS.rename (r / s!"M.{ext}") (r / s!"M.{ext}.old")
   let (rcR, outR, errR) ← lean r (outputs "M" ++ #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old",
     "M.lean"])

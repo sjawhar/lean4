@@ -7,7 +7,9 @@ contents. A permit is granted in `E1` and refused in `E2`; one checked in `E1` k
 module or one written with another `.olean`, an environment of another module, an import without digests whose
 `.olean` changed, and, for a module that read the resolver's whole map, an import whose provides changed; it names a
 module that joined the import closure (a rebuilt `W` that also imports `X`) or left it (one that no longer imports `U`)
-as such. Its own lookups are not recorded as resolutions of the running module. -/
+as such. It refuses `N` once `D`, which `N` imports through `M`, gains a `@[csimp]` entry after `M` was compiled: `M`
+still records `D`'s old closure, and the closure's tables as the environment holds them changed. Its own lookups are not
+recorded as resolutions of the running module. -/
 open Lean Elab Command
 
 def runLean (dir : System.FilePath) (args : Array String) : IO (UInt32 × String) := do
@@ -127,5 +129,23 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun base => do
   let e6 ← header (d1 / "C2.lean") `C2
   IO.println s!"C2 with U leaving the closure: \
     {shown (← ModuleUsage.keepPermit e6 `C2 (d1 / "C2.olean") (d1 / "C2.usage"))}"
+  -- `D`'s tables change after `M` was compiled: `M`'s recorded closure still describes the old `D`
+  let d6 := base / "d6"
+  IO.FS.createDirAll d6
+  let dSource := "@[noinline] def slowFn (n : Nat) : Nat := n + 0\n@[noinline] def fastFn (n : Nat) : Nat := n\n\
+    theorem slow_eq : @slowFn = @fastFn := by funext n; simp [slowFn, fastFn]\n"
+  IO.FS.writeFile (d1 / "D.lean") dSource
+  IO.FS.writeFile (d1 / "M.lean") "import D\ndef m (n : Nat) : Nat := slowFn n + 1\n"
+  IO.FS.writeFile (d1 / "N.lean") "import M\ndef nn (k : Nat) : Nat := slowFn k + 2\n"
+  for m in ["D", "M", "N"] do compile d1 m
+  IO.FS.writeFile (d6 / "D.lean") (dSource ++ "attribute [csimp] slow_eq\n")
+  compile d6 "D"
+  initSearchPath (← findSysroot) [d1]
+  let e7 ← header (d1 / "N.lean") `N
+  IO.println s!"N: {shown (← ModuleUsage.keepPermit e7 `N (d1 / "N.olean") (d1 / "N.usage"))}"
+  initSearchPath (← findSysroot) [d6, d1]
+  let e8 ← header (d1 / "N.lean") `N
+  IO.println s!"N with D's tables changed after M was compiled: \
+    {shown (← ModuleUsage.keepPermit e8 `N (d1 / "N.olean") (d1 / "N.usage"))}"
 
 #eval main

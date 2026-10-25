@@ -63,7 +63,7 @@ def step (dir : System.FilePath) (label b z : String) : IO Unit := do
   IO.FS.writeFile (dir / "M.lean") (mSource "bar_term" "1")
   let (rc, out) ← lean dir (outputs "M" ++ #["M.lean"]) (env "1")
   unless rc == 0 do throw <| IO.userError s!"the first build failed: {out}"
-  for ext in ["olean", "usage", "ilean"] do
+  for ext in ["olean", "usage", "resolved", "ilean"] do
     IO.FS.writeBinFile (dir / s!"M.{ext}.old") (← IO.FS.readBinFile (dir / s!"M.{ext}"))
   IO.FS.writeFile (dir / "M.lean") (mSource b z)
   let (rc, out) ← lean dir reuseArgs (env "1")
@@ -87,7 +87,7 @@ def step (dir : System.FilePath) (label b z : String) : IO Unit := do
   step (dir / "b") "b reads nothing" "\"x\"" "1"
   -- the next build of the `z edited` reuse run's outputs, with another `FOO`
   let d := dir / "z"
-  for ext in ["olean", "usage", "ilean"] do
+  for ext in ["olean", "usage", "resolved", "ilean"] do
     IO.FS.writeBinFile (d / s!"M.{ext}.old") (← IO.FS.readBinFile (d / s!"M.{ext}"))
   let (rc, _) ← lean d reuseArgs (env "3")
   IO.println s!"FOO changed after the z edit: exit {rc}, reuse {(← usageOf (d / "M.usage")).2}"

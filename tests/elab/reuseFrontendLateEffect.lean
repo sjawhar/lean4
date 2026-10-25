@@ -50,7 +50,7 @@ def trigger : String := "#eval show IO Unit from do
   IO.FS.writeFile (dir / "M.lean") (mSource "#eval show IO Unit from pure ()")
   let (rc, out) ← lean dir (outputs "M" ++ #["M.lean"])
   IO.println s!"first build: exit {rc}, output {out.trimAscii.copy.quote}"
-  for ext in ["olean", "usage", "ilean"] do
+  for ext in ["olean", "usage", "resolved", "ilean"] do
     IO.FS.writeBinFile (dir / s!"M.{ext}.old") (← IO.FS.readBinFile (dir / s!"M.{ext}"))
   IO.FS.writeFile (dir / "M.lean") (mSource trigger)
   let (rc, out) ← lean dir (outputs "M" ++ #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old",

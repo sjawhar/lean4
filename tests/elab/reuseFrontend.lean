@@ -117,7 +117,7 @@ def step (r f : System.FilePath) (label x m : String) : IO Unit := do
     IO.FS.writeFile (d / "X.lean") x
     discard <| build d "X"
     IO.FS.writeFile (d / "M.lean") m
-  for ext in ["olean", "usage", "ilean"] do
+  for ext in ["olean", "usage", "resolved", "ilean"] do
     IO.FS.writeBinFile (r / s!"M.{ext}.old") (← IO.FS.readBinFile (r / s!"M.{ext}"))
   let args := #["-o", "M.olean", "--usage=M.usage", "-i", "M.ilean"]
   let (rcR, out) ← lean r (args ++ #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old",

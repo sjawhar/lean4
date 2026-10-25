@@ -31,7 +31,7 @@ waiter() {
     '  throw <| IO.userError "the test did not release the build"'
 }
 
-# `T.E` reads `D.usage` when it writes its `.usekey`. `T.Slow` imports `T.X`, which imports `T.E`,
+# `T.E` reads `D.usekey` when it writes its own `.usekey`. `T.Slow` imports `T.X`, which imports `T.E`,
 # and holds the build until the test creates `release`; `M` is built after it.
 write_a() {
   printf 'import D\ndef early : Nat := sharedValue + %s\n' $1 > a/T/E.lean
@@ -152,9 +152,8 @@ test_exp $rc != 0
 no_match_text "Replayed T.M" after.log
 match_text "T/M.lean" after.log
 
-# A `.usage` counts only with the `.usekey` written from it. `b` rebuilds `D`, and `D.usage` from before the
-# rebuild is put back next to the new `D.usekey` and `D.olean` (the pair a check holds when it reads `D.usage` just
-# before the rebuild and the other two files after it): `M` is not replayed against the old `sharedValue`.
+# An importer reads a dependency's `.usekey`, never its `.usage`. `b` rebuilds `D`, and `D.usage` from before the
+# rebuild is put back next to the new `D.usekey` and `D.olean`: `M` is not replayed against the old `sharedValue`.
 printf 'def sharedValue : Nat := 1\n' > dep/D.lean
 printf 'import D\ntheorem kept : sharedValue = 1 := rfl\n' > a/T/M.lean
 (cd a && test_run build T.M)
@@ -170,15 +169,29 @@ test_exp $rc != 0
 no_match_text "Replayed T.M" after.log
 match_text "T/M.lean" after.log
 
-# A module checked after another workspace rewrites a shared dependency can be replayed although the dependency
-# now changes how it compiles; the next build heals it. `D` <- `M` <- `S` <- `N`, with `M` calling `slowFn` from
-# `F`. `a`'s build checks and keeps `M`, then compiles `S`, which holds. Meanwhile `b` rebuilds `D` with a
-# `@[csimp]` lemma that redirects `slowFn`, and `N` is checked after that. `N` may be replayed in this build; the
-# next build compiles `N` again, and its C file is the one a fresh build of the same sources produces.
+# A module checked after another workspace rewrites a shared dependency is compiled again in that build, not replayed.
+# `D` <- `M` <- `S` <- `N`, with `M` calling `slowFn` from `F`. `a`'s build keeps `D` and `M`, then compiles `S`, which
+# holds. Meanwhile `b` rebuilds `D` with a `@[csimp]` lemma that redirects `slowFn`. `M` still records `D`'s old closure,
+# so the edge `M` -> `D` of `N`'s closure is stale when `N` is checked, and `N` is compiled again: its C file is the one
+# a fresh build of the same sources produces.
 printf '[[lean_lib]]\nname = "F"\n' >> dep/lakefile.toml
 f_src='@[noinline] def slowFn (n : Nat) : Nat := n + 0\n@[noinline] def fastFn (n : Nat) : Nat := n\ntheorem slow_eq'"'"' : slowFn = fastFn := by funext n; simp [slowFn, fastFn]\n'
 imp_d='import F\ndef d0 : Nat := 0\n'
 write_s() { { printf 'import T.M\n'; waiter; printf 'def slowv : Nat := %s\n' $1; } > a/T/S.lean; }
+# Builds `T.N` in `a` after an edit to `T.S`. While `T.S` holds that build, writes `$1` to `dep/D.lean` and rebuilds
+# `D` from `b`. The build of `a` must succeed; its output is `race.log`.
+race_n() {
+  rm -f ready release
+  write_s $2
+  (cd a && "$LAKE" build -v T.N) > race.log 2>&1 &
+  pid=$!
+  await_ready
+  printf "$1" > dep/D.lean
+  (cd b && test_run build D)
+  touch release
+  wait $pid
+  cat race.log
+}
 printf "$f_src" > dep/F.lean
 printf "$imp_d" > dep/D.lean
 printf 'import F\nimport D\n@[noinline] def m (n : Nat) : Nat := slowFn n + 1\n' > a/T/M.lean
@@ -188,26 +201,43 @@ touch release
 (cd a && test_run build T.N)
 printf "${imp_d}def d1 : Nat := 1\n" > dep/D.lean
 (cd b && test_run build D)
-rm -f ready release
-write_s 1
-(cd a && "$LAKE" build -v T.N) > race.log 2>&1 &
-pid=$!
-await_ready
-printf "${imp_d}def d1 : Nat := 1\n@[csimp] theorem slow_eq : @slowFn = @fastFn := slow_eq'\n" > dep/D.lean
-(cd b && test_run build D)
-touch release
-wait $pid
-cat race.log
-(cd a && "$LAKE" build -v T.N) > after.log 2>&1 && rc=0 || rc=$?
-cat after.log
-test_exp $rc = 0
-no_match_text "Replayed T.N" after.log
-match_text "Built T.N" after.log
+race_n "${imp_d}def d1 : Nat := 1\n@[csimp] theorem slow_eq : @slowFn = @fastFn := slow_eq'\n" 1
+no_match_text "Replayed T.N" race.log
+match_text "Built T.N" race.log
 mkdir fresh
 cp -r dep a fresh/
 rm -rf fresh/dep/.lake fresh/a/.lake
 (cd fresh/a && test_run build T.N)
 test_cmd cmp fresh/a/.lake/build/ir/T/N.c a/.lake/build/ir/T/N.c
+
+# The same race through an instance: `D` gains an instance of higher priority, which `N`'s proof then uses instead of
+# the axiom `axC`. `N` uses only `C.ok` and `axC`, which did not change, so only `D`'s closure shows the change.
+# `N` is compiled again in that build, and `saved` depends on the axioms a fresh build gives it: none.
+printf '[[lean_lib]]\nname = "K"\n' >> dep/lakefile.toml
+printf 'class C : Prop where\n  ok : True\naxiom axC : C\ndef cleanC : C := ⟨trivial⟩\nattribute [instance 100] axC\n' \
+  > dep/K.lean
+printf 'import K\ndef d0 : Nat := 0\n' > dep/D.lean
+printf 'import D\ndef m : Nat := 0\n' > a/T/M.lean
+printf 'import T.S\ntheorem saved : True := C.ok\n' > a/T/N.lean
+printf 'import T.N\n#check saved\n#print axioms saved\n' > a/Check.lean
+write_s 0
+touch release
+(cd a && test_run build T.N)
+(cd b && test_run build D)
+(cd a && test_cmd_out "depends on axioms: [axC]" "$LAKE" env lean Check.lean)
+race_n 'import K\nattribute [instance 200] cleanC\ndef d0 : Nat := 0\n' 1
+no_match_text "Replayed T.N" race.log
+match_text "Built T.N" race.log
+(cd a && "$LAKE" env lean Check.lean) > kept.out 2>&1
+cat kept.out
+mkdir fresh2
+cp -r dep a fresh2/
+rm -rf fresh2/dep/.lake fresh2/a/.lake
+(cd fresh2/a && LAKE_USAGE_CUTOFF=0 test_run build T.N)
+(cd fresh2/a && LAKE_USAGE_CUTOFF=0 "$LAKE" env lean Check.lean) > fresh.out 2>&1
+cat fresh.out
+match_text "does not depend on any axioms" fresh.out
+test_cmd cmp fresh.out kept.out
 
 # A build hashes a module-system file once and reuses the hash in its later checks only while the file's stamp is
 # unchanged. `U` is a module-system file of `dep` that `D` imports; `a`'s build hashes it in the checks of `T.E`,

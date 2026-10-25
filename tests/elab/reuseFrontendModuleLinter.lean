@@ -52,7 +52,7 @@ def lints (dir : System.FilePath) (olean : System.FilePath) : IO String := do
   return (← lean dir #["--run", "Lints.lean", olean.toString]).2.trimAscii.copy
 
 def step (dir : System.FilePath) (label : String) (b : Nat) : IO Unit := do
-  for ext in ["olean", "usage", "ilean"] do
+  for ext in ["olean", "usage", "resolved", "ilean"] do
     IO.FS.writeBinFile (dir / s!"M.{ext}.old") (← IO.FS.readBinFile (dir / s!"M.{ext}"))
   IO.FS.writeFile (dir / "M.lean") (mSource b)
   let (rc, out) ← lean dir (outputs "M" ++ #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old",

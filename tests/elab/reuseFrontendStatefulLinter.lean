@@ -45,7 +45,7 @@ def readOr (f : System.FilePath) : IO ByteArray := do
   IO.FS.writeFile (dir / "M.lean") (mSource 2)
   let (rc, out) ← lean dir (outputs "M" ++ #["M.lean"])
   IO.println s!"first build: exit {rc}, output {out.trimAscii.copy.quote}"
-  for ext in ["olean", "usage", "ilean"] do
+  for ext in ["olean", "usage", "resolved", "ilean"] do
     IO.FS.writeBinFile (dir / s!"M.{ext}.old") (← IO.FS.readBinFile (dir / s!"M.{ext}"))
   -- only `b`'s value changes, keeping its length: `a` can be kept
   IO.FS.writeFile (dir / "M.lean") (mSource 3)
