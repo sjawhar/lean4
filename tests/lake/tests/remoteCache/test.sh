@@ -49,16 +49,17 @@ cp -r "$FIXTURE_DIR/lakefile.toml" "$FIXTURE_DIR/BadCurl.lean" \
   "$FIXTURE_DIR/Test.lean" "$FIXTURE_DIR/Test" "$WORK_DIR/"
 chmod -R u+w "$WORK_DIR"
 cd "$WORK_DIR"
-# A second library of two modules that do not import each other,
-# so that a build fetches their artifacts independently
+# A second library: two modules that do not import each other, so that a build fetches
+# their artifacts independently, and a third that waits for `Test.Basic`, which it imports
 mkdir -p Two
 echo 'def a := 1' > Two/A.lean
 echo 'def b := 2' > Two/B.lean
+printf 'import Test.Basic\ndef c := 3\n' > Two/C.lean
 cat >> lakefile.toml << 'EOF'
 
 [[lean_lib]]
 name = "Two"
-roots = ["Two.A", "Two.B"]
+roots = ["Two.A", "Two.B", "Two.C"]
 EOF
 
 echo "# SETUP"
@@ -437,19 +438,28 @@ case_failing_cmd() {
 case_refused_token() {
   # A service that refuses every token the command prints: once the new token is refused
   # as well, the refusal is reported for a while instead of running the command again for
-  # each download (the two modules of `Two` are fetched independently)
+  # each download. `Two.A` and `Two.B` are fetched at once; `Two.C` is fetched only after
+  # `Test.Basic`, which it imports, comes from a slow service that needs no token, so it
+  # starts after the others were refused twice.
   LAKE_CACHE_DIR="$BUILD_CACHE_DIR" LAKE_CACHE_KEY=mock:key \
     test_run cache put two.jsonl --scope=refused --service=ok
+  seed refused
   fresh
   test_run cache add two.jsonl --scope=refused --service=bearer
+  test_run cache add outputs.jsonl --scope=refused --service=slow
   COUNTER="$WORK_DIR/counter"
   ROTATE_CMD="n=\$((\$(cat '$COUNTER' 2> /dev/null || echo 0) + 1)); echo \$n > '$COUNTER'; echo test-token-\$n"
   rm -f "$COUNTER"
   echo test-token-0 > "$TOKENS"
+  : > "$SERVER_LOG"
   LAKE_REMOTE_CACHE=bearer LAKE_CACHE_TOKEN_CMD="$ROTATE_CMD" \
-    test_err '401' -v build Two --no-build
+    test_err 'the service refused a new token from `LAKE_CACHE_TOKEN_CMD` (HTTP 401)' \
+    -v build Two --no-build
   test_cmd_eq 2 cat "$COUNTER"
-  test_artifacts 0
+  # `Two.C` sent no request: none reached the service after `Test.Basic`'s slow download
+  match_text 'GET /slow/' "$SERVER_LOG"
+  test_cmd_eq 0 awk '/GET \/slow\// {s = 1; next} s && /\/bearer\// {n++} END {print n + 0}' \
+    "$SERVER_LOG"
   echo test-token-1 > "$TOKENS"
 }
 
