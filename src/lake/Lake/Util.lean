@@ -34,6 +34,7 @@ public import Lake.Util.OrdHashSet
 public import Lake.Util.Proc
 public import Lake.Util.RBArray
 public import Lake.Util.Reservoir
+public import Lake.Util.Sha256
 public import Lake.Util.Store
 public import Lake.Util.StoreInsts
 public import Lake.Util.String
