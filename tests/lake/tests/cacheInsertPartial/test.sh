@@ -308,6 +308,22 @@ else
   echo "SKIPPED: the cases with failing hard links need a Linux preload"
 fi
 
+# A cache whose artifact directory Lake cannot write to (here mode 555) fails the build with the
+# error of the write, as before Lake published entries only by hard links. Only a hard link that
+# fails because the file system cannot hard-link (EPERM) makes Lake cache nothing and go on; a link
+# into this directory fails with EACCES instead.
+mkdir t12 && cp lakefile.lean input.txt Big.lean t12/
+mkdir -p cache11/artifacts
+chmod 555 cache11/artifacts
+if touch cache11/artifacts/probe 2> /dev/null; then
+  rm -f cache11/artifacts/probe
+  echo "SKIPPED: the unwritable cache case needs a user whom a directory's mode restricts (not root)"
+else
+  LAKE_CACHE_DIR="$PWD/cache11" test_err 'failed to cache artifact: permission denied' -d t12 build Big
+fi
+chmod 755 cache11/artifacts
+test_exp "$(find cache11 -name '*.json' | wc -l)" = 0
+
 # A module output with the cache on another file system, where the output cannot be hard-linked
 # into the cache and its entry is written
 OTHER=${LAKE_TEST_OTHER_FS:-/dev/shm}
