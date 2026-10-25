@@ -197,6 +197,7 @@ token.
 -/
 public def getUrl?
   (url : String) (headers : Array String := #[]) (cacheToken := false)
+  (maxFileSize? : Option Nat := none)
 : LogIO (Option String) := withLogErrorPos do
   let request (token? : Option String) : LogIO (Nat × IO.Process.Output) :=
     CacheToken.withCurlArgs token? fun authArgs => do
@@ -204,6 +205,7 @@ public def getUrl?
           "-s", "-w", "%{stderr}%{json}\n",
           "--retry", "3" -- intermittent network errors can occur
       ] ++ downloadTimeoutArgs ++ authArgs
+      let args := maxFileSize?.elim args fun size => args ++ #["--max-filesize", toString size]
       let args := if token?.isSome then args else args.push "-L"
       let args := headers.foldl (init := args) (· ++ #["-H", ·])
       let out ← captureProc' {cmd := ← Internal.getCurl, args := args.push url}
