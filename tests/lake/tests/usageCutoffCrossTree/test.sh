@@ -360,6 +360,8 @@ case9() {
   test_exp -d "$d"
   test_exp "$(find "$d" -maxdepth 1 -name '*.json' | wc -l)" = 8
   test_exp ! -e "$d/${names[1]}"
+  test_exp ! -e "$d/${names[1]%.json}.pre"
+  test_exp -f "$d/${names[9]%.json}.pre"
   test_exp -f "$d/${names[9]}"
   mkpkg t2 2
   edx t2
@@ -475,6 +477,27 @@ case12() {
   test_cmd chmod 444 "$art"
 }
 
+# 13. The pre-filter reads a candidate's compact usage record (`<name>.pre`, which the index writes beside the
+# compile's file), not its `.usage`: with the cached `.usage` replaced by bytes that do not parse, the candidate still
+# passes the pre-filter, and the check, which reads the `.usage` by the digest the key records, rejects it, so B
+# builds. (Reading the `.usage`, the pre-filter rejects it unchecked: `0 fully checked`.) C is restored.
+case13() {
+  local art
+  mkpkg f
+  test_run -d f build $ALL
+  test_exp -f "$(idxdir f B)/$(idxname f B | sed 's/\.json$/.pre/')"
+  art="$LAKE_CACHE_DIR/artifacts/$(entryArt "$(entry f B)" u)"
+  test_exp -f "$art"
+  printf 'not a usage record\n' > bad.tmp
+  mv -f bad.tmp "$art"
+  mkpkg t
+  edx t
+  lake_out -d t build -v Test.B Test.C
+  jobhas Test.C "usage index: restored"
+  jobhas Test.B "usage index: no match (1 candidates, 1 parsed, 1 fully checked"
+  jobhas Test.B "Built Test.B"
+}
+
 runcase() {
   echo "=== case $1"
   mkdir -p "c$1"
@@ -485,7 +508,7 @@ runcase() {
   )
 }
 
-if [ $# = 0 ]; then set -- 1 2 3 4 5 6a 6b 7 8 9 10 11 12; fi
+if [ $# = 0 ]; then set -- 1 2 3 4 5 6a 6b 7 8 9 10 11 12 13; fi
 for c in "$@"; do runcase "$c"; done
 
 rm -f produced.out
