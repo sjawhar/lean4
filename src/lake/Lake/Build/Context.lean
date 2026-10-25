@@ -154,9 +154,11 @@ public structure BuildContext extends BuildConfig, Context where
   What this build first read of each imported module's usage-cutoff sidecars, keyed by the module's `.usage`, as a
   `Lake.UsageView` (`Lake.freezeUsageView`): an entry is added once and never replaced, so a view can be older
   than the files when another process rewrote them since. Only the usage index's pre-filter reads views, and it only
-  rejects: a check that accepts reads the files again.
+  rejects: a check that accepts reads the files again. Concurrent jobs share it, so the map is persistent, as
+  `KernelProviders`' are: a shared hash map is never updated in place, so each view added would copy its whole bucket
+  array, one entry for each importee the build has viewed.
   -/
-  usageViews : Std.Mutex (Std.HashMap FilePath Dynamic)
+  usageViews : Std.Mutex (Lean.PHashMap FilePath Dynamic)
   /--
   The kept-module checker (`LAKE_KEPT_CHECKER`): a module whose own source and options did not
   change since its outputs were built, but whose imports did, keeps those outputs if the usage
