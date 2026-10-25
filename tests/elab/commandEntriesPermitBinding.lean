@@ -5,8 +5,9 @@ header processed against `Z` claiming nothing, `E2` against `Z` claiming `ru`: t
 contents. A permit is granted in `E1` and refused in `E2`; one checked in `E1` keeps nothing into `E2`, and one for `C2`
 (another module importing the same modules) keeps none of `C`'s payloads. `keepPermit` refuses a `.usage` of another
 module or one written with another `.olean`, an environment of another module, an import without digests whose
-`.olean` changed, and, for a module that read the resolver's whole map, an import whose provides changed. Its own
-lookups are not recorded as resolutions of the running module. -/
+`.olean` changed, and, for a module that read the resolver's whole map, an import whose provides changed; it names a
+module that joined the import closure (a rebuilt `W` that also imports `X`) or left it (one that no longer imports `U`)
+as such. Its own lookups are not recorded as resolutions of the running module. -/
 open Lean Elab Command
 
 def runLean (dir : System.FilePath) (args : Array String) : IO (UInt32 × String) := do
@@ -108,5 +109,23 @@ unsafe def main : IO Unit := IO.FS.withTempDir fun base => do
   initSearchPath (← findSysroot) [d3, d1]
   let e4' ← header (d1 / "C4.lean") `C4
   IO.println s!"C4 with V changed: {shown (← ModuleUsage.keepPermit e4' `C4 (d1 / "C4.olean") (d1 / "C4.usage"))}"
+  let d4 := base / "d4"
+  IO.FS.createDirAll d4
+  IO.FS.writeFile (d4 / "U.lean") "@[reducible] def ru : Nat := 7\n"
+  IO.FS.writeFile (d4 / "X.lean") "def xx : Nat := 1\n"
+  IO.FS.writeFile (d4 / "W.lean") "import U\nimport X\n@[reducible] def wv : Nat := ru\n"
+  for m in ["U", "X", "W"] do compile d4 m
+  initSearchPath (← findSysroot) [d4, d1]
+  let e5 ← header (d1 / "C2.lean") `C2
+  IO.println s!"C2 with X joining the closure: \
+    {shown (← ModuleUsage.keepPermit e5 `C2 (d1 / "C2.olean") (d1 / "C2.usage"))}"
+  let d5 := base / "d5"
+  IO.FS.createDirAll d5
+  IO.FS.writeFile (d5 / "W.lean") "@[reducible] def wv : Nat := 7\n"
+  compile d5 "W"
+  initSearchPath (← findSysroot) [d5, d1]
+  let e6 ← header (d1 / "C2.lean") `C2
+  IO.println s!"C2 with U leaving the closure: \
+    {shown (← ModuleUsage.keepPermit e6 `C2 (d1 / "C2.olean") (d1 / "C2.usage"))}"
 
 #eval main

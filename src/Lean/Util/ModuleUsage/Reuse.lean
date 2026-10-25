@@ -212,20 +212,28 @@ private def closureChanged? (env : Environment) (r : KeepRecord) : IO (Option St
   let lib := toString (← getLibDir (← getBuildDir))
   let recordedDigested : NameSet := r.digested.foldl (·.insert ·.1) {}
   let untracked : NameMap Digest := r.untracked.foldl (fun m (n, d) => m.insert n d) {}
+  let closure : NameSet := env.header.moduleNames.foldl (·.insert ·) {}
+  let joined (m : Name) := s!"`{m}` is in the import closure and was not when the module was compiled"
   let mut digestedNow : NameSet := {}
   -- every import carries digests as when the module was compiled, or is pinned by its `.olean` or the githash
   for (m, i) in env.header.moduleNames.zipIdx do
     if s.hasEntries i then
       unless recordedDigested.contains m do
-        return some s!"`{m}` carries usage digests, which it did not when the module was compiled"
+        return some <| if untracked.contains m then
+          s!"`{m}` carries usage digests, which it did not when the module was compiled" else joined m
       digestedNow := digestedNow.insert m
     else
       let olean ← findOLean m
       if (toString olean).startsWith lib then continue
-      unless untracked.find? m == some (← fileDigest olean) do
+      if recordedDigested.contains m then
+        return some s!"`{m}` carried usage digests when the module was compiled and does not here"
+      let some d := untracked.find? m | return some (joined m)
+      unless d == (← fileDigest olean) do
         return some s!"`{m}`, which carries no usage digests, is not the `.olean` the module was compiled against"
   if let some (m, _) := r.digested.find? (!digestedNow.contains ·.1) then
-    return some s!"`{m}` carried usage digests when the module was compiled and does not here"
+    return some <| if closure.contains m then
+      s!"`{m}` carried usage digests when the module was compiled and does not here"
+    else s!"`{m}` was in the import closure when the module was compiled and is not here"
   -- the closure's cross-module compiler tables and the modules the compile used whole, as the compile imported them
   for (field, recorded, sel) in #[("closure", r.importedClosures, fun (d : Digest × Digest) => d.2),
       ("module digest", r.importedDigests, fun (d : Digest × Digest) => d.1)] do

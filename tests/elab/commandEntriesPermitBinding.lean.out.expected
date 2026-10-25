@@ -14,3 +14,5 @@ names recorded as resolved by keepPermit: 0, whole map read: false
 C's .usage with another .olean: refused: the `.usage` was not written with this `.olean`
 C4: granted
 C4 with V changed: refused: `V`, which carries no usage digests, is not the `.olean` the module was compiled against
+C2 with X joining the closure: refused: `X` is in the import closure and was not when the module was compiled
+C2 with U leaving the closure: refused: `U` was in the import closure when the module was compiled and is not here
