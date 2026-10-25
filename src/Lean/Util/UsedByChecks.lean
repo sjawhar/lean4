@@ -227,6 +227,15 @@ opaque getTaskContext : BaseIO UInt32
 processed (`withImportContext`). -/
 def importContext : UInt32 := 0xFFFFFFFE
 
+@[extern "lean_io_live_tasks"]
+private opaque liveTasks (c : UInt32) : BaseIO UInt32
+
+/-- How many tasks that run code command `i` created while recording was on (in its task context, `withCommandContext`)
+are not finished: queued, running, or waiting for another task. Promises are not counted: whoever resolves one runs in
+its own context. While none is, the command's code cannot note an effect any more (`takeRecordedEffects`). -/
+def unfinishedCommandTasks (i : Nat) : BaseIO Nat :=
+  return (← liveTasks (i + 1).toUInt32).toNat
+
 @[extern "lean_io_set_effect_recording"]
 private opaque setEffectRecording (on : Bool) (pinned : @& Array String) (root solver : @& String) : BaseIO Unit
 

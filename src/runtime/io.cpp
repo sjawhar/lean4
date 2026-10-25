@@ -1606,6 +1606,33 @@ std::string describe_context(uint32 ctx) {
         : "command " + std::to_string(ctx - 1);
 }
 
+// the tasks that run code each command context created while effects are noted and that are not freed yet: queued,
+// running or waiting for another task (`lean_io_live_tasks`)
+static mutex * g_live_tasks_mutex = nullptr;
+static std::unordered_map<uint32, int64_t> * g_live_tasks = nullptr;
+
+bool note_task_created(uint32 ctx) {
+    if (ctx == 0 || ctx == import_context || ctx == LEAN_REF_ACCOUNTED || !g_effects_on.load(std::memory_order_relaxed))
+        return false;
+    lock_guard<mutex> lock(*g_live_tasks_mutex);
+    (*g_live_tasks)[ctx]++;
+    return true;
+}
+
+void note_task_freed(uint32 ctx) {
+    lock_guard<mutex> lock(*g_live_tasks_mutex);
+    auto it = g_live_tasks->find(ctx);
+    if (it != g_live_tasks->end() && --it->second <= 0) g_live_tasks->erase(it);
+}
+
+/* liveTasks (ctx : UInt32) : BaseIO UInt32: how many tasks that run code task context `ctx` created while effects were
+   noted are not finished: while none is, code of the context cannot note an effect any more */
+extern "C" LEAN_EXPORT uint32 lean_io_live_tasks(uint32 ctx) {
+    lock_guard<mutex> lock(*g_live_tasks_mutex);
+    auto it = g_live_tasks->find(ctx);
+    return it == g_live_tasks->end() ? 0 : static_cast<uint32>(it->second);
+}
+
 static void note_value_read_core(std::string const & key, char const * value, uint32 ctx) {
     auto it = g_value_reads->find(key);
     if (it == g_value_reads->end()) {
@@ -2252,6 +2279,8 @@ void initialize_io() {
     g_handle_contexts = new std::unordered_map<FILE *, uint32>();
     g_object_contexts = new std::unordered_map<void const *, uint32>();
     g_value_reads = new std::map<std::string, value_read>();
+    g_live_tasks_mutex = new mutex();
+    g_live_tasks = new std::unordered_map<uint32, int64_t>();
     g_pinned_dirs = new std::vector<std::string>();
     g_pinned_root = new std::string();
     g_pinned_solver = new std::string();

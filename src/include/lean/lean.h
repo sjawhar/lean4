@@ -281,6 +281,9 @@ typedef struct {
     // If true, task will not be freed until finished
     uint8_t              m_keep_alive;
     uint8_t              m_deleted;
+    // Whether the task runs code and was created in a command's task context while effects are noted: the runtime
+    // counts it as one of that context's unfinished tasks until it is freed (`lean_io_live_tasks`).
+    uint8_t              m_counted;
     // The task context of the thread that created the task, in force while it runs (`lean_io_set_task_context`). For a
     // promise's task, the context that created the promise, or `LEAN_REF_ACCOUNTED` (`lean_io_mark_promise_accounted`).
     uint32_t             m_context;

@@ -751,10 +751,13 @@ static lean_task_imp * alloc_task_imp(obj_arg c, unsigned prio, bool keep_alive)
     imp->m_keep_alive  = keep_alive;
     imp->m_deleted     = false;
     imp->m_context     = g_task_context;
+    // a promise (no closure) runs no code: whoever resolves it does, in its own context
+    imp->m_counted     = c != nullptr && note_task_created(imp->m_context);
     return imp;
 }
 
 static void free_task_imp(lean_task_imp * imp) {
+    if (imp->m_counted) note_task_freed(imp->m_context);
     lean_free_small_object((lean_object*)imp);
 }
 

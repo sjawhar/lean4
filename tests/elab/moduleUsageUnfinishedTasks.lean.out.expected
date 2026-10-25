@@ -1,0 +1,4 @@
+M: exit 0
+N: exit 0
+while command 2's task waits: 1
+after it ended: 0

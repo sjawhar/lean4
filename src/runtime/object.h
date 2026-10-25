@@ -495,6 +495,11 @@ inline void note_effect_here(char const * what) {
 /* Notes `what` and who created `t` for task context `ctx` (not 0) when `t`, a task or a promise's task, is another
    context's. */
 void note_task_owner(uint32 ctx, lean_task_object * t, char const * what);
+/* While effects are noted, counts a task that runs code, created in task context `ctx`, as one of the unfinished tasks of
+   that context if it is a command's (`lean_io_live_tasks`); whether it counted it. */
+bool note_task_created(uint32 ctx);
+/* Uncounts a task `note_task_created` counted for `ctx`, once it is finished or dropped. */
+void note_task_freed(uint32 ctx);
 /* While effects are noted, records in any context that the running code read the process value `key` (an
    environment variable `env:NAME`, `appPath`, `workingDirectory`), which is `value`, or absent for `nullptr`
    (`lean_io_take_value_reads`). */
