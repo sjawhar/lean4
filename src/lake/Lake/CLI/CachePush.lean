@@ -29,11 +29,11 @@ whose artifact is gone. `Cache.pushDroppedFile` records each drop with its reaso
 
 A module's outputs go up as one archive (`.ltar`), which the pusher packs from the bytes it
 verified and a trace that it writes from the entry alone: it never reads a file of a workspace.
-The pusher copies the bytes it uploads into `Cache.pushStagingDir`, in the cache directory. It
-names each artifact by its SHA-256 and uploads it, and then the entry's remote mapping (see
-`RemoteCacheMapping`) once all of the entry's artifacts are present, each only if the object is
-absent. Pushed and dropped entries leave the queue. An entry whose upload failed stays in the
-queue for the next push.
+The pusher copies the bytes it uploads into a directory of its own below `Cache.pushStagingDir`,
+in the cache directory. It names each artifact by its SHA-256 and uploads it, and then the
+entry's remote mapping (see `RemoteCacheMapping`) once all of the entry's artifacts are present,
+each only if the object is absent. Pushed and dropped entries leave the queue. An entry whose
+upload failed stays in the queue for the next push.
 
 One pusher at a time holds `Cache.pushLockFile`. It works in passes: each pass reads the queue,
 pushes the entries that it has not tried, and removes the pushed and dropped ones with one rewrite
@@ -75,6 +75,8 @@ structure PushContext where
   cache : Cache
   env : Env
   lakeCfg : LoadedLakeConfig
+  /-- The staging directory of this push, below `Cache.pushStagingDir` (see `pushRemoteCache`). -/
+  stagingDir : FilePath
 
 /-- A queue entry whose files are staged for upload. -/
 structure ReadyEntry where
@@ -340,13 +342,13 @@ def uniqueUploads (uploads : Array RemoteUpload) : Array RemoteUpload :=
     if urls.contains u.url then (kept, urls) else (kept.push u, urls.insert u.url)).1
 
 /--
-Pushes a prefix of the queue lines `lines`, staged in `Cache.pushStagingDir`: it stages lines
-until it has staged `pushChunkBytes`, uploads the artifacts of the staged entries, and then the
-mapping of each entry whose artifacts are all present. Returns the outcome of each line that it
-handled, at least one.
+Pushes a prefix of the queue lines `lines`, staged in the push's own staging directory: it stages
+lines until it has staged `pushChunkBytes`, uploads the artifacts of the staged entries, and then
+the mapping of each entry whose artifacts are all present. Returns the outcome of each line that
+it handled, at least one.
 -/
 def pushChunk (ctx : PushContext) (lines : Array String) : LoggerIO (Array PushOutcome) := do
-  let dir := ctx.cache.pushStagingDir
+  let dir := ctx.stagingDir
   removeDirAllIfExists dir
   IO.FS.createDirAll dir
   try
@@ -462,7 +464,17 @@ public def pushRemoteCache
   else unless (← pushLock.tryLock) do
     logInfo s!"another `lake cache push` uploads the queue (it holds {cache.pushLockFile})"
     return 0
+  /-
+  The lock proves that no other push runs, so any staging directory is a dead push's. The `curl`
+  of a push that was killed can outlive it and still open the files it was given: this push
+  stages in a directory of its own, so such a `curl` can never upload this push's files under the
+  dead push's URLs (and finds its own files gone).
+  -/
+  removeDirAllIfExists cache.pushStagingDir
+  let stagingDir := cache.pushStagingDir /
+    s!"{← IO.Process.getPID}-{(Hash.ofByteArray (← IO.getRandomBytes 8)).hex}"
+  logVerbose s!"staging uploads in {stagingDir}"
   let queueLock ← IO.FS.Handle.mk cache.pushQueueLockFile .append
-  pushLoop {cache, env, lakeCfg} pushLock queueLock {} {} {}
+  pushLoop {cache, env, lakeCfg, stagingDir} pushLock queueLock {} {} {}
 
 end Lake

@@ -919,8 +919,9 @@ public def buildArtifactUnlessUpToDate
             let art ← cacheArtifact file ext text exe restore
             -- The trace holds the log of the action that produced `file`: its replay or its build
             let log := (← readTraceFile traceFile).log
-            -- Queued before the local mapping is written: once that exists, no later build
-            -- compiles (and queues) this input again. A crash in between queues it twice.
+            -- Queued before the local mapping is written: a build that finds the mapping never
+            -- compiles (or queues) this input. After a crash between the two, the next build
+            -- restores the outputs through the trace without queueing them, so they stay queued once.
             if built then
               queueRemotePush pkg inputHash (← currentRemoteCacheTarget) none (toJson art.descr) log
             (← getLakeCache).writeOutputs pkg.cacheScope inputHash art.descr (log := log)
