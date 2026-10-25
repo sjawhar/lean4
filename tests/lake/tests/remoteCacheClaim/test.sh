@@ -563,9 +563,49 @@ case_claim_follow_reap() {
   wait $PID_A || true
 }
 
+case_claim_unreadable() {
+  # A claim that cannot be read (an invalid body, no times), which nothing rewrites, is a claim
+  # failure: the build compiles at once without a claim and records the failure.
+  claim_fresh
+  START=$(date +%s)
+  CLAIM_SERVICE=badclaim LAKE_CLAIM_TAKEOVER_SECS=3 BUILD_TIMEOUT=30 \
+    run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
+  match_text 'Built Claim.A' "$LOG_A"
+  test_exp $(( $(date +%s) - START )) -lt 15
+  match_text 'is unreadable' "$CACHE_A/remote-status-read.json"
+}
+
+case_claim_local_clock() {
+  # A claim goes stale by the waiting build's own clock as well: answers without times, and a
+  # holder's time a day ahead, never keep a build waiting longer than the takeover time after it
+  # first saw the claim unchanged. The claim is another host's, so its holder is not seen as gone.
+  claim_fresh
+  LAKE_REMOTE_CACHE_CLAIMS=false run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
+  put_claim "$(inputs "$CACHE_A" Claim.A)" building $(( $(date +%s) + 86400 ))
+  START=$(date +%s)
+  CLAIM_SERVICE=notimes LAKE_CLAIM_TAKEOVER_SECS=5 BUILD_TIMEOUT=40 \
+    run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim.A
+  match_text 'Built Claim.A' "$LOG_B"
+  test_exp $(( $(date +%s) - START )) -ge 5
+  test_exp $(( $(date +%s) - START )) -lt 25
+  match_text 'unchanged for' "$LOG_B"
+}
+
+case_claim_stream() {
+  # An answer to a claim request that does not end, sent faster than any speed limit, is cut
+  # off by the request's limits: the build compiles without a claim and records the failure.
+  claim_fresh
+  START=$(date +%s)
+  CLAIM_SERVICE=streamclaim BUILD_TIMEOUT=60 run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
+  match_text 'Built Claim.A' "$LOG_A"
+  test_exp $(( $(date +%s) - START )) -lt 45
+  match_text 'did not finish' "$CACHE_A/remote-status-read.json"
+}
+
 run_cases case_claim_two_builds case_claim_one_push case_claim_order case_claim_failed \
   case_claim_takeover case_claim_dead_holder case_claim_stale case_claim_detached_push \
   case_claim_pool_slot case_claim_fail_fast case_claim_same_pid case_claim_queued \
   case_claim_exe_push case_claim_push_retry case_claim_push_spawn_fails \
   case_claim_push_start_wfail case_claim_foreground_push case_claim_follow_reap \
-  case_claim_off case_claim_fail_open
+  case_claim_unreadable case_claim_local_clock case_claim_stream case_claim_off \
+  case_claim_fail_open
