@@ -112,9 +112,10 @@ public def readRemoteOutputs?
 **For internal use only.**
 Appends outputs that this Lake process just compiled to the write-back queue of the shared remote
 cache (`Cache.appendPushQueue`), which `lake cache push` uploads, if the queue is on (see
-`Env.remoteCacheQueueService?`). Call it only where this process ran the compiler or linker that
-produced `data` (see `JobState.built`): never for outputs that were replayed, unpacked, fetched or
-restored.
+`Env.remoteCacheQueueService?`), with the generation of the input's claim (`claimGeneration?`) if
+the build held it. Call it only where this process ran the compiler or linker that produced
+`data` (see `JobState.built`): never for outputs that were replayed, unpacked, fetched or
+restored. Returns whether the outputs were queued.
 
 Nothing is queued while usage cutoff is on (`Env.usageCutoff`): a build with usage cutoff can keep
 outputs that were compiled for another input, and only fresh compiles with usage cutoff off are
@@ -122,18 +123,20 @@ published.
 -/
 public def queueRemotePush
   (pkg : Package) (inputHash : Hash) (target : String) (srcHash? : Option Hash)
-  (data : Json) (log : Log)
-: JobM Unit := do
+  (data : Json) (log : Log) (claimGeneration? : Option String := none)
+: JobM Bool := do
   let ws ← getWorkspace
   let some service := ws.lakeEnv.remoteCacheQueueService?
-    | return
+    | return false
   if ws.lakeEnv.usageCutoff then
-    return
+    return false
   let entry : RemotePushEntry := {
-    service, inputHash, target, srcHash?, data
+    service, inputHash, target, srcHash?, data, claimGeneration?
     remoteScope := remoteCacheScope ws.lakeEnv.leanGithash pkg.cacheScope
     -- As in the local mapping, verbose entries (which name the tree's paths) are not kept
     log := log.filter (·.level ≥ .info)
   }
   if let .error e ← (ws.lakeCache.appendPushQueue entry).toBaseIO then
     logWarning s!"could not queue the outputs of `{target}` for the remote cache: {e}"
+    return false
+  return true

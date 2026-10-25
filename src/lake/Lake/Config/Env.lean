@@ -96,6 +96,19 @@ public structure Env where
   add it to `baseVars`.
   -/
   remoteCacheQueue : Bool := false
+  /--
+  Whether a build that queues its outputs (see `remoteCacheQueue`) also claims each input before it
+  compiles it and waits while another build holds the input's claim, and starts a detached
+  `lake cache push` after it queues outputs (i.e., `LAKE_REMOTE_CACHE_CLAIMS`, on unless set to a
+  false value; see `Lake.Build.Claim`). Lake does not add it to `baseVars`.
+  -/
+  remoteCacheClaims : Bool := true
+  /--
+  How long a claim may go without a rewrite before a waiting build takes it over, in seconds
+  (i.e., `LAKE_CLAIM_TAKEOVER_SECS`, 600 unless set to another positive number).
+  Lake does not add it to `baseVars`.
+  -/
+  claimTakeoverSecs : Nat := 600
   /-- The initial Lean library search path of the environment (i.e., `LEAN_PATH`). -/
   initLeanPath : SearchPath
   /-- The initial Lean source search path of the environment (i.e., `LEAN_SRC_PATH`). -/
@@ -211,6 +224,8 @@ public def compute
     cacheTokenCmd? := (← IO.getEnv "LAKE_CACHE_TOKEN_CMD").filter (!·.trimAscii.isEmpty)
     remoteCache? := (← IO.getEnv "LAKE_REMOTE_CACHE").map (·.trimAscii.copy) |>.filter (!·.isEmpty)
     remoteCacheQueue := ((← IO.getEnv "LAKE_REMOTE_CACHE_QUEUE").bind envToBool?).getD false
+    remoteCacheClaims := ((← IO.getEnv "LAKE_REMOTE_CACHE_CLAIMS").bind envToBool?).getD true
+    claimTakeoverSecs := ← computeClaimTakeoverSecs
     githashOverride := (← IO.getEnv "LEAN_GITHASH").getD ""
     toolchain
     initLeanPath := ← getSearchPath "LEAN_PATH",
@@ -237,6 +252,14 @@ where
     match Json.parse urlMapStr |>.bind fromJson? with
     | .ok urlMap => return urlMap
     | .error e => throw s!"'LAKE_PKG_URL_MAP' has invalid JSON: {e}"
+  computeClaimTakeoverSecs := do
+    let some secs ← IO.getEnv "LAKE_CLAIM_TAKEOVER_SECS"
+      | return 600
+    match secs.trimAscii.copy.toNat? with
+    | some n => if n > 0 then return n else throw (badTakeover secs)
+    | none => throw (badTakeover secs)
+  badTakeover (secs : String) : String :=
+    s!"'LAKE_CLAIM_TAKEOVER_SECS' must be a positive number of seconds, got '{secs}'"
   @[macro_inline] getUrlD var default := do
     if let some url ← IO.getEnv var then
       return normalizeUrl url
@@ -265,6 +288,14 @@ public def remoteCacheQueueService? (env : Env) : Option String :=
     env.remoteCache?
   else
     none
+
+/--
+The name of the cache service whose claims builds take, if any: the queue's service (see
+`remoteCacheQueueService?`), unless `LAKE_REMOTE_CACHE_CLAIMS` is false or usage cutoff is on
+(a build that publishes nothing claims nothing).
+-/
+public def remoteCacheClaimService? (env : Env) : Option String :=
+  if env.remoteCacheClaims && !env.usageCutoff then env.remoteCacheQueueService? else none
 
 /-- The toolchain identifier for the Lake cache corresponding to the environment's toolchain. -/
 @[inline] public def cacheToolchain (env : Env) : CacheToolchain :=

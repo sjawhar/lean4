@@ -13,6 +13,7 @@ import Lake.Config.RemoteCache
 import Lake.Build.Common
 import Lake.Build.Module
 import Lake.Build.RemoteCache
+import Lake.Build.Claim
 import Lake.Util.IO
 import Lake.Util.JsonObject
 import Lake.Util.Proc
@@ -108,6 +109,11 @@ structure ReadyEntry where
   mapping : RemoteUpload
   /-- The number of bytes of the entry's staged artifacts. -/
   bytes : Nat
+  /--
+  The URL of the claim of the entry's input and the generation that the build that queued the entry
+  gave it, if the build held the claim: the push marks it `done` after the mapping is uploaded.
+  -/
+  claim? : Option (String × String) := none
 
 /-- The result of preparing a queue entry for upload. -/
 inductive StagedEntry
@@ -236,8 +242,10 @@ def stageMapping
   let path := dir / "mapping.json"
   IO.FS.writeFile path mapping.toJson.compress
   let url := service.remoteMappingUrl entry.remoteScope entry.inputHash
+  let claim? := entry.claimGeneration?.map fun generation =>
+    (service.remoteClaimUrl entry.remoteScope entry.inputHash, generation)
   return .ready {
-    idx, serviceName := entry.service, service, artifacts, bytes
+    idx, serviceName := entry.service, service, artifacts, bytes, claim?
     mapping := {path, url, hash := entry.inputHash}
   }
 
@@ -389,6 +397,38 @@ def stageLines (ctx : PushContext) (dir : FilePath) (lines : Array String)
   return (← results.get).filterMap id
 
 /--
+Marks the claim of each entry that names one `done` (see `markClaimDone`), now that the entry's
+mapping is uploaded, with `ctx.workers` workers. A claim that another build changed meanwhile
+(HTTP 412) or that could not be written is left as it is, and logged: the outcome of the entry
+does not change, since what other builds wait for is the mapping.
+-/
+def markClaimsDone (ctx : PushContext) (entries : Array ReadyEntry) : LoggerIO Unit := do
+  let claims := entries.filterMap fun e =>
+    e.claim?.map fun (url, generation) => (e.service, url, generation)
+  if claims.isEmpty then
+    return
+  let holder ← claimHolder
+  let next ← IO.mkRef 0
+  let results ← IO.mkRef (Array.replicate claims.size (none : Option String))
+  let worker : BaseIO Unit := do
+    repeat
+      let i ← next.modifyGet fun i => (i, i + 1)
+      let some (service, url, generation) := claims[i]?
+        | break
+      let msg? := match ← tryLogIO (markClaimDone service url generation holder) with
+        | .ok 200 => none
+        | .ok code => some s!"left the claim {url} as it is (HTTP {code})"
+        | .error msg => some s!"could not mark the claim {url} done:\n{msg}"
+      results.modify (·.set! i msg?)
+  let tasks ← (Array.range (min ctx.workers claims.size)).mapM fun _ =>
+    IO.asTask (prio := .dedicated) (monadLift worker)
+  for task in tasks do
+    discard <| IO.wait task
+  for msg? in ← results.get do
+    if let some msg := msg? then
+      logVerbose msg
+
+/--
 Pushes a prefix of the queue lines `lines`, staged in the push's own staging directory: it stages
 lines until it has staged `pushChunkBytes` (see `stageLines`), uploads the artifacts of the staged
 entries, and then the mapping of each entry whose artifacts are all present. Returns the outcome
@@ -427,6 +467,8 @@ def pushChunk (ctx : PushContext) (lines : Array String) : LoggerIO (Array PushO
       for e in complete do
         if mapped.contains e.mapping.url then
           outcomes := outcomes.set! e.idx .pushed
+      -- The builds that wait for these claims look for the mappings, which are there now
+      markClaimsDone ctx (complete.filter (mapped.contains ·.mapping.url))
     return outcomes
   finally
     discard <| (removeDirAllIfExists dir).toBaseIO

@@ -14,6 +14,7 @@ import Init.Omega
 import Lake.Util.JsonObject
 import Lake.Util.IO
 import Lake.Config.PushQueue
+import Lake.Build.Claim
 
 /-! # Build Runner
 
@@ -403,6 +404,35 @@ def writeRemoteReadStatus (cache : Cache) (status : RemoteReadStatus) : IO Unit 
     |>.insert "failures" status.failures
     |>.insert "lastError" status.lastError : Json).pretty
 
+/--
+At the end of a build that takes claims (see `Env.remoteCacheClaimService?`), starts a detached
+`lake cache push` if the queue still holds lines and none runs, so that the outputs of the
+build's last compiles are uploaded even if the push that its compiles started had ended before
+they were queued (see `startDetachedPush`). Without the shell that a detached push needs, it runs
+the push in the foreground instead, with a warning (see `runForegroundPush`).
+-/
+def startQueuedPush (ws : Workspace) (logger : MonadLog BaseIO) : BaseIO Unit := do
+  unless ws.lakeEnv.remoteCacheClaimService?.isSome do
+    return
+  let cache := ws.lakeCache
+  let .ok md ← cache.pushQueueFile.metadata.toBaseIO
+    | return
+  if md.byteSize == 0 then
+    return
+  if !(← canDetachPush) then
+    logger.logEntry (.warning s!"`/bin/bash` is missing, so `lake cache push` runs before the \
+      build ends; log: {cache.pushLogFile}")
+    match (← (runForegroundPush ws.lakeEnv cache).toBaseIO) with
+    | .ok 0 => pure ()
+    | .ok rc => logger.logEntry (.warning s!"`lake cache push` exited with code {rc}")
+    | .error e => logger.logEntry (.warning s!"could not run `lake cache push`: {e}")
+    return
+  match (← (startDetachedPush ws.lakeEnv cache).toBaseIO) with
+  | .ok (some pid) =>
+    logger.logEntry (.trace s!"started `lake cache push` (pid {pid}), log: {cache.pushLogFile}")
+  | .ok none => pure ()
+  | .error e => logger.logEntry (.warning s!"could not start `lake cache push`: {e}")
+
 def finalizeBuild
   (cfg : BuildConfig) (bctx : BuildContext) (mctx : MonitorContext) (result : BuildResult α)
 : IO α := do
@@ -411,6 +441,7 @@ def finalizeBuild
   if remoteStatus.failures > 0 then
     if let .error e ← (writeRemoteReadStatus bctx.workspace.lakeCache remoteStatus).toBaseIO then
       mctx.logger.logEntry (.trace s!"could not write remote cache read status: {e}")
+  startQueuedPush bctx.workspace mctx.logger
   if let some outputsFile := cfg.outputsFile? then
     bctx.saveOutputs (logger := mctx.logger) mctx.out outputsFile
   match result.out with

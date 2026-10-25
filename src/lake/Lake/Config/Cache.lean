@@ -23,6 +23,7 @@ import Lake.Util.JsonObject
 import Lake.Util.IO
 import Init.System.Platform
 import Init.Data.String.Lemmas
+import Init.Data.String.Legacy
 
 open Lean System
 
@@ -735,6 +736,88 @@ public def remoteMappingUrl (service : CacheService) (scope : String) (inputHash
 /-- The remote artifact URL for a SHA-256 digest. -/
 public def remoteArtifactUrl (service : CacheService) (scope : String) (sha256 : Sha256) : String :=
   service.remoteObjectUrl scope s!"a/{sha256}.art"
+
+/-- The URL of the claim of an input hash (see `remoteClaimScope`). -/
+public def remoteClaimUrl (service : CacheService) (scope : String) (inputHash : Hash) : String :=
+  service.remoteObjectUrl (remoteClaimScope scope) inputHash.toString
+
+/--
+The answer to a request for an object of the shared remote cache that the request reads the
+headers of (see `getRemoteObject`, `putRemoteObjectIf`).
+-/
+public structure RemoteObjectResponse where
+  /-- The HTTP status code. -/
+  code : Nat
+  /-- The header fields of the response, each name lowercased. -/
+  headers : Array (String × String)
+  /-- The body of the response. -/
+  body : String
+
+/-- The value of the header field `name` (lowercase) of the response, if it has one. -/
+public def RemoteObjectResponse.header? (r : RemoteObjectResponse) (name : String) : Option String :=
+  r.headers.findSome? fun (n, v) => if n == name then some v else none
+
+/--
+The header fields that `curl -D` wrote: those of the last response only (a request that `curl`
+retried writes each response's), each name lowercased.
+-/
+def parseResponseHeaders (text : String) : Array (String × String) :=
+  text.splitOn "\n" |>.foldl (init := #[]) fun headers line =>
+    let line := line.trimAscii.copy
+    if line.startsWith "HTTP/" then
+      #[]
+    else match line.splitOn ":" with
+      | name :: value@(_ :: _) =>
+        headers.push (name.trimAscii.copy.toLower, (":".intercalate value).trimAscii.copy)
+      | _ => headers
+
+/--
+Sends one request for the object at `url` with the cache token (see `withCacheTokenRequest`),
+never following a redirect, and returns the answer with its header fields. `args` are the
+request's own `curl` arguments. Errors if the request cannot carry the token: these requests are
+for the service that `LAKE_REMOTE_CACHE` names, which accepts no other credential. A transfer
+that `curl` could not finish (e.g., a connection that failed) is an error, as is a stall (see
+`transferTimeoutArgs`).
+-/
+def requestRemoteObject
+  (service : CacheService) (url : String) (args : Array String)
+: LogIO RemoteObjectResponse := do
+  unless service.sendsCacheToken url do
+    error s!"a request for {url} needs the token of `{CacheToken.cmdVar}` for its host"
+  IO.FS.withTempFile fun _ headerFile => do
+    let (code, out, _) ← withCacheTokenRequest url true (follow := false) fun _ lead => do
+      let out ← captureProc' {
+        cmd := ← Internal.getCurl
+        args := lead ++ #["-s", "-w", "%{stderr}%{json}\n", "-D", headerFile.toString] ++
+          transferTimeoutArgs ++ args ++ #[url]
+      }
+      return (← curlResponseCode out.stderr, out)
+    let headers := parseResponseHeaders (← IO.FS.readFile headerFile)
+    return {code, headers, body := out.stdout}
+
+/--
+Reads the object at `url` (with the cache token; see `requestRemoteObject`). A missing object is
+an answer with code 404.
+-/
+public def getRemoteObject (service : CacheService) (url : String) : LogIO RemoteObjectResponse :=
+  service.requestRemoteObject url #["--retry", "3"]
+
+/--
+Writes `body` as the object at `url` (with the cache token; see `requestRemoteObject`) only if the
+object has the generation `generation` (`x-goog-if-generation-match`; `0` names an object that does
+not exist). The answer has code 200 and the object's new generation in `x-goog-generation` if the
+write happened, and code 412 if the object had another generation. The request is sent once: a
+retry of a write that happened but whose answer was lost would find the new generation and report
+412.
+-/
+public def putRemoteObjectIf
+  (service : CacheService) (url body : String) (generation : String)
+: LogIO RemoteObjectResponse :=
+  service.requestRemoteObject url #[
+    "-X", "PUT", "--data-binary", body,
+    "-H", "Content-Type: application/json",
+    "-H", s!"x-goog-if-generation-match: {generation}"
+  ]
 
 def s3ArtifactUrl (contentHash : Hash) (service : CacheService) (scope : CacheServiceScope) : String :=
   let endpoint :=
