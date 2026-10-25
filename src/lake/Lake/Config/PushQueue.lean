@@ -31,6 +31,12 @@ public structure RemotePushEntry extends RemoteOutputs where
   service : String
   /-- The remote scope of the outputs (see `remoteCacheScope`). -/
   remoteScope : String
+  /--
+  The generation of the claim of the input (see `RemoteClaim`) that the build held when it
+  compiled the outputs, if it held one. Once the mapping is uploaded, `lake cache push` marks that
+  claim `done` if it still has this generation.
+  -/
+  claimGeneration? : Option String := none
 
 namespace RemotePushEntry
 
@@ -43,6 +49,7 @@ public protected def toJson (entry : RemotePushEntry) : Json :=
   |>.insert "srcHash" entry.srcHash?
   |>.insert "data" entry.data
   |>.insert "log" entry.log
+  |>.insertSome "claimGeneration" entry.claimGeneration?
 
 public instance : ToJson RemotePushEntry := ⟨RemotePushEntry.toJson⟩
 
@@ -56,6 +63,7 @@ public protected def fromJson? (json : Json) : Except String RemotePushEntry := 
     srcHash? := ← obj.get "srcHash"
     data := ← obj.get "data"
     log := ← obj.get "log"
+    claimGeneration? := ← obj.get? "claimGeneration"
   }
 
 public instance : FromJson RemotePushEntry := ⟨RemotePushEntry.fromJson?⟩
@@ -82,6 +90,13 @@ that builds compiled, which `lake cache push` uploads and removes.
 /-- The queue entries that `lake cache push` refused, one JSON object per line, with the reason. -/
 @[inline] public def pushDroppedFile (cache : Cache) : FilePath :=
   cache.dir / "push-dropped.jsonl"
+
+/--
+The output of the detached `lake cache push` runs that builds start (see `startDetachedPush`):
+each run appends a line `lake cache push: started, pid <pid>, …` and then its own output.
+-/
+@[inline] public def pushLogFile (cache : Cache) : FilePath :=
+  cache.dir / "push.log"
 
 /-- The outcome of the last `lake cache push`. -/
 @[inline] public def pushStatusFile (cache : Cache) : FilePath :=

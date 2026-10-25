@@ -803,7 +803,20 @@ in the queue.
 One push runs at a time. Another one exits at once (with status 0), unless
 `--wait` is set, and the running one also uploads any entry appended while it
 runs. At the end, the push writes its counts to `remote-status-push.json` in the
-cache directory. It exits with status 1 if entries remain in the queue."
+cache directory. It exits with status 1 if entries remain in the queue.
+
+Unless `LAKE_REMOTE_CACHE_CLAIMS` is set to a false value, a build with the
+queue on also claims each input before it compiles it, so that two machines
+that build the same targets at once compile each one once: it creates the
+object `claim/<scope>/<inputHash>` in the remote cache if no build holds it,
+and rewrites it while it compiles. A build that finds the claim taken waits
+for the input's mapping instead of compiling, and takes the claim over when the
+claim says that the compile failed or when the remote cache has not replaced it
+for `LAKE_CLAIM_TAKEOVER_SECS` seconds (600 by default). A build that holds
+claims runs this command itself, detached, after each compile it queues, and
+that push marks each claim done once the mapping is uploaded; its output goes
+to `push.log` in the cache directory. A claim that cannot be read or written is
+a miss: the build compiles as it would without claims."
 
 def helpCacheClean :=
 "Removes ALL files from the local Lake cache
@@ -864,7 +877,19 @@ reads: never on a command line. That endpoint must use HTTPS, unless its host
 is a loopback address (`localhost`, `127.x.x.x`, `[::1]`). A request that
 carries the token follows no redirect (a redirect is an error) and ignores
 the user's `.curlrc`. A process Lake starts does not get the token, though
-it inherits both variables from Lake's environment."
+it inherits both variables from Lake's environment.
+
+A build that uploads to such a service (`LAKE_REMOTE_CACHE_QUEUE`; see
+`lake cache push`) also claims each input before it compiles it:
+
+  LAKE_REMOTE_CACHE_CLAIMS=false   do not claim, and do not push in the
+                                   background (off by default, i.e. claims are
+                                   taken)
+  LAKE_CLAIM_TAKEOVER_SECS=<n>     take a claim over after the remote cache has
+                                   not replaced it for `n` seconds (600 by
+                                   default); the holder rewrites its claims
+                                   every 60 seconds, or every `n/4` seconds if
+                                   that is less"
 
 def helpScriptCli :=
 "Manage Lake scripts
