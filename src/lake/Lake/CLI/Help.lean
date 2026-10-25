@@ -777,13 +777,13 @@ def helpCachePush :=
 "Upload the outputs that builds queued for the shared remote cache
 
 USAGE:
-  lake cache push [--wait] [--follow <pid>]
+  lake cache push [--wait] [--follow <file>]
 
 OPTIONS:
   --wait                          wait for a push that is running, then push
-  --follow <pid>                  keep pushing what the build with this process
-                                  ID queues until it has ended (builds that
-                                  claim inputs start their push this way)
+  --follow <file>                 keep pushing what a build queues while it
+                                  holds the lock on <file> (builds that claim
+                                  inputs start their push this way)
 
 With `LAKE_REMOTE_CACHE_QUEUE` set to true and `LAKE_REMOTE_CACHE` naming an
 `s3` service (see `lake cache services`), a build appends each output that it
@@ -814,15 +814,18 @@ that build the same targets at once compile each one once: it creates the
 object `claim/<scope>/<inputHash>` in the remote cache if no build holds it,
 and rewrites it while it compiles. A build that finds the claim taken waits
 for the input's mapping instead of compiling, and takes the claim over when the
-claim says that the compile failed, when its holder is a process of this
-machine that no longer runs, or when the remote cache has not replaced it for
-`LAKE_CLAIM_TAKEOVER_SECS` seconds (600 by default). After its first queued
-output, a build that claims inputs starts this command itself, once, detached,
-as `lake cache push --wait --follow <its pid>`: the push uploads each output as
-the build queues it, ends after the build has ended, and marks each claim done
-once its mapping is uploaded. Its output goes to `push.log` in the cache
-directory. A claim that cannot be read or written is a miss: the build compiles
-as it would without claims."
+claim says that the compile failed, when the claim's compile still runs but its
+holder is a process of this machine that no longer runs, or when the remote
+cache has not replaced it for `LAKE_CLAIM_TAKEOVER_SECS` seconds (600 by
+default). After its first queued output, a build that claims inputs starts this
+command itself, once, detached, as `lake cache push --wait --follow <file>`
+with a lock file that the build holds until it ends: the push uploads each
+output as the build queues it, tries an upload that failed again every 30
+seconds while the build runs, ends after the build has ended (also when the
+Lake process goes on, as `lake exe` does), and marks each claim done once its
+mapping is uploaded. Its output goes to `push.log` in the cache directory. A
+claim that cannot be read or written is a miss: the build compiles as it would
+without claims."
 
 def helpCacheClean :=
 "Removes ALL files from the local Lake cache

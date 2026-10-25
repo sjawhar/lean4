@@ -37,11 +37,13 @@ push_check() { "$PYTHON" "$TEST_DIR/../remoteCachePush/push_check.py" "$@"; }
 # `build.sh <tree> <cache> <log> <target>...`. The other settings come from the environment.
 # It records its process ID in `<log>.pid`, and stops the build after `$BUILD_TIMEOUT` seconds
 # (by default 600), so that a build that waits for a claim too long fails instead of hanging.
+# `$LAKE_CMD` is the Lake command (by default `build`), and `$LAKE_PRELOAD` a library that Lake
+# (not this script) runs with as `LD_PRELOAD`.
 cat > "$WORK_DIR/build.sh" << 'EOF'
 tree=$1; cache=$2; log=$3; shift 3
 echo $$ > "$log.pid"
-LAKE_CACHE_DIR="$cache" exec timeout "${BUILD_TIMEOUT:-600}" "$LAKE" -v --dir "$tree" build "$@" \
-  > "$log" 2>&1
+LAKE_CACHE_DIR="$cache" exec timeout "${BUILD_TIMEOUT:-600}" env LD_PRELOAD="${LAKE_PRELOAD:-}" \
+  "$LAKE" -v --dir "$tree" "${LAKE_CMD:-build}" "$@" > "$log" 2>&1
 EOF
 # As `tools/lbq.sh` does: holds a lock on descriptor 9 for the command it runs, and also keeps a
 # descriptor above 9 open, which a shell can only close by number
@@ -238,8 +240,11 @@ case_claim_failed() {
   run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim.Flaky
   match_text 'Built Claim.Flaky' "$LOG_B"
   test_exp $(( $(date +%s) - START )) -lt 60
-  # B took the claim over from the generation that held `failed`
-  test_cmd_eq 1 count "^PUT /bearer/a0/claim/.*/$FLAKY -> 200 auth=bearer gen=[1-9]" "$SERVER_LOG"
+  # B took the claim over from the generation that held `failed`: after its create was refused
+  # (412), its first successful write of the claim names that generation (later writes mark the
+  # claim `queued`, then `done`)
+  test_cmd grep -m 1 -E "^PUT /bearer/a0/claim/.*/$FLAKY -> 200 auth=bearer gen=[1-9]" \
+    <(grep -m 1 "^PUT /bearer/a0/claim/.*/$FLAKY -> 200 " "$SERVER_LOG")
   wait_push "$CACHE_B"
   claims_done 1
 }
@@ -422,6 +427,79 @@ case_claim_fail_open() {
   test_cmd_eq $CLAIM_COMPILES queued_lines "$CACHE_A"
 }
 
+case_claim_same_pid() {
+  # Two builds whose Lake processes have one process ID (as in two containers that share the
+  # cache; here an `LD_PRELOAD` `getpid` gives both 4242) share one cache. The first build queues
+  # `Claim.A` and starts its push, then keeps compiling `Claim.Slow`; the second build queues
+  # `Claim.B` while the first still runs. Each build's push follows a file of its own, so the
+  # second build does not wait for the first.
+  claim_fresh
+  test_cmd cc -shared -fPIC -o "$WORK_DIR/same-pid.so" "$TEST_DIR/SamePidLake.c" -ldl
+  LAKE_PRELOAD="$WORK_DIR/same-pid.so" LAKE_TEST_CLAIM_SLEEP=120000 \
+    start_build "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A Claim.Slow
+  PID_A=$!
+  # A's first queued output (`Claim.A`'s) started its push
+  test_cmd claim_check wait-text "$CACHE_A/push.log" 'lake cache push: started' --timeout 60
+  START=$(date +%s)
+  LAKE_PRELOAD="$WORK_DIR/same-pid.so" BUILD_TIMEOUT=60 \
+    run_build 0 "$TREE_B" "$CACHE_A" "$LOG_B" Claim.B
+  match_text 'Built Claim.B' "$LOG_B"
+  test_exp $(( $(date +%s) - START )) -lt 30
+  test_exp -d /proc/$PID_A
+  # Two follow files, one per build (A still builds; B's push waits for A's)
+  test_cmd claim_check wait-entries "$CACHE_A/push-follow" 2 --timeout 10
+}
+
+case_claim_queued() {
+  # A build that queued a compile's outputs marks the claim `queued` and ends while its push
+  # still uploads (each upload takes 4 seconds here). A build of another cache on the same host
+  # that comes next finds the holder's process gone, but a `queued` claim waits for its push:
+  # it restores every target from the remote cache and compiles none.
+  claim_fresh
+  CLAIM_SERVICE=slowobj run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim claimexe
+  test_cmd_eq $CLAIM_COMPILES claim_check built-by "$LOG_A"
+  test_exp ! -e "$CACHE_A/remote-status-push.json"
+  # The claims' states as A left them (`done` for one whose mapping the push already uploaded)
+  for claim in "$CLAIMS"/*; do cp "$claim" "$WORK_DIR/state-$(basename "$claim")"; done
+  CLAIM_SERVICE=slowobj BUILD_TIMEOUT=120 run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim claimexe
+  test_cmd_eq 0 claim_check built-by "$LOG_B"
+  test_cmd_eq $CLAIM_COMPILES machine_targets "$LOG_B"
+  for claim in "$WORK_DIR"/state-*; do test_cmd claim_check state "$claim" queued,done; done
+  test_cmd rm -f "$WORK_DIR"/state-*
+  wait_push "$CACHE_A"
+  claims_done $CLAIM_COMPILES
+}
+
+case_claim_exe_push() {
+  # `lake exe` keeps its Lake process while the program runs. The push that its build started
+  # follows the build, not the process: it ends once the build has, while the program still runs.
+  claim_fresh
+  LAKE_CMD=exe LAKE_TEST_CLAIM_EXE_SLEEP=60000 start_build "$TREE_A" "$CACHE_A" "$LOG_A" claimexe
+  PID_A=$!
+  test_cmd claim_check wait-text "$LOG_A" 'claimexe started' --timeout 60
+  test_cmd claim_check wait-file "$CACHE_A/remote-status-push.json" --timeout 20
+  test_exp -d /proc/$PID_A
+  no_match_text 'Hello, claim' "$LOG_A"
+  test_cmd push_check status "$CACHE_A/remote-status-push.json" 3 0 0 0
+}
+
+case_claim_push_retry() {
+  # A push that follows a build tries an upload that failed again (after 30 seconds) while the
+  # build still runs: the first upload of each artifact is refused here, and `Claim.A`'s mapping
+  # is in the remote cache before the build (which then compiles `Claim.Slow` for 50 seconds)
+  # ends.
+  claim_fresh
+  CLAIM_SERVICE=denyartonce LAKE_TEST_CLAIM_SLEEP=50000 \
+    start_build "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A Claim.Slow
+  PID_A=$!
+  test_cmd claim_check wait-text "$CACHE_A/push.jsonl" '"target":"Claim.A"' --timeout 60
+  A_INPUT="$(inputs "$CACHE_A" Claim.A)"
+  test_cmd claim_check wait-file "$OBJECTS/in/$A_INPUT.json" --timeout 45
+  test_exp -d /proc/$PID_A
+  match_text 'trying 1 failed queue entries again' "$CACHE_A/push.log"
+}
+
 run_cases case_claim_two_builds case_claim_one_push case_claim_order case_claim_failed \
   case_claim_takeover case_claim_dead_holder case_claim_stale case_claim_detached_push \
-  case_claim_pool_slot case_claim_fail_fast case_claim_off case_claim_fail_open
+  case_claim_pool_slot case_claim_fail_fast case_claim_same_pid case_claim_queued \
+  case_claim_exe_push case_claim_push_retry case_claim_off case_claim_fail_open
