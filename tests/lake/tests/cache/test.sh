@@ -282,17 +282,24 @@ test_run cache stage .lake/outputs.jsonl .lake/staging
 test_exp ! -s $staging_art
 test_run cache stage .lake/outputs.jsonl .lake/staging --force-overwrite
 test_exp -s $staging_art
-# Verify unstage overwritting
+# Verify unstage overwritting (of a cache artifact without its hash's bytes, here an empty file)
 test_cmd rm -rf "$CACHE_DIR"
 test_run cache unstage .lake/staging --no-overwrite
 test_exp -f $cache_art # verify copy can occur with `--no-overwrite`
+test_cmd rm -f $cache_art
+test_cmd touch $cache_art
+test_exp ! -s $cache_art
+test_run cache unstage .lake/staging
+test_exp ! -s $cache_art
+test_run cache unstage .lake/staging --force-overwrite
+test_exp -s $cache_art
+# Verify that `cache unstage` does not copy a staged artifact without its hash's bytes, also with
+# `--force-overwrite`, and keeps the cache's artifact
 test_cmd rm $staging_art
 test_cmd touch $staging_art
-test_exp ! -s $staging_art
-test_run cache unstage .lake/staging
+test_err 'staged artifact does not match its content hash' \
+  cache unstage .lake/staging --force-overwrite
 test_exp -s $cache_art
-test_run cache unstage .lake/staging --force-overwrite
-test_exp ! -s $cache_art
 
 # Verify that `lake cache clean` deletes the cache directory
 test_exp -d "$CACHE_DIR"
