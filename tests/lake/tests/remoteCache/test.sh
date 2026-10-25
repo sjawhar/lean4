@@ -49,21 +49,30 @@ cp -r "$FIXTURE_DIR/lakefile.toml" "$FIXTURE_DIR/BadCurl.lean" \
   "$FIXTURE_DIR/Test.lean" "$FIXTURE_DIR/Test" "$WORK_DIR/"
 chmod -R u+w "$WORK_DIR"
 cd "$WORK_DIR"
+# A second library of two modules that do not import each other,
+# so that a build fetches their artifacts independently
+mkdir -p Two
+echo 'def a := 1' > Two/A.lean
+echo 'def b := 2' > Two/B.lean
+cat >> lakefile.toml << 'EOF'
+
+[[lean_lib]]
+name = "Two"
+roots = ["Two.A", "Two.B"]
+EOF
 
 echo "# SETUP"
 
 init_git
 REV="$(git rev-parse HEAD)"
 
-# Two mock servers, each on a free port, which accept the tokens in `$TOKENS`
+# Two mock servers, each on a free port, which accept the tokens in `$TOKENS`.
+# The first one's `redirect` mode sends requests to the second one's `ok` store.
 echo test-token-1 > "$TOKENS"
-"$PYTHON" "$FIXTURE_DIR/server.py" --store "$STORE_DIR" --port-file port \
-  --tokens "$TOKENS" >> "$SERVER_LOG" 2>&1 &
-SERVER_PID=$!
 "$PYTHON" "$FIXTURE_DIR/server.py" --store "$STORE2_DIR" --port-file port2 \
   --tokens "$TOKENS" >> "$SERVER2_LOG" 2>&1 &
 SERVER2_PID=$!
-trap 'kill $SERVER_PID $SERVER2_PID 2> /dev/null' EXIT
+trap 'kill $SERVER2_PID 2> /dev/null' EXIT
 # Since each server is a separate process, the port it binds has to be waited on
 wait_port() {
   while [ ! -s "$1" ]; do
@@ -75,10 +84,14 @@ wait_port() {
     sleep 0.1
   done
 }
-wait_port port $SERVER_PID "$SERVER_LOG"
 wait_port port2 $SERVER2_PID "$SERVER2_LOG"
-URL="http://127.0.0.1:$(cat port)"
 URL2="http://127.0.0.1:$(cat port2)"
+"$PYTHON" "$FIXTURE_DIR/server.py" --store "$STORE_DIR" --port-file port \
+  --tokens "$TOKENS" --redirect "$URL2/ok" >> "$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
+trap 'kill $SERVER_PID $SERVER2_PID 2> /dev/null' EXIT
+wait_port port $SERVER_PID "$SERVER_LOG"
+URL="http://127.0.0.1:$(cat port)"
 echo "URL=$URL URL2=$URL2"
 
 # Copied after the commit above so that it does not dirty the work tree
@@ -104,6 +117,7 @@ NUM_REPLAY_ARTS=8
 LAKE_CACHE_DIR="$BUILD_CACHE_DIR" test_run build Test -o outputs.jsonl
 # Keep the `curl` wrapper out of the build directory, which the cases delete
 LAKE_CACHE_DIR="$BUILD_CACHE_DIR" test_run build curl
+LAKE_CACHE_DIR="$BUILD_CACHE_DIR" test_run build Two -o two.jsonl
 test_cmd cp "$(LAKE_CACHE_DIR="$BUILD_CACHE_DIR" "$LAKE" query curl:exe)" "$WORK_DIR/bad-curl"
 CURL_MOCK="$WORK_DIR/bad-curl"
 CURL_REAL="$(type -P curl)"
@@ -404,8 +418,63 @@ case_download() {
   test_cmd_eq 0 count_other '--connect-timeout 10 --speed-limit 1024 --speed-time 30' "$ARGV_LOG"
 }
 
+case_failing_cmd() {
+  # A token command that fails is not run again for each download that needs the token:
+  # the two modules of `Two` are fetched independently, and the command runs once
+  LAKE_CACHE_DIR="$BUILD_CACHE_DIR" LAKE_CACHE_KEY=mock:key \
+    test_run cache put two.jsonl --scope=failing --service=ok
+  fresh
+  test_run cache add two.jsonl --scope=failing --service=bearer
+  rm -f "$TOKEN_RUNS"
+  : > "$SERVER_LOG"
+  LAKE_REMOTE_CACHE=bearer LAKE_CACHE_TOKEN_CMD="echo run >> '$TOKEN_RUNS'; exit 1" \
+    test_err '`LAKE_CACHE_TOKEN_CMD` exited with code 1' -v build Two --no-build
+  test_cmd_eq 1 token_runs
+  test_cmd_eq 0 count ' -> ' "$SERVER_LOG"
+  test_artifacts 0
+}
+
+case_redirect() {
+  # A request that carries the token follows no redirect, even when the user's `.curlrc`
+  # asks `curl` to: the redirect is an error that names it, and the other host sees nothing
+  seed redirect
+  test_cmd mkdir -p "$STORE2_DIR/a0" "$STORE2_DIR/r0"
+  test_cmd cp -r "$STORE_DIR/a0/redirect" "$STORE2_DIR/a0/"
+  test_cmd cp -r "$STORE_DIR/r0/redirect" "$STORE2_DIR/r0/"
+  test_cmd mkdir -p curlhome
+  echo location > curlhome/.curlrc
+  # Without `-q`, that `.curlrc` makes `curl` follow the redirect
+  ART="$(ls -1 "$STORE_DIR/a0/redirect" | head -1)"
+  test_cmd_eq 200 env CURL_HOME="$WORK_DIR/curlhome" \
+    curl -s -o /dev/null -w '%{http_code}' "$URL/redirect/a0/redirect/$ART"
+  redir() {
+    CURL_HOME="$WORK_DIR/curlhome" LAKE_REMOTE_CACHE=redirect \
+      LAKE_CACHE_TOKEN_CMD="$TOKEN_CMD" "$@"
+  }
+  : > "$SERVER2_LOG"
+  fresh
+  redir test_err 'error 302' cache get --scope=redirect --service=redirect
+  redir test_err 'status code: 302' cache get outputs.jsonl --scope=redirect --service=redirect
+  test_run cache add outputs.jsonl --scope=redirect --service=redirect
+  redir test_err 'the server redirected the download (status 302)' -v build Test --no-build
+  no_match_text 'hash mismatch' produced.out
+  test_artifacts 0
+  test_cmd_eq 0 count ' -> ' "$SERVER2_LOG"
+}
+
+case_cleartext() {
+  # The token is not sent over unencrypted HTTP to a host that is not a loopback one,
+  # and the token command does not run
+  fresh
+  rm -f "$TOKEN_RUNS"
+  LAKE_REMOTE_CACHE=cleartext LAKE_CACHE_TOKEN_CMD="$TOKEN_CMD" \
+    test_err 'over unencrypted HTTP' cache get --scope=cleartext --service=cleartext
+  test_cmd_eq 0 token_runs
+}
+
 CASES="${REMOTE_CACHE_CASES:-case_roundtrip case_no_token case_second_put case_no_leak
-  case_rotation case_token_cmd_fails case_other_host case_no_request case_download}"
+  case_rotation case_token_cmd_fails case_other_host case_no_request case_download
+  case_failing_cmd case_redirect case_cleartext}"
 for c in $CASES; do
   echo "# ${c#case_}"
   "$c"
