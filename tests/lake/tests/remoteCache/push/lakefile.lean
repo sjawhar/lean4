@@ -4,13 +4,17 @@ open System Lake DSL
 /-!
 The package that `test.sh` builds with the write-back queue on and uploads with
 `lake cache push`: modules (one with an `admit` warning), a native executable
-(an object file and its link), and a target that builds two files in one job.
+(an object file and its link), a precompiled module that another module loads
+(an object file and a shared library), and a target that builds two files in one job.
 -/
 
 package push where
   enableArtifactCache := true
 
 lean_lib Push
+
+lean_lib Pre where
+  precompileModules := true
 
 lean_exe pushexe where
   root := `Main
