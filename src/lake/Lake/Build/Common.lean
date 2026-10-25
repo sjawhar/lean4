@@ -12,6 +12,7 @@ public import Lake.Util.JsonObject
 public import Lake.Util.IO
 public import Lake.Build.Actions
 import Lake.Util.Url
+import Lake.Config.PushQueue
 
 /-! # Common Build Tools
 This file defines general utilities that abstract common
@@ -576,6 +577,13 @@ public def Cache.quarantine (cache : Cache) (file : FilePath) (name : String) : 
   IO.FS.createDirAll cache.quarantineDir
   quarantineAs cache.quarantineDir file name 0
 
+/-- Describes the outcome of `Cache.quarantine`; a failure to quarantine is reported, not thrown. -/
+public def describeQuarantine (cache : Cache) (file : FilePath) (name : String) : BaseIO String := do
+  match (← (cache.quarantine file name).toBaseIO) with
+  | .ok (some dest) => return s!"moved it to: {dest}"
+  | .ok none => return "it was already moved away by another process"
+  | .error e => return s!"could not move it into quarantine: {e}"
+
 /-- **For internal use only.** -/
 public class ResolveOutputs (α : Type) where
   /-- **For internal use only.** -/
@@ -911,9 +919,11 @@ public def buildArtifactUnlessUpToDate
             let art ← cacheArtifact file ext text exe restore
             -- The trace holds the log of the action that produced `file`: its replay or its build
             let log := (← readTraceFile traceFile).log
-            (← getLakeCache).writeOutputs pkg.cacheScope inputHash art.descr (log := log)
+            -- Queued before the local mapping is written: once that exists, no later build
+            -- compiles (and queues) this input again. A crash in between queues it twice.
             if built then
               queueRemotePush pkg inputHash (← currentRemoteCacheTarget) none (toJson art.descr) log
+            (← getLakeCache).writeOutputs pkg.cacheScope inputHash art.descr (log := log)
             return art
           else
             computeArtifact file ext text
