@@ -777,28 +777,52 @@ def parseResponseHeaders (text : String) : Array (String × String) :=
       | _ => headers
 
 /--
+How long one request for an object of the shared remote cache that a build makes for a claim may
+take in all, in seconds (`curl --max-time`), and how long its retries may go on
+(`--retry-max-time`): a request that is answered but keeps sending stays bounded.
+-/
+def remoteObjectMaxSecs : Nat := 20
+
+/-- The most bytes that the body of an answer to a claim request may have: a claim is far smaller. -/
+def remoteObjectMaxBytes : Nat := 65536
+
+/--
 Sends one request for the object at `url` with the cache token (see `withCacheTokenRequest`),
 never following a redirect, and returns the answer with its header fields. `args` are the
 request's own `curl` arguments. Errors if the request cannot carry the token: these requests are
 for the service that `LAKE_REMOTE_CACHE` names, which accepts no other credential. A transfer
 that `curl` could not finish (e.g., a connection that failed) is an error, as is a stall (see
-`transferTimeoutArgs`).
+`transferTimeoutArgs`), a request that has not ended after `remoteObjectMaxSecs` (with its
+retries; a request renewed for a refused token is sent once more), and a body larger than
+`remoteObjectMaxBytes`. The body goes to a temporary file, never to memory, while it arrives.
 -/
 def requestRemoteObject
   (service : CacheService) (url : String) (args : Array String)
 : LogIO RemoteObjectResponse := do
   unless service.sendsCacheToken url do
     error s!"a request for {url} needs the token of `{CacheToken.cmdVar}` for its host"
-  IO.FS.withTempFile fun _ headerFile => do
-    let (code, out, _) ← withCacheTokenRequest url true (follow := false) fun _ lead => do
-      let out ← captureProc' {
+  IO.FS.withTempFile fun _ headerFile => IO.FS.withTempFile fun _ bodyFile => do
+    let (code, exitCode, _) ← withCacheTokenRequest url true (follow := false) fun _ lead => do
+      let out ← rawProc (quiet := true) {
         cmd := ← Internal.getCurl
-        args := lead ++ #["-s", "-w", "%{stderr}%{json}\n", "-D", headerFile.toString] ++
+        args := lead ++ #["-s", "-w", "%{stderr}%{json}\n", "-D", headerFile.toString,
+          "-o", bodyFile.toString,
+          "--max-time", toString remoteObjectMaxSecs,
+          "--retry-max-time", toString remoteObjectMaxSecs,
+          "--max-filesize", toString remoteObjectMaxBytes] ++
           transferTimeoutArgs ++ args ++ #[url]
       }
-      return (← curlResponseCode out.stderr, out)
+      return (← curlResponseCode out.stderr, out.exitCode)
+    -- `curl` reports the status of an answer that it then did not receive whole
+    unless exitCode == 0 do
+      error s!"the request for {url} did not finish (curl exit code {exitCode}; a request may \
+        take {remoteObjectMaxSecs} s and its answer {remoteObjectMaxBytes} bytes)"
+    let size := (← bodyFile.metadata).byteSize
+    if size > remoteObjectMaxBytes.toUInt64 then
+      error s!"the answer to the request for {url} has {size} bytes, more than \
+        {remoteObjectMaxBytes}"
     let headers := parseResponseHeaders (← IO.FS.readFile headerFile)
-    return {code, headers, body := out.stdout}
+    return {code, headers, body := ← IO.FS.readFile bodyFile}
 
 /--
 Reads the object at `url` (with the cache token; see `requestRemoteObject`). A missing object is
