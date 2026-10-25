@@ -134,6 +134,15 @@ if [ "$UNAME" = Linux ]; then
   test_cmd "$BUILD_DIR/bin/leanc" -o fallback Fallback.c -L"$BUILD_DIR/lib/lean" -lLake_shared
   FALLBACK=./fallback
   head -c 65536 /dev/zero | tr '\0' A > first.bin
+
+  # After a forced hard-link failure, the temporary copy is gone before the fallback opens the
+  # final path. The preload records whether that temporary file still exists at that open.
+  rm -f space-ifnew space-ready space-start tmp-state.log
+  touch space-start
+  test_cmd env LD_LIBRARY_PATH="$BUILD_DIR/lib/lean" LD_PRELOAD="$PWD/no-hard-link.so" \
+    LAKE_TEST_TMP_STATE_LOG="$PWD/tmp-state.log" LAKE_TEST_STAT_PATH=space-ifnew \
+    "$FALLBACK" space-ifnew first.bin space-ready space-start
+  test_cmd grep -qx removed tmp-state.log
   head -c 8388608 /dev/zero | tr '\0' B > second.bin
   rm -f ifnew ready-a ready-b start link.log first.out second.out
   mkdir stat-barrier
