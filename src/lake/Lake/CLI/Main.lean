@@ -13,7 +13,6 @@ public import Lake.CLI.Shake
 public import Lake.CLI.Check
 import Lake.Version
 import Lake.Build.Run
-import Lake.Build.RemoteExec
 import Lake.Build.Infos
 import Lake.Build.Targets
 import Lake.Build.Target.Fetch
@@ -22,15 +21,12 @@ import Lake.Load.Workspace
 import Lake.Load.Toml
 import Lake.Util.IO
 import Lake.Util.Git
-import Lake.Util.Proc
 import Lake.Util.MainM
 import Lake.Util.Cli
 import Lake.CLI.Init
 import Lake.CLI.Help
 import Lake.CLI.Build
 import LeanExport.Basic
-import Lake.CLI.CachePush
-import Lake.Config.PushQueue
 import Lake.CLI.Actions
 import Lake.CLI.Translate
 import Lake.CLI.Serve
@@ -84,13 +80,6 @@ public structure LakeOptions where
   toolchain? : Option CacheToolchain := none
   rev? : Option GitRev := none
   maxRevs : Nat := 100
-  /-- Whether `lake cache push` waits for a push that is running (via `--wait`). -/
-  wait : Bool := false
-  /--
-  The follow file of the build that `lake cache push` follows (via `--follow`): the push keeps
-  reading the queue while that build holds the file's lock (see `pushRemoteCache`).
-  -/
-  follow? : Option System.FilePath := none
   shake : Shake.Args := {}
   comparatorConfig? : Option FilePath := none
   /-- File received via `lake check --from-export` -/
@@ -110,6 +99,9 @@ public structure LakeOptions where
   builtinOnly : Bool := false
   samplyRaw : Bool := false
   samplyNoServe : Bool := false
+  /-- Whether the process exits after this command (`main`), so a build may leave its context allocated
+  (`BuildConfig.forgetContext`). -/
+  oneShot : Bool := false
 
 def LakeOptions.outLv (opts : LakeOptions) : LogLevel :=
   opts.outLv?.getD opts.verbosity.minLogLv
@@ -183,9 +175,9 @@ abbrev CliMainM := ExceptT CliError MainM
 abbrev CliStateM := StateT LakeOptions CliMainM
 abbrev CliM := ArgsT CliStateM
 
-def CliM.run (self : CliM α) (args : List String) : BaseIO ExitCode := do
+def CliM.run (self : CliM α) (args : List String) (oneShot := false) : BaseIO ExitCode := do
   let (elanInstall?, leanInstall?, lakeInstall?) ← findInstall?
-  let main := self.run' args |>.run' {args, elanInstall?, leanInstall?, lakeInstall?}
+  let main := self.run' args |>.run' {args, elanInstall?, leanInstall?, lakeInstall?, oneShot}
   let main := main.run >>= fun | .ok a => pure a | .error e => error e.toString
   main.run
 
@@ -332,10 +324,6 @@ def lakeLongOption : (opt : String) → CliM PUnit
 | "--force-download" => modifyThe LakeOptions ({· with forceDownload := true})
 | "--download-arts" => modifyThe LakeOptions ({· with mappingsOnly := false})
 | "--mappings-only" => modifyThe LakeOptions ({· with mappingsOnly := true})
-| "--wait"        => modifyThe LakeOptions ({· with wait := true})
-| "--follow" => do
-  let file ← takeOptArg "--follow" "follow file"
-  modifyThe LakeOptions ({· with follow? := some file})
 | "--package" => do
   let pkgName ← takeOptArg "--package" "package name"
   modifyThe LakeOptions ({· with package? := some pkgName})
@@ -681,31 +669,23 @@ def computeUploadService
   if let some service := service? then
     let some service := lakeCfg.cacheServices.find? (.mkSimple service)
       | error (serviceNotFound service lakeCfg.config.cache.services)
-    withUploadKey lakeEnv.cacheKey? service
+    let some key := lakeEnv.cacheKey?
+      | error "uploads require an authentication key configured through `LAKE_CACHE_KEY`"
+    return service.withKey key
   else
     match lakeEnv.cacheKey?, lakeEnv.cacheArtifactEndpoint?, lakeEnv.cacheRevisionEndpoint? with
     | some key, some artifactEndpoint, some revisionEndpoint =>
       return .uploadService key artifactEndpoint revisionEndpoint
     | key?, none, none =>
       if let some service := lakeCfg.defaultCacheUploadService? then
-        withUploadKey key? service
+        let some key := key?
+          | error "uploads require an authentication key configured through `LAKE_CACHE_KEY`"
+        return service.withKey key
       else
         error "no default upload service configured; the `--service` option must be set"
     | key?, artifactEndpoint?, revisionEndpoint? =>
       error (invalidEndpointConfig key? artifactEndpoint? revisionEndpoint?)
 where
-  /-
-  A service that uses the cache token needs no key for the uploads that carry it
-  (those to the host of its artifact endpoint).
-  -/
-  withUploadKey (key? : Option String) (service : CacheService) : CliStateM CacheService := do
-    if let some key := key? then
-      return service.withKey key
-    else if service.usesCacheToken then
-      return service
-    else
-      let name := service.name?.map (·.toString) |>.getD "the upload service"
-      error (CacheService.uploadCredentialError s!"`{name}`")
   invalidEndpointConfig key? artifactEndpoint? revisionEndpoint? :=
     s!"invalid endpoint configuration:\
     \n  LAKE_CACHE_KEY is {if key?.isNone then "unset" else "set"}\
@@ -901,20 +881,6 @@ protected def services : CliM PUnit := do
   let cfg  ← loadLakeConfig lakeEnv
   cfg.config.cache.services.forM (IO.println ·.name)
 
-protected def push : CliM PUnit := do
-  processOptions lakeOption
-  let opts ← getThe LakeOptions
-  noArgsRem do
-  let lakeEnv ← opts.computeEnv
-  -- No workspace is loaded: the queue names everything the push needs
-  let some cache := lakeEnv.lakeCache?
-    | error "no system cache detected; set `LAKE_CACHE_DIR` to the cache that holds the queue"
-  let lakeCfg ← loadLakeConfig lakeEnv
-  let left ← pushRemoteCache lakeEnv lakeCfg cache opts.wait opts.follow?
-  if left > 0 then
-    logError s!"{left} queue entries could not be uploaded; they remain in {cache.pushQueueFile}"
-    exit 1
-
 protected def clean : CliM PUnit := do
   processOptions lakeOption
   let opts ← getThe LakeOptions
@@ -943,7 +909,6 @@ def cacheCli : (cmd : String) → CliM PUnit
 | "put-staged"  => cache.putStaged
 | "clean"       => cache.clean
 | "services"    => cache.services
-| "push"        => cache.push
 | "help"        => cache.help
 | cmd           => throw <| CliError.unknownCommand cmd
 
@@ -1035,10 +1000,7 @@ protected def build : CliM PUnit := do
     | none, some _ => error "`--package` requires `-o`"
     | none, none => return none
   let buildConfig := mkBuildConfig opts (out := .stdout) (showSuccess := true) outputsPackage?
-  -- Say `hello` to the build service at the build's start, so its GetCapabilities carries the
-  -- build's invocation id (contract C5.1). A no-op when service mode is off.
-  startRemoteSession ws
-  ws.runBuild (buildSpecs specs) buildConfig
+  ws.runBuild (buildSpecs specs) {buildConfig with forgetContext := opts.oneShot}
 
 protected def checkBuild : CliM PUnit := do
   processOptions lakeOption
@@ -1321,7 +1283,7 @@ protected def env : CliM PUnit := do
     else
       pure config.lakeEnv.vars
   if let some cmd ← takeArg? then
-    let child ← spawnProc {cmd, args := (← takeArgs).toArray, env}
+    let child ← IO.Process.spawn {cmd, args := (← takeArgs).toArray, env}
     exit <| ← child.wait
   else
     env.forM fun (var, val?) =>
@@ -1501,7 +1463,6 @@ def lake : CliM PUnit := do
       else
         throw <| CliError.missingCommand
 
-public def cli (args : List String) : BaseIO ExitCode := do
-  -- However a command ends (an exception included), stop the build-service bridge: its read task
-  -- would otherwise keep this process from exiting.
-  try inline <| (lake).run args finally RemoteExec.shutdown
+/-- Runs the Lake command `args`. With `oneShot`, the process exits when it returns (`LakeOptions.oneShot`). -/
+public def cli (args : List String) (oneShot := false) : BaseIO ExitCode :=
+  inline <| (lake).run args oneShot
