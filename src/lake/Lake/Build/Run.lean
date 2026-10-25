@@ -417,7 +417,8 @@ def finalizeBuild
   reportResult cfg mctx.out result
   let remoteStatus ← bctx.remoteReadStatus.get
   if remoteStatus.failures > 0 then
-    writeRemoteReadStatus ws.lakeCache remoteStatus
+    if let .error e ← (writeRemoteReadStatus ws.lakeCache remoteStatus).toBaseIO then
+      mctx.logger.logEntry (.trace s!"could not write remote cache read status: {e}")
   if let some outputsFile := cfg.outputsFile? then
     bctx.saveOutputs (logger := mctx.logger) mctx.out outputsFile
   match result.out with
