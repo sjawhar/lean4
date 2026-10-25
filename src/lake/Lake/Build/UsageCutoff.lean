@@ -284,37 +284,27 @@ def readOwnUsage (path : FilePath) (expected? : Option ModuleUsage.Digest := non
 
 /--
 The hashes of the files one usage-cutoff check (`Module.usageUpToDate`, `Module.writeUsekey`) has
-read, so that it reads each file once, and every `importUsage?` binding of the check is to the same bytes. A check
-never reuses another's: another workspace's build can rebuild a shared dependency between two checks. Across checks,
-a file's hash is reused only while its stamp shows its bytes unchanged (`BuildContext.fileDigests`).
+read, so that every `importUsage?` binding of the check is to one hash of each file, also in the check's parallel
+tasks (`parallelRuns`), which share it. A check never reuses another's: another workspace's build can
+rebuild a shared dependency between two checks. Across checks, a file's hash is reused only while its stamp shows its
+bytes unchanged (`BuildContext.fileDigests`).
 -/
-public abbrev ContentHashes := IO.Ref (Std.HashMap FilePath ModuleUsage.Digest)
-
-/--
-Adds the hashes that parallel tasks of a check computed (`forks`, `parallelRuns`) to the check's `hashes`, or returns
-`false` if a file has two hashes: its bytes changed while the check read it.
--/
-def joinHashes (hashes : ContentHashes) (forks : Array (Std.HashMap FilePath ModuleUsage.Digest)) : BaseIO Bool :=
-  hashes.modifyGet fun all => Id.run do
-    let mut all := all
-    for fork in forks do
-      for (p, d) in fork do
-        if all[p]?.any (· != d) then return (false, all)
-        all := all.insert p d
-    return (true, all)
+public abbrev ContentHashes := Std.Mutex (Std.HashMap FilePath ModuleUsage.Digest)
 
 /--
 The hash of `file`'s current bytes (`Lean.ModuleUsage.fileDigest`, 128 bits), never read from a
 `.hash` file: an `.olean` rewritten behind Lake's back (e.g., by `lean -o`) keeps its old `.hash`,
-and a usage-cutoff decision must see the new bytes. Read at most once per check (`hashes`), and taken from an
-earlier check of the build only if the file's stamp (`Lean.ModuleUsage.fileStamp`) is the one recorded when those
-bytes were read (`BuildContext.fileDigests`).
+and a usage-cutoff decision must see the new bytes. One hash per check (`hashes`): the first one a task of the check
+records. Taken from an earlier check of the build only if the file's stamp (`Lean.ModuleUsage.fileStamp`) is the one
+recorded when those bytes were read (`BuildContext.fileDigests`).
 -/
 def contentHash (hashes : ContentHashes) (file : FilePath) : JobM ModuleUsage.Digest := do
-  if let some hash := (← hashes.get)[file]? then return hash
+  if let some hash ← hashes.atomically (return (← get)[file]?) then return hash
   let hash ← stampedDigest
-  hashes.modify (·.insert file hash)
-  return hash
+  -- another task of the check may have hashed the file meanwhile: the first hash binds it
+  hashes.atomically <| modifyGet fun all => match all[file]? with
+    | some first => (first, all)
+    | none => (hash, all.insert file hash)
 where
   stampedDigest : JobM ModuleUsage.Digest := do
     let memo := (← getBuildContext).fileDigests.get (Hashable.hash file)
@@ -343,30 +333,24 @@ def minRunsPerTask : Nat := 64
 
 /--
 Runs `f` on each element of `xs` on its own (`LoggedRun`), so that the caller replays the runs it needs, in order
-(`replayRun`). Many elements run in parallel tasks, each over a slice of `xs` with its own `ContentHashes`, which are
-added to `hashes` when the tasks end (`joinHashes`). Returns the runs, and `false` if two runs hashed a file
-differently. A task never reads `hashes`, so the check's map stays its own and is updated in place.
+(`replayRun`). Many elements run in parallel tasks, each over a slice of `xs`.
 -/
-def parallelRuns (hashes : ContentHashes) (xs : Array α) (f : ContentHashes → α → JobM β) :
-    JobM (Array (LoggedRun β) × Bool) := JobM.ofFn fun fetch pkg? stack store ctx s => do
-  let run (hashes : ContentHashes) (x : α) : BaseIO (LoggedRun β) := do
-    return match ← (f hashes x).toFn fetch pkg? stack store ctx {} with
+def parallelRuns (xs : Array α) (f : α → JobM β) :
+    JobM (Array (LoggedRun β)) := JobM.ofFn fun fetch pkg? stack store ctx s => do
+  let run (x : α) : BaseIO (LoggedRun β) := do
+    return match ← (f x).toFn fetch pkg? stack store ctx {} with
       | .ok b s' => (s'.log.entries, .ok b)
       | .error e s' => (s'.log.entries, .error e.val)
   let tasks := 2 * max 1 (System.Platform.Internal.getHardwareConcurrency ()).toNat
   let size := max minRunsPerTask ((xs.size + tasks - 1) / tasks)
   if xs.size ≤ size then
-    return .ok (← xs.mapM (run hashes), true) s
+    return .ok (← xs.mapM run) s
   let chunks ← (Array.range ((xs.size + size - 1) / size)).mapM fun i => BaseIO.asTask do
-    let own ← IO.mkRef {}
-    return (← (xs.extract (i * size) ((i + 1) * size)).mapM (run own), ← own.get)
+    (xs.extract (i * size) ((i + 1) * size)).mapM run
   let mut runs := Array.mkEmpty xs.size
-  let mut forks := Array.mkEmpty chunks.size
   for chunk in chunks do
-    let (rs, fork) ← IO.wait chunk
-    runs := runs ++ rs
-    forks := forks.push fork
-  return .ok (runs, ← joinHashes hashes forks) s
+    runs := runs ++ (← IO.wait chunk)
+  return .ok runs s
 
 /--
 A hash of every artifact of every module-system module in an import closure, with its name.
@@ -414,17 +398,14 @@ with `ContentHashes`.
 abbrev ImportReads := IO.Ref (Std.HashMap Name (LoggedRun (Option (FilePath × UsageImport))))
 
 /--
-Reads (`readImportUsage?`) each module of `mods` that `reads` lacks into `reads`, many in parallel (`parallelRuns`). If
-a file changed while they ran, records each read that succeeded as unbound (`none`), so the check fails; the reads'
-logs and errors are kept.
+Reads (`readImportUsage?`) each module of `mods` that `reads` lacks into `reads`, many in parallel (`parallelRuns`).
 -/
 def readImports (hashes : ContentHashes) (reads : ImportReads) (importArts : NameMap ImportArtifacts)
     (mods : Array Name) : JobM Unit := do
   let known ← reads.get
   let mods := mods.filter (!known.contains ·)
   if mods.isEmpty then return
-  let (runs, consistent) ← parallelRuns hashes mods (readImportUsage? · importArts ·)
-  let runs := if consistent then runs else runs.map fun (log, r) => (log, r.map fun _ => none)
+  let runs ← parallelRuns mods (readImportUsage? hashes importArts)
   reads.modify fun reads => Id.run do
     let mut reads := reads
     for m in mods, r in runs do
@@ -555,20 +536,22 @@ every new duplicate has a declarer this checks.
 Names are compared by `Name.hash`, so a hash collision only rebuilds. The `.olean` reads assume the data layout of
 the Lean that Lake was built with, so with another Lean, or if a read fails, the check fails. A `module` file's kernel
 constants are kept per build and module state, a toolchain module's per build (`BuildContext.kernelProviders`), so a
-later check does not read them again. The workspace modules are checked in parallel (`parallelRuns`).
+later check does not read them again. The workspace modules are read in parallel (`parallelRuns`), and their reads'
+logs and errors are replayed in closure order before any duplicate decides the check, as a serial check meets them.
 -/
 def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetup) (hashes : ContentHashes)
     (reads : ImportReads) (importArts : NameMap ImportArtifacts) (changed : Array (Name × UsageImport)) :
     JobM Bool := do
   unless (← getLeanInstall).githash == Lean.githash do return false
   -- each kernel constant a changed module declares whose other copies the compile did not depend on, as its hash,
-  -- with the changed modules that declare it
+  -- with the changed modules that declare it, and whether the compiled module declares one of them itself
   let mut claims : Std.HashMap UInt64 (Array Name) := {}
+  let mut clashes := false
   for (m, imp) in changed do
     let declared := (usage.used.binSearch (m, #[]) (Name.quickLt ·.1 ·.1)).elim #[] (·.2)
     for n in imp.provides.1 do
       if (declared.binSearch (n, default) (Name.quickLt ·.1 ·.1)).isSome then continue
-      if usage.provides.1.binSearchContains n Name.quickLt then return false
+      if usage.provides.1.binSearchContains n Name.quickLt then clashes := true
       claims := claims.alter n.hash fun ms? => some ((ms?.getD #[]).push m)
   -- whether module `k` declaring the constant with hash `h` duplicates a claimed constant
   let clash (k : Name) (h : UInt64) : Bool := claims[h]?.any (·.any (· != k))
@@ -577,11 +560,13 @@ def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetu
   readImports hashes reads importArts (keyedModules importArts)
   let known ← reads.get
   let snap ← getBuildStoreSnapshot
-  -- a workspace module of the closure: `none` if it duplicates a claimed constant or its constants cannot be read,
-  -- else the toolchain modules it imports
-  let check (hashes : ContentHashes) (x : Name × ImportArtifacts) : JobM (Option (Array Name)) := do
+  -- a workspace module of the closure: the toolchain modules it imports, and whether its kernel constants duplicate a
+  -- claimed one or, for a `module` file, the digest of its state and its `.olean` parts, whose constants are read next;
+  -- `none` if they cannot be read
+  let scan (x : Name × ImportArtifacts) :
+      JobM (Option (Array Name × (Bool ⊕ (Name × ModuleUsage.Digest × Array FilePath)))) := do
     let (m, arts) := x
-    let some mod ← findModule? m | return some #[]
+    let some mod ← findModule? m | return some (#[], .inl false)
     let imports := (← (← fetchFrom snap mod.input).await).imports.foldl outside #[]
     if arts.oleanServer?.isSome then
       if arts.oleanPrivate?.isNone then return none
@@ -589,27 +574,33 @@ def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetu
       let mut e : ModuleUsage.Enc := {}
       for p in parts do
         e := e.digest (← contentHash hashes p)
-      let d := e.finish
-      let hs ← match ← kp.atomically (return (← get).modsys.find? (m, d)) with
-        | some hs => pure hs
-        | none =>
-          let some (hs, _) ← readKernelProvides (readModuleDataParts parts) | return none
-          kp.atomically (modify fun s => { s with modsys := s.modsys.insert (m, d) hs })
-          pure hs
-      if hs.any (clash m) then return none
-    else
-      let some (_, imp) ← replayRun (known[m]?.getD (#[], .ok none)) | return none
-      if imp.provides.1.any (clash m ·.hash) then return none
-    return some imports
+      return some (imports, .inr (m, e.finish, parts))
+    let some (_, imp) ← replayRun (known[m]?.getD (#[], .ok none)) | return none
+    return some (imports, .inl (imp.provides.1.any (clash m ·.hash)))
+  -- whether a `module` file's kernel constants duplicate a claimed one, or `none` if they cannot be read
+  let modsysClash (x : Name × ModuleUsage.Digest × Array FilePath) : JobM (Option Bool) := do
+    let (m, d, parts) := x
+    let hs ← match ← kp.atomically (return (← get).modsys.find? (m, d)) with
+      | some hs => pure hs
+      | none =>
+        let some (hs, _) ← readKernelProvides (readModuleDataParts parts) | return none
+        kp.atomically (modify fun s => { s with modsys := s.modsys.insert (m, d) hs })
+        pure hs
+    return some (hs.any (clash m))
   let mut closure := #[]
   for x in importArts do
     closure := closure.push x
-  let (runs, consistent) ← parallelRuns hashes closure check
   let mut toolchain := presetup.directImports.foldl outside #[]
-  for r in runs do
-    let some imports ← replayRun r | return false
+  let mut modsys := #[]
+  for r in ← parallelRuns closure scan do
+    let some (imports, kernel) ← replayRun r | return false
     toolchain := toolchain ++ imports
-  unless consistent do return false
+    match kernel with
+    | .inl c => clashes := clashes || c
+    | .inr x => modsys := modsys.push x
+  for r in ← parallelRuns modsys modsysClash do
+    let some c ← replayRun r | return false
+    clashes := clashes || c
   let searchPath := (← getLeanPath) ++ [← getLeanLibDir]
   let mut seen : NameSet := {}
   while h : 0 < toolchain.size do
@@ -626,9 +617,9 @@ def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetu
         kp.atomically (modify fun s => { s with toolchain := s.toolchain.insert m read? })
         pure read?
     let some (hs, imports) := read? | return false
-    if hs.any (clash m) then return false
+    clashes := clashes || hs.any (clash m)
     toolchain := toolchain ++ imports
-  return true
+  return !clashes
 
 /--
 The module's `.resolved` sidecar at `file` (Lean writes it next to its `.usage`, `Lean.ModuleUsage.encodeResolved`), if
@@ -714,7 +705,7 @@ public def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     (oleanDigest? : Option ModuleUsage.Digest := none) : JobM Unit := do
   let some (usage, usageDigest) ← readOwnUsage mod.usageFile | return
   unless usage.coversClosure importArts do return
-  let hashes ← IO.mkRef {}
+  let hashes ← Std.Mutex.new {}
   let reads ← IO.mkRef {}
   let modsys ← modsysHash hashes importArts
   unless modsys == modsysBefore do return
@@ -756,7 +747,7 @@ public def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
   let some (usage, _) ← readOwnUsage mod.usageFile (expected? := key.usage) | return false
   if usage.noskip || key.localHash != presetup.localTrace.hash || !usage.coversClosure importArts then
     return false
-  let hashes ← IO.mkRef {}
+  let hashes ← Std.Mutex.new {}
   let reads ← IO.mkRef {}
   unless (← contentHash hashes mod.oleanFile) == key.olean do return false
   unless (← modsysHash hashes importArts) == key.modsys do return false
