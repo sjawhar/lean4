@@ -85,10 +85,10 @@ public structure LakeOptions where
   /-- Whether `lake cache push` waits for a push that is running (via `--wait`). -/
   wait : Bool := false
   /--
-  The process ID of the build that `lake cache push` follows (via `--follow`): the push keeps
-  reading the queue while that build runs (see `pushRemoteCache`).
+  The follow file of the build that `lake cache push` follows (via `--follow`): the push keeps
+  reading the queue while that build holds the file's lock (see `pushRemoteCache`).
   -/
-  follow? : Option Nat := none
+  follow? : Option System.FilePath := none
   shake : Shake.Args := {}
   comparatorConfig? : Option FilePath := none
   /-- File received via `lake check --from-export` -/
@@ -332,10 +332,8 @@ def lakeLongOption : (opt : String) → CliM PUnit
 | "--mappings-only" => modifyThe LakeOptions ({· with mappingsOnly := true})
 | "--wait"        => modifyThe LakeOptions ({· with wait := true})
 | "--follow" => do
-  let pid ← takeOptArg "--follow" "process ID"
-  let some pid := pid.toNat?
-    | error s!"invalid process ID for --follow: {pid}"
-  modifyThe LakeOptions ({· with follow? := some pid})
+  let file ← takeOptArg "--follow" "follow file"
+  modifyThe LakeOptions ({· with follow? := some file})
 | "--package" => do
   let pkgName ← takeOptArg "--package" "package name"
   modifyThe LakeOptions ({· with package? := some pkgName})

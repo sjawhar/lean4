@@ -99,12 +99,13 @@ each run appends a line `lake cache push: started, pid <pid>, …` and then its 
   cache.dir / "push.log"
 
 /--
-The file that a build which started a detached `lake cache push` keeps locked while it runs, so
-that the push (`lake cache push --follow <pid>`) knows when the build has ended: the lock goes with
-the build's process, however it ends.
+The directory of the files that builds which started a detached `lake cache push` keep locked
+while they build, so that the push (`lake cache push --follow <file>`) knows when the build has
+ended. Each build names its file with its process ID and 64 random bits (see `startBuildPush`), so
+that builds with one process ID (in containers that share the cache) never share a file.
 -/
-@[inline] public def pushFollowLockFile (cache : Cache) (pid : Nat) : FilePath :=
-  cache.dir / "push-follow" / s!"{pid}.lock"
+@[inline] public def pushFollowDir (cache : Cache) : FilePath :=
+  cache.dir / "push-follow"
 
 /-- The outcome of the last `lake cache push`. -/
 @[inline] public def pushStatusFile (cache : Cache) : FilePath :=

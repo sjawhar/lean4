@@ -194,12 +194,45 @@ def findPushService (ctx : PushContext) (name : String) : Except String CacheSer
   let service ← ctx.lakeCfg.findRemoteCacheService? name
   return if let some key := ctx.env.cacheKey? then service.withKey key else service
 
+/-- The bytes of `file`, if they hash to `hash`. -/
+def bytesIfHash (file : FilePath) (hash : Hash) : BaseIO (Option ByteArray) := do
+  match (← (IO.FS.readBinFile file).toBaseIO) with
+  | .ok bytes => return if Hash.ofByteArray bytes == hash then some bytes else none
+  | .error _ => return none
+
+/--
+Moves the cache artifact of `descr`, whose bytes did not hash to its name, into the cache's
+quarantine directory, unless another process (e.g., a build that inserts the same entry) has
+replaced it with the right bytes meanwhile: then returns those bytes and keeps the file. The
+bytes are checked again right before the move, and the moved file right after it, which it puts
+back if it has the right bytes, so a replacement between the check and the move is never lost.
+-/
+def quarantineUnlessReplaced
+  (cache : Cache) (target : String) (descr : ArtifactDescr)
+: LoggerIO (Option ByteArray) := do
+  let path := cache.artifactDir / descr.relPath
+  if let some bytes ← bytesIfHash path descr.hash then
+    return some bytes
+  let moved ← match (← (cache.quarantine path descr.relPath.toString).toBaseIO) with
+    | .ok (some dest) =>
+      if let some bytes ← bytesIfHash dest descr.hash then
+        -- Replaced between the check and the move: the right file goes back
+        discard <| (IO.FS.hardLink dest path).toBaseIO
+        discard <| (removeFileIfExists dest).toBaseIO
+        return some bytes
+      pure s!"moved it to: {dest}"
+    | .ok none => pure "it was already moved away by another process"
+    | .error e => pure s!"could not move it into quarantine: {e}"
+  logWarning s!"{target}: dropped from the queue: cache artifact {path} changed after the \
+    build (it no longer has the hash in its name); {moved}"
+  return none
+
 /--
 Reads the cache artifact of each descriptor, if its bytes still hash to the descriptor.
 If they do not, records the entry as dropped with reason `mismatch` and moves each such artifact
-into the cache's quarantine directory, so that no local build restores it again.
-If an artifact is gone (e.g., deleted from the cache to save space), records the entry as dropped
-with reason `missing`.
+into the cache's quarantine directory (see `quarantineUnlessReplaced`), so that no local build
+restores it again. If an artifact is gone (e.g., deleted from the cache to save space), records
+the entry as dropped with reason `missing`.
 -/
 def verifyArtifacts
   (cache : Cache) (target : String) (json : Json) (descrs : Array ArtifactDescr)
@@ -212,6 +245,8 @@ def verifyArtifacts
     | .ok bytes =>
       if Hash.ofByteArray bytes == descr.hash then
         contents := contents.push bytes
+      else if let some bytes ← quarantineUnlessReplaced cache target descr then
+        contents := contents.push bytes
       else
         mismatched := mismatched.push descr
     | .error (.noFileOrDirectory ..) =>
@@ -219,11 +254,6 @@ def verifyArtifacts
     | .error e =>
       error s!"{target}: could not read cache artifact {descr}: {e}"
   if !mismatched.isEmpty then
-    for descr in mismatched do
-      let path := cache.artifactDir / descr.relPath
-      let moved ← describeQuarantine cache path descr.relPath.toString
-      logWarning s!"{target}: dropped from the queue: cache artifact {path} changed after the \
-        build (it no longer has the hash in its name); {moved}"
     recordDrop cache "mismatch" json mismatched
     return none
   if !missing.isEmpty then
@@ -484,8 +514,9 @@ def writePushStatus (cache : Cache) (stats : PushStats) (queued : Nat) : IO Unit
     |>.insert "queued" queued : Json).pretty
 
 /--
-Whether the build that holds the lock file `file` (see `Cache.pushFollowLockFile`) still runs: it
-holds the lock for as long as its process lives. A missing file is a build that has ended.
+Whether the build that holds the lock on its follow file `file` (see `startBuildPush`) still
+runs: it holds the lock until its build ends, or its process does. A missing file is a build that
+has ended.
 -/
 def followedBuildRuns (file : FilePath) : IO Bool := do
   let h ← match (← IO.FS.Handle.mk file .read |>.toBaseIO) with
@@ -501,21 +532,28 @@ def followedBuildRuns (file : FilePath) : IO Bool := do
 def followPollMs : UInt32 := 1000
 
 /--
+How long a push that follows a build waits before it tries again the lines whose upload failed
+(e.g., on a transient error of the remote cache), in milliseconds: 30 seconds.
+-/
+def followRetryMs : Nat := 30000
+
+/--
 Runs passes of the push until a pass finds no queue line that this push has not tried, then
 releases `pushLock` (see the module docs). `done` counts the lines that the last pass pushed or
 dropped, which this pass removes from the queue. `failed` holds the lines whose upload failed:
-they stay in the queue, and this push does not try them again. Returns the number of lines left
-in the queue.
+they stay in the queue. Returns the number of lines left in the queue.
 
-With `follow?` (the lock file of a build; see `Cache.pushFollowLockFile`), a pass that finds
-nothing to push waits `followPollMs` and looks again while that build runs, so the build's one
-push uploads every output the build queues. Whether the build runs is read before the queue, so
-the pass that sees it ended also sees every line it queued.
+With `follow?` (the follow file of a build; see `startBuildPush`), a pass that finds nothing to
+push waits `followPollMs` and looks again while that build runs, so the build's one push uploads
+every output the build queues. While it follows, it tries the failed lines again once
+`followRetryMs` have passed since the last failure (`retryAt`, a monotonic time); the passes after
+the build has ended do not. Whether the build runs is read before the queue, so the pass that sees
+it ended also sees every line it queued.
 -/
 partial def pushLoop
   (ctx : PushContext) (pushLock queueLock : IO.FS.Handle)
   (stats : PushStats) (failed : Std.HashSet String) (done : Std.HashMap String Nat)
-  (follow? : Option FilePath := none)
+  (follow? : Option FilePath := none) (retryAt : Nat := 0)
 : LoggerIO Nat := do
   let cache := ctx.cache
   let following ← match follow? with
@@ -531,8 +569,13 @@ partial def pushLoop
   if todo.isEmpty then
     if following then
       queueLock.unlock
+      if !failed.isEmpty && (← IO.monoMsNow) ≥ retryAt then
+        -- Tries them again: they no longer count as failed unless they fail again
+        logInfo s!"trying {failed.size} failed queue entries again"
+        let stats := {stats with failed := stats.failed - failed.size}
+        return ← pushLoop ctx pushLock queueLock stats {} {} follow? retryAt
       IO.sleep followPollMs
-      return ← pushLoop ctx pushLock queueLock stats failed {} follow?
+      return ← pushLoop ctx pushLock queueLock stats failed {} follow? retryAt
     if let .error e ← (writePushStatus cache stats lines.size).toBaseIO then
       logWarning s!"could not write {cache.pushStatusFile}: {e}"
     -- Released while the queue is locked: a line appended after this is the next push's
@@ -545,6 +588,7 @@ partial def pushLoop
   logInfo s!"pushing {todo.size} queue entries to the remote cache"
   let mut stats := stats
   let mut failed := failed
+  let mut retryAt := retryAt
   let mut done : Std.HashMap String Nat := {}
   let mut start := 0
   while start < todo.size do
@@ -561,8 +605,9 @@ partial def pushLoop
       | .failed =>
         stats := {stats with failed := stats.failed + 1}
         failed := failed.insert line
+        retryAt := (← IO.monoMsNow) + followRetryMs
     start := start + max 1 outcomes.size
-  pushLoop ctx pushLock queueLock stats failed done follow?
+  pushLoop ctx pushLock queueLock stats failed done follow? retryAt
 
 /--
 Uploads the write-back queue of `cache` to the shared remote cache (see the module docs).
@@ -571,13 +616,13 @@ Returns the number of entries left in the queue, which only failed uploads leave
 If another `lake cache push` holds the push lock, returns `0` at once and changes nothing, since
 that push uploads the queue. With `wait`, waits for that push to end instead, then pushes.
 
-With `follow?`, the process ID of a build that started this push (see `startBuildPush`), the push
+With `follow?`, the follow file of a build that started this push (see `startBuildPush`), the push
 keeps looking for new queue lines while that build runs, and ends after the build has ended and
 the queue holds nothing this push has not tried.
 -/
 public def pushRemoteCache
   (env : Env) (lakeCfg : LoadedLakeConfig) (cache : Cache) (wait : Bool)
-  (follow? : Option Nat := none)
+  (follow? : Option FilePath := none)
 : LoggerIO Nat := do
   IO.FS.createDirAll cache.dir
   let pushLock ← IO.FS.Handle.mk cache.pushLockFile .append
@@ -599,7 +644,6 @@ public def pushRemoteCache
   let workers ← pushWorkers
   logVerbose s!"staging with {workers} workers"
   let queueLock ← IO.FS.Handle.mk cache.pushQueueLockFile .append
-  let follow? := follow?.map cache.pushFollowLockFile
   pushLoop {cache, env, lakeCfg, stagingDir, workers} pushLock queueLock {} {} {} follow?
 
 end Lake
