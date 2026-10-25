@@ -1333,7 +1333,7 @@ def Module.buildLean
   let outputPaths := mod.mkArtifacts presetup.srcFile presetup.isModule
   mod.clearOutputArtifacts
   mod.clearOutputHashes
-  let modsysBefore? ← if usage then some <$> modsysHash (← IO.mkRef {}) setup.importArts else pure none
+  let modsysBefore? ← if usage then some <$> modsysHash (← Std.Mutex.new {}) setup.importArts else pure none
   compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile outputPaths args
     (← getLeanPath) (← getLean)
   mod.checkSourceUnchanged presetup
