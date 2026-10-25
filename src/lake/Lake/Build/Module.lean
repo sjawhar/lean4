@@ -761,7 +761,11 @@ def Module.recFetchSetup (mod : Module) : FetchM (Job ModuleSetup) := ensureJob 
 public def Module.setupFacetConfig : ModuleFacetConfig setupFacet :=
   mkFacetJobConfig (buildable := false) recFetchSetup
 
-/-- Remove all existing artifacts produced by a Lean build of the module. -/
+/--
+Remove all existing artifacts produced by a Lean build of the module. Lake owns the usage-cutoff sidecar paths
+(`.usage`, `.resolved`, `.usekey`) and removes them also with the cutoff off, so that a rebuild never leaves an earlier
+build's sidecars beside its outputs, or saves them to the cache with them (`cacheUsageSidecars`).
+-/
 public def Module.clearOutputArtifacts (mod : Module) : IO PUnit := do
   try
     removeFileIfExists mod.ltarFile
@@ -789,7 +793,8 @@ public def Module.clearIROutputArtifacts (mod : Module) : IO PUnit := do
   catch e =>
     error s!"failed to remove IR output artifacts: {e}"
 
-/-- Remove any cached file hashes of the module build outputs (in `.hash` files). -/
+/-- Remove any cached file hashes of the module build outputs (in `.hash` files), the usage-cutoff sidecars' also with
+the cutoff off (`clearOutputArtifacts`). -/
 public def Module.clearOutputHashes (mod : Module) : IO PUnit := do
   try
     clearFileHash mod.ltarFile
