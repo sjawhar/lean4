@@ -602,7 +602,11 @@ def uploadS3
       return (← curlResponseCode out.stderr, out)
   let (code, out) ← put token?
   let (code, out) ← match code, token? with
-    | 401, some token => do put (← CacheToken.renew token)
+    | 401, some token => do
+      let token? ← CacheToken.renew token
+      let (code, out) ← put token?
+      if code == 401 then if let some token := token? then CacheToken.refused token
+      pure (code, out)
     | _, _ => pure (code, out)
   if code == 200 || (token?.isSome && code == 201) then
     return true
@@ -819,6 +823,8 @@ structure TransferState where
   numSuccesses : Nat := 0
   /-- The transfers refused with HTTP 401, to retry with a new token. -/
   unauthorized : Array TransferInfo := #[]
+  /-- Whether a transfer was refused with HTTP 401 and reported as a failure. -/
+  refused : Bool := false
 
 /--
 Monitors the transfers of a `curl` run. With `withToken`, an upload that finds its object already
@@ -863,7 +869,7 @@ partial def monitorTransfer
               modify fun s => {s with unauthorized := s.unauthorized.push info}
             else
               handleFailure info (.ok 401) out line
-              modify ({· with didError := true})
+              modify ({· with didError := true, refused := true})
           | code? =>
             handleFailure info code? out line
             modify ({· with didError := true})
@@ -1034,8 +1040,9 @@ def transferArtifacts
   let mut s ← runTransfer cfg token? (retryUnauthorized := token?.isSome)
   if let some token := token? then
     unless s.unauthorized.isEmpty do
-      let retry ← runTransfer {cfg with infos := s.unauthorized}
-        (← CacheToken.renew token) (retryUnauthorized := false)
+      let token? ← CacheToken.renew token
+      let retry ← runTransfer {cfg with infos := s.unauthorized} token? (retryUnauthorized := false)
+      if retry.refused then if let some token := token? then CacheToken.refused token
       s := {
         didError := s.didError || retry.didError
         numSuccesses := s.numSuccesses + retry.numSuccesses
