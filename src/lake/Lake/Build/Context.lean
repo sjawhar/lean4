@@ -67,6 +67,12 @@ public structure BuildConfig extends LogConfig where
   or across all builds with the environment variable `MACOSX_DEPLOYMENT_TARGET`.
   -/
   macosxDeploymentTarget? : Option String := none
+  /--
+  Whether to leave the build context (`BuildContext`, with the usage-cutoff caches) allocated after the build
+  (`Runtime.forget`) instead of freeing it. Freeing the caches of a large workspace takes seconds on one thread, so a
+  command that exits right after its build sets this (`lake build`). A process that runs more builds must not.
+  -/
+  forgetContext : Bool := false
 
 /--
 Whether the build should show progress information.
