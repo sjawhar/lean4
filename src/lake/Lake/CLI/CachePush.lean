@@ -8,6 +8,7 @@ module
 prelude
 public import Lake.Config.Env
 public import Lake.Config.LakeConfig
+import Lake.Config.PushQueue
 import Lake.Build.Common
 import Lake.Build.Module
 import Lake.Util.IO
@@ -28,13 +29,17 @@ whose artifact is gone. `Cache.pushDroppedFile` records each drop with its reaso
 
 A module's outputs go up as one archive (`.ltar`), which the pusher packs from the bytes it
 verified and a trace that it writes from the entry alone: it never reads a file of a workspace.
-The pusher names each artifact by its SHA-256 and uploads it, and then the entry's remote mapping
-(see `RemoteCacheMapping`), each only if the object is absent. Pushed and dropped entries leave the
-queue. An entry whose upload failed stays in the queue for the next push.
+The pusher copies the bytes it uploads into `Cache.pushStagingDir`, in the cache directory. It
+names each artifact by its SHA-256 and uploads it, and then the entry's remote mapping (see
+`RemoteCacheMapping`) once all of the entry's artifacts are present, each only if the object is
+absent. Pushed and dropped entries leave the queue. An entry whose upload failed stays in the
+queue for the next push.
 
-One pusher at a time holds `Cache.pushLockFile`. It repeats until the queue holds no entry that it
-has not tried, so it pushes an entry that a build appends while it runs. It releases the lock while
-it still holds the queue's lock, so that no append can fall between its last look at the queue and
+One pusher at a time holds `Cache.pushLockFile`. It works in passes: each pass reads the queue,
+pushes the entries that it has not tried, and removes the pushed and dropped ones with one rewrite
+of the queue at the start of the next pass. It stops when a pass finds no entry that it has not
+tried, so it pushes an entry that a build appends while it runs. It releases the lock while it
+still holds the queue's lock, so that no append can fall between its last look at the queue and
 the release. At the end, it records its outcome in `Cache.pushStatusFile`.
 -/
 
@@ -54,8 +59,14 @@ inductive PushOutcome
 | failed
 | dropped
 
-/-- How many queue entries the pusher stages, and then uploads with two `curl` runs, at a time. -/
+/-- At most how many queue entries the pusher stages, and then uploads with two `curl` runs. -/
 def pushChunkSize : Nat := 64
+
+/--
+The staged bytes after which the pusher stages no more entries before it uploads them, so that
+staging takes at most about this much space in the cache directory (plus one entry).
+-/
+def pushChunkBytes : Nat := 256 * 1024 * 1024
 
 /-- The MIME type of a remote mapping. -/
 def remoteMappingContentType : String := "application/json"
@@ -69,11 +80,15 @@ structure PushContext where
 structure ReadyEntry where
   /-- The index of the entry in its chunk. -/
   idx : Nat
-  service : String
+  /-- The name of the service, as the entry names it. -/
+  serviceName : String
+  service : CacheService
   /-- The artifacts of the entry. -/
   artifacts : Array RemoteUpload
   /-- The remote mapping of the entry, which goes up after all of its artifacts. -/
   mapping : RemoteUpload
+  /-- The number of bytes of the entry's staged artifacts. -/
+  bytes : Nat
 
 /-- The result of preparing a queue entry for upload. -/
 inductive StagedEntry
@@ -111,11 +126,11 @@ def writeQueue (cache : Cache) (lines : Array String) : IO Unit :=
   writeFileAtomic cache.pushQueueFile <| lines.foldl (init := "") fun s line => s ++ line ++ "\n"
 
 /--
-Reads the queue's lines; the caller holds the queue's lock. A line that is not UTF-8 text, which
-only an append that died partway can leave, is dropped at once. Returns the lines and the number
-of lines dropped.
+Reads the queue's non-empty lines; the caller holds the queue's lock. A line that is not UTF-8
+text, which only an append that died partway can leave, is recorded as dropped and left out.
+Returns the lines and the number of lines left out.
 -/
-def takeQueueLines (cache : Cache) : IO (Array String × Nat) := do
+def readQueueLines (cache : Cache) : IO (Array String × Nat) := do
   let bytes ← match (← IO.FS.readBinFile cache.pushQueueFile |>.toBaseIO) with
     | .ok bytes => pure bytes
     | .error (.noFileOrDirectory ..) => return (#[], 0)
@@ -130,8 +145,6 @@ def takeQueueLines (cache : Cache) : IO (Array String × Nat) := do
     | none =>
       recordDrop cache "invalid" (toJson s!"a line of {line.size} bytes that is not UTF-8")
       invalid := invalid + 1
-  if invalid > 0 then
-    writeQueue cache lines
   return (lines, invalid)
 
 /--
@@ -182,10 +195,7 @@ def verifyArtifacts
   if !mismatched.isEmpty then
     for descr in mismatched do
       let path := cache.artifactDir / descr.relPath
-      let moved ← match (← (cache.quarantine path descr.relPath.toString).toBaseIO) with
-        | .ok (some dest) => pure s!"moved it to {dest}"
-        | .ok none => pure "it was already moved away by another process"
-        | .error e => pure s!"could not move it into quarantine: {e}"
+      let moved ← describeQuarantine cache path descr.relPath.toString
       logWarning s!"{target}: dropped from the queue: cache artifact {path} changed after the \
         build (it no longer has the hash in its name); {moved}"
     recordDrop cache "mismatch" json mismatched
@@ -200,7 +210,7 @@ def verifyArtifacts
 /-- Writes the remote mapping of `entry` into `dir`, and makes the entry ready for upload. -/
 def stageMapping
   (dir : FilePath) (idx : Nat) (entry : RemotePushEntry) (service : CacheService)
-  (data : Json) (sha256 : JsonObject) (artifacts : Array RemoteUpload)
+  (data : Json) (sha256 : JsonObject) (artifacts : Array RemoteUpload) (bytes : Nat)
 : IO StagedEntry := do
   let mapping : RemoteCacheMapping := {
     inputHash := entry.inputHash, target := entry.target, srcHash? := entry.srcHash?
@@ -209,7 +219,10 @@ def stageMapping
   let path := dir / "mapping.json"
   IO.FS.writeFile path mapping.toJson.compress
   let url := service.remoteMappingUrl entry.remoteScope entry.inputHash
-  return .ready {idx, service := entry.service, artifacts, mapping := {path, url, hash := entry.inputHash}}
+  return .ready {
+    idx, serviceName := entry.service, service, artifacts, bytes
+    mapping := {path, url, hash := entry.inputHash}
+  }
 
 /--
 Stages the outputs of a target other than a module: a copy of each artifact's verified bytes.
@@ -232,6 +245,7 @@ def stageOutputs
       path, url := service.remoteArtifactUrl entry.remoteScope digest, hash := descr.hash
     }
   stageMapping dir idx entry service entry.data sha256 artifacts
+    (contents.foldl (· + ·.size) 0)
 
 /--
 Stages the outputs of a module as one archive, as `Module.packLtar` packs it, from the verified
@@ -256,9 +270,7 @@ def stageModule
   (BuildMetadata.ofFetch entry.inputHash (toJson descrs) entry.log).writeFile
     (libDir / fileName "trace")
   let ltar := dir / "outputs.ltar"
-  let args ← match descrs.ltarPackArgs fileName libDir irDir ltar with
-    | .ok args => pure args
-    | .error e => error s!"{entry.target}: {e}"
+  let args := ltarPackArgs files fileName libDir irDir ltar
   proc (quiet := true) {cmd := ctx.env.lean.leantar.toString, args}
   let bytes ← IO.FS.readBinFile ltar
   let descr := artifactWithExt (Hash.ofByteArray bytes) "ltar"
@@ -266,6 +278,7 @@ def stageModule
   let artifact := {path := ltar, url := service.remoteArtifactUrl entry.remoteScope digest, hash := descr.hash}
   stageMapping dir idx entry service (toJson descr)
     (JsonObject.empty.insert descr.relPath.toString digest) #[artifact]
+    (contents.foldl (· + ·.size) bytes.size)
 
 /--
 The file name stem of a module's outputs (the last component of its name), if `target` names a
@@ -321,43 +334,57 @@ def stageLine (ctx : PushContext) (dir : FilePath) (idx : Nat) (line : String) :
       return ← invalid s!"{entry.target}: an output has an unsupported extension"
     stageOutputs ctx dir idx entry json service descrs
 
+/-- The uploads of `uploads`, each URL once (entries can share an artifact, or an input). -/
+def uniqueUploads (uploads : Array RemoteUpload) : Array RemoteUpload :=
+  (uploads.foldl (init := (#[], ({} : Std.HashSet String))) fun (kept, urls) u =>
+    if urls.contains u.url then (kept, urls) else (kept.push u, urls.insert u.url)).1
+
 /--
-Pushes the queue lines `lines`: stages each, uploads the artifacts of the staged entries, and then
-the mapping of each entry whose artifacts are all present. Returns the outcome of each line.
+Pushes a prefix of the queue lines `lines`, staged in `Cache.pushStagingDir`: it stages lines
+until it has staged `pushChunkBytes`, uploads the artifacts of the staged entries, and then the
+mapping of each entry whose artifacts are all present. Returns the outcome of each line that it
+handled, at least one.
 -/
-def pushChunk (ctx : PushContext) (lines : Array String) : LoggerIO (Array PushOutcome) :=
-  IO.FS.withTempDir fun dir => do
-    let mut outcomes := Array.replicate lines.size PushOutcome.failed
+def pushChunk (ctx : PushContext) (lines : Array String) : LoggerIO (Array PushOutcome) := do
+  let dir := ctx.cache.pushStagingDir
+  removeDirAllIfExists dir
+  IO.FS.createDirAll dir
+  try
+    let mut outcomes : Array PushOutcome := #[]
     let mut ready : Array ReadyEntry := #[]
-    let mut idx := 0
+    let mut staged := 0
     for line in lines do
+      if staged ≥ pushChunkBytes then
+        break
+      let idx := outcomes.size
       match (← try stageLine ctx (dir / toString idx) idx line catch _ => pure .failed) with
-      | .ready entry => ready := ready.push entry
-      | .dropped => outcomes := outcomes.set! idx .dropped
-      | .failed => pure ()
-      idx := idx + 1
-    let names := ready.foldl (init := #[]) fun names e =>
-      if names.contains e.service then names else names.push e.service
-    for name in names do
-      let .ok service := findPushService ctx name
-        | continue
-      let group := ready.filter (·.service == name)
-      -- Each artifact once, although entries can share one
-      let (artifacts, _) := group.foldl (init := (#[], ({} : Std.HashSet String)))
-        fun (uploads, urls) e => e.artifacts.foldl (init := (uploads, urls)) fun (uploads, urls) u =>
-          if urls.contains u.url then (uploads, urls) else (uploads.push u, urls.insert u.url)
+      | .ready entry =>
+        ready := ready.push entry
+        staged := staged + entry.bytes
+        outcomes := outcomes.push .failed -- until its mapping is uploaded
+      | .dropped => outcomes := outcomes.push .dropped
+      | .failed => outcomes := outcomes.push .failed
+    let services := ready.foldl (init := #[]) fun services e =>
+      if services.any (·.1 == e.serviceName) then services else services.push (e.serviceName, e.service)
+    for (name, service) in services do
+      let group := ready.filter (·.serviceName == name)
       -- Artifacts go up before mappings, so a reader that finds a mapping finds its artifacts
+      let artifacts := uniqueUploads (group.flatMap (·.artifacts))
       let uploaded : Std.HashSet String ← (({} : Std.HashSet String).insertMany ·) <$>
         try service.putRemoteObjects artifacts CacheService.artifactContentType "artifact"
         catch _ => pure #[]
+      -- An entry with an artifact that did not go up sends no mapping, and stays queued
       let complete := group.filter (·.artifacts.all (uploaded.contains ·.url))
+      let mappings := uniqueUploads (complete.map (·.mapping))
       let mapped : Std.HashSet String ← (({} : Std.HashSet String).insertMany ·) <$>
-        try service.putRemoteObjects (complete.map (·.mapping)) remoteMappingContentType "mapping"
+        try service.putRemoteObjects mappings remoteMappingContentType "mapping"
         catch _ => pure #[]
       for e in complete do
         if mapped.contains e.mapping.url then
           outcomes := outcomes.set! e.idx .pushed
     return outcomes
+  finally
+    discard <| (removeDirAllIfExists dir).toBaseIO
 
 /-- Records the outcome of a push in `Cache.pushStatusFile`. -/
 def writePushStatus (cache : Cache) (stats : PushStats) (queued : Nat) : IO Unit := do
@@ -370,17 +397,22 @@ def writePushStatus (cache : Cache) (stats : PushStats) (queued : Nat) : IO Unit
     |>.insert "queued" queued : Json).pretty
 
 /--
-Pushes the queue until it holds no line that this push has not tried, then releases `pushLock`
-(see the module docs). `failed` holds the lines whose upload failed: they stay in the queue, and
-this push does not try them again. Returns the number of lines left in the queue.
+Runs passes of the push until a pass finds no queue line that this push has not tried, then
+releases `pushLock` (see the module docs). `done` counts the lines that the last pass pushed or
+dropped, which this pass removes from the queue. `failed` holds the lines whose upload failed:
+they stay in the queue, and this push does not try them again. Returns the number of lines left
+in the queue.
 -/
 partial def pushLoop
   (ctx : PushContext) (pushLock queueLock : IO.FS.Handle)
-  (stats : PushStats) (failed : Std.HashSet String)
+  (stats : PushStats) (failed : Std.HashSet String) (done : Std.HashMap String Nat)
 : LoggerIO Nat := do
   let cache := ctx.cache
   queueLock.lock
-  let (lines, invalid) ← takeQueueLines cache
+  let (lines, invalid) ← try readQueueLines cache catch e => queueLock.unlock; throw e
+  let lines := removeDone lines done
+  if invalid > 0 || !done.isEmpty then
+    try writeQueue cache lines catch e => queueLock.unlock; throw e
   let stats := {stats with dropped := stats.dropped + invalid}
   let todo := lines.filter (!failed.contains ·)
   if todo.isEmpty then
@@ -394,12 +426,11 @@ partial def pushLoop
   logInfo s!"pushing {todo.size} queue entries to the remote cache"
   let mut stats := stats
   let mut failed := failed
+  let mut done : Std.HashMap String Nat := {}
   let mut start := 0
   while start < todo.size do
     let chunk := todo.extract start (start + pushChunkSize)
-    start := start + pushChunkSize
     let outcomes ← try pushChunk ctx chunk catch _ => pure (Array.replicate chunk.size .failed)
-    let mut done : Std.HashMap String Nat := {}
     for line in chunk, outcome in outcomes do
       match outcome with
       | .pushed =>
@@ -411,15 +442,8 @@ partial def pushLoop
       | .failed =>
         stats := {stats with failed := stats.failed + 1}
         failed := failed.insert line
-    unless done.isEmpty do
-      queueLock.lock
-      try
-        let (lines, invalid) ← takeQueueLines cache
-        stats := {stats with dropped := stats.dropped + invalid}
-        writeQueue cache (removeDone lines done)
-      finally
-        queueLock.unlock
-  pushLoop ctx pushLock queueLock stats failed
+    start := start + max 1 outcomes.size
+  pushLoop ctx pushLock queueLock stats failed done
 
 /--
 Uploads the write-back queue of `cache` to the shared remote cache (see the module docs).
@@ -439,6 +463,6 @@ public def pushRemoteCache
     logInfo s!"another `lake cache push` uploads the queue (it holds {cache.pushLockFile})"
     return 0
   let queueLock ← IO.FS.Handle.mk cache.pushQueueLockFile .append
-  pushLoop {cache, env, lakeCfg} pushLock queueLock {} {}
+  pushLoop {cache, env, lakeCfg} pushLock queueLock {} {} {}
 
 end Lake
