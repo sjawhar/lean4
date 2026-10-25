@@ -538,6 +538,44 @@ public def cacheArtifact
   (file : FilePath) (ext := "art") (text exe useLocalFile := false)
 : m Artifact := do (← getLakeCache).saveArtifact file ext text exe useLocalFile
 
+/--
+The directory where Lake moves cache entries and build outputs that were found not to match
+their recorded hashes. Their bytes are kept there for diagnosis; Lake never reads them back.
+-/
+@[inline] public def Cache.quarantineDir (cache : Cache) : FilePath :=
+  cache.dir / "quarantine"
+
+partial def quarantineAs (dir file : FilePath) (name : String) (n : Nat) : IO (Option FilePath) := do
+  let dest := dir / s!"{name}.{n}"
+  match (← (IO.FS.hardLink file dest).toBaseIO) with
+  | .ok _ =>
+    removeFileIfExists file
+    return some dest
+  | .error (.alreadyExists ..) => quarantineAs dir file name (n + 1)
+  | .error (.noFileOrDirectory ..) => return none
+  | .error _ =>
+    -- e.g., `file` is on another file system: keep a copy of its bytes, then remove it
+    let bytes ← match (← (IO.FS.readBinFile file).toBaseIO) with
+      | .ok bytes => pure bytes
+      | .error (.noFileOrDirectory ..) => return none
+      | .error e => throw e
+    let h ← try IO.FS.Handle.mk dest .writeNew catch
+      | .alreadyExists .. => return ← quarantineAs dir file name (n + 1)
+      | e => throw e
+    h.write bytes
+    h.flush
+    removeFileIfExists file
+    return some dest
+
+/--
+Moves `file` into the cache's quarantine directory as `<name>.<n>`, with the least `n` not yet
+taken, so an earlier quarantined file is never replaced. Returns the new path, or `none` if
+`file` no longer exists (e.g., another process quarantined it first).
+-/
+public def Cache.quarantine (cache : Cache) (file : FilePath) (name : String) : IO (Option FilePath) := do
+  IO.FS.createDirAll cache.quarantineDir
+  quarantineAs cache.quarantineDir file name 0
+
 /-- **For internal use only.** -/
 public class ResolveOutputs (α : Type) where
   /-- **For internal use only.** -/
@@ -602,6 +640,35 @@ def readRemoteOutputs?
     -- Cache failures remain verbose so --wfail and --iofail builds still compile locally.
     logVerbose s!"remote cache read for input `{inputHash}` failed:\n{msg}"
     return none
+
+/--
+**For internal use only.**
+Appends outputs that this Lake process just compiled to the write-back queue of the shared remote
+cache (`Cache.appendPushQueue`), which `lake cache push` uploads, if the queue is on (see
+`Env.remoteCacheQueueService?`). Call it only where this process ran the compiler or linker that
+produced `data`: never for outputs that were replayed, unpacked, fetched or restored.
+
+Nothing is queued while usage cutoff is on (`LAKE_USAGE_CUTOFF` is true): a build with usage
+cutoff can keep outputs that were compiled for another input, and only fresh compiles with usage
+cutoff off are published.
+-/
+public def queueRemotePush
+  (pkg : Package) (inputHash : Hash) (target : String) (srcHash? : Option Hash)
+  (data : Json) (log : Log)
+: JobM Unit := do
+  let ws ← getWorkspace
+  let some service := ws.lakeEnv.remoteCacheQueueService?
+    | return
+  if ((← IO.getEnv "LAKE_USAGE_CUTOFF").bind envToBool?).getD false then
+    return
+  let entry := {
+    service, inputHash, target, srcHash?, data
+    remoteScope := remoteCacheScope ws.lakeEnv.leanGithash pkg.cacheScope
+    -- As in the local mapping, verbose entries (which name the tree's paths) are not kept
+    log := log.filter (·.level ≥ .info)
+  }
+  if let .error e ← (ws.lakeCache.appendPushQueue entry).toBaseIO then
+    logWarning s!"could not queue the outputs of `{target}` for the remote cache: {e}"
 
 open ResolveOutputs in
 /--
@@ -836,13 +903,17 @@ public def buildArtifactUnlessUpToDate
           return art
         else
           let status ← savedTrace.replayIfUpToDate' file depTrace
-          unless status.isUpToDate do
+          -- Whether this call ran `build` (the job's action merges all actions of the job)
+          let built := !status.isUpToDate
+          if built then
             discard <| doBuild depTrace traceFile
           if status.isCacheable then
             let art ← cacheArtifact file ext text exe restore
             -- The trace holds the log of the action that produced `file`: its replay or its build
             let log := (← readTraceFile traceFile).log
             (← getLakeCache).writeOutputs pkg.cacheScope inputHash art.descr (log := log)
+            if built then
+              queueRemotePush pkg inputHash (← currentRemoteCacheTarget) none (toJson art.descr) log
             return art
           else
             computeArtifact file ext text
