@@ -89,6 +89,26 @@ def data(args):
     print(entries[0]["data"])
 
 
+def artifacts(args):
+    """Prints each cache artifact that the queue's only entry for a target names."""
+    entries = [e for e in queue_entries(args.queue) if e["target"] == args.target]
+    if len(entries) != 1:
+        sys.exit(f"expected one queue entry for {args.target}, found {len(entries)}")
+
+    def names(value):
+        if isinstance(value, str):
+            yield value
+        elif isinstance(value, list):
+            for v in value:
+                yield from names(v)
+        elif isinstance(value, dict):
+            for v in value.values():
+                yield from names(v)
+
+    for name in names(entries[0]["data"]):
+        print(name)
+
+
 def inputs(args):
     """Prints the input hash of each queue entry for a target."""
     for e in queue_entries(args.queue):
@@ -215,6 +235,10 @@ def main():
     p.add_argument("queue")
     p.add_argument("target")
     p.set_defaults(run=data)
+    p = sub.add_parser("artifacts")
+    p.add_argument("queue")
+    p.add_argument("target")
+    p.set_defaults(run=artifacts)
     p = sub.add_parser("inputs")
     p.add_argument("queue")
     p.add_argument("target")

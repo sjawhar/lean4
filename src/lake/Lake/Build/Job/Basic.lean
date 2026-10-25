@@ -82,8 +82,8 @@ public structure JobState where
   buildTime : Nat := 0
   /--
   Whether a build action of this job (see `buildAction`) completed: this process ran the compiler
-  or linker. It is merged from the jobs this job continues, so a site that reads it clears it first
-  (see `queueRemotePush`).
+  or linker. It is merged from the jobs this job continues, so read it only through `trackBuilds`,
+  which clears it first.
   -/
   built : Bool := false
   deriving Inhabited

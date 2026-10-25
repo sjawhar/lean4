@@ -18,6 +18,8 @@ import Lake.Util.JsonObject
 import Lake.Util.Proc
 import Lake.Util.Sha256
 import Init.While
+import Std.Sync.Mutex
+import Std.Internal.UV.System
 
 /-! # `lake cache push`
 
@@ -32,10 +34,12 @@ whose artifact is gone. `Cache.pushDroppedFile` records each drop with its reaso
 A module's outputs go up as one archive (`.ltar`), which the pusher packs from the bytes it
 verified and a trace that it writes from the entry alone: it never reads a file of a workspace.
 The pusher copies the bytes it uploads into a directory of its own below `Cache.pushStagingDir`,
-in the cache directory. It names each artifact by its SHA-256 and uploads it, and then the
-entry's remote mapping (see `RemoteCacheMapping`) once all of the entry's artifacts are present,
-each only if the object is absent. Pushed and dropped entries leave the queue. An entry whose
-upload failed stays in the queue for the next push.
+in the cache directory. It stages (and packs) the entries of a chunk with several workers at once
+(`pushWorkers`); a failure while one entry is staged fails only that entry. It names each
+artifact by its SHA-256 and uploads it, and then the entry's remote mapping (see
+`RemoteCacheMapping`) once all of the entry's artifacts are present, each only if the object is
+absent. Pushed and dropped entries leave the queue. An entry whose upload failed stays in the
+queue for the next push.
 
 One pusher at a time holds `Cache.pushLockFile`. It works in passes: each pass reads the queue,
 pushes the entries that it has not tried, and removes the pushed and dropped ones with one rewrite
@@ -66,9 +70,18 @@ def pushChunkSize : Nat := 64
 
 /--
 The staged bytes after which the pusher stages no more entries before it uploads them, so that
-staging takes at most about this much space in the cache directory (plus one entry).
+staging takes at most about this much space in the cache directory (plus one entry per worker).
 -/
 def pushChunkBytes : Nat := 256 * 1024 * 1024
+
+/--
+How many entries the pusher stages at once: one per CPU, at most 16. Packing a module's archive
+takes one CPU (`leantar`), and staging reads and hashes the entry's artifacts.
+-/
+def pushWorkers : BaseIO Nat := do
+  match (← Std.Internal.UV.System.cpuInfo.toBaseIO) with
+  | .ok cpus => return max 1 (min 16 cpus.size)
+  | .error _ => return 1
 
 /-- The MIME type of a remote mapping. -/
 def remoteMappingContentType : String := "application/json"
@@ -79,6 +92,8 @@ structure PushContext where
   lakeCfg : LoadedLakeConfig
   /-- The staging directory of this push, below `Cache.pushStagingDir` (see `pushRemoteCache`). -/
   stagingDir : FilePath
+  /-- How many entries the push stages at once (see `pushWorkers`). -/
+  workers : Nat
 
 /-- A queue entry whose files are staged for upload. -/
 structure ReadyEntry where
@@ -100,6 +115,9 @@ inductive StagedEntry
 | dropped
 | failed
 
+/-- Serializes this process's appends to `Cache.pushDroppedFile`, which concurrent workers make. -/
+builtin_initialize dropFileLock : Std.Mutex Unit ← Std.Mutex.new ()
+
 /-- Appends a record of a queue entry that the pusher refused to `Cache.pushDroppedFile`. -/
 def recordDrop
   (cache : Cache) (reason : String) (entry : Json) (artifacts : Array ArtifactDescr := #[])
@@ -109,9 +127,10 @@ def recordDrop
     |>.insert "reason" reason
     |>.insert "artifacts" (artifacts.map (·.relPath.toString))
     |>.insert "entry" entry : Json).compress
-  let h ← IO.FS.Handle.mk cache.pushDroppedFile .append
-  h.putStr (line.push '\n')
-  h.flush
+  dropFileLock.atomically (m := IO) do
+    let h ← IO.FS.Handle.mk cache.pushDroppedFile .append
+    h.write (line.push '\n').toUTF8
+    h.flush
 
 /-- Splits `bytes` into lines, without their line feeds. -/
 def splitLines (bytes : ByteArray) : Array ByteArray := Id.run do
@@ -338,10 +357,42 @@ def uniqueUploads (uploads : Array RemoteUpload) : Array RemoteUpload :=
     if urls.contains u.url then (kept, urls) else (kept.push u, urls.insert u.url)).1
 
 /--
+Stages a prefix of the queue lines `lines` in `dir` with `ctx.workers` workers, each in its own
+thread, since staging a module runs `leantar`. A worker takes the next line in order until every
+line is taken or `pushChunkBytes` are staged, so the lines staged are a prefix of `lines` (at least
+one). A failure while a line is staged fails only that line. Returns the result of each staged
+line with the log of its staging, in order.
+-/
+def stageLines (ctx : PushContext) (dir : FilePath) (lines : Array String)
+: BaseIO (Array (StagedEntry × Log)) := do
+  -- The index of the next line to take, and the bytes staged so far
+  let progress ← IO.mkRef ((0 : Nat), (0 : Nat))
+  let results ← IO.mkRef (Array.replicate lines.size (none : Option (StagedEntry × Log)))
+  let worker : BaseIO Unit := do
+    repeat
+      let idx? ← progress.modifyGet fun (next, staged) =>
+        if next < lines.size && staged < pushChunkBytes then
+          (some next, (next + 1, staged))
+        else
+          (none, (next, staged))
+      let some idx := idx?
+        | break
+      let (r?, log) ← (stageLine ctx (dir / toString idx) idx lines[idx]!).captureLog
+      let r := r?.getD .failed
+      if let .ready entry := r then
+        progress.modify fun (next, staged) => (next, staged + entry.bytes)
+      results.modify (·.set! idx (some (r, log)))
+  let tasks ← (Array.range ctx.workers).mapM fun _ =>
+    IO.asTask (prio := .dedicated) (monadLift worker)
+  for task in tasks do
+    discard <| IO.wait task
+  return (← results.get).filterMap id
+
+/--
 Pushes a prefix of the queue lines `lines`, staged in the push's own staging directory: it stages
-lines until it has staged `pushChunkBytes`, uploads the artifacts of the staged entries, and then
-the mapping of each entry whose artifacts are all present. Returns the outcome of each line that
-it handled, at least one.
+lines until it has staged `pushChunkBytes` (see `stageLines`), uploads the artifacts of the staged
+entries, and then the mapping of each entry whose artifacts are all present. Returns the outcome
+of each line that it handled, at least one.
 -/
 def pushChunk (ctx : PushContext) (lines : Array String) : LoggerIO (Array PushOutcome) := do
   let dir := ctx.stagingDir
@@ -350,15 +401,11 @@ def pushChunk (ctx : PushContext) (lines : Array String) : LoggerIO (Array PushO
   try
     let mut outcomes : Array PushOutcome := #[]
     let mut ready : Array ReadyEntry := #[]
-    let mut staged := 0
-    for line in lines do
-      if staged ≥ pushChunkBytes then
-        break
-      let idx := outcomes.size
-      match (← try stageLine ctx (dir / toString idx) idx line catch _ => pure .failed) with
+    for (staged, log) in ← stageLines ctx dir lines do
+      log.replay
+      match staged with
       | .ready entry =>
         ready := ready.push entry
-        staged := staged + entry.bytes
         outcomes := outcomes.push .failed -- until its mapping is uploaded
       | .dropped => outcomes := outcomes.push .dropped
       | .failed => outcomes := outcomes.push .failed
@@ -470,7 +517,9 @@ public def pushRemoteCache
   let stagingDir := cache.pushStagingDir /
     s!"{← IO.Process.getPID}-{(Hash.ofByteArray (← IO.getRandomBytes 8)).hex}"
   logVerbose s!"staging uploads in {stagingDir}"
+  let workers ← pushWorkers
+  logVerbose s!"staging with {workers} workers"
   let queueLock ← IO.FS.Handle.mk cache.pushQueueLockFile .append
-  pushLoop {cache, env, lakeCfg, stagingDir} pushLock queueLock {} {} {}
+  pushLoop {cache, env, lakeCfg, stagingDir, workers} pushLock queueLock {} {} {}
 
 end Lake

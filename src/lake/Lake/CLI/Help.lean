@@ -794,10 +794,11 @@ hashes the cache artifacts again. An entry whose artifact is gone, or no longer
 matches its hash, is dropped and recorded in `push-dropped.jsonl`, and a
 changed artifact is moved to the cache's `quarantine` directory. A module's
 outputs are packed into one archive. The push copies the bytes it uploads into
-`push-staging` in the cache directory. Each artifact is uploaded under its
-SHA-256, then, once all of its artifacts are present, the entry's
-input-to-output mapping, each only if the object is not present yet. An entry
-that fails to upload stays in the queue.
+`push-staging` in the cache directory, preparing up to 16 entries at once (one
+per CPU). Each artifact is uploaded under its SHA-256, then, once all of its
+artifacts are present, the entry's input-to-output mapping, each only if the
+object is not present yet. An entry that fails to be packed or uploaded stays
+in the queue.
 
 One push runs at a time. Another one exits at once (with status 0), unless
 `--wait` is set, and the running one also uploads any entry appended while it
@@ -851,9 +852,11 @@ digits, and `-._~+/=`. Lake refuses any other output, without showing it.
 Lake runs the command (with `sh -c`) when it first sends such a request, not
 at startup. It reuses the token for up to 45 minutes, and it runs the command
 again and retries the request once if the service refuses the token (HTTP
-401). A command that has not ended after 60 seconds is stopped, with every
-process it started, and fails. If the command fails, Lake reports the same
-error for 60 seconds without running it again.
+401). The command runs in a session of its own, so a Ctrl-C that stops Lake
+does not stop it; a command that has not ended after 60 seconds is stopped,
+with every process it started, and fails. If the command fails, Lake reports
+the same error for 60 seconds without running it again (for 5 minutes if it
+was stopped after 60 seconds).
 
 The token goes only to the host of the service's artifact endpoint, as
 `Authorization: Bearer <token>`, and only through a temporary file that `curl`

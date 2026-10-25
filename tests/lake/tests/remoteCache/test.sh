@@ -268,6 +268,41 @@ case_token_cmd_time_limit() {
   test_cmd_eq 0 count '^sleep 7531$' processes
 }
 
+case_token_cmd_time_limit_cache() {
+  # After the token command was stopped at the time limit, Lake reports that failure for
+  # 5 minutes without running the command again, not only for 60 seconds, so a command that
+  # hangs every time stalls the build's requests once. Here the first lookup starts the
+  # command, which hangs (and is stopped after 60 s), and the second lookup comes after
+  # `Slow.A` compiled for 75 s: a run would print a token and send a request.
+  local pkg="$WORK_DIR/slowpkg"
+  test_cmd rm -rf "$pkg"
+  test_cmd mkdir -p "$pkg/Slow"
+  printf 'name = "slow"\n\n[[lean_lib]]\nname = "Slow"\nroots = ["Slow.A", "Slow.B"]\n' \
+    > "$pkg/lakefile.toml"
+  printf '#eval IO.sleep 75000\ndef a := 1\n' > "$pkg/Slow/A.lean"
+  printf 'import Slow.A\ndef b := a\n' > "$pkg/Slow/B.lean"
+  cat > "$WORK_DIR/hang-once.sh" << EOF
+echo run >> '$TOKEN_RUNS'
+[ "\$(grep -c run '$TOKEN_RUNS')" -gt 1 ] || sleep 7532
+echo test-token-1
+EOF
+  fresh
+  rm -f "$TOKEN_RUNS"
+  : > "$SERVER_LOG"
+  local start elapsed rc
+  start="$(date +%s)"
+  if LAKE_REMOTE_CACHE=bearer LAKE_CACHE_TOKEN_CMD="sh '$WORK_DIR/hang-once.sh'" \
+      timeout 400 "$LAKE" -v --dir "$pkg" build Slow > produced.out 2>&1; then rc=0; else rc=$?; fi
+  elapsed=$(($(date +%s) - start))
+  cat produced.out
+  echo "lake exited with code $rc after $elapsed seconds"
+  test_exp "$rc" = 0
+  match_text 'Built Slow.B' produced.out
+  test_exp "$elapsed" -ge 135
+  test_cmd_eq 1 token_runs
+  test_cmd_eq 0 count ' -> ' "$SERVER_LOG"
+}
+
 case_other_host() {
   # The token goes only to the host of the artifact endpoint of the service
   # that `LAKE_REMOTE_CACHE` names: not to a second service on another port,
@@ -432,5 +467,6 @@ case_cleartext() {
 }
 
 run_cases case_roundtrip case_no_token case_second_put case_no_leak case_rotation \
-  case_token_cmd_fails case_token_cmd_time_limit case_other_host case_no_request case_download \
+  case_token_cmd_fails case_token_cmd_time_limit case_token_cmd_time_limit_cache case_other_host \
+  case_no_request case_download \
   case_put_timeouts case_failing_cmd case_refused_token case_redirect case_cleartext

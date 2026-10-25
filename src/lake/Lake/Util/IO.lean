@@ -30,13 +30,20 @@ public def removeFileIfExists (path : FilePath) : IO Unit := do
 builtin_initialize tmpPathCount : IO.Ref Nat ← IO.mkRef 0
 
 /--
+Returns a suffix, {lit}`.<pid>.<n>.tmp`, that no concurrent call, in this process or in another,
+returns. Appended to a path, it names a temporary file next to it (see {lit}`uniqueTmpPath`).
+-/
+public def uniqueTmpSuffix : BaseIO String := do
+  let n ← tmpPathCount.modifyGet fun n => (n, n + 1)
+  return s!".{← IO.Process.getPID}.{n}.tmp"
+
+/--
 Returns a temporary path next to {lean}`path`, {lit}`<path>.<pid>.<n>.tmp`, that no concurrent
 call, in this process or in another, returns. It suits a file that is written, then renamed
 into place.
 -/
 public def uniqueTmpPath (path : FilePath) : BaseIO FilePath := do
-  let n ← tmpPathCount.modifyGet fun n => (n, n + 1)
-  return s!"{path}.{← IO.Process.getPID}.{n}.tmp"
+  return path.toString ++ (← uniqueTmpSuffix)
 
 /-- The wall-clock time, in whole seconds since the Unix epoch (e.g., for the `at` of a status file). -/
 public def wallClockSecs : IO Int := do

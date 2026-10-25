@@ -354,6 +354,18 @@ cannot clear it for this action.
       let elapsed := endTime - startTime
       modify fun s => {s with buildTime := s.buildTime + elapsed}
 
+/--
+**For internal use only.**
+Starts tracking whether this job completes a build action (`JobState.built`, which `buildAction`
+sets), and returns the action that tells whether one completed since. It clears the flag first:
+a job's state carries the flag of its earlier build actions (e.g., a target that builds two files
+in one job) and of the unregistered jobs it continues, so a reader that skipped the clear would
+count their builds. (A registered job, such as a module's, reaches the jobs that continue it
+renewed, without the flag; see `Job.renew`.) Read the flag only through this.
+-/
+public def trackBuilds : JobM (JobM Bool) := do
+  modify ({· with built := false})
+  return JobState.built <$> getThe JobState
 
 /--
 Checks whether `info` is up-to-date, and runs `build` to recreate it if not.
@@ -798,8 +810,8 @@ public def buildArtifactUnlessUpToDate
   (text := false) (ext := "art") (restore := false) (exe := false)
   (platformIndependent := false)
 : JobM Artifact := do
-  -- Cleared on entry: a job's state carries the flag of the jobs it continues (`JobState.built`)
-  modify ({· with built := false})
+  -- Whether this call completes a build action (not a job it continues)
+  let builtHere ← trackBuilds
   let depTrace ← getTrace
   let traceFile := FilePath.mk <| file.toString ++ ".trace"
   let savedTrace ← readTraceFile traceFile
@@ -832,7 +844,7 @@ public def buildArtifactUnlessUpToDate
             -- Queued before the local mapping is written: a build that finds the mapping never
             -- compiles (or queues) this input. After a crash between the two, the next build
             -- restores the outputs through the trace without queueing them, so they stay queued once.
-            if (← getThe JobState).built then
+            if (← builtHere) then
               queueRemotePush pkg inputHash (← currentRemoteCacheTarget) none (toJson art.descr) log
             (← getLakeCache).writeOutputs pkg.cacheScope inputHash art.descr (log := log)
             return art

@@ -89,6 +89,25 @@ case_push_queue() {
   test_cmd rm -rf "$PUSH_A/.lake/build"
   build_a
   test_cmd_eq $PUSH_COMPILES queued
+  # Replayed while an import compiled in the same build: after a fresh build
+  # (which leaves the outputs in the tree), `Push` lost its cache artifacts (as
+  # a cache cleaner leaves it), and a comment added to its import `Push.Basic`
+  # recompiles that import to the same outputs, so `Push` keeps its input and
+  # replays from the tree. Only `Push.Basic` is queued. (`Push`'s job gets the
+  # import's job renewed, without its build flag, so this holds without the
+  # clear in `trackBuilds` too; `case_push_custom_target` tests the clear.)
+  push_fresh
+  build_a
+  for art in $(push_check artifacts "$PUSH_QUEUE" Push); do
+    test_cmd rm "$PUSH_CACHE/artifacts/$art"
+  done
+  echo '-- a comment' >> "$PUSH_A/Push/Basic.lean"
+  on_a test_out 'Built Push.Basic' -v --dir "$PUSH_A" build $PUSH_TARGETS
+  match_pat 'Replayed Push( |$)' produced.out
+  no_match_pat 'Built Push( |$)' produced.out
+  test_cmd_eq $((PUSH_COMPILES + 1)) queued
+  test_cmd_eq 2 count '"target":"Push.Basic"' "$PUSH_QUEUE"
+  test_cmd_eq 1 count '"target":"Push"' "$PUSH_QUEUE"
   # The queue is off
   push_fresh
   LAKE_CACHE_DIR="$PUSH_CACHE" LAKE_REMOTE_CACHE=bearer LAKE_CACHE_TOKEN_CMD="$TOKEN_CMD" \
@@ -183,14 +202,31 @@ case_push_missing() {
   test_exp ! -e "$PUSH_CACHE/quarantine"
 }
 
+# Counts the files in a directory with the same bytes as a file
+count_files_equal() {
+  local n=0 f
+  for f in "$1"/*; do
+    if cmp -s "$f" "$2"; then n=$((n + 1)); fi
+  done
+  echo "$n"
+}
+
 case_push_custom_target() {
-  # A job that compiles one file and replays another queues only the one it compiled.
+  # A job that compiles one file and replays another queues only the one it
+  # compiled. `b.out`'s cache artifact is gone, so its call replays the tree's
+  # file and writes its mapping again, after `a.out`'s call compiled in the same
+  # job (whose state then says a build action completed).
   push_fresh
   LAKE_CACHE_DIR="$PUSH_CACHE" test_run --dir "$PUSH_A" build pair
+  for art in "$PUSH_CACHE"/artifacts/*.art; do
+    if cmp -s "$art" "$PUSH_A/b.in"; then test_cmd rm "$art"; fi
+  done
   echo changed > "$PUSH_A/a.in"
   on_a test_out 'Built push/pair' --dir "$PUSH_A" build pair
   test_cmd_eq 1 queued
   test_cmd cmp "$PUSH_CACHE/artifacts/$(push_check entry "$PUSH_QUEUE" data)" "$PUSH_A/a.in"
+  # `b.out` was cached again, from the tree
+  test_cmd_eq 1 count_files_equal "$PUSH_CACHE/artifacts" "$PUSH_A/b.in"
 }
 
 case_push_githash() {
@@ -370,6 +406,51 @@ case_push_stall() {
   test_cmd push_check status "$PUSH_STATUS" 0 2 0 2
 }
 
+case_push_pack_failure() {
+  # The entries of a chunk are staged and packed at once, and a pack that fails
+  # fails only its own entry: the others are uploaded, and the failed one stays
+  # queued (with no mapping) until a later push packs it. A Lean installation
+  # whose `leantar` refuses `Push.Admit`'s archive (through `LEAN_SYSROOT`)
+  # injects the failure.
+  push_fresh
+  build_a
+  local real fake
+  real="$(cd "$PUSH_A" && "$LAKE" env printenv LEAN_SYSROOT)"
+  fake="$WORK_DIR/fake-sysroot"
+  test_cmd rm -rf "$fake"
+  test_cmd mkdir -p "$fake/bin"
+  for entry in "$real"/*; do
+    [ "$(basename "$entry")" = bin ] || ln -s "$entry" "$fake/"
+  done
+  for entry in "$real"/bin/*; do
+    [ "$(basename "$entry")" = leantar ] || ln -s "$entry" "$fake/bin/"
+  done
+  cat > "$fake/bin/leantar" << EOF
+#!/bin/sh
+case " \$* " in
+  *" Admit.trace "*) echo "leantar: injected failure" >&2; exit 1 ;;
+esac
+exec "$real/bin/leantar" "\$@"
+EOF
+  chmod +x "$fake/bin/leantar"
+  BASIC_INPUT="$(push_check inputs "$PUSH_QUEUE" Push.Basic)"
+  ADMIT_INPUT="$(push_check inputs "$PUSH_QUEUE" Push.Admit)"
+  : > "$SERVER_LOG"
+  LAKE_OVERRIDE_LEAN=true LEAN_SYSROOT="$fake" on_a \
+    test_status_out 1 'injected failure' -v cache push
+  match_text 'staging with ' produced.out
+  test_cmd_eq 1 queued
+  match_text '"target":"Push.Admit"' "$PUSH_QUEUE"
+  test_cmd push_check status "$PUSH_STATUS" $((PUSH_COMPILES - 1)) 1 0 1
+  test_cmd push_check order "$SERVER_LOG" "$STORE_DIR"
+  test_exp -f "$STORE_DIR/a0/$PUSH_SCOPE/in/$BASIC_INPUT.json"
+  test_exp ! -e "$STORE_DIR/a0/$PUSH_SCOPE/in/$ADMIT_INPUT.json"
+  on_a test_run cache push
+  test_cmd_eq 0 queued
+  test_cmd push_check status "$PUSH_STATUS" 1 0 0 0
+  test_exp -f "$STORE_DIR/a0/$PUSH_SCOPE/in/$ADMIT_INPUT.json"
+}
+
 run_cases case_push_queue case_push_upload case_push_tree_changed case_push_mismatch \
   case_push_missing case_push_custom_target case_push_githash case_push_deny case_push_invalid \
-  case_push_many case_push_staging case_push_concurrent case_push_stall
+  case_push_many case_push_staging case_push_concurrent case_push_stall case_push_pack_failure
