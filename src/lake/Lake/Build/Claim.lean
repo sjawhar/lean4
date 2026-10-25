@@ -40,16 +40,20 @@ once. The claim of an input is the object `claim/<remoteScope>/<inputHash>` (see
   (`remoteClaimPollMs`), and reads through it once it is there. It takes the claim over (a rewrite
   only if the claim still has the generation it read) and compiles when the claim says `failed`,
   when it says `building` and its holder is a process of this host that no longer runs (a killed
-  build; a `queued` claim waits for its push, which outlives the build), or when the
-  remote cache last replaced the claim at least `LAKE_CLAIM_TAKEOVER_SECS` before (by the
+  build; a `queued` claim waits for its push, which outlives the build), or when the claim is
+  stale: the remote cache last replaced it at least `LAKE_CLAIM_TAKEOVER_SECS` before (by the
   `Last-Modified` and `Date` of the claim's `GET`, so the machines' clocks do not matter; the same
-  `GET` returns the claim's state). A module waits with no thread at all (`runWithClaimWaits`);
-  another target waits on its job's thread, which gives its slot in the pool to another job
-  meanwhile (`waitForClaim`).
+  `GET` returns the claim's state), or this build has seen it keep one generation for that long
+  by its own monotonic clock (`observeClaim`). No time that the holder wrote is trusted, and an
+  answer without times, or with times in the future, only leaves the second bound. A module waits
+  with no thread at all (`runWithClaimWaits`); another target waits on its job's thread, which
+  gives its slot in the pool to another job meanwhile (`waitForClaim`).
 
 Generations are only compared for equality, as Cloud Storage guarantees nothing else.
 Any failure to read or write a claim is a miss: the build compiles as it would without claims,
-and records the failure in its read status (`remote-status-read.json`).
+and records the failure in its read status (`remote-status-read.json`). That includes a claim
+that cannot be read, and a request that does not end within its limits (see
+`CacheService.requestRemoteObject`).
 -/
 
 open System Lean
@@ -294,6 +298,34 @@ public def withClaim (claim? : Option HeldClaim) (build : JobM α) : JobM α := 
 /-! ## Taking Claims -/
 
 /--
+When this process first saw each claim with the generation it last saw, by its own monotonic clock
+(milliseconds), by URL: the claims it waits for (see `observeClaim`).
+-/
+builtin_initialize claimSightings : Std.Mutex (Std.HashMap String (String × Nat)) ←
+  Std.Mutex.new {}
+
+/--
+Records that this process sees the claim at `url` with `generation`, and returns for how many
+seconds, by this process's own monotonic clock, the claim has had that generation since this
+process first saw it so. A live holder rewrites its claim (a new generation) well within the
+takeover time, so a claim that keeps a generation for the takeover time is stale, whatever the
+times that the remote cache or the holder report.
+-/
+def observeClaim (url generation : String) : BaseIO Nat := do
+  let now ← IO.monoMsNow
+  claimSightings.atomically do
+    let s ← get
+    match s[url]? with
+    | some (seen, since) =>
+      if seen == generation then
+        return (now - since) / 1000
+      set (s.insert url (generation, now))
+      return 0
+    | none =>
+      set (s.insert url (generation, now))
+      return 0
+
+/--
 What a build waits for when another build holds the claim of an input: a promise that resolves
 when it is time to look for the input's mapping again.
 -/
@@ -395,23 +427,26 @@ public def claimInput (pkg : Package) (inputHash : Hash) (sawDone := false) : Jo
       error s!"could not read the claim {url} (HTTP {r.code})"
     let some generation := r.header? "x-goog-generation"
       | error s!"the remote cache reported no generation for the claim {url}"
-    let claim? := (Json.parse r.body >>= fromJson? (α := RemoteClaim)).toOption
-    let state? := claim?.map (·.state)
-    -- By the remote cache's clock; by the holder's clock only if the answer has no times
-    let age? ← match r.age?, claim? with
-      | some age, _ => pure (some age)
-      | none, some claim => pure (some ((← wallClockSecs) - claim.writtenAt))
-      | none, none => pure none
-    let stale : Bool := (age?.map (decide <| · ≥ (takeoverSecs : Int))).getD false
-    if state? == some .done && !sawDone then
+    -- An unreadable claim is a claim failure: the build compiles without a claim
+    let claim ← match Json.parse r.body >>= fromJson? (α := RemoteClaim) with
+      | .ok claim => pure claim
+      | .error e => error s!"the claim {url} is unreadable: {e}"
+    let state := claim.state
+    if state == .done && !sawDone then
       -- The mapping should be there now: look for it again at once
       return .wait (← ClaimWait.after 0 true)
-    let gone ← match claim? with
-      | some claim => if claim.state == .building then holderGone claim.holder else pure false
-      | none => pure false
-    if state? == some .failed || state? == some .done || stale || gone then
-      logVerbose s!"taking over the claim {url} (state {state?.map toString |>.getD "unknown"}, \
-        last written {age?.map toString |>.getD "?"} s ago{if gone then ", holder gone" else ""})"
+    -- Stale by the remote cache's clock (`Date` minus `Last-Modified` of this answer), or by
+    -- this build's own clock: the claim has kept this generation since this build first saw it
+    -- for the takeover time. No time that the holder wrote is trusted, and a missing or future
+    -- time of the remote cache only leaves the second bound.
+    let serverAge? := r.age?
+    let unchangedSecs ← observeClaim url generation
+    let stale := (serverAge?.any (· ≥ (takeoverSecs : Int))) || unchangedSecs ≥ takeoverSecs
+    let gone ← if state == .building then holderGone claim.holder else pure false
+    if state == .failed || state == .done || stale || gone then
+      logVerbose s!"taking over the claim {url} (state {state}, last written \
+        {serverAge?.map toString |>.getD "?"} s ago, unchanged for {unchangedSecs} s here\
+        {if gone then ", holder gone" else ""})"
       if let some claim ← takeClaim service url holder generation takeoverSecs then
         return .compile (some claim)
     logVerbose s!"waiting for the claim {url}: {r.body.trimAscii}"

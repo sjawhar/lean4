@@ -16,6 +16,7 @@ import Lake.Build.Common
 import Lake.Build.RemoteCache
 import Lake.Build.Target
 import Init.Omega
+import Std.Sync.Mutex
 
 /-! # Module Build Definitions -/
 
@@ -1099,6 +1100,51 @@ def Module.unpackLtar (self : Module) (ltar : FilePath) (inputHash : Hash) : Job
   ]
   proc (quiet := true) (input? := input.compress) {cmd := (← getLeantar).toString, args}
 
+/--
+The cached archives that this process could not unpack, as `<cache scope>/<input hash>`: a build
+that met one compiles the module and does not restore that input's archive again (see
+`Module.rejectArchive`).
+-/
+builtin_initialize rejectedArchives : Std.Mutex (Std.HashSet String) ← Std.Mutex.new {}
+
+/-- The key of `mod`'s input `inputHash` in `rejectedArchives`. -/
+def Module.archiveKey (mod : Module) (inputHash : Hash) : String :=
+  s!"{mod.pkg.cacheScope}/{inputHash}"
+
+/-- Unpacks `ltar` (see `Module.unpackLtar`), and returns the messages of its log if it failed. -/
+def Module.tryUnpackLtar (mod : Module) (ltar : FilePath) (inputHash : Hash) :
+    JobM (Except Log Unit) := do
+  try
+    mod.unpackLtar ltar inputHash
+    return .ok ()
+  catch e =>
+    return .error (← takeLogFrom e)
+
+/--
+Handles a cached archive of `mod`'s input that did not unpack (`log` is the failure), though its
+digests matched: the build treats it as a cache miss and compiles. It removes what the unpack left
+(the outputs and the trace), moves the archive out of the cache's artifacts into its quarantine
+directory when it is there, records the failure in the read status (see `RemoteReadStatus`) at
+verbose level, and does not restore this input's archive again in this process.
+-/
+def Module.rejectArchive (mod : Module) (inputHash : Hash) (ltar : FilePath) (log : Log) :
+    JobM Unit := do
+  rejectedArchives.atomically (modify (·.insert (mod.archiveKey inputHash)))
+  discard <| mod.clearOutputArtifacts.toBaseIO
+  discard <| (removeFileIfExists mod.traceFile).toBaseIO
+  let cache ← getLakeCache
+  let moved ← if ltar.toString.startsWith (cache.artifactDir.toString ++ "/") then
+      describeQuarantine cache ltar (ltar.fileName.getD "archive.ltar")
+    else pure "it is not in the cache"
+  let why := log.entries.foldl (init := "") fun msg entry =>
+    if msg.isEmpty then entry.message else s!"{msg}\n- {entry.message}"
+  let msg := s!"{mod.name}: the cached archive {ltar} did not unpack ({moved}); \
+    compiling the module instead:\n{why}"
+  let status := (← getBuildContext).remoteReadStatus
+  liftM (m := BaseIO) <| status.modify (·.add msg)
+  -- A cache failure, not a build failure: verbose, so `--wfail` builds still compile
+  logVerbose msg
+
 def Module.recBuildLtar (self : Module) : FetchM (Job FilePath) := do
   withRegisterJob s!"{self.name}:ltar" <| withCurrPackage self.pkg do
   (← self.irArts.fetch).mapM fun arts => do
@@ -1167,6 +1213,9 @@ def Module.recBuildElabArts (mod : Module) : FetchM (Job ModuleOutputArtifacts) 
 where
   fetchFromCache? presetup savedTrace restoreAll : JobM ModuleFetchState := do
     let inputHash := (← getTrace).hash
+    -- An archive of this input that this process could not unpack is not tried again
+    if (← rejectedArchives.atomically (return (← get).contains (mod.archiveKey inputHash)) : Bool) then
+      return .incomplete savedTrace none
     let some ((ltarOrArts : ModuleOutputs), log) ←
       getArtifacts? inputHash savedTrace mod.pkg mod.name.toString (some presetup.srcHash)
       | return .incomplete savedTrace none
@@ -1174,7 +1223,11 @@ where
     | .ltar ltar =>
       updateAction .unpack
       mod.clearOutputArtifacts
-      mod.unpackLtar ltar.path inputHash
+      -- A cached archive whose digests match but which does not unpack is a cache miss: the
+      -- module compiles, and this process does not restore that archive again
+      if let .error log ← mod.tryUnpackLtar ltar.path inputHash then
+        mod.rejectArchive inputHash ltar.path log
+        return .incomplete .missing none
       -- Note: This branch implies that only the ltar output is (validly) cached.
       -- Thus, we use only the new trace unpacked from the ltar to resolve further artifacts.
       let savedTrace ← readTraceFile mod.traceFile
