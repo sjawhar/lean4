@@ -584,7 +584,7 @@ once with a new token.
 def uploadS3
   (file : FilePath) (contentType : String) (url : String) (key : String) (cacheToken := false)
 : LoggerIO Bool := do
-  let token? ← if cacheToken then CacheToken.get? else pure none
+  let token? ← if cacheToken then cacheTokenFor? url else pure none
   let put (token? : Option String) : LoggerIO (Nat × IO.Process.Output) :=
     CacheToken.withCurlArgs token? fun authArgs => do
       let auth :=
@@ -594,7 +594,7 @@ def uploadS3
           #["--aws-sigv4", "aws:amz:auto:s3", "--user", key]
       let out ← captureProc' {
         cmd := ← Internal.getCurl
-        args := #["-s", "-w", "%{stderr}%{json}\n"] ++ auth ++ #[
+        args := curlLeadArgs token? ++ #["-s", "-w", "%{stderr}%{json}\n"] ++ auth ++ #[
           "-X", "PUT", "-T", file.toString, url,
           "-H",  s!"Content-Type: {contentType}"
         ]
@@ -977,7 +977,7 @@ def runTransfer
             h.putStrLn s!"url = {info.url.quote}"
             h.putStrLn s!"-o {info.tmpPath.toString.quote}"
           h.flush
-          return #["-Z", "-X", "GET"] ++ follow ++ #[
+          return curlLeadArgs token? ++ #["-Z", "-X", "GET"] ++ follow ++ #[
             "--retry", "3" -- intermittent network errors can occur
           ] ++ downloadTimeoutArgs ++ #[
             "-s", "-w", "%{stderr}%{json}\n", "--config", path.toString
@@ -992,7 +992,7 @@ def runTransfer
               #["-H", "x-goog-if-generation-match: 0"]
             else
               #["--aws-sigv4", "aws:amz:auto:s3", "--user", cfg.key]
-          return #["-Z", "-X", "PUT"] ++ follow ++ #[
+          return curlLeadArgs token? ++ #["-Z", "-X", "PUT"] ++ follow ++ #[
             "-H", s!"Content-Type: {artifactContentType}",
             "--retry", "3" -- intermittent network errors can occur
           ] ++ auth ++ #[
@@ -1024,7 +1024,13 @@ Transfers the artifacts of `cfg` with one `curl` run. If the cache token is sent
 def transferArtifacts
   (cfg : TransferConfig)
 : LoggerIO Unit := do
-  let token? ← if cfg.cacheToken then CacheToken.get? else pure none
+  let token? ← id do
+    if cfg.cacheToken then
+      -- Refused if any transfer would send the token unencrypted (they all share one host)
+      let info? := cfg.infos.find? (!isCredentialSafe ·.url) <|> cfg.infos[0]?
+      cacheTokenFor? (info?.map (·.url) |>.getD "")
+    else
+      pure none
   let mut s ← runTransfer cfg token? (retryUnauthorized := token?.isSome)
   if let some token := token? then
     unless s.unauthorized.isEmpty do
