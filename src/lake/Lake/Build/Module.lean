@@ -1241,8 +1241,9 @@ where
           -- The trace holds the log of the action that produced the outputs: their replay,
           -- unpack or build
           let log := (← readTraceFile mod.traceFile).log
-          -- Queued before the local mapping is written: once that exists, no later build
-          -- compiles (and queues) this input again. A crash in between queues it twice.
+          -- Queued before the local mapping is written: a build that finds the mapping never
+          -- compiles (or queues) this input. After a crash between the two, the next build
+          -- restores the outputs through the trace without queueing them, so they stay queued once.
           if compiled then
             -- `lake cache push` packs the per-file outputs into the archive it uploads
             queueRemotePush mod.pkg depTrace.hash mod.name.toString (some presetup.srcHash)
