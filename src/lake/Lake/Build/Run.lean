@@ -436,6 +436,8 @@ def finalizeBuild
   if remoteStatus.failures > 0 then
     if let .error e ← (writeRemoteReadStatus bctx.workspace.lakeCache remoteStatus).toBaseIO then
       mctx.logger.logEntry (.trace s!"could not write remote cache read status: {e}")
+  -- The build's push (if it started one) ends with the build, not with this process
+  endBuildPush
   runQueuedPush bctx.workspace mctx.logger
   if let some outputsFile := cfg.outputsFile? then
     bctx.saveOutputs (logger := mctx.logger) mctx.out outputsFile
