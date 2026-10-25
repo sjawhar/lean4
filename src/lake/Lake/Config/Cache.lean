@@ -790,8 +790,6 @@ structure TransferInfo where
   path : FilePath
   /-- Additional paths for a downloaded artifact. -/
   extraPaths : Array FilePath := #[]
-  /-- The temporary file of a download, unique to its `curl` run (set by `runTransfer`). -/
-  tmpPath? : Option FilePath := none
 
 @[inline] def TransferInfo.addPath (self : TransferInfo) (path : FilePath) (extra := true) : TransferInfo :=
   if extra then
@@ -854,9 +852,10 @@ structure TransferState where
 Monitors the transfers of a `curl` run. With `cfg.createOnly` (the uploads only create their
 objects), an upload that finds its object already present (HTTP 412) succeeds. With
 `retryUnauthorized`, a transfer refused with HTTP 401 is not reported but added to `unauthorized`.
+A download of `path` goes to the temporary file `tmpOf path`.
 -/
 partial def monitorTransfer
-  (cfg : TransferConfig) (retryUnauthorized : Bool)
+  (cfg : TransferConfig) (retryUnauthorized : Bool) (tmpOf : FilePath → FilePath)
   (h hOut : IO.FS.Handle) (s : TransferState)
 : LoggerIO TransferState := do
   let line ← h.getLine
@@ -904,23 +903,21 @@ partial def monitorTransfer
       | .error e =>
         logError s!"curl produced invalid JSON: {e}; received: {line.trimAscii}"
         modify ({· with didError := true})
-    monitorTransfer cfg retryUnauthorized h hOut s
+    monitorTransfer cfg retryUnauthorized tmpOf h hOut s
 where
   getInfo? out :=
     match out.getAs Nat "urlnum" with
     | .ok i => cfg.infos[i]?
     | _ => none
   handleTransfer info code out line : StateT TransferState LoggerIO Unit := do
-    let {url, hash, path, extraPaths, tmpPath?} := info
+    let {url, hash, path, extraPaths} := info
     match cfg.kind with
     | .get =>
       let logDownload :=
         logInfo s!"{cfg.scope}: downloaded artifact {hash}\
           \n  local path: {path}\
           \n  remote URL: {url}"
-      let some tmpPath := tmpPath?
-        | logError s!"{path}: the download has no temporary file"
-          modify ({· with didError := true})
+      let tmpPath := tmpOf path
       match (← IO.FS.readBinFile tmpPath |>.toBaseIO) with
       | .ok contents =>
         logDownload
@@ -974,9 +971,8 @@ where
           if size > 0 then
             if let .ok contentType := out.getAs String "content_type" then
               if contentType != artifactContentType then
-                if let some tmpPath := info.tmpPath? then
-                  if let .ok resp ← IO.FS.readFile tmpPath |>.toBaseIO then
-                    msg := s!"{msg}\nunexpected response:\n{resp}"
+                if let .ok resp ← IO.FS.readFile (tmpOf info.path) |>.toBaseIO then
+                  msg := s!"{msg}\nunexpected response:\n{resp}"
     | .put =>
       if let .ok size := out.getAs Nat "size_download" then
         if size > 0 then
@@ -995,14 +991,11 @@ Downloads go to temporary files unique to the run, which are gone when it return
 def runTransfer
   (cfg : TransferConfig) (token? : Option String) (retryUnauthorized : Bool)
 : LoggerIO TransferState := do
-  let infos ← id do
-    if cfg.kind == .get then
-      cfg.infos.mapM fun info => do
-        return {info with tmpPath? := some (← uniqueTmpPath info.path)}
-    else
-      return cfg.infos
+  -- Each download goes to a temporary file of this run next to its path
+  let tmpSuffix ← uniqueTmpSuffix
+  let tmpOf (path : FilePath) : FilePath := path.toString ++ tmpSuffix
   -- An upload with the token always only creates its object
-  let cfg := {cfg with infos, createOnly := token?.isSome || cfg.createOnly}
+  let cfg := {cfg with createOnly := token?.isSome || cfg.createOnly}
   try
     IO.FS.withTempFile fun h path => do
       if let some token := token? then
@@ -1012,8 +1005,7 @@ def runTransfer
         | .get =>
           cfg.infos.forM fun info => do
             h.putStrLn s!"url = {info.url.quote}"
-            if let some tmpPath := info.tmpPath? then
-              h.putStrLn s!"-o {tmpPath.toString.quote}"
+            h.putStrLn s!"-o {(tmpOf info.path).toString.quote}"
           h.flush
           return curlLeadArgs token? ++ #["-Z", "-X", "GET"] ++ curlFollowArgs token? ++ #[
             "--retry", "3" -- intermittent network errors can occur
@@ -1045,7 +1037,7 @@ def runTransfer
         cmd := ← Internal.getCurl, args
         stdout := .piped, stderr := .piped
       }
-      let s ← monitorTransfer cfg retryUnauthorized child.stderr child.stdout {}
+      let s ← monitorTransfer cfg retryUnauthorized tmpOf child.stderr child.stdout {}
       let rc ← child.wait
       let stdout ← child.stdout.readToEnd
       unless stdout.isEmpty do
@@ -1056,9 +1048,9 @@ def runTransfer
       return s
   finally
     -- A download that succeeded was renamed into place; the others leave nothing behind
-    for info in cfg.infos do
-      if let some tmpPath := info.tmpPath? then
-        discard <| (removeFileIfExists tmpPath).toBaseIO
+    if cfg.kind == .get then
+      for info in cfg.infos do
+        discard <| (removeFileIfExists (tmpOf info.path)).toBaseIO
 
 /--
 Transfers the files of `cfg` with one `curl` run. If the cache token is sent and refused
