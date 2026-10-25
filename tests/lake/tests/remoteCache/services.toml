@@ -55,3 +55,10 @@ name = "cleartext"
 type = "s3"
 artifactEndpoint = "http://cache.invalid/a0"
 revisionEndpoint = "http://cache.invalid/r0"
+
+# As `ok`, but every download takes 2 seconds
+[[cache.service]]
+name = "slow"
+type = "s3"
+artifactEndpoint = "%URL%/slow/a0"
+revisionEndpoint = "%URL%/slow/r0"
