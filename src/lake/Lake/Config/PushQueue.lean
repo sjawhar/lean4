@@ -92,11 +92,19 @@ that builds compiled, which `lake cache push` uploads and removes.
   cache.dir / "push-dropped.jsonl"
 
 /--
-The output of the detached `lake cache push` runs that builds start (see `startDetachedPush`):
+The output of the detached `lake cache push` runs that builds start (see `startBuildPush`):
 each run appends a line `lake cache push: started, pid <pid>, …` and then its own output.
 -/
 @[inline] public def pushLogFile (cache : Cache) : FilePath :=
   cache.dir / "push.log"
+
+/--
+The file that a build which started a detached `lake cache push` keeps locked while it runs, so
+that the push (`lake cache push --follow <pid>`) knows when the build has ended: the lock goes with
+the build's process, however it ends.
+-/
+@[inline] public def pushFollowLockFile (cache : Cache) (pid : Nat) : FilePath :=
+  cache.dir / "push-follow" / s!"{pid}.lock"
 
 /-- The outcome of the last `lake cache push`. -/
 @[inline] public def pushStatusFile (cache : Cache) : FilePath :=

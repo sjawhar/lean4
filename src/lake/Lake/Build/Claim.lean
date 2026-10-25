@@ -15,6 +15,7 @@ import Std.Internal.UV.Timer
 import Std.Internal.UV.System
 import Std.Sync.Mutex
 import Std.Time
+import Init.Data.String.Legacy
 
 /-! # Claims in the Shared Remote Cache
 
@@ -29,14 +30,16 @@ once. The claim of an input is the object `claim/<remoteScope>/<inputHash>` (see
   with state `building` (`claimInput`).
 * The build that created it compiles the target, and rewrites the claim (only if it still has the
   generation the build last wrote) every 60 seconds until the compile ends (`registerClaim`; see
-  `remoteClaimRefreshSecs`). Then it queues the outputs with the claim's generation and starts a
-  detached `lake cache push` (`queueCompiledOutputs`, `startDetachedPush`), which marks the claim
-  `done` after the mapping is uploaded. A compile that fails, or that publishes nothing, marks the
-  claim `failed` (`withClaim`).
+  `remoteClaimRefreshSecs`). Then it queues the outputs with the claim's generation; its first
+  queued output starts the build's one detached `lake cache push`, which follows the build and
+  uploads each output as it is queued (`queueCompiledOutputs`, `startBuildPush`), and marks each
+  claim `done` after its mapping is uploaded. A compile that fails, or that publishes nothing,
+  marks the claim `failed` (`withClaim`).
 * Another build waits: it looks for the mapping of the input every 5 seconds
   (`remoteClaimPollMs`), and reads through it once it is there. It takes the claim over (a rewrite
-  only if the claim still has the generation it read) and compiles when the claim says `failed`, or
-  when the remote cache last replaced the claim at least `LAKE_CLAIM_TAKEOVER_SECS` before (by the
+  only if the claim still has the generation it read) and compiles when the claim says `failed`,
+  when its holder is a process of this host that no longer runs (a killed build), or when the
+  remote cache last replaced the claim at least `LAKE_CLAIM_TAKEOVER_SECS` before (by the
   `Last-Modified` and `Date` of the claim's `GET`, so the machines' clocks do not matter; the same
   `GET` returns the claim's state). A module waits with no thread at all (`runWithClaimWaits`);
   another target waits on its job's thread, which gives its slot in the pool to another job
@@ -106,12 +109,25 @@ def CacheService.RemoteObjectResponse.age? (r : CacheService.RemoteObjectRespons
 
 /-! ## Holding Claims -/
 
-/-- A claim that this process holds, which it rewrites while it compiles the claimed input. -/
-structure Held where
-  service : CacheService
-  holder : String
+/-- What this process knows of a claim it holds, behind the claim's own lock. -/
+structure HeldState where
   /-- The generation that the last write of this process gave the claim. -/
   generation : String
+  /-- Whether this process stopped holding the claim (its build released it, or lost it). -/
+  released : Bool := false
+  deriving Inhabited
+
+/-- A claim that this process holds, which it rewrites while it compiles the claimed input. -/
+structure Held where
+  /-- Tells this registration from a later one of the same claim. -/
+  id : Nat
+  service : CacheService
+  holder : String
+  /--
+  The generation and whether the claim is released. Each write of the claim by this process holds
+  this lock, so a release waits for a rewrite in flight, and no rewrite follows a release.
+  -/
+  state : Std.Mutex HeldState
   /-- The read status of the build that holds the claim, where a failed rewrite is recorded. -/
   status : IO.Ref RemoteReadStatus
 
@@ -119,11 +135,16 @@ structure Held where
 structure Registry where
   claims : Std.HashMap String Held := {}
   timer? : Option Std.Internal.UV.Timer := none
+  /-- Whether a round of rewrites runs (it arms the next timer when it ends). -/
+  refreshing : Bool := false
   /-- How often the claims are rewritten, in milliseconds (see `remoteClaimRefreshSecs`). -/
   periodMs : Nat := 60000
   deriving Inhabited
 
 builtin_initialize registry : Std.Mutex Registry ← Std.Mutex.new {}
+
+/-- Counts the registrations of claims in this process (see `Held.id`). -/
+builtin_initialize claimIds : IO.Ref Nat ← IO.mkRef 0
 
 /--
 Starts a timer that runs `refresh` on a dedicated thread after `periodMs`, holding no thread
@@ -140,66 +161,88 @@ def armRefresh (periodMs : Nat) (refresh : BaseIO Unit) : BaseIO (Option Std.Int
     return timer
   return (← act.toBaseIO).toOption
 
-/--
-Rewrites each claim this process holds (state `building`), only if the claim still has the
-generation of the last write, and arms the timer of the next rewrite while any claim is held.
-A claim whose rewrite finds another generation (HTTP 412) was taken over by another build: this
-process no longer holds it. The rewrite does not hold the registry's lock, so a claim that its
-build released in the meantime is left as the release left it.
--/
-partial def refreshClaims : BaseIO Unit := do
-  let claims ← registry.atomically do
-    modify ({· with timer? := none})
-    return (← get).claims.toArray
-  for (url, held) in claims do
-    let r ← tryLogIO do
-      held.service.putRemoteObjectIf url (← claimBody held.holder .building) held.generation
-    registry.atomically do
-      let s ← get
-      let some cur := s.claims[url]?
-        | return
-      match r with
-      | .ok r =>
-        if r.code == 200 then
-          if let some generation := r.header? "x-goog-generation" then
-            set {s with claims := s.claims.insert url {cur with generation}}
-        else if r.code == 412 then
-          set {s with claims := s.claims.erase url}
-        else
-          cur.status.modify (·.add s!"could not rewrite the claim {url} (HTTP {r.code})")
-      | .error msg =>
-        cur.status.modify (·.add s!"could not rewrite the claim {url}:\n{msg}")
+/-- Removes the registration `held` of the claim at `url`, if it is still the registered one. -/
+def unregister (url : String) (held : Held) : BaseIO Unit :=
   registry.atomically do
     let s ← get
-    if !s.claims.isEmpty && s.timer?.isNone then
-      set {s with timer? := ← armRefresh s.periodMs refreshClaims}
-
-/-- Starts rewriting the claim at `url` (see `refreshClaims`). -/
-def registerClaim (url : String) (held : Held) (periodMs : Nat) : BaseIO Unit :=
-  registry.atomically do
-    let s ← get
-    let s := {s with claims := s.claims.insert url held, periodMs}
-    if s.timer?.isNone then
-      set {s with timer? := ← armRefresh periodMs refreshClaims}
-    else
-      set s
-
-/--
-Stops rewriting the claim at `url`, and returns it if this process still held it. Once no claim is
-held, the timer of the next rewrite is stopped, so nothing is left to run after the compiles end.
--/
-def releaseClaim (url : String) : BaseIO (Option Held) :=
-  registry.atomically do
-    let s ← get
-    let held? := s.claims[url]?
-    let claims := s.claims.erase url
+    let claims := if s.claims[url]?.any (·.id == held.id) then s.claims.erase url else s.claims
     if claims.isEmpty then
       if let some timer := s.timer? then
         discard <| timer.stop.toBaseIO
       set {s with claims, timer? := none}
     else
       set {s with claims}
-    return held?
+
+/--
+Rewrites each claim this process holds (state `building`), only if the claim still has the
+generation of this process's last write, and arms the timer of the next round while any claim is
+held. One round runs at a time. Each rewrite holds the claim's own lock and skips a claim that its
+build released meanwhile. A claim whose rewrite finds another generation (HTTP 412) was taken over
+by another build: this process no longer holds it.
+-/
+partial def refreshClaims : BaseIO Unit := do
+  let claims ← registry.atomically do
+    modify ({· with timer? := none, refreshing := true})
+    return (← get).claims.toArray
+  for (url, held) in claims do
+    let lost ← held.state.atomically do
+      let st ← get
+      if st.released then
+        return false
+      let r ← tryLogIO do
+        held.service.putRemoteObjectIf url (← claimBody held.holder .building) st.generation
+      match r with
+      | .ok r =>
+        if r.code == 200 then
+          if let some generation := r.header? "x-goog-generation" then
+            set {st with generation}
+          return false
+        else if r.code == 412 then
+          set {st with released := true}
+          return true
+        else
+          held.status.modify (·.add s!"could not rewrite the claim {url} (HTTP {r.code})")
+          return false
+      | .error msg =>
+        held.status.modify (·.add s!"could not rewrite the claim {url}:\n{msg}")
+        return false
+    if lost then
+      unregister url held
+  registry.atomically do
+    let s ← get
+    let s := {s with refreshing := false}
+    if !s.claims.isEmpty && s.timer?.isNone then
+      set {s with timer? := ← armRefresh s.periodMs refreshClaims}
+    else
+      set s
+
+/-- Starts rewriting the claim at `url` (see `refreshClaims`). -/
+def registerClaim (url : String) (held : Held) (periodMs : Nat) : BaseIO Unit :=
+  registry.atomically do
+    let s ← get
+    let s := {s with claims := s.claims.insert url held, periodMs}
+    if !s.refreshing && s.timer?.isNone then
+      set {s with timer? := ← armRefresh periodMs refreshClaims}
+    else
+      set s
+
+/--
+Stops holding the claim at `url`, and returns it with the generation of this process's last write
+if this process still held it. It waits for a rewrite of the claim in flight, and no rewrite
+follows it, so that generation is the claim's. Once no claim is held, the timer of the next round
+is stopped, so nothing is left to run after the compiles end.
+-/
+def releaseClaim (url : String) : BaseIO (Option (Held × String)) := do
+  let some held ← registry.atomically do return (← get).claims[url]?
+    | return none
+  let generation? ← held.state.atomically do
+    let st ← get
+    if st.released then
+      return none
+    set {st with released := true}
+    return some st.generation
+  unregister url held
+  return generation?.map (held, ·)
 
 /-- A claim that this build holds on an input it compiles (see `claimInput`). -/
 public structure HeldClaim where
@@ -207,12 +250,13 @@ public structure HeldClaim where
   url : String
 
 /--
-Marks the claim at `url`, which this process held as `held`, `failed` (only if it still has the
-generation of the last write), so that a build that waits for it compiles the input at once.
+Marks the claim at `url`, which this process held as `held` with generation `generation`, `failed`
+(only if it still has that generation), so that a build that waits for it compiles the input at
+once.
 -/
-def markClaimFailed (url : String) (held : Held) : JobM Unit := do
+def markClaimFailed (url : String) (held : Held) (generation : String) : JobM Unit := do
   let r ← tryLogIO do
-    held.service.putRemoteObjectIf url (← claimBody held.holder .failed) held.generation
+    held.service.putRemoteObjectIf url (← claimBody held.holder .failed) generation
   match r with
   | .ok r =>
     unless r.code == 200 do
@@ -221,13 +265,13 @@ def markClaimFailed (url : String) (held : Held) : JobM Unit := do
     logVerbose s!"could not mark the claim {url} failed:\n{msg}"
 
 /--
-Stops rewriting the claim, and marks it `failed` if this build still held it (see
+Stops holding the claim, and marks it `failed` if this build still held it (see
 `markClaimFailed`). A claim whose outputs were queued (see `queueCompiledOutputs`) is no longer
 held, and is left for `lake cache push` to mark `done`.
 -/
 def HeldClaim.abandon (claim : HeldClaim) : JobM Unit := do
-  if let some held ← releaseClaim claim.url then
-    markClaimFailed claim.url held
+  if let some (held, generation) ← releaseClaim claim.url then
+    markClaimFailed claim.url held generation
 
 /--
 Runs `build`, the compile of an input whose claim this build holds (if `claim?`), and then marks
@@ -293,9 +337,30 @@ def takeClaim
       | some generation => pure generation
       | none => error s!"the remote cache reported no generation for the claim {url}"
   let status := (← getBuildContext).remoteReadStatus
-  registerClaim url {service, holder, generation, status}
+  let id ← claimIds.modifyGet fun n => (n, n + 1)
+  let state ← Std.Mutex.new ({generation} : HeldState)
+  registerClaim url {id, service, holder, state, status}
     (remoteClaimRefreshSecs takeoverSecs * 1000)
   return some {url}
+
+/--
+Whether `holder` (`<host>:<pid>`, see `claimHolder`) names a process of this host that no longer
+runs, so that its claim can be taken over at once: its build was killed (Lake writes no claim on a
+signal). This needs `/proc`; elsewhere no holder counts as gone, and its claim goes stale after
+the takeover time. A wrong answer (another host with this host's name, whose process has this
+process ID) costs one more compile of the input, never a wrong output.
+-/
+def holderGone (holder : String) : BaseIO Bool := do
+  let parts := holder.splitOn ":"
+  let some pid := parts.getLast? >>= (·.toNat?)
+    | return false
+  let host := ":".intercalate parts.dropLast
+  let ourHost := ((← claimHolder).splitOn ":").dropLast
+  unless host == ":".intercalate ourHost do
+    return false
+  unless ← ("/proc/self" : FilePath).pathExists do
+    return false
+  return !(← (FilePath.mk s!"/proc/{pid}").pathExists)
 
 /--
 Claims `inputHash` of `pkg` before this build compiles it (see the module docs), if this build
@@ -339,9 +404,12 @@ public def claimInput (pkg : Package) (inputHash : Hash) (sawDone := false) : Jo
     if state? == some .done && !sawDone then
       -- The mapping should be there now: look for it again at once
       return .wait (← ClaimWait.after 0 true)
-    if state? == some .failed || state? == some .done || stale then
+    let gone ← match claim? with
+      | some claim => if claim.state == .building then holderGone claim.holder else pure false
+      | none => pure false
+    if state? == some .failed || state? == some .done || stale || gone then
       logVerbose s!"taking over the claim {url} (state {state?.map toString |>.getD "unknown"}, \
-        last written {age?.map toString |>.getD "?"} s ago)"
+        last written {age?.map toString |>.getD "?"} s ago{if gone then ", holder gone" else ""})"
       if let some claim ← takeClaim service url holder generation takeoverSecs then
         return .compile (some claim)
     logVerbose s!"waiting for the claim {url}: {r.body.trimAscii}"
@@ -402,6 +470,10 @@ public def waitForClaim
     | .compile claim? => return .compile claim?
     | .wait wait =>
       discard <| IO.wait wait.promise.result?
+      -- A build canceled after a failure (`--fail-fast`) stops waiting, as a module's job does
+      if let some tk := (← getBuildContext).cancelTk? then
+        if ← tk.isSet then
+          Job.cancelJob
       if let some a ← retry then
         return .found a
       sawDone := wait.sawDone
@@ -409,17 +481,17 @@ public def waitForClaim
 
 /-! ## Publishing -/
 
-/-- Serializes the decisions of this process to start a detached `lake cache push`. -/
-builtin_initialize pushStartLock : Std.Mutex Unit ← Std.Mutex.new ()
+/--
+What this process did about its build's push: whether it started one (see `startBuildPush`),
+and the lock it holds on its `Cache.pushFollowLockFile` while it lives, which tells the push
+that the build still runs. The lock goes when the process ends, however it ends.
+-/
+structure BuildPush where
+  started : Bool := false
+  followLock? : Option IO.FS.Handle := none
+  deriving Inhabited
 
-/-- Whether a `lake cache push` holds the push lock of `cache` (see `Cache.pushLockFile`). -/
-def pushRuns (cache : Cache) : IO Bool := do
-  IO.FS.createDirAll cache.dir
-  let h ← IO.FS.Handle.mk cache.pushLockFile .append
-  if ← h.tryLock then
-    h.unlock
-    return false
-  return true
+builtin_initialize buildPush : Std.Mutex BuildPush ← Std.Mutex.new {}
 
 /-- The size above which a detached push moves `Cache.pushLogFile` to `push.log.1` first. -/
 def pushLogMaxBytes : UInt64 := 4 * 1024 * 1024
@@ -433,18 +505,20 @@ outlive the build.
 def detachedPushShell : FilePath := "/bin/bash"
 
 /--
-The script that starts a detached `lake cache push`: `bash -c <script> sh <log> <lake> cache push`.
+The script that starts a detached `lake cache push`: `bash -c <script> sh <log> <lake> cache push …`.
 It closes every descriptor above 2 that Lake inherited (for example the lock of a wrapper such as
 `lbq.sh`, which the push would otherwise hold until it ends; Lean closes none of them when it starts
-a process), sends its output to the log, writes a line that names the push, and runs it.
+a process), sends its output to the log, starts the push in the background, writes a line that
+names it, and ends. So the push is no child of Lake (which reaps the shell at once) and no zombie
+stays behind.
 -/
 def detachedPushScript : String :=
   "log=$1; shift; " ++
   "for fd in /proc/$$/fd/* /dev/fd/*; do n=${fd##*/}; case $n in " ++
   "\"\"|*[!0-9]*|0|1|2) ;; *) eval \"exec $n>&-\" ;; esac; done; " ++
   "exec >>\"$log\" 2>&1 </dev/null; " ++
-  "echo \"lake cache push: started, pid $$, by pid $PPID, at $(date -u +%Y-%m-%dT%H:%M:%SZ)\"; " ++
-  "exec \"$@\""
+  "\"$@\" & " ++
+  "echo \"lake cache push: started, pid $!, by pid $PPID, at $(date -u +%Y-%m-%dT%H:%M:%SZ)\""
 
 /-- Moves `Cache.pushLogFile` to `push.log.1` once it is larger than `pushLogMaxBytes`. -/
 def rotatePushLog (cache : Cache) : BaseIO Unit := do
@@ -459,37 +533,42 @@ def pushEnv (env : Env) (cache : Cache) : Array (String × Option String) :=
     (env.lakeConfig?.map (fun cfg => #[("LAKE_CONFIG", some cfg.toString)]) |>.getD #[])
 
 /--
-Starts a detached `lake cache push` of `cache`'s queue (see `Cache.pushQueueFile`), unless one
-runs (it holds `Cache.pushLockFile`) or there is no `detachedPushShell`, and returns its process
-ID. It runs in a session of its own, with the environment of this process and its cache, so it
-outlives the build and a Ctrl-C that stops it; this process never waits for it. Its output goes to
-`Cache.pushLogFile`.
+Starts this build's one detached push of `cache`'s queue, `lake cache push --wait --follow <pid>`
+(see `pushRemoteCache`), unless it started one already or there is no `detachedPushShell`.
+Returns whether it started it now. The push follows this build: it uploads each line as the build
+queues it, and ends once the build has ended and the queue is pushed. With `--wait`, it pushes
+after any push that runs, which also uploads this build's lines meanwhile.
 
-One push at a time: the decisions of this process are serialized, and after it starts a push it
-waits until the push holds the lock (or has ended, or 2 seconds passed), so that the next compile
-of this build sees it run.
+The push runs in a session of its own, with the environment of this process and its cache, so it
+outlives the build and a Ctrl-C that stops it. Its output goes to `Cache.pushLogFile`.
 -/
-public def startDetachedPush (env : Env) (cache : Cache) : IO (Option UInt32) :=
-  pushStartLock.atomically do
+public def startBuildPush (env : Env) (cache : Cache) : IO Bool :=
+  buildPush.atomically do
+    if (← get).started then
+      return false
     unless ← detachedPushShell.pathExists do
-      return none
-    if ← pushRuns cache then
-      return none
+      return false
+    let pid ← IO.Process.getPID
+    -- The lock tells the push that this build runs; this process holds it until it ends
+    if (← get).followLock?.isNone then
+      let lockFile := cache.pushFollowLockFile pid.toNat
+      createParentDirs lockFile
+      let lock ← IO.FS.Handle.mk lockFile .append
+      lock.lock
+      modify ({· with followLock? := some lock})
     rotatePushLog cache
-    let log := cache.pushLogFile
     let child ← IO.Process.spawn {
       cmd := detachedPushShell.toString
-      args := #["-c", detachedPushScript, "sh", log.toString, env.lake.lake.toString, "cache", "push"]
+      args := #["-c", detachedPushScript, "sh", cache.pushLogFile.toString,
+        env.lake.lake.toString, "cache", "push", "--wait", "--follow", toString pid]
       stdin := .null, stdout := .null, stderr := .null
       setsid := true
       env := pushEnv env cache
     }
-    let deadline := (← IO.monoMsNow) + 2000
-    repeat
-      if (← pushRuns cache) || (← child.tryWait).isSome || (← IO.monoMsNow) ≥ deadline then
-        break
-      IO.sleep 10
-    return some child.pid
+    -- The shell ends as soon as the push runs in the background
+    discard <| child.wait
+    modify ({· with started := true})
+    return true
 
 /--
 Runs `lake cache push` of `cache`'s queue and waits for it, appending its output to
@@ -497,16 +576,15 @@ Runs `lake cache push` of `cache`'s queue and waits for it, appending its output
 `detachedPushShell`. The push ends before the build does, so a descriptor it inherited is closed
 by then. Returns its exit code.
 -/
-public def runForegroundPush (env : Env) (cache : Cache) : IO UInt32 :=
-  pushStartLock.atomically do
-    rotatePushLog cache
-    let out ← IO.Process.output {
-      cmd := env.lake.lake.toString, args := #["cache", "push", "--wait"], env := pushEnv env cache
-    }
-    let h ← IO.FS.Handle.mk cache.pushLogFile .append
-    h.putStr s!"lake cache push: ran in the foreground of pid {← IO.Process.getPID}, \
-      exit code {out.exitCode}\n{out.stdout}{out.stderr}"
-    return out.exitCode
+public def runForegroundPush (env : Env) (cache : Cache) : IO UInt32 := do
+  rotatePushLog cache
+  let out ← IO.Process.output {
+    cmd := env.lake.lake.toString, args := #["cache", "push", "--wait"], env := pushEnv env cache
+  }
+  let h ← IO.FS.Handle.mk cache.pushLogFile .append
+  h.putStr s!"lake cache push: ran in the foreground of pid {← IO.Process.getPID}, \
+    exit code {out.exitCode}\n{out.stdout}{out.stderr}"
+  return out.exitCode
 
 /-- Whether builds can start detached pushes (see `detachedPushShell`). -/
 public def canDetachPush : BaseIO Bool :=
@@ -515,28 +593,28 @@ public def canDetachPush : BaseIO Bool :=
 /--
 Queues outputs that this build just compiled (see `queueRemotePush`), with the generation of the
 input's claim if this build held it, which it stops rewriting. When this build takes claims, it
-then starts a detached `lake cache push` (see `startDetachedPush`), which uploads the outputs and
-marks the claim `done`, so the builds that wait for the claim find the mapping. If the outputs
-could not be queued, the claim is marked `failed` instead.
+then starts its one detached `lake cache push` if it has not yet (see `startBuildPush`), which
+uploads the outputs and marks the claim `done`, so the builds that wait for the claim find the
+mapping. If the outputs could not be queued, the claim is marked `failed` instead.
 -/
 public def queueCompiledOutputs
   (claim? : Option HeldClaim) (pkg : Package) (inputHash : Hash) (target : String)
   (srcHash? : Option Hash) (data : Json) (log : Log)
 : JobM Unit := do
-  let held? ← match claim? with
+  let released? ← match claim? with
     | some claim => releaseClaim claim.url
     | none => pure none
   let queued ← queueRemotePush pkg inputHash target srcHash? data log
-    (claimGeneration? := held?.map (·.generation))
-  if let (some claim, some held) := (claim?, held?) then
+    (claimGeneration? := released?.map (·.2))
+  if let (some claim, some (held, generation)) := (claim?, released?) then
     unless queued do
-      markClaimFailed claim.url held
+      markClaimFailed claim.url held generation
   let ws ← getWorkspace
   if queued && ws.lakeEnv.remoteCacheClaimService?.isSome then
-    match (← (startDetachedPush ws.lakeEnv ws.lakeCache).toBaseIO) with
-    | .ok (some pid) =>
-      logVerbose s!"started `lake cache push` (pid {pid}), log: {ws.lakeCache.pushLogFile}"
-    | .ok none => pure ()
+    match (← (startBuildPush ws.lakeEnv ws.lakeCache).toBaseIO) with
+    | .ok true =>
+      logVerbose s!"started `lake cache push --follow`, log: {ws.lakeCache.pushLogFile}"
+    | .ok false => pure ()
     | .error e => logWarning s!"could not start `lake cache push`: {e}"
 
 end Lake
