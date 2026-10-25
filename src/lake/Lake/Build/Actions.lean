@@ -173,12 +173,10 @@ Download a file using `curl`, replacing any existing file.
 `curl` writes to a temporary file next to `file`, unique to this download, which `check`
 vets before it is renamed into place. Thus, `file` never holds a partial download, and a
 failed download (whose temporary file is removed) leaves it as it was. The download gives up
-on a stalled transfer (see `downloadTimeoutArgs`).
+on a stalled transfer (see `transferTimeoutArgs`).
 
-With `cacheToken`, the request carries the cache token (see `cacheTokenFor?`), ignores the
-user's `.curlrc` (see `curlLeadArgs`) and does not follow redirects, so that the token goes only
-to the host of `url`; a redirect is an error that names it. If the token is refused (HTTP 401),
-the request is retried once with a new token.
+With `cacheToken`, the request carries the cache token, ignores the user's `.curlrc` and does not
+follow redirects (see `withCacheTokenRequest`); a redirect is an error that names it.
 -/
 public def download
   (url : String) (file : FilePath) (headers : Array String := #[])
@@ -187,36 +185,26 @@ public def download
 : LogIO PUnit := do
   createParentDirs file
   let tmp ← uniqueTmpPath file
-  let fetch (token? : Option String) : LogIO (IO.Process.Output × Nat) :=
-    CacheToken.withCurlArgs token? fun authArgs => do
-      let args := curlLeadArgs token? ++
-        #["-s", "-S", "-f", "-o", tmp.toString, "-w", "%{http_code}"]
-      let args := args ++ downloadTimeoutArgs ++ authArgs
+  try
+    let (code, out, token) ← withCacheTokenRequest url cacheToken fun _ args => do
+      let args := args ++ #["-s", "-S", "-f", "-o", tmp.toString, "-w", "%{http_code}"]
+      let args := args ++ transferTimeoutArgs
       let args := maxFileSize?.elim args fun size => args ++ #["--max-filesize", toString size]
-      let args := if token?.isSome then args else args.push "-L"
       let args := headers.foldl (init := args) (· ++ #["-H", ·])
       let out ← rawProc {cmd := ← Internal.getCurl, args := args.push url}
-      return (out, out.stdout.trimAscii.toNat?.getD 0)
-  try
-    let token? ← if cacheToken then cacheTokenFor? url else pure none
-    let (out, code) ← fetch token?
-    let (out, code) ← match code, token? with
-      | 401, some token => do
-        let token? ← CacheToken.renew token
-        let (out, code) ← fetch token?
-        if code == 401 then if let some token := token? then CacheToken.refused token
-        pure (out, code)
-      | _, _ => pure (out, code)
+      return (out.stdout.trimAscii.toNat?.getD 0, out)
     -- The standard output is the status code that `-w` reports
     let out := {out with stdout := ""}
     if out.exitCode = 0 then
       logOutput out logVerbose
     else
       logOutput out logInfo
-      error s!"external command '{← Internal.getCurl}' exited with code {out.exitCode}"
+      -- With `-f`, `curl` fails on an HTTP error status, which its exit code does not name
+      let status := if code == 0 then "" else s!" (HTTP {code})"
+      error s!"external command '{← Internal.getCurl}' exited with code {out.exitCode}{status}"
     -- Without `-L`, `curl` succeeds on a redirect, having written the redirect's body
     if 300 ≤ code && code < 400 then
-      if token?.isSome then
+      if token then
         error s!"{url}: the server redirected the download (status {code}), and a request \
           that carries the token of `{CacheToken.cmdVar}` does not follow redirects"
       else
