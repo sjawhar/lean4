@@ -81,6 +81,14 @@ def entry(args):
     print(value if isinstance(value, str) else json.dumps(value))
 
 
+def data(args):
+    """Prints the `data` of the queue's only entry for a target."""
+    entries = [e for e in queue_entries(args.queue) if e["target"] == args.target]
+    if len(entries) != 1:
+        sys.exit(f"expected one queue entry for {args.target}, found {len(entries)}")
+    print(entries[0]["data"])
+
+
 def inputs(args):
     """Prints the input hash of each queue entry for a target."""
     for e in queue_entries(args.queue):
@@ -132,36 +140,47 @@ def wait_text(args):
 
 
 def locked(cache, update):
-    """Runs `update` on the queue's lines under the queue's lock, as Lake does."""
+    """Runs `update` on the queue's lines (bytes, each with its line feed) under the
+    queue's lock, as Lake does."""
     with open(os.path.join(cache, "push.jsonl.lock"), "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
             queue = os.path.join(cache, "push.jsonl")
-            lines = open(queue).read().splitlines(keepends=True) if os.path.exists(queue) else []
+            if os.path.exists(queue):
+                with open(queue, "rb") as f:
+                    lines = f.read().splitlines(keepends=True)
+            else:
+                lines = []
             lines = update(lines)
             if lines is not None:
-                with open(queue, "w") as f:
+                with open(queue, "wb") as f:
                     f.writelines(lines)
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def take_last(args):
-    """Moves the queue's last line into a file."""
+    """Moves the queue's last non-empty line into a file."""
 
     def update(lines):
-        with open(args.out, "w") as f:
-            f.write(lines[-1])
-        return lines[:-1]
+        i = max(i for i, line in enumerate(lines) if line.strip())
+        with open(args.out, "wb") as f:
+            f.write(lines[i])
+        return lines[:i] + lines[i + 1 :]
 
     locked(args.cache, update)
 
 
 def append(args):
-    """Appends the line in a file to the queue."""
-    with open(args.line) as f:
+    """Appends the bytes of a file to the queue, as they are."""
+    with open(args.line, "rb") as f:
         line = f.read()
     locked(args.cache, lambda lines: lines + [line])
+
+
+def repeat(args):
+    """Repeats each non-empty line of the queue `n` times."""
+    locked(args.cache, lambda lines: [line for line in lines if line.strip() for _ in range(args.n)])
 
 
 def flip(args):
@@ -192,6 +211,10 @@ def main():
     p.add_argument("queue")
     p.add_argument("field")
     p.set_defaults(run=entry)
+    p = sub.add_parser("data")
+    p.add_argument("queue")
+    p.add_argument("target")
+    p.set_defaults(run=data)
     p = sub.add_parser("inputs")
     p.add_argument("queue")
     p.add_argument("target")
@@ -218,6 +241,10 @@ def main():
     p.add_argument("cache")
     p.add_argument("line")
     p.set_defaults(run=append)
+    p = sub.add_parser("repeat")
+    p.add_argument("cache")
+    p.add_argument("n", type=int)
+    p.set_defaults(run=repeat)
     p = sub.add_parser("flip")
     p.add_argument("file")
     p.set_defaults(run=flip)
