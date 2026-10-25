@@ -82,11 +82,24 @@ public def JobQueue := IO.Ref (Array OpaqueJob)
 @[inline] public def mkJobQueue : BaseIO JobQueue :=
   IO.mkRef #[]
 
+/-- Non-404 failures observed while reading input-hash mappings in one Lake build. -/
+public structure RemoteReadStatus where
+  failures : Nat := 0
+  lastError : String := ""
+  deriving Inhabited
+
+/-- Add one read-through failure to a build's remote status. -/
+public def RemoteReadStatus.add (message : String) (status : RemoteReadStatus) : RemoteReadStatus :=
+  {failures := status.failures + 1, lastError := message}
+
+
 /-- A Lake context with a build configuration and additional build data. -/
 public structure BuildContext extends BuildConfig, Context where
   leanTrace : BuildTrace
   leanIncludeDirs : Array (Option (FilePath × BuildTrace))
   registeredJobs : JobQueue
+  /-- Read-through failures that `finalizeBuild` writes to `remote-status-read.json`. -/
+  remoteReadStatus : IO.Ref RemoteReadStatus
   /--
   Input-to-output(s) map for hashes of the tracked package's artifacts.
   If `none`, tracking outputs is disabled for this build.
@@ -112,6 +125,7 @@ public instance [Pure m] : MonadLift LakeM (BuildT m) where
 
 @[inline] public def getBuildContext [MonadBuild m] : m BuildContext :=
   readThe BuildContext
+
 
 @[inline] public def getLeanTrace [Functor m] [MonadBuild m] : m BuildTrace :=
   (·.leanTrace) <$> getBuildContext

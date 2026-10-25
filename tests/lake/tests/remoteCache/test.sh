@@ -55,11 +55,18 @@ mkdir -p Two
 echo 'def a := 1' > Two/A.lean
 echo 'def b := 2' > Two/B.lean
 printf 'import Test.Basic\ndef c := 3\n' > Two/C.lean
+cat > Native.lean << 'EOF'
+def main : IO Unit := pure ()
+EOF
 cat >> lakefile.toml << 'EOF'
 
 [[lean_lib]]
 name = "Two"
 roots = ["Two.A", "Two.B", "Two.C"]
+
+[[lean_exe]]
+name = "native"
+root = "Native"
 EOF
 
 echo "# SETUP"
@@ -116,12 +123,50 @@ NUM_REPLAY_ARTS=8
 
 # Build the package once, into the cache of the machine that uploads
 LAKE_CACHE_DIR="$BUILD_CACHE_DIR" test_run build Test -o outputs.jsonl
+LAKE_CACHE_DIR="$BUILD_CACHE_DIR" test_run build Test native -o remote-outputs.jsonl
+# A remote restore replaces its trace with a synthetic one, so the seeder keeps
+# the source traces of the fresh producer build separately.
+test_cmd cp -r .lake/build seed-build
 # Keep the `curl` wrapper out of the build directory, which the cases delete
 LAKE_CACHE_DIR="$BUILD_CACHE_DIR" test_run build curl
 LAKE_CACHE_DIR="$BUILD_CACHE_DIR" test_run build Two -o two.jsonl
 test_cmd cp "$(LAKE_CACHE_DIR="$BUILD_CACHE_DIR" "$LAKE" query curl:exe)" "$WORK_DIR/bad-curl"
 CURL_MOCK="$WORK_DIR/bad-curl"
 CURL_REAL="$(type -P curl)"
+
+# The read-through mapping lives under the toolchain, platform and package scope
+# that Lake derives for every build.
+remote_scope() {
+  cat > RemoteScope.lean << 'EOF'
+#eval System.Platform.target
+EOF
+  local platform
+  platform="$("$LAKE" env lean RemoteScope.lean)"
+  platform="${platform#\"}"
+  platform="${platform%\"}"
+  printf 'v1/%s/%s/test' "$("$LAKE" env lean --githash)" "$platform"
+}
+
+seed_remote() {
+  "$PYTHON" "$TEST_DIR/seed_remote.py" \
+    --store "$STORE_DIR/a0" \
+    --scope "$(remote_scope)" \
+    --outputs remote-outputs.jsonl \
+    --cache "$BUILD_CACHE_DIR" \
+    --build seed-build \
+    "$@"
+}
+
+remote_targets() {
+  "$PYTHON" -c 'import json, sys; print(sum(bool(line.strip()) for line in open(sys.argv[1])) - 1)' \
+    remote-outputs.jsonl
+}
+
+# The threaded mock server can write two request records together, so count the
+# path component rather than physical log lines.
+count_path() {
+  "$PYTHON" -c 'import sys; print(open(sys.argv[2]).read().count(sys.argv[1]))' "$1" "$2"
+}
 
 # Counts the lines of a file that match a basic regular expression
 count() { grep -c -- "$1" "$2" || true; }
@@ -501,9 +546,114 @@ case_cleartext() {
   test_cmd_eq 0 token_runs
 }
 
+case_read_through() {
+  # A missing local mapping reads every module and native target mapping and
+  # its SHA-256-addressed artifact. The next build is entirely local, so it
+  # neither sends a request nor starts the token command.
+  seed_remote
+  fresh
+  : > "$SERVER_LOG"
+  LAKE_REMOTE_CACHE=ok test_not_out 'Built ' -v build Test native
+  test_cmd_eq "$(remote_targets)" count_path /in/ "$SERVER_LOG"
+  test_cmd_eq "$(remote_targets)" count_path /a/ "$SERVER_LOG"
+  : > "$SERVER_LOG"
+  rm -f "$TOKEN_RUNS"
+  LAKE_REMOTE_CACHE=ok LAKE_CACHE_TOKEN_CMD="$TOKEN_CMD" test_run build Test native
+  test_cmd_eq 0 token_runs
+  test_cmd_eq 0 count ' -> ' "$SERVER_LOG"
+  # Read-through is opt-in: without it a fresh cache compiles and makes no request.
+  fresh
+  : > "$SERVER_LOG"
+  test_out 'Built Test' build Test native
+  test_cmd_eq 0 count ' -> ' "$SERVER_LOG"
+}
+
+case_read_404() {
+  # A missing remote mapping is a normal cache miss: each target compiles after
+  # exactly one mapping request, without an artifact request.
+  fresh
+  : > "$SERVER_LOG"
+  LAKE_REMOTE_CACHE=miss test_out 'Built Test' build Test native
+  test_cmd_eq "$(remote_targets)" count_path /in/ "$SERVER_LOG"
+  test_cmd_eq 0 count_path /a/ "$SERVER_LOG"
+}
+
+case_read_invalid_mapping() {
+  # A map must name this build's input, target and source hashes. Each mismatch
+  # falls back to a local compile and reports the rejected field at verbose level.
+  for field in srcHash target inputHash; do
+    seed_remote --bad "$field"
+    fresh
+    : > "$SERVER_LOG"
+    LAKE_REMOTE_CACHE=ok test_out "$field" -v build Test native
+    match_text 'Built Test' produced.out
+  done
+}
+
+case_read_bad_artifact() {
+  # The artifact's SHA-256 is checked before its Lake hash and a bad remote
+  # ltar never becomes a cache file.
+  seed_remote --bad sha256
+  BAD_ART="$("$PYTHON" -c 'import json; print(json.loads(open("remote-outputs.jsonl").readlines()[1])[1])')"
+  fresh
+  LAKE_REMOTE_CACHE=ok test_out 'SHA-256' -v build Test native
+  test_exp ! -e "$CACHE_DIR/artifacts/$BAD_ART"
+  match_text 'Built Test' produced.out
+}
+
+case_read_bad_descriptor() {
+  # Data from the bucket cannot turn an extension into a local path.
+  seed_remote --bad ext
+  fresh
+  LAKE_REMOTE_CACHE=ok test_out 'extension' -v build Test native
+  test_exp ! -e "$CACHE_DIR/x"
+  match_text 'Built Test' produced.out
+}
+
+case_read_transport() {
+  # Connection resets, permission failures and an oversized artifact all turn
+  # into cache misses and leave the build successful.
+  seed_remote
+  for service in reset deny oversize; do
+    fresh
+    : > "$SERVER_LOG"
+    LAKE_REMOTE_CACHE="$service" test_out 'Built Test' build Test native
+    test_cmd_eq "$(remote_targets)" count_path /in/ "$SERVER_LOG"
+  done
+}
+
+case_read_status() {
+  # Non-404 failures are carried to the build-level status file. An unknown
+  # service sends no request but still records the configuration error.
+  seed_remote
+  fresh
+  : > "$SERVER_LOG"
+  LAKE_REMOTE_CACHE=deny test_run build Test native
+  "$PYTHON" -c '
+import json, sys
+status = json.load(open(sys.argv[1]))
+assert status["failures"] == int(sys.argv[2]), status
+assert "403" in status["lastError"], status
+' "$CACHE_DIR/remote-status-read.json" "$(remote_targets)"
+  fresh
+  : > "$SERVER_LOG"
+  LAKE_REMOTE_CACHE=unknown test_run build Test
+  test_cmd_eq 0 count ' -> ' "$SERVER_LOG"
+  "$PYTHON" -c '
+import json, sys
+status = json.load(open(sys.argv[1]))
+assert status["failures"] > 0, status
+assert "unknown" in status["lastError"], status
+' "$CACHE_DIR/remote-status-read.json"
+}
+
+
+
 CASES="${REMOTE_CACHE_CASES:-case_roundtrip case_no_token case_second_put case_no_leak
   case_rotation case_token_cmd_fails case_other_host case_no_request case_download
-  case_failing_cmd case_refused_token case_redirect case_cleartext}"
+  case_failing_cmd case_refused_token case_redirect case_cleartext case_read_through
+  case_read_404 case_read_invalid_mapping case_read_bad_artifact case_read_bad_descriptor
+  case_read_transport case_read_status}"
 for c in $CASES; do
   echo "# ${c#case_}"
   "$c"
