@@ -1443,11 +1443,10 @@ checked (`checkUsageIndexEntry`).
 A lookup that found any candidate logs one verbose line: `usage index: restored <name> (...) at rank <r>` or
 `usage index: no match (...)`, where `(...)` counts the candidates, those whose usage record the pre-filter read (its
 compact record or its `.usage`, `readCandidateUsage?`; `parsed`) and those that reached the check (`fully checked`),
-with the wall and current-thread CPU time the
-pre-filter took apart from reading views, the views this lookup added (`UsageView`) and their wall and CPU read
-times, and the importees the checks bound (`ContentHashes.imports`) that the module's same-tree check had not, with
-their wall and CPU check times; `<r>` is the restored candidate's position among the candidates, most recent first
-(from 1), which shows how many of them a lookup needs.
+with the wall and current-thread CPU time the pre-filter took apart from reading views, the views this lookup added
+(`UsageView`) and their wall and CPU read times, and the importees the checks bound (`ContentHashes.imports`) that the
+module's same-tree check had not, with their wall and CPU check times; `<r>` is the restored candidate's position
+among the candidates, most recent first (from 1), which shows how many of them a lookup needs.
 -/
 def Module.lookupUsageIndex (mod : Module) (presetup : ModulePreSetup) (importArts : NameMap ImportArtifacts)
     (hashes : ContentHashes) (kept : Bool) (accept : String → ModuleOutputArtifacts → JobM (Option α)) :
