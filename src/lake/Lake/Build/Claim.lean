@@ -30,15 +30,17 @@ once. The claim of an input is the object `claim/<remoteScope>/<inputHash>` (see
   with state `building` (`claimInput`).
 * The build that created it compiles the target, and rewrites the claim (only if it still has the
   generation the build last wrote) every 60 seconds until the compile ends (`registerClaim`; see
-  `remoteClaimRefreshSecs`). Then it queues the outputs with the claim's generation; its first
-  queued output starts the build's one detached `lake cache push`, which follows the build and
-  uploads each output as it is queued (`queueCompiledOutputs`, `startBuildPush`), and marks each
-  claim `done` after its mapping is uploaded. A compile that fails, or that publishes nothing,
-  marks the claim `failed` (`withClaim`).
+  `remoteClaimRefreshSecs`). Then it marks the claim `queued` and queues the outputs with the
+  claim's generation; its first queued output starts the build's one detached `lake cache push`,
+  which follows the build until the build ends and uploads each output as it is queued
+  (`queueCompiledOutputs`, `startBuildPush`, `endBuildPush`), and marks each claim `done` after its
+  mapping is uploaded. A compile that fails, or that publishes nothing, marks the claim `failed`
+  (`withClaim`).
 * Another build waits: it looks for the mapping of the input every 5 seconds
   (`remoteClaimPollMs`), and reads through it once it is there. It takes the claim over (a rewrite
   only if the claim still has the generation it read) and compiles when the claim says `failed`,
-  when its holder is a process of this host that no longer runs (a killed build), or when the
+  when it says `building` and its holder is a process of this host that no longer runs (a killed
+  build; a `queued` claim waits for its push, which outlives the build), or when the
   remote cache last replaced the claim at least `LAKE_CLAIM_TAKEOVER_SECS` before (by the
   `Last-Modified` and `Date` of the claim's `GET`, so the machines' clocks do not matter; the same
   `GET` returns the claim's state). A module waits with no thread at all (`runWithClaimWaits`);
@@ -482,9 +484,10 @@ public def waitForClaim
 /-! ## Publishing -/
 
 /--
-What this process did about its build's push: whether it started one (see `startBuildPush`),
-and the lock it holds on its `Cache.pushFollowLockFile` while it lives, which tells the push
-that the build still runs. The lock goes when the process ends, however it ends.
+What this process did about the push of the build that runs: whether it started one (see
+`startBuildPush`), and the lock it holds on that push's follow file (in `Cache.pushFollowDir`)
+while the build runs, which tells the push that the build still runs. The build releases the lock
+when it ends (`endBuildPush`); the lock also goes when the process ends, however it ends.
 -/
 structure BuildPush where
   started : Bool := false
@@ -533,11 +536,15 @@ def pushEnv (env : Env) (cache : Cache) : Array (String × Option String) :=
     (env.lakeConfig?.map (fun cfg => #[("LAKE_CONFIG", some cfg.toString)]) |>.getD #[])
 
 /--
-Starts this build's one detached push of `cache`'s queue, `lake cache push --wait --follow <pid>`
+Starts this build's one detached push of `cache`'s queue, `lake cache push --wait --follow <file>`
 (see `pushRemoteCache`), unless it started one already or there is no `detachedPushShell`.
 Returns whether it started it now. The push follows this build: it uploads each line as the build
-queues it, and ends once the build has ended and the queue is pushed. With `--wait`, it pushes
-after any push that runs, which also uploads this build's lines meanwhile.
+queues it, and ends once the build has ended (see `endBuildPush`) and the queue is pushed. With
+`--wait`, it pushes after any push that runs, which also uploads this build's lines meanwhile.
+
+The follow file, in `Cache.pushFollowDir`, is named with this process's ID and 64 random bits (see
+`uniqueTmpSuffix`), so a build of another process with the same ID (in a container that shares the
+cache) never holds it.
 
 The push runs in a session of its own, with the environment of this process and its cache, so it
 outlives the build and a Ctrl-C that stops it. Its output goes to `Cache.pushLogFile`.
@@ -548,27 +555,36 @@ public def startBuildPush (env : Env) (cache : Cache) : IO Bool :=
       return false
     unless ← detachedPushShell.pathExists do
       return false
-    let pid ← IO.Process.getPID
-    -- The lock tells the push that this build runs; this process holds it until it ends
-    if (← get).followLock?.isNone then
-      let lockFile := cache.pushFollowLockFile pid.toNat
-      createParentDirs lockFile
-      let lock ← IO.FS.Handle.mk lockFile .append
-      lock.lock
-      modify ({· with followLock? := some lock})
+    let followFile := cache.pushFollowDir / s!"build{← uniqueTmpSuffix}"
+    createParentDirs followFile
+    let lock ← IO.FS.Handle.mk followFile .append
+    -- Nobody else has this name; a lock that is held anyway means no follow, so no push
+    unless ← lock.tryLock do
+      return false
+    set ({started := true, followLock? := some lock} : BuildPush)
     rotatePushLog cache
     let child ← IO.Process.spawn {
       cmd := detachedPushShell.toString
       args := #["-c", detachedPushScript, "sh", cache.pushLogFile.toString,
-        env.lake.lake.toString, "cache", "push", "--wait", "--follow", toString pid]
+        env.lake.lake.toString, "cache", "push", "--wait", "--follow", followFile.toString]
       stdin := .null, stdout := .null, stderr := .null
       setsid := true
       env := pushEnv env cache
     }
     -- The shell ends as soon as the push runs in the background
     discard <| child.wait
-    modify ({· with started := true})
     return true
+
+/--
+Ends the follow of this build's push (see `startBuildPush`), at the end of the build: the push
+then does its last pass and ends, also while this process goes on (e.g., `lake exe` runs the
+program it built). A later build of this process starts a push of its own.
+-/
+public def endBuildPush : BaseIO Unit :=
+  buildPush.atomically do
+    if let some lock := (← get).followLock? then
+      discard <| lock.unlock.toBaseIO
+    set ({} : BuildPush)
 
 /--
 Runs `lake cache push` of `cache`'s queue and waits for it, appending its output to
@@ -591,11 +607,36 @@ public def canDetachPush : BaseIO Bool :=
   detachedPushShell.pathExists
 
 /--
-Queues outputs that this build just compiled (see `queueRemotePush`), with the generation of the
-input's claim if this build held it, which it stops rewriting. When this build takes claims, it
-then starts its one detached `lake cache push` if it has not yet (see `startBuildPush`), which
-uploads the outputs and marks the claim `done`, so the builds that wait for the claim find the
-mapping. If the outputs could not be queued, the claim is marked `failed` instead.
+Marks the claim at `url`, which this process held as `held` with generation `generation`,
+`queued`: the build queued the outputs for its push, which marks the claim `done` after their
+mapping is uploaded. A claim in this state is not taken over when its holder process has ended
+(see `holderGone`), since the build ends before its push. Returns the generation for the queue
+line: the new one, `none` if another build took the claim over meanwhile (HTTP 412), and
+`generation` if the claim could not be written (it stays `building`).
+-/
+def markClaimQueued (url : String) (held : Held) (generation : String) : JobM (Option String) := do
+  let r ← tryLogIO do
+    held.service.putRemoteObjectIf url (← claimBody held.holder .queued) generation
+  match r with
+  | .ok r =>
+    if r.code == 200 then
+      return some ((r.header? "x-goog-generation").getD generation)
+    else if r.code == 412 then
+      return none
+    else
+      logVerbose s!"could not mark the claim {url} queued (HTTP {r.code})"
+      return some generation
+  | .error msg =>
+    logVerbose s!"could not mark the claim {url} queued:\n{msg}"
+    return some generation
+
+/--
+Queues outputs that this build just compiled (see `queueRemotePush`). If this build held the
+input's claim, it stops rewriting it, marks it `queued` (see `markClaimQueued`), and queues the
+outputs with the claim's generation. When this build takes claims, it then starts its one detached
+`lake cache push` if it has not yet (see `startBuildPush`), which uploads the outputs and marks
+the claim `done`, so the builds that wait for the claim find the mapping. If the outputs could not
+be queued, the claim is marked `failed` instead.
 -/
 public def queueCompiledOutputs
   (claim? : Option HeldClaim) (pkg : Package) (inputHash : Hash) (target : String)
@@ -604,9 +645,12 @@ public def queueCompiledOutputs
   let released? ← match claim? with
     | some claim => releaseClaim claim.url
     | none => pure none
+  let generation? ← match claim?, released? with
+    | some claim, some (held, generation) => markClaimQueued claim.url held generation
+    | _, _ => pure none
   let queued ← queueRemotePush pkg inputHash target srcHash? data log
-    (claimGeneration? := released?.map (·.2))
-  if let (some claim, some (held, generation)) := (claim?, released?) then
+    (claimGeneration? := generation?)
+  if let (some claim, some (held, _), some generation) := (claim?, released?, generation?) then
     unless queued do
       markClaimFailed claim.url held generation
   let ws ← getWorkspace
