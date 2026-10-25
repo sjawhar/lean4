@@ -128,7 +128,8 @@ void set_max_memory(size_t max) {
 }
 
 extern "C" LEAN_EXPORT lean_obj_res lean_internal_set_max_memory(size_t max) {
-    note_effect_here("sets the runtime's maximum memory");
+    if (uint32 ctx = effect_context())
+        note_effect(ctx, "sets the runtime's maximum memory to " + std::to_string(max));
     set_max_memory(max);
     return lean_box(0);
 }

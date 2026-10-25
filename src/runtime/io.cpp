@@ -178,7 +178,7 @@ static void note_path_use(char const * what, char const * p);
 static void note_path_create(char const * what, char const * p, bool dir);
 static void note_path_created(char const * p, bool dir);
 static void note_path_remove(char const * what, char const * p);
-static void note_handle_use(FILE * fp);
+static void note_handle_use(FILE * fp, bool writes = false);
 static void note_handle_open(FILE * fp);
 static void forget_handle(FILE * fp);
 
@@ -617,7 +617,7 @@ extern "C" LEAN_EXPORT uint8_t lean_io_prim_handle_is_tty(b_obj_arg h) {
 /* Handle.flush : (@& Handle) → IO Unit */
 extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_flush(b_obj_arg h) {
     FILE * fp = io_get_handle(h);
-    note_handle_use(fp);
+    note_handle_use(fp, true);
     if (!std::fflush(fp)) {
         return io_result_mk_ok(box(0));
     } else {
@@ -680,7 +680,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_read(b_obj_arg h, usize nbyte
 /* Handle.write : (@& Handle) → (@& ByteArray) → IO Unit */
 extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_write(b_obj_arg h, b_obj_arg buf) {
     FILE * fp = io_get_handle(h);
-    note_handle_use(fp);
+    note_handle_use(fp, true);
     usize n = lean_sarray_size(buf);
     usize m = std::fwrite(lean_sarray_cptr(buf), 1, n, fp);
     if (m == n) {
@@ -734,7 +734,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_get_line(b_obj_arg h) {
 /* Handle.putStr : (@& Handle) → (@& String) → IO Unit */
 extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_put_str(b_obj_arg h, b_obj_arg s) {
     FILE * fp = io_get_handle(h);
-    note_handle_use(fp);
+    note_handle_use(fp, true);
     usize n = lean_string_size(s) - 1; // - 1 to ignore the terminal NULL byte.
     usize m = std::fwrite(lean_string_cstr(s), 1, n, fp);
     if (m == n) {
@@ -1555,12 +1555,19 @@ Effect notes. While on (`lean_io_set_effect_recording`), the runtime notes, per 
 any command), each effect that context has on state outside it: a write to a reference another context created
 (`m_context`), the resolution or cancellation of a task or promise another context created, the use of a mutable
 native object (a SAT solver) another context created, and each use of process-wide state through the runtime's
-primitives: a file or directory it did not create, a file handle it did not open (the standard streams among them), a
-file it created and left in place, the working directory changed, a child process, the network, signals, a native
-library loaded, the process's other settings (the runtime's maximum heartbeats and memory, exit on panic, thread stack
-size, debug tags, the event loop, the process title and priority, the environment written), and host facts (the host
-name, the user and group database, the network interfaces). The import context (`import_context`) notes only the
-process-wide uses: what imported modules' initializers do inside the process follows from the imported modules.
+primitives: a file or directory it did not create, a file handle it did not open (the standard streams among them;
+writing the standard output or error is noted apart from their other uses), a file it created and left in place, the
+working directory changed, a child process, the network, signals, a native library loaded, the process's other
+settings (the runtime's maximum heartbeats and memory, exit on panic, thread stack size, debug tags, the event loop,
+the process title and priority, the environment written), and host facts (the host name, the user and group database,
+the network interfaces). A change of the working directory and a setting of the runtime's maximum heartbeats or memory,
+thread stack size or exit on panic carry the value set; a write of an environment variable carries its name and the
+value's hash (`hash_str` as `String.hash` computes it), so that no value reaches a record; a removal carries the name.
+The import context (`import_context`) notes only the process-wide uses: what imported modules' initializers do inside
+the process follows from the imported modules. A context keeps its first `max_effect_notes` distinct notes; the first
+distinct note beyond them is appended as `has more effects than were noted`, which stands for it and every later one,
+and later notes are dropped. The paths a context created and left in place are noted, sorted, when the notes are taken
+(`lean_io_take_effects`).
 
 Not effects: reads of the toolchain's own files (`in_pinned_dirs`), which the Lean githash pins, recorded as a read of
 the value `toolchain` (the pinned directories' root), and for the same reason a run of the toolchain's own SAT solver on
@@ -1619,13 +1626,13 @@ std::string describe_context(uint32 ctx) {
         : "command " + std::to_string(ctx - 1);
 }
 
-// the tasks that run code each command context created while effects are noted and that are not freed yet: queued,
-// running or waiting for another task (`lean_io_live_tasks`)
+// the tasks that run code each command context and the import context created while effects are noted and that are not
+// freed yet: queued, running or waiting for another task (`lean_io_live_tasks`)
 static mutex * g_live_tasks_mutex = nullptr;
 static std::unordered_map<uint32, int64_t> * g_live_tasks = nullptr;
 
 bool note_task_created(uint32 ctx) {
-    if (ctx == 0 || ctx == import_context || ctx == LEAN_REF_ACCOUNTED || !g_effects_on.load(std::memory_order_relaxed))
+    if (ctx == 0 || ctx == LEAN_REF_ACCOUNTED || !g_effects_on.load(std::memory_order_relaxed))
         return false;
     lock_guard<mutex> lock(*g_live_tasks_mutex);
     (*g_live_tasks)[ctx]++;
@@ -1638,8 +1645,9 @@ void note_task_freed(uint32 ctx) {
     if (it != g_live_tasks->end() && --it->second <= 0) g_live_tasks->erase(it);
 }
 
-/* liveTasks (ctx : UInt32) : BaseIO UInt32: how many tasks that run code task context `ctx` created while effects were
-   noted are not finished: while none is, code of the context cannot note an effect any more */
+/* liveTasks (ctx : UInt32) : BaseIO UInt32: how many tasks that run code task context `ctx` (a command's or the import
+   context) created while effects were noted are not finished: while none is, code of the context cannot note an effect
+   any more */
 extern "C" LEAN_EXPORT uint32 lean_io_live_tasks(uint32 ctx) {
     lock_guard<mutex> lock(*g_live_tasks_mutex);
     auto it = g_live_tasks->find(ctx);
@@ -1717,8 +1725,16 @@ void note_value_read(std::string const & key, char const * value) {
     note_value_read_core(key, value, ctx);
 }
 
+// Appended after a context's first `max_effect_notes` distinct notes in place of the next distinct one: stands for it and
+// every later one, which are dropped.
+static char const * const g_more_effects_note = "has more effects than were noted";
+
 static void note_effect_core(context_effects & e, std::string const & what) {
-    if (e.notes.size() < max_effect_notes && std::find(e.notes.begin(), e.notes.end(), what) == e.notes.end())
+    if (e.notes.size() > max_effect_notes || std::find(e.notes.begin(), e.notes.end(), what) != e.notes.end())
+        return;
+    if (e.notes.size() == max_effect_notes)
+        e.notes.push_back(g_more_effects_note);
+    else
         e.notes.push_back(what);
 }
 
@@ -1917,15 +1933,19 @@ static void note_path_remove(char const * what, char const * p) {
     }
 }
 
-/* For the effect context, about to use handle `fp`: notes it unless the context opened it. */
-static void note_handle_use(FILE * fp) {
+/* For the effect context, about to use handle `fp`, only to write or flush it if `writes`: notes it unless the context
+   opened it. Writing a standard output or error is noted apart from its other uses (reading, locking, truncating,
+   rewinding it), whose results or effects a later command can depend on. */
+static void note_handle_use(FILE * fp, bool writes) {
     uint32 ctx = effect_context();
     if (ctx == 0) return;
     lock_guard<mutex> lock(*g_effects_mutex);
     auto it = g_handle_contexts->find(fp);
     if (it != g_handle_contexts->end() && it->second == ctx) return;
-    char const * what = fp == stdout ? "uses the standard output" : fp == stderr ? "uses the standard error"
-        : fp == stdin ? "uses the standard input" : "uses a file handle another context opened";
+    char const * what = fp == stdin ? "uses the standard input"
+        : fp == stdout ? (writes ? "uses the standard output" : "uses the standard output other than by writing")
+        : fp == stderr ? (writes ? "uses the standard error" : "uses the standard error other than by writing")
+        : "uses a file handle another context opened";
     note_effect_core((*g_effects)[ctx], what);
 }
 
@@ -2027,7 +2047,9 @@ extern "C" LEAN_EXPORT obj_res lean_io_take_effects() {
     }
     std::vector<std::pair<uint32, std::string>> notes;
     for (auto & [ctx, e] : effects) {
-        for (std::string const & p : e.created) note_effect_core(e, "leaves " + p + ", which it created");
+        std::vector<std::string> left(e.created.begin(), e.created.end());
+        std::sort(left.begin(), left.end());
+        for (std::string const & p : left) note_effect_core(e, "leaves " + p + ", which it created");
         for (std::string const & w : e.notes) notes.push_back(std::make_pair(ctx, w));
     }
     std::sort(notes.begin(), notes.end());

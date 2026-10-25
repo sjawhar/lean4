@@ -3,10 +3,13 @@ Copyright (c) 2024 Lean FRO, LLC. All rights reserved.
 Released under Apache 2.0 license as described in the file LICENSE.
 Author: Sofia Rodrigues
 */
+#include <cinttypes>
 #include <climits>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include "runtime/hash.h"
 #include "runtime/uv/system.h"
 #include "runtime/uv/util.h"
 
@@ -148,11 +151,12 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_cwd() {
 
 // Std.Internal.UV.System.chdir : @& String → IO Unit
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_chdir(b_obj_arg path) {
-    note_effect_here("changes the working directory");
     const char* path_str = lean_string_cstr(path);
     if (strlen(path_str) != lean_string_size(path) - 1) {
         return mk_embedded_nul_error(path);
     }
+    if (uint32 ctx = effect_context())
+        note_effect(ctx, std::string("changes the working directory to ") + path_str);
 
     int result = uv_chdir(path_str);
 
@@ -326,7 +330,6 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_getenv(b_obj_arg name) {
 
 // Std.Internal.UV.System.osSetenv : @& String → @& String → IO Unit
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_setenv(b_obj_arg name, b_obj_arg value) {
-    note_effect_here("writes an environment variable");
     const char* name_str = lean_string_cstr(name);
     const char* value_str = lean_string_cstr(value);
     if (strlen(name_str) != lean_string_size(name) - 1) {
@@ -334,6 +337,14 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_setenv(b_obj_arg name, b_obj_arg 
     }
     if (strlen(value_str) != lean_string_size(value) - 1) {
         return mk_embedded_nul_error(value);
+    }
+    if (uint32 ctx = effect_context()) {
+        // the value's `String.hash`, so that no value reaches a record
+        char hex[17];
+        snprintf(hex, sizeof(hex), "%016" PRIx64,
+                 hash_str(lean_string_size(value) - 1, reinterpret_cast<unsigned char const *>(value_str), 11));
+        note_effect(ctx, std::string("writes the environment variable ") + name_str + " with the value hashed to " +
+                    hex);
     }
 
     int result = uv_os_setenv(name_str, value_str);
@@ -347,11 +358,12 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_setenv(b_obj_arg name, b_obj_arg 
 
 // Std.Internal.UV.System.osUnsetenv : @& String → IO Unit
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_unsetenv(b_obj_arg name) {
-    note_effect_here("writes an environment variable");
     const char* name_str = lean_string_cstr(name);
     if (strlen(name_str) != lean_string_size(name) - 1) {
         return mk_embedded_nul_error(name);
     }
+    if (uint32 ctx = effect_context())
+        note_effect(ctx, std::string("unsets the environment variable ") + name_str);
 
     int result = uv_os_unsetenv(name_str);
 

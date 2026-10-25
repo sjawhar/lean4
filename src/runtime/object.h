@@ -496,7 +496,7 @@ inline void note_effect_here(char const * what) {
    context's. */
 void note_task_owner(uint32 ctx, lean_task_object * t, char const * what);
 /* While effects are noted, counts a task that runs code, created in task context `ctx`, as one of the unfinished tasks of
-   that context if it is a command's (`lean_io_live_tasks`); whether it counted it. */
+   that context if it is a command's or the import context (`lean_io_live_tasks`); whether it counted it. */
 bool note_task_created(uint32 ctx);
 /* Uncounts a task `note_task_created` counted for `ctx`, once it is finished or dropped. */
 void note_task_freed(uint32 ctx);

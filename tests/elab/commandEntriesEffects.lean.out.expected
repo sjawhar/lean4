@@ -24,7 +24,7 @@ command 22: refusals #[an effect outside the command: it spawns the process true
 command 23: refusals #[]
 command 24: refusals #[an effect outside the command: it reads X.olean]
 command 25: refusals #[]
-command 26: refusals #[an effect outside the command: it writes an environment variable]
+command 26: refusals #[an effect outside the command: it writes the environment variable DECL2_EFFECTS_TEST with the value hashed to 08c345cd80ac61f0]
 command 27: refusals #[an effect outside the command: it reads the host name]
 command 28: refusals #[an effect outside the command: it uses the network]
 command 29: refusals #[a write to solverExt, neither persistent nor a command cache]

@@ -158,9 +158,10 @@ inductive Refusal where
   reference it did not create, the resolution of a promise or the cancellation of a task it did not create, the use of
   a mutable native object it did not create, or a use of process-wide state (files outside the toolchain's, child
   processes but the toolchain's SAT solver run on files the command created, the network, the standard streams, the
-  process's settings), which no payload carries. Reads of the environment, the working directory and the executable's
-  path are no effects: the module records their values (`takeValueReads`), which a keep requires unchanged
-  (`ModuleUsage.keepPermit`). -/
+  process's settings), which no payload carries. A command with more distinct effects than the runtime keeps has the
+  effect `has more effects than were noted`, which stands for the rest. Reads of the environment, the working directory
+  and the executable's path are no effects: the module records their values (`takeValueReads`), which a keep requires
+  unchanged (`ModuleUsage.keepPermit`). -/
   | effect (what : String)
   deriving Inhabited, BEq
 

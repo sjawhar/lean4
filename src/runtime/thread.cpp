@@ -148,7 +148,8 @@ void lthread::join() { m_imp->join(); }
 
 /* setThreadStackSize (sz : USize) : BaseIO Unit */
 extern "C" LEAN_EXPORT lean_obj_res lean_internal_set_thread_stack_size(size_t sz) {
-    note_effect_here("sets the runtime's thread stack size");
+    if (uint32 ctx = effect_context())
+        note_effect(ctx, "sets the runtime's thread stack size to " + std::to_string(sz));
     lthread::set_thread_stack_size(sz);
     return lean_box(0);
 }

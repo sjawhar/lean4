@@ -120,7 +120,8 @@ extern "C" LEAN_EXPORT void lean_set_exit_on_panic(bool flag) {
 
 /* setExitOnPanic (exit : Bool) : BaseIO Unit */
 extern "C" LEAN_EXPORT obj_res lean_internal_set_exit_on_panic(uint8 exit) {
-    note_effect_here("sets whether the runtime exits on a panic");
+    if (uint32 ctx = effect_context())
+        note_effect(ctx, std::string("sets whether the runtime exits on a panic to ") + (exit ? "true" : "false"));
     g_exit_on_panic = exit;
     return box(0);
 }

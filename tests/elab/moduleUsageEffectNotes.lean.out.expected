@@ -1,0 +1,21 @@
+N: exit 0
+command 2: has more effects than were noted
+command 2: writes the environment variable EFFECT_NOTES_0 with the value hashed to a00b9350ae2c0b96
+command 2: writes the environment variable EFFECT_NOTES_1 with the value hashed to 08c345cd80ac61f0
+command 2: writes the environment variable EFFECT_NOTES_2 with the value hashed to 470384a52bef7e9e
+command 2: writes the environment variable EFFECT_NOTES_3 with the value hashed to 193eb08744b3a142
+command 2: writes the environment variable EFFECT_NOTES_4 with the value hashed to 5237805651f8de1b
+command 2: writes the environment variable EFFECT_NOTES_5 with the value hashed to 71df736c83576246
+command 2: writes the environment variable EFFECT_NOTES_6 with the value hashed to 3249c0fcc759faf4
+command 2: writes the environment variable EFFECT_NOTES_7 with the value hashed to 9ae7964f93ca325f
+command 3: writes the environment variable X with the value hashed to 08c345cd80ac61f0
+command 5: writes the environment variable BOUNDARY_0 with the value hashed to a00b9350ae2c0b96
+command 5: writes the environment variable BOUNDARY_1 with the value hashed to 08c345cd80ac61f0
+command 5: writes the environment variable BOUNDARY_2 with the value hashed to 470384a52bef7e9e
+command 5: writes the environment variable BOUNDARY_3 with the value hashed to 193eb08744b3a142
+command 5: writes the environment variable BOUNDARY_4 with the value hashed to 5237805651f8de1b
+command 5: writes the environment variable BOUNDARY_5 with the value hashed to 71df736c83576246
+command 5: writes the environment variable BOUNDARY_6 with the value hashed to 3249c0fcc759faf4
+command 5: writes the environment variable BOUNDARY_7 with the value hashed to 9ae7964f93ca325f
+command 3's note holds the value's String.hash: true
+command 4 read a nondeterministic value: true
