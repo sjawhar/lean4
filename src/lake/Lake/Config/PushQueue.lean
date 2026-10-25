@@ -7,12 +7,14 @@ module
 
 prelude
 public import Lake.Config.Cache
+public import Lake.Config.RemoteCache
 import Lake.Util.JsonObject
 
 /-! # Write-Back Queue
 
 The queue of outputs that builds compiled, for upload to the shared remote cache by
-`lake cache push`, and the other files of the push in the Lake cache directory.
+`lake cache push`, the other files of the push, and the status files of the shared remote cache
+in the Lake cache directory.
 -/
 
 open System Lean
@@ -21,23 +23,14 @@ namespace Lake
 
 /--
 Outputs that a build compiled, queued for upload to the shared remote cache: one line of the
-write-back queue (`Cache.pushQueueFile`), which `lake cache push` empties.
+write-back queue (`Cache.pushQueueFile`), which `lake cache push` empties. Its `data` are the
+outputs as the local mapping records them (for a module, its per-file descriptors).
 -/
-public structure RemotePushEntry where
+public structure RemotePushEntry extends RemoteOutputs where
   /-- The name of the cache service that `LAKE_REMOTE_CACHE` named for the build. -/
   service : String
   /-- The remote scope of the outputs (see `remoteCacheScope`). -/
   remoteScope : String
-  /-- The input hash of the outputs. -/
-  inputHash : Hash
-  /-- The build key of the target (see `RemoteCacheMapping`). -/
-  target : String
-  /-- The source hash of a module, or `none` for any other target. -/
-  srcHash? : Option Hash
-  /-- The outputs, as the local mapping records them (for a module, its per-file descriptors). -/
-  data : Json
-  /-- The log of the build that produced the outputs. -/
-  log : Log
 
 namespace RemotePushEntry
 
@@ -93,6 +86,10 @@ that builds compiled, which `lake cache push` uploads and removes.
 /-- The outcome of the last `lake cache push`. -/
 @[inline] public def pushStatusFile (cache : Cache) : FilePath :=
   cache.dir / "remote-status-push.json"
+
+/-- The read-through failures of the last build that had any (see `RemoteReadStatus`). -/
+@[inline] public def readStatusFile (cache : Cache) : FilePath :=
+  cache.dir / "remote-status-read.json"
 
 /--
 The directory where `lake cache push` copies the bytes it uploads. It is in the cache directory,
