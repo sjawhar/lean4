@@ -569,7 +569,8 @@ def readRemoteOutputs?
     let contents? ← getUrl? url (cacheToken := service.sendsCacheToken url)
       (maxFileSize? := some remoteCacheMaxFileSize)
     let some contents := contents?
-      | return none
+      | logVerbose s!"remote cache mapping miss for input `{inputHash}` at {url}"
+        return none
     let json ← match Json.parse contents with
       | .ok json => pure json
       | .error e => error s!"remote mapping is invalid JSON: {e}"
