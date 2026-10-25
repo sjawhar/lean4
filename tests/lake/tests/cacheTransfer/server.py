@@ -32,6 +32,9 @@ a test picks one by pointing an endpoint at it (e.g. `.../corrupt/a0`):
   slowobj   as `ok`, but each `PUT` of an object outside a `claim` directory
             (an artifact or a mapping, not a claim of the shared remote cache)
             is answered after 4 seconds
+  denyartonce
+            403 for the first `PUT` of each object in an `a/` directory (an
+            artifact of the shared remote cache), and otherwise as `ok`
 
 A fault that does not apply to a request kind (e.g. `badcount` on a `GET`)
 behaves as `ok`. Like Cloud Storage, each object has a generation, which a new
@@ -105,6 +108,19 @@ STORE_LOCK = threading.Lock()
 # The last generation given out, of the size of Cloud Storage's generations
 LAST_GENERATION = [1792925620545348]
 
+# The object paths that `denyartonce` mode has refused once
+REFUSED_ONCE = set()
+
+
+def first_put(parts):
+    """Whether this is the first `PUT` of the object at `parts` (and records it)."""
+    key = "/".join(parts)
+    with STORE_LOCK:
+        if key in REFUSED_ONCE:
+            return False
+        REFUSED_ONCE.add(key)
+        return True
+
 
 def new_generation(path):
     """Gives the object at `path` a new generation; the caller holds `STORE_LOCK`."""
@@ -154,6 +170,7 @@ class Mode(StrEnum):
     DENY_ART = "denyart"
     STALL_PUT = "stallput"
     SLOW_OBJ = "slowobj"
+    DENY_ART_ONCE = "denyartonce"
 
 
 def content_type(path):
@@ -415,6 +432,8 @@ class Handler(BaseHTTPRequestHandler):
         elif mode == Mode.RESET:
             self.reset()
         elif mode == Mode.DENY:
+            self.deny()
+        elif mode == Mode.DENY_ART_ONCE and parts[-2:-1] == ["a"] and first_put(parts):
             self.deny()
         else:
             if mode == Mode.SLOW_PUT:
