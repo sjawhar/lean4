@@ -96,6 +96,11 @@ def wait_file(args):
     sys.exit(f"{args.file} does not exist after {args.timeout} s")
 
 
+def count_files(args):
+    """Prints how many entries a directory holds (0 if it does not exist)."""
+    print(len(os.listdir(args.dir)) if os.path.isdir(args.dir) else 0)
+
+
 def fds(args):
     """Prints the open descriptors above 2 of a process that are files it did not open itself.
 
@@ -157,6 +162,10 @@ def main():
     p.add_argument("file")
     p.add_argument("--timeout", type=float, default=60)
     p.set_defaults(run=wait_file)
+
+    p = sub.add_parser("count-files", help=count_files.__doc__)
+    p.add_argument("dir")
+    p.set_defaults(run=count_files)
 
     p = sub.add_parser("fds", help=fds.__doc__)
     p.add_argument("pid", type=int)

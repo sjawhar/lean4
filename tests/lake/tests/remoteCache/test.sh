@@ -247,7 +247,7 @@ case_token_cmd_time_limit() {
   # report it without running the command again, and the build compiles locally as soon as
   # the command is stopped
   fresh
-  rm -f "$TOKEN_RUNS" token-sid
+  rm -f "$TOKEN_RUNS" "$WORK_DIR/token-sid"
   : > "$SERVER_LOG"
   local start elapsed rc
   start="$(date +%s)"
@@ -266,11 +266,19 @@ case_token_cmd_time_limit() {
   test_cmd_eq 1 token_runs
   test_cmd_eq 0 count ' -> ' "$SERVER_LOG"
   test_exp "$elapsed" -lt 90
-  # No process of the command's session is left
-  test_exp -s token-sid
-  ps -o pid=,args= -s "$(cat token-sid)" > processes || true
-  cat processes
-  test_cmd_eq 0 count . processes
+  # No process of the command's session is left. `ps -s` is the session selector of procps,
+  # so this part runs on Linux alone; elsewhere `ps` has no `-s`. procps exits with 1 when it
+  # selects no process, which is the expected outcome; any other failure fails the case.
+  test_exp -s "$WORK_DIR/token-sid"
+  if [ "$UNAME" = Linux ]; then
+    local ps_rc=0
+    ps -o pid=,args= -s "$(cat "$WORK_DIR/token-sid")" > "$WORK_DIR/processes" || ps_rc=$?
+    cat "$WORK_DIR/processes"
+    test_exp "$ps_rc" -le 1
+    test_cmd_eq 0 count . "$WORK_DIR/processes"
+  else
+    echo "SKIPPED the check for the command's processes: 'ps -s' needs Linux"
+  fi
 }
 
 case_token_cmd_time_limit_cache() {
