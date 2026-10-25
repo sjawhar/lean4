@@ -104,8 +104,7 @@ open Meta Tactic.BVDecide
 Get the directory that contains the Lean file which is currently being elaborated.
 -/
 def getSrcDir : TermElabM System.FilePath := do
-  let ctx ← readThe Lean.Core.Context
-  let srcPath := System.FilePath.mk ctx.fileName
+  let srcPath := System.FilePath.mk (← getFileName)
   let some srcDir := srcPath.parent
     | throwError "cannot compute parent directory of `{srcPath}`"
   return srcDir

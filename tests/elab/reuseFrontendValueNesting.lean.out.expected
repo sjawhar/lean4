@@ -1,2 +1,2 @@
-exit 0, output ""
+exit 0, stdout "", stderr ""
 values lists env:FOO: false

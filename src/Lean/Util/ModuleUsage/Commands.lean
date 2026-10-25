@@ -190,6 +190,49 @@ instance : FromJson CommandSpan := ⟨fun j => do
   return { offset := ← j.getObjValAs? Nat "offset", pos := ← position "pos", endPos := ← position "end"
            src := ← j.getObjValAs? Digest "src" }⟩
 
+/-- An identifier of `CommandRefs` (`Lsp.RefIdent`): a constant's module and name, or a local variable of the module by
+its number in the command, which stands for its id (the ids a build gives local variables are not stable). -/
+inductive CommandRefIdent where
+  | const (module name : String)
+  | fvar (n : Nat)
+  deriving Inhabited, BEq
+
+instance : ToJson CommandRefIdent := ⟨fun | .const m n => .arr #[.str m, .str n] | .fvar n => toJson n⟩
+instance : FromJson CommandRefIdent := ⟨fun j => do
+  if let .ok n := j.getNat? then return .fvar n
+  let #[m, n] ← j.getArr? | throw s!"expected a reference identifier, got {j.compress}"
+  return .const (← fromJson? m) (← fromJson? n)⟩
+
+/-- The `.ilean` references of a command's info trees, as `runFrontend` records them: a kept command has no info
+tree, so a reuse run takes its references from its record. The local variables are numbered by first occurrence, in
+`refs`, then in `aliases`. -/
+structure CommandRefs where
+  idents : Array CommandRefIdent
+  /-- The parent declarations (`ContextInfo.parentDecl?`). -/
+  parents : Array Name
+  /-- The references in the order `Server.findReferences` finds them, four numbers each: the index of the identifier in
+  `idents`; the byte offset of the start from the previous reference's start (from the file's start for the first);
+  the length in bytes; and `4 * p + 2 * d + b`, where `p` is 0 for no parent declaration and 1 + its index in
+  `parents` otherwise, `d` is 1 if the parent's declaration ranges were found (`Server.Reference.parentDeclInfo?`),
+  and `b` is 1 for a binder. -/
+  refs : Array Int
+  /-- The local variables the command's `FVarAliasInfo` nodes connect, as the alias and its base, in visit order
+  (`Server.fvarAliases`). -/
+  aliases : Array (Nat × Nat)
+  deriving Inhabited, BEq
+
+instance : ToJson CommandRefs := ⟨fun r => Json.mkObj [
+  ("idents", toJson r.idents), ("parents", .arr (r.parents.map nameToJson)), ("refs", toJson r.refs),
+  ("aliases", toJson (r.aliases.foldl (fun a (x, b) => a.push x |>.push b) (#[] : Array Nat)))]⟩
+instance : FromJson CommandRefs := ⟨fun j => do
+  let aliases ← j.getObjValAs? (Array Nat) "aliases"
+  unless aliases.size % 2 == 0 do throw "expected the aliases in pairs"
+  return {
+    idents := ← j.getObjValAs? (Array CommandRefIdent) "idents"
+    parents := (← j.getObjValAs? (Array JName) "parents").map (·.name)
+    refs := ← j.getObjValAs? (Array Int) "refs"
+    aliases := (Array.range (aliases.size / 2)).map fun k => (aliases[2 * k]!, aliases[2 * k + 1]!) }⟩
+
 /-- One top-level command's record in `.usage` (`commands`). It lists the constants the command used and no name
 resolution of its own, while a command can depend on the module the resolver picks for a name that occurs in none of
 its terms (the reducibility of a constant a tactic unfolds): a command may be kept only in a build where every name
@@ -231,6 +274,9 @@ structure CommandRecord where
   /-- What the command read of its file beyond its own source (`getFileName`: `fileName`; `getFileMap`: `source`), with
   the digest of the file name or of the whole source then. Filled by `runFrontend`. -/
   fileContext : Array (String × Digest) := #[]
+  /-- The `.ilean` references of the command's info trees; `none` if the build that elaborated it wrote no `.ilean`.
+  Filled by `runFrontend`. -/
+  refs? : Option CommandRefs := none
   deriving Inhabited, BEq
 
 instance : ToJson CommandRecord := ⟨fun r => Json.mkObj [
@@ -242,7 +288,7 @@ instance : ToJson CommandRecord := ⟨fun r => Json.mkObj [
   ("extra", .arr (r.extra.map fun (m, isMeta) => .arr #[nameToJson m, isMeta])),
   ("post", toJson r.post), ("caches", toJson r.caches), ("values", toJson r.values),
   ("messages", toJson r.messages?), ("lints", r.lints), ("linterState", r.linterState),
-  ("fileContext", toJson r.fileContext)]⟩
+  ("fileContext", toJson r.fileContext), ("refs", toJson r.refs?)]⟩
 
 instance : FromJson CommandRecord := ⟨fun j => return {
   i := ← j.getObjValAs? Nat "i"
@@ -266,7 +312,8 @@ instance : FromJson CommandRecord := ⟨fun j => return {
   messages? := ← j.getObjValAs? (Option (Array Json)) "messages"
   lints := ← j.getObjValAs? Nat "lints"
   linterState := ← j.getObjValAs? Bool "linterState"
-  fileContext := ← j.getObjValAs? (Array (String × Digest)) "fileContext" }⟩
+  fileContext := ← j.getObjValAs? (Array (String × Digest)) "fileContext"
+  refs? := ← j.getObjValAs? (Option CommandRefs) "refs" }⟩
 
 private def matcherKeyDigest (value : Expr) (compile isPrivate : Bool) : Digest :=
   (({} : Enc).digest (exprDigest .namesInfos .eqv value) |>.bool compile |>.bool isPrivate).finish
@@ -470,7 +517,7 @@ private partial def transientDeps (transient : Name → Option NameSet) (seen ou
       | some ds => transientDeps transient (seen.insert c) out (ds.toList ++ cs)
       | none => transientDeps transient (seen.insert c) (out.insert c) cs
 
-private unsafe def linterStateChangedImpl (inits : Array Elab.Command.LinterState) (before after : Elab.Command.State) :
+unsafe def linterStateChangedImpl (inits : Array Elab.Command.LinterState) (before after : Elab.Command.State) :
     Bool :=
   let states (s : Elab.Command.State) := s.prevLinterStates.elim inits Task.get
   let (b, a) := (states before, states after)
@@ -479,7 +526,7 @@ private unsafe def linterStateChangedImpl (inits : Array Elab.Command.LinterStat
 /-- Whether the state of a stateful linter changed from `before` to `after` (`Command.State.prevLinterStates`, whose
 `none` stands for the initial states `inits`). A state the linter returned unchanged is the same object. -/
 @[implemented_by linterStateChangedImpl]
-private opaque linterStateChanged (inits : Array Elab.Command.LinterState) (before after : Elab.Command.State) : Bool
+opaque linterStateChanged (inits : Array Elab.Command.LinterState) (before after : Elab.Command.State) : Bool
 
 /-- The per-command records of `observations` and `kept` (each in command order), or why there are none: a command
 used a name no digest stands for, one that names no constant (a declaration the kernel or the elaborator rejected
@@ -677,7 +724,7 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
     -- the command did not run here: what it read and did beyond its payload is its previous run's
     return .record { r with
       usesStmt, usesFull, extra := k.record.extra, values := k.record.values, linterState := k.record.linterState
-      fileContext := k.record.fileContext }
+      fileContext := k.record.fileContext, refs? := k.record.refs? }
   let parts ← CommandEntries.parallelMap observations (lanes := lanes) fun obs =>
     pure (obs.i, obs.stx, obs.before, (none : Option Digest), part obs)
   let parts := (parts ++ kept.map fun k => (k.i, k.stx, k.before, some k.record.ctx, keptPart k)).qsort (·.1 < ·.1)

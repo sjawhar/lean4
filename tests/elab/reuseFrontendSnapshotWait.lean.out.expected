@@ -1,0 +1,9 @@
+first build: exit 0, stdout "", stderr ""
+exit codes: reuse 0, fresh 0
+stdout equal to the fresh build's: true
+stderr equal to the fresh build's: true
+olean equal to the fresh build's: true
+ilean equal to the fresh build's: true
+usage equal to the fresh build's but `reuse` and `resolved`: true; `commands` lengths: reuse 5, fresh 5; `resolved` holds the fresh build's: true
+reuse run kept: 0, elaborated: [0,1,2,3]
+z: reuse 2 (exit 0), fresh 2 (exit 0)

@@ -225,8 +225,6 @@ structure KeepRecord where
   module : Name
   /-- The digest of the `.olean` written with the `.usage`. -/
   olean : Digest
-  /-- The digest of the `.ilean` written with the `.usage`, if one was. -/
-  ilean : Option Digest
   githash : String
   /-- The imports with digests, each with its provides digest (`digestedModules`). -/
   digested : Array (Name × Digest)
@@ -250,7 +248,6 @@ def KeepRecord.ofUsage (j : Json) : Except String KeepRecord := do
   return {
     module := ← nameOfJson? (← j.getObjVal? "module")
     olean := ← j.getObjValAs? Digest "olean"
-    ilean := ← j.getObjValAs? (Option Digest) "ilean"
     githash := ← j.getObjValAs? String "githash"
     digested := ← pairs "digested"
     untracked := ← pairs "untracked"

@@ -199,9 +199,11 @@ private def recordLintsByCommand (fileMap : FileMap) (fileName : String) (env : 
 The messages a build reports for each command but its parse messages (`SnapshotTree.runAndReport` prints the messages
 that are not marked reported, node by node, and a command's nodes are together), each with its position and end
 position: `none` for a command whose messages a later build cannot show again as it would, because one's text is made
-when it is printed (`MessageData.hasFixedText`) or its info trees are reported (`trace.Elab.info`).
+when it is printed (`MessageData.hasFixedText`), one names another file than the module's, `fileName` (a kept command's
+messages are shown for the file it is compiled as; the lint log entries are made from these messages), or its info
+trees are reported (`trace.Elab.info`).
 -/
-private def commandMessages (snap : Language.Lean.InitialSnapshot) :
+private def commandMessages (fileName : String) (snap : Language.Lean.InitialSnapshot) :
     BaseIO (Array (Option (Array (Position × Option Position × Json)))) := do
   let cmds := (Language.Lean.foldCmdSnaps? snap #[] (·.push ·)).getD #[]
   cmds.mapM fun c => do
@@ -209,19 +211,21 @@ private def commandMessages (snap : Language.Lean.InitialSnapshot) :
     let mut out := #[]
     for node in (Language.toSnapshotTree c.elabSnap).getAll do
       for m in node.diagnostics.msgLog.unreported do
-        unless m.data.hasFixedText do return none
+        unless m.fileName == fileName && m.data.hasFixedText do return none
         out := out.push (m.pos, m.endPos, toJson (← m.serialize))
     return some out
 
 /-- The command records `commands` (`CommandRecord` as JSON) with what the run observed of each command after its
 records were made: its reported messages (`commandMessages`), which its record holds only if they all lie in its span
-(`CommandRecord.messages?`), its lint log entries (`lints`), and, for an elaborated command, what it read of its file
-beyond its source (`reads`, `FileContextRead` bits by command index: `commandFileContextReads`) with the digests
-`fileContext` (`ModuleUsage.fileContextDigests`). A kept command (`keptIdxs`) read what its previous record says. -/
+(`CommandRecord.messages?`), its lint log entries (`lints`), and, for an elaborated command, its `.ilean` references
+(`refs`, by command index, for a run that writes an `.ilean`) and what it read of its file beyond its source (`reads`,
+`FileContextRead` bits by command index: `commandFileContextReads`) with the digests `fileContext`
+(`ModuleUsage.fileContextDigests`). A kept command (`keptIdxs`) has the references and read what its previous record
+says. -/
 private def withRunRecords (commands : Array Json)
     (messages : Array (Option (Array (Position × Option Position × Json)))) (lints : Std.HashMap Nat Nat)
-    (reads : Std.HashMap Nat UInt8) (fileContext : Array (String × ModuleUsage.Digest))
-    (keptIdxs : Std.HashSet Nat) : Array Json :=
+    (refs : Array (Option ModuleUsage.CommandRefs)) (reads : Std.HashMap Nat UInt8)
+    (fileContext : Array (String × ModuleUsage.Digest)) (keptIdxs : Std.HashSet Nat) : Array Json :=
   commands.map fun c => Id.run do
     let .ok i := c.getObjValAs? Nat "i" | return c
     let inSpan (ms : Array (Position × Option Position × Json)) : Option (Array Json) := do
@@ -231,37 +235,122 @@ private def withRunRecords (commands : Array Json)
     let recorded := (messages[i]?.getD (some #[])).bind inSpan
     let c := (c.setObjVal! "messages" (toJson recorded)).setObjVal! "lints" (toJson (lints.getD i 0))
     if keptIdxs.contains i then return c
+    let c := c.setObjVal! "refs" (toJson (refs[i]?.join))
     let bits := reads.getD i 0
     let read (k : String) := (k == "fileName" && bits &&& FileContextRead.fileName != 0) ||
       (k == "source" && bits &&& FileContextRead.source != 0)
     return c.setObjVal! "fileContext" (toJson (fileContext.filter (read ·.1)))
 
-/--
-The `.ilean` references and declarations for a reuse run that kept the commands `kept`, from those of its elaborated
-commands (`refs`, `decls`): a kept command has no info tree, so its references are the previous `.ilean`'s in its span,
-each identifier's usages in range order as `Server.findModuleRefs` orders them, with their parent declarations.
--/
-private def mergeKeptRefs (fileMap : FileMap) (kept : Array ModuleUsage.KeptCommand) (previous : Server.Ilean)
-    (refs : Lsp.ModuleRefs) (decls : Lsp.Decls) : Lsp.ModuleRefs × Lsp.Decls := Id.run do
-  let spans := kept.map fun k => (fileMap.leanPosToLspPos k.span.pos, fileMap.leanPosToLspPos k.span.endPos)
-  let le (a b : Lsp.Position) := a.line < b.line || (a.line == b.line && a.character ≤ b.character)
-  let inKept (l : Lsp.RefInfo.Location) : Bool := spans.any fun (s, e) => le s l.range.start && le l.range.start e
-  let previousDecls : Std.TreeMap String Lsp.DeclInfo := previous.decls
-  let mut refs : Std.TreeMap Lsp.RefIdent Lsp.RefInfo := refs
-  let mut decls : Std.TreeMap String Lsp.DeclInfo := decls
-  for (ident, info) in previous.references do
-    let defn? := info.definition?.filter inKept
-    let usages := info.usages.filter inKept
-    if defn?.isNone && usages.isEmpty then continue
-    let fresh := refs.getD ident { definition? := none, usages := #[] }
-    let definition? := match fresh.definition?, defn? with
-      | some a, some b => if a.range < b.range then some a else some b
-      | a, b => a <|> b
-    refs := refs.insert ident { definition?, usages := (fresh.usages ++ usages).qsort (·.range < ·.range) }
-    for l in defn?.toArray ++ usages do
-      if let some d := l.parentDecl? then
-        if let some i := previousDecls[d]? then decls := decls.insert d i
-  return (refs, decls)
+/-- The info trees the snapshots of command `c` report: its own node's and those of its elaboration. -/
+private def commandTrees (c : Language.Lean.CommandParsedSnapshot) : Array InfoTree :=
+  c.infoTree?.toArray ++ (Language.toSnapshotTree c.elabSnap).getAll.filterMap (·.infoTree?)
+
+/-- The record of the references `refs` (`Server.findReferences`) and aliases `aliases` (`Server.fvarAliases`) of a
+command's info trees. -/
+private def recordRefs (refs : Array Server.Reference) (aliases : Array (Lsp.RefIdent × Lsp.RefIdent)) :
+    ModuleUsage.CommandRefs := Id.run do
+  let mut idents : Array ModuleUsage.CommandRefIdent := #[]
+  let mut identIdxs : Std.HashMap Lsp.RefIdent Nat := {}
+  -- the local variables' numbers (`CommandRefIdent.fvar`) by id
+  let mut fvars : Std.HashMap String Nat := {}
+  let mut parents : Array Name := #[]
+  let mut parentIdxs : Std.HashMap Name Nat := {}
+  let mut out : Array Int := Array.emptyWithCapacity (4 * refs.size)
+  let mut prev : Nat := 0
+  for ref in refs do
+    let k := identIdxs.getD ref.ident idents.size
+    if k == idents.size then
+      identIdxs := identIdxs.insert ref.ident k
+      match ref.ident with
+      | .const m n => idents := idents.push (.const m n)
+      | .fvar _ id =>
+        idents := idents.push (.fvar fvars.size)
+        fvars := fvars.insert id fvars.size
+    let mut flags := if ref.isBinder then 1 else 0
+    if let some d := ref.ci.parentDecl? then
+      let p := parentIdxs.getD d parents.size
+      if p == parents.size then
+        parentIdxs := parentIdxs.insert d p
+        parents := parents.push d
+      flags := flags + 4 * (p + 1) + (if ref.parentDeclInfo?.isSome then 2 else 0)
+    -- `findReferences` finds only references with a range
+    let r := ref.info.range?.getD default
+    out := out.push (k : Int) |>.push ((r.start.byteIdx : Int) - prev)
+      |>.push ((r.stop.byteIdx : Int) - r.start.byteIdx) |>.push (flags : Int)
+    prev := r.start.byteIdx
+  let mut pairs : Array (Nat × Nat) := #[]
+  for (a, b) in aliases do
+    -- `fvarAliases` connects local variables only
+    let (.fvar _ a, .fvar _ b) := (a, b) | continue
+    let na := fvars.getD a fvars.size
+    fvars := fvars.insert a na
+    let nb := fvars.getD b fvars.size
+    fvars := fvars.insert b nb
+    pairs := pairs.push (na, nb)
+  return { idents, parents, refs := out, aliases := pairs }
+
+/-- The references and aliases the record `r` of command `i` holds, as `Server.findReferences` and
+`Server.fvarAliases` would find them in its info trees, for the module `env` and its file `fileMap`. The record numbers
+its local variables per command, so they are named apart from those of every other command. -/
+private def recordedRefs (env : Environment) (fileMap : FileMap) (i : Nat) (r : ModuleUsage.CommandRefs) :
+    Except String (Array Server.Reference × Array (Lsp.RefIdent × Lsp.RefIdent)) := do
+  let mod := env.header.mainModule.toString
+  let fvar (n : Nat) : Lsp.RefIdent := .fvar mod s!"{i}:{n}"
+  let idents := r.idents.map fun
+    | .const m n => Lsp.RefIdent.const m n
+    | .fvar n => fvar n
+  unless r.refs.size % 4 == 0 do throw "the references are not in fours"
+  let mut refs : Array Server.Reference := Array.emptyWithCapacity (r.refs.size / 4)
+  let mut prev : Int := 0
+  for j in [0:r.refs.size / 4] do
+    let (k, s, len) := (r.refs[4 * j]!, r.refs[4 * j + 1]!, r.refs[4 * j + 2]!)
+    let flags := (r.refs[4 * j + 3]!).toNat
+    let some ident := idents[k.toNat]? | throw s!"no identifier {k}"
+    let p := flags / 4
+    let parentDecl? : Option Name ← if p == 0 then pure none else
+      match r.parents[p - 1]? with
+      | some d => pure (some d)
+      | none => throw s!"no parent declaration {p - 1}"
+    let b := prev + s
+    prev := b
+    let range : Syntax.Range := ⟨⟨b.toNat⟩, ⟨(b + len).toNat⟩⟩
+    -- the final environment holds the kept command's declaration ranges
+    let cmdEnv? := if flags % 4 ≥ 2 then some env else none
+    refs := refs.push { ident, range := range.toLspRange fileMap, stx := .missing, isBinder := flags % 2 == 1,
+                        ci := { env, cmdEnv?, fileMap, ngen := {}, parentDecl? }, info := default }
+  return (refs, r.aliases.map fun (a, b) => (fvar a, fvar b))
+
+/-- The `.ilean` references of the module, and the record of each elaborated command's (`recordRefs`, by command index)
+if `recording`, from the info trees `trees` its snapshots `snap` report: each command's references are those of its
+info trees (`commandTrees`) or, for a command a reuse run kept (`kept`), its record's (`recordedRefs`), and all of them
+are combined and deduplicated together (`Server.ModuleRefs.ofReferences`), as `Server.findModuleRefs` does. -/
+private def ileanReferences (env : Environment) (fileMap : FileMap) (snap : Language.Lean.InitialSnapshot)
+    (trees : Array InfoTree) (kept : Array ModuleUsage.KeptCommand) (recording : Bool) :
+    IO (Server.ModuleRefs × Array (Option ModuleUsage.CommandRefs)) := do
+  let cmds := (Language.Lean.foldCmdSnaps? snap #[] (·.push ·)).getD #[]
+  let cmdTrees := cmds.map commandTrees
+  -- the header's trees precede those of the commands
+  let headerTrees := trees.extract 0 (trees.size - cmdTrees.foldl (fun n ts => n + ts.size) 0)
+  let keptByIdx : Std.HashMap Nat ModuleUsage.KeptCommand := kept.foldl (fun m k => m.insert k.i k) {}
+  let mut refs := Server.findReferences fileMap headerTrees
+  let mut aliases := Server.fvarAliases headerTrees
+  let mut records : Array (Option ModuleUsage.CommandRefs) := #[]
+  for ts in cmdTrees, i in [0:cmdTrees.size] do
+    if let some k := keptByIdx[i]? then
+      let some r := k.record.refs?
+        | throw <| IO.userError s!"reuse: internal error: kept command {i} has no recorded references"
+      let (rs, als) ← IO.ofExcept <| (recordedRefs env fileMap i r).mapError
+        (s!"reuse: the recorded references of kept command {i} cannot be read: {·}")
+      refs := refs ++ rs
+      aliases := aliases ++ als
+      records := records.push none
+    else
+      let rs := Server.findReferences fileMap ts
+      let als := Server.fvarAliases ts
+      refs := refs ++ rs
+      aliases := aliases ++ als
+      records := records.push <| if recording then some (recordRefs rs als) else none
+  return (Server.ModuleRefs.ofReferences refs aliases (localVars := false), records)
 
 /--
 On-disk wrapper for `--incr-(header-)save`: bundles the snapshot with the indices
@@ -548,16 +637,11 @@ def runFrontend
       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
     return usage?
 
+  let mut ileanRefs : Array (Option ModuleUsage.CommandRefs) := #[]
   if let some ileanFileName := ileanFileName? then
-    let references := Lean.Server.findModuleRefs inputCtx.fileMap trees (localVars := false)
+    let (references, records) ← ileanReferences env inputCtx.fileMap snap trees kept (recording := usage?.isSome)
+    ileanRefs := records
     let (moduleRefs, decls) ← references.toLspModuleRefs
-    -- the keep permit bound the previous `.ilean` to the previous `.usage` (`Reuse.Previous.ilean?`)
-    let previousIlean? ← if kept.isEmpty then pure none else
-      (reused?.bind (·.previousIlean?)).mapM fun text =>
-        IO.ofExcept <| (Json.parse text >>= fromJson? (α := Server.Ilean)).mapError
-          (s!"reuse: the previous `.ilean` cannot be read: {·}")
-    let (moduleRefs, decls) := previousIlean?.elim (moduleRefs, decls) fun previous =>
-      mergeKeptRefs inputCtx.fileMap kept previous moduleRefs decls
     let ilean := {
       module        := mainModuleName
       directImports := Server.collectImports ⟨snap.stx⟩
@@ -590,12 +674,12 @@ def runFrontend
     for c in commands do
       let .ok i := c.getObjValAs? Nat "i" | continue
       reads := reads.insert i (← commandFileContextReads i)
-    let commands := withRunRecords commands (← commandMessages snap) (← lintCounts.get) reads
+    let commands := withRunRecords commands (← commandMessages fileName snap) (← lintCounts.get) ileanRefs reads
       (ModuleUsage.fileContextDigests fileName input) (kept.foldl (·.insert ·.i) {})
     ModuleUsage.writeUsage env nodes own closure provides indirect used (← lookedUpSpecKeys) stmt commands
       (incrLoaded := incrLoadFileName?.isSome) usageFileName (← ModuleUsage.fileDigest oleanFileName)
       (noreuseReason? := recs.noreuseReason?) (carried := reused?.elim {} (·.carried))
-      (reuse? := reused?.map (·.field)) (ileanDigest? := ← ileanFileName?.mapM ModuleUsage.fileDigest)
+      (reuse? := reused?.map (·.field))
 
   -- no point in freeing the snapshot graph and all referenced data this close to process exit
   Runtime.forget snaps

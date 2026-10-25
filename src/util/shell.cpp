@@ -196,7 +196,6 @@ static struct option g_long_options[] = {
     {"incr-header-save", required_argument, 0, 'H'},
     {"reuse-olean",  required_argument, 0, 'K'},
     {"reuse-usage",  required_argument, 0, 'Q'},
-    {"reuse-ilean",  required_argument, 0, 'G'},
     {"reuse-changed-extra", required_argument, 0, 'F'},
     {"reuse-declined", required_argument, 0, 'X'},
 #ifdef LEAN_DEBUG

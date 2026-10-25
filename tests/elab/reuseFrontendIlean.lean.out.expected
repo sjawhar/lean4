@@ -1,4 +1,3 @@
-(a) without --reuse-ilean: ilean equal to the fresh build's: true
-(b) --reuse-ilean of another source: ilean equal to the fresh build's: true
-(c) --reuse-ilean of an older build: ilean equal to the fresh build's: true
-control: --reuse-ilean of the previous build: kept 2; ilean equal to the fresh build's: true
+(a) previous build with an .ilean, reuse run writes one: kept 2; elabReasons {"text":1}; ilean equal to the fresh build's: true
+(b) previous build without an .ilean, reuse run writes one: kept 0; elabReasons {"refs":2,"text":1}; ilean equal to the fresh build's: true
+(c) neither writes an .ilean: kept 2; elabReasons {"text":1}

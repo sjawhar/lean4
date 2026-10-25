@@ -17,7 +17,8 @@ def t : Nat := 1
   let out ← IO.Process.output {
     cmd := "lean", args := #["-o", "M.olean", "--usage=M.usage", "M.lean"], cwd := dir,
     env := #[("LEAN_PATH", some dir.toString), ("FOO", some "1")] }
-  IO.println s!"exit {out.exitCode}, output {(out.stdout ++ out.stderr).replace dir.toString "DIR" |>.trimAscii.copy.quote}"
+  let norm (s : String) := (s.replace dir.toString "DIR").trimAscii.copy.quote
+  IO.println s!"exit {out.exitCode}, stdout {norm out.stdout}, stderr {norm out.stderr}"
   let mut j := Json.mkObj []
   for line in (← IO.FS.readFile (dir / "M.usage")).splitOn "\n" do
     unless line.isEmpty do j := j.mergeObj (← IO.ofExcept (Json.parse line))

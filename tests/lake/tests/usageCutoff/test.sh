@@ -650,7 +650,7 @@ no_match_text "Replayed Test.SB" default.log
 test_exp ! -f cache12/.lake/build/lib/lean/Test/SB.usage
 
 # Declaration-level reuse: a module compiled again under the usage cutoff keeps commands from its previous outputs.
-# Lake passes them to `lean` (`--reuse-olean`, `--reuse-usage`, `--reuse-ilean`) or the reason it does not
+# Lake passes them to `lean` (`--reuse-olean`, `--reuse-usage`) or the reason it does not
 # (`--reuse-declined`), and `lean` records what it kept in the `.usage` `reuse` field. The action line stays `Built`,
 # and the log says nothing about reuse (the paths of this checkout and `-v`'s command lines aside: `reuse/`, `reuse-`).
 mkdir -p declkeep/Test
@@ -702,12 +702,16 @@ rm -f $M.olean && cp .lake/build/lib/lean/Test/A.olean $M.olean
 printf 'theorem L : 1 = 1 := by rfl\ndef v := 10\n' > Test/A.lean
 test_out "Built Test.M" build -v Test.N
 match_text '"reuse":{"declined":"olean-hash-mismatch"}' $M.usage
-# an `.ilean` that is not the previous build's (here A's, which parses) cannot give the kept commands' references:
-# the module is compiled in full
-rm -f $M.ilean && cp .lake/build/lib/lean/Test/A.ilean $M.ilean
+# the kept commands' `.ilean` references come from their `.usage` records: the `.ilean` of a reuse build equals the
+# one a build without reuse writes (`v`'s value does not change M's `.ilean`)
 printf 'theorem L : 1 = 1 := by rfl\ndef v := 20\n' > Test/A.lean
 test_out "Built Test.M" build -v Test.N
-match_text '"reuse":{"declined":' $M.usage
+match_text '"reuse":{"elabReasons":{"full":2,"nonconst":1},"kept":1,"reElab":[1,2,3],"total":4}' $M.usage
+cp $M.ilean ilean.reuse
+printf 'theorem L : 1 = 1 := by rfl\ndef v := 21\n' > Test/A.lean
+LAKE_DECL_CUTOFF=0 test_out "Built Test.M" build -v Test.N
+match_text '"reuse":{"declined":"decl-cutoff-off"}' $M.usage
+test_cmd cmp ilean.reuse $M.ilean
 # a module-system file is never partially compiled again
 printf 'module\n\npublic def ms := 1\n' > Test/MS.lean
 test_run build Test.MS

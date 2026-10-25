@@ -1,0 +1,14 @@
+text: first build: exit 0
+text: exit codes: reuse 0, fresh 0
+text: stdout equal to the fresh build's: true
+text: stderr equal to the fresh build's: true
+text: olean equal to the fresh build's: true
+text: ilean equal to the fresh build's: true
+text: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true
+json: first build: exit 0
+json: exit codes: reuse 0, fresh 0
+json: stdout equal to the fresh build's: true
+json: stderr equal to the fresh build's: true
+json: olean equal to the fresh build's: true
+json: ilean equal to the fresh build's: true
+json: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true

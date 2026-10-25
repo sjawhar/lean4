@@ -7,7 +7,8 @@ open Lean
 
 def lean (dir : System.FilePath) (args : Array String) : IO (UInt32 × String) := do
   let out ← IO.Process.output { cmd := "lean", args, cwd := dir, env := #[("LEAN_PATH", some dir.toString)] }
-  return (out.exitCode, (out.stdout ++ out.stderr).replace dir.toString "DIR")
+  let norm (s : String) := (s.replace dir.toString "DIR").quote
+  return (out.exitCode, s!"stdout {norm out.stdout}, stderr {norm out.stderr}")
 
 def outputs : Array String := #["-o", "M.olean", "--usage=M.usage", "-i", "M.ilean"]
 
@@ -31,7 +32,7 @@ def run (dir : System.FilePath) (label : String) (args : Array String) : IO Unit
   for ext in ["olean", "usage", "ilean"] do
     IO.FS.writeBinFile (dir / s!"M.{ext}.old") (← IO.FS.readBinFile (dir / s!"M.{ext}"))
   run dir "Lake's reason" #["--reuse-declined=no-saved-trace"]
-  run dir "previous outputs" #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old", "--reuse-ilean=M.ilean.old"]
+  run dir "previous outputs" #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old"]
   let usage ← IO.FS.readFile (dir / "M.usage.old")
   IO.FS.writeFile (dir / "M.usage.old") (usage.take 40).copy
   run dir "truncated .usage" #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old"]

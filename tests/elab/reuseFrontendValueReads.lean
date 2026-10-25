@@ -14,12 +14,13 @@ open Lean
 def lean (dir : System.FilePath) (args : Array String) (env : Array (String × Option String)) :
     IO (UInt32 × String) := do
   let out ← IO.Process.output { cmd := "lean", args, cwd := dir, env := env.push ("LEAN_PATH", some dir.toString) }
-  return (out.exitCode, (out.stdout ++ out.stderr).replace dir.toString "DIR")
+  let norm (s : String) := (s.replace dir.toString "DIR").quote
+  return (out.exitCode, s!"stdout {norm out.stdout}, stderr {norm out.stderr}")
 
 def outputs (m : String) : Array String := #["-o", s!"{m}.olean", s!"--usage={m}.usage", "-i", s!"{m}.ilean"]
 
 def reuseArgs : Array String := outputs "M" ++
-  #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old", "--reuse-ilean=M.ilean.old", "M.lean"]
+  #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old", "M.lean"]
 
 /-- A `.usage`, one JSON object per line, as one object without `reuse`, and its `reuse` field. -/
 def usageOf (file : System.FilePath) : IO (Json × String) := do

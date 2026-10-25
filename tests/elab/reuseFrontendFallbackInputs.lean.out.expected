@@ -18,7 +18,7 @@ R8 stats: statistics printed: reuse 1, fresh 1
 R8 stats: olean equal to the fresh build's: true
 R8 stats: ilean equal to the fresh build's: true
 R8 stats: usage equal to the fresh build's but `reuse`: true
-R9 abbreviations without fallback: exit 0, output "", kept 2
+R9 abbreviations without fallback: exit 0, output "stdout \"\", stderr \"\"", kept 2
 R9 abbreviations: reuse run fell back: false
 R9 abbreviations: exit codes: reuse 0, fresh 0
 R9 abbreviations: output equal to the fresh build's: true

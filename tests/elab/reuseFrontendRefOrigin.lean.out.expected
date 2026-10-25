@@ -1,0 +1,18 @@
+(1) z edited: first build: exit 0, stdout "", stderr ""
+(1) z edited: exit codes: reuse 0, fresh 0
+(1) z edited: stdout equal to the fresh build's: true; stderr equal: true
+(1) z edited: olean equal to the fresh build's: true
+(1) z edited: ilean equal to the fresh build's: true
+(1) z edited: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true
+(2) touch_ref b: first build: exit 0, stdout "", stderr ""
+(2) touch_ref b: exit codes: reuse 0, fresh 0
+(2) touch_ref b: stdout equal to the fresh build's: true; stderr equal: true
+(2) touch_ref b: olean equal to the fresh build's: true
+(2) touch_ref b: ilean equal to the fresh build's: true
+(2) touch_ref b: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true
+(3) touch_decl b: first build: exit 0, stdout "", stderr ""
+(3) touch_decl b: exit codes: reuse 0, fresh 0
+(3) touch_decl b: stdout equal to the fresh build's: true; stderr equal: true
+(3) touch_decl b: olean equal to the fresh build's: true
+(3) touch_decl b: ilean equal to the fresh build's: true
+(3) touch_decl b: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true

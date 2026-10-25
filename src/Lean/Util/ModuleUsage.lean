@@ -907,11 +907,12 @@ private def addValueReads (reads : Std.HashMap Nat (Array String)) (c : Json) : 
   c.setObjVal! "values" (toJson (all.foldl (fun out k => if out.back? == some k then out else out.push k) #[]))
 
 /-- What a reuse run (`Lean.Elab.Reuse`) takes into a module's `.usage` from the previous build's for the commands it
-kept, which it did not elaborate and so did not observe: the kept records' extra module uses and process values (with
-the previous `.usage`'s digests, which the keep permit found equal to this process's, and the first kept command that
-read each), and the observations of the previous `.usage` that no record attributes to a command (the names it
-resolved, whether it read the resolver's whole map, the specialization-cache keys it looked up, whether a compile made
-every import an extra use). -/
+kept, which it did not elaborate and so did not observe: the kept records' extra module uses and the process values
+they read that are fixed for the process (the executable's path, the toolchain, the SAT solver's bytes, with the
+previous `.usage`'s digests, which the keep permit found equal to this process's, and the first kept command that read
+each; a keep reads the others again, so the runtime records them), and the observations of the previous `.usage` that
+no record attributes to a command (the names it resolved, whether it read the resolver's whole map, the
+specialization-cache keys it looked up, whether a compile made every import an extra use). -/
 structure Carried where
   extra : Array (Name × Bool) := #[]
   values : Array (String × Option Digest × Nat) := #[]
@@ -940,8 +941,7 @@ is set when the run reused commands from an `--incr-load` snapshot, since reused
 this process and `used` may miss constants they used.
 
 The fields for keeping the module's commands one by one (`ModuleUsage.keepPermit`): `module`, the module's name; `olean`,
-the digest of the `.olean` written beside it (`oleanDigest`, `fileDigest`), which holds the command payloads; `ilean`,
-the digest of the `.ilean` written beside it, if one was (`ileanDigest?`), which holds the kept commands' references;
+the digest of the `.olean` written beside it (`oleanDigest`, `fileDigest`), which holds the command payloads;
 `githash`, the Lean that wrote both; `untracked`, the imports without digests outside the toolchain with their `.olean`
 digests (`untrackedImports`); `values`, each process value the run read (`takeValueReads`, taken before this
 function's own lookups, such as `untrackedImports`' of the toolchain's path) with the digest of its value
@@ -962,7 +962,7 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
     (provides : Array Name × Array Name) (indirect : Array Name) (used : NameSet) (lookups : Array Expr)
     (stmt : Array (Name × Digest × Digest)) (commands : Array Json) (incrLoaded : Bool) (path : System.FilePath)
     (oleanDigest : Digest) (noreuseReason? : Option String := none) (carried : Carried := {})
-    (reuse? : Option Json := none) (ileanDigest? : Option Digest := none) : IO Unit := do
+    (reuse? : Option Json := none) : IO Unit := do
   let s := state env
   let allExtra := (getLocalExtraModUses env).foldl (·.insert ·) (← extraModUsesByChecks)
   let allExtra := carried.extra.foldl (init := allExtra) fun es (m, isMeta) =>
@@ -1007,8 +1007,8 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
   let values ← reads.mapM fun (k, v?, changed, _) => do
     try return (k, valueDigest? (← recordedValue? k v?), changed, firstReader[k]?, none)
     catch e => return (k, none, changed, firstReader[k]?, some s!"the process value {k} cannot be recorded: {e}")
-  -- a kept command read its values in the previous build: they join this run's reads in command order (a read outside
-  -- any command, `none`, comes first), and one this run read with another digest changed while the module was compiled
+  -- a kept command read the values fixed for the process in the previous build: they join this run's reads in command
+  -- order (a read outside any command, `none`, comes first)
   let kept : Std.HashMap String (Option Digest × Nat) := carried.values.foldl (fun m (k, d?, i) => m.insert k (d?, i)) {}
   let values : Array (String × Option Digest × Bool × Option String) :=
     values.map fun (k, d?, changed, first?, err?) => match kept[k]? with
@@ -1048,7 +1048,6 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
       Json.arr #[toJson k, toJson p])),
     ("module", nameToJson env.mainModule),
     ("olean", toJson oleanDigest),
-    ("ilean", toJson ileanDigest?),
     ("githash", toJson Lean.githash),
     ("untracked", Json.arr (untracked.map fun (m, d) => pair m d)),
     ("values", Json.arr (values.map fun (k, d?, _) => Json.arr #[toJson k, toJson d?])),

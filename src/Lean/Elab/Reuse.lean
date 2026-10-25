@@ -29,21 +29,20 @@ module's final digests, that the constant and what it depends on are as in the p
 `Progress.fullDirty`), the environment variables and working directory it read are unchanged where it starts, and its
 context (`ctxDigest`, `contextChanged?`) is its record's. The context hashes the payloads of every command before it,
 so a command is kept only after commands with the previous build's payloads in order: the candidate for command `i` is
-always the previous build's command `i`. An elaborated command keeps the chain only once its payload is final (no task
-of it is unfinished, `unfinishedCommandTasks`) and, if it had effects outside it, its inputs are the previous build's
-(`effectInputsChanged`): a keep never relies on what may change later, and the run never has to start over.
+always the previous build's command `i`. An elaborated command keeps the chain only once its work has settled, which
+the run checks without waiting on it (`settledWithin`: code may wait for a later command), when no stateful linter's
+state changed in it, and, if it had effects outside it, when its record decides them and holds the previous build's
+inputs (`effectInputsChanged`): a keep never relies on what may change later, and the run never has to start over.
 -/
 
 namespace Lean.Elab.Reuse
 open ModuleUsage
 
-/-- What a run is asked to reuse (`lean --reuse-olean`, `--reuse-usage`, `--reuse-ilean`, `--reuse-declined`,
-`--reuse-changed-extra`). -/
+/-- What a run is asked to reuse (`lean --reuse-olean`, `--reuse-usage`, `--reuse-declined`, `--reuse-changed-extra`).
+-/
 structure Inputs where
   /-- The module's previous `.olean` and `.usage`, or why none are reused (`--reuse-declined`). -/
   previous : Except String (System.FilePath × System.FilePath)
-  /-- The module's previous `.ilean`, whose references of kept commands the new one holds. -/
-  ilean? : Option System.FilePath := none
   /-- The workspace modules whose `.olean` differs from the one the previous build's `.usekey` records for them: a
   command with one of them among its extra uses is elaborated. -/
   changedExtra : NameSet := {}
@@ -75,8 +74,6 @@ structure Previous extends PreviousUsage where
   consts : NameMap ConstantInfo
   /-- The command of the previous build that added each constant of the module. -/
   ownerCmd : NameMap Nat
-  /-- The previous `.ilean`'s text, for a run that writes an `.ilean`: the one written with the previous `.usage`. -/
-  ilean? : Option String
 
 /-- A keep `Request.decide` allows. -/
 structure Plan where
@@ -135,25 +132,20 @@ inductive Status where
   | declined (reason : String)
   | active (prev : Previous) (progress : IO.Ref Progress)
 
-/-- What a reuse run reads of the module's previous `.olean`, `.usage` and `.ilean` while its header is processed
+/-- What a reuse run reads of the module's previous `.olean` and `.usage` while its header is processed
 (`Request.new`): the files of its keep permit (`readPermitFiles`), why the `.usage` is no JSON object if it is not
-(`parseUsage`), what the `.usage` gives besides the permit's checks, and the `.ilean`'s digest and text, if one is given.
--/
+(`parseUsage`), and what the `.usage` gives besides the permit's checks. -/
 structure Prefetched where
   files : PermitFiles
   unreadable? : Option String
   usage : Except String PreviousUsage
-  ilean? : Option (Except IO.Error (Digest × String))
 
-private def prefetch (olean usage : System.FilePath) (ilean? : Option System.FilePath) (opts : Options) :
-    IO Prefetched :=
+private def prefetch (olean usage : System.FilePath) (opts : Options) : IO Prefetched :=
   profileitIO "reuse prefetch" opts do
     let files ← readPermitFiles olean usage
-    let ilean? ← ilean?.mapM fun f =>
-      (do return (← fileDigest f, ← IO.FS.readFile f) : IO (Digest × String)).toBaseIO
     match files.head >>= parseUsageWithHead files.text with
-    | .error e => return { files, unreadable? := some e, usage := .error e, ilean? }
-    | .ok j => return { files, unreadable? := none, usage := files.record >>= ofJson j, ilean? }
+    | .error e => return { files, unreadable? := some e, usage := .error e }
+    | .ok j => return { files, unreadable? := none, usage := files.record >>= ofJson j }
 where
   ofJson (j : Json) (record : KeepRecord) : Except String PreviousUsage := do
     let records ← j.getObjValAs? (Array CommandRecord) "commands"
@@ -178,7 +170,8 @@ structure Request where
   inputs : Inputs
   /-- The toolchain's library directory, read before recording started (`keepPermit`'s `lib?`). -/
   lib? : Option String
-  /-- Whether the run writes an `.ilean`, which then holds the kept commands' references from the previous one. -/
+  /-- Whether the run writes an `.ilean`, which then holds the kept commands' references from their records
+  (`CommandRecord.refs?`). -/
   writesIlean : Bool
   /-- The digests of this run's file name and source, which a kept command that read them requires unchanged
   (`CommandRecord.fileContext`, `ModuleUsage.fileContextDigests`). -/
@@ -196,7 +189,7 @@ def Request.new (inputs : Inputs) (lib? : Option String) (writesIlean : Bool) (f
     | .ok _ => "the header was not processed"
   let prefetched? ← match inputs.previous with
     | .error _ => pure none
-    | .ok (olean, usage) => some <$> IO.asTask (prefetch olean usage inputs.ilean? opts)
+    | .ok (olean, usage) => some <$> IO.asTask (prefetch olean usage opts)
   let fileContext := (fileContextDigests fileName source).foldl (fun m (k, d) => m.insert k d) {}
   -- accounted (`mkAccountedRef`): the commands write them, and no command's result depends on them
   return { inputs, lib?, writesIlean, fileContext, prefetched?, status := ← mkAccountedRef (.declined reason) }
@@ -212,7 +205,7 @@ private partial def addedNames : AddedConst → Array Name
 def addedConstants (ce : CommandEntries) : Array Name :=
   ce.added.flatMap addedNames
 
-private def readPrevious (env : Environment) (pre : Prefetched) (lib? : Option String) (writesIlean : Bool) :
+private def readPrevious (env : Environment) (pre : Prefetched) (lib? : Option String) :
     IO (Except String Previous) := do
   if let some e := pre.unreadable? then return .error s!"the previous `.usage` cannot be read: {e}"
   let permit ← match ← keepPermitOf env env.mainModule pre.files lib? with
@@ -225,19 +218,9 @@ private def readPrevious (env : Environment) (pre : Prefetched) (lib? : Option S
   let usage ← match pre.usage with
     | .ok usage => pure usage
     | .error e => return .error s!"the previous `.usage` cannot be read: {e}"
-  -- a kept command has no info tree: its references are the previous `.ilean`'s, which must be the one written with
-  -- the previous `.usage` and `.olean`
-  let ilean? ← if !writesIlean then pure none else
-    match pre.ilean?, pre.files.record with
-    | none, _ => return .error "the run writes an `.ilean`, and no previous `.ilean` is given (`--reuse-ilean`)"
-    | some (.error e), _ => return .error s!"the previous `.ilean` cannot be read: {e}"
-    | some (.ok (d, text)), .ok r =>
-      unless r.ilean == some d do return .error "the previous `.ilean` was not written with the previous `.usage`"
-      pure (some text)
-    | some (.ok _), .error e => return .error s!"the previous `.usage` cannot be read: {e}"
   let md := permit.data
   let prev : Previous := {
-    toPreviousUsage := usage, permit, ilean?
+    toPreviousUsage := usage, permit
     payloads := permit.payloads.foldl (fun m ce => m.insert ce.idx ce) {}
     consts := (md.constNames.zip md.constants).foldl (fun m (n, c) => m.insert n c) {}
     ownerCmd := permit.payloads.foldl (init := {}) fun m ce =>
@@ -258,8 +241,7 @@ def Request.start (req : Request) (env : Environment) (opts : Options) : IO Unit
     try
       if env.header.isModule then pure (.declined "module-system") else
       -- the permit's reads of the values the previous build read are not this run's (`valuesChanged?`)
-      match ← withoutValueReads (readPrevious env (← MonadExcept.ofExcept (← IO.wait prefetched)) req.lib?
-          req.writesIlean) with
+      match ← withoutValueReads (readPrevious env (← MonadExcept.ofExcept (← IO.wait prefetched)) req.lib?) with
       | .ok prev => pure (.active prev (← mkAccountedRef {}))
       | .error reason => pure (.declined reason)
     catch e => pure (.declined s!"the previous outputs cannot be read: {e}")
@@ -363,60 +345,98 @@ private def usesChanged (prev : Previous) (env : Environment) (r : CommandRecord
       | _ => return some "stmt"
   return none
 
-/-- Waits for the snapshot tasks `ts` and, recursively, for the tasks of their snapshots. -/
-private partial def waitSnapshots (ts : Array (Language.SnapshotTask Language.SnapshotTree)) : BaseIO Unit :=
-  ts.forM fun t => do waitSnapshots (← IO.wait t.task).children
+/-- Whether the snapshot tasks `ts` and, recursively, the tasks of their snapshots have finished. Waits for none. -/
+private partial def snapshotsFinished (ts : Array (Language.SnapshotTask Language.SnapshotTree)) : BaseIO Bool :=
+  ts.allM fun t => do
+    unless ← IO.hasFinished t.task do return false
+    snapshotsFinished t.task.get.children
 
-/-- The first value among `keys` that code of this process can change (an environment variable, the working
-directory) and that is not now what the previous build read (`PreviousUsage.valueDigests`). Read without recording:
-the check is no read of the run's. -/
+/-- Whether code of this process can change the process value `key` (`takeValueReads`) while a module is compiled:
+an environment variable or the working directory. The others (the executable's path, the toolchain, the SAT solver's
+bytes) are fixed for the process. -/
+private def changeableValue (key : String) : Bool :=
+  key.startsWith "env:" || key == "workingDirectory"
+
+/-- The first value among `keys` that code of this process can change (`changeableValue`) and that is not now what the
+previous build read (`PreviousUsage.valueDigests`). Read without recording: the check is no read of the run's. -/
 private def valueChangedNow (prev : Previous) (keys : Array String) : IO (Option String) := withoutValueReads do
   for k in keys do
-    unless k.startsWith "env:" || k == "workingDirectory" do continue
+    unless changeableValue k do continue
     unless prev.valueDigests[k]? == some (valueDigest? (← currentValue? k)) do return some k
   return none
 
-/-- Which input of an elaborated command `pend` with effects outside it (refusals), with its context `ctx` and the
-reason `uses?` its record does not allow it for what it used (`usesChanged`), is not the previous build's, if one is
-not. Its payload names its effects but not what they did, so it keeps the chain only if what decides them is the
-previous build's: its text, position and context, its extra modules, the constants it used and the process values it
-read. -/
-private def effectInputsChanged (inputs : Inputs) (prev : Previous) (pend : Pending) (r : CommandRecord) (ctx : Digest)
-    (uses? : Option String) : IO (Option String) := do
+/-- Whether a refusal's effect outside the command is decided by what the command's record compares when it keeps the
+chain (`effectInputsChanged`): a write to a reference or promise other code created, a task's cancellation, a write to
+an environment variable, the working directory, the runtime's settings or the standard output or error, whose content
+the command computes. A read of a file, the network, a child process, a mutable native object the command did not
+create, the standard input or the system's state gives the command an input no record holds. A refusal that is no
+effect concerns what the payload expresses, not an input. -/
+private def effectDecidedByRecord : Refusal → Bool
+  | .effect what => ["writes a reference ", "resolves a promise ", "cancels a task ", "writes an environment variable",
+      "changes the working directory", "sets the runtime's ", "sets whether the runtime ", "uses the standard output",
+      "uses the standard error"].any fun (p : String) => what.startsWith p
+  | _ => true
+
+/-- Which input of an elaborated command `pend` with refusals (`ce`'s), with its context `ctx` and the reason `uses?` its
+record does not allow it for what it used (`usesChanged`), may not be the previous build's, if one may. Its payload
+names its effects but not what they did, so it keeps the chain only if every effect is decided by the command's record
+(`effectDecidedByRecord`), the command read no clock or random source (`commandReadNondeterministic`), and what the
+record holds is the previous build's: its text, position and context, its extra modules, the constants it used, the
+file name and source it read (`CommandRecord.fileContext`) and the process values it read. -/
+private def effectInputsChanged (req : Request) (prev : Previous) (pend : Pending) (r : CommandRecord)
+    (ce : CommandEntries) (ctx : Digest) (uses? : Option String) : IO (Option String) := do
+  unless ce.refusals.all effectDecidedByRecord do return some "unrecorded"
+  if ← commandReadNondeterministic pend.i then return some "nondeterministic"
   unless r.text == textDigest pend.stx do return some "text"
   unless r.span == pend.span do return some "position"
   unless contextMatches r ctx do return some "ctx"
-  if r.extra.any (inputs.changedExtra.contains ·.1) then return some "extra"
+  if r.extra.any (req.inputs.changedExtra.contains ·.1) then return some "extra"
+  if let some (what, _) := r.fileContext.find? fun (what, d) => req.fileContext[what]? != some d then
+    return some what
   if uses?.isSome then return uses?
   return (← valueChangedNow prev r.values).map fun _ => "value"
 
-/-- How many of command `i`'s tasks (`unfinishedCommandTasks`) are unfinished once those that end shortly after what the
-run waited for have ended (a task the runtime runs right after the one it waits on finished), waiting up to
-`deadline` (`IO.monoMsNow`). A task that runs longer, such as one waiting for a later command, ends the keeps instead
-of being waited for. -/
-private partial def unfinishedAfter (i : Nat) (deadline : Nat) : BaseIO Nat := do
-  let n ← unfinishedCommandTasks i
-  if n == 0 || (← IO.monoMsNow) ≥ deadline then return n
-  IO.sleep 1
-  unfinishedAfter i deadline
+/-- Whether the work of the elaborated command `pend` that the run knows of has finished (its kernel checks, its
+snapshot tasks such as proofs, compilation and linters, its stateful linters' states, its info trees) and no task the
+command or a realization it used started is unfinished (`unfinishedCommandTasks`). Waits for none of it: code a command
+runs (a tactic, a linter, a task it registers as a snapshot) may wait for a later command, which the command loop
+reaches only after the decision. -/
+private def settled (pend : Pending) : BaseIO Bool := do
+  unless ← IO.hasFinished pend.after.env.checked do return false
+  unless ← snapshotsFinished pend.after.snapshotTasks do return false
+  unless ← pend.after.codeQualityEntryTasks.allM IO.hasFinished do return false
+  if let some t := pend.after.prevLinterStates then
+    unless ← IO.hasFinished t do return false
+  unless ← IO.hasFinished pend.info do return false
+  return (← unfinishedCommandTasks pend.i) == 0
 
-/-- Extends the chain over the pending elaborated commands while each has the previous build's payload, final: the run
-waits for the command's work it knows of (its kernel checks, its snapshot tasks such as proofs, compilation and
-linters, its info trees), and then no task the command started may be unfinished (`unfinishedAfter`), so that no
-effect is noted for it after its payload is computed (`commandPayload`). A keep never depends on a payload that may
-change later. -/
-private def catchUp (inputs : Inputs) (prev : Previous) : StateT Progress IO Unit := do
+/-- How long the run lets an elaborated command's work settle (`settled`) before it keeps no later command, in steps of
+a millisecond's sleep (`settledWithin`). -/
+private def settleSteps : Nat := 10000
+
+/-- Whether `pend` is settled (`settled`) within `steps` checks a millisecond apart. -/
+private partial def settledWithin (pend : Pending) (steps : Nat) : BaseIO Bool := do
+  if ← settled pend then return true
+  if steps == 0 then return false
+  IO.sleep 1
+  settledWithin pend (steps - 1)
+
+/-- Extends the chain over the pending elaborated commands while each has the previous build's payload, final: the
+command's work settles (`settledWithin`, never waiting on it beyond `settleSteps`), so that no effect is noted for it
+after its payload is computed (`commandPayload`); no stateful linter's state changed in it (a kept command after it
+would read the state a fresh build gives, which no record holds: `linterStateChanged`); and if it has refusals, what
+decides its effects is the previous build's (`effectInputsChanged`). A keep never depends on a payload that may change
+later. -/
+private def catchUp (req : Request) (prev : Previous) : StateT Progress IO Unit := do
   let pending := (← get).pending
   modify ({ · with pending := #[] })
+  let linterInits ← Elab.Command.initialLinterStates
   for pend in pending do
     unless (← get).intact do return
-    let kenv ← IO.wait pend.after.env.checked
-    waitSnapshots pend.after.snapshotTasks
-    for t in pend.after.codeQualityEntryTasks do discard <| IO.wait t
-    discard <| IO.wait pend.info
-    unless (← unfinishedAfter pend.i ((← IO.monoMsNow) + 1000)) == 0 do
+    unless ← settledWithin pend settleSteps do
       modify ({ · with intact := false, breakReason := "unsettled" })
       return
+    let kenv := pend.after.env.checked.get
     let taken ← takeRecordedEffects
     modify fun p => { p with effects := p.effects ++ taken }
     let (rs, ce, d) ← commandPayload pend.i pend.before pend.after (← get).effects
@@ -436,17 +456,18 @@ private def catchUp (inputs : Inputs) (prev : Previous) : StateT Progress IO Uni
         let dirty := !same || uses?.isSome || r.usesStmt.any fun (n, _) =>
           if prev.ownerCmd.contains n then ownFullDirty prev p n else importedFullChanged prev pend.before.env n
         set { p with fullDirty := p.fullDirty.insert pend.i dirty }
-        unless ce.refusals.isEmpty do
-          if let some why ← effectInputsChanged inputs prev pend r ctx uses? then broken? := some s!"effect-{why}"
+        if linterStateChanged linterInits pend.before pend.after then
+          broken? := some "linter-state"
+        else unless ce.refusals.isEmpty do
+          if let some why ← effectInputsChanged req prev pend r ce ctx uses? then broken? := some s!"effect-{why}"
     modify fun p => { p with
       chain := chain.push ce d text ctx, intact := broken?.isNone, breakReason := broken?.getD p.breakReason
       computed := p.computed.insert pend.i (rs, ce, d) }
 
 /-- Why the context of command `i`, the command starting from `st`, is not its previous record's (`contextMatches`), if
-it is not, with the context it has. -/
-private def contextChanged? (inputs : Inputs) (prev : Previous) (st : Elab.Command.State) (r : CommandRecord) :
+it is not, with the context it has. The pending commands before it are caught up (`catchUp`) already. -/
+private def contextChanged? (st : Elab.Command.State) (r : CommandRecord) :
     StateT Progress IO (Option String × Digest) := do
-  catchUp inputs prev
   let (ctx, chain) := (← get).chain.ctx st
   modify ({ · with chain })
   unless (← get).intact do return (some (← get).breakReason, ctx)
@@ -465,17 +486,22 @@ private def decideWith (req : Request) (prev : Previous) (i : Nat) (stx : Syntax
   if r.extra.any (req.inputs.changedExtra.contains ·.1) then return .error "extra"
   -- a kept command shows its previous messages, which only a message with a fixed text in its span allows
   if r.messages?.isNone then return .error "messages"
+  -- a kept command's `.ilean` references are its record's (`CommandRecord.refs?`), which a build writing none lacks
+  if req.writesIlean && r.refs?.isNone then return .error "refs"
   if r.linterState then return .error "linter-state"
   if let some (what, _) := r.fileContext.find? fun (what, d) => req.fileContext[what]? != some d then
     return .error what
+  -- the checks below depend on the commands elaborated before: whether their constants changed (`Progress.fullDirty`),
+  -- the process values their work set, and their payloads, which the context hashes
+  (fun p => profileitIO "reuse context check" st.scopes.head!.opts ((catchUp req prev).run p) :
+    StateT Progress IO Unit)
+  unless (← get).intact do return .error (← get).breakReason
   let (changed?, p) ← withoutResolvedNotes do return (usesChanged prev st.env r).run (← get)
   set p
   if let some reason := changed? then return .error reason
   -- the permit compared the process values when the header was processed; an earlier command may have changed one
   if (← valueChangedNow prev r.values).isSome then return .error "value"
-  -- last: the context waits for the payloads of the commands elaborated before
-  let (changed?, ctx) ← fun p => profileitIO "reuse context check" st.scopes.head!.opts
-    ((contextChanged? req.inputs prev st r).run p)
+  let (changed?, ctx) ← contextChanged? st r
   if let some reason := changed? then return .error reason
   return .ok { i, stx, span, record := r, payload := ce, ctx }
 
@@ -528,7 +554,9 @@ private def replayedMessage (fileName : String) (j : Json) : Except String Messa
 (`readdCommandConstants`, `replayCommandEntries`) and restores the command state its record's `post` gives. The state
 has the messages the command reported in the previous build, shown for the file `fileName`, and one info tree, for the
 command alone. Fails on a payload or record that does not fit the environment, before it replays anything when the
-record is at fault: the module's previous outputs are inconsistent. -/
+record is at fault: the module's previous outputs are inconsistent. The realizations the keep made are cached for later
+commands only once it succeeded, so a failed keep leaves nothing outside the command state it started from but the
+names the interpreter resolved (`recordUsedName`). -/
 def Request.keep (req : Request) (plan : Plan) (st : Elab.Command.State) (fileMap : FileMap) (fileName : String) :
     IO Elab.Command.State := do
   let .active prev progress ← req.status.get | throw <| IO.userError "reuse: keep without a permit"
@@ -566,6 +594,10 @@ def Request.keep (req : Request) (plan : Plan) (st : Elab.Command.State) (fileMa
     infoState := { st.infoState with trees := PersistentArray.empty.push tree } }
   let dirty := r.usesStmt.any fun (n, _) =>
     if prev.ownerCmd.contains n then ownFullDirty prev p n else importedFullChanged prev env n
+  -- the values code can change (`changeableValue`) are read again here, in the command's context, so that the runtime
+  -- records them in the order a fresh build reads them; `valueChangedNow` found them to be the previous ones
+  for k in r.values do
+    if changeableValue k then discard <| currentValue? k
   progress.set { p with
     chain := p.chain.push ce digest r.text plan.ctx
     fullDirty := p.fullDirty.insert plan.i dirty
@@ -589,8 +621,6 @@ structure Outcome where
   usedUnattributed : Array Name := #[]
   /-- The previous `.olean`'s data, when a command was kept. -/
   previous? : Option ModuleData := none
-  /-- The previous `.ilean`'s text, when a command was kept and the run writes an `.ilean` (`Previous.ilean?`). -/
-  previousIlean? : Option String := none
   /-- How many lint log entries each command added in the previous build, by command index (`CommandRecord.lints`),
   when a command was kept. -/
   previousLintCounts : Array Nat := #[]
@@ -606,15 +636,16 @@ def Request.finish (req : Request) : IO Outcome := do
       ("reElab", toJson (p.reasons.map (·.1))),
       ("elabReasons", Json.mkObj (counts.toList.map fun (r, n) => (r, toJson n)))]
     if p.kept.isEmpty then return { field, effects := p.effects, computed := p.computed }
-    -- `kept` is in command order: the first kept command that read a value is the first one found
+    -- `kept` is in command order: the first kept command that read a value is the first one found; a value code can
+    -- change was read again where the command was kept (`Request.keep`), so the runtime recorded it
     let firsts := p.kept.foldl (init := ({} : Std.HashMap String Nat)) fun m k =>
-      k.record.values.foldl (fun m key => if m.contains key then m else m.insert key k.i) m
+      k.record.values.foldl (fun m key => if m.contains key || changeableValue key then m else m.insert key k.i) m
     let carried : Carried :=
       { extra := p.kept.flatMap (·.record.extra), resolved := prev.resolved, resolvedAll := prev.resolvedAll
         specKeys := prev.specKeys, allExtra := prev.allExtra
         values := firsts.toArray.filterMap fun (k, i) => (prev.valueDigests[k]?).map (k, ·, i) }
     return { field, kept := p.kept, effects := p.effects, computed := p.computed, carried
              usedUnattributed := prev.usedUnattributed, previous? := some prev.permit.data
-             previousIlean? := prev.ilean?, previousLintCounts := prev.records.map (·.lints) }
+             previousLintCounts := prev.records.map (·.lints) }
 
 end Lean.Elab.Reuse

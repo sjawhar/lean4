@@ -1,5 +1,5 @@
-first build: exit 0, output "count 1\ncount 2"
-fresh build output: "count 1\ncount 2"
+first build: exit 0, output "stdout \"count 1\\ncount 2\\n\", stderr \"\""
+fresh build output: "stdout \"count 1\\ncount 2\\n\", stderr \"\""
 exit codes: reuse 0, fresh 0
 output equal to the fresh build's: true
 kept: 0

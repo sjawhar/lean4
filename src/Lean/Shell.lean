@@ -142,7 +142,6 @@ def displayHelp (useStderr : Bool) : IO Unit := do
   out.putStrLn    "      --usage=file       with -o, add usage-cutoff digests to the olean and write its sidecar to file"
   out.putStrLn    "      --reuse-olean=file, --reuse-usage=file"
   out.putStrLn    "                         with --usage, keep commands from the module's previous .olean and .usage"
-  out.putStrLn    "      --reuse-ilean=file with --reuse-olean, the previous .ilean for the kept commands' references"
   out.putStrLn    "      --reuse-changed-extra=module"
   out.putStrLn    "                         with --reuse-olean, elaborate the commands that used the module whole"
   out.putStrLn    "      --reuse-declined=reason"
@@ -250,7 +249,6 @@ structure ShellOptions where
   incrHeaderSaveFileName? : Option System.FilePath := none
   reuseOleanFileName? : Option System.FilePath := none
   reuseUsageFileName? : Option System.FilePath := none
-  reuseIleanFileName? : Option System.FilePath := none
   reuseChangedExtra : Array Name := #[]
   reuseDeclined? : Option String := none
 
@@ -451,8 +449,6 @@ def ShellOptions.process (opts : ShellOptions)
     return {opts with reuseOleanFileName? := ← checkOptArg "reuse-olean" optArg?}
   | 'Q' => -- `--reuse-usage=file`
     return {opts with reuseUsageFileName? := ← checkOptArg "reuse-usage" optArg?}
-  | 'G' => -- `--reuse-ilean=file`
-    return {opts with reuseIleanFileName? := ← checkOptArg "reuse-ilean" optArg?}
   | 'F' => -- `--reuse-changed-extra=module`
     let arg ← checkOptArg "reuse-changed-extra" optArg?
     return {opts with reuseChangedExtra := opts.reuseChangedExtra.push arg.toName}
@@ -576,8 +572,8 @@ def shellMain (args : List String) (opts : ShellOptions) : IO UInt32 := do
   let reuse? : Option Elab.Reuse.Inputs := match opts.reuseDeclined?, opts.reuseOleanFileName?,
       opts.reuseUsageFileName? with
     | some reason, _, _ => some { previous := .error reason }
-    | none, some olean, some usage => some { previous := .ok (olean, usage), ilean? := opts.reuseIleanFileName?
-                                             changedExtra := opts.reuseChangedExtra.foldl (·.insert ·) {} }
+    | none, some olean, some usage =>
+      some { previous := .ok (olean, usage), changedExtra := opts.reuseChangedExtra.foldl (·.insert ·) {} }
     | _, _, _ => none
   if reuse?.isSome && (opts.oleanFileName?.isNone || opts.usageFileName?.isNone) then
     IO.eprintln "error: --reuse-olean, --reuse-usage and --reuse-declined need -o and --usage"

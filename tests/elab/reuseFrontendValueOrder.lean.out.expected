@@ -1,0 +1,7 @@
+exit codes: reuse 0, fresh 0
+stdout equal: true; stderr equal: true
+olean equal: true; ilean equal: true
+values equal: true
+noreuse equal: true; noreuseReason equal: true
+commands lengths equal: true
+usage fields differing from the fresh build's but `reuse`: []

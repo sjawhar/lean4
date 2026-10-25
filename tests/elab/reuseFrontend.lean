@@ -10,10 +10,10 @@ digest of its syntax, and the payloads before it, which hold their declaration r
 commands with the previous build's text and positions, and every command after an edited or moved one is elaborated. -/
 open Lean
 
-/-- `lean ARGS` in `dir`, with `dir` the search path: its exit code and output. -/
+/-- `lean ARGS` in `dir`, with `dir` the search path: its exit code and its stdout and stderr, each quoted. -/
 def lean (dir : System.FilePath) (args : Array String) : IO (UInt32 × String) := do
   let out ← IO.Process.output { cmd := "lean", args, cwd := dir, env := #[("LEAN_PATH", some dir.toString)] }
-  return (out.exitCode, out.stdout ++ out.stderr)
+  return (out.exitCode, s!"stdout {out.stdout.quote}, stderr {out.stderr.quote}")
 
 /-- Compiles `m` in `dir` with its `.olean`, `.usage` and `.ilean`, with the extra arguments `extra`: its output. -/
 def build (dir : System.FilePath) (m : String) (extra : Array String := #[]) : IO String := do
@@ -29,8 +29,9 @@ def usageOf (file : System.FilePath) : IO Json := do
     unless line.isEmpty do j := j.mergeObj (← IO.ofExcept (Json.parse line))
   return j
 
-/-- The top-level fields of two `.usage` files that differ, `reuse` left out; for `commands`, each record's fields that
-differ, as `commands.I.FIELD`; for `values`, each process value that differs, as `values.KEY`. -/
+/-- The top-level fields of two `.usage` files that differ, `reuse` left out; for `commands`, `commands.length` if the
+numbers of records differ, and each record's fields that differ, as `commands.I.FIELD`; for `values`, each process
+value that differs, as `values.KEY`. -/
 def usageDiff (a b : System.FilePath) : IO (List String) := do
   let fields (j : Json) : List (String × Json) := (j.getObj?.toOption.map (·.toList)).getD []
   let diff (la lb : List (String × Json)) : List String :=
@@ -39,7 +40,8 @@ def usageDiff (a b : System.FilePath) : IO (List String) := do
   let (ja, jb) := (← usageOf a, ← usageOf b)
   let top := (diff (fields ja) (fields jb)).filter (· != "reuse")
   let recs (j : Json) := ((j.getObjValAs? (Array Json) "commands").toOption.getD #[]).toList
-  let cmds := ((recs ja).zip (recs jb)).zipIdx.flatMap fun ((ra, rb), i) =>
+  let len := if (recs ja).length != (recs jb).length then ["commands.length"] else []
+  let cmds := len ++ ((recs ja).zip (recs jb)).zipIdx.flatMap fun ((ra, rb), i) =>
     (diff (fields ra) (fields rb)).map (s!"commands.{i}.{·}")
   let values (j : Json) : List (String × Json) := ((j.getObjValAs? (Array (String × Json)) "values").toOption.getD #[]).toList
   let vals := (diff (values ja) (values jb)).map (s!"values.{·}")
@@ -119,7 +121,7 @@ def step (r f : System.FilePath) (label x m : String) : IO Unit := do
     IO.FS.writeBinFile (r / s!"M.{ext}.old") (← IO.FS.readBinFile (r / s!"M.{ext}"))
   let args := #["-o", "M.olean", "--usage=M.usage", "-i", "M.ilean"]
   let (rcR, out) ← lean r (args ++ #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old",
-    "--reuse-ilean=M.ilean.old", "M.lean"])
+    "M.lean"])
   let (rcF, outF) ← lean f (args ++ #["M.lean"])
   let same := out.replace r.toString "DIR" == outF.replace f.toString "DIR"
   let reuse := ((← usageOf (r / "M.usage")).getObjValD "reuse").compress

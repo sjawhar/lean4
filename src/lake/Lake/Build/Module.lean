@@ -1343,8 +1343,8 @@ inductive ReuseRequest where
 Compiles the module. `setup?` is its `ModuleSetup` if the caller already computed it
 (`Module.skipOrBuild`); otherwise it is computed here. Only with usage cutoff enabled does Lean
 record usage (`--usage`: digests in the `.olean`, the `.usage`) and Lake write the `.usekey`. With it, `lean` may
-keep commands from the module's previous outputs (`reuse`): Lake moves the previous `.olean`, `.usage` and `.ilean`
-aside (`.old`) for the compile and removes them after it, or passes the reason it does not.
+keep commands from the module's previous outputs (`reuse`): Lake moves the previous `.olean` and `.usage` aside
+(`.old`) for the compile and removes them after it, or passes the reason it does not.
 -/
 def Module.buildLean
   (mod : Module) (presetup : ModulePreSetup) (reuse : ReuseRequest) (setup? : Option ModuleSetup := none)
@@ -1365,12 +1365,11 @@ def Module.buildLean
       | .ok changed =>
         let aside (f : FilePath) := f.addExtension "old"
         let mut moved := #[]
-        for f in #[mod.oleanFile, mod.usageFile, mod.ileanFile] do
+        for f in #[mod.oleanFile, mod.usageFile] do
           if ← f.pathExists then
             IO.FS.rename f (aside f)
             moved := moved.push (aside f)
-        let ilean := if moved.contains (aside mod.ileanFile) then #[s!"--reuse-ilean={aside mod.ileanFile}"] else #[]
-        pure (#[s!"--reuse-olean={aside mod.oleanFile}", s!"--reuse-usage={aside mod.usageFile}"] ++ ilean ++
+        pure (#[s!"--reuse-olean={aside mod.oleanFile}", s!"--reuse-usage={aside mod.usageFile}"] ++
           changed.map (s!"--reuse-changed-extra={·}"), moved)
   mod.clearOutputArtifacts
   mod.clearOutputHashes

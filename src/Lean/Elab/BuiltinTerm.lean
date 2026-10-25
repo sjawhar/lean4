@@ -437,8 +437,7 @@ private opaque evalFilePath (stx : Syntax) : TermElabM System.FilePath
 @[builtin_term_elab includeStr] def elabIncludeStr : TermElab
   | `(include_str $path:term), _ => do
     let path ← evalFilePath path
-    let ctx ← readThe Lean.Core.Context
-    let srcPath := System.FilePath.mk ctx.fileName
+    let srcPath := System.FilePath.mk (← getFileName)
     let some srcDir := srcPath.parent
       | throwError "cannot compute parent directory of `{srcPath}`"
     let path := srcDir / path

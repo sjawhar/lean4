@@ -9,7 +9,8 @@ open Lean
 
 def lean (dir : System.FilePath) (args : Array String) : IO (UInt32 × String) := do
   let out ← IO.Process.output { cmd := "lean", args, cwd := dir, env := #[("LEAN_PATH", some dir.toString)] }
-  return (out.exitCode, (out.stdout ++ out.stderr).replace dir.toString "DIR")
+  let norm (s : String) := (s.replace dir.toString "DIR").quote
+  return (out.exitCode, s!"stdout {norm out.stdout}, stderr {norm out.stderr}")
 
 def outputs (m : String) : Array String := #["-o", s!"{m}.olean", s!"--usage={m}.usage", "-i", s!"{m}.ilean"]
 
@@ -49,7 +50,7 @@ def readOr (f : System.FilePath) : IO ByteArray := do
   -- only `b`'s value changes, keeping its length: `a` can be kept
   IO.FS.writeFile (dir / "M.lean") (mSource 3)
   let (rc, out) ← lean dir (outputs "M" ++ #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old",
-    "--reuse-ilean=M.ilean.old", "M.lean"])
+    "M.lean"])
   IO.FS.createDirAll (dir / "f")
   for f in ["L.olean", "L.usage", "M.lean"] do
     IO.FS.writeBinFile (dir / "f" / f) (← IO.FS.readBinFile (dir / f))

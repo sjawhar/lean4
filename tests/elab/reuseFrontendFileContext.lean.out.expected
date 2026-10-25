@@ -1,15 +1,15 @@
-file name: first build: exit 0, f "M.lean"
+file name: first build: exit 0, f stdout "\"M.lean\"\n", stderr ""
 file name: exit codes: reuse 0, fresh 0
 file name: output equal to the fresh build's: true
 file name: olean equal to the fresh build's: true
 file name: ilean equal to the fresh build's: true
 file name: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true
-file name: f: reuse "./M.lean", fresh "./M.lean"
-source length: first build: exit 0, n 78
+file name: f: reuse stdout "\"./M.lean\"\n", stderr "", fresh stdout "\"./M.lean\"\n", stderr ""
+source length: first build: exit 0, n stdout "78\n", stderr ""
 source length: exit codes: reuse 0, fresh 0
 source length: output equal to the fresh build's: true
 source length: olean equal to the fresh build's: true
 source length: ilean equal to the fresh build's: true
 source length: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true
 source length: reuse run kept: 1, elaborated: [1,2]
-source length: n: reuse 82, fresh 82
+source length: n: reuse stdout "82\n", stderr "", fresh stdout "82\n", stderr ""

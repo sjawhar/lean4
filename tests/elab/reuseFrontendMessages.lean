@@ -12,7 +12,8 @@ open Lean
 
 def lean (dir : System.FilePath) (args : Array String) : IO (UInt32 × String) := do
   let out ← IO.Process.output { cmd := "lean", args, cwd := dir, env := #[("LEAN_PATH", some dir.toString)] }
-  return (out.exitCode, (out.stdout ++ out.stderr).replace dir.toString "DIR")
+  let norm (s : String) := (s.replace dir.toString "DIR").quote
+  return (out.exitCode, s!"stdout {norm out.stdout}, stderr {norm out.stderr}")
 
 def outputs : Array String := #["-o", "M.olean", "--usage=M.usage", "-i", "M.ilean"]
 
@@ -40,7 +41,7 @@ def case (r f : System.FilePath) (label : String) (extra : Array String) : IO Un
     IO.FS.writeBinFile (r / s!"M.{ext}.old") (← IO.FS.readBinFile (r / s!"M.{ext}"))
   IO.FS.writeFile (r / "M.lean") (mSource 2)
   let (rcR, outR) ← lean r (outputs ++ extra ++ #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old",
-    "--reuse-ilean=M.ilean.old", "M.lean"])
+    "M.lean"])
   IO.FS.writeFile (f / "M.lean") (mSource 2)
   let (rcF, outF) ← lean f (outputs ++ extra ++ #["M.lean"])
   if extra.isEmpty then IO.println s!"{label}: kept {← kept r}"

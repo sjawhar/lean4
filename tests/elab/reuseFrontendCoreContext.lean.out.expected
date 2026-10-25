@@ -1,0 +1,16 @@
+include_str: first build: exit 0
+include_str: exit codes: reuse 0, fresh 0
+include_str: stdout equal to the fresh build's: true
+include_str: stderr equal to the fresh build's: true
+include_str: olean equal to the fresh build's: true
+include_str: ilean equal to the fresh build's: true
+include_str: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true
+include_str: s: reuse "hello" (exit 0), fresh "hello" (exit 0)
+bv_check: first build: exit 0
+bv_check: exit codes: reuse 0, fresh 0
+bv_check: stdout equal to the fresh build's: true
+bv_check: stderr equal to the fresh build's: true
+bv_check: olean equal to the fresh build's: true
+bv_check: ilean equal to the fresh build's: true
+bv_check: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true
+bv_check: b: reuse "no such file or directory (error code: 2)\n  file: ./b.lrat" (exit 0), fresh "no such file or directory (error code: 2)\n  file: ./b.lrat" (exit 0)

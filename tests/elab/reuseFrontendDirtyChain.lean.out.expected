@@ -1,0 +1,9 @@
+first build: exit 0
+exit codes: reuse 0, fresh 0
+stdout equal to the fresh build's: true
+stderr equal to the fresh build's: true
+olean equal to the fresh build's: true
+ilean equal to the fresh build's: true
+usage equal to the fresh build's but `reuse` and `resolved`: true; commands: reuse 6, fresh 6; `resolved` holds the fresh build's: true
+b kept: true, c kept: true
+reuse run elabReasons: {"messages":1,"text":1}

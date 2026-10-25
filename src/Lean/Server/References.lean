@@ -51,6 +51,19 @@ structure Reference where
   /-- Whether this reference declares `ident`. -/
   isBinder : Bool
 
+/-- The declaration ranges of `ref`'s parent declaration in the final environment of its command (`cmdEnv?`). -/
+def Reference.parentDeclInfo? (ref : Reference) : Option DeclInfo := do
+  -- Use final command env that has decl ranges for current declaration as well
+  let cmdEnv ← ref.ci.cmdEnv?
+  let parentDeclName ← ref.ci.parentDecl?
+  -- Use `local` as it avoids unnecessary blocking, which is especially important when called
+  -- from the snapshot reporter. Specifically, if `ref` is from a tactic of an async theorem,
+  -- `parentDeclName` will not be available in the current environment and we would block only
+  -- to return `none` in the end anyway. At the end of elaboration, we rerun this function on
+  -- the full info tree with the main environment, so the access will succeed immediately.
+  let parentDeclRanges ← declRangeExt.find? (asyncMode := .local) cmdEnv parentDeclName
+  return .ofDeclarationRanges parentDeclRanges
+
 /-- Definition and usages of an identifier within a single module. -/
 structure RefInfo where
   /--
@@ -84,23 +97,11 @@ def addRef (i : RefInfo) (ref : Reference) : RefInfo :=
 /-- Converts `i` to a JSON-serializable `Lsp.RefInfo` and collects its decls. -/
 def toLspRefInfo (i : RefInfo) : StateT Decls BaseIO Lsp.RefInfo := do
   let refToRefInfoLocation (ref : Reference) : StateT Decls BaseIO RefInfo.Location := do
-    let parentDeclName? := ref.ci.parentDecl?
-    let parentDeclNameString? := parentDeclName?.map (·.toString)
-    let parentDeclInfo? : Option DeclInfo := do
-      -- Use final command env that has decl ranges for current declaration as well
-      let cmdEnv ← ref.ci.cmdEnv?
-      let parentDeclName ← parentDeclName?
-      -- Use `local` as it avoids unnecessary blocking, which is especially important when called
-      -- from the snapshot reporter. Specifically, if `ref` is from a tactic of an async theorem,
-      -- `parentDeclName` will not be available in the current environment and we would block only
-      -- to return `none` in the end anyway. At the end of elaboration, we rerun this function on
-      -- the full info tree with the main environment, so the access will succeed immediately.
-      let parentDeclRanges ← declRangeExt.find? (asyncMode := .local) cmdEnv parentDeclName
-      return .ofDeclarationRanges parentDeclRanges
+    let parentDeclNameString? := ref.ci.parentDecl?.map (·.toString)
     if let some parentDeclNameString := parentDeclNameString? then
-      if let some parentDeclInfo := parentDeclInfo? then
+      if let some parentDeclInfo := ref.parentDeclInfo? then
         modify (·.insert parentDeclNameString parentDeclInfo)
-    return .mk ref.range (parentDeclName?.map (·.toString))
+    return .mk ref.range parentDeclNameString?
   let definition? ← i.definition.mapM refToRefInfoLocation
   let usages ← i.usages.mapM refToRefInfoLocation
   return {
@@ -269,6 +270,17 @@ def findReferences (text : FileMap) (trees : Array InfoTree) : Array Reference :
           modify (·.push { ident, range := range.toLspRange text, stx := info.stx, ci, info, isBinder }))
     get
 
+/-- The identifiers that `FVarAliasInfo` nodes in `trees` connect, each as the alias and its base, in visit order. -/
+def fvarAliases (trees : Array InfoTree) : Array (RefIdent × RefIdent) :=
+  Id.run <| StateT.run' (s := #[]) do
+    for tree in trees do
+      tree.visitM' (postNode := fun ci info _ => do
+        if let .ofFVarAliasInfo ai := info then
+          -- FVars can only be aliases of FVars of the same file / module
+          let mod := ci.env.header.mainModule
+          modify (·.push (.fvar mod.toString ai.id.name.toString, .fvar mod.toString ai.baseId.name.toString)))
+    get
+
 /--
 There are several different identifiers that should be considered equal for the purpose of finding
 all references of an identifier:
@@ -281,12 +293,12 @@ all references of an identifier:
 In the first three cases that are not explicitly denoted as aliases with an `FVarAliasInfo`, the
 corresponding `Reference`s have the exact same range.
 This function finds all definitions that have the exact same range as another definition or usage
-and collapses them into a single identifier. It also collapses identifiers connected by
-an `FVarAliasInfo`.
+and collapses them into a single identifier. It also collapses the identifiers connected by
+an `FVarAliasInfo` (`aliases`, see `fvarAliases`).
 When collapsing identifiers, it prefers using a `RefIdent.const name` over a `RefIdent.fvar id` for
 all identifiers that are being collapsed into one.
 -/
-partial def combineIdents (trees : Array InfoTree) (refs : Array Reference) : Array Reference := Id.run do
+partial def combineIdents (aliases : Array (RefIdent × RefIdent)) (refs : Array Reference) : Array Reference := Id.run do
   -- Deduplicate definitions based on their exact range
   let mut posMap : Std.HashMap Lsp.Range RefIdent := ∅
   for ref in refs do
@@ -351,11 +363,8 @@ where
         insertIdMap id baseId
 
     -- apply `FVarAliasInfo`
-    trees.forM (·.visitM' (postNode := fun ci info _ => do
-      if let .ofFVarAliasInfo ai := info then
-        -- FVars can only be aliases of FVars of the same file / module
-        let mod := ci.env.header.mainModule
-        insertIdMap (.fvar mod.toString ai.id.name.toString) (.fvar mod.toString ai.baseId.name.toString)))
+    for (id, baseId) in aliases do
+      insertIdMap id baseId
 
     get
 
@@ -385,20 +394,27 @@ def dedupReferences (refs : Array Reference) (allowSimultaneousBinderUse := fals
   return dedupedRefs.qsort (·.range < ·.range)
 
 /--
-Finds all references in `trees` and deduplicates the result.
-See `dedupReferences` and `combineIdents`.
+Deduplicates `refs`, which `findReferences` found in info trees whose `FVarAliasInfo` nodes give
+`aliases` (`fvarAliases`). See `dedupReferences` and `combineIdents`.
 -/
-def findModuleRefs (text : FileMap) (trees : Array InfoTree) (localVars : Bool := true)
-    (allowSimultaneousBinderUse := false) : ModuleRefs := Id.run do
+def ModuleRefs.ofReferences (refs : Array Reference) (aliases : Array (RefIdent × RefIdent))
+    (localVars : Bool := true) (allowSimultaneousBinderUse := false) : ModuleRefs := Id.run do
   let mut refs :=
     dedupReferences (allowSimultaneousBinderUse := allowSimultaneousBinderUse) <|
-    combineIdents trees <|
-    findReferences text trees
+    combineIdents aliases refs
   if !localVars then
     refs := refs.filter fun
       | { ident := RefIdent.fvar .., .. } => false
       | _ => true
   refs.foldl (init := Std.TreeMap.empty) fun m ref => m.addRef ref
+
+/--
+Finds all references in `trees` and deduplicates the result.
+See `dedupReferences` and `combineIdents`.
+-/
+def findModuleRefs (text : FileMap) (trees : Array InfoTree) (localVars : Bool := true)
+    (allowSimultaneousBinderUse := false) : ModuleRefs :=
+  ModuleRefs.ofReferences (findReferences text trees) (fvarAliases trees) localVars allowSimultaneousBinderUse
 
 /-! # Collecting and maintaining reference info from different sources -/
 

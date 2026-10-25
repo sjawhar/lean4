@@ -7,7 +7,7 @@ Whatever else its command line and inputs hold, it looks like one fresh build fr
   build adds;
 * R7b: the source is read from `/dev/stdin`, a pipe;
 * R8: `--stats` is given; the statistics are printed once;
-* R9: the reuse options are spelled as unambiguous abbreviations (`--reuse-ole=`, `--reuse-usa=`, `--reuse-ile=`).
+* R9: the reuse options are spelled as unambiguous abbreviations (`--reuse-ole=`, `--reuse-usa=`).
 Each case compares the exit code, the normalized output and the `.olean`, `.ilean` and `.usage` (but `reuse`) with a
 fresh build's of the same sources and arguments. -/
 open Lean
@@ -34,7 +34,8 @@ def lean (dir : System.FilePath) (args : Array String) (input? : Option String :
       let exitCode ← child.wait
       pure { exitCode, stdout := ← IO.ofExcept stdout.get, stderr := ← IO.ofExcept stderr.get : IO.Process.Output }
   let stdout := "\n".intercalate ((out.stdout.splitOn "\n").filter (!·.startsWith "number of memory-mapped modules:"))
-  return (out.exitCode, (stdout ++ out.stderr).replace dir.toString "DIR")
+  let norm (s : String) := (s.replace dir.toString "DIR").quote
+  return (out.exitCode, s!"stdout {norm stdout}, stderr {norm out.stderr}")
 
 def outputs (m : String) : Array String := #["-o", s!"{m}.olean", s!"--usage={m}.usage", "-i", s!"{m}.ilean"]
 
@@ -87,8 +88,8 @@ def lineCount (f : System.FilePath) : IO Nat := do
 /-- Compiles `M` in `dir`, reusing its previous outputs if `reuse`. -/
 def compile (c : Case) (dir : System.FilePath) (reuse : Bool) : IO (UInt32 × String) := do
   let reuseOpts := if !reuse then #[] else if c.abbrevOpts then
-      #["--reuse-ole=M.olean.old", "--reuse-usa=M.usage.old", "--reuse-ile=M.ilean.old"]
-    else #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old", "--reuse-ilean=M.ilean.old"]
+      #["--reuse-ole=M.olean.old", "--reuse-usa=M.usage.old"]
+    else #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old"]
   let src := if c.stdin then #["--setup=setup.json", "/dev/stdin"] else #["M.lean"]
   let input? ← if c.stdin then some <$> IO.FS.readFile (dir / "M.lean") else pure none
   lean dir (outputs "M" ++ c.extra ++ reuseOpts ++ src) input?
@@ -141,7 +142,7 @@ def abbrevAccepted : IO Unit := IO.FS.withTempDir fun dir => do
   for ext in ["olean", "usage", "ilean"] do
     IO.FS.writeBinFile (dir / s!"M.{ext}.old") (← IO.FS.readBinFile (dir / s!"M.{ext}"))
   let (rc, out) ← lean dir (outputs "M" ++
-    #["--reuse-ole=M.olean.old", "--reuse-usa=M.usage.old", "--reuse-ile=M.ilean.old", "M.lean"])
+    #["--reuse-ole=M.olean.old", "--reuse-usa=M.usage.old", "M.lean"])
   let (_, reuse) ← usageOf (dir / "M.usage")
   IO.println s!"R9 abbreviations without fallback: exit {rc}, output {out.trimAscii.copy.quote}, kept {reuse.getObjValD "kept"}"
 

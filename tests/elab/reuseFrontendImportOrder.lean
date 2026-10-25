@@ -9,7 +9,8 @@ open Lean
 
 def lean (dir : System.FilePath) (args : Array String) : IO (UInt32 × String) := do
   let out ← IO.Process.output { cmd := "lean", args, cwd := dir, env := #[("LEAN_PATH", some dir.toString)] }
-  return (out.exitCode, (out.stdout ++ out.stderr).replace dir.toString "DIR")
+  let norm (s : String) := (s.replace dir.toString "DIR").quote
+  return (out.exitCode, s!"stdout {norm out.stdout}, stderr {norm out.stderr}")
 
 def outputs (m : String) : Array String := #["-o", s!"{m}.olean", s!"--usage={m}.usage", "-i", s!"{m}.ilean"]
 
@@ -52,7 +53,7 @@ def xOf (dir : System.FilePath) : IO String := do
   IO.FS.writeFile (dir / "M.lean") (mSource "B" "A")
   IO.FS.writeFile (dir / "f" / "M.lean") (mSource "B" "A")
   let (rcR, outR) ← lean dir (outputs "M" ++ #["--reuse-olean=M.olean.old", "--reuse-usage=M.usage.old",
-    "--reuse-ilean=M.ilean.old", "M.lean"])
+    "M.lean"])
   let (rcF, outF) ← lean (dir / "f") (outputs "M" ++ #["M.lean"])
   IO.println s!"exit codes: reuse {rcR}, fresh {rcF}"
   IO.println s!"output equal to the fresh build's: {outR == outF}"

@@ -1,0 +1,18 @@
+config file: first build: exit 0, d "A" (exit 0)
+config file: exit codes: reuse 0, fresh 0
+config file: stdout equal to the fresh build's: true
+config file: stderr equal to the fresh build's: true
+config file: olean equal to the fresh build's: true
+config file: ilean equal to the fresh build's: true
+config file: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true
+config file: d: reuse "B" (exit 0), fresh "B" (exit 0)
+config file: reuse run kept: 0
+source length: first build: exit 0, d "164" (exit 0)
+source length: exit codes: reuse 0, fresh 0
+source length: stdout equal to the fresh build's: true
+source length: stderr equal to the fresh build's: true
+source length: olean equal to the fresh build's: true
+source length: ilean equal to the fresh build's: true
+source length: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true
+source length: d: reuse "168" (exit 0), fresh "168" (exit 0)
+source length: reuse run kept: 0

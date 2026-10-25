@@ -1,7 +1,7 @@
-first build (import A, import B): exit 0, x 2
+first build (import A, import B): exit 0, x stdout "2\n", stderr ""
 exit codes: reuse 0, fresh 0
 output equal to the fresh build's: true
 olean equal to the fresh build's: true
 ilean equal to the fresh build's: true
 usage equal to the fresh build's but `reuse`: true
-x after the swap: reuse 1, fresh 1
+x after the swap: reuse stdout "1\n", stderr "", fresh stdout "1\n", stderr ""
