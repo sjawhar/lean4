@@ -1156,11 +1156,14 @@ def Module.recBuildElabArts (mod : Module) : FetchM (Job ModuleOutputArtifacts) 
   -/
   withRegisterJob mod.name.toString do
   let presetupJob ← mod.presetup.fetch
-  presetupJob.mapM fun presetup => do
+  -- While another build holds the claim of the module's input, the job waits without a thread,
+  -- and then fetches again (see `runWithClaimWaits`)
+  presetupJob.bindM fun presetup => do
     setTrace presetup.trace
-    let arts ← fetchCore presetup
-    let arts ← adjustMTime arts mod.traceFile
-    return arts
+    runWithClaimWaits fun sawDone => do
+      match ← fetchCore presetup sawDone with
+      | .done arts => return .done (← adjustMTime arts mod.traceFile)
+      | .wait wait => return .wait wait
 where
   fetchFromCache? presetup savedTrace restoreAll : JobM ModuleFetchState := do
     let inputHash := (← getTrace).hash
@@ -1209,7 +1212,8 @@ where
           let ltar ← computeArtifact mod.ltarFile "ltar"
           return .complete {arts with ltar? := some ltar}
       return .complete arts
-  fetchCore (presetup : ModulePreSetup) : JobM ModuleOutputArtifacts := do
+  fetchCore (presetup : ModulePreSetup) (sawDone : Bool) :
+      JobM (ClaimLoop ModuleOutputArtifacts) := do
     -- Whether this call compiles the module (not an earlier action of the job it continues)
     let compiledHere ← trackBuilds
     let depTrace ← getTrace
@@ -1220,9 +1224,10 @@ where
       let restore ← mod.pkg.restoreAllArtifacts
       match (← fetchFromCache? presetup savedTrace restore) with
       | .complete arts =>
-        return arts
+        return .done arts
       | .incomplete savedTrace ltar? =>
         let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
+        let mut claim? : Option HeldClaim := none
         if status.isUpToDate then
           unless (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) do
             -- Restoring from the archive stamps the trace with the current input
@@ -1233,26 +1238,33 @@ where
             else
               discard <| mod.buildLean presetup
         else
-          discard <| mod.buildLean presetup
-        if status.isCacheable then
-          let arts ← mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile
-          let arts := {arts with ltar? := arts.ltar? <|> ltar?}
-          -- The trace holds the log of the action that produced the outputs: their replay,
-          -- unpack or build
-          let log := (← readTraceFile mod.traceFile).log
-          -- Queued before the local mapping is written: a build that finds the mapping never
-          -- compiles (or queues) this input. After a crash between the two, the next build
-          -- restores the outputs through the trace without queueing them, so they stay queued once.
-          if (← compiledHere) then
-            -- `lake cache push` packs the per-file outputs into the archive it uploads
-            queueRemotePush mod.pkg depTrace.hash mod.name.toString (some presetup.srcHash)
-              (toJson {arts.descrs with ltar? := none}) log
-          (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs (log := log)
-          return arts
-        else
-          let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
-          return {arts with ltar? := arts.ltar? <|> ltar?}
-    else
+          -- Before it compiles, a build that writes the shared remote cache claims the input.
+          -- While another build holds the claim, the job waits, then fetches again.
+          match ← claimInput mod.pkg depTrace.hash sawDone with
+          | .wait wait => return .wait wait
+          | .compile c? => claim? := c?
+        withClaim claim? do
+          unless status.isUpToDate do
+            discard <| mod.buildLean presetup
+          if status.isCacheable then
+            let arts ← mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile
+            let arts := {arts with ltar? := arts.ltar? <|> ltar?}
+            -- The trace holds the log of the action that produced the outputs: their replay,
+            -- unpack or build
+            let log := (← readTraceFile mod.traceFile).log
+            -- Queued before the local mapping is written: a build that finds the mapping never
+            -- compiles (or queues) this input. After a crash between the two, the next build
+            -- restores the outputs through the trace without queueing them, so they stay queued once.
+            if (← compiledHere) then
+              -- `lake cache push` packs the per-file outputs into the archive it uploads
+              queueCompiledOutputs claim? mod.pkg depTrace.hash mod.name.toString
+                (some presetup.srcHash) (toJson {arts.descrs with ltar? := none}) log
+            (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs (log := log)
+            return .done arts
+          else
+            let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
+            return .done {arts with ltar? := arts.ltar? <|> ltar?}
+    else .done <$> do
       let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
       if status.isUpToDate then
         unless (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) do

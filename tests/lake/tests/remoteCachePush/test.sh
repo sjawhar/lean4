@@ -37,10 +37,12 @@ push_fresh() {
   test_cmd chmod -R u+w "$PUSH_A"
 }
 # Runs a command as machine A: its cache, read-through from `$PUSH_SERVICE`
-# (by default `bearer`) with a token, and the queue on
+# (by default `bearer`) with a token, and the queue on. Claims are off
+# (`../remoteCacheClaim` tests them): with them, a build would start a push that
+# empties the queue these cases count.
 on_a() {
   LAKE_CACHE_DIR="$PUSH_CACHE" LAKE_REMOTE_CACHE="${PUSH_SERVICE:-bearer}" \
-    LAKE_CACHE_TOKEN_CMD="$TOKEN_CMD" LAKE_REMOTE_CACHE_QUEUE=true "$@"
+    LAKE_CACHE_TOKEN_CMD="$TOKEN_CMD" LAKE_REMOTE_CACHE_QUEUE=true LAKE_REMOTE_CACHE_CLAIMS=false "$@"
 }
 # Builds the package on machine A
 build_a() { on_a test_run --dir "$PUSH_A" build $PUSH_TARGETS; }
