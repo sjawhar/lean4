@@ -134,6 +134,46 @@ public def urlOrigin? (url : String) : Option String := do
   return s!"{scheme}://{authority}"
 
 /--
+Whether a request to `url` may carry a credential: it uses HTTPS, or HTTP to a loopback host
+(`localhost`, `127.x.x.x` or `[::1]`), whose traffic does not leave the machine.
+-/
+public def isCredentialSafe (url : String) : Bool := Id.run do
+  let some origin := urlOrigin? url
+    | return false
+  if origin.startsWith "https://" then
+    return true
+  let some authority := origin.dropPrefix? "http://"
+    | return false
+  let authority := authority.copy
+  let host :=
+    if authority.startsWith "[" then
+      (authority.takeWhile (· != ']')).copy ++ "]"
+    else
+      (authority.takeWhile (· != ':')).copy
+  return host == "localhost" || host == "[::1]" ||
+    (host.startsWith "127." && host.all fun c => c.isDigit || c == '.')
+
+/--
+Returns the cache token (see `CacheToken.get?`) for a request to `url`. Errors, without running
+the token command, if the request would send the token over unencrypted HTTP to a host that is
+not a loopback one (see `isCredentialSafe`).
+-/
+public def cacheTokenFor? (url : String) : LogIO (Option String) := do
+  unless isCredentialSafe url do
+    error s!"refusing to send the token of `{CacheToken.cmdVar}` to \
+      {(urlOrigin? url).getD url} over unencrypted HTTP; the artifact endpoint of the service \
+      that `LAKE_REMOTE_CACHE` names must use HTTPS (or a loopback host)"
+  CacheToken.get?
+
+/--
+The `curl` arguments that start a request: with a token, `-q`, so that no `.curlrc` of the user
+applies (it could make `curl` follow redirects, and thus send the token to another host);
+without one, none. `-q` must be the first argument.
+-/
+public def curlLeadArgs (token? : Option String) : Array String :=
+  if token?.isSome then #["-q"] else #[]
+
+/--
 Returns the HTTP status code in the JSON that `curl -w "%{json}"` wrote to `stderr`.
 -/
 public def curlResponseCode (stderr : String) : LogIO Nat := do
@@ -150,16 +190,17 @@ public def curlResponseCode (stderr : String) : LogIO Nat := do
 Performs a HTTP `GET` request of a URL (using `curl` with JSON output) and, if successful,
 return the body.  Otherwise, returns `none` on a 404 and errors on anything else.
 
-With `cacheToken`, the request carries the cache token (see `CacheToken.get?`) and does not
-follow redirects, so that the token goes only to the host of `url`. If the token is refused
-(HTTP 401), the request is retried once with a new token.
+With `cacheToken`, the request carries the cache token (see `cacheTokenFor?`), ignores the
+user's `.curlrc` (see `curlLeadArgs`) and does not follow redirects, so that the token goes only
+to the host of `url`. If the token is refused (HTTP 401), the request is retried once with a new
+token.
 -/
 public def getUrl?
   (url : String) (headers : Array String := #[]) (cacheToken := false)
 : LogIO (Option String) := withLogErrorPos do
   let request (token? : Option String) : LogIO (Nat × IO.Process.Output) :=
     CacheToken.withCurlArgs token? fun authArgs => do
-      let args := #[
+      let args := curlLeadArgs token? ++ #[
           "-s", "-w", "%{stderr}%{json}\n",
           "--retry", "3" -- intermittent network errors can occur
       ] ++ downloadTimeoutArgs ++ authArgs
@@ -167,7 +208,7 @@ public def getUrl?
       let args := headers.foldl (init := args) (· ++ #["-H", ·])
       let out ← captureProc' {cmd := ← Internal.getCurl, args := args.push url}
       return (← curlResponseCode out.stderr, out)
-  let token? ← if cacheToken then CacheToken.get? else pure none
+  let token? ← if cacheToken then cacheTokenFor? url else pure none
   let (code, out) ← request token?
   let (code, out) ← match code, token? with
     | 401, some token => do request (← CacheToken.renew token)
@@ -184,6 +225,6 @@ public def getUrl (url : String) (headers : Array String := #[]) : LogIO String 
   let args := #[
       "-s", "-L",
       "--retry", "3" -- intermittent network errors can occur
-  ] ++ downloadTimeoutArgs
+  ]
   let args := headers.foldl (init := args) (· ++ #["-H", ·])
   captureProc {cmd := ← Internal.getCurl, args := args.push url}
