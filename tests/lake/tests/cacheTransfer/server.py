@@ -22,6 +22,7 @@ a test picks one by pointing an endpoint at it (e.g. `.../corrupt/a0`):
             for a token listed in the `--tokens` file (read on each request,
             so a test can change it), and otherwise as `ok`
   redirect  302 to the same object path under the `--redirect` URL
+  slow      as `ok`, but each `GET` is answered after 2 seconds
 
 A fault that does not apply to a request kind (e.g. `badcount` on a `GET`)
 behaves as `ok`. Like Cloud Storage, a `PUT` with the header
@@ -45,6 +46,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from enum import StrEnum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
@@ -91,6 +93,7 @@ class Mode(StrEnum):
     API_ERROR = "apierror"
     BEARER = "bearer"
     REDIRECT = "redirect"
+    SLOW = "slow"
 
 
 def content_type(path):
@@ -189,6 +192,8 @@ class Handler(BaseHTTPRequestHandler):
         self.log("reset")
 
     def serve(self, mode, path, ctype=None):
+        if mode == Mode.SLOW:
+            time.sleep(2)
         try:
             with open(path, "rb") as f:
                 data = f.read()
