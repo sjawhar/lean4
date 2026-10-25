@@ -55,10 +55,6 @@ public def isCacheExtension (ext : String) : Bool :=
   ext == "c" || ext == "bc" || ext == "o" || ext == "a" || ext == "so" ||
   ext == "dylib" || ext == "dll" || ext == "exe" || ext == "ltar"
 
-/-- Whether an artifact description from an untrusted mapping can name a cache artifact. -/
-public def isRemoteSafe (self : ArtifactDescr) : Bool :=
-  isCacheExtension self.ext && !self.ext.any (fun c => c == '/' || c == '\\')
-
 public instance : ToString ArtifactDescr := ⟨(·.relPath.toString)⟩
 public instance : ToJson ArtifactDescr := ⟨(toJson ·.relPath)⟩
 
@@ -84,6 +80,28 @@ public protected def fromJson? (data : Json) : Except String ArtifactDescr := do
 public instance : FromJson ArtifactDescr := ⟨ArtifactDescr.fromJson?⟩
 
 end ArtifactDescr
+
+/--
+Extracts the artifact descriptors of one output value (as a cache mapping records it), failing on
+the first one that is malformed. `null` and boolean values are metadata, not artifacts.
+-/
+public partial def outputArtifactDescrs? (output : Json) : Except String (Array ArtifactDescr) :=
+  go #[] output
+where
+  go descrs output := do
+    match output with
+    | .null | .bool _ => -- boolean metadata is allowed (as of 2025-03-13)
+      return descrs
+    | .num n =>
+      match Hash.ofJsonNumber? n with
+      | .ok hash => return descrs.push {hash}
+      | .error reason => throw s!"{reason}: {n}"
+    | .str name =>
+      return descrs.push (← ArtifactDescr.ofFilePath? name)
+    | .arr values =>
+      values.foldlM (init := descrs) go
+    | .obj values =>
+      values.foldlM (init := descrs) fun descrs _ value => go descrs value
 
 /-- A file with a known content hash. -/
 public structure Artifact extends descr : ArtifactDescr where

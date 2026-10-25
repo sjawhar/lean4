@@ -11,8 +11,7 @@ public import Lake.Config.Monad
 public import Lake.Util.JsonObject
 public import Lake.Util.IO
 public import Lake.Build.Actions
-import Lake.Util.Url
-import Lake.Config.PushQueue
+public import Lake.Build.RemoteCache
 
 /-! # Common Build Tools
 This file defines general utilities that abstract common
@@ -323,7 +322,9 @@ Runs `build` as a build action of kind `action`.
 
 The build's input trace (`depTrace`), JSON description of the result of `build`,
 and log are saved to `traceFile`, if the build completes without a fatal error
-(i.e., it does not `throw`).
+(i.e., it does not `throw`). Then, for an action of kind `.build`, it sets the job's
+`JobState.built`: set after `build` returns, so a site within `build` that clears the flag
+cannot clear it for this action.
 -/
 @[specialize] public def buildAction
   [ToOutputJson α]
@@ -345,6 +346,8 @@ and log are saved to `traceFile`, if the build completes without a fatal error
       let log := (← getLog).takeFrom iniPos
       writeBuildTrace traceFile depTrace (toOutputJson a) log
       removeFileIfExists noBuildTraceFile
+      if action matches .build then
+        modify ({· with built := true})
       return a
     finally
       let endTime ← IO.monoMsNow
@@ -590,94 +593,6 @@ public class ResolveOutputs (α : Type) where
   resolveOutputs (out : CacheOutput) : JobM α
 
 
-def currentRemoteCacheTarget : JobM String := do
-  let key :: _ ← getCallStack
-    | error "could not determine the current build key for remote cache lookup"
-  return key.toString
-
-def recordRemoteReadFailure (message : String) : JobM Unit := do
-  let status := (← getBuildContext).remoteReadStatus
-  liftM (m := BaseIO) <| status.modify (·.add message)
-
-def readRemoteOutputs?
-  (inputHash : Hash) (pkg : Package) (target : String) (srcHash? : Option Hash)
-: JobM (Option CacheOutput) := do
-  let ws ← getWorkspace
-  let some serviceName := ws.lakeEnv.remoteCache?
-    | return none
-  try
-    let some service := ws.findCacheService? serviceName
-      | error s!"remote cache service `{serviceName}` is not configured"
-    if service.isReservoir then
-      error s!"remote cache service `{serviceName}` must have kind `s3`"
-    let scope := remoteCacheScope ws.lakeEnv.leanGithash pkg.cacheScope
-    let url := service.remoteMappingUrl scope inputHash
-    let contents? ← getUrl? url (cacheToken := service.sendsCacheToken url)
-      (maxFileSize? := some remoteCacheMaxFileSize)
-    let some contents := contents?
-      | logVerbose s!"remote cache mapping miss for input `{inputHash}` at {url}"
-        return none
-    let json ← match Json.parse contents with
-      | .ok json => pure json
-      | .error e => error s!"remote mapping is invalid JSON: {e}"
-    let mapping ← match RemoteCacheMapping.fromJson? json with
-      | .ok mapping => pure mapping
-      | .error e => error s!"remote mapping is invalid: {e}"
-    unless mapping.inputHash == inputHash do
-      error s!"remote mapping inputHash mismatch: expected {inputHash}, got {mapping.inputHash}"
-    unless mapping.target == target do
-      error s!"remote mapping target mismatch: expected {target}, got {mapping.target}"
-    unless mapping.srcHash? == srcHash? do
-      error s!"remote mapping srcHash mismatch"
-    match mapping.checkedArtifactDescrs with
-    | .ok _ => pure ()
-    | .error e => error s!"remote mapping is invalid: {e}"
-    let cache ← getLakeCache
-    let act := cache.writeOutputs pkg.cacheScope inputHash mapping.data service.name?
-      (some (.ofString scope)) (log := mapping.log) (sha256? := some mapping.sha256)
-      (overwrite := false)
-    if let .error e ← act.toBaseIO then
-      error s!"could not write remote mapping to local cache: {e}"
-    cache.readOutputs? pkg.cacheScope inputHash
-  catch e =>
-    let log ← takeLogFrom e
-    let msg := log.entries.foldl (init := "") fun msg entry =>
-      if msg.isEmpty then entry.message else s!"{msg}\n- {entry.message}"
-    let msg := if msg.isEmpty then "remote cache read failed" else msg
-    recordRemoteReadFailure msg
-    -- Cache failures remain verbose so --wfail and --iofail builds still compile locally.
-    logVerbose s!"remote cache read for input `{inputHash}` failed:\n{msg}"
-    return none
-
-/--
-**For internal use only.**
-Appends outputs that this Lake process just compiled to the write-back queue of the shared remote
-cache (`Cache.appendPushQueue`), which `lake cache push` uploads, if the queue is on (see
-`Env.remoteCacheQueueService?`). Call it only where this process ran the compiler or linker that
-produced `data`: never for outputs that were replayed, unpacked, fetched or restored.
-
-Nothing is queued while usage cutoff is on (`LAKE_USAGE_CUTOFF` is true): a build with usage
-cutoff can keep outputs that were compiled for another input, and only fresh compiles with usage
-cutoff off are published.
--/
-public def queueRemotePush
-  (pkg : Package) (inputHash : Hash) (target : String) (srcHash? : Option Hash)
-  (data : Json) (log : Log)
-: JobM Unit := do
-  let ws ← getWorkspace
-  let some service := ws.lakeEnv.remoteCacheQueueService?
-    | return
-  if ((← IO.getEnv "LAKE_USAGE_CUTOFF").bind envToBool?).getD false then
-    return
-  let entry := {
-    service, inputHash, target, srcHash?, data
-    remoteScope := remoteCacheScope ws.lakeEnv.leanGithash pkg.cacheScope
-    -- As in the local mapping, verbose entries (which name the tree's paths) are not kept
-    log := log.filter (·.level ≥ .info)
-  }
-  if let .error e ← (ws.lakeCache.appendPushQueue entry).toBaseIO then
-    logWarning s!"could not queue the outputs of `{target}` for the remote cache: {e}"
-
 open ResolveOutputs in
 /--
 Retrieve artifacts from the Lake cache using only the outputs
@@ -755,7 +670,7 @@ along with the build log stored with them.
 public def resolveArtifact
   (descr : ArtifactDescr)
   (service? : Option CacheServiceName) (scope? : Option CacheServiceScope) (exe := false)
-  (sha256? : Option Json := none)
+  (sha256? : Option Sha256Map := none)
 : JobM Artifact := do
   let ws ← getWorkspace
   let path := ws.lakeCache.artifactDir / descr.relPath
@@ -771,23 +686,18 @@ public def resolveArtifact
           | error s!"artifact with associated cache service but no scope"
         match sha256? with
         | some sha256s =>
-          let sha256 ← match RemoteCacheMapping.remoteSha256For sha256s descr with
-            | .ok sha256 => pure sha256
-            | .error e => error e
+          let some sha256 := sha256s.get? descr.relPath.toString
+            | error s!"remote mapping has no SHA-256 for artifact `{descr}`"
           let url := service.remoteArtifactUrl scope.toString sha256
           logVerbose s!"\
             downloaded remote artifact {descr.hash}\
             \n  local path: {path}\
             \n  remote URL: {url}"
           try
-            liftM <| downloadRemoteArtifactCore descr.hash sha256 url path
-              (service.sendsCacheToken url)
+            liftM <| downloadArtifactCore descr.hash url path (service.sendsCacheToken url)
+              (sha256? := some sha256) (maxFileSize? := some remoteCacheMaxFileSize)
           catch e =>
-            let log ← takeLogFrom e
-            let msg := log.entries.foldl (init := "remote artifact download failed") fun _ entry =>
-              entry.message
-            recordRemoteReadFailure msg
-            error msg
+            error (← recordRemoteReadFailure (← takeLogFrom e) "remote artifact download failed")
         | none =>
           let url := service.artifactUrl descr.hash scope
           logVerbose s!"\
@@ -888,6 +798,8 @@ public def buildArtifactUnlessUpToDate
   (text := false) (ext := "art") (restore := false) (exe := false)
   (platformIndependent := false)
 : JobM Artifact := do
+  -- Cleared on entry: a job's state carries the flag of the jobs it continues (`JobState.built`)
+  modify ({· with built := false})
   let depTrace ← getTrace
   let traceFile := FilePath.mk <| file.toString ++ ".trace"
   let savedTrace ← readTraceFile traceFile
@@ -911,9 +823,7 @@ public def buildArtifactUnlessUpToDate
           return art
         else
           let status ← savedTrace.replayIfUpToDate' file depTrace
-          -- Whether this call ran `build` (the job's action merges all actions of the job)
-          let built := !status.isUpToDate
-          if built then
+          unless status.isUpToDate do
             discard <| doBuild depTrace traceFile
           if status.isCacheable then
             let art ← cacheArtifact file ext text exe restore
@@ -922,7 +832,7 @@ public def buildArtifactUnlessUpToDate
             -- Queued before the local mapping is written: a build that finds the mapping never
             -- compiles (or queues) this input. After a crash between the two, the next build
             -- restores the outputs through the trace without queueing them, so they stay queued once.
-            if built then
+            if (← getThe JobState).built then
               queueRemotePush pkg inputHash (← currentRemoteCacheTarget) none (toJson art.descr) log
             (← getLakeCache).writeOutputs pkg.cacheScope inputHash art.descr (log := log)
             return art

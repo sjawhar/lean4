@@ -17,10 +17,10 @@ An OAuth bearer token for a remote cache service that accepts no other credentia
 prints the token, in the manner of Git credential helpers or the AWS `credential_process`.
 
 Lake runs the command only when a request that needs the token is about to be sent, never at
-startup, and reuses its token for at most 45 minutes (a Google access token lasts an hour). The
-token reaches `curl` only through a configuration file that only the user can read, which is
-removed after the request. It is never on a command line, in a log, or in the environment of a
-process that Lake starts.
+startup, stops it if it has not ended within 60 seconds, and reuses its token for at most 45
+minutes (a Google access token lasts an hour). The token reaches `curl` only through a
+configuration file that only the user can read, which is removed after the request. It is never
+on a command line, in a log, or in the environment of a process that Lake starts.
 -/
 
 open System
@@ -36,6 +36,9 @@ def maxAgeMs : Nat := 45 * 60 * 1000
 /-- How long Lake reports a failure of the command again without running it: 60 s, in milliseconds. -/
 def failureAgeMs : Nat := 60 * 1000
 
+/-- How long the command may run: 60 s, in milliseconds. Then Lake stops it. -/
+def timeLimitMs : Nat := 60 * 1000
+
 structure Cached where
   token : String
   /-- The monotonic time (in milliseconds) at which the command that printed the token started. -/
@@ -44,7 +47,7 @@ structure Cached where
 structure State where
   /-- The token of this Lake process, if any has been obtained. -/
   token? : Option Cached := none
-  /-- The error of the last run of the command and the time it started, if that run failed. -/
+  /-- The error of the last run of the command and the time it ended, if that run failed. -/
   failure? : Option (String × Nat) := none
   deriving Inhabited
 
@@ -58,23 +61,48 @@ Such a token has no quote, backslash, or whitespace, so it is safe in a `curl` c
 def isTokenChar (c : Char) : Bool :=
   c.isAlphanum || c matches '-' | '.' | '_' | '~' | '+' | '/' | '='
 
+/-- Waits until `task` has finished or the monotonic clock reaches `deadline` (in milliseconds). -/
+partial def waitUntil (task : Task α) (deadline : Nat) : BaseIO Bool := do
+  if ← IO.hasFinished task then
+    return true
+  if (← IO.monoMsNow) ≥ deadline then
+    return false
+  IO.sleep 20
+  waitUntil task deadline
+
 /--
 Runs the token command `cmd` with `sh -c` and returns the token it printed
 (its standard output, trimmed). Its standard error goes to Lake's standard error,
 and it reads no standard input, so a command that asks a question fails instead of waiting.
+The command runs in a session of its own: if it has not ended after 60 seconds (`timeLimitMs`),
+Lake kills it and every process it started, and the run fails.
 Errors name `cmdVar`, but never include what the command printed.
 -/
 def run (cmd : String) : BaseIO (Except String String) := do
-  let act : IO (String × UInt32) := do
+  let act : IO (Option (String × UInt32)) := do
     let child ← IO.Process.spawn {
       cmd := "sh", args := #["-c", cmd]
       stdin := .null, stdout := .piped, stderr := .inherit
+      setsid := true
     }
-    let out ← child.stdout.readToEnd
-    return (out, ← child.wait)
+    let deadline := (← IO.monoMsNow) + timeLimitMs
+    let output ← IO.asTask (prio := .dedicated) do
+      let out ← child.stdout.readToEnd
+      return (out, ← child.wait)
+    if ← waitUntil output deadline then
+      return some (← MonadExcept.ofExcept output.get)
+    -- Kills the command's process group (it may have ended in the meantime)
+    try child.kill catch _ => pure ()
+    -- Gives the reader a moment to see the end of the output and reap the command, but never
+    -- waits on a process that left the group and still holds the pipe
+    discard <| waitUntil output ((← IO.monoMsNow) + 1000)
+    return none
   match (← act.toBaseIO) with
   | .error e => return .error s!"failed to run `{cmdVar}`: {e}"
-  | .ok (out, rc) =>
+  | .ok none =>
+    return .error s!"`{cmdVar}` printed no token within {timeLimitMs / 1000} seconds; \
+      Lake stopped it"
+  | .ok (some (out, rc)) =>
     if rc != 0 then
       return .error s!"`{cmdVar}` exited with code {rc}"
     let token := out.trimAscii.copy
@@ -88,9 +116,10 @@ def run (cmd : String) : BaseIO (Except String String) := do
 Returns the token of this Lake process, or `none` if `LAKE_CACHE_TOKEN_CMD` is unset or empty.
 
 The first call runs the command; later calls reuse its token until it is 45 minutes old.
-Concurrent calls run the command at most once. If the command fails, calls in the next
-60 seconds report its error without running it again, so that a build whose many downloads
-all need the token fails once instead of waiting for the command once per download.
+Concurrent calls run the command at most once. If the command fails (or Lake stops it after
+60 seconds), calls in the next 60 seconds report its error without running it again, so that a
+build whose many downloads all need the token fails once instead of waiting for the command once
+per download.
 -/
 public def get? : LogIO (Option String) := do
   let some cmd ← IO.getEnv cmdVar
@@ -109,7 +138,7 @@ public def get? : LogIO (Option String) := do
     let r ← run cmd
     match r with
     | .ok token => set ({token? := some {token, startedAt := now}} : State)
-    | .error msg => set ({failure? := some (msg, now)} : State)
+    | .error msg => set ({failure? := some (msg, ← IO.monoMsNow)} : State)
     return r
   match r with
   | .ok token => return some token

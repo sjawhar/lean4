@@ -9,8 +9,10 @@ prelude
 public import Lake.Config.Env
 public import Lake.Config.LakeConfig
 import Lake.Config.PushQueue
+import Lake.Config.RemoteCache
 import Lake.Build.Common
 import Lake.Build.Module
+import Lake.Build.RemoteCache
 import Lake.Util.IO
 import Lake.Util.JsonObject
 import Lake.Util.Proc
@@ -162,12 +164,9 @@ def removeDone (lines : Array String) (done : Std.HashMap String Nat) : Array St
     | _ => kept := kept.push line
   return kept
 
-/-- Returns the `s3` cache service named `name` in the Lake configuration. -/
+/-- Returns the `s3` cache service named `name` in the Lake configuration, with the push's key. -/
 def findPushService (ctx : PushContext) (name : String) : Except String CacheService := do
-  let some service := ctx.lakeCfg.cacheServices.find? (.mkSimple name)
-    | throw s!"remote cache service `{name}` is not configured"
-  if service.isReservoir then
-    throw s!"remote cache service `{name}` must have kind `s3`"
+  let service ← ctx.lakeCfg.findRemoteCacheService? name
   return if let some key := ctx.env.cacheKey? then service.withKey key else service
 
 /--
@@ -212,12 +211,9 @@ def verifyArtifacts
 /-- Writes the remote mapping of `entry` into `dir`, and makes the entry ready for upload. -/
 def stageMapping
   (dir : FilePath) (idx : Nat) (entry : RemotePushEntry) (service : CacheService)
-  (data : Json) (sha256 : JsonObject) (artifacts : Array RemoteUpload) (bytes : Nat)
+  (data : Json) (sha256 : Sha256Map) (artifacts : Array RemoteUpload) (bytes : Nat)
 : IO StagedEntry := do
-  let mapping : RemoteCacheMapping := {
-    inputHash := entry.inputHash, target := entry.target, srcHash? := entry.srcHash?
-    data, sha256, log := entry.log
-  }
+  let mapping : RemoteCacheMapping := {entry.toRemoteOutputs with data, sha256}
   let path := dir / "mapping.json"
   IO.FS.writeFile path mapping.toJson.compress
   let url := service.remoteMappingUrl entry.remoteScope entry.inputHash
@@ -235,7 +231,7 @@ def stageOutputs
 : LoggerIO StagedEntry := do
   let some contents ← verifyArtifacts ctx.cache entry.target json descrs
     | return .dropped
-  let mut sha256 : JsonObject := {}
+  let mut sha256 : Sha256Map := {}
   let mut artifacts := #[]
   for descr in descrs, bytes in contents do
     -- A private copy, so the upload sends exactly the bytes that were verified
@@ -279,7 +275,7 @@ def stageModule
   let digest := sha256Bytes bytes
   let artifact := {path := ltar, url := service.remoteArtifactUrl entry.remoteScope digest, hash := descr.hash}
   stageMapping dir idx entry service (toJson descr)
-    (JsonObject.empty.insert descr.relPath.toString digest) #[artifact]
+    (({} : Sha256Map).insert descr.relPath.toString digest) #[artifact]
     (contents.foldl (· + ·.size) bytes.size)
 
 /--
@@ -325,14 +321,14 @@ def stageLine (ctx : PushContext) (dir : FilePath) (idx : Nat) (line : String) :
     let files ← match descrs.ltarFiles with
       | .ok files => pure files
       | .error e => return ← invalid s!"{entry.target}: {e}"
-    unless files.all (·.1.isRemoteSafe) do
+    unless files.all (ArtifactDescr.isCacheExtension ·.1.ext) do
       return ← invalid s!"{entry.target}: an output has an unsupported extension"
     stageModule ctx dir idx entry json service stem descrs files
   else
     let descrs ← match outputArtifactDescrs? entry.data with
       | .ok descrs => pure descrs
       | .error e => return ← invalid s!"{entry.target}: {e}"
-    unless descrs.all (·.isRemoteSafe) do
+    unless descrs.all (ArtifactDescr.isCacheExtension ·.ext) do
       return ← invalid s!"{entry.target}: an output has an unsupported extension"
     stageOutputs ctx dir idx entry json service descrs
 
