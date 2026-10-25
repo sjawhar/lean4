@@ -2,7 +2,12 @@
 # Copyright (c) 2026 Lean FRO. All rights reserved.
 # Released under Apache 2.0 license as described in the file LICENSE.
 
-"""Seed input-hash remote cache mappings from a local Lake build."""
+"""Seed input-hash remote cache mappings from a local Lake build.
+
+With `--bad FIELD --bad-target TARGET`, the mapping of the target named TARGET (e.g. the module
+`Test.Basic`) is corrupted in FIELD, and the names of its artifacts are printed, one per line.
+The target is chosen by name because the order of the outputs file follows the input hashes.
+"""
 
 import argparse
 import glob
@@ -72,7 +77,10 @@ def main():
     parser.add_argument(
         "--bad", choices=("srcHash", "target", "inputHash", "sha256", "ext")
     )
+    parser.add_argument("--bad-target", help="the target whose mapping `--bad` corrupts")
     args = parser.parse_args()
+    if (args.bad is None) != (args.bad_target is None):
+        parser.error("--bad and --bad-target go together")
 
     traces = module_traces(args.build)
     with open(args.outputs) as file:
@@ -81,7 +89,7 @@ def main():
         raise ValueError("outputs file does not begin with its schema version")
 
     root = os.path.join(args.store, *args.scope.split("/"))
-    changed = False
+    corrupted = False
     for input_hash, data in lines[1:]:
         if input_hash in traces:
             target, trace = traces[input_hash]
@@ -111,8 +119,9 @@ def main():
             "sha256": sha256,
             "log": log,
         }
-        if args.bad and not changed:
-            changed = True
+        if args.bad and target == args.bad_target:
+            corrupted = True
+            print("\n".join(sha256))
             if args.bad == "srcHash":
                 mapping["srcHash"] = "0000000000000000"
             elif args.bad == "target":
@@ -135,6 +144,8 @@ def main():
         os.makedirs(os.path.dirname(destination), exist_ok=True)
         with open(destination, "w") as file:
             json.dump(mapping, file, separators=(",", ":"))
+    if args.bad and not corrupted:
+        raise ValueError("no mapping has the target " + args.bad_target)
 
 
 if __name__ == "__main__":

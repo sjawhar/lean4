@@ -694,9 +694,8 @@ where
     else if service.usesCacheToken then
       return service
     else
-      error "uploads require an authentication key configured through `LAKE_CACHE_KEY` \
-        (or, for the service that `LAKE_REMOTE_CACHE` names, a token command configured \
-        through `LAKE_CACHE_TOKEN_CMD`)"
+      let name := service.name?.map (·.toString) |>.getD "the upload service"
+      error (CacheService.uploadCredentialError s!"`{name}`")
   invalidEndpointConfig key? artifactEndpoint? revisionEndpoint? :=
     s!"invalid endpoint configuration:\
     \n  LAKE_CACHE_KEY is {if key?.isNone then "unset" else "set"}\
