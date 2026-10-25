@@ -92,23 +92,24 @@ public def JobQueue := IO.Ref (Array OpaqueJob)
   IO.mkRef #[]
 
 /--
-A value split into 1024 shards, each behind its own mutex, so that threads that use different shards do not wait for
-each other. The data of a key with hash `h` is in shard `Shards.index h`.
+A value split into `n` shards, each behind its own mutex, so that threads that use different shards do not wait for
+each other. The data of a key with hash `h` is in shard `Shards.index n h`.
 -/
-public structure Shards (α : Type) where
-  shards : Vector (Std.Mutex α) 1024
+public structure Shards (n : Nat) (α : Type) where
+  shards : Vector (Std.Mutex α) n
 
-/-- 1024 shards, each holding `a`. -/
-public def Shards.new (a : α) : BaseIO (Shards α) :=
-  return ⟨← (Vector.replicate 1024 ()).mapM fun _ => Std.Mutex.new a⟩
+/-- `n` shards, each holding `a`. -/
+public def Shards.new (n : Nat) (a : α) : BaseIO (Shards n α) :=
+  return ⟨← (Vector.replicate n ()).mapM fun _ => Std.Mutex.new a⟩
 
-/-- The shard of hash `h`, from its top bits: a `Lean.PersistentHashMap` in a shard branches on the low bits. -/
-@[inline] public def Shards.index (h : UInt64) : Fin 1024 :=
-  ⟨(h >>> 54).toNat % 1024, Nat.mod_lt _ (by decide)⟩
+/-- The shard of hash `h` among `n`, from its high bits: a `Lean.PersistentHashMap` in a shard branches on the low
+bits. -/
+@[inline] public def Shards.index (n : Nat) [NeZero n] (h : UInt64) : Fin n :=
+  ⟨(h >>> 32).toNat % n, Nat.mod_lt _ (Nat.pos_of_ne_zero (NeZero.ne n))⟩
 
 /-- The shard of a key with hash `h`. -/
-@[inline] public def Shards.get (s : Shards α) (h : UInt64) : Std.Mutex α :=
-  s.shards[Shards.index h]
+@[inline] public def Shards.get [NeZero n] (s : Shards n α) (h : UInt64) : Std.Mutex α :=
+  s.shards[Shards.index n h]
 
 /--
 The kernel constants, as name hashes (`Name.hash`), that usage-cutoff checks read from `.olean` files
@@ -149,7 +150,7 @@ public structure BuildContext extends BuildConfig, Context where
   only a read of the same contents, or a file whose current stamp is the recorded one. Sharded by the path's hash, and
   persistent, as `kernelProviders` is.
   -/
-  sidecarCache : Shards
+  sidecarCache : Shards 1024
     (Lean.PHashMap FilePath (Option Lean.ModuleUsage.FileStamp × Lean.ModuleUsage.Digest × Dynamic))
   /--
   The content hashes (`Lean.ModuleUsage.fileDigest`) that usage-cutoff checks computed in this build, each with the
@@ -163,7 +164,7 @@ public structure BuildContext extends BuildConfig, Context where
   through a stream to a temporary file it then renames (`src/library/module.cpp:314,408`) and maps the files it
   reads `MAP_PRIVATE` (`:528`).
   -/
-  fileDigests : Shards (Lean.PHashMap FilePath (Lean.ModuleUsage.FileStamp × Lean.ModuleUsage.Digest))
+  fileDigests : Shards 1024 (Lean.PHashMap FilePath (Lean.ModuleUsage.FileStamp × Lean.ModuleUsage.Digest))
   /-- The kernel constants usage-cutoff checks read from `.olean` files in this build. -/
   kernelProviders : Std.Mutex KernelProviders
 

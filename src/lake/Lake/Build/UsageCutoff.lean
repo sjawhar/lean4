@@ -294,25 +294,19 @@ The hashes of the files one usage-cutoff check (`Module.usageUpToDate`, `Module.
 read, so that every `importUsage?` binding of the check is to one hash of each file, also in the check's parallel
 tasks (`parallelRuns`), which share it. A check never reuses another's: another workspace's build can
 rebuild a shared dependency between two checks. Across checks, a file's hash is reused only while its stamp shows its
-bytes unchanged (`BuildContext.fileDigests`). Split into 256 shards by the path's hash, each behind its own mutex: the
-check's tasks hash about every file of the closure, and one mutex for all of them is contended. Persistent, because
-the tasks share it: an insert into a hash map that other threads can reach copies the whole map.
+bytes unchanged (`BuildContext.fileDigests`). Split into 256 shards by the path's hash (`Shards`): the check's tasks
+hash about every file of the closure, and one mutex for all of them is contended. Persistent, because the tasks share
+it: an insert into a hash map that other threads can reach copies the whole map.
 -/
-public structure ContentHashes where
-  shards : Vector (Std.Mutex (PHashMap FilePath ModuleUsage.Digest)) 256
+public abbrev ContentHashes := Shards 256 (PHashMap FilePath ModuleUsage.Digest)
 
 /-- An empty `ContentHashes`, for one check. -/
 public def ContentHashes.new : BaseIO ContentHashes :=
-  return ⟨← (Vector.replicate 256 ()).mapM fun _ => Std.Mutex.new {}⟩
-
-/-- The shard of `file`, from the top bits of its hash: a `Lean.PersistentHashMap` in a shard branches on the low bits. -/
-@[inline] def ContentHashes.shard (hashes : ContentHashes) (file : FilePath) :
-    Std.Mutex (PHashMap FilePath ModuleUsage.Digest) :=
-  hashes.shards[(⟨(hash file >>> 56).toNat % 256, Nat.mod_lt _ (by decide)⟩ : Fin 256)]
+  Shards.new _ {}
 
 /-- The hash the check recorded for `file`, if any. -/
 public def ContentHashes.find? (hashes : ContentHashes) (file : FilePath) : BaseIO (Option ModuleUsage.Digest) :=
-  (hashes.shard file).atomically (return (← get).find? file)
+  (hashes.get (Hashable.hash file)).atomically (return (← get).find? file)
 
 /--
 Records `hash` for `file` unless the check recorded a hash for it first, and returns the recorded one. A path has one
@@ -320,7 +314,7 @@ shard, and the first insert under that shard's mutex wins, so every task of the 
 -/
 public def ContentHashes.record (hashes : ContentHashes) (file : FilePath) (hash : ModuleUsage.Digest) :
     BaseIO ModuleUsage.Digest :=
-  (hashes.shard file).atomically <| modifyGet fun all => match all.find? file with
+  (hashes.get (Hashable.hash file)).atomically <| modifyGet fun all => match all.find? file with
     | some first => (first, all)
     | none => (hash, all.insert file hash)
 
