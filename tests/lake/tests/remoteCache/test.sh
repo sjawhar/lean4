@@ -678,11 +678,12 @@ PUSH_QUEUE="$PUSH_CACHE/push.jsonl"
 PUSH_STATUS="$PUSH_CACHE/remote-status-push.json"
 PUSH_DROPPED="$PUSH_CACHE/push-dropped.jsonl"
 PUSH_SCOPE="$(remote_scope push)"
-PUSH_TARGETS="Push pushexe pair"
-# What a fresh build of those targets compiles: four modules (`Push`, `Push.Basic`,
-# `Push.Admit` and `Main`), the object file and the executable of `pushexe`, and
-# the two files of `pair`
-PUSH_COMPILES=8
+PUSH_TARGETS="Push Pre pushexe pair"
+# What a fresh build of those targets compiles: six modules (`Push`, `Push.Basic`,
+# `Push.Admit`, `Pre`, `Pre.Hello` and `Main`), the object file and the
+# executable of `pushexe`, the object file and the shared library of the
+# precompiled `Pre.Hello`, and the two files of `pair`
+PUSH_COMPILES=12
 
 push_check() { "$PYTHON" "$TEST_DIR/push_check.py" "$@"; }
 # Starts both machines afresh, and removes what earlier cases uploaded for the package
@@ -760,16 +761,19 @@ case_push_upload() {
   # A push uploads each entry's artifacts, then its mapping, each only if it is
   # absent and with the token, and empties the queue. A second push has nothing
   # to send. Machine B then restores everything with no compile: the modules,
-  # the object file and the executable, and the files of `pair`, with the
-  # `admit` warning, at two requests per target, and it queues nothing.
+  # the object files, the executable, the shared library of the precompiled
+  # module, and the files of `pair`, with the logs of their builds, at two
+  # requests per target, and it queues nothing.
   push_fresh
   build_a
+  test_cmd_eq 1 count '"data":"[0-9a-f]*\.so"' "$PUSH_QUEUE"
   : > "$SERVER_LOG"
   on_a test_run cache push
   test_cmd_eq 0 queued
   test_cmd push_check status "$PUSH_STATUS" $PUSH_COMPILES 0 0 0
   test_cmd_eq $PUSH_COMPILES push_check order "$SERVER_LOG" "$STORE_DIR"
   test_cmd_eq 0 count_other ' auth=bearer gen=0$' "$SERVER_LOG"
+  test_exp ! -e "$PUSH_CACHE/push-staging"
   : > "$SERVER_LOG"
   on_a test_run cache push
   test_cmd_eq 0 count ' -> ' "$SERVER_LOG"
@@ -777,7 +781,9 @@ case_push_upload() {
   : > "$SERVER_LOG"
   restore_b $PUSH_TARGETS
   match_text 'Push/Admit.lean:1:8: declaration uses' produced.out
+  match_text 'Hello, precompiled world' produced.out
   test_exp -x "$PUSH_B/.lake/build/bin/pushexe"
+  test_cmd ls "$PUSH_CACHE_B"/artifacts/*.so
   test_cmd_eq $PUSH_COMPILES count_path /in/ "$SERVER_LOG"
   test_cmd_eq $PUSH_COMPILES count_path /a/ "$SERVER_LOG"
   test_cmd_eq 0 queued "$PUSH_CACHE_B/push.jsonl"
@@ -825,7 +831,7 @@ case_push_missing() {
   # entry, and the push succeeds.
   push_fresh
   build_a
-  test_cmd rm "$PUSH_CACHE"/artifacts/*.o
+  test_cmd rm "$PUSH_CACHE/artifacts/$(push_check data "$PUSH_QUEUE" push/pushexe:exe)"
   on_a test_out 'no longer in the cache' cache push
   test_cmd_eq 0 queued
   test_cmd push_check status "$PUSH_STATUS" $((PUSH_COMPILES - 1)) 0 1 0
@@ -858,16 +864,66 @@ case_push_githash() {
 }
 
 case_push_deny() {
-  # A push that the service refuses fails and keeps the queue; a later push that
-  # the service accepts empties it.
+  # A push that the service refuses fails and keeps the queue, and it sends no
+  # mapping whose artifacts it could not upload. A later push that the service
+  # accepts empties the queue.
   push_fresh
   PUSH_SERVICE=flaky build_a
+  : > "$SERVER_LOG"
   PUSH_SERVICE=flaky on_a test_status 1 cache push
+  test_cmd_eq $PUSH_COMPILES count '^PUT .*/a/.* -> 403 ' "$SERVER_LOG"
+  test_cmd_eq 0 count '^PUT .*/in/' "$SERVER_LOG"
   test_cmd_eq $PUSH_COMPILES queued
   test_cmd push_check status "$PUSH_STATUS" 0 $PUSH_COMPILES 0 $PUSH_COMPILES
   LAKE_CONFIG="$WORK_DIR/services-ok.toml" PUSH_SERVICE=flaky on_a test_run cache push
   test_cmd_eq 0 queued
   test_cmd push_check status "$PUSH_STATUS" $PUSH_COMPILES 0 0 0
+}
+
+case_push_invalid() {
+  # Part of a line that a killed writer left does not take the next line with
+  # it. Each kind of invalid line is dropped and recorded, and the push still
+  # uploads the good entries and succeeds.
+  push_fresh
+  test_cmd mkdir -p "$PUSH_CACHE"
+  printf '{"service":"bearer","remoteScope":"' > "$WORK_DIR/bad.line"
+  test_cmd push_check append "$PUSH_CACHE" "$WORK_DIR/bad.line"
+  build_a
+  # Not UTF-8; not JSON; not an entry; an unsupported extension; not a module name
+  printf '\xff\xfe\n' > "$WORK_DIR/bad.line"
+  test_cmd push_check append "$PUSH_CACHE" "$WORK_DIR/bad.line"
+  printf 'not json\n' > "$WORK_DIR/bad.line"
+  test_cmd push_check append "$PUSH_CACHE" "$WORK_DIR/bad.line"
+  printf '{"service":"bearer"}\n' > "$WORK_DIR/bad.line"
+  test_cmd push_check append "$PUSH_CACHE" "$WORK_DIR/bad.line"
+  printf '{"service":"bearer","remoteScope":"%s","inputHash":"0123456789abcdef","target":"x","srcHash":null,"data":"0123456789abcdef.exe/x","log":[]}\n' \
+    "$PUSH_SCOPE" > "$WORK_DIR/bad.line"
+  test_cmd push_check append "$PUSH_CACHE" "$WORK_DIR/bad.line"
+  printf '{"service":"bearer","remoteScope":"%s","inputHash":"0123456789abcdef","target":"x/y","srcHash":"0123456789abcdef","data":{},"log":[]}\n' \
+    "$PUSH_SCOPE" > "$WORK_DIR/bad.line"
+  test_cmd push_check append "$PUSH_CACHE" "$WORK_DIR/bad.line"
+  on_a test_out 'dropped' cache push
+  test_cmd_eq 0 queued
+  test_cmd push_check status "$PUSH_STATUS" $PUSH_COMPILES 0 6 0
+  test_cmd_eq 6 push_check dropped "$PUSH_DROPPED" invalid
+  test_exp ! -e "$STORE_DIR/a0/$PUSH_SCOPE/in/0123456789abcdef.json"
+}
+
+case_push_many() {
+  # A queue longer than one upload chunk is pushed whole, and each of its
+  # lines, duplicates included, leaves the queue once. Without a token, the
+  # uploads are signed with the key, and they still only create their objects.
+  push_fresh
+  PUSH_SERVICE=ok build_a
+  test_cmd push_check repeat "$PUSH_CACHE" 6
+  test_cmd_eq $((6 * PUSH_COMPILES)) queued
+  : > "$SERVER_LOG"
+  LAKE_CACHE_DIR="$PUSH_CACHE" LAKE_REMOTE_CACHE=ok LAKE_CACHE_KEY=mock:key \
+    test_run cache push
+  test_cmd_eq 0 queued
+  test_cmd push_check status "$PUSH_STATUS" $((6 * PUSH_COMPILES)) 0 0 0
+  test_cmd_eq "$(count '^PUT ' "$SERVER_LOG")" count '^PUT .* auth=other gen=0$' "$SERVER_LOG"
+  test_cmd push_check order "$SERVER_LOG" "$STORE_DIR"
 }
 
 case_push_concurrent() {
@@ -928,7 +984,8 @@ CASES="${REMOTE_CACHE_CASES:-case_roundtrip case_no_token case_second_put case_n
   case_read_404 case_read_invalid_mapping case_read_bad_artifact case_read_bad_descriptor
   case_read_transport case_read_status case_read_status_persistence case_push_queue
   case_push_upload case_push_tree_changed case_push_mismatch case_push_missing
-  case_push_custom_target case_push_githash case_push_deny case_push_concurrent}"
+  case_push_custom_target case_push_githash case_push_deny case_push_invalid case_push_many
+  case_push_concurrent}"
 for c in $CASES; do
   echo "# ${c#case_}"
   "$c"

@@ -28,6 +28,7 @@ import Lake.CLI.Help
 import Lake.CLI.Build
 import LeanExport.Basic
 import Lake.CLI.CachePush
+import Lake.Config.PushQueue
 import Lake.CLI.Actions
 import Lake.CLI.Translate
 import Lake.CLI.Serve
