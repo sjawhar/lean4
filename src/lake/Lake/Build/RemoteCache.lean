@@ -58,13 +58,15 @@ public def recordRemoteReadFailure (log : Log) (default : String) : JobM String 
 /--
 **For internal use only.**
 Reads the remote mapping of `inputHash` for `target` from the shared remote cache that
-`LAKE_REMOTE_CACHE` names, if any, and stores it as the local mapping. A mapping that does not
-name this input, target and source hash (`srcHash?`, for a module), or whose artifacts could not
-be cache files, is refused. Every failure but a missing mapping is recorded (see
-`recordRemoteReadFailure`), and each is a miss.
+`LAKE_REMOTE_CACHE` names, if any, and stores it as the local mapping: over an existing local
+mapping only with `replace` (one that could not be used, e.g., because its artifacts were pruned).
+A mapping that does not name this input, target and source hash (`srcHash?`, for a module), or
+whose artifacts could not be cache files, is refused. Every failure but a missing mapping is
+recorded (see `recordRemoteReadFailure`), and each is a miss.
 -/
 public def readRemoteOutputs?
   (inputHash : Hash) (pkg : Package) (target : String) (srcHash? : Option Hash)
+  (replace := false)
 : JobM (Option CacheOutput) := do
   let ws ← getWorkspace
   let some serviceName := ws.lakeEnv.remoteCache?
@@ -98,7 +100,7 @@ public def readRemoteOutputs?
     let cache ← getLakeCache
     let act := cache.writeOutputs pkg.cacheScope inputHash mapping.data service.name?
       (some (.ofString scope)) (log := mapping.log) (sha256? := some mapping.sha256)
-      (overwrite := false)
+      (overwrite := replace)
     if let .error e ← act.toBaseIO then
       error s!"could not write remote mapping to local cache: {e}"
     cache.readOutputs? pkg.cacheScope inputHash
