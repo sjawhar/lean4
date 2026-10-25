@@ -19,6 +19,7 @@ import Lake.Util.CacheToken
 import Lake.Util.Reservoir
 import Lake.Util.JsonObject
 import Lake.Util.IO
+import Lake.Util.Sha256
 import Init.System.Platform
 import Init.Data.String.Lemmas
 
@@ -236,6 +237,23 @@ where go as o := do
 
 end CacheMap
 
+/-- Extract artifact descriptors from one output value, rejecting any malformed descriptor. -/
+public partial def outputArtifactDescrs? (output : Json) : Except String (Array ArtifactDescr) :=
+  go #[] output
+where
+  go descrs output := do
+    match output with
+    | .null | .bool _ =>
+      return descrs
+    | .num n =>
+      return descrs.push {hash := ← Hash.ofJsonNumber? n}
+    | .str name =>
+      return descrs.push (← ArtifactDescr.ofFilePath? name)
+    | .arr values =>
+      values.foldlM (init := descrs) go
+    | .obj values =>
+      values.foldlM (init := descrs) fun descrs _ value => go descrs value
+
 /-! ## Cache Ref -/
 
 /-- A mutable reference to a `CacheMap`. -/
@@ -346,6 +364,8 @@ public structure CacheOutput where
     scope? : Option CacheServiceScope := none
     /-- The log of the build that produced the outputs, replayed when they are restored. -/
     log? : Option Log := none
+    /-- SHA-256 digests of remote artifacts, keyed by `ArtifactDescr.relPath`. -/
+    sha256? : Option Json := none
     deriving Inhabited
 
 namespace CacheOutput
@@ -361,6 +381,7 @@ public protected def toJson (out : CacheOutput) : Json := Id.run do
   if let some scope := out.scope? then
     obj := obj.insert (if scope.isRepo then "repo" else "scope") scope.toJson
   obj := obj.insertSome "log" out.log?
+  obj := obj.insertSome "sha256" out.sha256?
   return obj.insert "data" out.data
 
 public instance : ToJson CacheOutput := ⟨CacheOutput.toJson⟩
@@ -382,13 +403,90 @@ public protected def fromJson? (json : Json) : Except String CacheOutput := do
         else
           return none
       let log? ← obj.get? "log"
-      return {data, service?, scope?, log?}
+      let sha256? : Option Json ← obj.get? "sha256"
+      return {data, service?, scope?, log?, sha256?}
   -- old format: just the data
   return .ofData json
 
 public instance : FromJson CacheOutput := ⟨CacheOutput.fromJson?⟩
 
 end CacheOutput
+
+/-- The version of the input-hash mappings stored in the shared remote cache. -/
+public def remoteCacheSchemaVersion : String := "lake-remote-2026-10-24"
+
+/--
+The largest remote artifact Lake accepts: four times the largest artifact (29,899,080 bytes)
+measured in a full MachCSL build on 2026-10-25.
+-/
+public def remoteCacheMaxFileSize : Nat := 119596320
+
+/-- The namespace of a package's input-hash mappings in the shared remote cache. -/
+public def remoteCacheScope (githash packageScope : String) : String :=
+  s!"v1/{githash}/{System.Platform.target}/{packageScope}"
+
+/-- An input-to-output mapping read from the shared remote cache. -/
+public structure RemoteCacheMapping where
+  inputHash : Hash
+  target : String
+  srcHash? : Option Hash
+  data : Json
+  sha256 : Json
+  log : Log
+
+namespace RemoteCacheMapping
+
+public def fromJson? (json : Json) : Except String RemoteCacheMapping := do
+  let obj ← JsonObject.fromJson? json
+  let schemaVersion : String ← obj.get "schemaVersion"
+  unless schemaVersion == remoteCacheSchemaVersion do
+    throw s!"unknown remote cache schema version: {schemaVersion}"
+  let inputHash : Hash ← obj.get "inputHash"
+  let target : String ← obj.get "target"
+  let srcHash : Json ← obj.get "srcHash"
+  let srcHash? : Option Hash ← match srcHash with
+    | .null => pure none
+    | json => do
+      let hashString ← json.getStr?
+      let some hash := Hash.ofString? hashString
+        | throw "srcHash: expected a content hash"
+      pure (some hash)
+  let data : Json ← obj.get "data"
+  let sha256 : Json ← obj.get "sha256"
+  discard <| JsonObject.fromJson? sha256
+  let log ← obj.get "log"
+  return {inputHash, target, srcHash?, data, sha256, log}
+
+def isLowerHex (c : Char) : Bool :=
+  c.isDigit || c == 'a' || c == 'b' || c == 'c' || c == 'd' || c == 'e' || c == 'f'
+
+/-- Retrieve and validate a SHA-256 digest assigned to an artifact descriptor. -/
+public def remoteSha256For (sha256 : Json) (descr : ArtifactDescr) : Except String String := do
+  let obj ← JsonObject.fromJson? sha256
+  let digest? : Option String ← obj.get? descr.relPath.toString
+  let some digest := digest?
+    | throw s!"remote mapping has no SHA-256 for artifact `{descr}`"
+  unless digest.length == 64 && digest.all isLowerHex do
+    throw s!"remote mapping has invalid SHA-256 for artifact `{descr}`"
+  return digest
+
+/-- Retrieve and validate the SHA-256 digest assigned to `descr` by this mapping. -/
+public def sha256For (mapping : RemoteCacheMapping) (descr : ArtifactDescr) : Except String String :=
+  remoteSha256For mapping.sha256 descr
+
+/--
+Validate every descriptor before it can become a local cache path, and require one valid SHA-256
+digest for every descriptor.
+-/
+public def checkedArtifactDescrs (mapping : RemoteCacheMapping) : Except String (Array ArtifactDescr) := do
+  let descrs ← outputArtifactDescrs? mapping.data
+  for descr in descrs do
+    unless descr.isRemoteSafe do
+      throw s!"remote mapping has unsupported artifact extension `{descr.ext}`"
+    discard <| mapping.sha256For descr
+  return descrs
+
+end RemoteCacheMapping
 
 /-! ## Local Cache -/
 
@@ -439,7 +537,7 @@ public def getArtifact (cache : Cache) (descr : ArtifactDescr) : EIO String Arti
 def writeOutputsCore
   (cache : Cache) (scope : String) (inputHash : Hash) (out : Json)
   (service? : Option CacheServiceName) (remoteScope? : Option CacheServiceScope)
-  (log : Log) (overwrite : Bool)
+  (log : Log) (sha256? : Option Json) (overwrite : Bool)
 : IO Unit := do
   let file := cache.outputsFile scope inputHash
   unless overwrite do
@@ -450,7 +548,7 @@ def writeOutputsCore
   -- in the tree that ran it and name its paths, so they are not kept with the outputs.
   let log := log.filter (·.level ≥ .info)
   let log? := if log.isEmpty then none else some log
-  let out := {service?, scope? := remoteScope?, data := out, log? : CacheOutput}
+  let out := {service?, scope? := remoteScope?, data := out, log?, sha256? : CacheOutput}
   let contents := (toJson out).pretty
   if overwrite then
     IO.FS.writeFile file contents
@@ -461,18 +559,18 @@ def writeOutputsCore
 Cache the outputs corresponding to the given input for the package,
 along with the log of the build that produced them.
 -/
-@[inline] public def writeOutputs
+public def writeOutputs
   [ToJson α] (cache : Cache) (scope : String) (inputHash : Hash) (outputs : α)
   (service? : Option CacheServiceName := none) (remoteScope? : Option CacheServiceScope := none)
-  (log : Log := {}) (overwrite := true)
-: IO Unit := cache.writeOutputsCore scope inputHash (toJson outputs) service? remoteScope? log overwrite
+  (log : Log := {}) (sha256? : Option Json := none) (overwrite := true)
+: IO Unit := cache.writeOutputsCore scope inputHash (toJson outputs) service? remoteScope? log sha256? overwrite
 
 /-- Cache the input-to-outputs mappings from a `CacheMap`.  -/
 public def writeMap
   (cache : Cache) (scope : String) (map : CacheMap)
   (service? : Option CacheServiceName := none) (remoteScope? : Option CacheServiceScope := none)
   (overwrite := true)
-: IO Unit := map.forM fun i e => cache.writeOutputsCore scope i e.out service? remoteScope? {} overwrite
+: IO Unit := map.forM fun i e => cache.writeOutputsCore scope i e.out service? remoteScope? {} none overwrite
 
 /-- Retrieve the cached outputs corresponding to the given input for the package (if any). -/
 public def readOutputs? (cache : Cache) (scope : String) (inputHash : Hash) : LogIO (Option CacheOutput) := do
@@ -571,6 +669,22 @@ public def downloadArtifactCore
     let actualHash ← computeFileHash tmp
     if actualHash != hash then
       error s!"{path}: downloaded artifact hash mismatch, got {actualHash}")
+
+/--
+Download a shared-remote artifact, checking its SHA-256 name and Lake content hash before it
+replaces the local cache path.
+-/
+public def downloadRemoteArtifactCore
+  (hash : Hash) (sha256 : String) (url : String) (path : FilePath) (cacheToken := false)
+: LogIO Unit := do
+  download url path (cacheToken := cacheToken) (maxFileSize? := some remoteCacheMaxFileSize)
+    (check := fun tmp => do
+      let actualSha256 ← sha256File tmp
+      if actualSha256 != sha256 then
+        error s!"{path}: downloaded artifact SHA-256 mismatch, got {actualSha256}"
+      let actualHash ← computeFileHash tmp
+      if actualHash != hash then
+        error s!"{path}: downloaded artifact hash mismatch, got {actualHash}")
 
 /--
 Uploads a file to an online bucket using the Amazon S3 protocol.
@@ -723,6 +837,18 @@ public def artifactContentType : String := "application/vnd.reservoir.artifact"
 def appendScope (endpoint : String) (scope : String) : String :=
   scope.split '/' |>.fold (init := endpoint) fun s component =>
     uriEncode component.copy (s.push '/')
+
+/-- A URL below an S3 service's artifact endpoint for the shared input-hash cache. -/
+public def remoteObjectUrl (service : CacheService) (scope object : String) : String :=
+  s!"{appendScope service.impl.artifactEndpoint scope}/{object}"
+
+/-- The remote mapping URL for an input hash. -/
+public def remoteMappingUrl (service : CacheService) (scope : String) (inputHash : Hash) : String :=
+  service.remoteObjectUrl scope s!"in/{inputHash}.json"
+
+/-- The remote artifact URL for a SHA-256 digest. -/
+public def remoteArtifactUrl (service : CacheService) (scope sha256 : String) : String :=
+  service.remoteObjectUrl scope s!"a/{sha256}.art"
 
 def s3ArtifactUrl (contentHash : Hash) (service : CacheService) (scope : CacheServiceScope) : String :=
   let endpoint :=
