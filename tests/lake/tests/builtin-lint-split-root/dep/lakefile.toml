@@ -1,4 +1,8 @@
 name = "dep"
 
+# Claims only `Shared.Dep`: with the default root `Shared`, the library would
+# claim every `Shared.*` module, and Lake would also look for the root
+# package's `Shared.Extra` here when `Root` imports it.
 [[lean_lib]]
 name = "Shared"
+roots = ["Shared.Dep"]

@@ -10,6 +10,11 @@ source ../common.sh
 # its `.olean` for `lake lint`; `Test` is a classic importer of it, so its input
 # hash mixes in `Test.Lint`'s `.olean`. A source path stored with the warning
 # makes `Test.Lint.olean` and the input hash of `Test` differ between the trees.
+#
+# Last, a third tree fills an artifact cache and a fourth, at another path,
+# restores from it without copying the `.olean` files into its build directory
+# (`LAKE_RESTORE_ARTIFACTS=false`); `lake lint` there must load the restored
+# modules from the cache.
 
 ./clean.sh
 
@@ -66,4 +71,27 @@ for tree in "$P1" "$P2"; do
 done
 pushd "$P2"
 no_match_text "$P1/" produced.out
+popd
+
+# --- A tree restored from an artifact cache shared with another checkout. ---
+export LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=false
+export LAKE_CACHE_DIR=$(pwd -P)/work/cache
+P3=$(pwd -P)/work/p3/tree
+P4=$(pwd -P)/work/p4/other/tree
+for tree in "$P3" "$P4"; do
+  mkdir -p "$tree"
+  cp -r lakefile.toml Test.lean Test "$tree/"
+done
+pushd "$P3"
+test_run build
+popd
+pushd "$P4"
+test_status_out 1 'Variable name `unusedLocal` is not explicitly referenced' lint --builtin-only Test
+match_text "$P4/" produced.out
+match_pat 'Test/Lint\.lean:4:6: warning:' produced.out
+no_match_pat 'failed to open|does not exist' produced.out
+# Both modules were cache hits: their `.olean` files exist only in the cache.
+test_exp ! -e .lake/build/lib/lean/Test.olean
+test_exp ! -e .lake/build/lib/lean/Test/Lint.olean
+test_exp -f .lake/build/lib/lean/Test/Lint.ilean
 popd
