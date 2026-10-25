@@ -127,6 +127,20 @@ public def invalidate (token : String) : BaseIO Unit :=
       set ({s with token? := none} : State)
 
 /--
+Records that a service refused `token` (HTTP 401) on the retry after `renew`, so that a new token
+did not help either. If `token` is still the token of this process (or another such refusal has
+already forgotten it), the next `get?` calls in 60 seconds report the refusal without running the
+command, as for a command that fails. Otherwise a service that accepts no token of the command
+would make Lake run it once per request.
+-/
+public def refused (token : String) : BaseIO Unit :=
+  cached.atomically do
+    let s : State ← get
+    if s.token?.all (·.token == token) then
+      let msg := s!"the service refused a new token from `{cmdVar}` (HTTP 401)"
+      set ({failure? := some (msg, ← IO.monoMsNow)} : State)
+
+/--
 Returns the token to retry a request with after a service refused `token` (HTTP 401):
 a new one, or the one that another refused request already obtained.
 -/
