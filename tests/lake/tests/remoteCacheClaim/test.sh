@@ -499,7 +499,43 @@ case_claim_push_retry() {
   match_text 'trying 1 failed queue entries again' "$CACHE_A/push.log"
 }
 
+case_claim_push_spawn_fails() {
+  # A push that cannot be started leaves the build free to start one again: the system refuses
+  # the `fork` of the first start (a preload fails the first spawn of the push's shell,
+  # `/bin/bash`), and the build's next queued output starts the push, which uploads both
+  # outputs. The follow file of the failed start is not left behind.
+  claim_fresh
+  test_cmd cc -shared -fPIC -o "$WORK_DIR/fail-spawn.so" "$TEST_DIR/FailSpawn.c" -ldl
+  PROBE_FAIL_SPAWN=/bin/bash LAKE_PRELOAD="$WORK_DIR/fail-spawn.so" \
+    run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A Claim.B
+  match_text 'could not start `lake cache push`' "$LOG_A"
+  wait_push "$CACHE_A"
+  test_cmd_eq 1 pushes_started "$CACHE_A"
+  test_cmd push_check status "$CACHE_A/remote-status-push.json" 2 0 0 0
+  test_cmd_eq 0 claim_check count-files "$CACHE_A/push-follow"
+}
+
+case_claim_follow_reap() {
+  # A build removes the follow files that no build holds and that are a day old (what a killed
+  # push leaves), and keeps a fresh one and one that a build still holds.
+  claim_fresh
+  test_cmd mkdir -p "$CACHE_A/push-follow"
+  test_cmd touch "$CACHE_A/push-follow/build.1.0.dead.tmp"
+  test_cmd touch -d '2 days ago' "$CACHE_A/push-follow/build.1.0.dead.tmp"
+  test_cmd touch "$CACHE_A/push-follow/build.2.0.fresh.tmp"
+  LAKE_TEST_CLAIM_SLEEP=60000 start_build "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A Claim.Slow
+  PID_A=$!
+  test_cmd claim_check wait-text "$CACHE_A/push.log" 'lake cache push: started' --timeout 60
+  test_exp ! -e "$CACHE_A/push-follow/build.1.0.dead.tmp"
+  test_exp -e "$CACHE_A/push-follow/build.2.0.fresh.tmp"
+  # The running build's own file is there
+  test_cmd_eq 2 claim_check count-files "$CACHE_A/push-follow"
+  test_cmd kill -KILL -- -"$(cat "$LOG_A.pid")"
+  wait $PID_A || true
+}
+
 run_cases case_claim_two_builds case_claim_one_push case_claim_order case_claim_failed \
   case_claim_takeover case_claim_dead_holder case_claim_stale case_claim_detached_push \
   case_claim_pool_slot case_claim_fail_fast case_claim_same_pid case_claim_queued \
-  case_claim_exe_push case_claim_push_retry case_claim_off case_claim_fail_open
+  case_claim_exe_push case_claim_push_retry case_claim_push_spawn_fails \
+  case_claim_follow_reap case_claim_off case_claim_fail_open

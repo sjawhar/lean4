@@ -414,15 +414,15 @@ the build's one detached push follows the build and uploads its last outputs (se
 def runQueuedPush (ws : Workspace) (logger : MonadLog BaseIO) : BaseIO Unit := do
   unless ws.lakeEnv.remoteCacheClaimService?.isSome do
     return
-  if ← canDetachPush then
+  if ← canDetachPush ws.lakeEnv then
     return
   let cache := ws.lakeCache
   let .ok md ← cache.pushQueueFile.metadata.toBaseIO
     | return
   if md.byteSize == 0 then
     return
-  logger.logEntry (.warning s!"`/bin/bash` is missing, so `lake cache push` runs before the \
-    build ends; log: {cache.pushLogFile}")
+  logger.logEntry (.warning s!"`{ws.lakeEnv.pushShell}` is missing (see `LAKE_PUSH_SHELL`), so \
+    `lake cache push` runs before the build ends; log: {cache.pushLogFile}")
   match (← (runForegroundPush ws.lakeEnv cache).toBaseIO) with
   | .ok 0 => pure ()
   | .ok rc => logger.logEntry (.warning s!"`lake cache push` exited with code {rc}")

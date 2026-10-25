@@ -110,6 +110,13 @@ public structure Env where
   Lake does not add it to `baseVars`.
   -/
   claimTakeoverSecs : Nat := 600
+  /--
+  The shell with which a build that takes claims starts its detached `lake cache push` (i.e.,
+  `LAKE_PUSH_SHELL`, `/bin/bash` unless set). It must be able to close every descriptor by
+  number; where it does not exist, the build runs the push in the foreground at its end (see
+  `Lake.Build.Claim`). Lake does not add it to `baseVars`.
+  -/
+  pushShell : FilePath := "/bin/bash"
   /-- The initial Lean library search path of the environment (i.e., `LEAN_PATH`). -/
   initLeanPath : SearchPath
   /-- The initial Lean source search path of the environment (i.e., `LEAN_SRC_PATH`). -/
@@ -227,6 +234,8 @@ public def compute
     remoteCacheQueue := ((← IO.getEnv "LAKE_REMOTE_CACHE_QUEUE").bind envToBool?).getD false
     remoteCacheClaims := ((← IO.getEnv "LAKE_REMOTE_CACHE_CLAIMS").bind envToBool?).getD true
     claimTakeoverSecs := ← computeClaimTakeoverSecs
+    pushShell := ((← IO.getEnv "LAKE_PUSH_SHELL").filter (!·.trimAscii.isEmpty)).map
+      (FilePath.mk ·.trimAscii.copy) |>.getD "/bin/bash"
     githashOverride := (← IO.getEnv "LEAN_GITHASH").getD ""
     toolchain
     initLeanPath := ← getSearchPath "LEAN_PATH",

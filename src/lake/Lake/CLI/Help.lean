@@ -898,7 +898,15 @@ A build that uploads to such a service (`LAKE_REMOTE_CACHE_QUEUE`; see
                                    not replaced it for `n` seconds (600 by
                                    default); the holder rewrites its claims
                                    every 60 seconds, or every `n/4` seconds if
-                                   that is less"
+                                   that is less
+  LAKE_PUSH_SHELL=<path>           the shell that starts the background push
+                                   (`/bin/bash` by default); it must close
+                                   every descriptor by number, and where it is
+                                   missing the push runs before the build ends
+
+A mapping that a build read from the remote cache stays in the local cache.
+Once `LAKE_REMOTE_CACHE` no longer names that service, Lake reads none of its
+artifacts from the remote cache: a missing one is compiled again."
 
 def helpScriptCli :=
 "Manage Lake scripts
