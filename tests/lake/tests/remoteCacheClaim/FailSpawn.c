@@ -1,7 +1,8 @@
-/* Makes the first spawn of the program named by `PROBE_FAIL_SPAWN` fail, as a `fork` that the
-   system refuses (EAGAIN) does. Lean's `IO.Process.spawn` copies the program's name with `strdup`
-   right before it forks, on the same thread, so a `strdup` of that name marks the next `fork` of
-   the thread to fail. Every other spawn and every later spawn of that program works.
+/* Makes the first spawn of the program named by `PROBE_FAIL_SPAWN` fail (every spawn of it, with
+   `PROBE_FAIL_SPAWN_ALWAYS`), as a `fork` that the system refuses (EAGAIN) does. Lean's
+   `IO.Process.spawn` copies the program's name with `strdup` right before it forks, on the same
+   thread, so a `strdup` of that name marks the next `fork` of the thread to fail. Every other
+   spawn works.
 
    Build: cc -shared -fPIC -o fail-spawn.so FailSpawn.c -ldl */
 #define _GNU_SOURCE
@@ -17,7 +18,8 @@ static int failed;
 
 char *strdup(const char *s) {
   const char *target = getenv("PROBE_FAIL_SPAWN");
-  if (target && !failed && strcmp(s, target) == 0) fail_next_fork = 1;
+  if (target && (!failed || getenv("PROBE_FAIL_SPAWN_ALWAYS")) && strcmp(s, target) == 0)
+    fail_next_fork = 1;
   return ((char *(*)(const char *))dlsym(RTLD_NEXT, "strdup"))(s);
 }
 
