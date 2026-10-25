@@ -1440,12 +1440,13 @@ skipped, and so is one whose cached files cannot be read during its check (e.g.,
 after the resolve). A candidate whose check found its `.olean` is not the one its key records has that cache entry
 checked (`checkUsageIndexEntry`).
 
-A lookup that found any candidate logs one verbose line: `usage index: restored <name> (...)` or
+A lookup that found any candidate logs one verbose line: `usage index: restored <name> (...) at rank <r>` or
 `usage index: no match (...)`, where `(...)` counts the candidates, those whose `.usage` the pre-filter read
 (`parsed`) and those that reached the check (`fully checked`), with the wall and current-thread CPU time the
 pre-filter took apart from reading views, the views this lookup added (`UsageView`) and their wall and CPU read
 times, and the importees the checks bound (`ContentHashes.imports`) that the module's same-tree check had not, with
-their wall and CPU check times.
+their wall and CPU check times; `<r>` is the restored candidate's position among the candidates, most recent first
+(from 1), which shows how many of them a lookup needs.
 -/
 def Module.lookupUsageIndex (mod : Module) (presetup : ModulePreSetup) (importArts : NameMap ImportArtifacts)
     (hashes : ContentHashes) (kept : Bool) (accept : String → ModuleOutputArtifacts → JobM (Option α)) :
@@ -1502,8 +1503,10 @@ def Module.lookupUsageIndex (mod : Module) (presetup : ModulePreSetup) (importAr
   let mut checkNs := 0
   let mut checkCpuNs := 0
   -- Kept outputs that passed, in the order they passed, offered once no compile has been taken
-  let mut keptPassed : Array (String × ModuleOutputArtifacts) := #[]
+  let mut keptPassed : Array (String × ModuleOutputArtifacts × Nat) := #[]
+  let mut rank := 0
   for file in candidates do
+    rank := rank + 1
     let start ← IO.monoNanosNow
     let cpuStart ← IO.threadCpuNanosNow
     let (passed?, read) ← prefilter file
@@ -1531,16 +1534,16 @@ def Module.lookupUsageIndex (mod : Module) (presetup : ModulePreSetup) (importAr
     unless verdict matches .upToDate do continue
     let name := file.fileStem.getD file.toString
     if arts.keptFrom?.isSome then
-      keptPassed := keptPassed.push (name, arts)
+      keptPassed := keptPassed.push (name, arts, rank)
       continue
     if let some result ← accept name arts then
       logVerbose s!"usage index: restored {name} \
-        ({← stats parsed checked prefilterNs prefilterCpuNs checkNs checkCpuNs})"
+        ({← stats parsed checked prefilterNs prefilterCpuNs checkNs checkCpuNs}) at rank {rank}"
       return some result
-  for (name, arts) in keptPassed do
+  for (name, arts, keptRank) in keptPassed do
     if let some result ← accept name arts then
       logVerbose s!"usage index: restored {name} \
-        ({← stats parsed checked prefilterNs prefilterCpuNs checkNs checkCpuNs})"
+        ({← stats parsed checked prefilterNs prefilterCpuNs checkNs checkCpuNs}) at rank {keptRank}"
       return some result
   logVerbose s!"usage index: no match \
     ({← stats parsed checked prefilterNs prefilterCpuNs checkNs checkCpuNs})"
