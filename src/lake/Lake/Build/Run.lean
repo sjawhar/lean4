@@ -11,6 +11,8 @@ import Lake.Config.Monad
 import Lake.Build.Job.Monad
 import Lake.Build.Index
 import Init.Omega
+import Lake.Util.JsonObject
+import Lake.Util.IO
 
 /-! # Build Runner
 
@@ -18,7 +20,7 @@ This module defines the top-level functions used to execute a
 Lake build, monitor its progress, and await the result.
 -/
 
-open System
+open System Lean
 
 namespace Lake
 
@@ -363,6 +365,7 @@ def mkBuildContext
     else
       return none
   registeredJobs := jobs
+  remoteReadStatus := ← IO.mkRef {}
   leanTrace := .ofHash (pureHash ws.lakeEnv.leanGithash)
     s!"Lean {Lean.versionStringCore}, commit {ws.lakeEnv.leanGithash}"
   cancelTk?
@@ -392,10 +395,29 @@ def Workspace.startBuild
   let compute := Job.async build (caption := caption)
   compute.run.run'.run bctx |>.run nilTrace
 
+/-- Atomically replace the status left by remote mapping reads in one build. -/
+def writeRemoteReadStatus (cache : Cache) (status : RemoteReadStatus) : IO Unit := do
+  let file := cache.dir / "remote-status-read.json"
+  let contents := (JsonObject.empty
+    |>.insert "at" (← IO.monoMsNow)
+    |>.insert "failures" status.failures
+    |>.insert "lastError" status.lastError : Json).pretty
+  createParentDirs file
+  let tmp ← uniqueTmpPath file
+  try
+    IO.FS.writeFile tmp contents
+    IO.FS.rename tmp file
+  finally
+    discard <| (removeFileIfExists tmp).toBaseIO
+
 def finalizeBuild
-  (cfg : BuildConfig) (bctx : BuildContext) (mctx : MonitorContext) (result : BuildResult α)
+  (ws : Workspace) (cfg : BuildConfig) (bctx : BuildContext) (mctx : MonitorContext)
+  (result : BuildResult α)
 : IO α := do
   reportResult cfg mctx.out result
+  let remoteStatus ← bctx.remoteReadStatus.get
+  if remoteStatus.failures > 0 then
+    writeRemoteReadStatus ws.lakeCache remoteStatus
   if let some outputsFile := cfg.outputsFile? then
     bctx.saveOutputs (logger := mctx.logger) mctx.out outputsFile
   match result.out with
@@ -421,7 +443,7 @@ public def Workspace.runFetchM
   let bctx ← mkBuildContext ws cfg jobs cancelTk?
   let job ← startBuild bctx build caption
   let result ← monitorJob mctx job
-  finalizeBuild cfg bctx mctx result
+  finalizeBuild ws cfg bctx mctx result
 
 def monitorBuild (mctx : MonitorContext) (job : Job (Job α)) : BaseIO (BuildResult α) := do
   let result ← monitorJob mctx job
@@ -462,7 +484,7 @@ public def Workspace.runBuild
   let bctx ← mkBuildContext ws cfg jobs cancelTk?
   let job ← startBuild bctx build
   let result ← monitorBuild mctx job
-  finalizeBuild cfg bctx mctx result
+  finalizeBuild ws cfg bctx mctx result
 
 /-- Produce a build job in the Lake monad's workspace and await the result. -/
 @[inline] public def runBuild
