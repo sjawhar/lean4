@@ -233,6 +233,19 @@ instance : FromJson CommandRefs := ⟨fun j => do
     refs := ← j.getObjValAs? (Array Int) "refs"
     aliases := (Array.range (aliases.size / 2)).map fun k => (aliases[2 * k]!, aliases[2 * k + 1]!) }⟩
 
+/-- Checks that `r` encodes references of a file of `sourceSize` bytes as `CommandRefs` describes: the numbers come in
+fours, each identifier and parent index is in range, and each reference lies in the file. -/
+def CommandRefs.validate (r : CommandRefs) (sourceSize : Nat) : Except String Unit := do
+  unless r.refs.size % 4 == 0 do throw "the references are not in fours"
+  let mut prev : Int := 0
+  for j in [0:r.refs.size / 4] do
+    let (k, s, len, flags) := (r.refs[4 * j]!, r.refs[4 * j + 1]!, r.refs[4 * j + 2]!, r.refs[4 * j + 3]!)
+    unless 0 ≤ k && k < r.idents.size do throw s!"reference {j} names no identifier ({k})"
+    unless 0 ≤ flags && flags / 4 ≤ r.parents.size do throw s!"reference {j} has no parent {flags}"
+    let b := prev + s
+    prev := b
+    unless 0 ≤ b && 0 ≤ len && b + len ≤ sourceSize do throw s!"reference {j} lies outside the file"
+
 /-- One top-level command's record in `.usage` (`commands`). It lists the constants the command used and no name
 resolution of its own, while a command can depend on the module the resolver picks for a name that occurs in none of
 its terms (the reducibility of a constant a tactic unfolds): a command may be kept only in a build where every name
@@ -277,6 +290,10 @@ structure CommandRecord where
   /-- The `.ilean` references of the command's info trees; `none` if the build that elaborated it wrote no `.ilean`.
   Filled by `runFrontend`. -/
   refs? : Option CommandRefs := none
+  /-- Whether the command or a task it started read a value tied to this process or this moment
+  (`commandReadNondeterministic`): its result may hold a value no other run can produce, so it is never kept. Reads of
+  the heartbeat counter are not noted. Filled by `runFrontend`. -/
+  nondeterministic : Bool := false
   deriving Inhabited, BEq
 
 instance : ToJson CommandRecord := ⟨fun r => Json.mkObj [
@@ -288,7 +305,7 @@ instance : ToJson CommandRecord := ⟨fun r => Json.mkObj [
   ("extra", .arr (r.extra.map fun (m, isMeta) => .arr #[nameToJson m, isMeta])),
   ("post", toJson r.post), ("caches", toJson r.caches), ("values", toJson r.values),
   ("messages", toJson r.messages?), ("lints", r.lints), ("linterState", r.linterState),
-  ("fileContext", toJson r.fileContext), ("refs", toJson r.refs?)]⟩
+  ("fileContext", toJson r.fileContext), ("refs", toJson r.refs?), ("nondeterministic", r.nondeterministic)]⟩
 
 instance : FromJson CommandRecord := ⟨fun j => return {
   i := ← j.getObjValAs? Nat "i"
@@ -313,7 +330,8 @@ instance : FromJson CommandRecord := ⟨fun j => return {
   lints := ← j.getObjValAs? Nat "lints"
   linterState := ← j.getObjValAs? Bool "linterState"
   fileContext := ← j.getObjValAs? (Array (String × Digest)) "fileContext"
-  refs? := ← j.getObjValAs? (Option CommandRefs) "refs" }⟩
+  refs? := ← j.getObjValAs? (Option CommandRefs) "refs"
+  nondeterministic := ← j.getObjValAs? Bool "nondeterministic" }⟩
 
 private def matcherKeyDigest (value : Expr) (compile isPrivate : Bool) : Digest :=
   (({} : Enc).digest (exprDigest .namesInfos .eqv value) |>.bool compile |>.bool isPrivate).finish
@@ -724,7 +742,7 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
     -- the command did not run here: what it read and did beyond its payload is its previous run's
     return .record { r with
       usesStmt, usesFull, extra := k.record.extra, values := k.record.values, linterState := k.record.linterState
-      fileContext := k.record.fileContext, refs? := k.record.refs? }
+      fileContext := k.record.fileContext, refs? := k.record.refs?, nondeterministic := k.record.nondeterministic }
   let parts ← CommandEntries.parallelMap observations (lanes := lanes) fun obs =>
     pure (obs.i, obs.stx, obs.before, (none : Option Digest), part obs)
   let parts := (parts ++ kept.map fun k => (k.i, k.stx, k.before, some k.record.ctx, keptPart k)).qsort (·.1 < ·.1)

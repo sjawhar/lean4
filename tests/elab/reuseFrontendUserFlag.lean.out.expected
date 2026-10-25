@@ -1,0 +1,10 @@
+first build: exit 0
+exit codes: reuse 0, fresh 0
+stdout equal to the fresh build's: true
+stderr equal to the fresh build's: true
+olean equal to the fresh build's: true
+ilean equal to the fresh build's: true
+usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true
+reuse: {"elabReasons":{"ctx":1,"text":1},"kept":1,"reElab":[1,2],"total":3}
+importer of the reuse run's M: 56; (5, 5, 0) (exit 0)
+importer of the fresh build's M: 56; (5, 5, 0) (exit 0)

@@ -146,6 +146,9 @@ def displayHelp (useStderr : Bool) : IO Unit := do
   out.putStrLn    "                         with --reuse-olean, elaborate the commands that used the module whole"
   out.putStrLn    "      --reuse-declined=reason"
   out.putStrLn    "                         with --usage, keep no command and record why in the usage sidecar"
+  out.putStrLn    "      --reuse-retry-marker=file, --reuse-retry-token=token"
+  out.putStrLn    "                         with --reuse-olean, write token to file before exiting with code 75 when a kept"
+  out.putStrLn    "                         command fails its replay, to ask for a compile without reuse"
   out.putStrLn    "  -c, --c=fname          name of the C output file"
   out.putStrLn    "  -b, --bc=fname         name of the LLVM bitcode file"
   out.putStrLn    "      --stdin            take input from stdin"
@@ -251,6 +254,8 @@ structure ShellOptions where
   reuseUsageFileName? : Option System.FilePath := none
   reuseChangedExtra : Array Name := #[]
   reuseDeclined? : Option String := none
+  reuseRetryMarkerFileName? : Option System.FilePath := none
+  reuseRetryToken? : Option String := none
 
 @[export lean_shell_options_mk]
 def mkShellOptions (_ : Unit) : ShellOptions := {}
@@ -454,6 +459,10 @@ def ShellOptions.process (opts : ShellOptions)
     return {opts with reuseChangedExtra := opts.reuseChangedExtra.push arg.toName}
   | 'X' => -- `--reuse-declined=reason`
     return {opts with reuseDeclined? := ← checkOptArg "reuse-declined" optArg?}
+  | 'A' => -- `--reuse-retry-marker=file`
+    return {opts with reuseRetryMarkerFileName? := ← checkOptArg "reuse-retry-marker" optArg?}
+  | 'G' => -- `--reuse-retry-token=token`
+    return {opts with reuseRetryToken? := ← checkOptArg "reuse-retry-token" optArg?}
   | _ =>
     pure ()
   eprint "Unknown command line option\n"
@@ -569,11 +578,23 @@ def shellMain (args : List String) (opts : ShellOptions) : IO UInt32 := do
   if opts.reuseOleanFileName?.isSome != opts.reuseUsageFileName?.isSome then
     IO.eprintln "error: --reuse-olean and --reuse-usage must be given together"
     return 1
+  if opts.reuseRetryMarkerFileName?.isSome != opts.reuseRetryToken?.isSome then
+    IO.eprintln "error: --reuse-retry-marker and --reuse-retry-token must be given together"
+    return 1
+  if opts.reuseRetryMarkerFileName?.isSome && opts.reuseOleanFileName?.isNone then
+    IO.eprintln "error: --reuse-retry-marker and --reuse-retry-token need --reuse-olean"
+    return 1
+  let retryMarker? := match opts.reuseRetryMarkerFileName?, opts.reuseRetryToken? with
+    | some marker, some token => some (marker, token)
+    | _, _ => none
   let reuse? : Option Elab.Reuse.Inputs := match opts.reuseDeclined?, opts.reuseOleanFileName?,
       opts.reuseUsageFileName? with
     | some reason, _, _ => some { previous := .error reason }
     | none, some olean, some usage =>
-      some { previous := .ok (olean, usage), changedExtra := opts.reuseChangedExtra.foldl (·.insert ·) {} }
+      some {
+        previous := .ok (olean, usage)
+        changedExtra := opts.reuseChangedExtra.foldl (·.insert ·) {}
+        retryMarker? }
     | _, _, _ => none
   if reuse?.isSome && (opts.oleanFileName?.isNone || opts.usageFileName?.isNone) then
     IO.eprintln "error: --reuse-olean, --reuse-usage and --reuse-declined need -o and --usage"

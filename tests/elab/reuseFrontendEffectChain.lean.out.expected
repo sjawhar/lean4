@@ -1,0 +1,33 @@
+free memory: first build: exit 0
+free memory: exit codes: reuse 0, fresh 0
+free memory: stdout equal to the fresh build's: true
+free memory: stderr equal to the fresh build's: true
+free memory: reuse run's d differs from the first build's: true
+free memory: reuse run kept: 0, elabReasons: {"effect-unrecorded":2,"nonconst":1}, declined: null
+chdir then config: first build: exit 0, d "A" (exit 0)
+chdir then config: exit codes: reuse 0, fresh 0
+chdir then config: stdout equal to the fresh build's: true
+chdir then config: stderr equal to the fresh build's: true
+chdir then config: olean equal to the fresh build's: true
+chdir then config: ilean equal to the fresh build's: true
+chdir then config: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true
+chdir then config: d: reuse "B" (exit 0), fresh "B" (exit 0)
+chdir then config: reuse run kept: 0, elabReasons: {"effect-unrecorded":2,"nonconst":1}, declined: null
+setenv only: first build: exit 0, d 1 (exit 0)
+setenv only: exit codes: reuse 0, fresh 0
+setenv only: stdout equal to the fresh build's: true
+setenv only: stderr equal to the fresh build's: true
+setenv only: olean equal to the fresh build's: true
+setenv only: ilean equal to the fresh build's: true
+setenv only: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true
+setenv only: d: reuse 1 (exit 0), fresh 1 (exit 0)
+setenv only: reuse run kept: 1, elabReasons: {"nonconst":1,"text":1}, declined: null
+setenv value: first build: exit 0, d "A" (exit 0)
+setenv value: exit codes: reuse 0, fresh 0
+setenv value: stdout equal to the fresh build's: true
+setenv value: stderr equal to the fresh build's: true
+setenv value: olean equal to the fresh build's: true
+setenv value: ilean equal to the fresh build's: true
+setenv value: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true
+setenv value: d: reuse "B" (exit 0), fresh "B" (exit 0)
+setenv value: reuse run kept: null, elabReasons: null, declined: "the process value env:FOO is not what it was when the module was compiled"

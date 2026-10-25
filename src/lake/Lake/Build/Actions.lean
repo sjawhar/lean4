@@ -39,6 +39,30 @@ public def compileLeanIR
     env := #[("LEAN_PATH", leanPath.toString)]
   }
 
+/--
+The exit code with which `lean` stops when a command kept by declaration reuse (`--reuse-olean`) fails its
+replay (`Lean.ModuleUsage.reuseReplayFailedExitCode`, in a module Lake does not import). It writes no outputs then,
+only the token it was given to its marker file (`--reuse-retry-token`, `--reuse-retry-marker`).
+-/
+def reuseReplayFailedExitCode : UInt32 := 75
+
+/-- A fresh random token for `lean --reuse-retry-token`: 16 bytes as 32 lowercase hex digits. -/
+def mkReuseRetryToken : IO String := do
+  return (← IO.getRandomBytes 16).foldl (init := "") fun s b =>
+    s.push (Nat.digitChar (b >>> 4).toNat) |>.push (Nat.digitChar (b &&& 0xf).toNat)
+
+/-- Whether `marker` holds exactly `token`; a missing or unreadable file does not. -/
+def reuseRetryConfirmed (marker : FilePath) (token : String) : BaseIO Bool :=
+  EIO.catchExceptions (h := fun _ => pure false) do
+    return (← IO.FS.readFile marker) == token
+
+/--
+Compiles `leanFile` with `lean`. With `retry? := some (retryArgs, marker)`, it gives `lean` a fresh random token to
+write to `marker` before `lean` exits with `reuseReplayFailedExitCode` because a kept command failed its replay. Only
+an exit with that code after which `marker` holds exactly the token makes it compile `leanFile` again with `retryArgs`
+in place of `leanArgs`, and only that second run's output and exit code count; any other exit with that code (e.g. the
+module's own `IO.Process.exit 75`) is a failure. `marker` is removed before each run and after the last.
+-/
 public def compileLeanModule
   (leanFile relLeanFile : FilePath)
   (setup : ModuleSetup) (setupFile : FilePath)
@@ -46,8 +70,9 @@ public def compileLeanModule
   (leanArgs : Array String := #[])
   (leanPath : SearchPath := [])
   (lean : FilePath := "lean")
+  (retry? : Option (Array String × FilePath) := none)
 : LogIO Unit := do
-  let mut args := leanArgs.push leanFile.toString
+  let mut args := #[leanFile.toString]
   if let some oleanFile := arts.olean? then
     createParentDirs oleanFile
     args := args ++ #["-o", oleanFile.toString]
@@ -68,13 +93,32 @@ public def compileLeanModule
   args := args ++ #["--setup", setupFile.toString]
   args := args.push "--json"
   withLogErrorPos do
-  let out ← rawProc {
-    args
-    cmd := lean.toString
-    env := #[
-      ("LEAN_PATH", leanPath.toString)
-    ]
-  }
+  let run (leanArgs : Array String) : LogIO IO.Process.Output :=
+    rawProc {
+      args := leanArgs ++ args
+      cmd := lean.toString
+      env := #[
+        ("LEAN_PATH", leanPath.toString)
+      ]
+    }
+  let out ← match retry? with
+    | none => run leanArgs
+    | some (retryArgs, marker) =>
+      removeFileIfExists marker
+      let token ← mkReuseRetryToken
+      try
+        let out ← run (leanArgs ++ #[s!"--reuse-retry-marker={marker}", s!"--reuse-retry-token={token}"])
+        let confirmed ←
+          if out.exitCode == reuseReplayFailedExitCode then reuseRetryConfirmed marker token else pure false
+        if confirmed then
+          logVerbose s!"{relLeanFile}: declaration reuse failed its replay; compiling again without reuse"
+          -- the compile without reuse starts as a build without reuse does, without the marker
+          removeFileIfExists marker
+          run retryArgs
+        else
+          pure out
+      finally
+        removeFileIfExists marker
   let outLogPos ← getLogPos
   unless out.stdout.isEmpty do
     let txt ← out.stdout.split '\n' |>.foldM (init := "") fun (txt : String) ln => do

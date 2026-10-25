@@ -1,0 +1,6 @@
+first build: exit 0
+reuse run: exit 0, stdout and stderr empty: true
+b = a + 1 in the importer: true
+reuse run reElab: [0,1,2]
+reuse run elabReasons: {"nonconst":1,"unexpressed-unrecorded":2}
+a reuse run sampled another value than the first build within 20 runs: true

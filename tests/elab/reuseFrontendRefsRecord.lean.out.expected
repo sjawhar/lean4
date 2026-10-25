@@ -1,0 +1,27 @@
+not in fours: first build: exit 0
+not in fours: usage lines tampered: 1
+not in fours: exit codes: reuse 0, fresh 0
+not in fours: stdout equal to the fresh build's: true
+not in fours: stderr equal to the fresh build's: true
+not in fours: olean equal to the fresh build's: true
+not in fours: ilean equal to the fresh build's: true
+not in fours: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true
+not in fours: reuse run reElab: [1,2]
+identifier out of range: first build: exit 0
+identifier out of range: usage lines tampered: 1
+identifier out of range: exit codes: reuse 0, fresh 0
+identifier out of range: stdout equal to the fresh build's: true
+identifier out of range: stderr equal to the fresh build's: true
+identifier out of range: olean equal to the fresh build's: true
+identifier out of range: ilean equal to the fresh build's: true
+identifier out of range: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true
+identifier out of range: reuse run reElab: [1,2]
+negative length: first build: exit 0
+negative length: usage lines tampered: 1
+negative length: exit codes: reuse 0, fresh 0
+negative length: stdout equal to the fresh build's: true
+negative length: stderr equal to the fresh build's: true
+negative length: olean equal to the fresh build's: true
+negative length: ilean equal to the fresh build's: true
+negative length: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true
+negative length: reuse run reElab: [1,2]

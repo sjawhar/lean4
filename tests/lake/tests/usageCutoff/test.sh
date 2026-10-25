@@ -757,5 +757,169 @@ test_out "Built Test.M" build -v Test.M
 no_reuse_log
 match_text '"reuse":{"declined":"precompiled"}' .lake/build/lib/lean/Test/M.usage
 cd ..
+# A kept command's replay adds its extension entries again, so a keep is admitted only where the `.olean` entry is the
+# entry itself, as core states for its identity conversions. Any other conversion (`ofOLeanEntry?`, which can run user
+# code) makes `lean` elaborate the command (`conversion`), decided before anything runs. Each module edits only its last
+# declaration; its `.olean` must equal a build of the edited source without reuse (`ref/`, built from scratch with
+# `LAKE_DECL_CUTOFF=0` and the artifact cache off, so that the reuse build compiles instead of restoring ref's outputs).
+# PA: `cpass` converts its entry by running the module's own `PassInstaller`, which bumps `replayCount` (read by
+# `laterA`) and throws in replay (file name `<ImportM>`, installer not imported). PB's installer drops the base phase's
+# `simp` passes in its command only, so a replayed entry would differ (`laterB` would be compiled with them). PC's
+# `def_flag` adds an entry to `flagExt`, whose conversion bumps `replayCount` and throws. No conversion runs, so no
+# compile stops for Lake to run again.
+mkdir -p declpass/Test
+cp lakefile.toml declpass/
+cd declpass
+cat > Test/R.lean <<'EOF'
+import Lean
+open Lean Elab Term Command
+initialize replayCount : IO.Ref Nat ← IO.mkRef 0
+elab "replay_count" : term => return mkNatLit (← replayCount.get)
+initialize flagExt : PersistentEnvExtension Name Name (List Name × Unit) ←
+  registerPersistentEnvExtension {
+    mkInitial := pure ([], ())
+    addImportedFn := fun _ => pure ([], ())
+    addEntryFn := fun (ns, u) n => (n :: ns, u)
+    ofOLeanEntry? := some fun _ n => do
+      replayCount.modify (· + 1)
+      throw <| IO.userError s!"flagExt cannot convert {n}"
+    stateDelta? := some StateDelta.ofLog
+    exportEntriesFn := fun (ns, _) => ns.reverse.toArray
+  }
+syntax "def_flag " ident : command
+elab_rules : command
+  | `(def_flag $x:ident) => do
+    modifyEnv (flagExt.addEntry · x.getId)
+    elabCommand (← `(def $x : Nat := replay_count))
+EOF
+cat > Test/PA.lean <<'EOF'
+import Test.R
+open Lean Compiler LCNF
+@[cpass] def throwOnReplay : PassInstaller where
+  phase := .base
+  install passes := do
+    if (← getFileName) == "<ImportM>" && ((← getEnv).getModuleIdxFor? `throwOnReplay).isNone then
+      replayCount.modify (· + 1)
+      throwError "throwOnReplay ran outside its command"
+    return passes
+def ordinaryA := 1
+def laterA := replay_count + 0
+EOF
+cat > Test/PB.lean <<'EOF'
+import Lean
+open Lean Compiler LCNF
+@[cpass] def dropBaseSimp : PassInstaller where
+  phase := .base
+  install passes := do
+    if (← getFileName) == "<ImportM>" then return passes
+    return passes.filter (·.name != `simp)
+def ordinaryB := 1
+def laterB : Nat := 1 + 1
+EOF
+printf 'import Test.R\ndef_flag flagC\ndef laterC := replay_count + 0\n' > Test/PC.lean
+printf 'import Test.PA\nimport Test.PB\nimport Test.PC\n#eval laterA + laterB + flagC + laterC\n' > Test/PN.lean
+test_run build Test.PN
+sed 's/replay_count + 0/replay_count + 1/' Test/PA.lean > PA.tmp && mv PA.tmp Test/PA.lean
+sed 's/1 + 1/2 + 1/' Test/PB.lean > PB.tmp && mv PB.tmp Test/PB.lean
+sed 's/replay_count + 0/replay_count + 1/' Test/PC.lean > PC.tmp && mv PC.tmp Test/PC.lean
+mkdir -p ref
+cp -r lakefile.toml Test ref/
+(cd ref && LAKE_ARTIFACT_CACHE=false LAKE_DECL_CUTOFF=0 test_run build Test.PN)
+lake_out build -v Test.PN
+match_text "Built Test.PA" produced.out
+match_text "Built Test.PB" produced.out
+match_text "Built Test.PC" produced.out
+no_match_text "declaration reuse failed its replay" produced.out
+for m in PA PB PC; do
+  match_text '"conversion":1' .lake/build/lib/lean/Test/$m.usage
+  test_cmd cmp ref/.lake/build/lib/lean/Test/$m.olean .lake/build/lib/lean/Test/$m.olean
+done
+cd ..
+# Lake compiles a module again without reuse only when `lean` asks for it: an exit with code 75 after which the marker
+# file Lake named (`--reuse-retry-marker`) holds the token Lake passed (`--reuse-retry-token`). Any other exit with that
+# code is a failure. Here the module's own `#eval` exits with 75 in a compile that may keep commands, once: it counts
+# its runs in `counter`, so a second compile would succeed and leave 2 there.
+mkdir -p declexit/Test
+cp lakefile.toml declexit/
+cd declexit
+printf 'def v := 1\n' > Test/V.lean
+cat > Test/E.lean <<'EOF'
+import Test.V
+def w := v
+#eval show IO Unit from do
+  let n := (← IO.FS.readFile "counter").toNat!
+  IO.FS.writeFile "counter" s!"{n + 1}"
+  if n == 0 then IO.Process.exit 75
+EOF
+printf '5' > counter
+test_run build Test.E
+printf 'def v := 2\n' > Test/V.lean
+printf '0' > counter
+test_err "Lean exited with code 75" build -v Test.E
+match_text "--reuse-olean=" produced.out
+no_match_text "declaration reuse failed its replay" produced.out
+test_exp "$(cat counter)" = 1
+test_exp ! -e .lake/build/lib/lean/Test/E.reuse-retry
+cd ..
+# The same handshake from the other side: a toolchain whose `lean` (a script; `LAKE_OVERRIDE_LEAN`, `LEAN_SYSROOT`)
+# runs the real one, but given the retry flags for `Test/RT.lean` writes a token to the marker and exits with 75. With
+# the token Lake passed, Lake compiles RT again without reuse, and its `.olean` equals a build without reuse (`ref/`);
+# the compile again starts without the marker (the script notes whether it sees it, `retry-saw-marker`). With another
+# token (`FAKE_LEAN_TOKEN`), the build fails. The marker is gone afterwards either way.
+if [ "$OS" = Windows_NT ]; then
+  echo "SKIPPED: a shell script cannot stand in for lean.exe on Windows"
+else
+  mkdir -p declretry/Test
+  cp lakefile.toml declretry/
+  cd declretry
+  SYSROOT="$("$LAKE" env printenv LEAN_SYSROOT)"
+  test_exp -x "$SYSROOT/bin/lean"
+  FAKE="$PWD/fakeroot"
+  mkdir -p "$FAKE/bin"
+  for e in "$SYSROOT"/*; do [ "$(basename "$e")" = bin ] || ln -s "$e" "$FAKE/$(basename "$e")"; done
+  for e in "$SYSROOT"/bin/*; do [ "$(basename "$e")" = lean ] || ln -s "$e" "$FAKE/bin/$(basename "$e")"; done
+  cat > "$FAKE/bin/lean" <<EOF
+#!/usr/bin/env bash
+marker= token= rt=false retry=false
+for a; do
+  case "\$a" in
+    --reuse-retry-marker=*) marker=\${a#--reuse-retry-marker=} ;;
+    --reuse-retry-token=*) token=\${a#--reuse-retry-token=} ;;
+    --reuse-declined=replay-failed) retry=true ;;
+    *Test/RT.lean) rt=true ;;
+  esac
+done
+if \$rt && [ -n "\$marker" ]; then
+  printf '%s' "\$marker" > "$FAKE/marker-path"
+  printf '%s' "\${FAKE_LEAN_TOKEN:-\$token}" > "\$marker"
+  exit 75
+fi
+if \$rt && \$retry; then
+  if [ -e "\$(cat "$FAKE/marker-path")" ]; then echo yes > "$FAKE/retry-saw-marker"; else echo no > "$FAKE/retry-saw-marker"; fi
+fi
+exec "$SYSROOT/bin/lean" "\$@"
+EOF
+  chmod +x "$FAKE/bin/lean"
+  printf 'def rt1 := 1\ndef rt2 := 2\n' > Test/RT.lean
+  LAKE_OVERRIDE_LEAN=true LEAN_SYSROOT="$FAKE" test_run build Test.RT
+  printf 'def rt1 := 1\ndef rt2 := 3\n' > Test/RT.lean
+  mkdir -p ref
+  cp -r lakefile.toml Test ref/
+  (cd ref && LAKE_ARTIFACT_CACHE=false LAKE_DECL_CUTOFF=0 test_run build Test.RT)
+  LAKE_OVERRIDE_LEAN=true LEAN_SYSROOT="$FAKE" lake_out build -v Test.RT
+  match_text "Built Test.RT" produced.out
+  match_text "Test/RT.lean: declaration reuse failed its replay; compiling again without reuse" produced.out
+  match_text '"reuse":{"declined":"replay-failed"}' .lake/build/lib/lean/Test/RT.usage
+  test_cmd cmp ref/.lake/build/lib/lean/Test/RT.olean .lake/build/lib/lean/Test/RT.olean
+  test_exp ! -e .lake/build/lib/lean/Test/RT.reuse-retry
+  test_exp "$(cat "$FAKE/retry-saw-marker")" = no
+  printf 'def rt1 := 1\ndef rt2 := 4\n' > Test/RT.lean
+  LAKE_OVERRIDE_LEAN=true LEAN_SYSROOT="$FAKE" FAKE_LEAN_TOKEN=forged \
+    test_err "Lean exited with code 75" build -v Test.RT
+  match_text "--reuse-retry-token=" produced.out
+  no_match_text "declaration reuse failed its replay" produced.out
+  test_exp ! -e .lake/build/lib/lean/Test/RT.reuse-retry
+  cd ..
+fi
 
 rm -f produced.out

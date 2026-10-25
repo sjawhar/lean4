@@ -1,0 +1,24 @@
+last edited: first build: exit 0
+last edited: exit codes: reuse 0, fresh 0
+last edited: stdout equal to the fresh build's: true
+last edited: stderr equal to the fresh build's: true
+last edited: olean equal to the fresh build's: true
+last edited: ilean equal to the fresh build's: true
+last edited: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true
+last edited: reuse run kept: 4, reElab: [0,2,3,5,6,7,8,11,12], elabReasons: {"nonconst":8,"text":1}
+open edited: first build: exit 0
+open edited: exit codes: reuse 0, fresh 0
+open edited: stdout equal to the fresh build's: true
+open edited: stderr equal to the fresh build's: true
+open edited: olean equal to the fresh build's: true
+open edited: ilean equal to the fresh build's: true
+open edited: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true
+open edited: reuse run kept: 2, reElab: [0,2,3,5,6,7,8,9,10,11,12], elabReasons: {"ctx":3,"nonconst":8}
+variable edited: first build: exit 0
+variable edited: exit codes: reuse 0, fresh 0
+variable edited: stdout equal to the fresh build's: true
+variable edited: stderr equal to the fresh build's: true
+variable edited: olean equal to the fresh build's: true
+variable edited: ilean equal to the fresh build's: true
+variable edited: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true
+variable edited: reuse run kept: 2, reElab: [0,2,3,5,6,7,8,9,10,11,12], elabReasons: {"ctx":3,"nonconst":8}

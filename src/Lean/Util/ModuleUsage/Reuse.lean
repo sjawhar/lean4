@@ -24,6 +24,11 @@ it skips the module holds (`keepPermit`).
 
 namespace Lean.ModuleUsage
 
+/-- The exit code of a `lean` reuse run whose keep ran code that may have changed state outside its command
+(`Lean.Elab.Reuse.Request.keep`): it wrote no output, and the module is to be compiled again without reuse, which Lake
+does. `EX_TEMPFAIL` of `sysexits.h`. -/
+def reuseReplayFailedExitCode : UInt8 := 75
+
 /-- How the per-command recorder treats a field of `Elab.Command.State` other than through the command's
 extension payload. -/
 inductive CommandStateField where

@@ -18,34 +18,53 @@ while its header is processed (`Request.new`), takes a keep permit for them once
 it (`Request.decide`), keeps it (`Request.keep`), and at the end hands what it kept to the module's records
 (`Request.finish`).
 
-The rule, in terms of the previous build's records: command `i` is kept iff the previous build has a record and a
-payload for command `i`, the record is of a declaration command that is no `initialize`, the payload has no refusal,
-the command's text digest (`textDigest`) and span (`CommandSpan`: the same source at the same position) are the record's,
-no module of its extra uses has another `.olean` than when it was compiled (`Inputs.changedExtra`), its messages can be
-shown again as they were (`CommandRecord.messages?`), no stateful linter's state changed in it, the file name and the
-source it read beyond its own are unchanged (`CommandRecord.fileContext`), every constant it used has the digests it
-recorded (for an import's, `ModuleUsage.importedUseDigests`; for one of this module's, which the record holds as the
-module's final digests, that the constant and what it depends on are as in the previous build, see
-`Progress.fullDirty`), the environment variables and working directory it read are unchanged where it starts, and its
-context (`ctxDigest`, `contextChanged?`) is its record's. The context hashes the payloads of every command before it,
-so a command is kept only after commands with the previous build's payloads in order: the candidate for command `i` is
-always the previous build's command `i`. An elaborated command keeps the chain only once its work has settled, which
-the run checks without waiting on it (`settledWithin`: code may wait for a later command), when no stateful linter's
-state changed in it, and, if it had effects outside it, when its record decides them and holds the previous build's
-inputs (`effectInputsChanged`): a keep never relies on what may change later, and the run never has to start over.
+The rule, in terms of the previous build's records: no command is kept when the run's import context read a value
+tied to the run, had an effect or still runs a task (`Request.start`). Otherwise command `i` is kept iff the previous
+build has a record and a payload for command `i`, the record is of a declaration command that is no `initialize`, the
+payload has no refusal, the command read no value tied to this process or this moment
+(`CommandRecord.nondeterministic`), every extension the payload has entries for takes them without a conversion
+(`CommandEntries.firstUnadmittedConversion`), the payload rebuilds what each realization the command made reported, as
+the full run made it and for the run's file (`CommandEntries.firstUnrebuildableRealization?`: a later request of it
+reports that again), the command's text digest (`textDigest`) and span (`CommandSpan`: the same source at the same
+position) are the record's, no module of its extra uses has another `.olean` than when it was compiled
+(`Inputs.changedExtra`), its messages can be shown again as they were (`CommandRecord.messages?`), no stateful
+linter's state changed in it, the file name and the source it read beyond its own are unchanged
+(`CommandRecord.fileContext`), every constant it used has the digests it recorded (for an import's,
+`ModuleUsage.importedUseDigests`; for one of this module's, which the record holds as the module's final digests, that
+the constant and what it depends on are as in the previous build, see `Progress.fullDirty`), the environment variables
+and working directory it read are unchanged where it starts, and its context (`ctxDigest`, `contextChanged?`) is its
+record's. The context hashes the payloads of every command before it, so a command is kept only after commands with the
+previous build's payloads in order: the candidate for command `i` is always the previous build's command `i`. An
+elaborated command keeps the chain only once its work has settled, which the run checks without waiting on it
+(`settledWithin`: code may wait for a later command), when no stateful linter's state changed in it, and when a later
+command can observe what its payload does not hold only through what it compares where it is kept
+(`refusalsEndKeeps?`): a keep never relies on what may change later. A keep runs no extension code but pure functions;
+its replay failing after the record was checked stops the process, which has then written nothing
+(`ModuleUsage.reuseReplayFailedExitCode`), and Lake compiles the module again without reuse.
+
+Inputs a run does not record, so that it cannot see them change: the heartbeat counter, which core reads in every
+command to enforce its limits; the file name and source read other than through `getFileName` and `getFileMap`, which
+core does not do and code outside core is required not to do; the random generator state `IO.stdGenRef` used in an
+imported module's initializer other than through the functions that note the use (`IO.noteRandomGeneratorUse`), which
+core does not do and code outside core is required not to do; pointer addresses (`ptrAddrUnsafe`); and what a pure
+function computes besides its result, which is nothing, as the compiler also assumes.
 -/
 
 namespace Lean.Elab.Reuse
 open ModuleUsage
 
-/-- What a run is asked to reuse (`lean --reuse-olean`, `--reuse-usage`, `--reuse-declined`, `--reuse-changed-extra`).
--/
+/-- What a run is asked to reuse (`lean --reuse-olean`, `--reuse-usage`, `--reuse-declined`, `--reuse-changed-extra`,
+`--reuse-retry-marker`, `--reuse-retry-token`). -/
 structure Inputs where
   /-- The module's previous `.olean` and `.usage`, or why none are reused (`--reuse-declined`). -/
   previous : Except String (System.FilePath × System.FilePath)
   /-- The workspace modules whose `.olean` differs from the one the previous build's `.usekey` records for them: a
   command with one of them among its extra uses is elaborated. -/
   changedExtra : NameSet := {}
+  /-- A file and a token: a run that stops because a keep's replay failed (`ModuleUsage.reuseReplayFailedExitCode`)
+  first writes the token to the file, which tells the caller (Lake) that the exit asks for a compile without reuse and
+  that no other code of the run exited with that code. -/
+  retryMarker? : Option (System.FilePath × String) := none
 
 /-- What the previous build's `.usage` gives a reuse run besides its permit's checks, read without an environment. -/
 structure PreviousUsage where
@@ -97,9 +116,9 @@ structure Pending where
 /-- What a reuse run has done so far, in command order. -/
 structure Progress where
   chain : CtxChain := {}
-  /-- Whether every command so far has the previous build's payload, in order, final, and for an effectful command, the
-  previous build's inputs. A command's context hashes the payloads before it, so none after a command with another
-  payload is kept. -/
+  /-- Whether every command so far has the previous build's payload, in order, final, and refusals no later command
+  can observe otherwise than through what it compares (`refusalsEndKeeps?`). A command's context hashes the payloads
+  before it, so none after a command with another payload is kept. -/
   intact : Bool := true
   /-- Why the chain broke, once `intact` is false: the reason of every later command with a record. -/
   breakReason : String := "ctx"
@@ -127,9 +146,16 @@ structure Progress where
   /-- The payloads of elaborated commands computed while the run went on, with their refusals beside the recorder's
   (`commandPayload`). -/
   computed : Std.HashMap Nat (Array Refusal × CommandEntries × Digest) := {}
+  /-- How many elaborated commands with effects outside them kept the chain (`refusalsEndKeeps?`), and how many
+  commands were kept after the first of them: the keeps those effects did not end (the `reuse` field's
+  `effectsAccepted` and `keptAfterEffects`). -/
+  effectsAccepted : Nat := 0
+  keptAfterEffects : Nat := 0
 
 inductive Status where
-  | declined (reason : String)
+  /-- No command is kept, for `reason`; `effects` are the runtime's notes the run took before it declined
+  (`Request.start`), which the module's records still need. -/
+  | declined (reason : String) (effects : RecordedEffects := {})
   | active (prev : Previous) (progress : IO.Ref Progress)
 
 /-- What a reuse run reads of the module's previous `.olean` and `.usage` while its header is processed
@@ -234,10 +260,13 @@ private def readPrevious (env : Environment) (pre : Prefetched) (lib? : Option S
 
 /-- Takes a keep permit for the module of `env`, the environment after its header, from its previous `.olean` and
 `.usage` (`keepPermitOf`, on the files `new` read); without one, every command is elaborated and the module's `.usage`
-says why. -/
+says why. Imported modules' initializers and extensions' initial states ran in the import context while the header was
+processed: what they did there is in every command's result and no record holds it, so a run whose import context
+read a value tied to the run (`import-nondeterministic`), had an effect (`import-effect`) or still runs a task that may
+do either later (`import-unsettled`) keeps nothing. -/
 def Request.start (req : Request) (env : Environment) (opts : Options) : IO Unit := do
   let some prefetched := req.prefetched? | return
-  let status ← profileitIO "reuse permit" opts do
+  let status : Status ← profileitIO "reuse permit" opts do
     try
       if env.header.isModule then pure (.declined "module-system") else
       -- the permit's reads of the values the previous build read are not this run's (`valuesChanged?`)
@@ -245,7 +274,17 @@ def Request.start (req : Request) (env : Environment) (opts : Options) : IO Unit
       | .ok prev => pure (.active prev (← mkAccountedRef {}))
       | .error reason => pure (.declined reason)
     catch e => pure (.declined s!"the previous outputs cannot be read: {e}")
-  req.status.set status
+  let .active _ progress := status | req.status.set status
+  -- once no task of the import context runs, none of its code can note anything later
+  let unsettled := (← unfinishedImportTasks) > 0
+  let taken ← takeRecordedEffects
+  progress.modify ({ · with effects := taken })
+  let reason? ←
+    if unsettled then pure (some "import-unsettled")
+    else if (← importReadNondeterministic) then pure (some "import-nondeterministic")
+    else if !(← taken.ofImport).isEmpty then pure (some "import-effect")
+    else pure none
+  req.status.set <| reason?.elim status (.declined · taken)
 
 /-- Whether the context `ctx` of a command is the one its previous record `r` was elaborated in: the single place a
 reuse run compares contexts. -/
@@ -365,36 +404,42 @@ private def valueChangedNow (prev : Previous) (keys : Array String) : IO (Option
     unless prev.valueDigests[k]? == some (valueDigest? (← currentValue? k)) do return some k
   return none
 
-/-- Whether a refusal's effect outside the command is decided by what the command's record compares when it keeps the
-chain (`effectInputsChanged`): a write to a reference or promise other code created, a task's cancellation, a write to
-an environment variable, the working directory, the runtime's settings or the standard output or error, whose content
-the command computes. A read of a file, the network, a child process, a mutable native object the command did not
-create, the standard input or the system's state gives the command an input no record holds. A refusal that is no
-effect concerns what the payload expresses, not an input. -/
-private def effectDecidedByRecord : Refusal → Bool
-  | .effect what => ["writes a reference ", "resolves a promise ", "cancels a task ", "writes an environment variable",
-      "changes the working directory", "sets the runtime's ", "sets whether the runtime ", "uses the standard output",
-      "uses the standard error"].any fun (p : String) => what.startsWith p
-  | _ => true
+/-- The kind of a refusal, as a reason names it. -/
+private def refusalKind : Refusal → String
+  | .inexpressible .. => "inexpressible"
+  | .notCarried .. => "notCarried"
+  | .unreplayable .. => "unreplayable"
+  | .unrecorded .. => "unrecorded"
+  | .divergentKernelAdd .. => "divergentKernelAdd"
+  | .foreignAttribute .. => "foreignAttribute"
+  | .partlyHeldRealization .. => "partlyHeldRealization"
+  | .realizedWithoutRealization .. => "realizedWithoutRealization"
+  | .foreignRealizationContext .. => "foreignRealizationContext"
+  | .unrelatedConstMap .. => "unrelatedConstMap"
+  | .commandState field => field.toString
+  | .uncompactable .. => "uncompactable"
+  | .effect .. => "effect"
 
-/-- Which input of an elaborated command `pend` with refusals (`ce`'s), with its context `ctx` and the reason `uses?` its
-record does not allow it for what it used (`usesChanged`), may not be the previous build's, if one may. Its payload
-names its effects but not what they did, so it keeps the chain only if every effect is decided by the command's record
-(`effectDecidedByRecord`), the command read no clock or random source (`commandReadNondeterministic`), and what the
-record holds is the previous build's: its text, position and context, its extra modules, the constants it used, the
-file name and source it read (`CommandRecord.fileContext`) and the process values it read. -/
-private def effectInputsChanged (req : Request) (prev : Previous) (pend : Pending) (r : CommandRecord)
-    (ce : CommandEntries) (ctx : Digest) (uses? : Option String) : IO (Option String) := do
-  unless ce.refusals.all effectDecidedByRecord do return some "unrecorded"
-  if ← commandReadNondeterministic pend.i then return some "nondeterministic"
-  unless r.text == textDigest pend.stx do return some "text"
-  unless r.span == pend.span do return some "position"
-  unless contextMatches r ctx do return some "ctx"
-  if r.extra.any (req.inputs.changedExtra.contains ·.1) then return some "extra"
-  if let some (what, _) := r.fileContext.find? fun (what, d) => req.fileContext[what]? != some d then
-    return some what
-  if uses?.isSome then return uses?
-  return (← valueChangedNow prev r.values).map fun _ => "value"
+/-- Why an elaborated command's refusals end the keeps, if one does. An elaborated command with the previous build's
+payload (`catchUp`) keeps the chain only if a later command can observe what its payload does not hold only through
+what the command after it compares where it is kept:
+- an effect that writes or removes an environment variable or changes the working directory (a kept command's reads of
+  them are compared at its keep, `valueChangedNow`), or that writes the standard output or error, which no command
+  reads. Every other effect, the note standing for effects the runtime did not note one by one included, is a change
+  the payload does not hold in full (`effect-unrecorded`).
+- a change of the scopes or of the next macro scope, which the next command's context holds (`ctxDigest`). Every other
+  refusal stands for state no digest of the chain holds (`unexpressed-` and its kind): that the command's inputs are the
+  record's does not make that state the previous build's, for a command may compute it from a value no record holds. -/
+private def refusalsEndKeeps? (refusals : Array Refusal) : Option String :=
+  refusals.findSome? fun
+    | .effect what =>
+      if ["writes the environment variable ", "unsets the environment variable ", "changes the working directory to "].any
+          (fun (p : String) => what.startsWith p) || what == "uses the standard output" ||
+          what == "uses the standard error" then
+        none
+      else some "effect-unrecorded"
+    | .commandState field => if field == `scopes || field == `nextMacroScope then none else some s!"unexpressed-{field}"
+    | r => some s!"unexpressed-{refusalKind r}"
 
 /-- Whether the work of the elaborated command `pend` that the run knows of has finished (its kernel checks, its
 snapshot tasks such as proofs, compilation and linters, its stateful linters' states, its info trees) and no task the
@@ -424,10 +469,10 @@ private partial def settledWithin (pend : Pending) (steps : Nat) : BaseIO Bool :
 /-- Extends the chain over the pending elaborated commands while each has the previous build's payload, final: the
 command's work settles (`settledWithin`, never waiting on it beyond `settleSteps`), so that no effect is noted for it
 after its payload is computed (`commandPayload`); no stateful linter's state changed in it (a kept command after it
-would read the state a fresh build gives, which no record holds: `linterStateChanged`); and if it has refusals, what
-decides its effects is the previous build's (`effectInputsChanged`). A keep never depends on a payload that may change
-later. -/
-private def catchUp (req : Request) (prev : Previous) : StateT Progress IO Unit := do
+would read the state a fresh build gives, which no record holds: `linterStateChanged`); and a later command can observe
+what its payload does not hold only through what it compares (`refusalsEndKeeps?`). A keep never depends on a payload
+that may change later. -/
+private def catchUp (prev : Previous) : StateT Progress IO Unit := do
   let pending := (← get).pending
   modify ({ · with pending := #[] })
   let linterInits ← Elab.Command.initialLinterStates
@@ -459,7 +504,9 @@ private def catchUp (req : Request) (prev : Previous) : StateT Progress IO Unit 
         if linterStateChanged linterInits pend.before pend.after then
           broken? := some "linter-state"
         else unless ce.refusals.isEmpty do
-          if let some why ← effectInputsChanged req prev pend r ce ctx uses? then broken? := some s!"effect-{why}"
+          broken? := refusalsEndKeeps? ce.refusals
+          if broken?.isNone && ce.refusals.any (· matches .effect _) then
+            modify fun p => { p with effectsAccepted := p.effectsAccepted + 1 }
     modify fun p => { p with
       chain := chain.push ce d text ctx, intact := broken?.isNone, breakReason := broken?.getD p.breakReason
       computed := p.computed.insert pend.i (rs, ce, d) }
@@ -481,6 +528,14 @@ private def decideWith (req : Request) (prev : Previous) (i : Nat) (stx : Syntax
   -- after a command whose payload is not the previous build's, no context is a record's (`Progress.intact`)
   unless (← get).intact do return .error (← get).breakReason
   unless ce.refusals.isEmpty do return .error "refused"
+  -- its result may hold a value another run reads otherwise (`CommandRecord.nondeterministic`)
+  if r.nondeterministic then return .error "nondeterministic"
+  -- a keep runs no extension code but pure functions: it replays only entries core states need no conversion
+  if (← ce.firstUnadmittedConversion).isSome then return .error "conversion"
+  -- a later request of a kept command's realization reports what its `realize` reported in the previous build, which
+  -- the payload rebuilds only for a result as the full run made it (`RealizationResult.report`) and for the run's file
+  let runsOn (f : String) := (fileContextDigests f "").all fun (k, d) => k != "fileName" || req.fileContext[k]? == some d
+  if (ce.firstUnrebuildableRealization? runsOn).isSome then return .error "realization-result"
   unless r.text == textDigest stx do return .error "text"
   unless r.span == span do return .error "position"
   if r.extra.any (req.inputs.changedExtra.contains ·.1) then return .error "extra"
@@ -493,7 +548,7 @@ private def decideWith (req : Request) (prev : Previous) (i : Nat) (stx : Syntax
     return .error what
   -- the checks below depend on the commands elaborated before: whether their constants changed (`Progress.fullDirty`),
   -- the process values their work set, and their payloads, which the context hashes
-  (fun p => profileitIO "reuse context check" st.scopes.head!.opts ((catchUp req prev).run p) :
+  (fun p => profileitIO "reuse context check" st.scopes.head!.opts ((catchUp prev).run p) :
     StateT Progress IO Unit)
   unless (← get).intact do return .error (← get).breakReason
   let (changed?, p) ← withoutResolvedNotes do return (usesChanged prev st.env r).run (← get)
@@ -535,14 +590,12 @@ def Request.elaborated (req : Request) (i : Nat) (stx : Syntax) (span : CommandS
     pending := if p.intact then p.pending.push { i, stx, span, before, after, info } else p.pending
     fullDirty := p.fullDirty.insert i true }
 
-/-- Notes that keeping command `i` failed with `error` (`Request.keep`): the command is elaborated as in a build without
-reuse, and no later command is kept. What the runtime noted for the command so far was the failed keep's, not the
-elaboration's: it is dropped. -/
+/-- Notes that keeping command `i` failed with `error` before it changed anything (`Request.keep` threw): the record
+does not fit the run, so the module's previous outputs are inconsistent; the command is elaborated as in a build
+without reuse, and no later command is kept. -/
 def Request.keepFailed (req : Request) (i : Nat) (error : String) : BaseIO Unit := do
   let .active _ progress ← req.status.get | return
-  let taken ← takeRecordedEffects
   progress.modify fun p => { p with
-    effects := p.effects ++ { taken with byCommand := taken.byCommand.filter (·.1 != i) }
     reasons := p.reasons.push (i, s!"keep failed: {error}"), intact := false, breakReason := "keep-failed" }
 
 /-- The message a build reported, as its record holds it (`CommandRecord.messages?`), shown for the file `fileName`: the
@@ -550,13 +603,42 @@ same text, kind, severity and position. -/
 private def replayedMessage (fileName : String) (j : Json) : Except String Message := do
   return { (← fromJson? (α := SerialMessage) j).toShownMessage with fileName }
 
-/-- Keeps the command `plan` allows, the command starting from `st`: re-adds and replays its previous payload
-(`readdCommandConstants`, `replayCommandEntries`) and restores the command state its record's `post` gives. The state
-has the messages the command reported in the previous build, shown for the file `fileName`, and one info tree, for the
-command alone. Fails on a payload or record that does not fit the environment, before it replays anything when the
-record is at fault: the module's previous outputs are inconsistent. The realizations the keep made are cached for later
-commands only once it succeeded, so a failed keep leaves nothing outside the command state it started from but the
-names the interpreter resolved (`recordUsedName`). -/
+/-- Stops the process: the replay of a kept command `i` failed after its record was checked whole, which no in-process
+fallback can undo; the replay runs no extension code but pure functions (`CommandEntries.firstUnadmittedConversion`), so
+this is an internal inconsistency, or core code with an effect outside the command. The run has written no output. It
+first writes the token of `Inputs.retryMarker?` to its file, which tells Lake that this exit asks for a compile without
+reuse in a fresh process (`ModuleUsage.reuseReplayFailedExitCode`). Nothing before the keep had effects that outlive the
+process: a command is kept only after commands whose effects are no more than those `refusalsEndKeeps?` lets pass. -/
+private def replayFailed (req : Request) (i : Nat) (detail : String) : IO α := do
+  IO.eprintln s!"declaration reuse replay failed; compile without reuse (command {i}: {detail})"
+  (← IO.getStdout).flush
+  (← IO.getStderr).flush
+  -- without the marker, Lake takes the exit as a failure
+  if let some (marker, token) := req.inputs.retryMarker? then
+    try IO.FS.writeFile marker token catch _ => pure ()
+  IO.Process.exit reuseReplayFailedExitCode
+
+/-- Runs `act`, part of the keep of command `i`, in the command's context: what it throws (`.error`) and, if the runtime
+noted an effect outside the command for it, stops the process (`replayFailed`); the other contexts' notes go to
+`progress`. Its reads of process values, clocks and names are not the command's (a kept command's are its record's). -/
+private def keepStep (req : Request) (progress : IO.Ref Progress) (i : Nat) (act : IO α) : IO (Except IO.Error α) := do
+  let a ← (withoutValueReads <| withoutNondeterministicReads <| withoutResolvedNotes act).toBaseIO
+  let taken ← takeRecordedEffects
+  let others : RecordedEffects := { taken with byCommand := taken.byCommand.filter (·.1 != i) }
+  progress.modify fun p => { p with effects := p.effects ++ others }
+  if let some (_, what) := taken.byCommand.find? (·.1 == i) then replayFailed req i s!"it {what}"
+  return a
+
+/-- Keeps the command `plan` allows, the command starting from `st`, in the command's context: re-adds and replays its
+previous payload (`readdCommandConstants`, `replayCommandEntries`) and restores the command state its record's `post`
+gives. The state has the messages the command reported in the previous build, shown for the file `fileName`, and one
+info tree, for the command alone.
+
+The record is checked whole first; a record that does not fit the run throws before anything runs (the module's
+previous outputs are inconsistent: `Request.keepFailed`). The replay adds the payload's extension entries without
+converting them (`admittedOnly`: `Request.decide` keeps only payloads whose every extension needs no conversion); a
+replay that throws or has an effect outside the command stops the process (`replayFailed`). The realizations the keep
+made are cached for later commands only once it succeeded. -/
 def Request.keep (req : Request) (plan : Plan) (st : Elab.Command.State) (fileMap : FileMap) (fileName : String) :
     IO Elab.Command.State := do
   let .active prev progress ← req.status.get | throw <| IO.userError "reuse: keep without a permit"
@@ -571,6 +653,8 @@ def Request.keep (req : Request) (plan : Plan) (st : Elab.Command.State) (fileMa
   let ngen ← IO.ofExcept (r.post.restoreNgen st.ngen |>.mapError (s!"reuse: command {plan.i}: {·}"))
   let messages ← IO.ofExcept <| (r.messages?.getD #[]).foldlM (init := MessageLog.empty) fun log j => do
     return log.add (← (replayedMessage fileName j).mapError (s!"reuse: command {plan.i}'s messages: {·}"))
+  if let some refs := r.refs? then
+    IO.ofExcept <| refs.validate fileMap.source.utf8ByteSize |>.mapError (s!"reuse: command {plan.i}'s references: {·}")
   let p ← progress.get
   let (some digest, p) ← (previousDigest prev plan.i).run p |
     throw <| IO.userError s!"reuse: command {plan.i}'s previous payload has no digest"
@@ -578,11 +662,13 @@ def Request.keep (req : Request) (plan : Plan) (st : Elab.Command.State) (fileMa
     { maxHeartbeats := (Core.getMaxHeartbeats opts).toUSize, maxRecDepth := (maxRecDepth.get opts).toUSize }
   -- as before an elaboration (`Language.Lean.process`): the stacks' logs then hold this command's operations
   let st := { st with env := ← clearScopedOps st.env }
-  let env ← profileitIO "reuse kernel replay" opts do
-    let (env, publish) ← readdCommandConstants permit st.env ce infos opts limits
-    let env ← replayCommandEntries permit env ce opts
-    publish
-    return env
+  let env ← match ← keepStep req progress plan.i <| profileitIO "reuse kernel replay" opts do
+      let (env, publish) ← readdCommandConstants permit st.env ce infos opts limits (admittedOnly := true)
+      let env ← replayCommandEntries permit env ce opts (admittedOnly := true)
+      publish
+      return env with
+    | .ok env => pure env
+    | .error e => replayFailed req plan.i (toString e)
   let g := r.post.auxDeclNGen
   let tree := InfoTree.context (.commandCtx { env, fileMap, ngen })
     (.node (.ofCommandInfo { elaborator := `Lean.Elab.Reuse.kept, stx := plan.stx }) PersistentArray.empty)
@@ -598,17 +684,21 @@ def Request.keep (req : Request) (plan : Plan) (st : Elab.Command.State) (fileMa
   -- records them in the order a fresh build reads them; `valueChangedNow` found them to be the previous ones
   for k in r.values do
     if changeableValue k then discard <| currentValue? k
+  -- `p` is from before the replay, which only added effect notes of other contexts
+  let p := { p with effects := (← progress.get).effects }
   progress.set { p with
     chain := p.chain.push ce digest r.text plan.ctx
     fullDirty := p.fullDirty.insert plan.i dirty
     keptIdxs := p.keptIdxs.insert plan.i
     kept := p.kept.push { i := plan.i, stx := plan.stx, span := plan.span, before := st, after, record := r,
-                          payload := ce, digest } }
+                          payload := ce, digest }
+    keptAfterEffects := if p.effectsAccepted > 0 then p.keptAfterEffects + 1 else p.keptAfterEffects }
   return after
 
 /-- What a reuse run leaves for the module's outputs. -/
 structure Outcome where
-  /-- The `.usage` `reuse` field: `{kept, total, reElab, elabReasons}`, or `{declined}`. -/
+  /-- The `.usage` `reuse` field: `{kept, total, reElab, elabReasons}`, with `effectsAccepted` and `keptAfterEffects`
+  when an elaborated command's effects kept the chain (`Progress`), or `{declined}`. -/
   field : Json
   kept : Array KeptCommand := #[]
   /-- The runtime's effect notes the run took (`takeRecordedEffects`). -/
@@ -628,13 +718,16 @@ structure Outcome where
 /-- The run's outcome, once every command is processed. -/
 def Request.finish (req : Request) : IO Outcome := do
   match ← req.status.get with
-  | .declined reason => return { field := Json.mkObj [("declined", reason)] }
+  | .declined reason effects => return { field := Json.mkObj [("declined", reason)], effects }
   | .active prev progress =>
     let p ← progress.get
     let counts := p.reasons.foldl (init := ({} : Std.HashMap String Nat)) fun m (_, r) => m.insert r (m.getD r 0 + 1)
-    let field := Json.mkObj [("kept", p.kept.size), ("total", p.total),
+    -- with the elaborated commands whose effects kept the chain, the commands kept after the first of them
+    let accepted := if p.effectsAccepted == 0 then [] else
+      [("effectsAccepted", toJson p.effectsAccepted), ("keptAfterEffects", toJson p.keptAfterEffects)]
+    let field := Json.mkObj <| [("kept", toJson p.kept.size), ("total", toJson p.total),
       ("reElab", toJson (p.reasons.map (·.1))),
-      ("elabReasons", Json.mkObj (counts.toList.map fun (r, n) => (r, toJson n)))]
+      ("elabReasons", Json.mkObj (counts.toList.map fun (r, n) => (r, toJson n)))] ++ accepted
     if p.kept.isEmpty then return { field, effects := p.effects, computed := p.computed }
     -- `kept` is in command order: the first kept command that read a value is the first one found; a value code can
     -- change was read again where the command was kept (`Request.keep`), so the runtime recorded it

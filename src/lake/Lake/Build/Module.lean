@@ -1344,7 +1344,9 @@ Compiles the module. `setup?` is its `ModuleSetup` if the caller already compute
 (`Module.skipOrBuild`); otherwise it is computed here. Only with usage cutoff enabled does Lean
 record usage (`--usage`: digests in the `.olean`, the `.usage`) and Lake write the `.usekey`. With it, `lean` may
 keep commands from the module's previous outputs (`reuse`): Lake moves the previous `.olean` and `.usage` aside
-(`.old`) for the compile and removes them after it, or passes the reason it does not.
+(`.old`) for the compile and removes them after it, or passes the reason it does not. If a kept command fails its
+replay, `lean` confirms it through a marker file beside the `.olean` (`.reuse-retry`), and the module is compiled again
+without reuse (`compileLeanModule`'s `retry?`).
 -/
 def Module.buildLean
   (mod : Module) (presetup : ModulePreSetup) (reuse : ReuseRequest) (setup? : Option ModuleSetup := none)
@@ -1356,12 +1358,12 @@ def Module.buildLean
   let setup ← setup?.getDM (mkModuleSetup mod presetup)
   let outputPaths := mod.mkArtifacts presetup.srcFile presetup.isModule
   -- the previous outputs leave the paths `lean` writes, which `clearOutputArtifacts` empties
-  let (reuseArgs, previous) ← if !usage then pure (#[], #[]) else
+  let (reuseArgs, previous, retry?) ← if !usage then pure (#[], #[], none) else
     match reuse with
-    | .declined reason => pure (#[s!"--reuse-declined={reason}"], #[])
+    | .declined reason => pure (#[s!"--reuse-declined={reason}"], #[], none)
     | .check => do
       match ← mod.reuseCheck presetup setup.importArts with
-      | .error reason => pure (#[s!"--reuse-declined={reason}"], #[])
+      | .error reason => pure (#[s!"--reuse-declined={reason}"], #[], none)
       | .ok changed =>
         let aside (f : FilePath) := f.addExtension "old"
         let mut moved := #[]
@@ -1370,13 +1372,14 @@ def Module.buildLean
             IO.FS.rename f (aside f)
             moved := moved.push (aside f)
         pure (#[s!"--reuse-olean={aside mod.oleanFile}", s!"--reuse-usage={aside mod.usageFile}"] ++
-          changed.map (s!"--reuse-changed-extra={·}"), moved)
+          changed.map (s!"--reuse-changed-extra={·}"), moved,
+          some (args.push "--reuse-declined=replay-failed", mod.oleanFile.withExtension "reuse-retry"))
   mod.clearOutputArtifacts
   mod.clearOutputHashes
   let modsysBefore? ← if usage then some <$> modsysHash (← IO.mkRef {}) setup.importArts else pure none
   try
     compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile outputPaths (args ++ reuseArgs)
-      (← getLeanPath) (← getLean)
+      (← getLeanPath) (← getLean) retry?
   finally
     for f in previous do removeFileIfExists f
   mod.checkSourceUnchanged presetup

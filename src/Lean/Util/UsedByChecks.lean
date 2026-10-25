@@ -319,6 +319,12 @@ realizations cannot note an effect or use another realization any more (`takeRec
 def unfinishedCommandTasks (i : Nat) : BaseIO Nat := do
   unfinishedTasksOf (← commandContexts i)
 
+/-- How many tasks that code of the import context (`withImportContext`), or a realization it used, created while
+recording was on are not finished. While none is, imported modules' initializers and extensions' initial states cannot
+note an effect or a nondeterministic read any more (`RecordedEffects.ofImport`, `importReadNondeterministic`). -/
+def unfinishedImportTasks : BaseIO Nat := do
+  unfinishedTasksOf (← contextClosure importContext)
+
 @[extern "lean_io_set_effect_recording"]
 private opaque setEffectRecording (on : Bool) (pinned : @& Array String) (root solver : @& String) : BaseIO Unit
 

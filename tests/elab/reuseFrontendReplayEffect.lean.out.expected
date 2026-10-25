@@ -1,0 +1,55 @@
+case throw
+first build: exit 0, x 0 (exit 0)
+reuse: {"elabReasons":{"conversion":1,"text":1},"kept":0,"reElab":[0,1],"total":2}
+exit codes: 0, fresh 0
+stdout equal to the fresh build's: true
+stderr equal to the fresh build's: true
+olean equal to the fresh build's: true
+ilean equal to the fresh build's: true
+usage equal to the fresh build's but `reuse` and `resolved`: true; `commands` lengths equal: true; `resolved` holds the fresh build's: true
+config.txt: A, fresh A
+x: 0 (exit 0), fresh 0 (exit 0)
+case async
+first build: exit 0, y 0 (exit 0)
+reuse: {"elabReasons":{"conversion":1,"ctx":1,"text":1},"kept":0,"reElab":[0,1,2],"total":3}
+exit codes: 0, fresh 0
+stdout equal to the fresh build's: true
+stderr equal to the fresh build's: true
+olean equal to the fresh build's: true
+ilean equal to the fresh build's: true
+usage equal to the fresh build's but `reuse` and `resolved`: true; `commands` lengths equal: true; `resolved` holds the fresh build's: true
+config.txt: A, fresh A
+y: 1 (exit 0), fresh 1 (exit 0)
+case copy
+first build: exit 0, x 0 (exit 0)
+reuse: {"elabReasons":{"conversion":1,"text":1},"kept":0,"reElab":[0,1],"total":2}
+exit codes: 0, fresh 0
+stdout equal to the fresh build's: true
+stderr equal to the fresh build's: true
+olean equal to the fresh build's: true
+ilean equal to the fresh build's: true
+usage equal to the fresh build's but `reuse` and `resolved`: true; `commands` lengths equal: true; `resolved` holds the fresh build's: true
+config.txt: A, fresh A
+x: 0 (exit 0), fresh 0 (exit 0)
+case simple
+first build: exit 0, x 0 (exit 0)
+reuse: {"elabReasons":{"text":1},"kept":1,"reElab":[1],"total":2}
+exit codes: 0, fresh 0
+stdout equal to the fresh build's: true
+stderr equal to the fresh build's: true
+olean equal to the fresh build's: true
+ilean equal to the fresh build's: true
+usage equal to the fresh build's but `reuse` and `resolved`: true; `commands` lengths equal: true; `resolved` holds the fresh build's: true
+config.txt: A, fresh A
+x: 0 (exit 0), fresh 0 (exit 0)
+case ownIdentity
+first build: exit 0, x 0 (exit 0)
+reuse: {"elabReasons":{"conversion":1,"text":1},"kept":0,"reElab":[0,1],"total":2}
+exit codes: 0, fresh 0
+stdout equal to the fresh build's: true
+stderr equal to the fresh build's: true
+olean equal to the fresh build's: true
+ilean equal to the fresh build's: true
+usage equal to the fresh build's but `reuse` and `resolved`: true; `commands` lengths equal: true; `resolved` holds the fresh build's: true
+config.txt: A, fresh A
+x: 0 (exit 0), fresh 0 (exit 0)

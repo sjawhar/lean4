@@ -1,0 +1,74 @@
+value: first build: exit 0
+value: exit codes: reuse 0, fresh 0
+value: stdout equal to the fresh build's: true
+value: stderr equal to the fresh build's: true
+value: olean equal to the fresh build's: true
+value: ilean equal to the fresh build's: true
+value: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true
+value: reuse run 1: values #[env:RV_FOO] fileContext #[] marker false extra #[E] nondeterministic false
+value: fresh build 1: values #[env:RV_FOO] fileContext #[] marker false extra #[E] nondeterministic false
+value: reuse run 2: values #[env:RV_FOO] fileContext #[] marker false extra #[E] nondeterministic false
+value: fresh build 2: values #[env:RV_FOO] fileContext #[] marker false extra #[E] nondeterministic false
+value: reuse run kept 2, reElab [2], elabReasons {"text":1}
+const: first build: exit 0
+const: exit codes: reuse 0, fresh 0
+const: stdout equal to the fresh build's: true
+const: stderr equal to the fresh build's: true
+const: olean equal to the fresh build's: true
+const: ilean equal to the fresh build's: true
+const: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true
+const: reuse run 1: values #[env:RV_BAR] fileContext #[fileName] marker true extra #[E, Z] nondeterministic false
+const: fresh build 1: values #[env:RV_BAR] fileContext #[fileName] marker true extra #[E, Z] nondeterministic false
+const: reuse run 2: values #[env:RV_BAR] fileContext #[fileName] marker true extra #[E, Z] nondeterministic false
+const: fresh build 2: values #[env:RV_BAR] fileContext #[fileName] marker true extra #[E, Z] nondeterministic false
+const: reuse run kept 2, reElab [2], elabReasons {"text":1}
+eval: first build: exit 0
+eval: exit codes: reuse 0, fresh 0
+eval: stdout equal to the fresh build's: true
+eval: stderr equal to the fresh build's: true
+eval: olean equal to the fresh build's: true
+eval: ilean equal to the fresh build's: true
+eval: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true
+eval: reuse run 1: values #[] fileContext #[] marker false extra #[E] nondeterministic false
+eval: fresh build 1: values #[] fileContext #[] marker false extra #[E] nondeterministic false
+eval: reuse run 2: values #[] fileContext #[] marker false extra #[E] nondeterministic false
+eval: fresh build 2: values #[] fileContext #[] marker false extra #[E] nondeterministic false
+eval: reuse run kept 2, reElab [2], elabReasons {"text":1}
+eval: 1 uses C.val: reuse run true, fresh build true
+eval: 2 uses C.val: reuse run true, fresh build true
+stale: exit codes: reuse 0, fresh 0
+stale: stdout equal to the fresh build's: true
+stale: stderr equal to the fresh build's: true
+stale: olean equal to the fresh build's: true
+stale: ilean equal to the fresh build's: true
+stale: usage equal to the fresh build's but `reuse` and `resolved`: true
+stale: reuse run kept 1, reElab [1,2]
+source: first build: exit 0
+source: exit codes: reuse 0, fresh 0
+source: stdout equal to the fresh build's: true
+source: stderr equal to the fresh build's: true
+source: olean equal to the fresh build's: true
+source: ilean equal to the fresh build's: true
+source: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true
+source: reuse run 1: values #[] fileContext #[source] marker false extra #[E] nondeterministic false
+source: fresh build 1: values #[] fileContext #[source] marker false extra #[E] nondeterministic false
+source: reuse run 2: values #[] fileContext #[source] marker false extra #[E] nondeterministic false
+source: fresh build 2: values #[] fileContext #[source] marker false extra #[E] nondeterministic false
+source: reuse run kept 1, reElab [1,2,3], elabReasons {"source":2,"text":1}
+source: `b` through an importer: reuse 121, fresh 121
+val_fx both: exit 0
+val_fx both: 1: values #[env:RV_BAR] fileContext #[fileName] marker true extra #[E, Z] nondeterministic true
+val_fx both: 1: refusals #[an effect outside the command: it reads data.txt]
+val_fx both: 2: values #[env:RV_BAR] fileContext #[fileName] marker true extra #[E, Z] nondeterministic true
+val_fx both: 2: refusals #[an effect outside the command: it reads data.txt]
+val_fx alone: exit 0
+val_fx alone: 2: values #[env:RV_BAR] fileContext #[fileName] marker true extra #[E, Z] nondeterministic true
+val_fx alone: 2: refusals #[an effect outside the command: it reads data.txt]
+const_fx both: exit 0
+const_fx both: 1: values #[env:RV_BAR] fileContext #[fileName] marker true extra #[E, Z] nondeterministic true
+const_fx both: 1: refusals #[an effect outside the command: it reads data.txt]
+const_fx both: 2: values #[env:RV_BAR] fileContext #[fileName] marker true extra #[E, Z] nondeterministic true
+const_fx both: 2: refusals #[an effect outside the command: it reads data.txt]
+const_fx alone: exit 0
+const_fx alone: 2: values #[env:RV_BAR] fileContext #[fileName] marker true extra #[E, Z] nondeterministic true
+const_fx alone: 2: refusals #[an effect outside the command: it reads data.txt]

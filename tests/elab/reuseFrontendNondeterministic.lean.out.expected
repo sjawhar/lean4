@@ -1,0 +1,6 @@
+first build: exit 0
+exit codes: reuse 0, fresh 0
+stdout equal to the fresh build's: true
+stderr equal to the fresh build's: true
+reuse run reElab: [1,2,3]
+reuse run elabReasons: {"nondeterministic":2,"text":1}

@@ -1,0 +1,26 @@
+nondeterministic: first build: exit 0
+nondeterministic: reuse run: exit 0, stdout and stderr empty: true
+nondeterministic: reuse field: {"declined":"import-nondeterministic"}
+nondeterministic: b = a + 1 in the importer: true
+nondeterministic: a reuse run with another seed than the first build found: true
+random: first build: exit 0
+random: reuse run: exit 0, stdout and stderr empty: true
+random: reuse field: {"declined":"import-nondeterministic"}
+random: b = a + 1 in the importer: true
+random: a reuse run with another seed than the first build found: true
+rand: first build: exit 0
+rand: reuse run: exit 0, stdout and stderr empty: true
+rand: reuse field: {"declined":"import-nondeterministic"}
+rand: b = a + 1 in the importer: true
+rand: a reuse run with another seed than the first build found: true
+effect: first build: exit 0
+effect: reuse run: exit 0, stdout and stderr empty: true
+effect: reuse field: {"declined":"import-effect"}
+effect: b = a + 1 in the importer: true
+effect: a reuse run with another seed than the first build found: true
+unsettled: first build: exit 0, noreuse: true
+unsettled: reuse run: exit 0, stdout and stderr empty: true
+unsettled: reuse field: {"declined":"import-unsettled"}
+task: first build: exit 0
+task: reuse run: exit 0, stdout and stderr empty: true
+task: reuse field: {"declined":"import-nondeterministic"}

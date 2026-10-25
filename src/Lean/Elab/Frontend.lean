@@ -218,14 +218,16 @@ private def commandMessages (fileName : String) (snap : Language.Lean.InitialSna
 /-- The command records `commands` (`CommandRecord` as JSON) with what the run observed of each command after its
 records were made: its reported messages (`commandMessages`), which its record holds only if they all lie in its span
 (`CommandRecord.messages?`), its lint log entries (`lints`), and, for an elaborated command, its `.ilean` references
-(`refs`, by command index, for a run that writes an `.ilean`) and what it read of its file beyond its source (`reads`,
+(`refs`, by command index, for a run that writes an `.ilean`), whether it read a nondeterministic source
+(`nondeterministic`, the indices of those that did) and what it read of its file beyond its source (`reads`,
 `FileContextRead` bits by command index: `commandFileContextReads`) with the digests `fileContext`
 (`ModuleUsage.fileContextDigests`). A kept command (`keptIdxs`) has the references and read what its previous record
 says. -/
 private def withRunRecords (commands : Array Json)
     (messages : Array (Option (Array (Position × Option Position × Json)))) (lints : Std.HashMap Nat Nat)
-    (refs : Array (Option ModuleUsage.CommandRefs)) (reads : Std.HashMap Nat UInt8)
-    (fileContext : Array (String × ModuleUsage.Digest)) (keptIdxs : Std.HashSet Nat) : Array Json :=
+    (refs : Array (Option ModuleUsage.CommandRefs)) (nondeterministic : Std.HashSet Nat)
+    (reads : Std.HashMap Nat UInt8) (fileContext : Array (String × ModuleUsage.Digest)) (keptIdxs : Std.HashSet Nat) :
+    Array Json :=
   commands.map fun c => Id.run do
     let .ok i := c.getObjValAs? Nat "i" | return c
     let inSpan (ms : Array (Position × Option Position × Json)) : Option (Array Json) := do
@@ -235,7 +237,8 @@ private def withRunRecords (commands : Array Json)
     let recorded := (messages[i]?.getD (some #[])).bind inSpan
     let c := (c.setObjVal! "messages" (toJson recorded)).setObjVal! "lints" (toJson (lints.getD i 0))
     if keptIdxs.contains i then return c
-    let c := c.setObjVal! "refs" (toJson (refs[i]?.join))
+    let c := (c.setObjVal! "refs" (toJson (refs[i]?.join))).setObjVal! "nondeterministic"
+      (toJson (nondeterministic.contains i))
     let bits := reads.getD i 0
     let read (k : String) := (k == "fileName" && bits &&& FileContextRead.fileName != 0) ||
       (k == "source" && bits &&& FileContextRead.source != 0)
@@ -670,12 +673,15 @@ def runFrontend
     let used := kept.foldl (init := used) fun s k =>
       k.record.usesFull.foldl (·.insert ·.1) (k.record.usesStmt.foldl (·.insert ·.1) s)
     let used := (reused?.elim #[] (·.usedUnattributed)).foldl (·.insert ·) used
+    let mut nondeterministic : Std.HashSet Nat := {}
     let mut reads : Std.HashMap Nat UInt8 := {}
     for c in commands do
       let .ok i := c.getObjValAs? Nat "i" | continue
+      if ← commandReadNondeterministic i then nondeterministic := nondeterministic.insert i
       reads := reads.insert i (← commandFileContextReads i)
-    let commands := withRunRecords commands (← commandMessages fileName snap) (← lintCounts.get) ileanRefs reads
-      (ModuleUsage.fileContextDigests fileName input) (kept.foldl (·.insert ·.i) {})
+    let commands := withRunRecords commands (← commandMessages fileName snap) (← lintCounts.get) ileanRefs
+      nondeterministic reads (ModuleUsage.fileContextDigests fileName input)
+      (kept.foldl (·.insert ·.i) {})
     ModuleUsage.writeUsage env nodes own closure provides indirect used (← lookedUpSpecKeys) stmt commands
       (incrLoaded := incrLoadFileName?.isSome) usageFileName (← ModuleUsage.fileDigest oleanFileName)
       (noreuseReason? := recs.noreuseReason?) (carried := reused?.elim {} (·.carried))

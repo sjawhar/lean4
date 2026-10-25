@@ -1,0 +1,16 @@
+rebuilt: first build: exit 0
+rebuilt: exit codes: reuse 0, fresh 0
+rebuilt: stdout equal to the fresh build's: true; `realized w` warnings: reuse 2, fresh 2
+rebuilt: stderr equal to the fresh build's: true
+rebuilt: olean equal to the fresh build's: true
+rebuilt: ilean equal to the fresh build's: true
+rebuilt: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true
+rebuilt: reuse run kept 2, reElab [2], elabReasons {"text":1}
+declined: first build: exit 0
+declined: exit codes: reuse 0, fresh 0
+declined: stdout equal to the fresh build's: true; `value 7` warnings: reuse 2, fresh 2
+declined: stderr equal to the fresh build's: true
+declined: olean equal to the fresh build's: true
+declined: ilean equal to the fresh build's: true
+declined: usage equal to the fresh build's but `reuse` and `resolved`: true; `resolved` holds the fresh build's: true
+declined: reuse run kept 1, reElab [1,2], elabReasons {"realization-result":1,"text":1}

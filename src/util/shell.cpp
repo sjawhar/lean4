@@ -198,6 +198,8 @@ static struct option g_long_options[] = {
     {"reuse-usage",  required_argument, 0, 'Q'},
     {"reuse-changed-extra", required_argument, 0, 'F'},
     {"reuse-declined", required_argument, 0, 'X'},
+    {"reuse-retry-marker", required_argument, 0, 'A'},
+    {"reuse-retry-token", required_argument, 0, 'G'},
 #ifdef LEAN_DEBUG
     {"debug",        required_argument, 0, 'B'},
 #endif
