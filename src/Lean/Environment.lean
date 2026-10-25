@@ -619,11 +619,11 @@ private structure RealizationContext where
   /-- Saved options. Empty for imported constants. -/
   opts      : Options
   /--
-  `realizeValue _ key ..` adds a mapping from `(typeName key, key)` to a task of the realization
-  result (`RealizeValueResult` when called from `Lean.realizeValue`, `RealizeConstResult` from
-  `Environment.realizeConst`).
+  `realizeValue _ key ..` adds a mapping from `(typeName key, key)` to the handle of the realization's task context
+  (`newRealizationContext`) and a task of the realization result (`RealizeValueResult` when called from
+  `Lean.realizeValue`, `RealizeConstResult` from `Environment.realizeConst`).
   -/
-  realizeMapRef : IO.Ref (NameMap NonScalar /- PHashMap α (Task Dynamic) -/)
+  realizeMapRef : IO.Ref (NameMap NonScalar /- PHashMap α (UInt64 × Task Dynamic) -/)
 
 /--
 The declarations whose declaration-keyed state changed, as recorded in `Environment.declChangeLog`.
@@ -3436,7 +3436,10 @@ private def realizationEnv (env : Environment) (ctx : RealizationContext) (forCo
     localRealizationCtxMap := realizeEnv.localRealizationCtxMap.insert forConst ctx
     importRealizationCtx? := env.importRealizationCtx? }
 
-/-- Plumbing function for `Lean.Meta.realizeValue`; see documentation there. -/
+/-- Plumbing function for `Lean.Meta.realizeValue`; see documentation there. With usage recording on, `realize` runs in
+a task context of its own (`withRealizationContext`), which the cache keeps with the result, and every request, the one
+that runs `realize` and each that gets the cached result, notes a use of it (`noteRealizationUse`): what `realize`
+observed counts for each requester alike (`commandContexts`). -/
 def realizeValue [BEq α] [Hashable α] [TypeName α] (env : Environment) (forConst : Name) (key : α)
     (realize : Environment → Options → BaseIO Dynamic) : IO Dynamic := do
   -- the following code is inherently non-deterministic in number of heartbeats, reset them at the
@@ -3451,28 +3454,33 @@ def realizeValue [BEq α] [Hashable α] [TypeName α] (env : Environment) (forCo
     -- First try checking for the key non-atomically as (de)allocating the promise is expensive.
     let m ← ctx.realizeMapRef.get
     if let some m' := m.find? (TypeName.typeName α) then
-      -- Safety: `typeName α` should uniquely identify `PHashMap α (Task Dynamic)`; there are no other
+      -- Safety: `typeName α` should uniquely identify `PHashMap α (UInt64 × Task Dynamic)`; there are no other
       -- accesses to `private realizeMapRef` outside this function.
-      let m' := unsafe unsafeCast (β := PHashMap α (Task Dynamic)) m'
-      if let some t := m'[key] then
+      let m' := unsafe unsafeCast (β := PHashMap α (UInt64 × Task Dynamic)) m'
+      if let some (r, t) := m'[key] then
+        noteRealizationUse r
         return t.get
 
     -- Now check atomically.
     let prom ← IO.Promise.new
+    let r ← newRealizationContext
     let existingConsts? ← ctx.realizeMapRef.modifyGet fun m =>
       let m' := match m.find? (TypeName.typeName α) with
-        | some m' => unsafe unsafeCast (β := PHashMap α (Task Dynamic)) m'
+        | some m' => unsafe unsafeCast (β := PHashMap α (UInt64 × Task Dynamic)) m'
         | none    => {}
       match m'[key] with
-      | some prom' => (some prom', m)
+      | some e => (some e, m)
       | none =>
-        let m' := m'.insert key prom.result!
+        let m' := m'.insert key (r, prom.result!)
         let m := m.insert (TypeName.typeName α) (unsafe unsafeCast (β := NonScalar) m')
         (none, m)
-    if let some t := existingConsts? then
+    if let some (r', t) := existingConsts? then
+      noteRealizationUse r'
       pure t.get
     else
-      let res ← realize (env.realizationEnv ctx forConst) ctx.opts
+      noteRealizationUse r
+      let res ← (withRealizationContext r (realize (env.realizationEnv ctx forConst) ctx.opts) : BaseIO Dynamic)
+      -- resolved in the requester's context, which created the promise
       prom.resolve res
       pure res)
   IO.setNumHeartbeats heartbeats
@@ -3581,30 +3589,40 @@ def realizeConst (env : Environment) (forConst : Name) (constName : Name)
   let (env, ex) ← mergeRealizeConstResult env res (replayExts := true)
   return (env, ex, res.dyn)
 
-/-- The realization results a keep built (`readdRealizeConst`), each with the cache of its realization context and its
-key, held back from the caches until the whole keep succeeded (`publish`): a failed keep leaves no result behind that
-the command's elaboration, or a later one, would merge instead of running `realize`. -/
+/-- The realization results a keep built (`readdRealizeConst`), each with the cache of its realization context, its
+key, and what the realization observed in the build the kept payload is from, held back from the caches until the
+whole keep succeeded (`publish`): a failed keep leaves no result behind that the command's elaboration, or a later one,
+would merge instead of running `realize`. -/
 private structure PendingRealizations where
-  results : Array (IO.Ref (NameMap NonScalar) × Name × RealizeConstResult) := #[]
+  results : Array (IO.Ref (NameMap NonScalar) × Name × RealizeConstResult × RealizationObservations) := #[]
 
 private unsafe def cachedRealizationImpl (ctx : RealizationContext) (constName : Name) :
-    BaseIO (Option RealizeConstResult) := do
+    BaseIO (Option (UInt64 × RealizeConstResult)) := do
   let some m := (← ctx.realizeMapRef.get).find? (TypeName.typeName RealizeConstKey) | return none
-  let m : PHashMap RealizeConstKey (Task Dynamic) := unsafeCast m
-  let some t := m[({ constName } : RealizeConstKey)] | return none
-  return t.get.get? RealizeConstResult
+  let m : PHashMap RealizeConstKey (UInt64 × Task Dynamic) := unsafeCast m
+  let some (r, t) := m[({ constName } : RealizeConstKey)] | return none
+  return (t.get.get? RealizeConstResult).map (r, ·)
 
-/-- The result `ctx` caches for the realization `constName`, waiting for one in progress. -/
+/-- The result `ctx` caches for the realization `constName`, with the handle of the task context its `realize` ran in
+(`newRealizationContext`), waiting for one in progress. -/
 @[implemented_by cachedRealizationImpl]
-private opaque cachedRealization (ctx : RealizationContext) (constName : Name) : BaseIO (Option RealizeConstResult)
+private opaque cachedRealization (ctx : RealizationContext) (constName : Name) :
+    BaseIO (Option (UInt64 × RealizeConstResult))
+
+/-- The result the realization context `env` holds for `forConst` caches for the realization `constName`, with its
+handle (`cachedRealization`). -/
+private def findCachedRealization? (env : Environment) (forConst constName : Name) :
+    BaseIO (Option (UInt64 × RealizeConstResult)) := do
+  let some ctx := env.realizationContext? forConst | return none
+  cachedRealization ctx constName
 
 /-- The result of the realization `constName` for `forConst`: the one the realization context `env` holds for
 `forConst` caches, or else the one `pending` holds for that context. -/
 private def findRealization? (env : Environment) (pending : PendingRealizations) (forConst constName : Name) :
     BaseIO (Option RealizeConstResult) := do
   let some ctx := env.realizationContext? forConst | return none
-  if let some res ← cachedRealization ctx constName then return some res
-  return pending.results.findSome? fun (ref, n, res) =>
+  if let some (_, res) ← cachedRealization ctx constName then return some res
+  return pending.results.findSome? fun (ref, n, res, _) =>
     if n == constName && SharedDiff.sameObject ref ctx.realizeMapRef then some res else none
 
 /--
@@ -3612,14 +3630,15 @@ Re-adds a realization a kept command made: as `realizeConst forConst constName` 
 which re-creates the realization's constants and recorded extension states in the realization's environment (the
 realization context's, inside the realization's async context), and `dyn` the value `realize` returned in the full run,
 rebuilt from the kept command's record, which a later request reports as a full run's does. The result is merged into
-`env` and added to `pending`, not cached: `PendingRealizations.publish` caches it once the keep succeeded, so that a
-later request elsewhere merges it as a full run's would. When the context caches a result for the key, or `pending`
-holds one, `build` does not run and that result is merged, as `realizeConst` does. The merge adds the constants only,
-because the kept command's recorded checked view already holds the extension writes a merge replays. Throws when
-`build` does, caching nothing; the task holds the kernel's exception, if any.
+`env` and added to `pending` with `obs`, what the realization observed in the full run, not cached:
+`PendingRealizations.publish` caches it once the keep succeeded, so that a later request elsewhere merges it and
+observes `obs` as a full run's request would. When the context caches a result for the key, or `pending` holds one,
+`build` does not run and that result is merged, as `realizeConst` does. The merge adds the constants only, because the
+kept command's recorded checked view already holds the extension writes a merge replays. Throws when `build` does,
+caching nothing; the task holds the kernel's exception, if any.
 -/
 private def readdRealizeConst (env : Environment) (pending : PendingRealizations) (forConst constName : Name)
-    (dyn : Dynamic) (build : Environment → Options → IO Environment) :
+    (dyn : Dynamic) (obs : RealizationObservations) (build : Environment → Options → IO Environment) :
     IO (Environment × Task (Option Kernel.Exception) × PendingRealizations) := do
   let some ctx := env.realizationContext? forConst |
     throw <| .userError s!"reuse: no realization context for {forConst}, which {constName}'s realization ran in"
@@ -3632,21 +3651,26 @@ private def readdRealizeConst (env : Environment) (pending : PendingRealizations
   let realizeEnv' ← tryFinally (build realizeEnv ctx.opts) (monadLift (IO.setNumHeartbeats heartbeats) : IO Unit)
   let res ← RealizeConstResult.ofRealization forConst constName realizeEnv realizeEnv' dyn
   let (env, ex) ← mergeRealizeConstResult env res (replayExts := false)
-  return (env, ex, { results := pending.results.push (ctx.realizeMapRef, constName, res) })
+  return (env, ex, { results := pending.results.push (ctx.realizeMapRef, constName, res, obs) })
 
 private unsafe def PendingRealizations.publishImpl (pending : PendingRealizations) : BaseIO Unit := do
-  for (ref, constName, res) in pending.results do
+  for (ref, constName, res, obs) in pending.results do
     let key : RealizeConstKey := { constName }
-    ref.modify fun m =>
-      let m' : PHashMap RealizeConstKey (Task Dynamic) := match m.find? (TypeName.typeName RealizeConstKey) with
+    let r ← newRealizationContext
+    let inserted ← ref.modifyGet fun m =>
+      let m' : PHashMap RealizeConstKey (UInt64 × Task Dynamic) :=
+        match m.find? (TypeName.typeName RealizeConstKey) with
         | some m' => unsafeCast m'
         | none    => {}
       match m'[key] with
-      | some _ => m
-      | none => m.insert (TypeName.typeName RealizeConstKey) (unsafeCast (m'.insert key (.pure (.mk res))))
+      | some _ => (false, m)
+      | none => (true, m.insert (TypeName.typeName RealizeConstKey) (unsafeCast (m'.insert key (r, .pure (.mk res)))))
+    if inserted then recordRealizationObservations r obs
 
 /-- Caches each result of `pending` in its realization context, as `realizeValue` caches a result, unless the context
-has one for the key by now (another branch realized it meanwhile, and requests merge that one). -/
+has one for the key by now (another branch realized it meanwhile, and requests merge that one): under a new
+realization handle (`newRealizationContext`) with what the realization observed in the full run
+(`recordRealizationObservations`), which every request that gets the result observes (`noteRealizationUse`). -/
 @[implemented_by PendingRealizations.publishImpl]
 private opaque PendingRealizations.publish (pending : PendingRealizations) : BaseIO Unit
 

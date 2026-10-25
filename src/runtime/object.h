@@ -482,11 +482,15 @@ uint32 get_task_context();
 /* The task context of imported modules' initializers and extension initial states while a module's header is
    processed (`Lean.withImportContext`): its effects on process-wide state concern the whole module. */
 constexpr uint32 import_context = 0xFFFFFFFEu;
+/* The first task context of a realization (`Lean.withRealizationContext`): a realization's `realize` runs in a context
+   from it up to `import_context`, command `i` in context `i + 1` below it. */
+constexpr uint32 realization_context_base = 0x80000000u;
 /* The task context of the running thread while effects are noted (`lean_io_set_effect_recording`), else 0. */
 uint32 effect_context();
 /* Notes for task context `ctx` (not 0) that it caused `what`, an effect on state outside it (`lean_io_take_effects`). */
 void note_effect(uint32 ctx, std::string const & what);
-/* `"command N"` for task context `ctx` (`N = ctx - 1`), `"no command"` for 0: who created an object. */
+/* `"command N"` for task context `ctx` (`N = ctx - 1`), `"a realization"` for a realization's, `"no command"` for 0:
+   who created an object. */
 std::string describe_context(uint32 ctx);
 /* Notes `what` for the running task context, if effects are noted and it is a command's or the import's. */
 inline void note_effect_here(char const * what) {

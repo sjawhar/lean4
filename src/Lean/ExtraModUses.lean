@@ -92,38 +92,23 @@ public def copyExtraModUses (src dest : Environment) : Environment := Id.run do
 /-- Every extra module use recorded in this process while usage recording is on, including those of commands
 whose environment is then discarded (`example`, `#check`, `#eval`, `#synth`, `#reduce`), which
 `getLocalExtraModUses` loses. Private: it grows only through `recordExtraModUseCore`, and only the start of a run
-clears it (`startFrontendRun`). -/
+clears it (`startFrontendRun`). The use is also recorded for the command or realization that made it
+(`recordContextExtraModUse`). -/
 builtin_initialize extraModUsesByChecksRef : IO.Ref (Std.HashSet ExtraModUse) ← mkAccountedRef {}
-
-/-- Every extra module use with the command that requested it, before environment-level deduplication. Private, as
-`extraModUsesByChecksRef`. Persistent: elaboration threads share the set, so a hash set's buckets would be copied on
-every insert. -/
-builtin_initialize extraModUsesByCmdRef : IO.Ref (PersistentHashSet (Nat × ExtraModUse)) ← mkAccountedRef {}
 
 builtin_initialize registerRunLog do
   extraModUsesByChecksRef.set {}
-  extraModUsesByCmdRef.set {}
 
 /-- The extra module uses `extraModUsesByChecksRef` holds. -/
 public def extraModUsesByChecks : BaseIO (Std.HashSet ExtraModUse) :=
   extraModUsesByChecksRef.get
-
-/-- The extra module uses `extraModUsesByCmdRef` holds. -/
-public def extraModUsesByCommand : BaseIO (Array (Nat × ExtraModUse)) :=
-  return (← extraModUsesByCmdRef.get).fold (·.push ·) #[]
-
-/-- Adds `(idx, entry)` to `extraModUsesByCmdRef`, writing the reference only when the pair is new. -/
-@[noinline] def noteCommandExtraModUse (idx : Nat) (entry : ExtraModUse) : BaseIO Unit := do
-  unless (← extraModUsesByCmdRef.get).contains (idx, entry) do
-    extraModUsesByCmdRef.modify (·.insert (idx, entry))
 
 def recordExtraModUseCore [MonadLiftT IO m] (mod : Name) (isMeta : Bool) (hint : Name := .anonymous) :
     m Unit := do
   let entry := { module := mod, isExported := (← getEnv).isExporting, isMeta }
   let recording ← (usageRecordingEnabled : IO Bool)
   if recording then
-    if let some idx ← (commandIdx? : IO _) then
-      (noteCommandExtraModUse idx entry : IO Unit)
+    (recordContextExtraModUse mod entry.isExported isMeta : IO Unit)
   if !(extraModUses.getState (asyncMode := .local) (← getEnv)).contains entry then
     trace[extraModUses] "recording {if entry.isExported then "public" else "private"} \
       {if isMeta then "meta" else "regular"} extra mod use {mod}\

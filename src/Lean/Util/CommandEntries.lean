@@ -94,6 +94,10 @@ structure RealizationResult where
   (`RealizeConstResult.merges`). -/
   merges : Array (Name × Name) := #[]
   report : RealizationReport := .unrebuildable
+  /-- What its code, and the realizations it used, observed (`realizationObservations`): a keep publishes the
+  re-added result with them, so that a later request observes them as a full run's request of the cached result does
+  (`Environment.PendingRealizations.publish`). -/
+  observed : RealizationObservations := {}
   deriving Inhabited
 
 /-- What a command added on its main branch, or an asynchronous constant's branch added, in order: everything a keep
@@ -108,7 +112,8 @@ inductive AddedConst where
   | async (name : Name) (exportedKind? : Option ConstantKind) (states : ViewStates) (nested : Array AddedConst)
   /-- The constants `realize` added itself in one `realizeConst forConst key` call, in order, with the realization's
   states relative to the main-branch view of the realization context's environment, and what its cached result holds
-  besides (`RealizationResult`: the realizations it merged while it ran, and what `realize` returned). -/
+  besides (`RealizationResult`: the realizations it merged while it ran, what `realize` returned and what it
+  observed). -/
   | realization (forConst key : Name) (consts : Array Name) (states : ViewStates) (result : RealizationResult)
   /-- A realization an earlier command made (the before-environment's kernel holds its constants), which this branch
   merged from the realization cache: merged again, so that the branch's constant map holds its constants as the full
@@ -138,7 +143,8 @@ inductive Refusal where
   `Kernel.Environment.divergentAdds`), or the constants the kernel gained not those the elaborator gained (`unchecked`
   false, `kernelMatchesElaborator`: rejected by the kernel, never committed to it, or committed to it alone). -/
   | divergentKernelAdd (unchecked : Bool)
-  /-- An attribute whose handlers may run code outside core Lean (`foreignAttributesByCommandRef`). -/
+  /-- An attribute whose handlers may run code outside core Lean, which the command or a realization it used ran
+  (`commandForeignAttributes`). -/
   | foreignAttribute (attr : Name)
   /-- A realization whose constants the before-environment holds only part of. -/
   | partlyHeldRealization (const : Name)
@@ -154,14 +160,14 @@ inductive Refusal where
   hold (`ModuleUsage.objectsDigests`: a closure, an external object, an unresolved promise, a reference); the payload
   leaves them out. -/
   | uncompactable (part : Name) (at? : Option Name := none)
-  /-- An effect on state outside the command that the runtime noted (`RecordedEffects.byCommand`): a write to a
-  reference it did not create, the resolution of a promise or the cancellation of a task it did not create, the use of
-  a mutable native object it did not create, or a use of process-wide state (files outside the toolchain's, child
-  processes but the toolchain's SAT solver run on files the command created, the network, the standard streams, the
-  process's settings), which no payload carries. A command with more distinct effects than the runtime keeps has the
-  effect `has more effects than were noted`, which stands for the rest. Reads of the environment, the working directory
-  and the executable's path are no effects: the module records their values (`takeValueReads`), which a keep requires
-  unchanged (`ModuleUsage.keepPermit`). -/
+  /-- An effect on state outside the command that the runtime noted for it or for a realization it used
+  (`RecordedEffects.ofCommand`): a write to a reference it did not create, the resolution of a promise or the
+  cancellation of a task it did not create, the use of a mutable native object it did not create, or a use of
+  process-wide state (files outside the toolchain's, child processes but the toolchain's SAT solver run on files the
+  command created, the network, the standard streams, the process's settings), which no payload carries. A command
+  with more distinct effects than the runtime keeps has the effect `has more effects than were noted`, which stands for
+  the rest. Reads of the environment, the working directory and the executable's path are no effects: the module
+  records their values (`takeValueReads`), which a keep requires unchanged (`ModuleUsage.keepPermit`). -/
   | effect (what : String)
   deriving Inhabited, BEq
 
@@ -228,7 +234,8 @@ structure PackedPayloads where
   /-- The distinct names of the extensions, scoped stacks and command caches parts are recorded for, indexed from
   `bytes`. -/
   parts : Array Name := #[]
-  /-- The other names, in order: added constants, realizations, declaration-log entries, constant generations. -/
+  /-- The other names, in order: added constants, realizations with the constants and modules they used,
+  declaration-log entries, constant generations. -/
   names : Array Name := #[]
   entries : Array EnvExtensionEntry := #[]
   options : Array Options := #[]
@@ -237,6 +244,8 @@ structure PackedPayloads where
   synthErased : Array Meta.SynthInstanceCacheKey := #[]
   /-- The snapshots realizations reported (`RealizationReport.snapshot`), in order. -/
   snapshots : Array ReportedSnapshot := #[]
+  /-- The process values realizations read (`RealizationObservations.values`), in order. -/
+  strings : Array String := #[]
   deriving Inhabited
 
 namespace PackedPayloads
@@ -264,6 +273,7 @@ private structure Writer where
   synthSet : Array (Meta.SynthInstanceCacheKey × List Meta.SynthInstanceCacheEntry) := #[]
   synthErased : Array Meta.SynthInstanceCacheKey := #[]
   snapshots : Array ReportedSnapshot := #[]
+  strings : Array String := #[]
   /-- The last `CountersDelta.extGens` written: a counters record with equal generations writes only a marker. -/
   lastExtGens : Array Nat := #[]
   /-- The parts of the payload being written so far, in order, which a later part with the same entries refers to. -/
@@ -288,6 +298,10 @@ private opaque sameEntries (a b : Array EnvExtensionEntry) : Bool
 private def nameArray (ns : Array Name) : W Unit := do
   nat ns.size
   modify fun w => { w with names := w.names ++ ns }
+
+private def stringArray (ss : Array String) : W Unit := do
+  nat ss.size
+  modify fun w => { w with strings := w.strings ++ ss }
 
 private def part (n : Name) : W Unit := do
   let w ← get
@@ -355,6 +369,13 @@ private partial def added : AddedConst → W Unit
     | .unrebuildable => nat 0
     | .silent => nat 1
     | .snapshot snap => nat 2; modify fun w => { w with snapshots := w.snapshots.push snap }
+    let o := result.observed
+    stringArray o.values
+    nameArray o.uses
+    nat o.extra.size
+    for (m, isExported, isMeta) in o.extra do name m; nat (2 * isExported.toNat + isMeta.toNat)
+    nat o.decls.size
+    for (ns, used) in o.decls do nameArray ns; nameArray used
   | .merged forConst key consts => do
     nat 3; name forConst; name key; nameArray consts
   | .context forConst opts main checked c => do
@@ -382,7 +403,8 @@ def CommandEntries.pack (ces : Array CommandEntries) : PackedPayloads :=
   let w := ((do PackedPayloads.nat ces.size; for ce in ces do PackedPayloads.entry ce) : PackedPayloads.W Unit).run {}
     |>.2
   { bytes := w.bytes, parts := w.parts, names := w.names, entries := w.entries, options := w.options,
-    refusals := w.refusals, synthSet := w.synthSet, synthErased := w.synthErased, snapshots := w.snapshots }
+    refusals := w.refusals, synthSet := w.synthSet, synthErased := w.synthErased, snapshots := w.snapshots,
+    strings := w.strings }
 
 namespace PackedPayloads
 
@@ -396,6 +418,7 @@ private structure Reader where
   synthSet : Nat := 0
   synthErased : Nat := 0
   snapshots : Nat := 0
+  strings : Nat := 0
   lastExtGens : Array Nat := #[]
   /-- The parts of the payload being read so far (`partArray`), with their extensions. -/
   cmdParts : Array (Name × Array EnvExtensionEntry) := #[]
@@ -445,6 +468,13 @@ private def readNames : R (Array Name) := do
   let ns ← slice (← read).names r.names n "names"
   set { r with names := r.names + n }
   return ns
+
+private def readStrings : R (Array String) := do
+  let n ← readNat
+  let r ← getThe Reader
+  let ss ← slice (← read).strings r.strings n "strings"
+  set { r with strings := r.strings + n }
+  return ss
 
 private def readParts : R (Array (Name × Array EnvExtensionEntry)) := do
   let n ← readByteCount
@@ -539,7 +569,20 @@ private partial def readAdded (depth : Nat := 0) : R AddedConst := do
         set { r with snapshots := r.snapshots + 1 }
         pure (.snapshot snap)
       | _ => throw "a realization report tag of the packed payloads is out of range"
-    return .realization forConst key consts states { merges, report }
+    let values ← readStrings
+    let uses ← readNames
+    let k ← readByteCount
+    let mut extra := Array.emptyWithCapacity k
+    for _ in [0:k] do
+      let m ← readName
+      let flags ← readNat
+      unless flags < 4 do throw "an extra module use of the packed payloads is out of range"
+      extra := extra.push (m, flags / 2 == 1, flags % 2 == 1)
+    let d ← readByteCount
+    let mut decls := Array.emptyWithCapacity d
+    for _ in [0:d] do decls := decls.push (← readNames, ← readNames)
+    return .realization forConst key consts states
+      { merges, report, observed := { values, uses, extra, decls } }
   | 3 => return .merged (← readName) (← readName) (← readNames)
   | 4 =>
     let forConst ← readName
@@ -575,7 +618,8 @@ def unpack (p : PackedPayloads) : Except String (Array CommandEntries) := do
     let r ← getThe Reader
     unless r.pos == p.bytes.size && r.names == p.names.size && r.entries == p.entries.size &&
         r.options == p.options.size && r.refusals == p.refusals.size && r.synthSet == p.synthSet.size &&
-        r.synthErased == p.synthErased.size && r.snapshots == p.snapshots.size && r.partsRead.size == p.parts.size do
+        r.synthErased == p.synthErased.size && r.snapshots == p.snapshots.size && r.strings == p.strings.size &&
+        r.partsRead.size == p.parts.size do
       throw "the packed payloads hold more than their payloads"
     unless (p.parts.foldl (·.insert ·) ({} : Std.HashSet Name)).size == p.parts.size do
       throw "the packed payloads name a part twice"
@@ -964,12 +1008,15 @@ private def realizationReport (dyn : Dynamic) : BaseIO RealizationReport := do
     | none => .unrebuildable
 
 /-- `a` with each `realization` record's result read from the one its context caches in `after`
-(`RealizationResult`), in nested records too. -/
+(`RealizationResult`), with what the realization observed (`realizationObservations`; of its declarations, those
+`after` lacks), in nested records too. -/
 private partial def attachResults (after : Environment) : AddedConst → BaseIO AddedConst
   | .realization forConst key consts states _ => do
-    let result : RealizationResult ← match ← after.findRealization? {} forConst key with
+    let result : RealizationResult ← match ← after.findCachedRealization? forConst key with
       | none => pure {}
-      | some res => pure { merges := res.merges forConst key, report := ← realizationReport res.dyn }
+      | some (r, res) => pure {
+        merges := res.merges forConst key, report := ← realizationReport res.dyn
+        observed := ← realizationObservations (!·.all after.contains) r }
     return .realization forConst key consts states result
   | .async n exportedKind? states nested => return .async n exportedKind? states (← nested.mapM (attachResults after))
   | a => return a
@@ -1202,12 +1249,27 @@ private def firstUnadmittedIn (regs : Registries) (parts : Array (EnvExtension.V
       unless regs.cacheByName.contains n do return some n
   return none
 
+/-- The part of a realization's recorded states (`AddedConst.realization`, relative to the main-branch view) that its
+writes made in the checked view too: the entries and cache entries of the extensions whose writes reach both views
+(`.sync` and `.async` modes, `EnvExtension.modifyState`), which a later request's merge replays from the realization's
+checked view (`RealizeConstResult.replayKernel`). -/
+private def realizationCheckedStates (regs : Registries) (states : ViewStates) : ViewStates :=
+  let bothViews (m : EnvExtension.AsyncMode) := !(m matches .mainOnly | .local)
+  { entries := states.entries.filter fun (n, _) =>
+      (regs.persistentByName[n]?).any (bothViews ·.toEnvExtension.asyncMode)
+    caches := states.caches.filter fun (n, _) => (regs.cacheByName[n]?).any (bothViews ·.ext.asyncMode) }
+
+/-- The parts a realization record's rebuild replays (`readdAdded`): its states in the main-branch view, and the part
+its writes made in the checked view (`realizationCheckedStates`). -/
+private def realizationParts (regs : Registries) (states : ViewStates) : Array (EnvExtension.View × ViewStates) :=
+  #[(.main, states), (.checked, realizationCheckedStates regs states)]
+
 /-- The parts a record's replay replays (`readdAdded`), in order, one array per `replayStates` call: nested records'
 before their asynchronous constant's own. -/
-private partial def recordParts : AddedConst → Array (Array (EnvExtension.View × ViewStates))
+private partial def recordParts (regs : Registries) : AddedConst → Array (Array (EnvExtension.View × ViewStates))
   | .plain _ | .merged .. => #[]
-  | .async _ _ states nested => nested.flatMap recordParts |>.push #[(.main, states)]
-  | .realization _ _ _ states _ => #[#[(.main, states)]]
+  | .async _ _ states nested => nested.flatMap (recordParts regs) |>.push #[(.main, states)]
+  | .realization _ _ _ states _ => #[realizationParts regs states]
   | .context _ _ main checked _ => #[#[(.checked, checked), (.main, main)]]
 
 /-- The first extension, in replay order (`ce.added`'s records as `readdCommandConstants` replays them, then the
@@ -1219,7 +1281,7 @@ the elaboration did; it is admitted only where core states that the `.olean` ent
 (`PersistentEnvExtension.oleanEntryIsEntry?`, `ScopedEnvExtension.Descr.oleanEntryIsEntry?`), and then none runs. -/
 def CommandEntries.firstUnadmittedConversion (ce : CommandEntries) : BaseIO (Option Name) := do
   let regs ← Registries.get
-  return (ce.added.flatMap recordParts |>.push #[(.checked, ce.checked), (.main, ce.main)]).findSome?
+  return (ce.added.flatMap (recordParts regs) |>.push #[(.checked, ce.checked), (.main, ce.main)]).findSome?
     (firstUnadmittedIn regs)
 
 /-- The messages of a snapshot tree a realization reported, node by node, depth first. -/
@@ -1385,10 +1447,12 @@ private def RealizationReport.rebuild? : RealizationReport → BaseIO (Option Dy
 - `realization`: `Environment.readdRealizeConst` in the context `env` holds for `forConst`, whose `build` first merges
   the results of the realizations it merged (`RealizationResult.merges`: cached by an earlier command's keep or
   elaboration, or held in `pending` by their own records; a missing one is an error), as the full run's realization
-  did, then adds its constants without a check (the merge's kernel check checks them) and replays the states (when the
-  context's cache or `pending` already holds the key, `build` does not run and that result is merged); the result
-  built, with the value `realize` returned rebuilt from the record (`RealizationResult.report`; one that cannot be
-  rebuilt is an error), is added to `pending`;
+  did, then adds its constants without a check (the merge's kernel check checks them) and replays the states into the
+  main-branch view and the part the full run's writes made in the checked view too (`realizationParts`), so that a
+  later request's merge replays what the full run's did (when the context's cache or `pending` already holds the key,
+  `build` does not run and that result is merged); the result built, with the value `realize` returned rebuilt from the
+  record (`RealizationResult.report`; one that cannot be rebuilt is an error), is added to `pending` with what the
+  realization observed (`RealizationResult.observed`);
 - `merged`: the same, with the context's cache or `pending` holding the key: that result is merged
   (`mergeCachedRealization`), and `env` must then hold the constants the record lists;
 - `context`: the context rebuilt from its record (`env` with the recorded states replayed into both views, so that it
@@ -1423,7 +1487,8 @@ private partial def readdAdded (regs : Registries) (infos : NameMap ConstantInfo
       throw <| IO.userError s!"reuse: the result of the realization {key} for {forConst} cannot be rebuilt"
     unless result.merges.isEmpty do discard <| IO.wait env.checked
     let infos' ← consts.mapM (infoOf infos)
-    let (env, ex, pending') ← env.readdRealizeConst pending forConst key dyn fun realizeEnv realizeOpts => do
+    let obs := result.observed
+    let (env, ex, pending') ← env.readdRealizeConst pending forConst key dyn obs fun realizeEnv realizeOpts => do
       let mut realizeEnv := realizeEnv
       for (forConst', key') in result.merges do
         realizeEnv ← mergeCachedRealization realizeEnv pending forConst' key' (replayExts := true)
@@ -1431,7 +1496,7 @@ private partial def readdAdded (regs : Registries) (infos : NameMap ConstantInfo
         match realizeEnv.addDeclCore 0 0 (← IO.ofExcept (declOf infos info)) none (doCheck := false) with
         | .ok e => realizeEnv := e
         | .error ex => throw <| IO.userError s!"adding {info.name}: {← kernelMessage ex}"
-      replayStates regs realizeEnv #[(.main, states)] realizeOpts admittedOnly
+      replayStates regs realizeEnv (realizationParts regs states) realizeOpts admittedOnly
     if let some ex := ex.get then
       throw <| IO.userError s!"reuse: kernel rejected the realization {key} for {forConst}: {← kernelMessage ex}"
     return (env, pending')

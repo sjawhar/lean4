@@ -889,7 +889,7 @@ def parseUsage (s : String) : Except String Json := do
   return .obj (records.foldl (init := head) fun m k v => m.insert k v)
 
 /-- The command record `c` (`CommandRecord` as JSON) with the process values its command read (`reads`, by command
-index: `takeValueReads`) among its `values`, sorted. -/
+index: `commandValueKeys`) among its `values`, sorted. -/
 private def addValueReads (reads : Std.HashMap Nat (Array String)) (c : Json) : Json := Id.run do
   let .ok i := c.getObjValAs? Nat "i" | return c
   let some ks := reads[i]? | return c
@@ -921,7 +921,8 @@ the digest of the `.olean` written beside it (`oleanDigest`, `fileDigest`), whic
 digests (`untrackedImports`); `values`, each process value the run read (`takeValueReads`, taken before this
 function's own lookups, such as `untrackedImports`' of the toolchain's path) with the digest of its value
 (`valueDigest?`), which a keep requires unchanged; `stmt`, `computeStmt`'s result; `commands`, the
-per-command records, each with the process values its command read in the run among its `values` (`addValueReads`);
+per-command records, each with the process values its command read in the run among its `values`, itself or through a
+realization it used (`addValueReads`, `commandValueKeys`);
 `usedAttrs`, beside each kernel constant of a `used` entry, the attrs digest the defining module
 recorded for it (`importedConstDigests?`); and `noreuse`, set when no command may be kept (`noreuseReason?`, or a
 process value that changed during the run; written as `noreuseReason`). `noreuse` decides nothing about skipping the
@@ -966,8 +967,7 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
   let names := env.getImportedKernelDuplicates.foldl (·.insert ·.1) names
   let names := (names : Std.HashSet Name).fold addInternalPrefixes names
   let reads ← takeValueReads
-  let readers : Std.HashMap Nat (Array String) := reads.foldl (init := {}) fun m (k, _, _, cmds) =>
-    cmds.foldl (fun m i => m.insert i ((m.getD i #[]).push k)) m
+  let readers ← commandValueKeys reads (commands.filterMap fun c => (c.getObjValAs? Nat "i").toOption)
   -- a value `recordedValue?` cannot give (the SAT solver's bytes) leaves nothing a keep could compare
   let values ← reads.mapM fun (k, v?, changed, _) => do
     try return (k, ← recordedValue? k v?, changed, none)

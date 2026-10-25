@@ -44,6 +44,7 @@ Authors: Leonardo de Moura, Sebastian Ullrich
 #include <unordered_map>
 #include <unordered_set>
 #include <map>
+#include <random>
 #include <cerrno>
 #include <cstdlib>
 #include <cctype>
@@ -1582,9 +1583,14 @@ counts when the import context creates it, `lean_io_as_task`, `lean_io_map_task`
 and the runtime's debugging output (`dbg_trace`, `timeit`, `allocprof`).
 
 Value reads: in every context, the first value of each environment variable, of the running executable's path and of
-the working directory read, whether a later read saw another one, and the command contexts that read it, sorted (not
-0 or the import context, whose reads are the module's alone) (`lean_io_take_value_reads`). A later build compares them
-with its own (`Lean.ModuleUsage.keepPermit`).
+the working directory read, whether a later read saw another one, and the command and realization contexts that read
+it, sorted (not 0 or the import context, whose reads are the module's alone) (`lean_io_take_value_reads`). A later
+build compares them with its own (`Lean.ModuleUsage.keepPermit`).
+
+Realizations: a realization runs its `realize` in a task context of its own (`lean_io_new_realization_context`), and
+every context that requests it, the one that ran it and those that got the cached result, notes a use of it
+(`lean_io_note_context_use`): what a realization's code did and read counts for each context that used it, directly or
+through other realizations (`lean_io_context_closure`).
 */
 static std::atomic<bool> g_effects_on(false);
 
@@ -1599,7 +1605,7 @@ struct value_read {
     std::string value;
     // a later read saw another value
     bool changed;
-    // the command contexts that read it, sorted
+    // the command and realization contexts that read it, sorted
     std::vector<uint32> contexts;
 };
 static mutex * g_effects_mutex = nullptr;
@@ -1609,6 +1615,8 @@ static std::unordered_map<FILE *, uint32> * g_handle_contexts = nullptr;
 // the mutable native objects created while effects are noted, with the context that created them
 static std::unordered_map<void const *, uint32> * g_object_contexts = nullptr;
 static std::map<std::string, value_read> * g_value_reads = nullptr;
+// per command or realization context, the keys of `g_value_reads` it read, each once (`lean_io_context_value_keys`)
+static std::unordered_map<uint32, std::vector<std::string>> * g_context_value_keys = nullptr;
 // the toolchain directories whose files the Lean githash pins, resolved, each ending in `/`, and their root as given
 static std::vector<std::string> * g_pinned_dirs = nullptr;
 static std::string * g_pinned_root = nullptr;
@@ -1623,11 +1631,12 @@ uint32 effect_context() {
 std::string describe_context(uint32 ctx) {
     return ctx == 0 ? std::string("no command")
         : ctx == import_context ? std::string("an imported module's initializer")
+        : ctx >= realization_context_base ? std::string("a realization")
         : "command " + std::to_string(ctx - 1);
 }
 
-// the tasks that run code each command context and the import context created while effects are noted and that are not
-// freed yet: queued, running or waiting for another task (`lean_io_live_tasks`)
+// the tasks that run code each command context, realization context and the import context created while effects are
+// noted and that are not freed yet: queued, running or waiting for another task (`lean_io_live_tasks`)
 static mutex * g_live_tasks_mutex = nullptr;
 static std::unordered_map<uint32, int64_t> * g_live_tasks = nullptr;
 
@@ -1645,17 +1654,87 @@ void note_task_freed(uint32 ctx) {
     if (it != g_live_tasks->end() && --it->second <= 0) g_live_tasks->erase(it);
 }
 
-/* liveTasks (ctx : UInt32) : BaseIO UInt32: how many tasks that run code task context `ctx` (a command's or the import
-   context) created while effects were noted are not finished: while none is, code of the context cannot note an effect
-   any more */
+/* liveTasks (ctx : UInt32) : BaseIO UInt32: how many tasks that run code task context `ctx` (a command's, a
+   realization's or the import context) created while effects were noted are not finished: while none is, code of the
+   context cannot note an effect any more */
 extern "C" LEAN_EXPORT uint32 lean_io_live_tasks(uint32 ctx) {
     lock_guard<mutex> lock(*g_live_tasks_mutex);
     auto it = g_live_tasks->find(ctx);
     return it == g_live_tasks->end() ? 0 : static_cast<uint32>(it->second);
 }
 
-// the command contexts and the import context that read a nondeterministic source while effects were noted
-// (`note_nondeterministic_read`)
+// The realization contexts handed out so far (`lean_io_new_realization_context`).
+static std::atomic<uint64> g_next_realization(0);
+// This process's epoch, the upper half of every realization handle it hands out: a handle another process made (a
+// realization cache loaded from a snapshot) names no context of this one.
+static uint32 g_context_epoch = 1;
+static mutex * g_context_uses_mutex = nullptr;
+// per task context, the realization contexts its code used (`lean_io_note_context_use`)
+static std::unordered_map<uint32, std::unordered_set<uint32>> * g_context_uses = nullptr;
+// bumped whenever `g_context_uses` is cleared, invalidating each thread's last noted use
+static std::atomic<uint32> g_context_uses_generation(0);
+// the use the thread noted last, so that repeated requests of one realization skip the lock
+static thread_local uint32 t_use_ctx = 0;
+static thread_local uint32 t_use_realization = 0;
+static thread_local uint32 t_use_gen = 0;
+
+/* newRealizationContext : BaseIO UInt64: while effects are noted, the handle of a task context no context had before,
+   for a realization's `realize` to run in: the epoch, then the context (from `realization_context_base`); else 0 */
+extern "C" LEAN_EXPORT uint64 lean_io_new_realization_context() {
+    if (!g_effects_on.load(std::memory_order_relaxed)) return 0;
+    uint64 k = g_next_realization.fetch_add(1, std::memory_order_relaxed);
+    if (k >= import_context - realization_context_base) return 0;
+    return (static_cast<uint64>(g_context_epoch) << 32) | (realization_context_base + k);
+}
+
+/* realizationContextOf (r : UInt64) : BaseIO UInt32: the task context of the realization handle `r`
+   (`lean_io_new_realization_context`), 0 for 0 or another process's handle */
+extern "C" LEAN_EXPORT uint32 lean_io_realization_context_of(uint64 r) {
+    return r != 0 && static_cast<uint32>(r >> 32) == g_context_epoch ? static_cast<uint32>(r) : 0;
+}
+
+/* noteRealizationUse (r : UInt64) : BaseIO Unit: while effects are noted, records that the running task context used
+   the realization with handle `r` (`lean_io_new_realization_context`); nothing for 0, for another process's handle,
+   or outside any context */
+extern "C" LEAN_EXPORT obj_res lean_io_note_context_use(uint64 r) {
+    if (r == 0 || !g_effects_on.load(std::memory_order_relaxed)) return box(0);
+    if (static_cast<uint32>(r >> 32) != g_context_epoch) return box(0);
+    uint32 realization = static_cast<uint32>(r);
+    uint32 ctx = get_task_context();
+    if (ctx == 0 || ctx == LEAN_REF_ACCOUNTED || ctx == realization) return box(0);
+    uint32 gen = g_context_uses_generation.load(std::memory_order_acquire);
+    if (ctx == t_use_ctx && realization == t_use_realization && gen == t_use_gen) return box(0);
+    {
+        lock_guard<mutex> lock(*g_context_uses_mutex);
+        (*g_context_uses)[ctx].insert(realization);
+    }
+    t_use_ctx = ctx;
+    t_use_realization = realization;
+    t_use_gen = gen;
+    return box(0);
+}
+
+/* contextClosure (c : UInt32) : BaseIO (Array UInt32): `c` and the realization contexts its code used, directly or
+   through other realizations (`lean_io_note_context_use`), `c` first */
+extern "C" LEAN_EXPORT obj_res lean_io_context_closure(uint32 c) {
+    std::vector<uint32> out{c};
+    {
+        lock_guard<mutex> lock(*g_context_uses_mutex);
+        std::unordered_set<uint32> seen{c};
+        for (size_t i = 0; i < out.size(); i++) {
+            auto it = g_context_uses->find(out[i]);
+            if (it == g_context_uses->end()) continue;
+            for (uint32 u : it->second)
+                if (seen.insert(u).second) out.push_back(u);
+        }
+    }
+    object * r = lean_alloc_array(0, out.size());
+    for (uint32 u : out) r = lean_array_push(r, lean_box_uint32(u));
+    return r;
+}
+
+// the command and realization contexts and the import context that read a nondeterministic source while effects were
+// noted (`note_nondeterministic_read`)
 static std::unordered_set<uint32> * g_nondet_contexts = nullptr;
 // bumped whenever `g_nondet_contexts` is cleared, invalidating each thread's `t_nondet_ctx`
 static std::atomic<uint32> g_nondet_generation(0);
@@ -1715,7 +1794,10 @@ static void note_value_read_core(std::string const & key, char const * value, ui
     if (ctx == 0 || ctx == import_context) return;
     std::vector<uint32> & cs = it->second.contexts;
     auto pos = std::lower_bound(cs.begin(), cs.end(), ctx);
-    if (pos == cs.end() || *pos != ctx) cs.insert(pos, ctx);
+    if (pos == cs.end() || *pos != ctx) {
+        cs.insert(pos, ctx);
+        (*g_context_value_keys)[ctx].push_back(key);
+    }
 }
 
 void note_value_read(std::string const & key, char const * value) {
@@ -2011,8 +2093,8 @@ static void forget_handle(FILE * fp) {
 }
 
 /* setEffectRecording (on : Bool) (pinned : @& Array String) (root solver : @& String) : BaseIO Unit; switching it on
-   forgets earlier notes, value reads and nondeterministic reads, and pins the directories `pinned` (`in_pinned_dirs`)
-   and the SAT solver `solver` (`note_process_spawn`), recorded as `root` when used */
+   forgets earlier notes, value reads, nondeterministic reads and uses of realizations, and pins the directories
+   `pinned` (`in_pinned_dirs`) and the SAT solver `solver` (`note_process_spawn`), recorded as `root` when used */
 extern "C" LEAN_EXPORT obj_res lean_io_set_effect_recording(uint8 on, b_obj_arg pinned, b_obj_arg root,
                                                            b_obj_arg solver) {
     if (on) {
@@ -2027,11 +2109,17 @@ extern "C" LEAN_EXPORT obj_res lean_io_set_effect_recording(uint8 on, b_obj_arg 
         lock_guard<mutex> lock(*g_effects_mutex);
         g_effects->clear();
         g_value_reads->clear();
+        g_context_value_keys->clear();
         g_nondet_contexts->clear();
         g_nondet_generation.fetch_add(1, std::memory_order_release);
         *g_pinned_dirs = std::move(dirs);
         *g_pinned_root = string_cstr(root);
         *g_pinned_solver = std::move(s);
+        {
+            lock_guard<mutex> uses_lock(*g_context_uses_mutex);
+            g_context_uses->clear();
+        }
+        g_context_uses_generation.fetch_add(1, std::memory_order_release);
     }
     g_effects_on.store(on != 0);
     return box(0);
@@ -2063,19 +2151,20 @@ extern "C" LEAN_EXPORT obj_res lean_io_take_effects() {
     return r;
 }
 
-/* takeValueReads : BaseIO (Array (String × Option String × Bool × Array Nat)): the value reads since recording was
-   switched on, sorted by key, each with its first value, whether a later read saw another, and the commands that read
-   it (their contexts less one), sorted; clears them */
+/* takeValueReads : BaseIO (Array (String × Option String × Bool × Array UInt32)): the value reads since recording was
+   switched on, sorted by key, each with its first value, whether a later read saw another, and the command and
+   realization contexts that read it, sorted; clears them */
 extern "C" LEAN_EXPORT obj_res lean_io_take_value_reads() {
     std::map<std::string, value_read> reads;
     {
         lock_guard<mutex> lock(*g_effects_mutex);
         reads.swap(*g_value_reads);
+        g_context_value_keys->clear();
     }
     object * r = lean_alloc_array(0, reads.size());
     for (auto const & [key, v] : reads) {
         object * cmds = lean_alloc_array(0, v.contexts.size());
-        for (uint32 ctx : v.contexts) cmds = lean_array_push(cmds, lean_usize_to_nat(ctx - 1));
+        for (uint32 ctx : v.contexts) cmds = lean_array_push(cmds, lean_box_uint32(ctx));
         object * last = lean_alloc_ctor(0, 2, 0);
         lean_ctor_set(last, 0, lean_box(v.changed));
         lean_ctor_set(last, 1, cmds);
@@ -2087,6 +2176,24 @@ extern "C" LEAN_EXPORT obj_res lean_io_take_value_reads() {
         lean_ctor_set(p, 1, rest);
         r = lean_array_push(r, p);
     }
+    return r;
+}
+
+/* contextValueKeys (cs : @& Array UInt32) : BaseIO (Array String): the process values one of the contexts `cs` read
+   since recording was switched on, sorted by key, without taking them (`lean_io_take_value_reads`) */
+extern "C" LEAN_EXPORT obj_res lean_io_context_value_keys(b_obj_arg cs) {
+    std::vector<std::string> keys;
+    {
+        lock_guard<mutex> lock(*g_effects_mutex);
+        for (size_t i = 0; i < lean_array_size(cs); i++) {
+            auto it = g_context_value_keys->find(lean_unbox_uint32(lean_array_get_core(cs, i)));
+            if (it != g_context_value_keys->end()) keys.insert(keys.end(), it->second.begin(), it->second.end());
+        }
+    }
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    object * r = lean_alloc_array(0, keys.size());
+    for (std::string const & k : keys) r = lean_array_push(r, mk_string(k));
     return r;
 }
 
@@ -2373,9 +2480,19 @@ void initialize_io() {
     g_handle_contexts = new std::unordered_map<FILE *, uint32>();
     g_object_contexts = new std::unordered_map<void const *, uint32>();
     g_value_reads = new std::map<std::string, value_read>();
+    g_context_value_keys = new std::unordered_map<uint32, std::vector<std::string>>();
     g_nondet_contexts = new std::unordered_set<uint32>();
     g_live_tasks_mutex = new mutex();
     g_live_tasks = new std::unordered_map<uint32, int64_t>();
+    g_context_uses_mutex = new mutex();
+    g_context_uses = new std::unordered_map<uint32, std::unordered_set<uint32>>();
+    try {
+        std::random_device rd;
+        g_context_epoch = rd();
+    } catch (...) {
+        g_context_epoch = static_cast<uint32>(std::chrono::steady_clock::now().time_since_epoch().count());
+    }
+    if (g_context_epoch == 0) g_context_epoch = 1;
     g_pinned_dirs = new std::vector<std::string>();
     g_pinned_root = new std::string();
     g_pinned_solver = new std::string();

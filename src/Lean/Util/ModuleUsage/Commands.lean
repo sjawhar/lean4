@@ -10,7 +10,6 @@ public import Lean.Util.ModuleUsage
 public import Lean.Elab.Command
 public import Lean.Util.CommandEntries
 import Lean.Util.ValueSensitive
-import Lean.ExtraModUses
 import Lean.Compiler.Old
 import Lean.Meta.Match.Match
 import Lean.Meta.Tactic.AuxLemma
@@ -355,14 +354,17 @@ private partial def transientDeps (transient : Name → Option NameSet) (seen ou
 /-- The per-command records of `observations` (in command order), or why there are none: a command used a name no
 digest stands for, one that names no constant (a declaration the kernel or the elaborator rejected referred to it; an
 IR-only name) or a constant of this module the kernel environment does not hold. None of the module's commands may
-then be kept (`noreuse`). What a record holds of its command alone is computed in `lanes` tasks
-(`CommandEntries.parallelMap`). -/
+then be kept (`noreuse`). What a command's code observed is that of its contexts (`commandContexts`): its own and those
+of the realizations it used, whether it ran them or got their results from the cache; of a realization's declarations,
+only those the environment lacks count (a realized constant the environment holds is among the constants of the command
+that added it). What a record holds of its command alone is computed in `lanes` tasks (`CommandEntries.parallelMap`).
+-/
 def commandRecords (env : Environment) (observations : Array CommandObservation) (own : Array (Name × Digest))
     (stmt : Array (Name × Digest × Digest)) (payloads : Array (CommandEntries × Digest)) (lanes : Nat := 4) :
     IO (Except String (Array CommandRecord)) := do
-  let declEntries := (← declsByCommand).toArray.reverse
-  let explicitUses := (← usedByCommand).toArray.reverse
-  let extras ← extraModUsesByCommand
+  let declEntries ← declsByContext
+  let ctxsByIdx : Std.HashMap Nat (Array UInt32) ←
+    observations.foldlM (init := {}) fun m o => return m.insert o.i (← commandContexts o.i)
   let fullLocal : Std.HashMap Name Digest := own.foldl (fun m (n, d) => m.insert n d) {}
   let stmtLocal : Std.HashMap Name (Digest × Digest) :=
     stmt.foldl (fun m (n, d, a) => m.insert n (d, a)) {}
@@ -376,8 +378,15 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
       if env.contains n then m else m.insert n (used.foldl (·.insert ·) (m.getD n {}))
   let transient : Std.HashMap Name NameSet :=
     declEntries.foldl (init := {}) fun m (_, ns, used) => addTransient m ns used
-  let transientByCmd : Std.HashMap Nat (Std.HashMap Name NameSet) :=
-    declEntries.foldl (init := {}) fun m (i, ns, used) => m.insert i (addTransient (m.getD i {}) ns used)
+  -- per context, the declarations it submitted; a realization's count for its commands only where the environment
+  -- lacks one of them
+  let declsByCtx : Std.HashMap UInt32 (Array (Array Name × NameSet)) := declEntries.foldl (init := {})
+    fun m (c, ns, used) =>
+      if isRealizationContext c && ns.all env.contains then m else m.insert c ((m.getD c #[]).push (ns, used))
+  let declsOf (i : Nat) : Array (Array Name × NameSet) :=
+    (ctxsByIdx.getD i #[commandContext i]).flatMap (declsByCtx.getD · #[])
+  let transientByCmd : Std.HashMap Nat (Std.HashMap Name NameSet) := ctxsByIdx.fold (init := {}) fun m i _ =>
+    m.insert i ((declsOf i).foldl (fun t (ns, used) => addTransient t ns used) {})
   let digestsOf (i : Nat) (n : Name) : Except String UseDigests := do
     if !env.contains n then
       return .unattributed s!"command {i} uses `{n}`, which names no constant of this module or its imports"
@@ -407,12 +416,12 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
   let payloadByIdx : Std.HashMap Nat (CommandEntries × Digest) :=
     payloads.foldl (fun m p => m.insert p.1.idx p) {}
   -- per-command lookups, so that each command's record costs what the command added
-  let usedByIdx : Std.HashMap Nat (Array NameSet) := declEntries.foldl (init := {})
-    fun m (i, _, used) => m.alter i fun us => some ((us.getD #[]).push used)
-  let explicitByIdx : Std.HashMap Nat (Array Name) := explicitUses.foldl (init := {})
-    fun m (i, n) => m.alter i fun ns => some ((ns.getD #[]).push n)
-  let extrasByIdx : Std.HashMap Nat (Array ExtraModUse) := extras.foldl (init := {})
-    fun m (i, u) => m.alter i fun us => some ((us.getD #[]).push u)
+  let usedByIdx : Std.HashMap Nat (Array NameSet) :=
+    ctxsByIdx.fold (init := {}) fun m i _ => m.insert i ((declsOf i).map (·.2))
+  let explicitByIdx : Std.HashMap Nat (Array Name) ←
+    ctxsByIdx.foldM (init := {}) fun m i ctxs => return m.insert i (← usedByContexts ctxs).toArray
+  let extrasByIdx : Std.HashMap Nat (Array (Name × Bool × Bool)) ←
+    ctxsByIdx.foldM (init := {}) fun m i ctxs => return m.insert i (← extraModUsesOf ctxs)
   -- each command's record but for what chains through the commands before it (a non-declaration's `key`, `ctx`)
   let part (obs : CommandObservation) : CommandPart := Id.run do
     let before := obs.before.env.checked.get
@@ -477,8 +486,8 @@ def commandRecords (env : Environment) (observations : Array CommandObservation)
     let usesFull := fullUses.qsort fun a b => Name.quickLt a.1 b.1
     let usesStmt := stmtUses.qsort fun a b => Name.quickLt a.1 b.1
     let text := textDigest obs.stx
-    let extra := ((extrasByIdx.getD obs.i #[]).filterMap fun u =>
-      if (env.getModuleIdx? u.module).any fs.hasEntries then some (u.module, u.isMeta)
+    let extra := ((extrasByIdx.getD obs.i #[]).filterMap fun (m, _, isMeta) =>
+      if (env.getModuleIdx? m).any fs.hasEntries then some (m, isMeta)
       else none).qsort fun a b => Name.quickLt a.1 b.1 ||
         (a.1 == b.1 && a.2.toNat < b.2.toNat)
     let matcher := Meta.Match.matcherCacheDelta obs.before.env obs.after.env

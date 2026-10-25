@@ -70,24 +70,28 @@ def commandStateChanges (before after : Elab.Command.State) : Array Refusal := I
     refused := refused.push (.commandState `infoState)
   return refused
 
+/-- The refusals of command `i`'s payload beyond the recorder's, with the command's contexts `ctxs`
+(`commandContexts`): the attributes with handlers outside core Lean it ran (`commandForeignAttributes`), then its
+effects on state outside it the runtime noted (`effects`, `RecordedEffects.ofCommand`), both its own and those of the
+realizations it used. -/
+private def commandRefusals (i : Nat) (ctxs : Array UInt32) (effects : RecordedEffects) : BaseIO (Array Refusal) := do
+  return (← commandForeignAttributes i ctxs).map .foreignAttribute ++ (effects.ofCommand i ctxs).map .effect
+
 /-- The command payloads of the observed commands (`observations`, in command order; `commandDeltaRecorder`), each also
-refused for the command-state fields it changed (`commandStateChanges`), the attributes with handlers outside core
-Lean it ran (`foreignAttributesByCommand`) and its effects on state outside it the runtime noted (`effects`,
-`RecordedEffects.byCommand`), as the `.olean` stores them (a payload holding a closure without the parts that hold one,
-`CommandEntries.withoutUncompactable`), with the digest of their contents (`objectsDigests`); the commands in parallel
-(`CommandEntries.parallelBlocks`), one digester per block, so that what a block's payloads share is digested once. -/
-def commandPayloads (observations : Array CommandObservation) (effects : Array (Nat × String)) :
+refused for the command-state fields it changed (`commandStateChanges`) and for what it and the realizations it used
+did beyond the payload (`commandRefusals`), as the `.olean` stores them (a payload holding a closure without the parts
+that hold one, `CommandEntries.withoutUncompactable`), with the digest of their contents (`objectsDigests`); the
+commands in parallel (`CommandEntries.parallelBlocks`), one digester per block, so that what a block's payloads share
+is digested once. -/
+def commandPayloads (observations : Array CommandObservation) (effects : RecordedEffects) :
     IO (Array (CommandEntries × Digest)) := do
-  let byCommand (records : Array (Nat × Refusal)) : Std.HashMap Nat (Array Refusal) :=
-    records.foldl (init := {}) fun m (i, r) => m.alter i fun rs => some ((rs.getD #[]).push r)
-  let foreign := byCommand <| (← foreignAttributesByCommand).reverse.toArray.map fun (i, attr) =>
-    (i, .foreignAttribute attr)
-  let effects := byCommand <| effects.map fun (i, what) => (i, .effect what)
+  let refusals : Std.HashMap Nat (Array Refusal) ← observations.foldlM (init := {}) fun m obs => do
+    return m.insert obs.i (← commandRefusals obs.i (← commandContexts obs.i) effects)
   let record ← commandDeltaRecorder
   CommandEntries.parallelBlocks observations fun block => do
     let ces ← block.mapM fun obs => do
       let ce ← record obs.before.env obs.after.env obs.i
-      let extra := commandStateChanges obs.before obs.after ++ foreign.getD obs.i #[] ++ effects.getD obs.i #[]
+      let extra := commandStateChanges obs.before obs.after ++ refusals.getD obs.i #[]
       return { ce with refusals := Refusal.addNew ce.refusals extra }
     (ces.zip (objectsDigests ces)).mapM fun
       | (ce, some d) => return (ce, d)
@@ -122,7 +126,7 @@ structure PendingRecords where
   command index: `Lean.Elab.process` recorded from index 0 again) leaves observations that are not the module's: none;
 - a module-system file is never partially re-elaborated: no payloads, `noreuse`;
 - an imported module's initializer or an extension's initial state used process-wide state while the header was
-  processed (`RecordedEffects.atImport`), or read a value that may differ in another run (`importReadNondeterministic`),
+  processed (`RecordedEffects.ofImport`), or read a value that may differ in another run (`importReadNondeterministic`),
   on which every command may depend: `noreuse`. -/
 def startModuleRecords (env : Environment) (sessionChanged : Bool) : IO PendingRecords := do
   -- the kernel checks run in their commands' contexts and note effects there
@@ -135,12 +139,12 @@ def startModuleRecords (env : Environment) (sessionChanged : Bool) : IO PendingR
   if nested then
     return { observations, wholeModule? := none, payloadsTask := .pure (.ok #[])
              done? := some { noreuseReason? := moduleSystem? <|> some "command observations of a nested frontend" } }
-  let wholeModule? := moduleSystem? <|> effects.atImport[0]?.map (s!"an imported module's initializer {·}") <|>
+  let wholeModule? := moduleSystem? <|> (← effects.ofImport)[0]?.map (s!"an imported module's initializer {·}") <|>
     if (← importReadNondeterministic) then
       some "an imported module's initializer read a value that may differ in another run"
     else none
   let payloadsTask ← if env.header.isModule then pure (.pure (.ok #[]))
-    else IO.asTask (commandPayloads observations effects.byCommand)
+    else IO.asTask (commandPayloads observations effects)
   return { observations, done? := none, wholeModule?, payloadsTask }
 
 /-- The module's command payloads, as its `.olean` stores them (`commandPayloads`), once computed. -/
