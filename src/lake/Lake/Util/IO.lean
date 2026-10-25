@@ -56,10 +56,31 @@ partial def writeBinFileToNewTmp (path : FilePath) (content : ByteArray) : IO Fi
   return tmp
 
 /--
+Writes {lean}`content` to a new temporary file next to {lean}`path` and hard-links that to
+{lean}`path`, unless a file already has the name. If the hard link fails for another reason than
+an existing file, renames the temporary file to {lean}`path` if {lean}`renameIfNoLink` is set, and
+otherwise returns the link's error. Removes the temporary file on every path.
+-/
+def publishNewFile (path : FilePath) (content : ByteArray) (renameIfNoLink : Bool) :
+    IO (Except IO.Error Unit) := do
+  if (← path.pathExists) then return .ok ()
+  let tmp ← writeBinFileToNewTmp path content
+  -- `tmp` is this call's own file, so it removes it on every path
+  try
+    match (← (IO.FS.hardLink tmp path).toBaseIO) with
+    | .ok _ | .error (.alreadyExists ..) => return .ok () -- or another process created `path` first
+    | .error e =>
+      unless renameIfNoLink do return .error e
+      IO.FS.rename tmp path
+      return .ok ()
+  finally
+    discard <| (removeFileIfExists tmp).toBaseIO
+
+/--
 Writes the bytes of {lean}`content` to the new file {lean}`path`, unless a file already has that
-name. Returns whether a file has the name afterwards: {lean}`true` if this call wrote it or a file
-already had the name (it is kept), {lean}`false` if the call wrote nothing because the file system
-did not hard-link the bytes to the name.
+name. Returns {lean}`Except.ok` if a file has the name afterwards (this call's, or one that had
+it, which it keeps), or the error of the hard link if that failed for another reason than an
+existing file; then this call wrote nothing.
 
 The name never holds part of {lean}`content`. The bytes go to a new temporary file next to
 {lean}`path` (see {lean}`uniqueTmpPath`), which is then hard-linked to {lean}`path` and removed. A
@@ -67,32 +88,39 @@ hard link publishes a whole file, and never replaces one, so the first of two co
 wins. A write that fails (e.g., on a full disk) leaves no file; one that stops part way (e.g., when
 the process is killed) leaves only the temporary file.
 
-If the hard link fails for another reason than an existing file (e.g., the file system cannot
-hard-link), nothing else here publishes a whole file without replacing one: a file created under
-the name holds part of the bytes until the write ends, and keeps that part if the write fails or
-stops. So the call then removes the temporary file and returns {lean}`false`.
+Where the hard link fails (e.g., the file system cannot hard-link), nothing else publishes a whole
+file without replacing one: a file created under the name holds part of the bytes until the write
+ends, and keeps that part if the write fails or stops. So the call then writes nothing.
 
 The bytes are flushed to the operating system, not synced to the disk: after a power loss, the
 name can hold a file whose data the disk did not keep.
 -/
-public def writeBinFileIfNew (path : FilePath) (content : ByteArray) : IO Bool := do
-  if (← path.pathExists) then return true
-  let tmp ← writeBinFileToNewTmp path content
-  -- `tmp` is this call's own file, so it removes it on every path
-  try
-    match (← (IO.FS.hardLink tmp path).toBaseIO) with
-    | .ok _ | .error (.alreadyExists ..) => return true -- or another process created `path` first
-    | .error _ => return false
-  finally
-    discard <| (removeFileIfExists tmp).toBaseIO
+public def writeBinFileIfNew (path : FilePath) (content : ByteArray) : IO (Except IO.Error Unit) :=
+  publishNewFile path content (renameIfNoLink := false)
 
 /--
-Writes the UTF-8 encoded string {lean}`content` to the new file {lean}`path`, as
-{lean}`writeBinFileIfNew` writes bytes: if a file already has that name, or the file system does not
-hard-link, writes nothing.
+Writes the UTF-8 encoded string {lean}`content` to the new file {lean}`path`, unless a file already
+has that name, as {lean}`writeBinFileIfNew` writes bytes: the name never holds part of
+{lean}`content`. Where the hard link fails for another reason than an existing file (e.g., the file
+system cannot hard-link), this renames the temporary file to {lean}`path`, which still publishes a
+whole file, but replaces a file that another writer put under the name in the meantime. So it suits
+whole files that are equivalent for one name, such as Lake's input-to-output mappings: a reader gets
+one of them, whole.
 -/
 public def writeFileIfNew (path : FilePath) (content : String) : IO Unit :=
-  discard <| writeBinFileIfNew path content.toUTF8
+  discard <| publishNewFile path content.toUTF8 (renameIfNoLink := true)
+
+/--
+Writes the bytes of {lean}`content` to {lean}`path`, replacing a file that has the name. The bytes
+go to a new temporary file next to {lean}`path`, which is then renamed to it, so the name holds
+either its old file or all of {lean}`content`, and needs no hard link.
+-/
+public def writeBinFileReplacing (path : FilePath) (content : ByteArray) : IO Unit := do
+  let tmp ← writeBinFileToNewTmp path content
+  try
+    IO.FS.rename tmp path
+  finally
+    discard <| (removeFileIfExists tmp).toBaseIO
 
 /--
 Remove a directory and all its contents.

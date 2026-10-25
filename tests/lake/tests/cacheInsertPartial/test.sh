@@ -149,12 +149,12 @@ LAKE_CACHE_DIR="$PWD/cache3" test_err "staging-bad/$BAD: staged artifact does no
   cache unstage staging-bad
 test_exp ! -e "cache3/artifacts/$BAD"
 
-# Where a hard link fails (e.g., the file system cannot hard-link), Lake caches nothing under the
+# Where a hard link fails (e.g., the file system cannot hard-link), Lake caches no artifact under the
 # name, because no other way publishes a whole file without replacing one: a file created and
 # written under the name holds part of it until the write ends, and keeps that part if the write
-# fails or stops. On Linux, a preload (NoHardLink.c) makes chosen hard links fail, and makes a write
-# into a chosen name that a process creates fail after 13 bytes. (Lake's output goes through a pipe,
-# which that file size limit does not cover.)
+# fails or stops. On Linux, a preload (NoHardLink.c) makes chosen hard links fail, logs them, and
+# makes a write into a chosen name that a process creates fail after 13 bytes. (Lake's output goes
+# through a pipe, which that file size limit does not cover.)
 if [ "$UNAME" = Linux ]; then
   test_cmd cc -shared -fPIC -o no-hard-link.so NoHardLink.c
   PRELOAD="$PWD/no-hard-link.so"
@@ -196,17 +196,17 @@ if [ "$UNAME" = Linux ]; then
   whole_entries cache7
   # `writeBinFileIfNew` never replaces a file. Here another writer creates the name while the helper
   # is between its check that the name is free and its hard link (the preload holds that check).
-  # It keeps the other file, and reports a file under the name if its hard link works, or that it
-  # cached nothing if its hard link fails.
+  # It keeps the other file, and reports success if its hard link works, or the link's error if the
+  # link fails.
   test_cmd env LEAN_PATH="$BUILD_DIR/lib/lean" "$BUILD_DIR/bin/lean" Fallback.lean -c Fallback.c
   test_cmd "$BUILD_DIR/bin/leanc" -o fallback Fallback.c -L"$BUILD_DIR/lib/lean" -lLake_shared
   printf 'mine\n' > mine.bin
   for fail in "" taken; do
     rm -rf stat-barrier taken && mkdir stat-barrier
-    echo "\$ (preload: links to '$fail' fail; fallback taken mine.bin) &"
+    echo "\$ (preload: links to '$fail' fail; fallback bin taken mine.bin) &"
     env LD_LIBRARY_PATH="$BUILD_DIR/lib/lean" LD_PRELOAD="$PRELOAD" LAKE_TEST_FAIL_LINK="$fail" \
       LAKE_TEST_STAT_PATH=taken LAKE_TEST_STAT_BARRIER="$PWD/stat-barrier" \
-      ./fallback taken mine.bin > fallback.out 2>&1 &
+      ./fallback bin taken mine.bin > fallback.out 2>&1 &
     pid=$!
     until [ -e "stat-barrier/$pid" ]; do
       if ! kill -0 $pid 2> /dev/null; then
@@ -224,9 +224,9 @@ if [ "$UNAME" = Linux ]; then
     test_exp $rc = 0
     test_cmd grep -qx theirs taken
     if [ -z "$fail" ]; then
-      test_cmd grep -qx true fallback.out
+      test_cmd grep -qx ok fallback.out
     else
-      test_cmd grep -qx false fallback.out
+      test_cmd grep -q '^link failed: ' fallback.out
     fi
     for f in taken.*.tmp; do
       if [ -e "$f" ]; then
@@ -234,6 +234,75 @@ if [ "$UNAME" = Linux ]; then
         exit 1
       fi
     done
+  done
+  # `writeFileIfNew` writes whole text files (e.g., input-to-output mappings). Where its hard link
+  # fails, it renames its temporary file to the name instead, so the file is still written whole.
+  printf 'a whole text file\n' > text.in
+  rm -f textout
+  test_cmd env LD_LIBRARY_PATH="$BUILD_DIR/lib/lean" LD_PRELOAD="$PRELOAD" \
+    LAKE_TEST_FAIL_LINK=textout ./fallback text textout text.in
+  test_cmd cmp text.in textout
+  for f in textout.*.tmp; do
+    if [ -e "$f" ]; then
+      echo "FAILURE: a temporary file stayed: $f"
+      exit 1
+    fi
+  done
+  # A build that restores an output with its saved trace writes the output's mapping where the cache
+  # has none (`writeOutputs` with `overwrite := false`), also where hard links into the cache's
+  # mapping directory fail, and a fresh tree then restores the output with it
+  mkdir t8 t9 && cp lakefile.lean input.txt t8/ && cp lakefile.lean input.txt t9/
+  LAKE_CACHE_DIR="$PWD/cache8" test_run -d t8 build out
+  test_cmd rm -rf cache8/outputs
+  echo "\$ (preload: links into $PWD/cache8/outputs/ fail; lake -d t8 build out)"
+  rc=0
+  out=$(env LD_PRELOAD="$PRELOAD" LAKE_TEST_FAIL_LINK="$PWD/cache8/outputs/" \
+    LAKE_TEST_LINK_LOG="$PWD/link8.log" LAKE_CACHE_DIR="$PWD/cache8" \
+    "$LAKE" -d t8 build out 2>&1) || rc=$?
+  printf '%s\n' "$out"
+  test_exp $rc = 0
+  test_exp -s link8.log
+  test_exp "$(find cache8/outputs -name '*.json' | wc -l)" = 1
+  LAKE_CACHE_DIR="$PWD/cache8" test_not_out 'Built p/out' -d t9 build out
+  test_cmd cmp input.txt "t9/$OUT"
+  # Where the cache's hard links fail, a build writes no mapping for an output that it did not cache
+  # (it would name an artifact that is not in the cache). After the first such failure, the process
+  # tries no more hard links into that cache, and writes no temporary copies there.
+  mkdir t10 t11 && cp lakefile.lean input.txt Big.lean t10/ && cp lakefile.lean input.txt Big.lean t11/
+  ARTS9="$PWD/cache9/artifacts/"
+  echo "\$ (preload: links into $ARTS9 fail; lake -v -d t10 build Big)"
+  rc=0
+  out=$(env LD_PRELOAD="$PRELOAD" LAKE_TEST_FAIL_LINK="$ARTS9" LAKE_TEST_LINK_LOG="$PWD/link9.log" \
+    LAKE_TEST_CREATE_PREFIX="$ARTS9" LAKE_TEST_CREATE_LOG="$PWD/create9.log" \
+    LAKE_CACHE_DIR="$PWD/cache9" "$LAKE" -v -d t10 build Big 2>&1) || rc=$?
+  printf '%s\n' "$out" > forced.out
+  cat forced.out
+  test_exp $rc = 0
+  match_text ": not cached" forced.out
+  test_exp "$(find cache9 -name '*.json' | wc -l)" = 0
+  test_exp "$(wc -l < link9.log)" = 1
+  test_exp ! -e create9.log
+  echo "\$ (preload: links into $ARTS9 fail; lake -d t10 build out)"
+  rc=0
+  env LD_PRELOAD="$PRELOAD" LAKE_TEST_FAIL_LINK="$ARTS9" LAKE_CACHE_DIR="$PWD/cache9" \
+    "$LAKE" -d t10 build out || rc=$?
+  test_exp $rc = 0
+  test_exp "$(find cache9 -name '*.json' | wc -l)" = 0
+  test_exp "$(find cache9 -type f | wc -l)" = 0
+  # Without failing links, a fresh tree builds the outputs, and caches them
+  LAKE_CACHE_DIR="$PWD/cache9" test_out 'Built Big' -d t11 build Big
+  test_cmd cmp "t11/$BIG" "cache9/artifacts/$(cat "t11/$BIG.hash").olean"
+  # `lake cache unstage --force-overwrite` replaces an artifact by renaming its staged copy to the
+  # artifact's name, so it needs no hard link, and the name never lacks a whole file
+  LAKE_CACHE_DIR="$PWD/cache10" test_run cache unstage staging
+  echo "\$ (preload: links into $PWD/cache10/artifacts/ fail; lake cache unstage staging --force-overwrite)"
+  rc=0
+  env LD_PRELOAD="$PRELOAD" LAKE_TEST_FAIL_LINK="$PWD/cache10/artifacts/" \
+    LAKE_CACHE_DIR="$PWD/cache10" "$LAKE" cache unstage staging --force-overwrite || rc=$?
+  test_exp $rc = 0
+  for f in staging/*; do
+    [ "$(basename "$f")" = outputs.jsonl ] && continue
+    test_cmd cmp "$f" "cache10/artifacts/$(basename "$f")"
   done
 else
   echo "SKIPPED: the cases with failing hard links need a Linux preload"
