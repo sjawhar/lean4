@@ -1441,8 +1441,9 @@ after the resolve). A candidate whose check found its `.olean` is not the one it
 checked (`checkUsageIndexEntry`).
 
 A lookup that found any candidate logs one verbose line: `usage index: restored <name> (...) at rank <r>` or
-`usage index: no match (...)`, where `(...)` counts the candidates, those whose `.usage` the pre-filter read
-(`parsed`) and those that reached the check (`fully checked`), with the wall and current-thread CPU time the
+`usage index: no match (...)`, where `(...)` counts the candidates, those whose usage record the pre-filter read (its
+compact record or its `.usage`, `readCandidateUsage?`; `parsed`) and those that reached the check (`fully checked`),
+with the wall and current-thread CPU time the
 pre-filter took apart from reading views, the views this lookup added (`UsageView`) and their wall and CPU read
 times, and the importees the checks bound (`ContentHashes.imports`) that the module's same-tree check had not, with
 their wall and CPU check times; `<r>` is the restored candidate's position among the candidates, most recent first
@@ -1470,8 +1471,8 @@ def Module.lookupUsageIndex (mod : Module) (presetup : ModulePreSetup) (importAr
       let cpuStop ← IO.threadCpuNanosNow
       views.modify fun (n, ns, cpuNs) => (n + 1, ns + (stop - start), cpuNs + (cpuStop - cpuStart))
     return view
-  -- The candidate's outputs, files and its key's `.olean` hash if it passes the pre-filter, and whether its `.usage`
-  -- was read
+  -- The candidate's outputs, files and its key's `.olean` hash if it passes the pre-filter, and whether its usage
+  -- record was read
   let prefilter (file : FilePath) :
       JobM (Option (ModuleOutputArtifacts × UsageFiles × ModuleUsage.Digest) × Bool) := do
     let some descrs ← readUsageIndexEntry? file | return (none, false)
@@ -1484,7 +1485,8 @@ def Module.lookupUsageIndex (mod : Module) (presetup : ModulePreSetup) (importAr
         return none
     let some arts := arts? | return (none, false)
     let (some usage, some usekey) := (arts.usage?, arts.usekey?) | return (none, false)
-    match (← usagePrefilter presetup importArts hashes importee? usekey.path usage.path) with
+    match (← usagePrefilter presetup importArts hashes importee? usekey.path usage.path
+        (Cache.usageIndexCompactFile file)) with
     | .key => return (none, false)
     | .usage => return (none, true)
     | .passed keyOlean =>
@@ -1615,15 +1617,24 @@ def Module.usageCutoffApplies (mod : Module) (presetup : ModulePreSetup) : JobM 
 /--
 Records the module's outputs, `arts`, which are in the cache, in the usage index (`Cache.writeUsageIndex`) if a
 lookup can read them: they name a `.usekey`, the build restores artifacts (`restore`), as a lookup requires, and usage
-cutoff can apply to the module. The entry has no archive.
+cutoff can apply to the module. The entry has no archive. With it goes the compact record of its `.usage` that the
+pre-filter reads (`compactUsage?`), unless the index has one already: the entry is named by its `.usekey`, which
+names the `.usage`, so a record under that name never needs to change.
 -/
 def Module.indexUsage (mod : Module) (presetup : ModulePreSetup) (arts : ModuleOutputArtifacts) (restore : Bool) :
     JobM Unit := do
   unless restore do return
   let some usekey := arts.usekey? | return
   unless (← mod.usageIndexApplies presetup) do return
-  (← getLakeCache).writeUsageIndex mod.pkg.cacheScope presetup.localTrace.hash usekey.hash
-    (toJson {arts.descrs with ltar? := none})
+  let cache ← getLakeCache
+  let compact := Cache.usageIndexCompactFile <|
+    cache.usageIndexFile mod.pkg.cacheScope presetup.localTrace.hash usekey.hash
+  let compact? ← id do
+    if (← compact.pathExists) then return none
+    let some usage := arts.usage? | return none
+    compactUsage? usage.path
+  cache.writeUsageIndex mod.pkg.cacheScope presetup.localTrace.hash usekey.hash
+    (toJson {arts.descrs with ltar? := none}) compact?
 
 /--
 Skips compiling a module whose trace is stale if usage cutoff applies to it
