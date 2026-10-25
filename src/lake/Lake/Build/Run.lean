@@ -363,8 +363,8 @@ def mkBuildContext
     else
       return none
   registeredJobs := jobs
-  sidecarCache := ← Std.Mutex.new {}
-  fileDigests := ← Std.Mutex.new {}
+  sidecarCache := ← Shards.new {}
+  fileDigests := ← Shards.new {}
   kernelProviders := ← Std.Mutex.new {}
   leanTrace := .ofHash (pureHash ws.lakeEnv.leanGithash)
     s!"Lean {Lean.versionStringCore}, commit {ws.lakeEnv.leanGithash}"

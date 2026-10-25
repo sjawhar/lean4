@@ -33,27 +33,6 @@ It is opt-in via `compiler.postponeCompile` and only meaningful under the module
   Compiler.compiler.postponeCompile.get self.leanOptions.toOptions
 
 /--
-One snapshot of the build store (a single `ST.Ref.get`). A lookup-only pass over many memoized
-facets reads it instead of the shared cell, since each `get` of a multi-threaded ref is two atomic
-exchanges on that cell. The transitive import walk's facets are already in the store: a module's
-imports are built before it.
--/
-@[inline] def getBuildStoreSnapshot : FetchM BuildStore :=
-  .ofFn fun _ _ _ store _ log => return .ok (← store.get) log
-
-/-- The job memoized for `info` in the snapshot `s`, if any. -/
-@[inline] def BuildStore.getInfo?
-  (s : BuildStore) (info : BuildInfo) [t : FamilyOut BuildData info.key α]
-: Option (Job α) :=
-  cast (by rw [t.fam_eq]) (s.get? info.key)
-
-/-- `info.fetch`, served from the snapshot `s` if already memoized there. -/
-@[inline] def fetchFrom
-  (s : BuildStore) (info : BuildInfo) [FamilyOut BuildData info.key α]
-: FetchM (Job α) := do
-  if let some job := s.getInfo? info then return job else info.fetch
-
-/--
 Fetches the information importers of the module need, including its IR.
 
 Importers need the IR because the language server imports at the `.server` level, where every
