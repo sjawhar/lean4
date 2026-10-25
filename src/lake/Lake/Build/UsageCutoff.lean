@@ -875,7 +875,7 @@ def readCandidateUsage? (path : FilePath) : BaseIO (Option UsageSidecar) := do
 public inductive UsagePrefilter
   /-- Rejected on its `.usekey`, before its `.usage` was read. -/
   | key
-  /-- Rejected on its `.usage`. -/
+  /-- Rejected after its `.usage` was read. -/
   | usage
   /-- Passed, with the hash of the `.olean` its `.usekey` records (`UsekeySidecar.olean`). -/
   | passed (olean : ModuleUsage.Digest)
@@ -886,19 +886,20 @@ The usage index's pre-filter of a cached compile of the module, whose `.usekey` 
 (`importArts`). It only rejects, and it binds no importee: it compares the importees as `importee? m` gives them
 (the module's own bindings, `ContentHashes`, or else the build's views, `UsageView`), and hashes no `.olean`; the
 check, which every accept passes, reads them again. It looks at the importees the check binds. In order: the key's
-local inputs, its `modsys` against the closure's (`modsysHash`, which the module's compile takes too) and its
-`closure` against the fold of the direct imports' recorded closures; then the `.usage`, which must have no `noskip`,
-cover the closure, and record for each constant it used from a workspace module the digest that module's `.usage`
-records, for each workspace `extra` module the `moduleDigest` and, unless it is a module-system file (pinned by
-`modsys`), the `.olean` hash its `.usekey` records, and for its specialization-cache lookups the providers in the
-closure.
+local inputs and its `closure` against the fold of the direct imports' recorded closures; then the `.usage`, which
+must have no `noskip`, cover the closure, and record for each constant it used from a workspace module the digest that
+module's `.usage` records, for each workspace `extra` module the `moduleDigest` and, unless it is a module-system file
+(pinned by `modsys`), the `.olean` hash its `.usekey` records, and for its specialization-cache lookups the providers
+in the closure; last, the key's `modsys` against the closure's (`modsysHash`). That hash costs a stamp of every file
+of the closure's module-system modules, most of the pre-filter's own time, and a module whose lookup finds no match
+computes it for its compile anyway (`usekeyBefore`), into the same `hashes`: compared last, it costs a candidate
+rejected on its `.usage` nothing.
 -/
 public def usagePrefilter (presetup : ModulePreSetup) (importArts : NameMap ImportArtifacts) (hashes : ContentHashes)
     (importee? : Name → JobM (Option (Option ModuleUsage.Digest × UsageImport)))
     (usekeyFile usageFile : FilePath) : JobM UsagePrefilter := do
   let some key ← readUsageSidecar UsekeySidecar usekeyFile | return .key
   if key.localHash != presetup.localTrace.hash then return .key
-  unless (← modsysHash hashes importArts) == key.modsys do return .key
   let closure ← foldClosureHash presetup fun m => return (← importee? m).map (·.2.closure)
   unless closure == some key.closure do return .key
   let some usage ← readCandidateUsage? usageFile | return .usage
@@ -917,4 +918,5 @@ public def usagePrefilter (presetup : ModulePreSetup) (importArts : NameMap Impo
   unless usage.specLookups.isEmpty do
     let providers ← usage.closureSpecProviders importArts fun m => return (← importee? m).map (·.2.specKeys)
     unless providers == some usage.specLookups do return .usage
+  unless (← modsysHash hashes importArts) == key.modsys do return .usage
   return .passed key.olean
