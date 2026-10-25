@@ -720,11 +720,12 @@ static optional<nat> to_nat_val(type_checker & tc, expr const & e) {
 /* `Decidable.decide p d` for `d` a `Decidable` instance of `Nat` equality or order, `Fin` equality or `BitVec`
    equality whose arguments reduce to numerals: the Boolean literal that `whnf` reaches by unfolding `d` down to
    `Nat.beq`/`Nat.ble` on the numerals (`Nat.decEq`/`instDecidableEqNat`/`Nat.decLe` directly, `Nat.decLt n m` as
-   `Nat.decLe (n+1) m`, `instDecidableEqFin` through `Nat.decEq` on `Fin.val`, `BitVec.decEq`/`instDecidableEqBitVec`
-   through `instDecidableEqFin` on `toFin`). Only `decide` is shortcut, never `d` itself: `whnf d` stays the structure
-   whose `decide` field is unevaluated, which is what projections in `lazy_delta_reduction` compare against the other
-   side. Like the `Nat` literal rules there, this only applies to terms without free variables (or under
-   `eagerReduce`): an open argument such as `x.toNat + 4294967244` unfolds `Nat.add` once per unit of its literal.
+   `Nat.decLe (Nat.succ n) m`, `instDecidableEqFin` through `Nat.decEq` on `Fin.val`, `BitVec.decEq`/
+   `instDecidableEqBitVec` through `instDecidableEqFin` on `toFin`). Only `decide` is shortcut, never `d` itself:
+   `whnf d` stays the structure whose `decide` field is unevaluated, which is what projections in
+   `lazy_delta_reduction` compare against the other side. Like the `Nat` literal rules there, this only applies to
+   terms without free variables (or under `eagerReduce`): an open argument such as `x.toNat + 4294967244` unfolds
+   `Nat.add` once per unit of its literal.
    Only `whnf` applies it, where the value is demanded, and `lazy_delta_reduction` when the other side is a Boolean
    literal. Two closed `decide` terms are compared by their arguments, as without the rule, which settles
    `decide (f (n + 1) = c) =?= decide (f m = c)` without evaluating `f`, however costly `f` is. */
@@ -745,11 +746,23 @@ optional<expr> type_checker::reduce_dec_lit(expr const & e) {
         if (is_fin) return to_nat_val(*this, mk_proj(*g_fin_name, 0u, a));
         return to_nat_val(*this, mk_proj(*g_fin_name, 0u, mk_proj(*g_bv_name, 0u, a)));
     };
+    // Each decision is the one the unfolded instance computes, with the same runtime functions on the same values and
+    // in the same order, so it equals stock's on every literal the kernel can hold, including one not in normal form
+    // (a value below 2^63 in a big object, or a negative big object made by `unsafeCast`). `Nat.decEq` (and
+    // `instDecidableEqFin`, `BitVec.decEq` on the values) is `Nat.beq`, that is `nat_eq`; `Nat.decLe` is `Nat.ble`,
+    // that is `nat_le`; `Nat.decLt n m` is `Nat.decLe (Nat.succ n) m`, so it is `nat_le` of `n + 1`, which is computed
+    // and size-checked as `reduce_nat` reduces `Nat.succ`, before `m` is reduced, never `nat_lt`, which differs on such
+    // a literal.
+    bool is_lt = n == *g_nat_dec_lt;
     optional<nat> a = val_of(app_arg(app_fn(d)));
     if (!a) return none_expr();
+    if (is_lt) {
+        a = optional<nat>(*a + nat(1));
+        check_nat_size(env(), nat_size_in_bytes(*a));
+    }
     optional<nat> b = val_of(app_arg(d));
     if (!b) return none_expr();
-    bool val = n == *g_nat_dec_le ? *a <= *b : n == *g_nat_dec_lt ? *a < *b : *a == *b;
+    bool val = (is_lt || n == *g_nat_dec_le) ? *a <= *b : *a == *b;
     return some_expr(val ? mk_bool_true() : mk_bool_false());
 }
 optional<expr> type_checker::reduce_nat(expr const & e) {
