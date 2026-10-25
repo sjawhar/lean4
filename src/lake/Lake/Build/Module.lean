@@ -683,6 +683,7 @@ def Module.recFetchPreSetup (mod : Module) : FetchM (Job ModulePreSetup) := ensu
     addPureTrace mod.leanArgs "Module.leanArgs"
     return {
       trace := ← getTrace
+      srcHash := input.trace.hash
       srcFile := input.path
       srcMTime := input.trace.mtime
       isModule := input.header.isModule
@@ -808,6 +809,7 @@ public def Module.cacheOutputHashes (mod : Module) : IO PUnit := do
 
 def ModuleOutputDescrs.resolve
   (descrs : ModuleOutputDescrs) (service? : Option CacheServiceName) (scope? : Option CacheServiceScope)
+  (sha256? : Option Json := none)
 : JobM ModuleOutputArtifacts := do
   let arts : ModuleOutputArtifacts := {
     isModule := descrs.isModule
@@ -826,11 +828,12 @@ def ModuleOutputDescrs.resolve
     return {arts with bc? := some (← resolve descr)}
   else
     return arts
-where @[inline] resolve descr := resolveArtifact descr service? scope?
+where @[inline] resolve descr := resolveArtifact descr service? scope? (sha256? := sha256?)
 
 def resolveModuleOutputArtifacts (out : CacheOutput) : JobM ModuleOutputArtifacts := do
   match fromJson? out.data with
-  | .ok (descrs : ModuleOutputDescrs) => descrs.resolve out.service? out.scope?
+  | .ok (descrs : ModuleOutputDescrs) =>
+    descrs.resolve out.service? out.scope? (sha256? := out.sha256?)
   | .error e => error s!"ill-formed module outputs:\n{out.data.render.pretty 80 2}\n{e}"
 
 instance : ResolveOutputs ModuleOutputArtifacts := ⟨resolveModuleOutputArtifacts⟩
@@ -845,7 +848,7 @@ def resolveModuleOutputs (out : CacheOutput) : JobM ModuleOutputs := do
   if let .str descr := out.data then
     match ArtifactDescr.ofFilePath? descr with
     | .ok descr =>
-      return .ltar (← resolveArtifact descr out.service? out.scope?)
+      return .ltar (← resolveArtifact descr out.service? out.scope? (sha256? := out.sha256?))
     | .error e =>
       error s!"ill-formed module archive output:\n{out.data.render.pretty 80 2}\n{e}"
   else
@@ -853,12 +856,12 @@ def resolveModuleOutputs (out : CacheOutput) : JobM ModuleOutputs := do
     | .ok (descrs : ModuleOutputDescrs) =>
       if let some descr := descrs.ltar? then
         try
-          descrs.resolve out.service? out.scope?
+          descrs.resolve out.service? out.scope? (sha256? := out.sha256?)
         catch e =>
           dropLogFrom e
-          return .ltar (← resolveArtifact descr out.service? out.scope?)
+          return .ltar (← resolveArtifact descr out.service? out.scope? (sha256? := out.sha256?))
       else
-        descrs.resolve out.service? out.scope?
+        descrs.resolve out.service? out.scope? (sha256? := out.sha256?)
     | .error e => error s!"ill-formed module outputs:\n{out.data.render.pretty 80 2}\n{e}"
 
 instance : ResolveOutputs ModuleOutputs := ⟨resolveModuleOutputs⟩
@@ -1148,7 +1151,8 @@ def Module.recBuildElabArts (mod : Module) : FetchM (Job ModuleOutputArtifacts) 
 where
   fetchFromCache? presetup savedTrace restoreAll : JobM ModuleFetchState := do
     let inputHash := (← getTrace).hash
-    let some ((ltarOrArts : ModuleOutputs), log) ← getArtifacts? inputHash savedTrace mod.pkg
+    let some ((ltarOrArts : ModuleOutputs), log) ←
+      getArtifacts? inputHash savedTrace mod.pkg mod.name.toString (some presetup.srcHash)
       | return .incomplete savedTrace none
     match ltarOrArts with
     | .ltar ltar =>
