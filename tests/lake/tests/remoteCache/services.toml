@@ -1,5 +1,5 @@
-# Cache services for `test.sh`, served by `../cacheTransfer/server.py`.
-# `test.sh` replaces `%URL%` with the URL of one mock server,
+# Cache services for the tests of `lib.sh`, served by `../cacheTransfer/server.py`.
+# `lib.sh` replaces `%URL%` with the URL of one mock server,
 # `%URL2%` with the URL of a second one, which listens on another port,
 # and `%FLAKY%` with a fault mode of the first server.
 
@@ -98,3 +98,17 @@ name = "slowput"
 type = "s3"
 artifactEndpoint = "%URL%/slowput/a0"
 revisionEndpoint = "%URL%/slowput/r0"
+
+# Mappings are served; their artifacts are refused (403)
+[[cache.service]]
+name = "denyart"
+type = "s3"
+artifactEndpoint = "%URL%/denyart/a0"
+revisionEndpoint = "%URL%/denyart/r0"
+
+# Each upload reads its body and then gets no answer for 15 minutes
+[[cache.service]]
+name = "stallput"
+type = "s3"
+artifactEndpoint = "%URL%/stallput/a0"
+revisionEndpoint = "%URL%/stallput/r0"

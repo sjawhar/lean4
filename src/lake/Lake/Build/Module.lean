@@ -13,6 +13,7 @@ import Lean.Elab.ParseImportsFast
 import Lake.Util.Proc
 import Lake.Build.Job.Register
 import Lake.Build.Common
+import Lake.Build.RemoteCache
 import Lake.Build.Target
 import Init.Omega
 
@@ -683,9 +684,9 @@ def Module.recFetchPreSetup (mod : Module) : FetchM (Job ModulePreSetup) := ensu
     addPureTrace mod.leanArgs "Module.leanArgs"
     return {
       trace := ← getTrace
-      srcHash := input.trace.hash
       srcFile := input.path
       srcMTime := input.trace.mtime
+      srcHash := input.trace.hash
       isModule := input.header.isModule
       directImports := input.imports
       directImportArts := info.directArts
@@ -809,7 +810,7 @@ public def Module.cacheOutputHashes (mod : Module) : IO PUnit := do
 
 def ModuleOutputDescrs.resolve
   (descrs : ModuleOutputDescrs) (service? : Option CacheServiceName) (scope? : Option CacheServiceScope)
-  (sha256? : Option Json := none)
+  (sha256? : Option Sha256Map := none)
 : JobM ModuleOutputArtifacts := do
   let arts : ModuleOutputArtifacts := {
     isModule := descrs.isModule
@@ -1209,6 +1210,8 @@ where
           return .complete {arts with ltar? := some ltar}
       return .complete arts
   fetchCore (presetup : ModulePreSetup) : JobM ModuleOutputArtifacts := do
+    -- Cleared on entry: a job's state carries the flag of the jobs it continues (`JobState.built`)
+    modify ({· with built := false})
     let depTrace ← getTrace
     have : GetMTime Module := ⟨(·.getMTime presetup.isModule presetup.postponeCompile)⟩
     have : CheckExists Module := ⟨(·.checkExists presetup.isModule presetup.postponeCompile)⟩
@@ -1220,8 +1223,6 @@ where
         return arts
       | .incomplete savedTrace ltar? =>
         let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
-        -- Whether `lean` ran here (the job's action also merges the actions of its dependencies)
-        let mut compiled := false
         if status.isUpToDate then
           unless (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) do
             -- Restoring from the archive stamps the trace with the current input
@@ -1231,10 +1232,8 @@ where
               mod.unpackLtar mod.ltarFile depTrace.hash
             else
               discard <| mod.buildLean presetup
-              compiled := true
         else
           discard <| mod.buildLean presetup
-          compiled := true
         if status.isCacheable then
           let arts ← mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile
           let arts := {arts with ltar? := arts.ltar? <|> ltar?}
@@ -1244,7 +1243,7 @@ where
           -- Queued before the local mapping is written: a build that finds the mapping never
           -- compiles (or queues) this input. After a crash between the two, the next build
           -- restores the outputs through the trace without queueing them, so they stay queued once.
-          if compiled then
+          if (← getThe JobState).built then
             -- `lake cache push` packs the per-file outputs into the archive it uploads
             queueRemotePush mod.pkg depTrace.hash mod.name.toString (some presetup.srcHash)
               (toJson {arts.descrs with ltar? := none}) log
