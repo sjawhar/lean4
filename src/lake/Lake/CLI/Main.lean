@@ -84,6 +84,11 @@ public structure LakeOptions where
   maxRevs : Nat := 100
   /-- Whether `lake cache push` waits for a push that is running (via `--wait`). -/
   wait : Bool := false
+  /--
+  The process ID of the build that `lake cache push` follows (via `--follow`): the push keeps
+  reading the queue while that build runs (see `pushRemoteCache`).
+  -/
+  follow? : Option Nat := none
   shake : Shake.Args := {}
   comparatorConfig? : Option FilePath := none
   /-- File received via `lake check --from-export` -/
@@ -326,6 +331,11 @@ def lakeLongOption : (opt : String) → CliM PUnit
 | "--download-arts" => modifyThe LakeOptions ({· with mappingsOnly := false})
 | "--mappings-only" => modifyThe LakeOptions ({· with mappingsOnly := true})
 | "--wait"        => modifyThe LakeOptions ({· with wait := true})
+| "--follow" => do
+  let pid ← takeOptArg "--follow" "process ID"
+  let some pid := pid.toNat?
+    | error s!"invalid process ID for --follow: {pid}"
+  modifyThe LakeOptions ({· with follow? := some pid})
 | "--package" => do
   let pkgName ← takeOptArg "--package" "package name"
   modifyThe LakeOptions ({· with package? := some pkgName})
@@ -900,7 +910,7 @@ protected def push : CliM PUnit := do
   let some cache := lakeEnv.lakeCache?
     | error "no system cache detected; set `LAKE_CACHE_DIR` to the cache that holds the queue"
   let lakeCfg ← loadLakeConfig lakeEnv
-  let left ← pushRemoteCache lakeEnv lakeCfg cache opts.wait
+  let left ← pushRemoteCache lakeEnv lakeCfg cache opts.wait opts.follow?
   if left > 0 then
     logError s!"{left} queue entries could not be uploaded; they remain in {cache.pushQueueFile}"
     exit 1
