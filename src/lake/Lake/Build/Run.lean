@@ -13,6 +13,7 @@ import Lake.Build.Index
 import Init.Omega
 import Lake.Util.JsonObject
 import Lake.Util.IO
+import Lake.Config.PushQueue
 
 /-! # Build Runner
 
@@ -397,19 +398,18 @@ def Workspace.startBuild
 
 /-- Atomically replace the status left by remote mapping reads in one build. -/
 def writeRemoteReadStatus (cache : Cache) (status : RemoteReadStatus) : IO Unit := do
-  writeFileAtomic (cache.dir / "remote-status-read.json") <| (JsonObject.empty
+  writeFileAtomic cache.readStatusFile <| (JsonObject.empty
     |>.insert "at" (← wallClockSecs)
     |>.insert "failures" status.failures
     |>.insert "lastError" status.lastError : Json).pretty
 
 def finalizeBuild
-  (ws : Workspace) (cfg : BuildConfig) (bctx : BuildContext) (mctx : MonitorContext)
-  (result : BuildResult α)
+  (cfg : BuildConfig) (bctx : BuildContext) (mctx : MonitorContext) (result : BuildResult α)
 : IO α := do
   reportResult cfg mctx.out result
   let remoteStatus ← bctx.remoteReadStatus.get
   if remoteStatus.failures > 0 then
-    if let .error e ← (writeRemoteReadStatus ws.lakeCache remoteStatus).toBaseIO then
+    if let .error e ← (writeRemoteReadStatus bctx.workspace.lakeCache remoteStatus).toBaseIO then
       mctx.logger.logEntry (.trace s!"could not write remote cache read status: {e}")
   if let some outputsFile := cfg.outputsFile? then
     bctx.saveOutputs (logger := mctx.logger) mctx.out outputsFile
@@ -436,7 +436,7 @@ public def Workspace.runFetchM
   let bctx ← mkBuildContext ws cfg jobs cancelTk?
   let job ← startBuild bctx build caption
   let result ← monitorJob mctx job
-  finalizeBuild ws cfg bctx mctx result
+  finalizeBuild cfg bctx mctx result
 
 def monitorBuild (mctx : MonitorContext) (job : Job (Job α)) : BaseIO (BuildResult α) := do
   let result ← monitorJob mctx job
@@ -477,7 +477,7 @@ public def Workspace.runBuild
   let bctx ← mkBuildContext ws cfg jobs cancelTk?
   let job ← startBuild bctx build
   let result ← monitorBuild mctx job
-  finalizeBuild ws cfg bctx mctx result
+  finalizeBuild cfg bctx mctx result
 
 /-- Produce a build job in the Lake monad's workspace and await the result. -/
 @[inline] public def runBuild

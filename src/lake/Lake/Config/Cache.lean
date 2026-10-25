@@ -11,6 +11,8 @@ public import Lake.Util.Git
 public import Lake.Util.Log
 public import Lake.Util.Version
 public import Lake.Config.Artifact
+public import Lake.Config.RemoteCache
+public import Lake.Util.Sha256
 import Lake.Config.InstallPath
 import Lake.Build.Actions
 import Lake.Util.Url
@@ -19,7 +21,6 @@ import Lake.Util.CacheToken
 import Lake.Util.Reservoir
 import Lake.Util.JsonObject
 import Lake.Util.IO
-import Lake.Util.Sha256
 import Init.System.Platform
 import Init.Data.String.Lemmas
 
@@ -211,48 +212,16 @@ def insertCore
 : CacheMap := cache.insertCore inputHash (toJson val) platformIndependent
 
 /-- Extract each output from their structured data into a flat array of artifact descriptions. -/
-public partial def collectOutputDescrs (map : CacheMap) : LogIO (Array ArtifactDescr) := do
-  throwIfLogs <| map.foldM (init := #[]) fun as _ e => go as e.out
-where go as o := do
-  match o with
-  | .null =>
-    return as
-  | .bool _ => -- boolean metadata is allowed (as of 2025-03-13)
-    return as
-  | .num o =>
-    match Hash.ofJsonNumber? o with
-    | .ok hash =>
-      return as.push {hash}
-    | .error reason =>
-      logError s!"unsupported output; {reason}: {o}"
+public def collectOutputDescrs (map : CacheMap) : LogIO (Array ArtifactDescr) := do
+  throwIfLogs <| map.foldM (init := #[]) fun as _ e => do
+    match outputArtifactDescrs? e.out with
+    | .ok descrs =>
+      return as ++ descrs
+    | .error err =>
+      logError s!"unsupported output: {err}"
       return as
-  | .str o =>
-    match ArtifactDescr.ofFilePath? o with
-    | .ok a => return as.push a
-    | .error e =>
-      logError s!"unsupported output: {e}"
-      return as
-  | .arr os => os.foldlM (init := as) go
-  | .obj os => os.foldlM (init := as) fun as _ o => go as o
 
 end CacheMap
-
-/-- Extract artifact descriptors from one output value, rejecting any malformed descriptor. -/
-public partial def outputArtifactDescrs? (output : Json) : Except String (Array ArtifactDescr) :=
-  go #[] output
-where
-  go descrs output := do
-    match output with
-    | .null | .bool _ =>
-      return descrs
-    | .num n =>
-      return descrs.push {hash := ← Hash.ofJsonNumber? n}
-    | .str name =>
-      return descrs.push (← ArtifactDescr.ofFilePath? name)
-    | .arr values =>
-      values.foldlM (init := descrs) go
-    | .obj values =>
-      values.foldlM (init := descrs) fun descrs _ value => go descrs value
 
 /-! ## Cache Ref -/
 
@@ -365,7 +334,7 @@ public structure CacheOutput where
     /-- The log of the build that produced the outputs, replayed when they are restored. -/
     log? : Option Log := none
     /-- SHA-256 digests of remote artifacts, keyed by `ArtifactDescr.relPath`. -/
-    sha256? : Option Json := none
+    sha256? : Option Sha256Map := none
     deriving Inhabited
 
 namespace CacheOutput
@@ -403,7 +372,7 @@ public protected def fromJson? (json : Json) : Except String CacheOutput := do
         else
           return none
       let log? ← obj.get? "log"
-      let sha256? : Option Json ← obj.get? "sha256"
+      let sha256? ← obj.get? "sha256"
       return {data, service?, scope?, log?, sha256?}
   -- old format: just the data
   return .ofData json
@@ -411,102 +380,6 @@ public protected def fromJson? (json : Json) : Except String CacheOutput := do
 public instance : FromJson CacheOutput := ⟨CacheOutput.fromJson?⟩
 
 end CacheOutput
-
-/-- The version of the input-hash mappings stored in the shared remote cache. -/
-public def remoteCacheSchemaVersion : String := "lake-remote-2026-10-24"
-
-/--
-The largest remote artifact Lake accepts: four times the largest artifact (29,899,080 bytes)
-measured in a full MachCSL build on 2026-10-25.
--/
-public def remoteCacheMaxFileSize : Nat := 119596320
-
-/-- The namespace of a package's input-hash mappings in the shared remote cache. -/
-public def remoteCacheScope (githash packageScope : String) : String :=
-  s!"v1/{githash}/{System.Platform.target}/{packageScope}"
-
-/-- An input-to-output mapping read from the shared remote cache. -/
-public structure RemoteCacheMapping where
-  inputHash : Hash
-  target : String
-  srcHash? : Option Hash
-  data : Json
-  sha256 : Json
-  log : Log
-
-namespace RemoteCacheMapping
-
-public def fromJson? (json : Json) : Except String RemoteCacheMapping := do
-  let obj ← JsonObject.fromJson? json
-  let schemaVersion : String ← obj.get "schemaVersion"
-  unless schemaVersion == remoteCacheSchemaVersion do
-    throw s!"unknown remote cache schema version: {schemaVersion}"
-  let inputHash : Hash ← obj.get "inputHash"
-  let target : String ← obj.get "target"
-  let srcHash : Json ← obj.get "srcHash"
-  let srcHash? : Option Hash ← match srcHash with
-    | .null => pure none
-    | json => do
-      let hashString ← json.getStr?
-      let some hash := Hash.ofString? hashString
-        | throw "srcHash: expected a content hash"
-      pure (some hash)
-  let data : Json ← obj.get "data"
-  let sha256 : Json ← obj.get "sha256"
-  discard <| JsonObject.fromJson? sha256
-  let log ← obj.get "log"
-  return {inputHash, target, srcHash?, data, sha256, log}
-
-/-- The JSON of the mapping as `lake cache push` uploads it, which `fromJson?` reads back. -/
-public protected def toJson (mapping : RemoteCacheMapping) : Json :=
-  JsonObject.empty
-  |>.insert "schemaVersion" remoteCacheSchemaVersion
-  |>.insert "inputHash" mapping.inputHash
-  |>.insert "target" mapping.target
-  |>.insert "srcHash" mapping.srcHash?
-  |>.insert "data" mapping.data
-  |>.insert "sha256" mapping.sha256
-  |>.insert "log" mapping.log
-
-def isLowerHex (c : Char) : Bool :=
-  c.isDigit || c == 'a' || c == 'b' || c == 'c' || c == 'd' || c == 'e' || c == 'f'
-
-/-- Retrieve and validate a SHA-256 digest assigned to an artifact descriptor. -/
-public def remoteSha256For (sha256 : Json) (descr : ArtifactDescr) : Except String String := do
-  let obj ← JsonObject.fromJson? sha256
-  let digest? : Option String ← obj.get? descr.relPath.toString
-  let some digest := digest?
-    | throw s!"remote mapping has no SHA-256 for artifact `{descr}`"
-  unless digest.length == 64 && digest.all isLowerHex do
-    throw s!"remote mapping has invalid SHA-256 for artifact `{descr}`"
-  return digest
-
-/-- Retrieve and validate the SHA-256 digest assigned to `descr` by this mapping. -/
-public def sha256For (mapping : RemoteCacheMapping) (descr : ArtifactDescr) : Except String String :=
-  remoteSha256For mapping.sha256 descr
-
-/--
-Validate every descriptor before it can become a local cache path, and require one valid SHA-256
-digest for every descriptor.
--/
-public def checkedArtifactDescrs (mapping : RemoteCacheMapping) : Except String (Array ArtifactDescr) := do
-  let descrs ← outputArtifactDescrs? mapping.data
-  for descr in descrs do
-    unless descr.isRemoteSafe do
-      throw s!"remote mapping has unsupported artifact extension `{descr.ext}`"
-    discard <| mapping.sha256For descr
-  return descrs
-
-end RemoteCacheMapping
-
-/-- A file to upload to the shared remote cache (see `CacheService.putRemoteObjects`). -/
-public structure RemoteUpload where
-  /-- The file to upload. -/
-  path : FilePath
-  /-- The URL of the object to create. -/
-  url : String
-  /-- The Lake content hash that names the file in messages (for a mapping, its input hash). -/
-  hash : Hash
 
 /-! ## Local Cache -/
 
@@ -557,7 +430,7 @@ public def getArtifact (cache : Cache) (descr : ArtifactDescr) : EIO String Arti
 def writeOutputsCore
   (cache : Cache) (scope : String) (inputHash : Hash) (out : Json)
   (service? : Option CacheServiceName) (remoteScope? : Option CacheServiceScope)
-  (log : Log) (sha256? : Option Json) (overwrite : Bool)
+  (log : Log) (sha256? : Option Sha256Map) (overwrite : Bool)
 : IO Unit := do
   let file := cache.outputsFile scope inputHash
   unless overwrite do
@@ -582,7 +455,7 @@ along with the log of the build that produced them.
 public def writeOutputs
   [ToJson α] (cache : Cache) (scope : String) (inputHash : Hash) (outputs : α)
   (service? : Option CacheServiceName := none) (remoteScope? : Option CacheServiceScope := none)
-  (log : Log := {}) (sha256? : Option Json := none) (overwrite := true)
+  (log : Log := {}) (sha256? : Option Sha256Map := none) (overwrite := true)
 : IO Unit := cache.writeOutputsCore scope inputHash (toJson outputs) service? remoteScope? log sha256? overwrite
 
 /-- Cache the input-to-outputs mappings from a `CacheMap`.  -/
@@ -681,70 +554,57 @@ end CacheToolchain
 
 /-! ## Remote Cache Service -/
 
-/-- **For internal use only.** -/
+/--
+**For internal use only.**
+Downloads the artifact with the content hash `hash` from `url` to `path` (see `download`), which
+it replaces only with bytes of that hash. With `sha256?` (for an artifact of the shared remote
+cache), the bytes must also have that SHA-256 digest, which is checked first. With
+`maxFileSize?`, a larger download fails.
+-/
 public def downloadArtifactCore
   (hash : Hash) (url : String) (path : FilePath) (cacheToken := false)
+  (sha256? : Option Sha256 := none) (maxFileSize? : Option Nat := none)
 : LogIO Unit := do
-  download url path (cacheToken := cacheToken) (check := fun tmp => do
-    let actualHash ← computeFileHash tmp
-    if actualHash != hash then
-      error s!"{path}: downloaded artifact hash mismatch, got {actualHash}")
-
-/--
-Download a shared-remote artifact, checking its SHA-256 name and Lake content hash before it
-replaces the local cache path.
--/
-public def downloadRemoteArtifactCore
-  (hash : Hash) (sha256 : String) (url : String) (path : FilePath) (cacheToken := false)
-: LogIO Unit := do
-  download url path (cacheToken := cacheToken) (maxFileSize? := some remoteCacheMaxFileSize)
+  download url path (cacheToken := cacheToken) (maxFileSize? := maxFileSize?)
     (check := fun tmp => do
-      let actualSha256 ← sha256File tmp
-      if actualSha256 != sha256 then
-        error s!"{path}: downloaded artifact SHA-256 mismatch, got {actualSha256}"
+      if let some sha256 := sha256? then
+        let actualSha256 ← sha256File tmp
+        if actualSha256 != sha256 then
+          error s!"{path}: downloaded artifact SHA-256 mismatch, got {actualSha256}"
       let actualHash ← computeFileHash tmp
       if actualHash != hash then
         error s!"{path}: downloaded artifact hash mismatch, got {actualHash}")
 
 /--
-Uploads a file to an online bucket using the Amazon S3 protocol.
+Uploads a file to an online bucket using the Amazon S3 protocol. The upload gives up when it
+stalls (see `transferTimeoutArgs`).
 
 The request is signed with `key` (AWS Signature Version 4), unless it carries the cache token
-(`cacheToken`; see `CacheToken.get?`). With the token, the request only creates the object
+(`cacheToken`; see `withCacheTokenRequest`). With the token, the request only creates the object
 (`x-goog-if-generation-match: 0`), and an object that is already present (HTTP 412) is not an
-error: then the result is `false`. If the token is refused (HTTP 401), the request is retried
-once with a new token.
+error: then the result is `false`.
 -/
 def uploadS3
   (file : FilePath) (contentType : String) (url : String) (key : String) (cacheToken := false)
 : LoggerIO Bool := do
-  let token? ← if cacheToken then cacheTokenFor? url else pure none
-  let put (token? : Option String) : LoggerIO (Nat × IO.Process.Output) :=
-    CacheToken.withCurlArgs token? fun authArgs => do
+  let (code, out, token) ← withCacheTokenRequest url cacheToken (follow := false)
+    fun token args => do
       let auth :=
-        if token?.isSome then
-          authArgs ++ #["-H", "x-goog-if-generation-match: 0"]
+        if token then
+          #["-H", "x-goog-if-generation-match: 0"]
         else
           #["--aws-sigv4", "aws:amz:auto:s3", "--user", key]
       let out ← captureProc' {
         cmd := ← Internal.getCurl
-        args := curlLeadArgs token? ++ #["-s", "-w", "%{stderr}%{json}\n"] ++ auth ++ #[
+        args := args ++ #["-s", "-w", "%{stderr}%{json}\n"] ++ auth ++ transferTimeoutArgs ++ #[
           "-X", "PUT", "-T", file.toString, url,
           "-H",  s!"Content-Type: {contentType}"
         ]
       }
       return (← curlResponseCode out.stderr, out)
-  let (code, out) ← put token?
-  let (code, out) ← match code, token? with
-    | 401, some token => do
-      let token? ← CacheToken.renew token
-      let (code, out) ← put token?
-      if code == 401 then if let some token := token? then CacheToken.refused token
-      pure (code, out)
-    | _, _ => pure (code, out)
-  if code == 200 || (token?.isSome && code == 201) then
+  if code == 200 || (token && code == 201) then
     return true
-  else if token?.isSome && code == 412 then
+  else if token && code == 412 then
     return false
   else
     error s!"failed to upload artifact, error {code}; received:\n{out.stdout}"
@@ -835,6 +695,14 @@ public def sendsCacheToken (service : CacheService) (url : String) : Bool :=
     | _, _ => false
 
 /--
+The error of an upload to `dest` that can neither carry the cache token nor be signed with a key.
+-/
+public def uploadCredentialError (dest : String) : String :=
+  s!"uploading to {dest} requires an authentication key configured through `LAKE_CACHE_KEY` \
+    (or, for the service that `LAKE_REMOTE_CACHE` names, a token command configured through \
+    `LAKE_CACHE_TOKEN_CMD`, whose token goes only to the host of that service's artifact endpoint)"
+
+/--
 Uploads `file` to `url` with the cache token if the request carries it (see `sendsCacheToken`),
 and otherwise with the service's key. Returns `false` if the object is already present,
 which only a request with the token reports (see `uploadS3`).
@@ -844,9 +712,7 @@ def uploadFile
 : LoggerIO Bool := do
   let cacheToken := service.sendsCacheToken url
   if !cacheToken && service.usesCacheToken && service.impl.key.isEmpty then
-    error s!"uploading to {url} requires an authentication key configured through \
-      `LAKE_CACHE_KEY`, since the token of `LAKE_CACHE_TOKEN_CMD` is sent only to the host \
-      of the service's artifact endpoint"
+    error (uploadCredentialError url)
   uploadS3 file contentType url service.impl.key cacheToken
 
 /-! ### Artifact Transfer -/
@@ -867,7 +733,7 @@ public def remoteMappingUrl (service : CacheService) (scope : String) (inputHash
   service.remoteObjectUrl scope s!"in/{inputHash}.json"
 
 /-- The remote artifact URL for a SHA-256 digest. -/
-public def remoteArtifactUrl (service : CacheService) (scope sha256 : String) : String :=
+public def remoteArtifactUrl (service : CacheService) (scope : String) (sha256 : Sha256) : String :=
   service.remoteObjectUrl scope s!"a/{sha256}.art"
 
 def s3ArtifactUrl (contentHash : Hash) (service : CacheService) (scope : CacheServiceScope) : String :=
@@ -925,7 +791,7 @@ structure TransferInfo where
   /-- Additional paths for a downloaded artifact. -/
   extraPaths : Array FilePath := #[]
   /-- The temporary file of a download, unique to its `curl` run (set by `runTransfer`). -/
-  tmpPath : FilePath := ""
+  tmpPath? : Option FilePath := none
 
 @[inline] def TransferInfo.addPath (self : TransferInfo) (path : FilePath) (extra := true) : TransferInfo :=
   if extra then
@@ -985,12 +851,12 @@ structure TransferState where
   refused : Bool := false
 
 /--
-Monitors the transfers of a `curl` run. With `createOnly` (the uploads only create their
+Monitors the transfers of a `curl` run. With `cfg.createOnly` (the uploads only create their
 objects), an upload that finds its object already present (HTTP 412) succeeds. With
 `retryUnauthorized`, a transfer refused with HTTP 401 is not reported but added to `unauthorized`.
 -/
 partial def monitorTransfer
-  (cfg : TransferConfig) (createOnly retryUnauthorized : Bool)
+  (cfg : TransferConfig) (retryUnauthorized : Bool)
   (h hOut : IO.FS.Handle) (s : TransferState)
 : LoggerIO TransferState := do
   let line ← h.getLine
@@ -1012,7 +878,7 @@ partial def monitorTransfer
           | .ok code@201 =>
             handleTransfer info code out line
           | .ok 412 =>
-            if createOnly && cfg.kind == .put then
+            if cfg.createOnly && cfg.kind == .put then
               discardResponse out
               logInfo s!"{cfg.scope}: {cfg.noun} {info.hash} already present\
                 \n  local path: {info.path}\
@@ -1038,20 +904,23 @@ partial def monitorTransfer
       | .error e =>
         logError s!"curl produced invalid JSON: {e}; received: {line.trimAscii}"
         modify ({· with didError := true})
-    monitorTransfer cfg createOnly retryUnauthorized h hOut s
+    monitorTransfer cfg retryUnauthorized h hOut s
 where
   getInfo? out :=
     match out.getAs Nat "urlnum" with
     | .ok i => cfg.infos[i]?
     | _ => none
   handleTransfer info code out line : StateT TransferState LoggerIO Unit := do
-    let {url, hash, path, extraPaths, tmpPath} := info
+    let {url, hash, path, extraPaths, tmpPath?} := info
     match cfg.kind with
     | .get =>
       let logDownload :=
         logInfo s!"{cfg.scope}: downloaded artifact {hash}\
           \n  local path: {path}\
           \n  remote URL: {url}"
+      let some tmpPath := tmpPath?
+        | logError s!"{path}: the download has no temporary file"
+          modify ({· with didError := true})
       match (← IO.FS.readBinFile tmpPath |>.toBaseIO) with
       | .ok contents =>
         logDownload
@@ -1105,8 +974,9 @@ where
           if size > 0 then
             if let .ok contentType := out.getAs String "content_type" then
               if contentType != artifactContentType then
-                if let .ok resp ← IO.FS.readFile info.tmpPath |>.toBaseIO then
-                  msg := s!"{msg}\nunexpected response:\n{resp}"
+                if let some tmpPath := info.tmpPath? then
+                  if let .ok resp ← IO.FS.readFile tmpPath |>.toBaseIO then
+                    msg := s!"{msg}\nunexpected response:\n{resp}"
     | .put =>
       if let .ok size := out.getAs Nat "size_download" then
         if size > 0 then
@@ -1119,7 +989,7 @@ where
 Runs one `curl` process for the transfers of `cfg`, sending `token?` if it is set.
 With a token, redirects are not followed (so the token goes only to the hosts of the transfers),
 and uploads only create their objects (`x-goog-if-generation-match: 0`), as they do with
-`cfg.createOnly`.
+`cfg.createOnly`. The transfers give up when they stall (see `transferTimeoutArgs`).
 Downloads go to temporary files unique to the run, which are gone when it returns.
 -/
 def runTransfer
@@ -1127,27 +997,27 @@ def runTransfer
 : LoggerIO TransferState := do
   let infos ← id do
     if cfg.kind == .get then
-      cfg.infos.mapM fun info => do return {info with tmpPath := ← uniqueTmpPath info.path}
+      cfg.infos.mapM fun info => do
+        return {info with tmpPath? := some (← uniqueTmpPath info.path)}
     else
       return cfg.infos
-  let cfg := {cfg with infos}
   -- An upload with the token always only creates its object
-  let createOnly := token?.isSome || cfg.createOnly
+  let cfg := {cfg with infos, createOnly := token?.isSome || cfg.createOnly}
   try
     IO.FS.withTempFile fun h path => do
       if let some token := token? then
         h.putStrLn (CacheToken.curlHeaderLine token)
-      let follow := if token?.isSome then #[] else #["-L"]
       let args ← id do
         match cfg.kind with
         | .get =>
           cfg.infos.forM fun info => do
             h.putStrLn s!"url = {info.url.quote}"
-            h.putStrLn s!"-o {info.tmpPath.toString.quote}"
+            if let some tmpPath := info.tmpPath? then
+              h.putStrLn s!"-o {tmpPath.toString.quote}"
           h.flush
-          return curlLeadArgs token? ++ #["-Z", "-X", "GET"] ++ follow ++ #[
+          return curlLeadArgs token? ++ #["-Z", "-X", "GET"] ++ curlFollowArgs token? ++ #[
             "--retry", "3" -- intermittent network errors can occur
-          ] ++ downloadTimeoutArgs ++ #[
+          ] ++ transferTimeoutArgs ++ #[
             "-s", "-w", "%{stderr}%{json}\n", "--config", path.toString
           ]
         | .put =>
@@ -1161,21 +1031,21 @@ def runTransfer
             else
               #["--aws-sigv4", "aws:amz:auto:s3", "--user", cfg.key]
           let auth :=
-            if createOnly then
+            if cfg.createOnly then
               auth ++ #["-H", "x-goog-if-generation-match: 0"]
             else
               auth
-          return curlLeadArgs token? ++ #["-Z", "-X", "PUT"] ++ follow ++ #[
+          return curlLeadArgs token? ++ #["-Z", "-X", "PUT"] ++ curlFollowArgs token? ++ #[
             "-H", s!"Content-Type: {cfg.contentType}",
             "--retry", "3" -- intermittent network errors can occur
-          ] ++ auth ++ #[
+          ] ++ transferTimeoutArgs ++ auth ++ #[
             "-s", "-w", "%{stderr}%{json}\n", "--config", path.toString
           ]
       let child ← IO.Process.spawn {
         cmd := ← Internal.getCurl, args
         stdout := .piped, stderr := .piped
       }
-      let s ← monitorTransfer cfg createOnly retryUnauthorized child.stderr child.stdout {}
+      let s ← monitorTransfer cfg retryUnauthorized child.stderr child.stdout {}
       let rc ← child.wait
       let stdout ← child.stdout.readToEnd
       unless stdout.isEmpty do
@@ -1186,14 +1056,14 @@ def runTransfer
       return s
   finally
     -- A download that succeeded was renamed into place; the others leave nothing behind
-    if cfg.kind == .get then
-      for info in cfg.infos do
-        discard <| (removeFileIfExists info.tmpPath).toBaseIO
+    for info in cfg.infos do
+      if let some tmpPath := info.tmpPath? then
+        discard <| (removeFileIfExists tmpPath).toBaseIO
 
 /--
 Transfers the files of `cfg` with one `curl` run. If the cache token is sent and refused
-(HTTP 401), the refused transfers are retried once in another run with a new token.
-Reports each failed transfer, and returns the state of both runs.
+(HTTP 401), the refused transfers are retried once in another run with a new token (see
+`retryWithNewToken`). Reports each failed transfer, and returns the state of both runs.
 -/
 def transferFiles
   (cfg : TransferConfig)
@@ -1206,17 +1076,18 @@ def transferFiles
     else
       pure none
   let s ← runTransfer cfg token? (retryUnauthorized := token?.isSome)
-  if let some token := token? then
-    unless s.unauthorized.isEmpty do
-      let token? ← CacheToken.renew token
-      let retry ← runTransfer {cfg with infos := s.unauthorized} token? (retryUnauthorized := false)
-      if retry.refused then if let some token := token? then CacheToken.refused token
-      return {
-        didError := s.didError || retry.didError
-        numSuccesses := s.numSuccesses + retry.numSuccesses
-        uploaded := s.uploaded ++ retry.uploaded
-      }
-  return s
+  let some token := token?
+    | return s
+  if s.unauthorized.isEmpty then
+    return s
+  let retry ← retryWithNewToken token fun token? => do
+    let retry ← runTransfer {cfg with infos := s.unauthorized} token? (retryUnauthorized := false)
+    return (retry, retry.refused)
+  return {
+    didError := s.didError || retry.didError
+    numSuccesses := s.numSuccesses + retry.numSuccesses
+    uploaded := s.uploaded ++ retry.uploaded
+  }
 
 /--
 Transfers the artifacts of `cfg` with one `curl` run (see `transferFiles`), and fails if any
@@ -1377,9 +1248,7 @@ public def putRemoteObjects
   let cacheToken := infos.all (service.sendsCacheToken ·.url)
   let name := service.name?.map (·.toString) |>.getD "the remote cache"
   if !cacheToken && service.impl.key.isEmpty then
-    error s!"uploading to `{name}` requires a token command configured through \
-      `LAKE_CACHE_TOKEN_CMD` (if `LAKE_REMOTE_CACHE` names it) or a key configured through \
-      `LAKE_CACHE_KEY`"
+    error (uploadCredentialError s!"`{name}`")
   let s ← transferFiles {
     kind := .put, scope := .ofString name, infos, key := service.impl.key
     cacheToken, createOnly := true, contentType, noun

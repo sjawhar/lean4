@@ -32,7 +32,7 @@ def checkVectors : IO UInt32 := do
   let mut rc := 0
   for (name, msg, expected) in vectors do
     let actual := sha256Bytes msg
-    if actual == expected then
+    if actual.hex == expected then
       IO.println s!"ok: {name}"
     else
       IO.eprintln s!"mismatch: {name}: expected {expected}, got {actual}"

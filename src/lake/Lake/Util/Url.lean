@@ -9,7 +9,7 @@ prelude
 public import Lake.Util.Log
 import Lake.Util.JsonObject
 import Lake.Util.Proc
-import Lake.Util.CacheToken
+public import Lake.Util.CacheToken
 import Init.Data.String.TakeDrop
 import Init.Data.String.Search
 import Init.Data.String.Modify
@@ -112,10 +112,11 @@ public def uriEncode (s : String) (init := "") : String :=
   return (← IO.getEnv "CURL").getD "curl"
 
 /--
-The `curl` arguments that make a download give up on a stalled transfer: one that has not
-connected within 10 seconds, or that has received less than 1 KiB per second for 30 seconds.
+The `curl` arguments that make a transfer give up when it stalls: one that has not connected
+within 10 seconds, or that has moved less than 1 KiB per second for 30 seconds. For an upload,
+the time it waits for the server's answer counts as well.
 -/
-public def downloadTimeoutArgs : Array String :=
+public def transferTimeoutArgs : Array String :=
   #["--connect-timeout", "10", "--speed-limit", "1024", "--speed-time", "30"]
 
 /--
@@ -174,6 +175,61 @@ public def curlLeadArgs (token? : Option String) : Array String :=
   if token?.isSome then #["-q"] else #[]
 
 /--
+The `curl` arguments that make a request follow redirects (`-L`): only without a token, so that a
+request with the token goes only to the host of its URL.
+-/
+public def curlFollowArgs (token? : Option String) : Array String :=
+  if token?.isSome then #[] else #["-L"]
+
+/--
+Retries a request whose token the service refused (HTTP 401): runs `retry` with a new token
+(see `CacheToken.renew`). If `retry` reports that the service refused that token as well (its
+`Bool`), records the refusal (see `CacheToken.refused`), so that the next requests report it
+without running the token command again.
+-/
+public def retryWithNewToken
+  [Monad m] [MonadLiftT LogIO m] [MonadLiftT BaseIO m]
+  (token : String) (retry : Option String → m (α × Bool))
+: m α := do
+  let token? ← CacheToken.renew token
+  let (a, refused) ← retry token?
+  if refused then if let some token := token? then CacheToken.refused token
+  return a
+
+/--
+Runs `request`, a `curl` request to `url`, with the cache token if `cacheToken` (see
+`cacheTokenFor?`). This is the policy of every single request that may carry the token.
+
+`request` gets whether it carries the token and the arguments that must start its `curl`
+command line: `-q` (see `curlLeadArgs`), the temporary configuration file that sends the token
+(see `CacheToken.withCurlArgs`), and, with `follow`, `-L` for a request without the token (see
+`curlFollowArgs`). It returns the HTTP status code of the response and its result. If the service
+refuses the token (HTTP 401), the request runs once more with a new token (see
+`retryWithNewToken`).
+
+Returns the status code and the result of the last request, and whether the request carried the
+token.
+-/
+public def withCacheTokenRequest
+  (url : String) (cacheToken : Bool)
+  (request : (token : Bool) → (args : Array String) → LogIO (Nat × α)) (follow := true)
+: LogIO (Nat × α × Bool) := do
+  let send (token? : Option String) : LogIO (Nat × α) :=
+    CacheToken.withCurlArgs token? fun authArgs => do
+      let followArgs := if follow then curlFollowArgs token? else #[]
+      request token?.isSome (curlLeadArgs token? ++ authArgs ++ followArgs)
+  let token? ← if cacheToken then cacheTokenFor? url else pure none
+  let (code, a) ← send token?
+  let some token := token?
+    | return (code, a, false)
+  if code != 401 then
+    return (code, a, true)
+  let (code, a) ← retryWithNewToken token fun token? => do
+    let (code, a) ← send token?
+    return ((code, a), code == 401)
+  return (code, a, true)
+
+/--
 Returns the HTTP status code in the JSON that `curl -w "%{json}"` wrote to `stderr`.
 -/
 public def curlResponseCode (stderr : String) : LogIO Nat := do
@@ -190,35 +246,22 @@ public def curlResponseCode (stderr : String) : LogIO Nat := do
 Performs a HTTP `GET` request of a URL (using `curl` with JSON output) and, if successful,
 return the body.  Otherwise, returns `none` on a 404 and errors on anything else.
 
-With `cacheToken`, the request carries the cache token (see `cacheTokenFor?`), ignores the
-user's `.curlrc` (see `curlLeadArgs`) and does not follow redirects, so that the token goes only
-to the host of `url`. If the token is refused (HTTP 401), the request is retried once with a new
-token.
+With `cacheToken`, the request carries the cache token, ignores the user's `.curlrc` and does not
+follow redirects (see `withCacheTokenRequest`).
 -/
 public def getUrl?
   (url : String) (headers : Array String := #[]) (cacheToken := false)
   (maxFileSize? : Option Nat := none)
 : LogIO (Option String) := withLogErrorPos do
-  let request (token? : Option String) : LogIO (Nat × IO.Process.Output) :=
-    CacheToken.withCurlArgs token? fun authArgs => do
-      let args := curlLeadArgs token? ++ #[
-          "-s", "-w", "%{stderr}%{json}\n",
-          "--retry", "3" -- intermittent network errors can occur
-      ] ++ downloadTimeoutArgs ++ authArgs
-      let args := maxFileSize?.elim args fun size => args ++ #["--max-filesize", toString size]
-      let args := if token?.isSome then args else args.push "-L"
-      let args := headers.foldl (init := args) (· ++ #["-H", ·])
-      let out ← captureProc' {cmd := ← Internal.getCurl, args := args.push url}
-      return (← curlResponseCode out.stderr, out)
-  let token? ← if cacheToken then cacheTokenFor? url else pure none
-  let (code, out) ← request token?
-  let (code, out) ← match code, token? with
-    | 401, some token => do
-      let token? ← CacheToken.renew token
-      let (code, out) ← request token?
-      if code == 401 then if let some token := token? then CacheToken.refused token
-      pure (code, out)
-    | _, _ => pure (code, out)
+  let (code, out, _) ← withCacheTokenRequest url cacheToken fun _ args => do
+    let args := args ++ #[
+        "-s", "-w", "%{stderr}%{json}\n",
+        "--retry", "3" -- intermittent network errors can occur
+    ] ++ transferTimeoutArgs
+    let args := maxFileSize?.elim args fun size => args ++ #["--max-filesize", toString size]
+    let args := headers.foldl (init := args) (· ++ #["-H", ·])
+    let out ← captureProc' {cmd := ← Internal.getCurl, args := args.push url}
+    return (← curlResponseCode out.stderr, out)
   if code == 200 then
     return some out.stdout.trimAscii.copy
   else if code == 404 then

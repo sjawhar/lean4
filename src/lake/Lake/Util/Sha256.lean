@@ -7,7 +7,10 @@ module
 
 prelude
 public import Init.System.IO
+public import Lean.Data.Json
 import Lake.Util.String
+import Init.Data.String.Length
+import Init.Data.String.TakeDrop
 
 /-! # SHA-256
 
@@ -19,7 +22,19 @@ file.
 
 open System
 
-namespace Lake.Sha256
+namespace Lake
+
+/--
+A SHA-256 digest: 64 lowercase hexadecimal digits, as `sha256sum` prints it. Only `sha256Bytes`,
+`sha256File` and `Sha256.ofHex?` make one, so its digits are always well-formed.
+-/
+public structure Sha256 where
+  private mk ::
+  /-- The digest's 64 lowercase hexadecimal digits. -/
+  hex : String
+  deriving BEq
+
+namespace Sha256
 
 /-- The eight working variables of the hash computation (§6.2.2). -/
 structure State where
@@ -236,27 +251,53 @@ Hashes the rest of the file `h`. `s` is the state after the whole blocks of the 
 of the file, and `pending` holds the bytes after those blocks (fewer than 64).
 -/
 partial def hashHandle (h : IO.FS.Handle) (s : State) (pending : ByteArray) (len : Nat) :
-    IO String := do
+    IO Sha256 := do
   let piece ← h.read 65536
   if piece.isEmpty then
-    return (finish s pending len).toHex
+    return ⟨(finish s pending len).toHex⟩
   let data := if pending.isEmpty then piece else pending ++ piece
   let blocks := data.size / 64
   hashHandle h (compressBlocks s data 0 blocks) (data.extract (blocks * 64) data.size)
     (len + piece.size)
 
+/-- Whether `c` is a lowercase hexadecimal digit. -/
+def isLowerHexDigit (c : Char) : Bool :=
+  c.isDigit || c == 'a' || c == 'b' || c == 'c' || c == 'd' || c == 'e' || c == 'f'
+
+/-- Parses a digest from its 64 lowercase hexadecimal digits. -/
+public def ofHex? (s : String) : Option Sha256 :=
+  if s.length == 64 && s.all isLowerHexDigit then some ⟨s⟩ else none
+
+public instance : ToString Sha256 := ⟨Sha256.hex⟩
+
+public instance : Lean.ToJson Sha256 := ⟨(Lean.toJson ·.hex)⟩
+
+public protected def fromJson? (json : Lean.Json) : Except String Sha256 := do
+  let s ← json.getStr?
+  let some digest := ofHex? s
+    | throw s!"expected a SHA-256 digest (64 lowercase hexadecimal digits), got {s.quote}"
+  return digest
+
+public instance : Lean.FromJson Sha256 := ⟨Sha256.fromJson?⟩
+
 end Sha256
+
+/--
+SHA-256 digests of files, keyed by their paths (for the artifacts of a remote cache mapping,
+`ArtifactDescr.relPath`). In JSON, it is an object from path to digest.
+-/
+public abbrev Sha256Map := Std.TreeMap String Sha256
 
 open Sha256
 
-/-- The SHA-256 digest of `b`, as 64 lowercase hexadecimal digits. -/
-public def sha256Bytes (b : ByteArray) : String :=
+/-- The SHA-256 digest of `b`. -/
+public def sha256Bytes (b : ByteArray) : Sha256 :=
   let blocks := b.size / 64
-  (finish (compressBlocks .init b 0 blocks) (b.extract (blocks * 64) b.size) b.size).toHex
+  ⟨(finish (compressBlocks .init b 0 blocks) (b.extract (blocks * 64) b.size) b.size).toHex⟩
 
 /--
-The SHA-256 digest of the file at `path`, as 64 lowercase hexadecimal digits (the digest that
-`sha256sum` prints). It reads the file in pieces of 64 KiB.
+The SHA-256 digest of the file at `path` (the digest that `sha256sum` prints).
+It reads the file in pieces of 64 KiB.
 -/
-public def sha256File (path : FilePath) : IO String := do
+public def sha256File (path : FilePath) : IO Sha256 := do
   hashHandle (← IO.FS.Handle.mk path .read) .init .empty 0

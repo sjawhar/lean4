@@ -3,7 +3,7 @@
 # Released under Apache 2.0 license as described in the file LICENSE.
 # Authors: Mac Malone, Claude Code
 
-"""A mock remote artifact cache for `test.sh` and `../remoteCache/test.sh`.
+"""A mock remote artifact cache for `test.sh` and the tests of `../remoteCache/lib.sh`.
 
 Serves an S3-style bucket (`GET`/`PUT` of `<store>/<path>`) and the part of the
 Reservoir API that Lake uses. Faults are selected by the first path segment, so
@@ -25,6 +25,10 @@ a test picks one by pointing an endpoint at it (e.g. `.../corrupt/a0`):
   slow      as `ok`, but each `GET` is answered after 2 seconds
   slowput   as `ok`, but each `PUT` is answered after 2 seconds
   oversize  mappings are normal; an artifact advertises 119596321 bytes and no body
+  denyart   403 for a `GET` of an object in an `a/` directory (an artifact of the
+            shared remote cache), and otherwise as `ok`
+  stallput  as `ok`, but each `PUT` reads its body and then sends no answer for
+            15 minutes
 
 A fault that does not apply to a request kind (e.g. `badcount` on a `GET`)
 behaves as `ok`. Like Cloud Storage, a `PUT` with the header
@@ -102,6 +106,8 @@ class Mode(StrEnum):
     SLOW = "slow"
     OVERSIZE = "oversize"
     SLOW_PUT = "slowput"
+    DENY_ART = "denyart"
+    STALL_PUT = "stallput"
 
 
 def content_type(path):
@@ -300,7 +306,7 @@ class Handler(BaseHTTPRequestHandler):
             self.redirect(parts)
         elif mode == Mode.RESET:
             self.reset()
-        elif mode == Mode.DENY:
+        elif mode == Mode.DENY or (mode == Mode.DENY_ART and parts[-2:-1] == ["a"]):
             self.deny()
         elif parts[:2] == ["api", "v1"]:
             self.reservoir_get(mode, parts[2:], query)
@@ -340,6 +346,8 @@ class Handler(BaseHTTPRequestHandler):
         else:
             if mode == Mode.SLOW_PUT:
                 time.sleep(2)
+            elif mode == Mode.STALL_PUT:
+                time.sleep(900)
             path = os.path.join(STORE, *parts)
             os.makedirs(os.path.dirname(path), exist_ok=True)
             if self.headers.get("x-goog-if-generation-match") == "0":
