@@ -35,6 +35,14 @@ a test picks one by pointing an endpoint at it (e.g. `.../corrupt/a0`):
   denyartonce
             403 for the first `PUT` of each object in an `a/` directory (an
             artifact of the shared remote cache), and otherwise as `ok`
+  badclaim  as `ok`, but every claim (`<endpoint>/claim/...`) exists and is
+            unreadable: its `GET` answers 200 with an invalid body, a generation
+            and no `Date` or `Last-Modified`, and its `PUT` answers 412
+  streamclaim
+            as `ok`, but a `PUT` of a claim is answered 200 with a body that does
+            not end (4 KiB every 100 ms, for 2 minutes)
+  notimes   as `ok`, but a `GET` of a claim is answered without `Date` and
+            `Last-Modified`
 
 A fault that does not apply to a request kind (e.g. `badcount` on a `GET`)
 behaves as `ok`. Like Cloud Storage, each object has a generation, which a new
@@ -171,6 +179,9 @@ class Mode(StrEnum):
     STALL_PUT = "stallput"
     SLOW_OBJ = "slowobj"
     DENY_ART_ONCE = "denyartonce"
+    BAD_CLAIM = "badclaim"
+    STREAM_CLAIM = "streamclaim"
+    NO_TIMES = "notimes"
 
 
 def content_type(path):
@@ -374,6 +385,31 @@ class Handler(BaseHTTPRequestHandler):
             self.reset()
         elif mode == Mode.DENY or (mode == Mode.DENY_ART and parts[-2:-1] == ["a"]):
             self.deny()
+        elif mode == Mode.BAD_CLAIM and parts[1:2] == ["claim"]:
+            # An unreadable claim with a generation and no times, which nothing rewrites
+            body = b'{"invalid":"claim"}'
+            self.log(200)
+            self.send_response_only(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("x-goog-generation", "1")
+            self.end_headers()
+            self.wfile.write(body)
+        elif mode == Mode.NO_TIMES and parts[1:2] == ["claim"]:
+            # The stored claim, with its generation but without `Date` and `Last-Modified`
+            path = os.path.join(STORE, *parts)
+            if not os.path.isfile(path):
+                self.not_found("no such object: %s" % self.path)
+                return
+            with open(path, "rb") as f:
+                body = f.read()
+            with STORE_LOCK:
+                gen = generation(path)
+            self.log(200)
+            self.send_response_only(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("x-goog-generation", str(gen))
+            self.end_headers()
+            self.wfile.write(body)
         elif parts[:2] == ["api", "v1"]:
             self.reservoir_get(mode, parts[2:], query)
         else:
@@ -435,6 +471,23 @@ class Handler(BaseHTTPRequestHandler):
             self.deny()
         elif mode == Mode.DENY_ART_ONCE and parts[-2:-1] == ["a"] and first_put(parts):
             self.deny()
+        elif mode == Mode.BAD_CLAIM and parts[1:2] == ["claim"]:
+            # The claim exists: its create is refused
+            self.respond(412, PRECONDITION_BODY, "application/xml")
+        elif mode == Mode.STREAM_CLAIM and parts[1:2] == ["claim"]:
+            # Accepted, and then an answer that never ends, fast enough for any speed limit
+            self.log(200)
+            self.send_response(200)
+            self.send_header("x-goog-generation", "1")
+            self.end_headers()
+            try:
+                for _ in range(1200):
+                    self.wfile.write(b"x" * 4096)
+                    self.wfile.flush()
+                    time.sleep(0.1)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            self.close_connection = True
         else:
             if mode == Mode.SLOW_PUT:
                 time.sleep(2)
