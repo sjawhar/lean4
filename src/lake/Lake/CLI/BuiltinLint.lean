@@ -45,8 +45,9 @@ public structure Args where
   imported alongside each top-level module -/
   checks : Array Name := #[]
   /-- Source search path used to resolve modules that `moduleSrcFile?` does not know to their
-  `.lean` files. Populated from the workspace's `LEAN_SRC_PATH`, since `getSrcSearchPath` alone
-  does not cover package sources during a `lake lint` run. -/
+  `.lean` files, and given to package code quality checks as their `srcSearchPath`. Populated from
+  the workspace's library source directories (root package first) and `LEAN_SRC_PATH`, since
+  `getSrcSearchPath` alone does not cover package sources during a `lake lint` run. -/
   srcSearchPath : SearchPath := {}
   /-- The source file that Lake compiles for a module of the workspace, if Lake knows the module.
   Linter findings are reported, and exceptions recorded, in this file. -/
@@ -393,7 +394,7 @@ def runEnvironmentLinters (args : Args) (linterOpts : Linter.LinterOptions) (sp 
           let fmtResults ←
             Linter.EnvLinter.formatLinterResults results decls
               (groupByFilename := true) (useErrorFormat := true)
-              s!"in {mod}" linters.size (findSrcFile? := some (args.findSrcFile? sp))
+              s!"in {mod}" linters.size (findSrcFile := args.findSrcFile? sp)
           IO.print (← fmtResults.toString)
         else
           IO.println s!"-- Environment linting passed for {mod}."

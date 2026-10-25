@@ -32,8 +32,7 @@ assert_precedes() {
 }
 
 # --- Baseline: the violations are present before recording. ---
-lake_out lint --builtin-lint Violations || true
-match_pat 'Variable name `unusedLocal` is not explicitly referenced' produced.out
+test_status_out 1 'Variable name `unusedLocal` is not explicitly referenced' lint --builtin-lint Violations
 match_pat 'firstDummyMarker' produced.out
 match_pat 'secondDummyMarker' produced.out
 
@@ -56,7 +55,7 @@ assert_precedes 'linter.unusedVariables' 'def unusedVarHere'
 assert_precedes 'linter.dummyMarker' 'def secondDummyMarker'
 
 # --- Re-linting now passes: every warning is silenced. ---
-lake_out lint --builtin-lint Violations || true
+lake_out lint --builtin-lint Violations
 match_pat 'Environment linting passed for Violations' produced.out
 no_match_pat 'is not explicitly referenced' produced.out
 no_match_pat "declaration name ends with 'DummyMarker'" produced.out
