@@ -11,6 +11,7 @@ public import Lake.Config.Monad
 public import Lake.Util.JsonObject
 public import Lake.Util.IO
 public import Lake.Build.Actions
+import Lake.Util.Url
 
 /-! # Common Build Tools
 This file defines general utilities that abstract common
@@ -543,6 +544,64 @@ public class ResolveOutputs (α : Type) where
   resolveOutputs (out : CacheOutput) : JobM α
 
 
+def currentRemoteCacheTarget : JobM String := do
+  let key :: _ ← getCallStack
+    | error "could not determine the current build key for remote cache lookup"
+  return key.toString
+
+def recordRemoteReadFailure (message : String) : JobM Unit := do
+  let status := (← getBuildContext).remoteReadStatus
+  liftM (m := BaseIO) <| status.modify (·.add message)
+
+def readRemoteOutputs?
+  (inputHash : Hash) (pkg : Package) (target : String) (srcHash? : Option Hash)
+: JobM (Option CacheOutput) := do
+  let ws ← getWorkspace
+  let some serviceName := ws.lakeEnv.remoteCache?
+    | return none
+  try
+    let some service := ws.findCacheService? serviceName
+      | error s!"remote cache service `{serviceName}` is not configured"
+    if service.isReservoir then
+      error s!"remote cache service `{serviceName}` must have kind `s3`"
+    let scope := remoteCacheScope ws.lakeEnv.leanGithash pkg.cacheScope
+    let url := service.remoteMappingUrl scope inputHash
+    let contents? ← getUrl? url (cacheToken := service.sendsCacheToken url)
+      (maxFileSize? := some remoteCacheMaxFileSize)
+    let some contents := contents?
+      | return none
+    let json ← match Json.parse contents with
+      | .ok json => pure json
+      | .error e => error s!"remote mapping is invalid JSON: {e}"
+    let mapping ← match RemoteCacheMapping.fromJson? json with
+      | .ok mapping => pure mapping
+      | .error e => error s!"remote mapping is invalid: {e}"
+    unless mapping.inputHash == inputHash do
+      error s!"remote mapping inputHash mismatch: expected {inputHash}, got {mapping.inputHash}"
+    unless mapping.target == target do
+      error s!"remote mapping target mismatch: expected {target}, got {mapping.target}"
+    unless mapping.srcHash? == srcHash? do
+      error s!"remote mapping srcHash mismatch"
+    match mapping.checkedArtifactDescrs with
+    | .ok _ => pure ()
+    | .error e => error s!"remote mapping is invalid: {e}"
+    let cache ← getLakeCache
+    let act := cache.writeOutputs pkg.cacheScope inputHash mapping.data service.name?
+      (some (.ofString scope)) (log := mapping.log) (sha256? := some mapping.sha256)
+      (overwrite := false)
+    if let .error e ← act.toBaseIO then
+      error s!"could not write remote mapping to local cache: {e}"
+    cache.readOutputs? pkg.cacheScope inputHash
+  catch e =>
+    let log ← takeLogFrom e
+    let msg := log.entries.foldl (init := "") fun msg entry =>
+      if msg.isEmpty then entry.message else s!"{msg}\n- {entry.message}"
+    let msg := if msg.isEmpty then "remote cache read failed" else msg
+    recordRemoteReadFailure msg
+    -- Cache failures remain verbose so --wfail and --iofail builds still compile locally.
+    logVerbose s!"remote cache read for input `{inputHash}` failed:\n{msg}"
+    return none
+
 open ResolveOutputs in
 /--
 Retrieve artifacts from the Lake cache using only the outputs
@@ -551,10 +610,15 @@ stored in the cached input-to-content mapping, along with the build log stored w
 **For internal use only.**
 -/
 @[specialize] def getArtifactsUsingCache?
-  [ResolveOutputs α] (inputHash : Hash) (pkg : Package)
+  [ResolveOutputs α] (inputHash : Hash) (pkg : Package) (target : String) (srcHash? : Option Hash)
 : JobM (Option (α × Log)) := do
   try
-    (← (← getLakeCache).readOutputs? pkg.cacheScope inputHash).mapM fun out =>
+    let cache ← getLakeCache
+    let local? ← cache.readOutputs? pkg.cacheScope inputHash
+    let out? ← match local? with
+      | some out => pure (some out)
+      | none => readRemoteOutputs? inputHash pkg target srcHash?
+    out?.mapM fun out =>
       return (← resolveOutputs out, out.log?.getD {})
   catch e =>
     let log ← takeLogFrom e
@@ -603,10 +667,11 @@ along with the build log stored with them.
 -/
 @[inline] public nonrec def getArtifacts?
   [ResolveOutputs α] (inputHash : Hash) (savedTrace : SavedTrace) (pkg : Package)
+  (target : String) (srcHash? : Option Hash)
 : JobM (Option (α × Log)) := do
   if let some a ← getArtifactsUsingTrace? inputHash savedTrace pkg then
     return some (a, savedTrace.log)
-  if let some a ← getArtifactsUsingCache? inputHash pkg then
+  if let some a ← getArtifactsUsingCache? inputHash pkg target srcHash? then
     return some a
   return none
 
@@ -614,6 +679,7 @@ along with the build log stored with them.
 public def resolveArtifact
   (descr : ArtifactDescr)
   (service? : Option CacheServiceName) (scope? : Option CacheServiceScope) (exe := false)
+  (sha256? : Option Json := none)
 : JobM Artifact := do
   let ws ← getWorkspace
   let path := ws.lakeCache.artifactDir / descr.relPath
@@ -627,12 +693,32 @@ public def resolveArtifact
       if let some service := ws.findCacheService? service.toString then
         let some scope := scope?
           | error s!"artifact with associated cache service but no scope"
-        let url := service.artifactUrl descr.hash scope
-        logVerbose s!"\
-          downloaded artifact {descr.hash}\
-          \n  local path: {path}\
-          \n  remote URL: {url}"
-        liftM <| downloadArtifactCore descr.hash url path (service.sendsCacheToken url)
+        match sha256? with
+        | some sha256s =>
+          let sha256 ← match RemoteCacheMapping.remoteSha256For sha256s descr with
+            | .ok sha256 => pure sha256
+            | .error e => error e
+          let url := service.remoteArtifactUrl scope.toString sha256
+          logVerbose s!"\
+            downloaded remote artifact {descr.hash}\
+            \n  local path: {path}\
+            \n  remote URL: {url}"
+          try
+            liftM <| downloadRemoteArtifactCore descr.hash sha256 url path
+              (service.sendsCacheToken url)
+          catch e =>
+            let log ← takeLogFrom e
+            let msg := log.entries.foldl (init := "remote artifact download failed") fun _ entry =>
+              entry.message
+            recordRemoteReadFailure msg
+            error msg
+        | none =>
+          let url := service.artifactUrl descr.hash scope
+          logVerbose s!"\
+            downloaded artifact {descr.hash}\
+            \n  local path: {path}\
+            \n  remote URL: {url}"
+          liftM <| downloadArtifactCore descr.hash url path (service.sendsCacheToken url)
         let r := {read := true, write := false, execution := exe}
         if let .error e ← IO.setAccessRights path ⟨r, r, r⟩ |>.toBaseIO then
           logWarning s!"could not mark downloaded artifact read-only: {e}"
@@ -651,7 +737,7 @@ public def resolveArtifact
 /-- **For internal use only.** -/
 public def resolveArtifactOutput (out : CacheOutput) (exe := false) : JobM Artifact := do
   match fromJson? out.data with
-  | .ok descr => resolveArtifact descr out.service? out.scope? exe
+  | .ok descr => resolveArtifact descr out.service? out.scope? (exe := exe) (sha256? := out.sha256?)
   | .error e => error s!"ill-formed artifact output:\n{out.data.render.pretty 80 2}\n{e}"
 
 set_option linter.unusedVariables false in
@@ -732,7 +818,8 @@ public def buildArtifactUnlessUpToDate
   if let some pkg ← getCurrPackage? then
     let inputHash := depTrace.hash
     let fetchArt? restore := do
-      let some ((art : XArtifact exe), log) ← getArtifacts? inputHash savedTrace pkg
+      let target ← currentRemoteCacheTarget
+      let some ((art : XArtifact exe), log) ← getArtifacts? inputHash savedTrace pkg target none
         | return none
       unless (← savedTrace.replayCachedIfUpToDate inputHash) do
         removeFileIfExists file

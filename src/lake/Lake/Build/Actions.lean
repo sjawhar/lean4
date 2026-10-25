@@ -182,7 +182,8 @@ the request is retried once with a new token.
 -/
 public def download
   (url : String) (file : FilePath) (headers : Array String := #[])
-  (cacheToken := false) (check : FilePath → LogIO PUnit := fun _ => pure ())
+  (cacheToken := false) (maxFileSize? : Option Nat := none)
+  (check : FilePath → LogIO PUnit := fun _ => pure ())
 : LogIO PUnit := do
   createParentDirs file
   let tmp ← uniqueTmpPath file
@@ -191,6 +192,7 @@ public def download
       let args := curlLeadArgs token? ++
         #["-s", "-S", "-f", "-o", tmp.toString, "-w", "%{http_code}"]
       let args := args ++ downloadTimeoutArgs ++ authArgs
+      let args := maxFileSize?.elim args fun size => args ++ #["--max-filesize", toString size]
       let args := if token?.isSome then args else args.push "-L"
       let args := headers.foldl (init := args) (· ++ #["-H", ·])
       let out ← rawProc {cmd := ← Internal.getCurl, args := args.push url}
