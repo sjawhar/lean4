@@ -773,7 +773,7 @@ case_push_upload() {
   test_cmd push_check status "$PUSH_STATUS" $PUSH_COMPILES 0 0 0
   test_cmd_eq $PUSH_COMPILES push_check order "$SERVER_LOG" "$STORE_DIR"
   test_cmd_eq 0 count_other ' auth=bearer gen=0$' "$SERVER_LOG"
-  test_exp ! -e "$PUSH_CACHE/push-staging"
+  test_cmd_eq 0 count_files "$PUSH_CACHE/push-staging"
   : > "$SERVER_LOG"
   on_a test_run cache push
   test_cmd_eq 0 count ' -> ' "$SERVER_LOG"
@@ -926,6 +926,30 @@ case_push_many() {
   test_cmd push_check order "$SERVER_LOG" "$STORE_DIR"
 }
 
+case_push_staging() {
+  # A push first removes the staging directories that dead pushes left, even
+  # with nothing to push, and each push stages in a directory of its own, so a
+  # dead push's `curl` cannot upload another push's files.
+  push_fresh
+  test_cmd mkdir -p "$PUSH_CACHE/push-staging/999999999-dead/0"
+  echo stale > "$PUSH_CACHE/push-staging/999999999-dead/0/mapping.json"
+  on_a test_run cache push
+  test_exp ! -e "$PUSH_CACHE/push-staging/999999999-dead"
+  build_a
+  on_a test_out 'staging uploads in' cache push -v
+  FIRST="$(sed -n 's/.*staging uploads in //p' produced.out)"
+  echo changed > "$PUSH_A/a.in"
+  on_a test_run --dir "$PUSH_A" build pair
+  on_a test_out 'staging uploads in' cache push -v
+  SECOND="$(sed -n 's/.*staging uploads in //p' produced.out)"
+  test_exp "${FIRST%/*}" = "$PUSH_CACHE/push-staging"
+  test_exp "${SECOND%/*}" = "$PUSH_CACHE/push-staging"
+  test_exp "$FIRST" != "$SECOND"
+  test_cmd_eq 0 queued
+  test_cmd push_check status "$PUSH_STATUS" 1 0 0 0
+  test_cmd_eq 0 count_files "$PUSH_CACHE/push-staging"
+}
+
 case_push_concurrent() {
   # Of two pushes started together, one uploads and the other exits at once,
   # writing nothing. A line appended while the first one runs is pushed by it.
@@ -985,7 +1009,7 @@ CASES="${REMOTE_CACHE_CASES:-case_roundtrip case_no_token case_second_put case_n
   case_read_transport case_read_status case_read_status_persistence case_push_queue
   case_push_upload case_push_tree_changed case_push_mismatch case_push_missing
   case_push_custom_target case_push_githash case_push_deny case_push_invalid case_push_many
-  case_push_concurrent}"
+  case_push_staging case_push_concurrent}"
 for c in $CASES; do
   echo "# ${c#case_}"
   "$c"
