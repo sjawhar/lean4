@@ -52,6 +52,10 @@ public structure Args where
   /-- The source file that Lake compiles for a module of the workspace, if Lake knows the module.
   Linter findings are reported, and exceptions recorded, in this file. -/
   moduleSrcFile? : Name → Option System.FilePath := fun _ => none
+  /-- The artifacts Lake built for the modules of the workspace in the import closures of the lint
+  targets and checks modules. These modules are imported from exactly these files; other modules
+  are found through the `.olean` search path (`searchPathRef`). -/
+  importArts : NameMap ImportArtifacts := {}
 
 /--
 The source file of the module `mod` for linter output and recorded exceptions: the one Lake
@@ -482,13 +486,15 @@ public def run (args : Args) : IO UInt32 := do
     -- Peek at the .olean header to learn whether `mod` participates in the module system.
     -- If so, import at the server level level, mirroring `processHeaderCore`, while
     -- exposing server-level data (i.e. the state of `lintLogExt`).
-    let modFile ← findOLean mod
+    let modFile ← match args.importArts.find? mod |>.bind (·.olean?) with
+      | some file => pure file
+      | none => findOLean mod
     let (modData, region) ← readModuleData modFile
     let isModule ← getIsModule modData
     let level := if isModule then OLeanLevel.server else OLeanLevel.private
     unsafe region.free
     let env ← importModules (#[{ module := mod }, envLinterModule] ++ checkImports) {}
-      (trustLevel := 1024) (loadExts := true) (level := level)
+      (trustLevel := 1024) (loadExts := true) (level := level) (arts := args.importArts)
 
     -- We create `LinterOptions` out of the passed overrides
     let linterOpts : Lean.Linter.LinterOptions := {
