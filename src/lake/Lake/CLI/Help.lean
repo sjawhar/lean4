@@ -817,15 +817,17 @@ for the input's mapping instead of compiling, and takes the claim over when the
 claim says that the compile failed, when the claim's compile still runs but its
 holder is a process of this machine that no longer runs, or when the remote
 cache has not replaced it for `LAKE_CLAIM_TAKEOVER_SECS` seconds (600 by
-default). After its first queued output, a build that claims inputs starts this
-command itself, once, detached, as `lake cache push --wait --follow <file>`
-with a lock file that the build holds until it ends: the push uploads each
-output as the build queues it, tries an upload that failed again every 30
-seconds while the build runs, ends after the build has ended (also when the
-Lake process goes on, as `lake exe` does), and marks each claim done once its
-mapping is uploaded. Its output goes to `push.log` in the cache directory. A
-claim that cannot be read or written is a miss: the build compiles as it would
-without claims."
+default) or the build has seen it unchanged for that long by its own clock.
+A claim request that has not ended after 20 seconds, or whose answer is larger
+than 64 KiB, fails. After its first queued output, a build that claims inputs
+starts this command itself, once, detached, as
+`lake cache push --wait --follow <file>` with a lock file that the build holds
+until it ends: the push uploads each output as the build queues it, tries an
+upload that failed again every 30 seconds while the build runs, ends after the
+build has ended (also when the Lake process goes on, as `lake exe` does), and
+marks each claim done once its mapping is uploaded. Its output goes to
+`push.log` in the cache directory. A claim that cannot be read or written is a
+miss: the build compiles as it would without claims."
 
 def helpCacheClean :=
 "Removes ALL files from the local Lake cache
@@ -895,7 +897,8 @@ A build that uploads to such a service (`LAKE_REMOTE_CACHE_QUEUE`; see
                                    background (unset by default: claims are
                                    taken)
   LAKE_CLAIM_TAKEOVER_SECS=<n>     take a claim over after the remote cache has
-                                   not replaced it for `n` seconds (600 by
+                                   not replaced it, or the build has seen it
+                                   unchanged, for `n` seconds (600 by
                                    default); the holder rewrites its claims
                                    every 60 seconds, or every `n/4` seconds if
                                    that is less
@@ -906,7 +909,11 @@ A build that uploads to such a service (`LAKE_REMOTE_CACHE_QUEUE`; see
 
 A mapping that a build read from the remote cache stays in the local cache.
 Once `LAKE_REMOTE_CACHE` no longer names that service, Lake reads none of its
-artifacts from the remote cache: a missing one is compiled again."
+artifacts from the remote cache: a missing one is compiled again. While it
+names one, a local mapping whose artifacts were pruned does not hide the
+remote cache: Lake reads the remote mapping instead. A downloaded archive
+that does not unpack is a miss: Lake compiles the module and moves the
+archive into the cache's `quarantine` directory."
 
 def helpScriptCli :=
 "Manage Lake scripts

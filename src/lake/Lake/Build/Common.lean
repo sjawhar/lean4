@@ -611,20 +611,16 @@ open ResolveOutputs in
 Retrieve artifacts from the Lake cache using only the outputs
 stored in the cached input-to-content mapping, along with the build log stored with them.
 
+A local mapping that cannot be used (e.g., its artifacts were pruned from the cache) does not hide
+the shared remote cache: the remote mapping is then read (see `readRemoteOutputs?`, which reads
+nothing unless `LAKE_REMOTE_CACHE` names a service) and replaces the local one.
+
 **For internal use only.**
 -/
 @[specialize] def getArtifactsUsingCache?
   [ResolveOutputs α] (inputHash : Hash) (pkg : Package) (target : String) (srcHash? : Option Hash)
 : JobM (Option (α × Log)) := do
-  try
-    let cache ← getLakeCache
-    let local? ← cache.readOutputs? pkg.cacheScope inputHash
-    let out? ← match local? with
-      | some out => pure (some out)
-      | none => readRemoteOutputs? inputHash pkg target srcHash?
-    out?.mapM fun out =>
-      return (← resolveOutputs out, out.log?.getD {})
-  catch e =>
+  let reportIssue (e : Log.Pos) : JobM Unit := do
     let log ← takeLogFrom e
     let msg := s!"input '{inputHash.toString.take 7}' found in package artifact cache, \
       but some output(s) have issues:"
@@ -632,7 +628,21 @@ stored in the cached input-to-content mapping, along with the build log stored w
     -- Must be `trace` to avoid breaking `--wfail` / `--iofail` builds
     -- TODO: Figure out a way to split cache and build failures
     logVerbose msg
-    return none
+  let resolve (out : CacheOutput) : JobM (Option (α × Log)) := do
+    try
+      return some (← resolveOutputs out, out.log?.getD {})
+    catch e =>
+      reportIssue e
+      return none
+  let local? ← try (← getLakeCache).readOutputs? pkg.cacheScope inputHash catch e =>
+    reportIssue e
+    pure none
+  if let some out := local? then
+    if let some a ← resolve out then
+      return some a
+  let some out ← readRemoteOutputs? inputHash pkg target srcHash? (replace := local?.isSome)
+    | return none
+  resolve out
 
 open ResolveOutputs in
 /--
