@@ -175,9 +175,10 @@ vets before it is renamed into place. Thus, `file` never holds a partial downloa
 failed download (whose temporary file is removed) leaves it as it was. The download gives up
 on a stalled transfer (see `downloadTimeoutArgs`).
 
-With `cacheToken`, the request carries the cache token (see `CacheToken.get?`) and does not
-follow redirects, so that the token goes only to the host of `url`. If the token is refused
-(HTTP 401), the request is retried once with a new token.
+With `cacheToken`, the request carries the cache token (see `cacheTokenFor?`), ignores the
+user's `.curlrc` (see `curlLeadArgs`) and does not follow redirects, so that the token goes only
+to the host of `url`; a redirect is an error that names it. If the token is refused (HTTP 401),
+the request is retried once with a new token.
 -/
 public def download
   (url : String) (file : FilePath) (headers : Array String := #[])
@@ -187,16 +188,17 @@ public def download
   let tmp ← uniqueTmpPath file
   let fetch (token? : Option String) : LogIO (IO.Process.Output × Nat) :=
     CacheToken.withCurlArgs token? fun authArgs => do
-      let args := #["-s", "-S", "-f", "-o", tmp.toString, "-w", "%{http_code}"]
+      let args := curlLeadArgs token? ++
+        #["-s", "-S", "-f", "-o", tmp.toString, "-w", "%{http_code}"]
       let args := args ++ downloadTimeoutArgs ++ authArgs
       let args := if token?.isSome then args else args.push "-L"
       let args := headers.foldl (init := args) (· ++ #["-H", ·])
       let out ← rawProc {cmd := ← Internal.getCurl, args := args.push url}
       return (out, out.stdout.trimAscii.toNat?.getD 0)
   try
-    let token? ← if cacheToken then CacheToken.get? else pure none
+    let token? ← if cacheToken then cacheTokenFor? url else pure none
     let (out, code) ← fetch token?
-    let (out, _) ← match code, token? with
+    let (out, code) ← match code, token? with
       | 401, some token => do fetch (← CacheToken.renew token)
       | _, _ => pure (out, code)
     -- The standard output is the status code that `-w` reports
@@ -206,6 +208,10 @@ public def download
     else
       logOutput out logInfo
       error s!"external command '{← Internal.getCurl}' exited with code {out.exitCode}"
+    -- Without `-L`, `curl` succeeds on a redirect, having written the redirect's body
+    if 300 ≤ code && code < 400 then
+      error s!"{url}: the server redirected the download (status {code}), and a request \
+        that carries the token of `{CacheToken.cmdVar}` does not follow redirects"
     check tmp
     IO.FS.rename tmp file
   finally
