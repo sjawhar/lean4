@@ -96,7 +96,8 @@ that builds compiled, which `lake cache push` uploads and removes.
 
 /--
 The directory where `lake cache push` copies the bytes it uploads. It is in the cache directory,
-on the file system of the artifacts it copies, and only the push that holds `pushLockFile` uses it.
+on the file system of the artifacts it copies. Each push stages in a directory of its own below
+it, `<pid>-<random>`, and removes all of it first, once it holds `pushLockFile`.
 -/
 @[inline] public def pushStagingDir (cache : Cache) : FilePath :=
   cache.dir / "push-staging"
