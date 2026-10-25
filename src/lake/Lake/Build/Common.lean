@@ -12,6 +12,7 @@ public import Lake.Util.JsonObject
 public import Lake.Util.IO
 public import Lake.Build.Actions
 public import Lake.Build.RemoteCache
+public import Lake.Build.Claim
 
 /-! # Common Build Tools
 This file defines general utilities that abstract common
@@ -835,21 +836,30 @@ public def buildArtifactUnlessUpToDate
           return art
         else
           let status ← savedTrace.replayIfUpToDate' file depTrace
+          -- Before it compiles, a build that writes the shared remote cache claims the input,
+          -- and while another build holds the claim, waits for that build's outputs
+          let mut claim? : Option HeldClaim := none
           unless status.isUpToDate do
-            discard <| doBuild depTrace traceFile
-          if status.isCacheable then
-            let art ← cacheArtifact file ext text exe restore
-            -- The trace holds the log of the action that produced `file`: its replay or its build
-            let log := (← readTraceFile traceFile).log
-            -- Queued before the local mapping is written: a build that finds the mapping never
-            -- compiles (or queues) this input. After a crash between the two, the next build
-            -- restores the outputs through the trace without queueing them, so they stay queued once.
-            if (← builtHere) then
-              queueRemotePush pkg inputHash (← currentRemoteCacheTarget) none (toJson art.descr) log
-            (← getLakeCache).writeOutputs pkg.cacheScope inputHash art.descr (log := log)
-            return art
-          else
-            computeArtifact file ext text
+            match ← waitForClaim pkg inputHash (fetchArt? restore) with
+            | .found art => return art
+            | .compile c? => claim? := c?
+          withClaim claim? do
+            unless status.isUpToDate do
+              discard <| doBuild depTrace traceFile
+            if status.isCacheable then
+              let art ← cacheArtifact file ext text exe restore
+              -- The trace holds the log of the action that produced `file`: its replay or its build
+              let log := (← readTraceFile traceFile).log
+              -- Queued before the local mapping is written: a build that finds the mapping never
+              -- compiles (or queues) this input. After a crash between the two, the next build
+              -- restores the outputs through the trace without queueing them, so they stay queued once.
+              if (← builtHere) then
+                queueCompiledOutputs claim? pkg inputHash (← currentRemoteCacheTarget) none
+                  (toJson art.descr) log
+              (← getLakeCache).writeOutputs pkg.cacheScope inputHash art.descr (log := log)
+              return art
+            else
+              computeArtifact file ext text
       else if (← savedTrace.replayIfUpToDate file depTrace) then
         computeArtifact file ext text
       else

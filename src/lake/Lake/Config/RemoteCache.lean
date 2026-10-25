@@ -17,7 +17,8 @@ import Init.System.Platform
 The objects of the shared remote cache, which builds read with `LAKE_REMOTE_CACHE` and which
 `lake cache push` writes: under a scope for the Lean, the platform and the package
 (`remoteCacheScope`), the input-to-output mapping of each input hash (`RemoteCacheMapping`), and
-each artifact, named by its SHA-256 digest.
+each artifact, named by its SHA-256 digest. Beside them, under the top-level folder `claim/`, a
+build that writes the cache claims each input it is about to compile (`RemoteClaim`).
 -/
 
 open System Lean
@@ -114,3 +115,89 @@ public structure RemoteUpload where
   url : String
   /-- The Lake content hash that names the file in messages (for a mapping, its input hash). -/
   hash : Hash
+
+/-! ## Claims -/
+
+/--
+The scope of the claims of the inputs of `remoteScope`: `claim/<remoteScope>`, in the top-level
+folder `claim/`, the only folder where a writer of the cache may replace objects. The claim of an
+input hash is `<that scope>/<inputHash>` below the artifact endpoint (see
+`CacheService.remoteClaimUrl`).
+-/
+public def remoteClaimScope (remoteScope : String) : String :=
+  s!"claim/{remoteScope}"
+
+/-- What the holder of a claim does with its input. -/
+public inductive RemoteClaimState
+/-- The holder compiles the input. -/
+| building
+/-- The compile failed, or ended with nothing to publish: a waiting build compiles the input. -/
+| failed
+/-- The mapping of the input is in the remote cache. -/
+| done
+deriving DecidableEq, Repr
+
+namespace RemoteClaimState
+
+public def toString : RemoteClaimState → String
+| .building => "building"
+| .failed => "failed"
+| .done => "done"
+
+public instance : ToString RemoteClaimState := ⟨RemoteClaimState.toString⟩
+public instance : ToJson RemoteClaimState := ⟨(toJson ·.toString)⟩
+
+public instance : FromJson RemoteClaimState := ⟨fun json => do
+  match (← fromJson? json : String) with
+  | "building" => return .building
+  | "failed" => return .failed
+  | "done" => return .done
+  | s => throw s!"unknown claim state: {s}"⟩
+
+end RemoteClaimState
+
+/--
+The body of a claim: the build that holds it (`<host>:<pid>`), what it does, and when it wrote the
+claim (seconds since the Unix epoch, by its own clock; a build that decides whether a claim is
+stale uses the remote cache's times instead).
+-/
+public structure RemoteClaim where
+  holder : String
+  state : RemoteClaimState
+  writtenAt : Int
+
+namespace RemoteClaim
+
+public protected def toJson (claim : RemoteClaim) : Json :=
+  JsonObject.empty
+  |>.insert "holder" claim.holder
+  |>.insert "state" claim.state
+  |>.insert "at" claim.writtenAt
+
+public instance : ToJson RemoteClaim := ⟨RemoteClaim.toJson⟩
+
+public protected def fromJson? (json : Json) : Except String RemoteClaim := do
+  let obj ← JsonObject.fromJson? json
+  return {
+    holder := ← obj.get "holder"
+    state := ← obj.get "state"
+    writtenAt := ← obj.get "at"
+  }
+
+public instance : FromJson RemoteClaim := ⟨RemoteClaim.fromJson?⟩
+
+end RemoteClaim
+
+/--
+How often a build that waits for another build's claim looks for the mapping of its input again:
+every 5 seconds, in milliseconds.
+-/
+public def remoteClaimPollMs : Nat := 5000
+
+/--
+How often the holder of a claim rewrites it while it compiles, in seconds: every 60 seconds, or a
+quarter of the takeover time (`LAKE_CLAIM_TAKEOVER_SECS`) if that is shorter, so that a claim
+whose holder still compiles never looks stale.
+-/
+public def remoteClaimRefreshSecs (takeoverSecs : Nat) : Nat :=
+  max 1 (min 60 (takeoverSecs / 4))
