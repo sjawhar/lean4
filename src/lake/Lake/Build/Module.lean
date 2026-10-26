@@ -1369,7 +1369,7 @@ def Module.buildLean
           some (args.push "--reuse-declined=replay-failed", mod.oleanFile.withExtension "reuse-retry"))
   mod.clearOutputArtifacts
   mod.clearOutputHashes
-  let modsysBefore? ← if usage then some <$> modsysHash (← Std.Mutex.new {}) setup.importArts else pure none
+  let modsysBefore? ← if usage then some <$> modsysHash (← ContentHashes.new) setup.importArts else pure none
   try
     compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile outputPaths (args ++ reuseArgs)
       (← getLeanPath) (← getLean) retry?

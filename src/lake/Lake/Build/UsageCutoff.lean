@@ -285,25 +285,46 @@ The hashes of the files one usage-cutoff check (`Module.usageUpToDate`, `Module.
 read, so that every `importUsage?` binding of the check is to one hash of each file, also in the check's parallel
 tasks (`parallelRuns`), which share it. A check never reuses another's: another workspace's build can
 rebuild a shared dependency between two checks. Across checks, a file's hash is reused only while its stamp shows its
-bytes unchanged (`BuildContext.fileDigests`). Persistent, because the tasks share it: an insert into a hash map that
-other threads can reach copies the whole map.
+bytes unchanged (`BuildContext.fileDigests`). Split into 256 shards by the path's hash, each behind its own mutex: the
+check's tasks hash about every file of the closure, and one mutex for all of them is contended. Persistent, because
+the tasks share it: an insert into a hash map that other threads can reach copies the whole map.
 -/
-public abbrev ContentHashes := Std.Mutex (PHashMap FilePath ModuleUsage.Digest)
+public structure ContentHashes where
+  shards : Vector (Std.Mutex (PHashMap FilePath ModuleUsage.Digest)) 256
+
+/-- An empty `ContentHashes`, for one check. -/
+public def ContentHashes.new : BaseIO ContentHashes :=
+  return ⟨← (Vector.replicate 256 ()).mapM fun _ => Std.Mutex.new {}⟩
+
+/-- The shard of `file`, from the top bits of its hash: a `Lean.PersistentHashMap` in a shard branches on the low bits. -/
+@[inline] def ContentHashes.shard (hashes : ContentHashes) (file : FilePath) :
+    Std.Mutex (PHashMap FilePath ModuleUsage.Digest) :=
+  hashes.shards[(⟨(hash file >>> 56).toNat % 256, Nat.mod_lt _ (by decide)⟩ : Fin 256)]
+
+/-- The hash the check recorded for `file`, if any. -/
+public def ContentHashes.find? (hashes : ContentHashes) (file : FilePath) : BaseIO (Option ModuleUsage.Digest) :=
+  (hashes.shard file).atomically (return (← get).find? file)
+
+/--
+Records `hash` for `file` unless the check recorded a hash for it first, and returns the recorded one. A path has one
+shard, and the first insert under that shard's mutex wins, so every task of the check gets one hash for each path.
+-/
+public def ContentHashes.record (hashes : ContentHashes) (file : FilePath) (hash : ModuleUsage.Digest) :
+    BaseIO ModuleUsage.Digest :=
+  (hashes.shard file).atomically <| modifyGet fun all => match all.find? file with
+    | some first => (first, all)
+    | none => (hash, all.insert file hash)
 
 /--
 The hash of `file`'s current bytes (`Lean.ModuleUsage.fileDigest`, 128 bits), never read from a
 `.hash` file: an `.olean` rewritten behind Lake's back (e.g., by `lean -o`) keeps its old `.hash`,
 and a usage-cutoff decision must see the new bytes. One hash per check (`hashes`): the first one a task of the check
-records. Taken from an earlier check of the build only if the file's stamp (`Lean.ModuleUsage.fileStamp`) is the one
-recorded when those bytes were read (`BuildContext.fileDigests`).
+records (`ContentHashes.record`). Taken from an earlier check of the build only if the file's stamp
+(`Lean.ModuleUsage.fileStamp`) is the one recorded when those bytes were read (`BuildContext.fileDigests`).
 -/
 def contentHash (hashes : ContentHashes) (file : FilePath) : JobM ModuleUsage.Digest := do
-  if let some hash ← hashes.atomically (return (← get).find? file) then return hash
-  let hash ← stampedDigest
-  -- another task of the check may have hashed the file meanwhile: the first hash binds it
-  hashes.atomically <| modifyGet fun all => match all.find? file with
-    | some first => (first, all)
-    | none => (hash, all.insert file hash)
+  if let some hash ← hashes.find? file then return hash
+  hashes.record file (← stampedDigest)
 where
   stampedDigest : JobM ModuleUsage.Digest := do
     let memo := (← getBuildContext).fileDigests.get (Hashable.hash file)
@@ -727,7 +748,7 @@ public def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     (oleanDigest? : Option ModuleUsage.Digest := none) : JobM Unit := do
   let some (usage, usageDigest) ← readOwnUsage mod.usageFile | return
   unless usage.coversClosure importArts do return
-  let hashes ← Std.Mutex.new {}
+  let hashes ← ContentHashes.new
   let reads ← IO.mkRef {}
   let modsys ← modsysHash hashes importArts
   unless modsys == modsysBefore do return
@@ -771,7 +792,7 @@ public def Module.usageUpToDate (mod : Module) (presetup : ModulePreSetup)
   let some (usage, _) ← readOwnUsage mod.usageFile (expected? := key.usage) | return false
   if usage.noskip || key.localHash != presetup.localTrace.hash || !usage.coversClosure importArts then
     return false
-  let hashes ← Std.Mutex.new {}
+  let hashes ← ContentHashes.new
   let reads ← IO.mkRef {}
   unless (← contentHash hashes mod.oleanFile) == key.olean do return false
   unless (← modsysHash hashes importArts) == key.modsys do return false
@@ -817,7 +838,7 @@ public def Module.reuseCheck (mod : Module) (presetup : ModulePreSetup) (importA
   let some (usage, _) ← readOwnUsage mod.usageFile (expected? := key.usage) | return .error "usage-unreadable"
   if usage.noskip then return .error "noskip"
   unless key.localNoSrc? == some presetup.localNoSrcTrace.hash do return .error "local-inputs-changed"
-  let hashes ← Std.Mutex.new {}
+  let hashes ← ContentHashes.new
   let reads ← IO.mkRef {}
   unless (← contentHash hashes mod.oleanFile) == key.olean do return .error "olean-hash-mismatch"
   unless (← modsysHash hashes importArts) == key.modsys do return .error "modsys-changed"
