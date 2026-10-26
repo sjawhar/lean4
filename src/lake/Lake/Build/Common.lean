@@ -867,19 +867,21 @@ which will be computed in the resulting `Job` before building.
     return art.path
 
 /--
-Makes the file `src` available at the path `name` (a hard link, or else a copy) and returns `name`.
-As with `restoreArtifact`, an existing file at `name` is kept: Lake removes its outputs before it
-writes new ones. A copy appears at `name` in one rename, so a concurrent reader never sees part of it.
+Makes the file `src` available at the path `name` (a hard link, or else a copy through the temporary
+path `tmp`, which must be unique to the caller) and returns `name`. As with `restoreArtifact`, an
+existing file at `name` is kept: Lake removes its outputs before it writes new ones. A new file at
+`name` gets no `.hash` file, so its hash is computed from its contents when it is next needed.
 -/
-def placeFileAs (src name : FilePath) : JobM FilePath := do
+def placeFileAs (src name tmp : FilePath) : JobM FilePath := do
   if src == name || (← name.pathExists) then
     return name
+  -- Removing an output keeps its `.hash` file, which would describe older contents
+  clearFileHash name
   createParentDirs name
   match (← (IO.FS.hardLink src name).toBaseIO) with
   | .ok _ | .error (.alreadyExists ..) => return name
   | .error e =>
     logVerbose s!"could not hard link {src} to {name}, copying instead; error: {e}"
-    let tmp := FilePath.mk s!"{name}.{← IO.Process.getPID}-{← IO.monoNanosNow}.tmp"
     if let .error e ← (copyFile src tmp *> IO.FS.rename tmp name).toBaseIO then
       discard <| (IO.FS.removeFile tmp).toBaseIO
       unless (← name.pathExists) do
@@ -914,7 +916,10 @@ public def Internal.buildLeanO
       let lean ← getLeanInstall
       let includeDir := leanIncludeDir?.elim lean.includeDir (·.1)
       let args := #["-I", includeDir.toString] ++ lean.ccFlags ++ weakArgs ++ traceArgs
-      let srcFile ← srcName?.elim (pure srcFile) (placeFileAs srcFile ·)
+      -- The temporary copy is named after this job's object file, so the jobs that compile one
+      -- source (with and without exports) never share it
+      let tmp := FilePath.mk s!"{oFile}.{← IO.Process.getPID}.src.tmp"
+      let srcFile ← srcName?.elim (pure srcFile) (placeFileAs srcFile · tmp)
       compileO oFile srcFile args lean.cc
     return art.path
 
