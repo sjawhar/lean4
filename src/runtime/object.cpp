@@ -71,6 +71,19 @@ __attribute__((weak)) void free_sized(void *ptr, size_t) {
 #define LEAN_MAX_PRIO 8
 #define LEAN_SYNC_PRIO std::numeric_limits<unsigned>::max()
 
+/* A thread blocked in `lean::task_manager::wait_for` or `wait_any` links one of these records
+   into the waiter list of every unfinished task it is waiting for, so that finishing a task
+   signals only the threads waiting for that task. The record lives on the waiting thread's
+   stack and is linked, unlinked and signalled while the task_manager mutex is held. */
+struct lean_task_waiter {
+    lean_task_waiter *         m_next{nullptr};
+    /* Address of the pointer referring to this record, i.e. the task's `m_head_waiter` or the
+       preceding record's `m_next`; null exactly while the record is linked into no task. */
+    lean_task_waiter **        m_prev_next{nullptr};
+    lean::condition_variable * m_cv;
+    explicit lean_task_waiter(lean::condition_variable * cv):m_cv(cv) {}
+};
+
 namespace lean {
 
 static bool should_abort_on_panic() {
@@ -729,6 +742,7 @@ static lean_task_imp * alloc_task_imp(obj_arg c, unsigned prio, bool keep_alive)
     imp->m_closure     = c;
     imp->m_head_dep    = nullptr;
     imp->m_next_dep    = nullptr;
+    imp->m_head_waiter = nullptr;
     imp->m_prio        = prio;
     imp->m_canceled    = false;
     imp->m_keep_alive  = keep_alive;
@@ -760,9 +774,46 @@ class task_manager {
     unsigned                                      m_queues_size{0};
     unsigned                                      m_max_prio{0};
     condition_variable                            m_queue_cv;
-    condition_variable                            m_task_finished_cv;
     condition_variable                            m_dedicated_finished_cv;
     bool                                          m_shutting_down{false};
+
+    /* Link `w` into the waiter list of the unfinished task `t`. */
+    static void add_waiter(lean_task_object * t, lean_task_waiter * w) {
+        lean_task_imp * imp = t->m_imp.load(std::memory_order_relaxed);
+        lean_assert(imp);
+        w->m_next      = imp->m_head_waiter;
+        w->m_prev_next = &imp->m_head_waiter;
+        if (w->m_next)
+            w->m_next->m_prev_next = &w->m_next;
+        imp->m_head_waiter = w;
+    }
+
+    /* Unlink `w`, which `wake_waiters` may already have done. */
+    static void remove_waiter(lean_task_waiter * w) {
+        if (!w->m_prev_next)
+            return;
+        *w->m_prev_next = w->m_next;
+        if (w->m_next)
+            w->m_next->m_prev_next = w->m_prev_next;
+        w->m_next      = nullptr;
+        w->m_prev_next = nullptr;
+    }
+
+    /* Signal and unlink every thread waiting for the task owning `imp`. The caller must not
+       release the mutex between finishing the task and this call, as a waiter that returns
+       destroys its record. */
+    static void wake_waiters(lean_task_imp * imp) {
+        lean_task_waiter * w = imp->m_head_waiter;
+        imp->m_head_waiter = nullptr;
+        while (w) {
+            lean_task_waiter * next = w->m_next;
+            w->m_next      = nullptr;
+            w->m_prev_next = nullptr;
+            /* Only the owning thread waits on this condition variable. */
+            w->m_cv->notify_one();
+            w = next;
+        }
+    }
 
     lean_task_object * dequeue() {
         lean_assert(m_queues_size != 0);
@@ -805,6 +856,8 @@ class task_manager {
 
     void deactivate_task_core(unique_lock<mutex> & lock, lean_task_object * t) {
         lean_task_imp* imp = t->m_imp.load(std::memory_order_relaxed);
+        /* A thread blocked on the task holds a reference to it, so it cannot be deactivated. */
+        lean_assert(imp->m_head_waiter == nullptr);
         object * c              = imp->m_closure;
         lean_task_object * it   = imp->m_head_dep;
         imp->m_closure     = nullptr;
@@ -923,11 +976,13 @@ class task_manager {
         mark_mt(v);
         t->m_value = v;
         lean_task_imp * imp = t->m_imp.exchange(nullptr, std::memory_order_relaxed);
+        /* Signal the waiters before `handle_finished`, which releases the mutex to run a `sync`
+           dependency: a waiter must not be able to return while its record is still in use. */
+        wake_waiters(imp);
         handle_finished(lock, t, imp);
         /* After the task has been finished and we propagated
            dependencies, we can release `imp` and keep just the value */
         free_task_imp(imp);
-        m_task_finished_cv.notify_all();
     }
 
     void handle_finished(unique_lock<mutex> & lock, lean_task_object * t, lean_task_imp * imp) {
@@ -957,6 +1012,13 @@ class task_manager {
             it = cnstr_get(it, 1);
         }
         return nullptr;
+    }
+
+    static unsigned task_list_length(object * task_list) {
+        unsigned n = 0;
+        for (object * it = task_list; !is_scalar(it); it = cnstr_get(it, 1))
+            n++;
+        return n;
     }
 
 public:
@@ -1035,7 +1097,11 @@ public:
             else
                 m_queue_cv.notify_one();
         }
-        m_task_finished_cv.wait(lock, [&]() { return t->m_value != nullptr; });
+        condition_variable cv;
+        lean_task_waiter w(&cv);
+        add_waiter(t, &w);
+        cv.wait(lock, [&]() { return t->m_value != nullptr; });
+        remove_waiter(&w);
         if (in_pool) {
             m_max_std_workers--;
         }
@@ -1045,11 +1111,23 @@ public:
         if (object * t = wait_any_check(task_list))
             return t;
         unique_lock<mutex> lock(m_mutex);
-        while (true) {
-            if (object * t = wait_any_check(task_list))
-                return t;
-            m_task_finished_cv.wait(lock);
-        }
+        if (object * t = wait_any_check(task_list))
+            return t;
+        condition_variable cv;
+        /* One record per task, as any of them may be the one that finishes. The vector is not
+           resized while the records are linked, as the lists point into it. */
+        std::vector<lean_task_waiter> waiters(task_list_length(task_list), lean_task_waiter(&cv));
+        unsigned i = 0;
+        for (object * it = task_list; !is_scalar(it); it = cnstr_get(it, 1), i++)
+            add_waiter(lean_to_task(lean_ctor_get(it, 0)), &waiters[i]);
+        object * result;
+        while (!(result = wait_any_check(task_list)))
+            cv.wait(lock);
+        /* The records die with this frame, so they must leave the lists of the tasks that did
+           not finish. `waiters` is destroyed before the lock is released. */
+        for (lean_task_waiter & w : waiters)
+            remove_waiter(&w);
+        return result;
     }
 
     void deactivate_task(lean_task_object * t) {

@@ -263,6 +263,8 @@ typedef struct {
 } lean_thunk_object;
 
 struct lean_task;
+/* Record of one thread blocked on a task, defined by the runtime in `object.cpp`. */
+struct lean_task_waiter;
 
 /* Data required for executing a Lean task. It is released as soon as
    the task terminates even if the task object itself is still referenced. */
@@ -270,6 +272,9 @@ typedef struct {
     lean_object *        m_closure;
     struct lean_task *   m_head_dep;
     struct lean_task *   m_next_dep;
+    /* Threads blocked on this task; finishing it signals exactly these. Only accessed while
+       holding the task_manager mutex. */
+    struct lean_task_waiter * m_head_waiter;
     unsigned             m_prio;
     // This field is atomic as we access it both with and without holding the task_manager mutex.
     _Atomic(uint8_t)     m_canceled;
@@ -318,6 +323,7 @@ typedef struct {
      * invariant: RC == 0
      * invariant: m_imp->m_closure == nullptr && m_imp->m_head_dep == nullptr (both freed by `deactivate_task_core`)
        * Note that all dependent tasks must have already been Deactivated by the converse of the second Waiting invariant
+     * invariant: m_imp->m_head_waiter == nullptr, as a thread blocked on the task holds a reference to it
      * invariant: m_value == nullptr
      * transition: dequeued by worker thread   ==> freed
      * transition: finished execution          ==> freed
