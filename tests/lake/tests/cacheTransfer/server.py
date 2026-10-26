@@ -32,9 +32,6 @@ a test picks one by pointing an endpoint at it (e.g. `.../corrupt/a0`):
   slowobj   as `ok`, but each `PUT` of an object outside a `claim` directory
             (an artifact or a mapping, not a claim of the shared remote cache)
             is answered after 4 seconds
-  flakyclaimslowobj
-            as `slowobj`, but the first conditional `PUT` of each claim fails
-            with 503
   denyartonce
             403 for the first `PUT` of each object in an `a/` directory (an
             artifact of the shared remote cache), and otherwise as `ok`
