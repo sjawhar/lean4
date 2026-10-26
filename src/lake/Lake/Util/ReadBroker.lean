@@ -66,11 +66,20 @@ public structure Request where
   /-- How a try gives up, and how often a transient failure is tried again. -/
   limits : TransferLimits := {}
 
-/-- How a read ended: `curl`'s exit code, the HTTP status (0 without an answer), and the error. -/
+/--
+How a read ended: `curl`'s exit code, the HTTP status (0 without an answer), the error, and how
+long its tries were in `curl` runs (`transferMs`).
+-/
 public structure Outcome where
   exitCode : Nat := 0
   code : Nat := 0
   message : String := ""
+  /--
+  How long the tries of the read took, in milliseconds: each from the start of the `curl` run that
+  carried it to the moment `curl` reported it. The time the read waited for a run (in the queue,
+  or before a retry) is not in it.
+  -/
+  transferMs : Nat := 0
   deriving Inhabited
 
 /-- A read that waits for a run, or goes in one. -/
@@ -81,6 +90,8 @@ structure Pending where
   tries : Nat := 0
   /-- The monotonic time (in milliseconds) at which the read was sent first. -/
   sentAt : Nat
+  /-- How long the tries that ended took in `curl` runs (see `Outcome.transferMs`). -/
+  transferMs : Nat := 0
 
 /-- Whether two reads can go in one run: they send the same token with the same limits. -/
 def Request.sharesRun (a b : Request) : Bool :=
@@ -204,13 +215,14 @@ mutual
 /--
 Ends `p` with `outcome`, or, if it failed transiently and its limits allow another try, sends it
 again after 1 s and then twice as long each time (as `curl --retry` would), unless
-`retryMaxSecs` have passed since it was sent first.
+`retryMaxSecs` have passed since it was sent first. `outcome.transferMs` is the time of all of
+`p`'s tries so far, this one included.
 -/
 partial def finish (p : Pending) (outcome : Outcome) : BaseIO Unit := do
   let delayMs := 1000 * 2 ^ p.tries
   let late := (← IO.monoMsNow) + delayMs - p.sentAt > p.req.limits.retryMaxSecs * 1000
   if isTransientFailure outcome.exitCode outcome.code && p.tries < p.req.limits.retries && !late then
-    let p := {p with tries := p.tries + 1}
+    let p := {p with tries := p.tries + 1, transferMs := outcome.transferMs}
     discard <| BaseIO.asTask (prio := .dedicated) do
       IO.sleep delayMs.toUInt32
       enqueue p
@@ -222,11 +234,15 @@ partial def runLoop : BaseIO Unit := do
   let some run ← take
     | return
   let seen ← IO.mkRef (Array.replicate run.size false)
-  let why ← runCurl run finish seen
+  -- Each try counts from the start of its run: the time it waited for one is not the remote's
+  let start ← IO.monoMsNow
+  let ended (p : Pending) (outcome : Outcome) : BaseIO Unit := do
+    finish p {outcome with transferMs := p.transferMs + ((← IO.monoMsNow) - start)}
+  let why ← runCurl run ended seen
   -- A transfer that `curl` did not report may not have been sent: it is tried again
   for (p, seen) in run.zip (← seen.get) do
     unless seen do
-      finish p {exitCode := 28, message := why}
+      ended p {exitCode := 28, message := why}
   runLoop
 
 /-- Adds `p` to the waiting reads, and starts a run if fewer than `maxRuns` go. -/
@@ -268,12 +284,16 @@ public def send (req : Request) : BaseIO Outcome := do
 /--
 Sends a read of `url` whose body goes to `out` through the broker, with the cache token if
 `cacheToken` (see `withCacheToken`). Fails if `curl` got no answer or did not end the transfer.
+Adds the time of each send's transfers (`Outcome.transferMs`) to `transferMs`, also when it
+fails: a read that waited for the token, or for a run, waited for neither in its transfer.
 -/
 def sendWithToken
   (url : String) (out : FilePath) (cacheToken : Bool) (maxBytes : Nat) (limits : TransferLimits)
+  (transferMs : IO.Ref Nat)
 : LogIO (Outcome × Bool) := do
   let (_, outcome, token) ← withCacheToken url cacheToken fun token? => do
     let outcome ← send {url, out, token?, maxBytes, limits}
+    transferMs.modify (· + outcome.transferMs)
     return (outcome.code, outcome)
   if outcome.exitCode != 0 then
     error s!"{url}: the read failed (curl exit code {outcome.exitCode}): {outcome.message}"
@@ -285,7 +305,8 @@ def sendWithToken
 Performs a HTTP `GET` of `url` through the broker (see `getUrl?`) and returns the body on HTTP 200
 and `none` on 404; any other answer is an error. With `cacheToken`, the read carries the cache
 token and does not follow redirects (see `withCacheToken`). A body larger than `maxFileSize`
-fails, and the read gives up and tries again as `limits` says.
+fails, and the read gives up and tries again as `limits` says. Adds the time its transfers took to
+`transferMs` (see `sendWithToken`).
 
 The body goes to a file of this read alone under `tmpDir`, which is removed when the read ends.
 No handle on it is held while the read waits: a build has thousands of reads in flight, and an
@@ -293,12 +314,12 @@ open handle for each would exhaust the process's file descriptors.
 -/
 public def getUrl?
   (url : String) (tmpDir : FilePath) (cacheToken := false) (maxFileSize : Nat)
-  (limits : TransferLimits := {})
+  (limits : TransferLimits := {}) (transferMs : IO.Ref Nat)
 : LogIO (Option String) := withLogErrorPos do
   let bodyFile ← uniqueTmpPath (tmpDir / "remote-read")
   createParentDirs bodyFile
   try
-    let (outcome, _) ← sendWithToken url bodyFile cacheToken maxFileSize limits
+    let (outcome, _) ← sendWithToken url bodyFile cacheToken maxFileSize limits transferMs
     let body ← IO.FS.readFile bodyFile
     if outcome.code == 200 then
       return some body.trimAscii.copy
@@ -316,16 +337,19 @@ The body goes to a temporary file next to `file`, unique to this download, which
 before it is renamed into place; so `file` never holds a partial download, and a failed download
 leaves it as it was. With `cacheToken`, the read carries the cache token and does not follow
 redirects (see `withCacheToken`). A body larger than `maxFileSize` fails, and the read gives up
-and tries again as `limits` says.
+and tries again as `limits` says. Adds the time its transfers took to `transferMs` (see
+`sendWithToken`): the wait for a slot of the build before `check`, and `check` itself, are not in
+it.
 -/
 public def download
   (url : String) (file : FilePath) (cacheToken := false) (maxFileSize : Nat)
   (limits : TransferLimits := {}) (check : FilePath → LogIO PUnit := fun _ => pure ())
+  (transferMs : IO.Ref Nat)
 : LogIO PUnit := do
   createParentDirs file
   let tmp ← uniqueTmpPath file
   try
-    let (outcome, token) ← sendWithToken url tmp cacheToken maxFileSize limits
+    let (outcome, token) ← sendWithToken url tmp cacheToken maxFileSize limits transferMs
     let code := outcome.code
     if 300 ≤ code && code < 400 then
       if token then
