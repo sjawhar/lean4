@@ -634,13 +634,17 @@ nothing unless `LAKE_REMOTE_CACHE` names a service) and replaces the local one.
     catch e =>
       reportIssue e
       return none
-  let local? ← try (← getLakeCache).readOutputs? pkg.cacheScope inputHash catch e =>
+  let cache ← getLakeCache
+  let local? ← try cache.readOutputs? pkg.cacheScope inputHash catch e =>
     reportIssue e
     pure none
   if let some out := local? then
     if let some a ← resolve out then
       return some a
-  let some out ← readRemoteOutputs? inputHash pkg target srcHash? (replace := local?.isSome)
+  -- A local mapping file that exists but cannot be used (it does not parse, or its artifacts are
+  -- gone) is replaced by the remote one, so that it does not hide the remote cache again
+  let hadLocal ← (cache.outputsFile pkg.cacheScope inputHash).pathExists
+  let some out ← readRemoteOutputs? inputHash pkg target srcHash? (replace := hadLocal)
     | return none
   resolve out
 

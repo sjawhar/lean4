@@ -4,8 +4,9 @@
 
    PROBE_ENTRY_READY, PROBE_ENTRY_RELEASE
      Pause before the first operation that takes a cache artifact away from its name: the
-     `rename` of a file under `artifacts/` (what `lake cache push` does to capture an entry it
-     found wrong), or the `unlink` of one (what the push did before it captured by rename).
+     `rename` of a file under `artifacts/` into `quarantine/` (what Lake does to capture an entry
+     it found wrong), or the `unlink` of one that is not a temporary file (what Lake did before it
+     captured by rename). A download's temporary file, and its rename onto its entry, do not pause.
 
    PROBE_MAPPING_READY, PROBE_MAPPING_RELEASE
      Pause after the first `open` that truncates an existing mapping in place: a `.json` file
@@ -42,8 +43,13 @@ static void pause_once(const char *ready_var, const char *release_var, int *done
 
 static int entry_paused, mapping_paused;
 
+static int ends_with(const char *s, const char *suffix) {
+  size_t n = strlen(s), m = strlen(suffix);
+  return n >= m && strcmp(s + n - m, suffix) == 0;
+}
+
 int rename(const char *from, const char *to) {
-  if (strstr(from, "/artifacts/"))
+  if (strstr(from, "/artifacts/") && strstr(to, "/quarantine/"))
     pause_once("PROBE_ENTRY_READY", "PROBE_ENTRY_RELEASE", &entry_paused);
   if (strstr(to, "/outputs/")) {
     const char *mark = getenv("PROBE_MAPPING_RENAME");
@@ -54,15 +60,10 @@ int rename(const char *from, const char *to) {
 
 /* `uv_fs_t` and `uv_loop_t` are only passed through, so they need no definition here. */
 int uv_fs_unlink(void *loop, void *req, const char *path, void *cb) {
-  if (strstr(path, "/artifacts/"))
+  if (strstr(path, "/artifacts/") && !ends_with(path, ".tmp"))
     pause_once("PROBE_ENTRY_READY", "PROBE_ENTRY_RELEASE", &entry_paused);
   return ((int (*)(void *, void *, const char *, void *))dlsym(RTLD_NEXT, "uv_fs_unlink"))(
       loop, req, path, cb);
-}
-
-static int ends_with(const char *s, const char *suffix) {
-  size_t n = strlen(s), m = strlen(suffix);
-  return n >= m && strcmp(s + n - m, suffix) == 0;
 }
 
 static int open_flags(const char *path, int flags, int rc) {
