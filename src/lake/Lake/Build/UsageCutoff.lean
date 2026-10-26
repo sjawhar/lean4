@@ -355,25 +355,38 @@ def replayRun (r : LoggedRun β) : JobM β := do
 def minRunsPerTask : Nat := 64
 
 /--
-Runs `f` on each element of `xs` on its own (`LoggedRun`), so that the caller replays the runs it needs, in order
-(`replayRun`). Many elements run in parallel tasks, each over a slice of `xs`.
+How many tasks one usage-cutoff check may spawn for its reads (`Lake.Env.usageCutoffReadTasks`,
+`LAKE_USAGE_CUTOFF_READ_TASKS`): 1 unless the variable says otherwise. At least 1, whatever the environment holds, so
+that a slice is never empty and the count of slices is never a division by zero.
 -/
-def parallelRuns (xs : Array α) (f : α → JobM β) :
-    JobM (Array (LoggedRun β)) := JobM.ofFn fun fetch pkg? stack store ctx s => do
-  let run (x : α) : BaseIO (LoggedRun β) := do
-    return match ← (f x).toFn fetch pkg? stack store ctx {} with
-      | .ok b s' => (s'.log.entries, .ok b)
-      | .error e s' => (s'.log.entries, .error e.val)
-  let tasks := 2 * max 1 (System.Platform.Internal.getHardwareConcurrency ()).toNat
-  let size := max minRunsPerTask ((xs.size + tasks - 1) / tasks)
-  if xs.size ≤ size then
-    return .ok (← xs.mapM run) s
-  let chunks ← (Array.range ((xs.size + size - 1) / size)).mapM fun i => BaseIO.asTask do
-    (xs.extract (i * size) ((i + 1) * size)).mapM run
-  let mut runs := Array.mkEmpty xs.size
-  for chunk in chunks do
-    runs := runs ++ (← IO.wait chunk)
-  return .ok runs s
+@[inline] def usageCutoffReadTasks [Functor m] [MonadLakeEnv m] : m Nat :=
+  (max 1 ·.usageCutoffReadTasks) <$> getLakeEnv
+
+/--
+Runs `f` on each element of `xs` on its own (`LoggedRun`), so that the caller replays the runs it needs, in order
+(`replayRun`). The runs are serial unless `usageCutoffReadTasks` allows more tasks, which then take slices of `xs`.
+
+A build of a large workspace runs thousands of checks at once, each its own job, so the reads already use every core
+and a check's own tasks only add traffic on the Lean runtime's task manager: every task's end wakes every thread
+waiting for a task (`task_manager::resolve_core`). Measured on the Linux tree, in a round that checks 13,000 modules on
+96 cores: 102-125 s of wall time with serial reads, against 131-143 s with a task per 64 modules.
+-/
+def parallelRuns (xs : Array α) (f : α → JobM β) : JobM (Array (LoggedRun β)) := do
+  let tasks ← usageCutoffReadTasks
+  JobM.ofFn fun fetch pkg? stack store ctx s => do
+    let run (x : α) : BaseIO (LoggedRun β) := do
+      return match ← (f x).toFn fetch pkg? stack store ctx {} with
+        | .ok b s' => (s'.log.entries, .ok b)
+        | .error e s' => (s'.log.entries, .error e.val)
+    let size := max minRunsPerTask ((xs.size + tasks - 1) / tasks)
+    if xs.size ≤ size then
+      return .ok (← xs.mapM run) s
+    let chunks ← (Array.range ((xs.size + size - 1) / size)).mapM fun i => BaseIO.asTask do
+      (xs.extract (i * size) ((i + 1) * size)).mapM run
+    let mut runs := Array.mkEmpty xs.size
+    for chunk in chunks do
+      runs := runs ++ (← IO.wait chunk)
+    return .ok runs s
 
 /--
 A hash of every artifact of every module-system module in an import closure, with its name.
