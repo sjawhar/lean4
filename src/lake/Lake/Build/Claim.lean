@@ -20,23 +20,28 @@ import Init.Data.String.Legacy
 /-! # Claims in the Shared Remote Cache
 
 A build that writes the shared remote cache (with `LAKE_REMOTE_CACHE_QUEUE`, unless
-`LAKE_REMOTE_CACHE_CLAIMS` is false; see `Env.remoteCacheClaimService?`) claims an input that it
-is about to compile when every other worker thread of it compiles, so that machines that build
-the same targets at once, and have more to compile than they can at once, compile each input
+`LAKE_REMOTE_CACHE_CLAIMS` is false; see `Env.remoteCacheClaimService?`) can claim an input that
+it is about to compile, so that machines that build the same targets at once compile each input
 once and share the compiles out. The claim of an input is the object
 `claim/<remoteScope>/<inputHash>` (see `remoteClaimScope`), whose body (`RemoteClaim`) names its
 holder and what the holder does.
 
-* A build claims, and waits for other builds, only when `LAKE_CLAIM_SLOTS` of its compiles
-  already run (`runningCompiles`). The default is one less than its worker threads: the job that
-  asks runs on a worker itself, so with `n` workers at most `n - 1` compiles run beside it, and
-  the default claims exactly when every other worker compiles. With a worker free, it compiles at
-  once without a claim. Waiting for another build saves a build time only when it cannot compile
-  more at once, and every claim request and every wait lies on the build's path; a build whose
-  dependency graph leaves its workers idle (one measured cold build ran 6 compiles at once on
-  average on 160 cores) waits on nothing but that path. `LAKE_CLAIM_SLOTS=0` claims every input.
+* **Claims are off unless `LAKE_CLAIM_SLOTS` is set.** It names how many of the build's compiles
+  must already run before it claims the next input and waits for other builds
+  (`runningCompiles`); `0` claims every input. A build with a worker free compiles at once, and
+  a build that claims nothing still queues its outputs and pushes them.
+
+  Claims are off by default because they cost wall time on both machines where they were
+  measured. On the Task 6 targets (1,679 compiles, a fresh scope per run, counted runs on two
+  machines of 160 and 96 cores): one machine alone, with no remote cache, took 250-254 s; two
+  machines with claims took 263-266 s. With four workers on each machine, a build that fills
+  them: alone 394-400 s, the pair 412-422 s, and about a third of the inputs were compiled on
+  both machines. The reason is that this build is bound by its dependency chain, not by its
+  workers (one machine ran 6 compiles at once on average on 160 cores): a second machine cannot
+  shorten that chain, so sharing the compiles out saves only idle workers, while every claim
+  request and every wait lies on the build's path.
 * Before it compiles a target whose outputs are neither in the local nor in the remote cache, a
-  build whose workers are all busy creates the claim of the input (only if it does not exist:
+  build whose compiles fill its slots creates the claim of the input (only if it does not exist:
   `x-goog-if-generation-match: 0`) with state `building` (`claimInput`).
 * The build that created it compiles the target, and rewrites the claim (only if it still has the
   generation the build last wrote) every 60 seconds until the compile ends (`registerClaim`; see
@@ -324,6 +329,27 @@ def HeldClaim.abandon (claim : HeldClaim) : JobM Unit := do
     markClaimFailed claim.url held generation
 
 /--
+The waits of the jobs that wait for another build's claim, or leave an input to another build,
+and have not looked again yet (`ClaimWait.after`), by a number that counts them: a compile that
+ends wakes one of them, so a job that could compile at once on the freed worker does not wait
+out its timer (`wakeClaimWait`). A wait is woken once, by its timer or by a compile, whichever
+is first.
+-/
+builtin_initialize claimWaits : Std.Mutex (Nat × Std.HashMap Nat (IO.Promise Unit)) ←
+  Std.Mutex.new (0, {})
+
+/-- Wakes one wait of `claimWaits`, if any: its job looks for its input again at once. -/
+def wakeClaimWait : BaseIO Unit := do
+  let some promise ← claimWaits.atomically do
+      let (next, waits) ← get
+      let some (id, promise) := waits.toArray[0]?
+        | return none
+      set (next, waits.erase id)
+      return some promise
+    | return
+  promise.resolve ()
+
+/--
 How many compiles of inputs this process runs now (see `withClaim`): a build claims an input, and
 waits for other builds, only once these fill `Env.claimSlots` (see `claimInput`).
 -/
@@ -332,7 +358,10 @@ builtin_initialize runningCompiles : IO.Ref Nat ← IO.mkRef 0
 /--
 Runs `build`, the compile of an input (counted in `runningCompiles` while it runs) whose claim
 this build holds (if `claim?`), and then marks the claim `failed` if the build did not queue the
-outputs (see `HeldClaim.abandon`), whether `build` succeeded or not.
+outputs (see `HeldClaim.abandon`), whether `build` succeeded or not. When the compile leaves
+fewer running than `Env.claimSlots`, it wakes one job that waits for another build's claim (see
+`wakeClaimWait`): that job can compile at once on the worker this compile frees, and must not
+wait out its timer first.
 -/
 public def withClaim (claim? : Option HeldClaim) (build : JobM α) : JobM α := do
   let run : JobM α := do
@@ -345,8 +374,14 @@ public def withClaim (claim? : Option HeldClaim) (build : JobM α) : JobM α := 
     catch e =>
       claim.abandon
       throw e
+  let slots? := (← getWorkspace).lakeEnv.claimSlots
   runningCompiles.modify (· + 1)
-  try run finally runningCompiles.modify (· - 1)
+  try
+    run
+  finally
+    let running ← runningCompiles.modifyGet fun n => (n - 1, n - 1)
+    if slots?.any (running < ·) then
+      wakeClaimWait
 
 /-! ## Sharing the Inputs Out -/
 
@@ -450,10 +485,24 @@ public structure ClaimWait where
   -/
   sawDone : Bool
 
-/-- A wait of `ms` milliseconds, which holds no thread. -/
+/--
+A wait of `ms` milliseconds, which holds no thread, and which a compile that ends can cut short
+(see `claimWaits`). The timer's own promise resolves this one, so both paths end the wait and
+only the first has an effect.
+-/
 def ClaimWait.after (ms : Nat) (sawDone : Bool) : IO ClaimWait := do
+  let promise ← IO.Promise.new
+  let id ← claimWaits.atomically do
+    let (next, waits) ← get
+    set (next + 1, waits.insert next promise)
+    return next
   let timer ← Std.Internal.UV.Timer.mk ms.toUInt64 false
-  return {promise := ← timer.next, sawDone}
+  let ticked ← timer.next
+  -- The timer and its promise live as long as this task, which ends the wait when it fires
+  discard <| BaseIO.mapTask (t := ticked.result?) fun _ => do
+    claimWaits.atomically (modify fun (next, waits) => (next, waits.erase id))
+    promise.resolve ()
+  return {promise, sawDone}
 
 /-- What a build does about the claim of an input that it is about to compile. -/
 public inductive ClaimStep
@@ -529,11 +578,14 @@ public def claimInput (pkg : Package) (inputHash : Hash) (sawDone := false) : Jo
   -- Claims are only for the service that accepts the cache token (a Cloud Storage bucket)
   unless service.sendsCacheToken url do
     return .compile none
-  -- With a free compile slot, this build compiles at once and neither claims nor waits: waiting
-  -- for another build saves it time only when it cannot compile more at once, and every claim
-  -- request and every wait lies on its path, which is all a build whose dependency graph leaves
-  -- its slots idle waits on
-  if (← runningCompiles.get) < ws.lakeEnv.claimSlots then
+  -- Claims are off unless `LAKE_CLAIM_SLOTS` names the compiles that must already run, and a
+  -- build with a worker free compiles at once: waiting for another build saves it time only when
+  -- it cannot compile more at once, and every claim request and every wait lies on its path,
+  -- which is all a build whose dependency graph leaves its workers idle waits on (see the
+  -- module docs for the measurement)
+  let some slots := ws.lakeEnv.claimSlots
+    | return .compile none
+  if (← runningCompiles.get) < slots then
     return .compile none
   let takeoverSecs := ws.lakeEnv.claimTakeoverSecs
   let deferSecs := ws.lakeEnv.claimDeferSecs
