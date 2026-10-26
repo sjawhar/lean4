@@ -809,19 +809,23 @@ runs. At the end, the push writes its counts to `remote-status-push.json` in the
 cache directory. It exits with status 1 if entries remain in the queue.
 
 Unless `LAKE_REMOTE_CACHE_CLAIMS` is set to a false value, a build with the
-queue on also claims an input before it compiles it when it has no free
-compile slot (`LAKE_CLAIM_SLOTS` compiles already run), so that machines that
-build the same targets at once, with more to compile than they can at once,
-compile each one once: it creates the object `claim/<scope>/<inputHash>` in
-the remote cache if no build holds it, and rewrites it while it compiles. With
-a free slot it compiles at once, and neither claims nor waits. A build with
-full slots that finds the claim taken waits
-for the input's mapping instead of compiling, and takes the claim over when the
+queue on also claims an input before it compiles it when every other worker
+thread of it is compiling (when `LAKE_CLAIM_SLOTS` compiles already run; by
+default one less than its worker threads), so that machines that build the
+same targets at once, with more to compile than they can at once, compile
+each one once: it creates the object `claim/<scope>/<inputHash>` in the
+remote cache if no build holds it, and rewrites it while it compiles. With a
+worker free it compiles at once, and neither claims nor waits, so a build
+whose targets keep few compiles running (most of a cold build is often one
+chain of modules) never claims, and two machines may each compile an input.
+A build whose workers are all busy and that finds the claim taken waits for
+the input's mapping instead of compiling, and takes the claim over when the
 claim says that the compile failed, when the claim says that its compile or
 its upload still runs but its holder (the build, or the push that uploads its
-outputs) is a process of this machine that no longer runs, or when the remote
-cache has not replaced it for `LAKE_CLAIM_TAKEOVER_SECS` seconds (600 by
-default) or the build has seen it unchanged for that long by its own clock.
+outputs) is a process of this machine that no longer runs and the build has
+seen the claim unchanged for 5 seconds, or when the remote cache has not
+replaced it for `LAKE_CLAIM_TAKEOVER_SECS` seconds (600 by default) or the
+build has seen it unchanged for that long by its own clock.
 Builds that see each other compiling share the inputs out: each gives every
 input it is about to compile to one of the builds whose live claim saying
 `building` it has read, by the input's hash, claims its own and leaves the
@@ -925,9 +929,9 @@ A build that uploads to such a service (`LAKE_REMOTE_CACHE_QUEUE`; see
                                    them)
   LAKE_CLAIM_SLOTS=<n>             claim an input, and wait for other builds,
                                    only once `n` compiles already run (by
-                                   default the worker threads:
-                                   `LEAN_NUM_THREADS` or the cores; 0 claims
-                                   every input)
+                                   default one less than the worker threads,
+                                   `LEAN_NUM_THREADS` or the cores: every
+                                   other worker compiles; 0 claims every input)
   LAKE_PUSH_SHELL=<path>           the shell that starts the background push
                                    (`/bin/bash` by default); it must close
                                    every descriptor by number, and where it is

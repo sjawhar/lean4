@@ -115,8 +115,8 @@ structure ReadyEntry where
   /--
   The URL of the claim of the entry's input and the generation that the build that queued the
   entry left it with, if the build held the claim: the push marks the claim `queued` as its own
-  as soon as it has staged the entry (`takeEntryClaim`), and `done` after the mapping is uploaded
-  (`markClaimsDone`).
+  as soon as a pass reads the line (`takeLineClaims`), and stages the entry with the claim's new
+  generation, and marks it `done` after the mapping is uploaded (`markClaimsDone`).
   -/
   claim? : Option (String × String) := none
 
@@ -454,32 +454,85 @@ def uniqueUploads (uploads : Array RemoteUpload) : Array RemoteUpload :=
   (uploads.foldl (init := (#[], ({} : Std.HashSet String))) fun (kept, urls) u =>
     if urls.contains u.url then (kept, urls) else (kept.push u, urls.insert u.url)).1
 
+/-- What `takeLineClaim` did with the claim of a queue line. -/
+inductive LineClaim
+/-- The push took the claim; it now has this generation. -/
+| taken (generation : String)
+/-- The line names no claim, or another build changed the claim: there is nothing to take. -/
+| none
+/-- The request failed (the message says how): a later round tries again. -/
+| retry (msg : String)
+
 /--
-Marks the claim of `entry`, if it names one, `queued` with this push as its holder (see
-`markClaimQueued`), as soon as the entry is staged: until then the claim names the build that
-compiled the input, whose process may already be gone, and a build on this host would take it
-over. Returns the entry with the generation that the claim now has, so that `markClaimsDone`
-writes against it. A claim that another build changed meanwhile is left as it is, with the
-generation that the queue line named.
+Marks the claim that the queue line `line` names, if any, `queued` with this push as its holder
+(see `markClaimQueued`). A claim that another build changed is left as it is: its outputs are
+still uploaded, and `markClaimsDone` then writes against the line's generation.
 -/
-def takeEntryClaim (entry : ReadyEntry) (holder : String) : BaseIO ReadyEntry := do
-  let some (url, generation) := entry.claim?
-    | return entry
-  match ← tryLogIO (markClaimQueued entry.service url generation holder) with
-  | .ok (some new) => return {entry with claim? := some (url, new)}
-  | _ => return entry
+def takeLineClaim (ctx : PushContext) (line : String) (holder : String) : BaseIO LineClaim := do
+  let .ok (entry : RemotePushEntry) := Json.parse line >>= fromJson?
+    | return .none
+  let some generation := entry.claimGeneration?
+    | return .none
+  let .ok service := findPushService ctx entry.service
+    | return .none
+  let url := service.remoteClaimUrl entry.remoteScope entry.inputHash
+  match ← tryLogIO (markClaimQueued service url generation holder) with
+  | .ok (some new) => return .taken new
+  | .ok none => return .none
+  | .error msg => return .retry s!"could not take the claim {url}:\n{msg}"
+
+/--
+The claims that a push took, by queue line (see `takeLineClaims`): the generation of each claim
+taken, or `none` for a line with no claim to take (or one being taken). Shared by the push's
+passes and its claim taker (`claimTaker`), with the messages of the requests that failed, which
+the passes log.
+-/
+structure TakenClaims where
+  generations : IO.Ref (Std.HashMap String (Option String))
+  messages : IO.Ref (Array String)
+
+/--
+Takes the claims that the queue lines `lines` name (see `takeLineClaim`), with `ctx.workers`
+workers, each line once: until then each claim names the build that compiled the input, whose
+process may already be gone, and a build on this host takes the claim over once it has seen it
+so for `remoteClaimGoneGraceSecs`. A line whose request failed is tried again by a later call.
+-/
+def takeLineClaims (ctx : PushContext) (taken : TakenClaims) (lines : Array String) : BaseIO Unit := do
+  let holder ← claimHolder
+  let next ← IO.mkRef 0
+  let worker : BaseIO Unit := do
+    repeat
+      let i ← next.modifyGet fun i => (i, i + 1)
+      let some line := lines[i]?
+        | break
+      -- Each line is taken once, by whichever of the passes and the taker reserves it first
+      let reserved ← taken.generations.modifyGet fun m =>
+        if m.contains line then (false, m) else (true, m.insert line none)
+      unless reserved do
+        continue
+      match ← takeLineClaim ctx line holder with
+      | .taken generation => taken.generations.modify (·.insert line (some generation))
+      | .none => pure ()
+      | .retry msg =>
+        taken.generations.modify (·.erase line)
+        taken.messages.modify (·.push msg)
+  let tasks ← (Array.range (min ctx.workers lines.size)).mapM fun _ =>
+    IO.asTask (prio := .dedicated) worker
+  for task in tasks do
+    discard <| IO.wait task
 
 /--
 Stages a prefix of the queue lines `lines` in `dir` with `ctx.workers` workers, each in its own
 thread, since staging a module runs `leantar`. A worker takes the next line in order until every
 line is taken or `pushChunkBytes` are staged, so the lines staged are a prefix of `lines` (at least
-one), and takes the claim of each line it staged (see `takeEntryClaim`). A failure while a line is
-staged fails only that line. Returns the result of each staged line with the log of its staging,
-in order.
+one). A staged entry names the generation that this push gave its claim (`taken`, see
+`takeLineClaims`). A failure while a line is staged fails only that line. Returns the result of
+each staged line with the log of its staging, in order.
 -/
-def stageLines (ctx : PushContext) (dir : FilePath) (lines : Array String)
+def stageLines
+  (ctx : PushContext) (dir : FilePath) (lines : Array String)
+  (taken : Std.HashMap String (Option String))
 : BaseIO (Array (StagedEntry × Log)) := do
-  let holder ← claimHolder
   -- The index of the next line to take, and the bytes staged so far
   let progress ← IO.mkRef ((0 : Nat), (0 : Nat))
   let results ← IO.mkRef (Array.replicate lines.size (none : Option (StagedEntry × Log)))
@@ -492,12 +545,17 @@ def stageLines (ctx : PushContext) (dir : FilePath) (lines : Array String)
           (none, (next, staged))
       let some idx := idx?
         | break
-      let (r?, log) ← (stageLine ctx (dir / toString idx) idx lines[idx]!).captureLog
-      let r ← match r?.getD .failed with
+      let line := lines[idx]!
+      let (r?, log) ← (stageLine ctx (dir / toString idx) idx line).captureLog
+      let r := match r?.getD .failed with
         | .ready entry =>
-          progress.modify fun (next, staged) => (next, staged + entry.bytes)
-          pure (.ready (← takeEntryClaim entry holder))
-        | r => pure r
+          match entry.claim?, taken[line]? with
+          | some (url, _), some (some generation) =>
+            .ready {entry with claim? := some (url, generation)}
+          | _, _ => .ready entry
+        | r => r
+      if let .ready entry := r then
+        progress.modify fun (next, staged) => (next, staged + entry.bytes)
       results.modify (·.set! idx (some (r, log)))
   let tasks ← (Array.range ctx.workers).mapM fun _ =>
     IO.asTask (prio := .dedicated) (monadLift worker)
@@ -550,18 +608,21 @@ def markClaimsDone (ctx : PushContext) (entries : Array ReadyEntry) : LoggerIO U
 
 /--
 Pushes a prefix of the queue lines `lines`, staged in the push's own staging directory: it stages
-lines until it has staged `pushChunkBytes` (see `stageLines`), uploads the artifacts of the staged
-entries, and then the mapping of each entry whose artifacts are all present. Returns the outcome
-of each line that it handled, at least one.
+lines until it has staged `pushChunkBytes` (see `stageLines`; `taken` holds the generations of
+the claims this push took), uploads the artifacts of the staged entries, and then the mapping of
+each entry whose artifacts are all present. Returns the outcome of each line that it handled, at
+least one.
 -/
-def pushChunk (ctx : PushContext) (lines : Array String) : LoggerIO (Array PushOutcome) := do
+def pushChunk
+  (ctx : PushContext) (lines : Array String) (taken : Std.HashMap String (Option String))
+: LoggerIO (Array PushOutcome) := do
   let dir := ctx.stagingDir
   removeDirAllIfExists dir
   IO.FS.createDirAll dir
   try
     let mut outcomes : Array PushOutcome := #[]
     let mut ready : Array ReadyEntry := #[]
-    for (staged, log) in ← stageLines ctx dir lines do
+    for (staged, log) in ← stageLines ctx dir lines taken do
       log.replay
       match staged with
       | .ready entry =>
@@ -572,7 +633,7 @@ def pushChunk (ctx : PushContext) (lines : Array String) : LoggerIO (Array PushO
     let services := ready.foldl (init := #[]) fun services e =>
       if services.any (·.1 == e.serviceName) then services else services.push (e.serviceName, e.service)
     for (name, service) in services do
-      -- Each claim of these entries is this push's now (`takeEntryClaim`)
+      -- Each claim of these entries is this push's now (`takeLineClaims`)
       let group := ready.filter (·.serviceName == name)
       -- Artifacts go up before mappings, so a reader that finds a mapping finds its artifacts
       let artifacts := uniqueUploads (group.flatMap (·.artifacts))
@@ -629,10 +690,37 @@ How long a push that follows a build waits before it tries again the lines whose
 def followRetryMs : Nat := 30000
 
 /--
+While a push follows a build, takes the claims of the lines that the build queues every
+`followPollMs`, apart from the passes, which can take long (staging and uploads): so each claim
+is the push's within about a second of its line, however long the uploads take, and well within
+`remoteClaimGoneGraceSecs`. It reads the queue under the queue lock with a handle of its own (a
+`flock` excludes only other handles), and stops once `stop` is set.
+-/
+partial def claimTaker (ctx : PushContext) (taken : TakenClaims) (stop : IO.Ref Bool) : BaseIO Unit := do
+  let .ok queueLock ← (IO.FS.Handle.mk ctx.cache.pushQueueLockFile .append).toBaseIO
+    | return
+  let rec loop : BaseIO Unit := do
+    IO.sleep followPollMs
+    if ← stop.get then
+      return
+    let read : IO (Array String) := do
+      queueLock.lock
+      try (·.1) <$> readQueueLines ctx.cache finally queueLock.unlock
+    if let .ok lines ← read.toBaseIO then
+      let known ← taken.generations.get
+      let fresh := lines.filter (!known.contains ·)
+      unless fresh.isEmpty do
+        takeLineClaims ctx taken fresh
+    loop
+  loop
+
+/--
 Runs passes of the push until a pass finds no queue line that this push has not tried, then
 releases `pushLock` (see the module docs). `done` counts the lines that the last pass pushed or
 dropped, which this pass removes from the queue. `failed` holds the lines whose upload failed:
-they stay in the queue. Returns the number of lines left in the queue.
+they stay in the queue. `taken` holds the claims this push took (see `takeLineClaims`): each pass
+first takes the claims of its lines that it has not taken yet, and stages each entry with its
+claim's new generation. Returns the number of lines left in the queue.
 
 With `follow?` (the follow file of a build; see `startBuildPush`), a pass that finds nothing to
 push waits `followPollMs` and looks again while that build runs, so the build's one push uploads
@@ -642,7 +730,7 @@ the build has ended do not. Whether the build runs is read before the queue, so 
 it ended also sees every line it queued.
 -/
 partial def pushLoop
-  (ctx : PushContext) (pushLock queueLock : IO.FS.Handle)
+  (ctx : PushContext) (pushLock queueLock : IO.FS.Handle) (taken : TakenClaims)
   (stats : PushStats) (failed : Std.HashSet String) (done : Std.HashMap String Nat)
   (follow? : Option FilePath := none) (retryAt : Nat := 0)
 : LoggerIO Nat := do
@@ -657,6 +745,11 @@ partial def pushLoop
     try writeQueue cache lines catch e => queueLock.unlock; throw e
   let stats := {stats with dropped := stats.dropped + invalid}
   let todo := lines.filter (!failed.contains ·)
+  -- The lines that left the queue need no generation any more
+  unless done.isEmpty do
+    taken.generations.modify (·.filter fun line _ => !done.contains line)
+  for msg in ← taken.messages.modifyGet (·, #[]) do
+    logVerbose msg
   if todo.isEmpty then
     if following then
       queueLock.unlock
@@ -664,9 +757,9 @@ partial def pushLoop
         -- Tries them again: they no longer count as failed unless they fail again
         logInfo s!"trying {failed.size} failed queue entries again"
         let stats := {stats with failed := stats.failed - failed.size}
-        return ← pushLoop ctx pushLock queueLock stats {} {} follow? retryAt
+        return ← pushLoop ctx pushLock queueLock taken stats {} {} follow? retryAt
       IO.sleep followPollMs
-      return ← pushLoop ctx pushLock queueLock stats failed {} follow? retryAt
+      return ← pushLoop ctx pushLock queueLock taken stats failed {} follow? retryAt
     if let .error e ← (writePushStatus cache stats lines.size).toBaseIO then
       logWarning s!"could not write {cache.pushStatusFile}: {e}"
     -- Released while the queue is locked: a line appended after this is the next push's
@@ -677,6 +770,7 @@ partial def pushLoop
     return lines.size
   queueLock.unlock
   logInfo s!"pushing {todo.size} queue entries to the remote cache"
+  takeLineClaims ctx taken todo
   let mut stats := stats
   let mut failed := failed
   let mut retryAt := retryAt
@@ -684,7 +778,9 @@ partial def pushLoop
   let mut start := 0
   while start < todo.size do
     let chunk := todo.extract start (start + pushChunkSize)
-    let outcomes ← try pushChunk ctx chunk catch _ => pure (Array.replicate chunk.size .failed)
+    let generations ← taken.generations.get
+    let outcomes ← try pushChunk ctx chunk generations
+      catch _ => pure (Array.replicate chunk.size .failed)
     for line in chunk, outcome in outcomes do
       match outcome with
       | .pushed =>
@@ -698,7 +794,7 @@ partial def pushLoop
         failed := failed.insert line
         retryAt := (← IO.monoMsNow) + followRetryMs
     start := start + max 1 outcomes.size
-  pushLoop ctx pushLock queueLock stats failed done follow? retryAt
+  pushLoop ctx pushLock queueLock taken stats failed done follow? retryAt
 
 /--
 Uploads the write-back queue of `cache` to the shared remote cache (see the module docs).
@@ -735,6 +831,18 @@ public def pushRemoteCache
   let workers ← pushWorkers
   logVerbose s!"staging with {workers} workers"
   let queueLock ← IO.FS.Handle.mk cache.pushQueueLockFile .append
-  pushLoop {cache, env, lakeCfg, stagingDir, workers} pushLock queueLock {} {} {} follow?
+  let ctx : PushContext := {cache, env, lakeCfg, stagingDir, workers}
+  let taken : TakenClaims := {generations := ← IO.mkRef {}, messages := ← IO.mkRef #[]}
+  -- A push that follows a build takes the claims of its lines as they come (see `claimTaker`)
+  let stop ← IO.mkRef false
+  let taker? ← if follow?.isSome then
+      some <$> IO.asTask (prio := .dedicated) (claimTaker ctx taken stop)
+    else pure none
+  try
+    pushLoop ctx pushLock queueLock taken {} {} {} follow?
+  finally
+    stop.set true
+    if let some taker := taker? then
+      discard <| IO.wait taker
 
 end Lake
