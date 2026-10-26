@@ -22,9 +22,9 @@ WORK="$TEST_DIR/.lake/work"
 # * `fetch`: without it, and with `Plugin` fetched from the cache before its object files are built
 # * `copy`: as `fetch`, with the cache on another file system (so Lake copies instead of linking)
 CACHE_OF_copy=
-if [ "$UNAME" = Linux ] && [ -d /dev/shm ]; then
-  CACHE_OF_copy=$(mktemp -d /dev/shm/lake-cFileName.XXXXXX)
-  trap 'rm -rf "$CACHE_OF_copy"' EXIT
+if [ "$UNAME" = Linux ] && [ -d /dev/shm ] && [ -w /dev/shm ]; then
+  CACHE_OF_copy=$(mktemp -d /dev/shm/lake-cFileName.XXXXXX 2>/dev/null) || CACHE_OF_copy=
+  [ -z "$CACHE_OF_copy" ] || trap 'rm -rf "$CACHE_OF_copy"' EXIT
 fi
 cache_of() {
   if [ "$1" = copy ]; then echo "$CACHE_OF_copy"; else echo "$WORK/$1/cache"; fi
