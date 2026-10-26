@@ -167,6 +167,12 @@ public structure BuildContext extends BuildConfig, Context where
   fileDigests : Shards 1024 (Lean.PHashMap FilePath (Lean.ModuleUsage.FileStamp × Lean.ModuleUsage.Digest))
   /-- The kernel constants usage-cutoff checks read from `.olean` files in this build. -/
   kernelProviders : Std.Mutex KernelProviders
+  /--
+  How many usage-cutoff checks (`Lake.Module.usageUpToDate`) and key writes (`Lake.Module.writeUsekey`) run now: each
+  reads its closure with more tasks the fewer run (`Lake.usageCutoffReadTasks`). An `IO.Ref` of a scalar: an update
+  is an atomic exchange held for a few nanoseconds, with no mutex, and a build makes two per check or key write.
+  -/
+  usageCutoffInFlight : IO.Ref Nat
 
 /-- A transformer to equip a monad with a `BuildContext`. -/
 public abbrev BuildT := ReaderT BuildContext
