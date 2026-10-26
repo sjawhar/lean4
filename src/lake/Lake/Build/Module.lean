@@ -1123,18 +1123,51 @@ def Module.tryUnpackLtar (mod : Module) (ltar : FilePath) (inputHash : Hash) :
 /--
 Handles a cached archive of `mod`'s input that did not unpack (`log` is the failure), though its
 digests matched: the build treats it as a cache miss and compiles. It removes what the unpack left
-(the outputs and the trace), moves the archive out of the cache's artifacts into its quarantine
-directory when it is there, records the failure in the read status (see `RemoteReadStatus`) at
-verbose level, and does not restore this input's archive again in this process.
+(the outputs and the trace), takes the archive out of the cache, records the failure in the read
+status (see `RemoteReadStatus`) at verbose level, and does not restore this input's archive again
+in this process.
+
+As the push does with an entry it found wrong (see `Lake.quarantineUnlessReplaced`), it takes the
+archive away from its name only by renaming it into the cache's quarantine directory, which
+captures exactly the file that is there, and then checks that it took the file that did not
+unpack: `was` is that file's size and modification time, read before the unpack. A file that
+another process installed in the meantime differs, and goes back to its name, so this build
+removes only the bytes it tested. The archive is left where it is when it is not in this cache's
+artifacts.
 -/
-def Module.rejectArchive (mod : Module) (inputHash : Hash) (ltar : FilePath) (log : Log) :
-    JobM Unit := do
+def Module.rejectArchive
+  (mod : Module) (inputHash : Hash) (ltar : FilePath) (was : Option (UInt64 × Int)) (log : Log)
+: JobM Unit := do
   rejectedArchives.atomically (modify (·.insert (mod.archiveKey inputHash)))
   discard <| mod.clearOutputArtifacts.toBaseIO
   discard <| (removeFileIfExists mod.traceFile).toBaseIO
   let cache ← getLakeCache
-  let moved ← if ltar.toString.startsWith (cache.artifactDir.toString ++ "/") then
-      describeQuarantine cache ltar (ltar.fileName.getD "archive.ltar")
+  let moved ←
+    if ltar.toString.startsWith (cache.artifactDir.toString ++ "/") then
+      let take : IO String := do
+        IO.FS.createDirAll cache.quarantineDir
+        let name := ltar.fileName.getD "archive.ltar"
+        let captured ← uniqueTmpPath (cache.quarantineDir / name)
+        try
+          IO.FS.rename ltar captured
+        catch
+          | .noFileOrDirectory .. => return "another process moved it away first"
+          | e => throw e
+        let now ← match (← captured.metadata.toBaseIO) with
+          | .ok md => pure (some (md.byteSize, md.modified.sec))
+          | .error _ => pure none
+        if now != was then
+          -- Another process installed an archive after the unpack failed: it is not this
+          -- build's to remove
+          discard <| (IO.FS.rename captured ltar).toBaseIO
+          return "another process replaced it, which this build kept"
+        match (← (cache.quarantine captured name).toBaseIO) with
+        | .ok (some dest) => return s!"moved it to: {dest}"
+        | .ok none => return s!"moved it to: {captured}"
+        | .error e => return s!"moved it to: {captured} ({e})"
+      match (← take.toBaseIO) with
+      | .ok msg => pure msg
+      | .error e => pure s!"could not move it into quarantine: {e}"
     else pure "it is not in the cache"
   let why := log.entries.foldl (init := "") fun msg entry =>
     if msg.isEmpty then entry.message else s!"{msg}\n- {entry.message}"
@@ -1225,8 +1258,11 @@ where
       mod.clearOutputArtifacts
       -- A cached archive whose digests match but which does not unpack is a cache miss: the
       -- module compiles, and this process does not restore that archive again
+      let was ← match (← ltar.path.metadata.toBaseIO) with
+        | .ok md => pure (some (md.byteSize, md.modified.sec))
+        | .error _ => pure none
       if let .error log ← mod.tryUnpackLtar ltar.path inputHash then
-        mod.rejectArchive inputHash ltar.path log
+        mod.rejectArchive inputHash ltar.path was log
         return .incomplete .missing none
       -- Note: This branch implies that only the ltar output is (validly) cached.
       -- Thus, we use only the new trace unpacked from the ltar to resolve further artifacts.
