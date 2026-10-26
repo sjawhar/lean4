@@ -22,6 +22,13 @@ lean_lib Extra where
 lean_lib Order where
   roots := #[`Order.AB, `Order.BA]
 
+/--
+Three modules that import nothing, whose compiles wait 1, 2 and 3 times `LAKE_TEST_CLAIM_SLEEP`
+milliseconds, built only when named: a build with fewer workers than three runs out of them.
+-/
+lean_lib Wide where
+  roots := #[`Wide.One, `Wide.Two, `Wide.Three]
+
 lean_exe claimexe where
   root := `Main
 
