@@ -780,8 +780,13 @@ def parseResponseHeaders (text : String) : Array (String × String) :=
 How long one request for an object of the shared remote cache that a build makes for a claim may
 take in all, in seconds (`curl --max-time`), so that a request that is answered but keeps sending
 stays bounded. Claim requests are not retried (a claim that fails is a cache miss), so each
-request ends within this time; one that the remote cache refuses for its token (401) is sent once
-more with a renewed token, so a claim request takes at most about twice this time.
+request ends within this time.
+
+A request that the remote cache refuses for its token (401) renews the token and is sent once
+more, and the renewal takes its own time: the token command's own limit (`CacheToken.timeLimitMs`,
+60 s, for `LAKE_CACHE_TOKEN_CMD`). A renewal happens at most once per request, so a claim request
+takes at most `remoteObjectMaxSecs` + the token command's limit + `remoteObjectMaxSecs`: 100
+seconds with the limits as they are.
 -/
 def remoteObjectMaxSecs : Nat := 20
 
