@@ -302,6 +302,31 @@ assert most <= int(sys.argv[2]), most
 ' "$busy" 2
 }
 
+case_read_fast_refusals() {
+  # A read that the remote cache refuses at once does not count as one that waited for the remote,
+  # however long the read waited before its transfer started. Here every read of the build waits
+  # 4 s for the token command, which the first read runs, and then the remote refuses each read
+  # (403) at once: the build reads on, and does not stop reading the remote cache after 3 of them,
+  # as it does after 3 reads that waited for a remote that did not answer (`case_read_silent`).
+  # A read that waits for a run of the read broker (every run busy) waits outside its transfer in
+  # the same way.
+  fresh
+  : > "$SERVER_LOG"
+  LEAN_NUM_THREADS=16 LAKE_REMOTE_CACHE=deny LAKE_CACHE_TOKEN_CMD="sleep 4; $TOKEN_CMD" \
+    test_out 'Built Many' -v build Many
+  test_cmd cp produced.out refusals.out
+  test_cmd_eq 0 count 'stopped reading the remote cache' refusals.out
+  # Every module's mapping was read, and refused
+  test_cmd_eq 16 count '^GET .*/in/.* -> 403 ' "$SERVER_LOG"
+  "$PYTHON" -c '
+import json, sys
+status = json.load(open(sys.argv[1]))
+assert "stopped" not in status, status
+assert status["failures"] >= 16, status
+' "$CACHE_DIR/remote-status-read.json"
+}
+
 run_cases case_read_through case_read_404 case_read_invalid_mapping case_read_bad_artifact \
   case_read_bad_descriptor case_read_transport case_read_status case_read_artifact_status \
-  case_read_status_persistence case_read_silent case_read_shared_runs case_read_compile_slots
+  case_read_status_persistence case_read_silent case_read_shared_runs case_read_compile_slots \
+  case_read_fast_refusals

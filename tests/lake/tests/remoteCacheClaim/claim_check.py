@@ -141,6 +141,32 @@ def count_files(args):
     print(len(os.listdir(args.dir)) if os.path.isdir(args.dir) else 0)
 
 
+def parity_pair(args):
+    """Prints the first of `targets` whose input hash in the queue is even and the first whose
+    input hash is odd, or fails if the queue has them of one parity only. Two builds that share
+    out inputs give each input to one of them by its hash, so of two such inputs each build owns
+    one, whichever of the two sorts first."""
+    hashes = {}
+    with open(args.queue) as f:
+        for line in f:
+            if line.strip():
+                entry = json.loads(line)
+                hashes[entry["target"]] = entry["inputHash"]
+    first = {}
+    for target in args.targets:
+        first.setdefault(int(hashes[target], 16) % 2, target)
+    if len(first) < 2:
+        sys.exit("the input hashes of %s are all %s" % (args.targets, "odd" if 1 in first else "even"))
+    print(first[0], first[1])
+
+
+def owner(args):
+    """Prints which of the holders `holders` owns the input `hash`, as a build that has seen them
+    all gives it out: the holders in order, the hash picking one."""
+    holders = sorted(args.holders)
+    print(holders[int(args.hash, 16) % len(holders)])
+
+
 def fds(args):
     """Prints the open descriptors above 2 of a process that are files it did not open itself.
 
@@ -223,6 +249,16 @@ def main():
     p.add_argument("dir")
     p.add_argument("state")
     p.set_defaults(run=first_state)
+
+    p = sub.add_parser("parity-pair", help=parity_pair.__doc__)
+    p.add_argument("queue")
+    p.add_argument("targets", nargs="+")
+    p.set_defaults(run=parity_pair)
+
+    p = sub.add_parser("owner", help=owner.__doc__)
+    p.add_argument("hash")
+    p.add_argument("holders", nargs="+")
+    p.set_defaults(run=owner)
 
     p = sub.add_parser("fds", help=fds.__doc__)
     p.add_argument("pid", type=int)

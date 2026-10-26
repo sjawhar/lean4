@@ -951,19 +951,20 @@ archive into the cache's `quarantine` directory.
 A read of a mapping or an artifact of the remote cache gives up after 3
 seconds without a connection or without progress, and is tried once more
 after 1 second: such a read of a remote cache that does not answer ends after
-about 7 seconds, and is a miss. After 3 such reads in a row fail after 3
-seconds or more, the build reads no more mappings or artifacts of the remote
-cache and compiles its other targets (claims, if they are on, are still
-requested); `remote-status-read.json` in the cache directory says so
-(`stopped`). An upload of `lake cache push` gives up after 30 seconds without
-progress, or after 60 seconds and one more for each MiB that its `curl` run
-uploads, and one that failed transiently (a timeout, a host that could not be
-resolved, or HTTP 408, 429, 500, 502, 503, 504, 522 or 524) is tried again up
-to 3 times. A push removes the entries it uploaded from the queue as it goes,
-so a push that is stopped keeps its progress. A push you run whose first
-entries reach no service at all stops there and keeps every entry queued
-(`remote-status-push.json` says so); a build's own push tries them again every
-30 seconds while the build runs."
+about 7 seconds, and is a miss. After 3 such reads in a row fail once their
+transfers took 3 seconds or more (what a read waits before its transfer, e.g.
+behind other reads, does not count), the build reads no more mappings or
+artifacts of the remote cache and compiles its other targets (claims, if they
+are on, are still requested); `remote-status-read.json` in the cache directory
+says so (`stopped`). An upload of `lake cache push` gives up after 30 seconds
+without progress, or after 60 seconds and one more for each MiB that its
+`curl` run uploads, and one that failed transiently (a timeout, a host that
+could not be resolved, or HTTP 408, 429, 500, 502, 503, 504, 522 or 524) is
+tried again up to 3 times. A push removes the entries it uploaded from the
+queue as it goes, so a push that is stopped keeps its progress. A push you run
+whose first entries reach no service at all stops there and keeps every entry
+queued (`remote-status-push.json` says so); a build's own push tries them again
+every 30 seconds while the build runs."
 
 def helpScriptCli :=
 "Manage Lake scripts
