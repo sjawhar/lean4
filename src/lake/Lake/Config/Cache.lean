@@ -782,11 +782,12 @@ take in all, in seconds (`curl --max-time`), so that a request that is answered 
 stays bounded. Claim requests are not retried (a claim that fails is a cache miss), so each
 request ends within this time.
 
-A request that the remote cache refuses for its token (401) renews the token and is sent once
-more, and the renewal takes its own time: the token command's own limit (`CacheToken.timeLimitMs`,
-60 s, for `LAKE_CACHE_TOKEN_CMD`). A renewal happens at most once per request, so a claim request
-takes at most `remoteObjectMaxSecs` + the token command's limit + `remoteObjectMaxSecs`: 100
-seconds with the limits as they are.
+Each send carries the cache token, which `LAKE_CACHE_TOKEN_CMD` may have to print first (see
+`withCacheTokenRequest`): before the first send when this process holds no token, or one older than
+45 minutes (`cacheTokenFor?`), and again before the one second send after a refusal of the token
+(401, `CacheToken.renew`). Each run of the command is bounded by its own limit
+(`CacheToken.timeLimitMs`, 60 s). So a claim request takes at most two runs of the command and two
+sends: 60 + 20 + 60 + 20 = 160 seconds with the limits as they are.
 -/
 def remoteObjectMaxSecs : Nat := 20
 

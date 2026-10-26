@@ -1130,13 +1130,15 @@ in this process.
 As the push does with an entry it found wrong (see `Lake.quarantineUnlessReplaced`), it takes the
 archive away from its name only by renaming it into the cache's quarantine directory, which
 captures exactly the file that is there, and then checks that it took the file that did not
-unpack: `was` is that file's size and modification time, read before the unpack. A file that
-another process installed in the meantime differs, and goes back to its name, so this build
+unpack: `was` is that file's size and modification time (to the nanosecond), read before the
+unpack. A file that another process installed in the meantime differs, even one of the same size
+written within the same second, and goes back to its name, so this build
 removes only the bytes it tested. The archive is left where it is when it is not in this cache's
 artifacts.
 -/
 def Module.rejectArchive
-  (mod : Module) (inputHash : Hash) (ltar : FilePath) (was : Option (UInt64 × Int)) (log : Log)
+  (mod : Module) (inputHash : Hash) (ltar : FilePath) (was : Option (UInt64 × IO.FS.SystemTime))
+  (log : Log)
 : JobM Unit := do
   rejectedArchives.atomically (modify (·.insert (mod.archiveKey inputHash)))
   discard <| mod.clearOutputArtifacts.toBaseIO
@@ -1154,7 +1156,7 @@ def Module.rejectArchive
           | .noFileOrDirectory .. => return "another process moved it away first"
           | e => throw e
         let now ← match (← captured.metadata.toBaseIO) with
-          | .ok md => pure (some (md.byteSize, md.modified.sec))
+          | .ok md => pure (some (md.byteSize, md.modified))
           | .error _ => pure none
         if now != was then
           -- Another process installed an archive after the unpack failed: it is not this
@@ -1259,7 +1261,7 @@ where
       -- A cached archive whose digests match but which does not unpack is a cache miss: the
       -- module compiles, and this process does not restore that archive again
       let was ← match (← ltar.path.metadata.toBaseIO) with
-        | .ok md => pure (some (md.byteSize, md.modified.sec))
+        | .ok md => pure (some (md.byteSize, md.modified))
         | .error _ => pure none
       if let .error log ← mod.tryUnpackLtar ltar.path inputHash then
         mod.rejectArchive inputHash ltar.path was log
