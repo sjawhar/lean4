@@ -105,9 +105,10 @@ if(NOT CMAKE_SYSTEM_NAME MATCHES "Emscripten")
     list(APPEND EXTRA_DEPENDS cadical)
   endif()
   # Lake packs and unpacks `.ltar` artifacts with leantar. leantar releases up to at least v0.1.21 unpack every
-  # ByteArray of an `.olean` with element size 0, which corrupts `.olean` files holding constant prefix trees. Unless
-  # LEANTAR names one, leantar is built here from the pinned leangz source with the fix in `script/leantar`, before
-  # stage 0, whose Lake builds stage 1 with the artifact cache. Either leantar must pass `script/leantar/probe.cmake`.
+  # ByteArray of an `.olean` with element size 0, which corrupts `.olean` files holding constant prefix trees, and
+  # panic when they pack a string that holds a NUL character. Unless LEANTAR names one, leantar is built here from a
+  # pinned leangz commit that fixes both, before stage 0, whose Lake builds stage 1 with the artifact cache. Either
+  # leantar must pass `script/leantar/probe.cmake`.
   set(LEANTAR "" CACHE FILEPATH "leantar to use instead of building one")
   set(LEANTAR_PROBE -DWORK=${CMAKE_BINARY_DIR}/leantar-probe -P ${CMAKE_SOURCE_DIR}/script/leantar/probe.cmake)
   if(LEANTAR)
@@ -120,7 +121,7 @@ if(NOT CMAKE_SYSTEM_NAME MATCHES "Emscripten")
     if(NOT CARGO)
       message(
         FATAL_ERROR
-        "Building leantar needs cargo. Install it, or pass -DLEANTAR=<leantar built with script/leantar/leangz-sarray-elem-size.patch>."
+        "Building leantar needs cargo. Install it, or pass -DLEANTAR=<leantar built from sjawhar/leangz v0.1.21-machcsl.1>."
       )
     endif()
     # As for the bundled Rust checkers (src/CMakeLists.txt), cargo and the `cc` crate use the host toolchain, except in
@@ -161,20 +162,18 @@ if(NOT CMAKE_SYSTEM_NAME MATCHES "Emscripten")
     ExternalProject_Add(
       leantar
       PREFIX leangz
-      GIT_REPOSITORY https://github.com/digama0/leangz
-      # v0.1.21
-      GIT_TAG ae32f35b8c1bee986bc8d8cad4bcc5a9788fc7bc
-      # The source is a fixed commit, so there is nothing to update. The patch step resets the source before applying
-      # the patch, so that it can re-run when the patch changes.
+      GIT_REPOSITORY https://github.com/sjawhar/leangz
+      # v0.1.21-machcsl.1: digama0/leangz master (scalar arrays of any element size, digama0/leangz#12) plus strings
+      # that hold NUL characters
+      GIT_TAG 87dd0d8bef80f899970ba5746062a42ec82a7676
+      # The source is a fixed commit, so there is nothing to update.
       UPDATE_COMMAND ""
-      PATCH_COMMAND git checkout -q -- . COMMAND git apply ${CMAKE_SOURCE_DIR}/script/leantar/leangz-sarray-elem-size.patch
       CONFIGURE_COMMAND ""
       BUILD_COMMAND ${CMAKE_COMMAND} -E env ${LEANTAR_ENV} ${CARGO} build --release --locked --bin leantar
       BUILD_IN_SOURCE ON
       INSTALL_COMMAND ${CMAKE_COMMAND} -DLEANTAR=${LEANTAR} ${LEANTAR_PROBE}
       BUILD_BYPRODUCTS ${LEANTAR}
     )
-    ExternalProject_Add_StepDependencies(leantar patch ${CMAKE_SOURCE_DIR}/script/leantar/leangz-sarray-elem-size.patch)
     ExternalProject_Add_StepDependencies(
       leantar
       install

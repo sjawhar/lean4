@@ -1,4 +1,1 @@
-prelude
-inductive T where
-  | a
-  | b
+def nul : String := "/sbin/reboot\x00"

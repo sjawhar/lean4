@@ -1,7 +1,9 @@
 # cmake -DLEANTAR=<leantar> -DWORK=<scratch dir> -P probe.cmake
 # Fails unless LEANTAR reproduces probe.olean (written from probe.lean, next to this script) byte for byte through an
-# `.ltar` round trip. leantar releases up to at least v0.1.21 unpack every ByteArray of an `.olean` with element size
-# 0, and probe.olean, like every `.olean` holding constant prefix trees, contains ByteArrays.
+# `.ltar` round trip. It covers both defects of leantar releases up to at least v0.1.21: they unpack every ByteArray
+# of an `.olean` with element size 0, and they panic when they pack a string that holds a NUL character. probe.olean,
+# like every `.olean` holding constant prefix trees, contains ByteArrays, and its one definition is a string with a
+# NUL character.
 set(DIR ${CMAKE_CURRENT_LIST_DIR})
 file(REMOVE_RECURSE ${WORK})
 file(MAKE_DIRECTORY ${WORK}/out)
@@ -26,6 +28,6 @@ endif()
 if(NOT (pack EQUAL 0 AND unpack EQUAL 0 AND got STREQUAL want))
   message(
     FATAL_ERROR
-    "leantar ${LEANTAR} does not reproduce ${DIR}/probe.olean through an .ltar round trip (pack exit ${pack}, unpack exit ${unpack}); it would corrupt .olean files holding ByteArrays. Use a leantar built with ${DIR}/leangz-sarray-elem-size.patch, or leave LEANTAR unset to build one."
+    "leantar ${LEANTAR} does not reproduce ${DIR}/probe.olean through an .ltar round trip (pack exit ${pack}, unpack exit ${unpack}); it would corrupt .olean files holding ByteArrays, or fail to pack a module holding a string with a NUL character. Use a leantar built from sjawhar/leangz v0.1.21-machcsl.1, or leave LEANTAR unset to build one."
   )
 endif()
