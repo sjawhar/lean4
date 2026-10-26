@@ -383,8 +383,8 @@ case_download() {
   record_argv test_run build Test --no-build
   fresh
   record_argv test_run cache get --scope=download --service=ok
-  test_cmd_eq 5 count '--connect-timeout 10 --speed-limit 1024 --speed-time 30' "$ARGV_LOG"
-  test_cmd_eq 0 count_other '--connect-timeout 10 --speed-limit 1024 --speed-time 30' "$ARGV_LOG"
+  test_cmd_eq 5 count '--connect-timeout 3 --speed-limit 1024 --speed-time 30' "$ARGV_LOG"
+  test_cmd_eq 0 count_other '--connect-timeout 3 --speed-limit 1024 --speed-time 30' "$ARGV_LOG"
 }
 
 case_put_timeouts() {
@@ -394,7 +394,7 @@ case_put_timeouts() {
   LAKE_CACHE_DIR="$BUILD_CACHE_DIR" record_argv with_token \
     test_run cache put outputs.jsonl --scope=put-timeouts --service=bearer
   test_cmd_eq 2 count ' -X PUT ' "$ARGV_LOG"
-  test_cmd_eq 2 count '--connect-timeout 10 --speed-limit 1024 --speed-time 30' "$ARGV_LOG"
+  test_cmd_eq 2 count '--connect-timeout 3 --speed-limit 1024 --speed-time 30' "$ARGV_LOG"
 }
 
 case_failing_cmd() {
