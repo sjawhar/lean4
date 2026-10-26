@@ -499,26 +499,29 @@ class Handler(BaseHTTPRequestHandler):
             path = os.path.join(STORE, *parts)
             os.makedirs(os.path.dirname(path), exist_ok=True)
             want = self.headers.get("x-goog-if-generation-match")
-            # The precondition and the write are one step, as Cloud Storage makes them
+            # The precondition and the replacement are one atomic step, as Cloud Storage makes
+            # them. In particular, a GET never sees a partially written claim body: it sees the
+            # old object, no object, or the new complete object. The test used to write `path`
+            # directly while it held STORE_LOCK, but GET does not take that lock.
             with STORE_LOCK:
-                if want == "0":
-                    # Create only: an existing object, even one being written by
-                    # another request, keeps its bytes and its modification time
-                    try:
-                        f = open(path, "xb")
-                    except FileExistsError:
-                        self.respond(412, PRECONDITION_BODY, "application/xml")
-                        return
-                elif want is not None:
+                if want == "0" and generation(path) is not None:
+                    self.respond(412, PRECONDITION_BODY, "application/xml")
+                    return
+                if want is not None and want != "0":
                     # Replace only the generation the request names
                     if str(generation(path) or 0) != want:
                         self.respond(412, PRECONDITION_BODY, "application/xml")
                         return
-                    f = open(path, "wb")
-                else:
-                    f = open(path, "wb")
-                with f:
-                    f.write(body)
+                tmp = f"{path}.put.{threading.get_ident()}"
+                try:
+                    with open(tmp, "xb") as f:
+                        f.write(body)
+                    os.replace(tmp, path)
+                finally:
+                    try:
+                        os.remove(tmp)
+                    except FileNotFoundError:
+                        pass
                 gen = new_generation(path)
             self.respond(200, b"", "application/xml", {"x-goog-generation": str(gen)})
 
