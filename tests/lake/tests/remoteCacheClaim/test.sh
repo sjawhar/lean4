@@ -659,59 +659,137 @@ case_claim_stream() {
   match_text 'did not finish' "$CACHE_A/remote-status-read.json"
 }
 
-# The index of `$1` (a hash, in hexadecimal) in a party of `$2` builds
-owner_index() { "$PYTHON" -c 'import sys; print(int(sys.argv[1], 16) % int(sys.argv[2]))' "$1" "$2"; }
+# Writes the module `Claim.Share.Y<i>`, which imports `Claim.Slow`, into both machines' trees
+share_module() {
+  local tree
+  for tree in "$TREE_A" "$TREE_B"; do
+    mkdir -p "$tree/Claim/Share"
+    printf 'import Claim.Slow\n\nnamespace Claim\n\ndef y%s := slow + %s\n' "$1" "$1" \
+      > "$tree/Claim/Share/Y$1.lean"
+  done
+}
+# The holder of the claims of a machine's build that `start_build` started (see `claimHolder`):
+# the host and the process ID of its `lake`, the child of the `timeout` that `build.sh` became
+build_holder() {
+  local pid=
+  claim_check wait-file "$1.pid" --timeout 30 > /dev/null
+  for _ in $(seq 1 100); do
+    pid="$(pgrep -P "$(cat "$1.pid")" || true)"
+    [ -n "$pid" ] && break
+    sleep 0.1
+  done
+  [ -n "$pid" ] || { echo "FAILURE: no lake process under $(cat "$1.pid")" >&2; return 1; }
+  echo "$(hostname):$pid"
+}
 
-# B starts afresh against an empty remote cache, which holds one claim of `$peer` (another build)
-# for `Claim.A`'s input in state `$1`, and builds `Claim.A` and the `Extra` library with the
-# settings `<var>=<value>...` that follow: `share_build <state> <var>=<value>...`. With one
-# worker (`LEAN_NUM_THREADS=1`), B reads `Claim.A`'s claim first, and reaches `Claim.Slow` while
-# it waits for it without a thread. Nothing refreshes that claim, so B takes it over once it is
-# stale (`LAKE_CLAIM_TAKEOVER_SECS=20`, longer than the wait this case measures).
-share_build() {
-  local state=$1
-  shift
-  test_cmd rm -rf "$TREE_B" "$CACHE_B" "$OBJECTS" "$CLAIMS"
-  test_cmd cp -r "$TEST_DIR/claim" "$TREE_B"
-  test_cmd chmod -R u+w "$TREE_B"
-  put_claim "$a" "$state" '' "$peer"
+# Two builds of the shared input pair: A compiles `Claim.Slow` for 20 s, holding a live claim of
+# it that it rewrites every second (`LAKE_CLAIM_TAKEOVER_SECS=4`, which A only uses to time its
+# rewrites), so that the claim never looks gone while A's push takes it over, and B builds
+# `Claim.Share.Y$SHARE_EVEN` and `Claim.Share.Y$SHARE_ODD`, which import it, with the settings
+# `<var>=<value>...` that follow. So B waits for A's claim, and has read it, before it reaches
+# either: the two builds are its party by then, whatever the order in which its reads come back.
+# Sets `HOLDER_A` and `HOLDER_B`.
+share_builds() {
+  claim_fresh
+  share_module "$SHARE_EVEN"
+  share_module "$SHARE_ODD"
+  LAKE_TEST_CLAIM_SLEEP=20000 LAKE_CLAIM_TAKEOVER_SECS=4 BUILD_TIMEOUT=120 \
+    start_build "$TREE_A" "$CACHE_A" "$LOG_A" Claim.Slow
+  PID_A=$!
+  test_cmd claim_check wait-file "$CLAIMS/$SHARE_SLOW" --timeout 60
+  HOLDER_A="$(build_holder "$LOG_A")"
+  test_exp -n "$HOLDER_A"
   (
-    export "$@" LAKE_CLAIM_TAKEOVER_SECS=20 BUILD_TIMEOUT=120 LEAN_NUM_THREADS=1
-    run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim.A Extra
-  )
-  test_cmd_eq 3 claim_check built-by "$LOG_B"
+    export "$@" LAKE_CLAIM_TAKEOVER_SECS=20 BUILD_TIMEOUT=120
+    start_build "$TREE_B" "$CACHE_B" "$LOG_B" \
+      "Claim.Share.Y$SHARE_EVEN" "Claim.Share.Y$SHARE_ODD"
+    wait $!
+  ) &
+  PID_B=$!
+  HOLDER_B="$(build_holder "$LOG_B")"
+  test_exp -n "$HOLDER_B"
+  echo "the builds are $HOLDER_A (A) and $HOLDER_B (B)"
+  wait_build $PID_A "$LOG_A"
+  wait_build $PID_B "$LOG_B"
+  match_text 'waiting for the claim' "$LOG_B"
+  test_cmd_eq 1 claim_check built-by "$LOG_A"
+  test_cmd_eq 2 claim_check built-by "$LOG_B"
+  wait_push "$CACHE_A"
   wait_push "$CACHE_B"
 }
 
 case_claim_share() {
   # Builds that have read each other's claims share the inputs out: each gives every input it is
   # about to compile to one of them, by the input's hash, claims its own, and leaves the others
-  # until `LAKE_CLAIM_DEFER_SECS` have passed with no claim. Here another build holds a live claim
-  # that says `building` for `Claim.A`, so this build has read it while it waits for that input:
-  # the party is that build and this one, ordered by their holders (a holder that starts with `!`
-  # sorts before this machine's, one that starts with `~` after it). The other build is named so
-  # that it owns `Claim.Slow`'s input, which this build reaches during that wait.
+  # until `LAKE_CLAIM_DEFER_SECS` have passed with no claim. Here two real builds run: A compiles
+  # `Claim.Slow`, and B builds two modules that import it, whose input hashes differ in parity, so
+  # that one of them is A's and the other B's, in whichever order their holders sort. A never
+  # claims its module (it does not build it), so B leaves it to A, takes it after the deferral,
+  # and then leaves A no more inputs. B reaches the two modules only after it has waited for A's
+  # claim of `Claim.Slow`, so the party is known by then, by construction and not by how fast its
+  # reads come back.
   claim_fresh
-  # The input hashes of the modules, from a build that claims nothing
-  LAKE_REMOTE_CACHE_CLAIMS=false run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A Extra
-  local a slow peer
-  a="$(inputs "$CACHE_A" Claim.A)"
-  slow="$(inputs "$CACHE_A" Claim.Slow)"
-  test_cmd rm -rf "$CACHE_A"
-  if [ "$(owner_index "$slow" 2)" = 0 ]; then peer='!peer:1'; else peer='~peer:2'; fi
-  share_build building LAKE_CLAIM_DEFER_SECS=2
-  # `Claim.Slow` belongs to the other build, which never claims it: this build leaves it and then
-  # takes it, and then leaves that build no more inputs, since it has stopped
-  match_text "leaving the input $slow to the build $peer" "$LOG_B"
-  match_text "taking the input $slow, which the build $peer left unclaimed" "$LOG_B"
-  match_text "leaving no more inputs to the build $peer until it is seen building" "$LOG_B"
+  # The input hashes of the modules, from a build that claims nothing: 8 candidates of the pair,
+  # of which (but with a chance of 1 in 128 for each 8) some are even and some odd
+  local i round targets pair even odd y_even y_odd mine theirs peer
+  SHARE_EVEN='' SHARE_ODD=''
+  for round in 0 1 2 3; do
+    targets=()
+    for i in $(seq $((round * 8)) $((round * 8 + 7))); do
+      share_module "$i"
+      targets+=("Claim.Share.Y$i")
+    done
+    LAKE_REMOTE_CACHE_CLAIMS=false run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" "${targets[@]}"
+    if pair="$(claim_check parity-pair "$CACHE_A/push.jsonl" "${targets[@]}")"; then
+      read -r even odd <<< "$pair"
+      SHARE_EVEN="${even#Claim.Share.Y}"
+      SHARE_ODD="${odd#Claim.Share.Y}"
+      break
+    fi
+  done
+  test_exp -n "$SHARE_EVEN"
+  y_even="$(inputs "$CACHE_A" "Claim.Share.Y$SHARE_EVEN")"
+  y_odd="$(inputs "$CACHE_A" "Claim.Share.Y$SHARE_ODD")"
+  SHARE_SLOW="$(inputs "$CACHE_A" Claim.Slow)"
+  share_builds LAKE_CLAIM_DEFER_SECS=2
+  if [ "$(claim_check owner "$y_even" "$HOLDER_A" "$HOLDER_B")" = "$HOLDER_A" ]; then
+    theirs=$y_even mine=$y_odd
+  else
+    theirs=$y_odd mine=$y_even
+  fi
+  # A's module: B leaves it, then takes it since A never claims it, and then leaves A no more
+  # inputs, since it has stopped; B's own module it claims at once
+  match_text "leaving the input $theirs to the build $HOLDER_A" "$LOG_B"
+  match_text "taking the input $theirs, which the build $HOLDER_A left unclaimed" "$LOG_B"
+  match_text "leaving no more inputs to the build $HOLDER_A until it is seen building" "$LOG_B"
+  no_match_text "leaving the input $mine " "$LOG_B"
+  # `Claim.Slow`, which A claimed and compiled, B never takes (it waits for A's claim), so it
+  # never says that it took it
+  no_match_text "taking the input $SHARE_SLOW," "$LOG_B"
+  # With the sharing off, B claims every input it reaches, as one build alone does
+  share_builds LAKE_CLAIM_DEFER_SECS=0
+  no_match_text 'leaving the input ' "$LOG_B"
   # A claim that says `queued` names a push, which compiles nothing (a push writes its own
-  # process ID into the claims it holds): it takes no share, so the build leaves no input
-  share_build queued LAKE_CLAIM_DEFER_SECS=2
+  # process ID into the claims it holds): it takes no share. B waits for such a claim of
+  # `Claim.Slow` (of another host, so never a gone holder) until it is stale (20 s, so it looks
+  # at it again several times), and then takes it over. The holder is named so that it would own
+  # `Claim.Slow`'s input if it took a share (a holder that starts with `!` sorts before this
+  # host's, one that starts with `~` after it), so B would leave that input to it while it waits.
+  claim_fresh
+  share_module "$SHARE_EVEN"
+  share_module "$SHARE_ODD"
+  if [ "$(claim_check owner "$SHARE_SLOW" '!other:1' "$(hostname):1")" = '!other:1' ]; then
+    peer='!other:1'
+  else
+    peer='~other:2'
+  fi
+  put_claim "$SHARE_SLOW" queued '' "$peer"
+  LAKE_CLAIM_DEFER_SECS=2 LAKE_CLAIM_TAKEOVER_SECS=20 BUILD_TIMEOUT=120 \
+    run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" "Claim.Share.Y$SHARE_EVEN" "Claim.Share.Y$SHARE_ODD"
+  match_text 'taking over the claim' "$LOG_B"
   no_match_text 'leaving the input ' "$LOG_B"
-  # With the sharing off, the build claims every input it reaches, as one build alone does
-  share_build building LAKE_CLAIM_DEFER_SECS=0
-  no_match_text 'leaving the input ' "$LOG_B"
+  test_cmd_eq 3 claim_check built-by "$LOG_B"
+  wait_push "$CACHE_B"
 }
 
 case_claim_free_slots() {

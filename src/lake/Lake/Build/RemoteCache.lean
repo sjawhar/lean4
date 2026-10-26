@@ -76,16 +76,18 @@ public def cancelIfBuildCanceled : JobM Unit := do
       Job.cancelJob
 
 /--
-Records how a read of the shared remote cache that started at the monotonic time `start` (in
-milliseconds) ended. A read that failed after waiting at least the stall time of
-`remoteReadLimits` (the remote did not answer) adds one to the build's reads in a row that did so;
-any other read resets them. The read that makes them `remoteReadTimeoutLimit` stops the build's
-reads of the remote cache (`remoteReadsStopped`), and that is logged once, at verbose level, and
-kept in the read status (`Cache.readStatusFile`).
+Records how a read of the shared remote cache ended, whose transfers took `transferMs`
+milliseconds in all (see `ReadBroker.Outcome.transferMs`). A read that failed after its transfers
+took at least the stall time of `remoteReadLimits` (the remote did not answer) adds one to the
+build's reads in a row that did so; any other read resets them. The time a read waited before a
+transfer (for the token command, for a run of the read broker, or for a retry) does not count:
+reads that the remote refuses at once can wait long behind others, and are not reads that waited
+for the remote. The read that makes them `remoteReadTimeoutLimit` stops the build's reads of the
+remote cache (`remoteReadsStopped`), and that is logged once, at verbose level, and kept in the
+read status (`Cache.readStatusFile`).
 -/
-public def noteRemoteRead (start : Nat) (failed : Bool) : JobM Unit := do
-  let waited := (← IO.monoMsNow) - start
-  let timedOut := failed && waited ≥ remoteReadLimits.stallSecs * 1000
+public def noteRemoteRead (transferMs : Nat) (failed : Bool) : JobM Unit := do
+  let timedOut := failed && transferMs ≥ remoteReadLimits.stallSecs * 1000
   let status := (← getBuildContext).remoteReadStatus
   let stopped? ← liftM (m := BaseIO) <| status.modifyGet fun s =>
     if !timedOut then
@@ -94,7 +96,7 @@ public def noteRemoteRead (start : Nat) (failed : Bool) : JobM Unit := do
       let n := s.timeoutsInRow + 1
       if s.stopped?.isNone && n ≥ remoteReadTimeoutLimit then
         let msg := s!"stopped reading the remote cache for the rest of this build: {n} reads in \
-          a row waited for it and failed (the last one after {waited} ms)"
+          a row waited for it and failed (the transfers of the last one took {transferMs} ms)"
         (some msg, {s with timeoutsInRow := n, stopped? := some msg})
       else
         (none, {s with timeoutsInRow := n})
@@ -102,16 +104,17 @@ public def noteRemoteRead (start : Nat) (failed : Bool) : JobM Unit := do
     logVerbose msg
 
 /--
-Runs `read`, a read of the shared remote cache, and records how it ended (see `noteRemoteRead`).
+Runs `read`, a read of the shared remote cache, with a counter of the milliseconds that its
+transfers take, which it adds to, and records how the read ended (see `noteRemoteRead`).
 -/
-@[inline] public def timeRemoteRead (read : JobM α) : JobM α := do
-  let start ← IO.monoMsNow
+@[inline] public def timeRemoteRead (read : IO.Ref Nat → JobM α) : JobM α := do
+  let transferMs ← IO.mkRef 0
   try
-    let a ← read
-    noteRemoteRead start false
+    let a ← read transferMs
+    noteRemoteRead (← transferMs.get) false
     return a
   catch e =>
-    noteRemoteRead start true
+    noteRemoteRead (← transferMs.get) true
     throw e
 
 /--
@@ -140,9 +143,10 @@ public def readRemoteOutputs?
       | .error e => error e
     let scope := remoteCacheScope ws.lakeEnv.leanGithash pkg.cacheScope
     let url := service.remoteMappingUrl scope inputHash
-    let contents? ← timeRemoteRead <| liftM <|
-      ReadBroker.getUrl? url (← getLakeCache).dir (cacheToken := service.sendsCacheToken url)
-        remoteMappingMaxFileSize remoteReadLimits
+    let tmpDir := (← getLakeCache).dir
+    let contents? ← timeRemoteRead fun transferMs => liftM <|
+      ReadBroker.getUrl? url tmpDir (cacheToken := service.sendsCacheToken url)
+        remoteMappingMaxFileSize remoteReadLimits transferMs
     let some contents := contents?
       | logVerbose s!"remote cache mapping miss for input `{inputHash}` at {url}"
         return none
