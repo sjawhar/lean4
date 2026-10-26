@@ -818,8 +818,10 @@ claim says that the compile failed, when the claim's compile still runs but its
 holder is a process of this machine that no longer runs, or when the remote
 cache has not replaced it for `LAKE_CLAIM_TAKEOVER_SECS` seconds (600 by
 default) or the build has seen it unchanged for that long by its own clock.
-A claim request that has not ended after 20 seconds, or whose answer is larger
-than 64 KiB, fails. After its first queued output, a build that claims inputs
+Each claim request ends within 20 seconds, or fails, as does one whose answer
+is larger than 64 KiB; a request refused for its token renews the token once
+and is sent again, so a claim request takes at most about 40 seconds. Claim
+requests are not retried. After its first queued output, a build that claims inputs
 starts this command itself, once, detached, as
 `lake cache push --wait --follow <file>` with a lock file that the build holds
 until it ends: the push uploads each output as the build queues it, tries an
