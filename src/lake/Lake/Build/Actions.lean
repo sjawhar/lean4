@@ -10,6 +10,7 @@ public import Lake.Util.Log
 import Lake.Util.Proc
 import Lake.Util.FilePath
 import Lake.Util.IO
+import Lake.Util.BuildSlots
 public import Lake.Util.Url
 import Lake.Util.CacheToken
 import Init.Data.String.Search
@@ -34,6 +35,7 @@ public def compileLeanIR
 : LogIO Unit := do
   createParentDirs irFile
   createParentDirs cFile
+  withBuildSlot do
   proc {
     cmd := leanir.toString
     args := #[setupFile.toString, irFile.toString, cFile.toString]
@@ -69,7 +71,7 @@ public def compileLeanModule
   args := args ++ #["--setup", setupFile.toString]
   args := args.push "--json"
   withLogErrorPos do
-  let out ← rawProc {
+  let out ← withBuildSlot <| rawProc {
     args
     cmd := lean.toString
     env := #[
@@ -110,6 +112,7 @@ public def compileO
   (moreArgs : Array String := #[]) (compiler : FilePath := "cc")
 : LogIO Unit := do
   createParentDirs oFile
+  withBuildSlot do
   proc {
     cmd := compiler.toString
     args := #["-c", "-o", oFile.toString, srcFile.toString] ++ moreArgs
@@ -141,13 +144,14 @@ public def compileStaticLib
   let args := #["rcs"]
   let args := if thin then args.push "--thin" else args
   let args := args.push libFile.toString ++ (← mkArgs libFile <| oFiles.map toString)
-  proc {cmd := ar.toString, args}
+  withBuildSlot <| proc {cmd := ar.toString, args}
 
 public def compileSharedLib
   (libFile : FilePath) (linkArgs : Array String)
   (linker : FilePath := "cc") (macosxDeploymentTarget? : Option String := none)
 : LogIO Unit := do
   createParentDirs libFile
+  withBuildSlot do
   proc {
     cmd := linker.toString
     args := #["-shared", "-o", libFile.toString] ++ (← mkArgs libFile linkArgs)
@@ -160,6 +164,7 @@ public def compileExe
   (linker : FilePath := "cc") (macosxDeploymentTarget? : Option String := none)
 : LogIO Unit := do
   createParentDirs binFile
+  withBuildSlot do
   proc {
     cmd := linker.toString
     args := #["-o", binFile.toString] ++ (← mkArgs binFile linkArgs)
@@ -224,6 +229,7 @@ public def untar (file : FilePath) (dir : FilePath) (gzip := true) : LogIO PUnit
   let mut opts := "-xvv"
   if gzip then
     opts := opts.push 'z'
+  withBuildSlot do
   proc (quiet := true) {
     cmd := "tar",
     args := #[opts, "-f", file.toString, "-C", dir.toString]

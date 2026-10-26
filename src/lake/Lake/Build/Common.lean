@@ -644,9 +644,16 @@ nothing unless `LAKE_REMOTE_CACHE` names a service) and replaces the local one.
   -- A local mapping file that exists but cannot be used (it does not parse, or its artifacts are
   -- gone) is replaced by the remote one, so that it does not hide the remote cache again
   let hadLocal ← (cache.outputsFile pkg.cacheScope inputHash).pathExists
-  let some out ← readRemoteOutputs? inputHash pkg target srcHash? (replace := hadLocal)
+  let out? ← readRemoteOutputs? inputHash pkg target srcHash? (replace := hadLocal)
+  -- The read gave this job's worker up and may have taken seconds, in which another job's
+  -- failure can have ended the build (`--fail-fast`)
+  cancelIfBuildCanceled
+  let some out := out?
     | return none
-  resolve out
+  let a? ← resolve out
+  -- As above: the artifacts of the mapping were read from the remote cache as well
+  cancelIfBuildCanceled
+  return a?
 
 open ResolveOutputs in
 /--
@@ -733,9 +740,8 @@ public def resolveArtifact
             \n  local path: {path}\
             \n  remote URL: {url}"
           try
-            timeRemoteRead <| liftM <| downloadArtifactCore descr.hash url path
-              (service.sendsCacheToken url) (sha256? := some sha256)
-              (maxFileSize? := some remoteCacheMaxFileSize) (limits := remoteReadLimits)
+            timeRemoteRead <| liftM <| downloadRemoteArtifact descr.hash sha256 url path
+              (service.sendsCacheToken url) remoteReadLimits
           catch e =>
             error (← recordRemoteReadFailure (← takeLogFrom e) "remote artifact download failed")
         | none =>

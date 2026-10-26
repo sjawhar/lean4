@@ -15,6 +15,7 @@ public import Lake.Config.RemoteCache
 public import Lake.Util.Sha256
 import Lake.Config.InstallPath
 import Lake.Build.Actions
+import Lake.Util.ReadBroker
 import Lake.Util.Url
 import Lake.Util.Proc
 import Lake.Util.CacheToken
@@ -561,26 +562,43 @@ end CacheToolchain
 /-! ## Remote Cache Service -/
 
 /--
+Checks that `tmp`, a download of the artifact with the content hash `hash` to `path`, has that
+hash and, with `sha256?` (for an artifact of the shared remote cache), that SHA-256 digest, which
+is checked first.
+-/
+def checkArtifactDownload (hash : Hash) (sha256? : Option Sha256) (path tmp : FilePath) :
+    LogIO Unit := do
+  if let some sha256 := sha256? then
+    let actualSha256 ← sha256File tmp
+    if actualSha256 != sha256 then
+      error s!"{path}: downloaded artifact SHA-256 mismatch, got {actualSha256}"
+  let actualHash ← computeFileHash tmp
+  if actualHash != hash then
+    error s!"{path}: downloaded artifact hash mismatch, got {actualHash}"
+
+/--
 **For internal use only.**
 Downloads the artifact with the content hash `hash` from `url` to `path` (see `download`), which
-it replaces only with bytes of that hash. With `sha256?` (for an artifact of the shared remote
-cache), the bytes must also have that SHA-256 digest, which is checked first. With
-`maxFileSize?`, a larger download fails. The download gives up and tries again as `limits` says.
+it replaces only with bytes of that hash.
 -/
 public def downloadArtifactCore
   (hash : Hash) (url : String) (path : FilePath) (cacheToken := false)
-  (sha256? : Option Sha256 := none) (maxFileSize? : Option Nat := none)
-  (limits : TransferLimits := {retries := 0})
 : LogIO Unit := do
-  download url path (cacheToken := cacheToken) (maxFileSize? := maxFileSize?) (limits := limits)
-    (check := fun tmp => do
-      if let some sha256 := sha256? then
-        let actualSha256 ← sha256File tmp
-        if actualSha256 != sha256 then
-          error s!"{path}: downloaded artifact SHA-256 mismatch, got {actualSha256}"
-      let actualHash ← computeFileHash tmp
-      if actualHash != hash then
-        error s!"{path}: downloaded artifact hash mismatch, got {actualHash}")
+  download url path (cacheToken := cacheToken) (check := checkArtifactDownload hash none path)
+
+/--
+**For internal use only.**
+Downloads the artifact of the shared remote cache with the content hash `hash` and the SHA-256
+digest `sha256` from `url` to `path`, through the read broker (see `ReadBroker.download`), which
+it replaces only with bytes of that digest and hash. A download larger than
+`remoteCacheMaxFileSize` fails, and the download gives up and tries again as `limits` says.
+-/
+public def downloadRemoteArtifact
+  (hash : Hash) (sha256 : Sha256) (url : String) (path : FilePath) (cacheToken : Bool)
+  (limits : TransferLimits)
+: LogIO Unit :=
+  ReadBroker.download url path cacheToken remoteCacheMaxFileSize limits
+    (check := checkArtifactDownload hash (some sha256) path)
 
 /--
 Uploads a file to an online bucket using the Amazon S3 protocol. The upload gives up when it
@@ -997,17 +1015,6 @@ def TransferState.merge (a b : TransferState) : TransferState where
   uploaded := a.uploaded ++ b.uploaded
   refused := a.refused || b.refused
   answered := a.answered + b.answered
-
-/--
-Whether a transfer that ended with the `curl` exit code `exitCode` and the HTTP status `code` failed
-transiently, as `curl --retry` decides: a timeout (exit code 28), a host that could not be resolved
-(5 or 6), or HTTP 408, 429, 500, 502, 503, 504, 522 or 524.
--/
-def isTransientFailure (exitCode code : Nat) : Bool :=
-  if exitCode == 0 then
-    code matches 408 | 429 | 500 | 502 | 503 | 504 | 522 | 524
-  else
-    exitCode matches 5 | 6 | 28
 
 /--
 Monitors the transfers of a `curl` run. With `cfg.createOnly` (the uploads only create their
