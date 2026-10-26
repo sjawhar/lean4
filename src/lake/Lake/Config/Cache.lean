@@ -565,13 +565,14 @@ end CacheToolchain
 Downloads the artifact with the content hash `hash` from `url` to `path` (see `download`), which
 it replaces only with bytes of that hash. With `sha256?` (for an artifact of the shared remote
 cache), the bytes must also have that SHA-256 digest, which is checked first. With
-`maxFileSize?`, a larger download fails.
+`maxFileSize?`, a larger download fails. The download gives up and tries again as `limits` says.
 -/
 public def downloadArtifactCore
   (hash : Hash) (url : String) (path : FilePath) (cacheToken := false)
   (sha256? : Option Sha256 := none) (maxFileSize? : Option Nat := none)
+  (limits : TransferLimits := {retries := 0})
 : LogIO Unit := do
-  download url path (cacheToken := cacheToken) (maxFileSize? := maxFileSize?)
+  download url path (cacheToken := cacheToken) (maxFileSize? := maxFileSize?) (limits := limits)
     (check := fun tmp => do
       if let some sha256 := sha256? then
         let actualSha256 ← sha256File tmp
@@ -980,15 +981,36 @@ structure TransferState where
   unauthorized : Array TransferInfo := #[]
   /-- Whether a transfer was refused with HTTP 401 and reported as a failure. -/
   refused : Bool := false
+  /-- The transfers that failed transiently (see `isTransientFailure`), to try again. -/
+  transient : Array TransferInfo := #[]
+
+/-- The outcome of two `curl` runs of disjoint transfers, without the transfers left to retry. -/
+def TransferState.merge (a b : TransferState) : TransferState where
+  didError := a.didError || b.didError
+  numSuccesses := a.numSuccesses + b.numSuccesses
+  uploaded := a.uploaded ++ b.uploaded
+  refused := a.refused || b.refused
+
+/--
+Whether a transfer that ended with the `curl` exit code `exitCode` and the HTTP status `code` failed
+transiently, as `curl --retry` decides: a timeout (exit code 28), a host that could not be resolved
+(5 or 6), or HTTP 408, 429, 500, 502, 503, 504, 522 or 524.
+-/
+def isTransientFailure (exitCode code : Nat) : Bool :=
+  if exitCode == 0 then
+    code matches 408 | 429 | 500 | 502 | 503 | 504 | 522 | 524
+  else
+    exitCode matches 5 | 6 | 28
 
 /--
 Monitors the transfers of a `curl` run. With `cfg.createOnly` (the uploads only create their
 objects), an upload that finds its object already present (HTTP 412) succeeds. With
 `retryUnauthorized`, a transfer refused with HTTP 401 is not reported but added to `unauthorized`.
-A download of `path` goes to the temporary file `tmpOf path`.
+With `retryTransient`, a transfer that failed transiently (see `isTransientFailure`) is not
+reported but added to `transient`. A download of `path` goes to the temporary file `tmpOf path`.
 -/
 partial def monitorTransfer
-  (cfg : TransferConfig) (retryUnauthorized : Bool) (tmpOf : FilePath → FilePath)
+  (cfg : TransferConfig) (retryUnauthorized retryTransient : Bool) (tmpOf : FilePath → FilePath)
   (h hOut : IO.FS.Handle) (s : TransferState)
 : LoggerIO TransferState := do
   let line ← h.getLine
@@ -1028,16 +1050,34 @@ partial def monitorTransfer
               handleFailure info (.ok 401) out line
               modify ({· with didError := true, refused := true})
           | code? =>
-            handleFailure info code? out line
-            modify ({· with didError := true})
+            let transient := match code? with
+              | .ok code => isTransientFailure 0 code
+              | .error _ => false
+            if retryTransient && transient then
+              retryLater info s!"status code: {code?.toOption.getD 0}" out
+            else
+              handleFailure info code? out line
+              modify ({· with didError := true})
         | _ =>
-          handleFailure info (out.get "http_code") out line
-          modify ({· with didError := true})
+          let exitCode := (out.getAs Nat "exitcode").toOption.getD 0
+          if retryTransient && isTransientFailure exitCode 0 then
+            let reason := (out.getAs String "errormsg").toOption.getD s!"curl exit code {exitCode}"
+            retryLater info reason out
+          else
+            handleFailure info (out.get "http_code") out line
+            modify ({· with didError := true})
       | .error e =>
         logError s!"curl produced invalid JSON: {e}; received: {line.trimAscii}"
         modify ({· with didError := true})
-    monitorTransfer cfg retryUnauthorized tmpOf h hOut s
+    monitorTransfer cfg retryUnauthorized retryTransient tmpOf h hOut s
 where
+  /- Keeps a transfer that failed transiently for another run (see `transferFiles`) -/
+  retryLater info reason out : StateT TransferState LoggerIO Unit := do
+    discardResponse out
+    let action := match cfg.kind with | .get => "download" | .put => "upload"
+    logVerbose s!"{cfg.scope}: the {action} of {cfg.noun} {info.hash} failed ({reason}); \
+      it is tried again\n  remote URL: {info.url}"
+    modify fun s => {s with transient := s.transient.push info}
   getInfo? out :=
     match out.getAs Nat "urlnum" with
     | .ok i => cfg.infos[i]?
@@ -1114,21 +1154,60 @@ where
     logError msg
     logVerbose s!"curl JSON: {line.trimAsciiEnd}"
 
+/-- How many transfers one `curl` run of `runTransfer` runs at once (`--parallel-max`). -/
+def transferParallelMax : Nat := 50
+
 /--
-Runs one `curl` process for the transfers of `cfg`, sending `token?` if it is set.
-With a token, redirects are not followed (so the token goes only to the hosts of the transfers),
-and uploads only create their objects (`x-goog-if-generation-match: 0`), as they do with
-`cfg.createOnly`. The transfers give up when they stall (see `transferTimeoutArgs`).
-Downloads go to temporary files unique to the run, which are gone when it returns.
+How many times `transferFiles` tries again a transfer that failed transiently: 3 times, after 1,
+2 and 4 seconds, as `curl --retry 3` would.
+-/
+def transferRetries : Nat := 3
+
+/-- The total size of `files`, in bytes (a file that cannot be read counts as empty). -/
+def totalFileSize (files : Array FilePath) : BaseIO Nat :=
+  files.foldlM (init := 0) fun n file => do
+    match (← file.metadata.toBaseIO) with
+    | .ok data => return n + data.byteSize.toNat
+    | .error _ => return n
+
+/--
+The longest that a `curl` run of `runTransfer` of `n` transfers, each with the `--max-time`
+`maxSecs`, may take, in seconds: as many rounds of `transferParallelMax` transfers as it takes for
+them all, each `maxSecs` long, and 10 seconds more to start and end `curl`.
+-/
+def transferRunMaxSecs (n maxSecs : Nat) : Nat :=
+  (n + transferParallelMax - 1) / transferParallelMax * maxSecs + 10
+
+/--
+Runs one `curl` process for the transfers of `cfg`, in parallel (`-Z`), sending `token?` if it is
+set. With a token, redirects are not followed (so the token goes only to the hosts of the
+transfers), and uploads only create their objects (`x-goog-if-generation-match: 0`), as they do
+with `cfg.createOnly`. The transfers give up when they stall (see `transferTimeoutArgs`), and
+`curl` does not try them again (see `transferRetryArgs`; `transferFiles` does). With
+`retryTransient`, the transfers that failed transiently are returned in `transient` (see
+`monitorTransfer`). Downloads go to temporary files unique to the run, which are gone when it
+returns.
+
+Each upload may take `transferMaxSecs` of the total size of its run's files (`--max-time`): the
+uploads of a run share one uplink, so each may move as slowly as the whole run. The run may take
+`transferRunMaxSecs`: Lake stops a `curl` that is still running then, and the uploads that it did
+not report fail. On 2026-10-26, a `curl` 8.18.0 run of 64 uploads went on for 36 minutes with no
+transfer running, which no `curl` option bounds.
 -/
 def runTransfer
-  (cfg : TransferConfig) (token? : Option String) (retryUnauthorized : Bool)
+  (cfg : TransferConfig) (token? : Option String) (retryUnauthorized retryTransient : Bool)
 : LoggerIO TransferState := do
   -- Each download goes to a temporary file of this run next to its path
   let tmpSuffix ← uniqueTmpSuffix
   let tmpOf (path : FilePath) : FilePath := path.toString ++ tmpSuffix
   -- An upload with the token always only creates its object
   let cfg := {cfg with createOnly := token?.isSome || cfg.createOnly}
+  -- An upload's `--max-time`; a download's size is not known in advance
+  let uploadSecs? : Option Nat ← match cfg.kind with
+    | .get => pure none
+    | .put => do pure (some (transferMaxSecs (← totalFileSize (cfg.infos.map (·.path)))))
+  let maxSecs? := uploadSecs?.map (transferRunMaxSecs cfg.infos.size)
+  let parallelArgs := #["-Z", "--parallel-max", toString transferParallelMax]
   try
     IO.FS.withTempFile fun h path => do
       if let some token := token? then
@@ -1140,11 +1219,8 @@ def runTransfer
             h.putStrLn s!"url = {info.url.quote}"
             h.putStrLn s!"-o {(tmpOf info.path).toString.quote}"
           h.flush
-          return curlLeadArgs token? ++ #["-Z", "-X", "GET"] ++ curlFollowArgs token? ++ #[
-            "--retry", "3" -- intermittent network errors can occur
-          ] ++ transferTimeoutArgs ++ #[
-            "-s", "-w", "%{stderr}%{json}\n", "--config", path.toString
-          ]
+          return curlLeadArgs token? ++ parallelArgs ++ #["-X", "GET"] ++ curlFollowArgs token? ++
+            transferTimeoutArgs ++ #["-s", "-w", "%{stderr}%{json}\n", "--config", path.toString]
         | .put =>
           cfg.infos.forM fun info => do
             h.putStrLn s!"-T {info.path.toString.quote}"
@@ -1160,22 +1236,40 @@ def runTransfer
               auth ++ #["-H", "x-goog-if-generation-match: 0"]
             else
               auth
-          return curlLeadArgs token? ++ #["-Z", "-X", "PUT"] ++ curlFollowArgs token? ++ #[
-            "-H", s!"Content-Type: {cfg.contentType}",
-            "--retry", "3" -- intermittent network errors can occur
-          ] ++ transferTimeoutArgs ++ auth ++ #[
-            "-s", "-w", "%{stderr}%{json}\n", "--config", path.toString
-          ]
+          let maxTime := uploadSecs?.elim #[] fun secs => #["--max-time", toString secs]
+          return curlLeadArgs token? ++ parallelArgs ++ #["-X", "PUT"] ++ curlFollowArgs token? ++
+            #["-H", s!"Content-Type: {cfg.contentType}"] ++ transferTimeoutArgs ++ maxTime ++
+            auth ++ #["-s", "-w", "%{stderr}%{json}\n", "--config", path.toString]
       let child ← IO.Process.spawn {
         cmd := ← Internal.getCurl, args
         stdout := .piped, stderr := .piped
       }
-      let s ← monitorTransfer cfg retryUnauthorized tmpOf child.stderr child.stdout {}
+      let logger ← read
+      let monitor ← BaseIO.asTask (prio := .dedicated) <| EIO.toBaseIO <|
+        (monitorTransfer cfg retryUnauthorized retryTransient tmpOf child.stderr child.stdout {}).run
+          logger
+      let ended ← match maxSecs? with
+        | some secs => waitUntil monitor ((← IO.monoMsNow) + secs * 1000)
+        | none => pure true
+      unless ended do
+        -- Ends the monitor, which then reads the end of the output; `child.wait` below reaps it
+        try child.kill catch _ => pure ()
+      let s ← match ← IO.wait monitor with
+        | .ok s => pure s
+        | .error e => throw e
       let rc ← child.wait
       let stdout ← child.stdout.readToEnd
       unless stdout.isEmpty do
         logWarning s!"{cfg.scope}: curl produced unexpected output:\n{stdout.trimAsciiEnd}"
+      unless ended do
+        logError s!"{cfg.scope}: curl had not ended after {maxSecs?.getD 0} s, the longest its \
+          {cfg.infos.size} transfers may take; Lake stopped it"
+        return {s with didError := true}
       if rc != 0 then
+        -- `curl` exits with the code of a failed transfer, which a transient one explains
+        if retryTransient && !s.didError && !s.transient.isEmpty then
+          logVerbose s!"{cfg.scope}: curl exited with code {rc}"
+          return s
         logError s!"{cfg.scope}: curl exited with code {rc}"
         return {s with didError := true}
       return s
@@ -1186,33 +1280,53 @@ def runTransfer
         discard <| (removeFileIfExists (tmpOf info.path)).toBaseIO
 
 /--
-Transfers the files of `cfg` with one `curl` run. If the cache token is sent and refused
-(HTTP 401), the refused transfers are retried once in another run with a new token (see
-`retryWithNewToken`). Reports each failed transfer, and returns the state of both runs.
+Runs the transfers of `cfg` with one `curl` run (see `runTransfer`), with `token?` if it is set.
+If the service refuses the token (HTTP 401), the refused transfers run once more in another run
+with a new token (see `retryWithNewToken`). With `retryTransient`, the transfers that failed
+transiently in either run are returned in `transient`, and the others are reported.
+-/
+def runTransferWithToken
+  (cfg : TransferConfig) (token? : Option String) (retryTransient : Bool)
+: LoggerIO TransferState := do
+  let s ← runTransfer cfg token? (retryUnauthorized := token?.isSome) retryTransient
+  let some token := token?
+    | return s
+  if s.unauthorized.isEmpty then
+    return s
+  let retry ← retryWithNewToken token fun token? => do
+    let retry ← runTransfer {cfg with infos := s.unauthorized} token?
+      (retryUnauthorized := false) retryTransient
+    return (retry, retry.refused)
+  return {s.merge retry with transient := s.transient ++ retry.transient}
+
+/--
+Transfers the files of `cfg` (see `runTransferWithToken`), and tries again up to `transferRetries`
+times, each in a run of its own, the transfers that failed transiently, after 1 s and then twice
+as long each time. Reports each failed transfer, and returns the state of all runs.
 -/
 def transferFiles
   (cfg : TransferConfig)
 : LoggerIO TransferState := do
-  let token? ← id do
+  let token? : LoggerIO (Option String) := do
     if cfg.cacheToken then
       -- Refused if any transfer would send the token unencrypted (they all share one host)
       let info? := cfg.infos.find? (!isCredentialSafe ·.url) <|> cfg.infos[0]?
       cacheTokenFor? (info?.map (·.url) |>.getD "")
     else
       pure none
-  let s ← runTransfer cfg token? (retryUnauthorized := token?.isSome)
-  let some token := token?
-    | return s
-  if s.unauthorized.isEmpty then
-    return s
-  let retry ← retryWithNewToken token fun token? => do
-    let retry ← runTransfer {cfg with infos := s.unauthorized} token? (retryUnauthorized := false)
-    return (retry, retry.refused)
-  return {
-    didError := s.didError || retry.didError
-    numSuccesses := s.numSuccesses + retry.numSuccesses
-    uploaded := s.uploaded ++ retry.uploaded
-  }
+  let mut total : TransferState := {}
+  let mut infos := cfg.infos
+  for attempt in [0:transferRetries + 1] do
+    -- The token of each run is the current one, which a refusal in the run before may have renewed
+    let s ← runTransferWithToken {cfg with infos} (← token?) (attempt < transferRetries)
+    total := total.merge s
+    if s.transient.isEmpty then
+      break
+    infos := s.transient
+    let delayMs := 1000 * 2 ^ attempt
+    logInfo s!"{cfg.scope}: trying {infos.size} transfers again in {delayMs / 1000} s"
+    IO.sleep delayMs.toUInt32
+  return total
 
 /--
 Transfers the artifacts of `cfg` with one `curl` run (see `transferFiles`), and fails if any
