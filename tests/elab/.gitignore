@@ -2,4 +2,5 @@
 /file_not_found.lean.readonly.txt
 /getline_crash.lean.tmp
 /handleLocking.lean.lock
+/isSameFile.lean.dir/
 /stdio.lean.stdout*.txt

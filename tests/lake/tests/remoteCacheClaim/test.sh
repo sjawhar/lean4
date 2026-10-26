@@ -90,9 +90,13 @@ claim_fresh() {
   test_cmd chmod -R u+w "$TREE_A" "$TREE_B"
 }
 # Runs a command as a machine with the queue on (and so, by default, claims): the remote cache
-# `$CLAIM_SERVICE` (by default `bearer`), with a token
+# `$CLAIM_SERVICE` (by default `bearer`), with a token. Its builds claim every input
+# (`LAKE_CLAIM_SLOTS=0`, as a build whose compile slots are full does), unless `$CLAIM_SLOTS`
+# names other slots, or is `default` for the build's own (its worker threads).
 on_m() {
-  LAKE_REMOTE_CACHE="${CLAIM_SERVICE:-bearer}" LAKE_CACHE_TOKEN_CMD="$TOKEN_CMD" \
+  local slots=(LAKE_CLAIM_SLOTS="${CLAIM_SLOTS:-0}")
+  if [ "${CLAIM_SLOTS:-}" = default ]; then slots=(); fi
+  env "${slots[@]}" LAKE_REMOTE_CACHE="${CLAIM_SERVICE:-bearer}" LAKE_CACHE_TOKEN_CMD="$TOKEN_CMD" \
     LAKE_REMOTE_CACHE_QUEUE=true "$@"
 }
 # Starts a machine's build in the background: `start_build <tree> <cache> <log> <target>...`
@@ -140,9 +144,10 @@ queued_lines() {
   if [ -f "$1/push.jsonl" ]; then grep -c . "$1/push.jsonl" || true; else echo 0; fi
 }
 # Creates a claim as another machine does, which nothing refreshes:
-# `put_claim <inputHash> <state> [<at>]` (`at` is the holder's clock, by default now)
+# `put_claim <inputHash> <state> [<at>] [<holder>]` (`at` is the holder's clock, by default now)
 put_claim() {
-  printf '{"holder":"other:1","state":"%s","at":%s}' "$2" "${3:-$(date +%s)}" > "$WORK_DIR/claim.json"
+  printf '{"holder":"%s","state":"%s","at":%s}' "${4:-other:1}" "$2" "${3:-$(date +%s)}" \
+    > "$WORK_DIR/claim.json"
   test_cmd_eq 200 curl -s -o /dev/null -w '%{http_code}' -X PUT -T "$WORK_DIR/claim.json" \
     -H 'x-goog-if-generation-match: 0' -H 'Authorization: Bearer test-token-1' \
     "$URL/bearer/a0/claim/$CLAIM_SCOPE/$1"
@@ -368,14 +373,16 @@ case_claim_pool_slot() {
   # A target other than a module that waits for a claim does not hold the slot of a job: with
   # one worker (`LEAN_NUM_THREADS=1`), a module compiles while the target waits. The claim of
   # `claim/copied` is another machine's, which nothing refreshes, so the build takes it over after
-  # the takeover time (10 s). `Claim.Slow` takes 8 s to compile, during that wait.
+  # the takeover time (10 s). `Claim.Slow` takes 8 s to compile, during that wait. The inputs
+  # are not shared out (`LAKE_CLAIM_DEFER_SECS=0`): this build has read the other machine's live
+  # claim, so it would leave that machine `Claim.Slow` if the hash gave it to it.
   claim_fresh
   LAKE_REMOTE_CACHE_CLAIMS=false run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" copied
   COPIED="$(inputs "$CACHE_A" claim/copied)"
   put_claim "$COPIED" building
   START=$(date +%s)
   LEAN_NUM_THREADS=1 LAKE_CLAIM_TAKEOVER_SECS=10 LAKE_TEST_CLAIM_SLEEP=8000 \
-    run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" copied Extra
+    LAKE_CLAIM_DEFER_SECS=0 run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" copied Extra
   ELAPSED=$(( $(date +%s) - START ))
   match_text 'Built claim/copied' "$LOG_B"
   match_text 'Built Claim.Slow' "$LOG_B"
@@ -451,15 +458,16 @@ case_claim_same_pid() {
 }
 
 case_claim_queued() {
-  # A build that queued a compile's outputs marks the claim `queued` and ends while its push
-  # still uploads (each upload takes 4 seconds here). A build of another cache on the same host
-  # that comes next finds the holder's process gone, but a `queued` claim waits for its push:
-  # it restores every target from the remote cache and compiles none.
+  # A build that compiled outputs ends while its push still uploads them (each upload takes 4
+  # seconds here). The push takes each claim over as `queued`, naming itself, so a build of
+  # another cache on the same host leaves those claims alone though the build that compiled them
+  # has ended: it restores every target from the remote cache and compiles none.
   claim_fresh
   CLAIM_SERVICE=slowobj run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim claimexe
   test_cmd_eq $CLAIM_COMPILES claim_check built-by "$LOG_A"
   test_exp ! -e "$CACHE_A/remote-status-push.json"
-  # The claims' states as A left them (`done` for one whose mapping the push already uploaded)
+  # A's push has taken every claim (none is left as the ended build wrote it)
+  test_cmd claim_check wait-no-state "$CLAIMS" building --timeout 120
   for claim in "$CLAIMS"/*; do cp "$claim" "$WORK_DIR/state-$(basename "$claim")"; done
   CLAIM_SERVICE=slowobj BUILD_TIMEOUT=120 run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim claimexe
   test_cmd_eq 0 claim_check built-by "$LOG_B"
@@ -468,6 +476,27 @@ case_claim_queued() {
   test_cmd rm -f "$WORK_DIR"/state-*
   wait_push "$CACHE_A"
   claims_done $CLAIM_COMPILES
+}
+
+case_claim_queued_killed() {
+  # A build killed with its push, after the claim of a compiled input says `queued`, leaves no
+  # mapping and nothing that will upload one. The next build takes that claim over at once (its
+  # holder's process is gone), instead of waiting out the takeover time.
+  claim_fresh
+  CLAIM_SERVICE=slowobj start_build "$TREE_A" "$CACHE_A" "$LOG_A" Claim claimexe
+  PID_A=$!
+  # Wait until a claim of A's is `queued`, which only a compiled input gets
+  test_cmd claim_check wait-state "$CLAIMS" queued --timeout 120
+  QUEUED="$(claim_check first-state "$CLAIMS" queued)"
+  test_cmd kill -KILL -- -"$(cat "$LOG_A.pid")"
+  wait $PID_A || true
+  kill_machines
+  test_exp ! -e "$OBJECTS/in/$QUEUED.json"
+  START=$(date +%s)
+  CLAIM_SERVICE=slowobj BUILD_TIMEOUT=120 run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim claimexe
+  match_text 'holder gone' "$LOG_B"
+  test_exp $(( $(date +%s) - START )) -lt 90
+  wait_push "$CACHE_B"
 }
 
 case_claim_exe_push() {
@@ -602,10 +631,97 @@ case_claim_stream() {
   match_text 'did not finish' "$CACHE_A/remote-status-read.json"
 }
 
+# The index of `$1` (a hash, in hexadecimal) in a party of `$2` builds
+owner_index() { "$PYTHON" -c 'import sys; print(int(sys.argv[1], 16) % int(sys.argv[2]))' "$1" "$2"; }
+
+# B starts afresh against an empty remote cache, which holds one claim of `$peer` (another build)
+# for `$a` in state `$1`, and builds `Claim` with the settings `<var>=<value>...` that follow:
+# `share_build <state> <var>=<value>...`. The claim is never refreshed, so B takes it over once
+# it is stale (`LAKE_CLAIM_TAKEOVER_SECS=5`).
+share_build() {
+  local state=$1
+  shift
+  test_cmd rm -rf "$TREE_B" "$CACHE_B" "$OBJECTS" "$CLAIMS"
+  test_cmd cp -r "$TEST_DIR/claim" "$TREE_B"
+  test_cmd chmod -R u+w "$TREE_B"
+  put_claim "$a" "$state" '' "$peer"
+  (
+    export "$@" LAKE_CLAIM_TAKEOVER_SECS=5 BUILD_TIMEOUT=120
+    run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim
+  )
+  test_cmd_eq 4 claim_check built-by "$LOG_B"
+  wait_push "$CACHE_B"
+}
+
+case_claim_share() {
+  # Builds that have read each other's claims share the inputs out: each gives every input it is
+  # about to compile to one of them, by the input's hash, claims its own, and leaves the others
+  # until `LAKE_CLAIM_DEFER_SECS` have passed with no claim. Here another build holds a live claim
+  # that says `building` for `Claim.A`, which `Claim.C` and `Claim` are built from, so this build
+  # has read it by the time it reaches them: the party is that build and this one, ordered by
+  # their holders (a holder that starts with `!` sorts before this machine's, one that starts
+  # with `~` after it). The other build is named so that it owns `Claim.C`'s input.
+  claim_fresh
+  # The input hashes of the package's modules, from a build that claims nothing
+  LAKE_REMOTE_CACHE_CLAIMS=false run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim
+  local a c root peer
+  a="$(inputs "$CACHE_A" Claim.A)"
+  c="$(inputs "$CACHE_A" Claim.C)"
+  root="$(inputs "$CACHE_A" Claim)"
+  test_cmd rm -rf "$CACHE_A"
+  if [ "$(owner_index "$c" 2)" = 0 ]; then peer='!peer:1'; else peer='~peer:2'; fi
+  share_build building LAKE_CLAIM_DEFER_SECS=2
+  # `Claim.C` belongs to the other build, which never claims it: this build leaves it and then
+  # takes it, and then leaves that build no more inputs, since it has stopped
+  match_text "leaving the input $c to the build $peer" "$LOG_B"
+  match_text "taking the input $c, which the build $peer left unclaimed" "$LOG_B"
+  match_text "leaving no more inputs to the build $peer until it is seen building" "$LOG_B"
+  # So `Claim`, which is built from `Claim.C`, costs no wait, whichever build its hash names
+  no_match_text "leaving the input $root" "$LOG_B"
+  # A claim that says `queued` names a push, which compiles nothing (a push writes its own
+  # process ID into the claims it holds): it takes no share, so the build leaves no input
+  share_build queued LAKE_CLAIM_DEFER_SECS=2
+  no_match_text 'leaving the input ' "$LOG_B"
+  # With the sharing off, the build claims every input it reaches, as one build alone does
+  share_build building LAKE_CLAIM_DEFER_SECS=0
+  no_match_text 'leaving the input ' "$LOG_B"
+}
+
+case_claim_free_slots() {
+  # A build with a free compile slot compiles at once, and neither claims nor waits: waiting for
+  # another build saves it time only when it cannot compile more at once. This package runs at
+  # most two compiles at once, so a build with more slots takes no claim, and another build's live
+  # claim of an input (here `Claim.A`'s, which that build never finishes) does not hold it up:
+  # with full slots it would wait out the takeover time (600 s).
+  claim_fresh
+  # The input hash of `Claim.A`, from a build that claims nothing
+  LAKE_REMOTE_CACHE_CLAIMS=false run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
+  local a slots
+  a="$(inputs "$CACHE_A" Claim.A)"
+  # Four slots set, and the build's own slots (here four worker threads)
+  for slots in 4 default; do
+    test_cmd rm -rf "$TREE_B" "$CACHE_B" "$OBJECTS" "$CLAIMS"
+    test_cmd cp -r "$TEST_DIR/claim" "$TREE_B"
+    test_cmd chmod -R u+w "$TREE_B"
+    put_claim "$a" building
+    START=$(date +%s)
+    CLAIM_SLOTS=$slots LEAN_NUM_THREADS=4 BUILD_TIMEOUT=60 \
+      run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim
+    test_exp $(( $(date +%s) - START )) -lt 45
+    test_cmd_eq 4 claim_check built-by "$LOG_B"
+    # The only claim is the other build's, as it wrote it
+    test_cmd_eq 1 claim_check count-files "$CLAIMS"
+    match_text '"holder":"other:1"' "$CLAIMS/$a"
+    no_match_text 'waiting for the claim' "$LOG_B"
+    wait_push "$CACHE_B"
+  done
+}
+
 run_cases case_claim_two_builds case_claim_one_push case_claim_order case_claim_failed \
   case_claim_takeover case_claim_dead_holder case_claim_stale case_claim_detached_push \
   case_claim_pool_slot case_claim_fail_fast case_claim_same_pid case_claim_queued \
+  case_claim_queued_killed \
   case_claim_exe_push case_claim_push_retry case_claim_push_spawn_fails \
   case_claim_push_start_wfail case_claim_foreground_push case_claim_follow_reap \
   case_claim_unreadable case_claim_local_clock case_claim_stream case_claim_off \
-  case_claim_fail_open
+  case_claim_fail_open case_claim_share case_claim_free_slots

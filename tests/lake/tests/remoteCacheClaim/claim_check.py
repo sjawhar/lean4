@@ -96,6 +96,46 @@ def wait_file(args):
     sys.exit(f"{args.file} does not exist after {args.timeout} s")
 
 
+def states(dir):
+    """Each claim file of a directory with its state."""
+    for name in sorted(os.listdir(dir)) if os.path.isdir(dir) else []:
+        try:
+            with open(os.path.join(dir, name)) as f:
+                yield name, json.load(f).get("state")
+        except Exception:
+            continue
+
+
+def wait_state(args):
+    """Waits until a claim of a directory is in a state."""
+    deadline = time.time() + args.timeout
+    while time.time() < deadline:
+        if any(s == args.state for _, s in states(args.dir)):
+            return
+        time.sleep(0.05)
+    sys.exit(f"no claim of {args.dir} is {args.state!r} after {args.timeout} s")
+
+
+def wait_no_state(args):
+    """Waits until no claim of a directory is in a state, and some claim exists."""
+    deadline = time.time() + args.timeout
+    while time.time() < deadline:
+        seen = list(states(args.dir))
+        if seen and not any(s == args.state for _, s in seen):
+            return
+        time.sleep(0.05)
+    sys.exit(f"a claim of {args.dir} is still {args.state!r} after {args.timeout} s")
+
+
+def first_state(args):
+    """Prints the name of the first claim of a directory in a state."""
+    for name, s in states(args.dir):
+        if s == args.state:
+            print(name)
+            return
+    sys.exit(f"no claim of {args.dir} is {args.state!r}")
+
+
 def count_files(args):
     """Prints how many entries a directory holds (0 if it does not exist)."""
     print(len(os.listdir(args.dir)) if os.path.isdir(args.dir) else 0)
@@ -166,6 +206,23 @@ def main():
     p = sub.add_parser("count-files", help=count_files.__doc__)
     p.add_argument("dir")
     p.set_defaults(run=count_files)
+
+    p = sub.add_parser("wait-state", help=wait_state.__doc__)
+    p.add_argument("dir")
+    p.add_argument("state")
+    p.add_argument("--timeout", type=float, default=60)
+    p.set_defaults(run=wait_state)
+
+    p = sub.add_parser("wait-no-state", help=wait_no_state.__doc__)
+    p.add_argument("dir")
+    p.add_argument("state")
+    p.add_argument("--timeout", type=float, default=60)
+    p.set_defaults(run=wait_no_state)
+
+    p = sub.add_parser("first-state", help=first_state.__doc__)
+    p.add_argument("dir")
+    p.add_argument("state")
+    p.set_defaults(run=first_state)
 
     p = sub.add_parser("fds", help=fds.__doc__)
     p.add_argument("pid", type=int)
