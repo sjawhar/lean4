@@ -112,12 +112,66 @@ public def uriEncode (s : String) (init := "") : String :=
   return (← IO.getEnv "CURL").getD "curl"
 
 /--
-The `curl` arguments that make a transfer give up when it stalls: one that has not connected
-within 10 seconds, or that has moved less than 1 KiB per second for 30 seconds. For an upload,
-the time it waits for the server's answer counts as well.
+How long a transfer may take to connect (the TCP and TLS handshakes), in seconds: 3 s. Measured on
+2026-10-26 from an Azure VM to Cloud Storage with 15,000 new connections at 75 and 200 a second:
+the handshakes took 25 ms at the 99.9th percentile, and the slowest 0.04% took about 1.05 s, as
+one retransmission of a lost SYN does (Linux sends it after 1 s). A connection that is not up
+after 3 s lost two or more: the transfer gives up, and a retry connects afresh.
 -/
-public def transferTimeoutArgs : Array String :=
-  #["--connect-timeout", "10", "--speed-limit", "1024", "--speed-time", "30"]
+public def transferConnectSecs : Nat := 3
+
+/--
+The `curl` arguments that make a transfer give up when it stalls: one that has not connected
+within `transferConnectSecs`, or that has moved less than 1 KiB per second for `stallSecs`
+seconds. For an upload, the time it waits for the server's answer counts as well.
+-/
+public def transferTimeoutArgs (stallSecs : Nat := 30) : Array String :=
+  #["--connect-timeout", toString transferConnectSecs, "--speed-limit", "1024",
+    "--speed-time", toString stallSecs]
+
+/--
+The longest that one try of a transfer of at most `bytes` bytes may take, in seconds
+(`curl --max-time`): 60 s, and one more second for each MiB. That is a rate of 1 MiB per second,
+a hundredth of what a download of a 134 MB artifact of the shared remote cache reached from an
+Azure VM on 2026-10-26 (100 to 165 MB per second). It bounds a transfer that keeps moving, but
+too slowly; one that stops moving gives up sooner (see `transferTimeoutArgs`).
+-/
+public def transferMaxSecs (bytes : Nat) : Nat := 60 + bytes / 1048576
+
+/--
+The `curl` arguments that try a transfer again up to `retries` times after a transient failure
+(a timeout, a host that could not be resolved, or HTTP 408, 429, 500, 502, 503, 504, 522 or 524),
+after 1 s and then twice as long each time, but never once `retryMaxSecs` have passed since the
+first try: so a long `Retry-After` of the server ends the retries instead of making the transfer
+wait. With no retries, none.
+
+Only for a `curl` run of one transfer: in a parallel run (`-Z`), `curl` 8.17.0 to 8.19.x never
+starts a retry that waits while no other transfer of the run is running, and the run then never
+ends (curl issue 20669, fixed in 8.20.0). `transferFiles` retries the transfers of such a run.
+-/
+public def transferRetryArgs (retries retryMaxSecs : Nat) : Array String :=
+  if retries == 0 then #[] else
+    #["--retry", toString retries, "--retry-max-time", toString retryMaxSecs]
+
+/-- How a `curl` run of one transfer gives up and tries again (see `TransferLimits.args`). -/
+public structure TransferLimits where
+  /-- The seconds after which a try that moves less than 1 KiB per second gives up. -/
+  stallSecs : Nat := 30
+  /-- How many times a transient failure is tried again (see `transferRetryArgs`). -/
+  retries : Nat := 3
+  /-- The seconds after the first try after which no retry starts (see `transferRetryArgs`). -/
+  retryMaxSecs : Nat := 60
+
+/--
+The `curl` arguments of one transfer with the limits `limits`: it gives up when it stalls (see
+`transferTimeoutArgs`) and tries again after a transient failure (see `transferRetryArgs`). With
+`maxBytes?`, the transfer of at most that many bytes, each try may take at most
+`transferMaxSecs maxBytes` seconds, and the transfer fails if it has more bytes.
+-/
+public def TransferLimits.args (limits : TransferLimits) (maxBytes? : Option Nat := none) : Array String :=
+  let args := transferTimeoutArgs limits.stallSecs ++ transferRetryArgs limits.retries limits.retryMaxSecs
+  maxBytes?.elim args fun bytes =>
+    args ++ #["--max-filesize", toString bytes, "--max-time", toString (transferMaxSecs bytes)]
 
 /--
 The scheme and authority of an HTTP(S) URL, lowercased (e.g., `https://storage.googleapis.com`),
@@ -247,27 +301,28 @@ Performs a HTTP `GET` request of a URL (using `curl` with JSON output) and, if s
 return the body.  Otherwise, returns `none` on a 404 and errors on anything else.
 
 With `cacheToken`, the request carries the cache token, ignores the user's `.curlrc` and does not
-follow redirects (see `withCacheTokenRequest`).
+follow redirects (see `withCacheTokenRequest`). The request gives up and tries again as `limits`
+says (see `TransferLimits.args`); with `maxFileSize?`, a larger body fails, and each try is bounded
+by the time such a body may take. The body goes to a temporary file, which `curl` empties before
+a retry, so that the body of a failed try (e.g., an HTTP 503) is not part of the result.
 -/
 public def getUrl?
   (url : String) (headers : Array String := #[]) (cacheToken := false)
-  (maxFileSize? : Option Nat := none)
-: LogIO (Option String) := withLogErrorPos do
-  let (code, out, _) ← withCacheTokenRequest url cacheToken fun _ args => do
-    let args := args ++ #[
-        "-s", "-w", "%{stderr}%{json}\n",
-        "--retry", "3" -- intermittent network errors can occur
-    ] ++ transferTimeoutArgs
-    let args := maxFileSize?.elim args fun size => args ++ #["--max-filesize", toString size]
+  (maxFileSize? : Option Nat := none) (limits : TransferLimits := {})
+: LogIO (Option String) := withLogErrorPos <| IO.FS.withTempFile fun _ bodyFile => do
+  let (code, _, _) ← withCacheTokenRequest url cacheToken fun _ args => do
+    let args := args ++ #["-s", "-w", "%{stderr}%{json}\n", "-o", bodyFile.toString] ++
+      limits.args maxFileSize?
     let args := headers.foldl (init := args) (· ++ #["-H", ·])
     let out ← captureProc' {cmd := ← Internal.getCurl, args := args.push url}
-    return (← curlResponseCode out.stderr, out)
+    return (← curlResponseCode out.stderr, ())
+  let body ← IO.FS.readFile bodyFile
   if code == 200 then
-    return some out.stdout.trimAscii.copy
+    return some body.trimAscii.copy
   else if code == 404 then
     return none
   else
-    error s!"failed to GET URL, error {code}; received:\n{out.stdout}"
+    error s!"failed to GET URL, error {code}; received:\n{body}"
 
 /-- Perform a HTTP `GET` request of a URL (using `curl`) and return the body. -/
 public def getUrl (url : String) (headers : Array String := #[]) : LogIO String := do

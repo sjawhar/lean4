@@ -168,6 +168,34 @@ case_read_status_persistence() {
   LAKE_REMOTE_CACHE=deny test_out 'Built Test' build Test native
 }
 
+case_read_silent() {
+  # A remote cache that accepts each request and never answers costs a build seconds, not
+  # minutes: a read gives up after 3 s without progress and is tried once more, and after 3
+  # such reads in a row the build reads the remote cache no more. Every target compiles, the
+  # verbose log says once why the build stopped reading, and so does the read status.
+  local start local_secs elapsed
+  fresh
+  start="$(date +%s)"
+  test_run build Test native
+  local_secs=$(($(date +%s) - start))
+  fresh
+  : > "$SERVER_LOG"
+  start="$(date +%s)"
+  LAKE_REMOTE_CACHE=silent test_out 'Built Test' -v build Test native
+  elapsed=$(($(date +%s) - start))
+  echo "the build took $elapsed seconds; without the remote cache, $local_secs seconds"
+  test_exp "$elapsed" -le $((local_secs + 30))
+  match_text 'Built native' produced.out
+  test_cmd cp produced.out silent.out
+  test_cmd_eq 1 count 'stopped reading the remote cache' silent.out
+  "$PYTHON" -c '
+import json, sys
+status = json.load(open(sys.argv[1]))
+assert "stopped reading the remote cache" in status["stopped"], status
+assert status["failures"] >= 3, status
+' "$CACHE_DIR/remote-status-read.json"
+}
+
 run_cases case_read_through case_read_404 case_read_invalid_mapping case_read_bad_artifact \
   case_read_bad_descriptor case_read_transport case_read_status case_read_artifact_status \
-  case_read_status_persistence
+  case_read_status_persistence case_read_silent
