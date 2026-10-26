@@ -493,7 +493,7 @@
                 },
                 "restoreAllArtifacts": {
                     "type": "boolean",
-                    "description": "Whether, when the local artifact cache is enabled, Lake should copy all cached artifacts into the build directory. This ensures the build results are available to external consumers who expect them in the build directory.\n\nIf `none` (the default), this will fallback to (in order):\n* The `LAKE_RESTORE_ARTIFACTS` environment variable (if set).\n* The workspace root's `restoreAllArtifacts` configuration (if set and this package is a dependency).\n* **Lake's default**: `false`."
+                    "description": "Whether, when the local artifact cache is enabled, Lake should copy all cached artifacts into the build directory. This ensures the build results are available to external consumers who expect them in the build directory.\n\nLake restores some artifacts either way: shared libraries, whose names matter, and the C files it compiles, whose names the compiler records in the object files.\n\nIf `none` (the default), this will fallback to (in order):\n* The `LAKE_RESTORE_ARTIFACTS` environment variable (if set).\n* The workspace root's `restoreAllArtifacts` configuration (if set and this package is a dependency).\n* **Lake's default**: `false`."
                 },
                 "srcDir": {
                     "type": "string",

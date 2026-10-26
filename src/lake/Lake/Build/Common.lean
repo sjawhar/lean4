@@ -867,14 +867,36 @@ which will be computed in the resulting `Job` before building.
     return art.path
 
 /--
+Makes the file `src` available at the path `name` (a hard link, or else a copy) and returns `name`.
+The file appears at `name` in one rename, so a concurrent reader of `name` sees either its old or
+its new contents, never a missing file.
+-/
+def placeFileAs (src name : FilePath) : JobM FilePath := do
+  if src == name then
+    return name
+  createParentDirs name
+  let tmp := FilePath.mk s!"{name}.{← IO.Process.getPID}-{← IO.monoNanosNow}.tmp"
+  if let .error e ← (IO.FS.hardLink src tmp).toBaseIO then
+    logVerbose s!"could not hard link {src} to {tmp}, copying instead; error: {e}"
+    copyFile src tmp
+  IO.FS.rename tmp name
+  return name
+
+/--
 **For internal use only.**
 Build an object file from a source fie job (i.e, a `lean -c` output)
 using the Lean toolchain's C compiler.
+
+If `srcName?` is set, the source is compiled under that path (e.g., the build directory's copy of a
+C file that is otherwise used from the artifact cache, where its name is its content hash). The
+compiler records the name of the file it compiles in the object file, so the object's bytes then do
+not depend on whether the artifact cache restores the source.
 -/
 public def Internal.buildLeanO
   (oFile : FilePath) (srcJob : Job FilePath)
   (weakArgs traceArgs : Array String := #[])
   (leanIncludeDir? : Option (FilePath × BuildTrace) := none)
+  (srcName? : Option FilePath := none)
 : SpawnM (Job FilePath) :=
   srcJob.mapM fun srcFile => do
     addLeanTrace
@@ -888,6 +910,7 @@ public def Internal.buildLeanO
       let lean ← getLeanInstall
       let includeDir := leanIncludeDir?.elim lean.includeDir (·.1)
       let args := #["-I", includeDir.toString] ++ lean.ccFlags ++ weakArgs ++ traceArgs
+      let srcFile ← srcName?.elim (pure srcFile) (placeFileAs srcFile ·)
       compileO oFile srcFile args lean.cc
     return art.path
 
