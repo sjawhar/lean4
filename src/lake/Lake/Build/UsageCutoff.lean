@@ -1054,10 +1054,14 @@ def readCompactUsage? (compactFile : FilePath) (usage : ModuleUsage.Digest) : Ba
 Whether the usage index has a compact record a reader takes (`readCompactUsage?`) at `compactFile` for the compile
 whose `.usekey` is at `usekeyFile`: one that decodes and was made from the `.usage` that key names. An unusable one
 (e.g., a file a crash left empty after its rename, or one damaged since) is never read, so the index writes it again
-(`Module.indexUsage`).
+(`Module.indexUsage`). Every compile and every hit asks, and a fresh compile has no record, so it answers that
+before it reads the key, and it reads the key without the build's shared sidecar cache (`readUsageSidecar`), whose
+insert under one mutex the question would otherwise add to each of them.
 -/
-public def hasCompactUsage (compactFile usekeyFile : FilePath) : JobM Bool := do
-  let some key ← readUsageSidecar UsekeySidecar usekeyFile | return false
+public def hasCompactUsage (compactFile usekeyFile : FilePath) : BaseIO Bool := do
+  unless (← compactFile.pathExists) do return false
+  let .ok bytes ← (IO.FS.readBinFile usekeyFile).toBaseIO | return false
+  let .ok (some key) := parseUsageSidecar.parse UsekeySidecar bytes | return false
   return (← readCompactUsage? compactFile key.usage).isSome
 
 /--
