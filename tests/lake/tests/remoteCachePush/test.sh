@@ -564,17 +564,33 @@ case_push_unset() {
 }
 
 case_push_local_pruned() {
-  # A local mapping whose artifacts were pruned from the cache does not hide the remote cache:
-  # the build reads the remote mapping, replaces the local one with it, and restores the modules
-  # instead of compiling them.
+  # A local mapping that cannot be used does not hide the remote cache: the build reads the
+  # remote mapping, replaces the local one with it, and restores the modules instead of
+  # compiling them. Two ways a local mapping becomes unusable: its artifacts are pruned, and
+  # its file does not parse.
   push_fresh
   build_a
+  local basic mapping
+  basic="$(push_check inputs "$PUSH_QUEUE" Push.Basic)"
   on_a test_run cache push
   test_exp -d "$PUSH_CACHE/outputs"
   test_cmd rm -rf "$PUSH_CACHE/artifacts" "$PUSH_A/.lake/build"
   : > "$SERVER_LOG"
   on_a test_not_out 'Built Push.Basic' -v --dir "$PUSH_A" build Push
   test_exp "$(count '^GET .*/in/.* -> 200' "$SERVER_LOG")" -ge 1
+  # The remote mapping replaced the local one, so the next build needs no request
+  : > "$SERVER_LOG"
+  test_cmd rm -rf "$PUSH_A/.lake/build"
+  on_a test_not_out 'Built Push.Basic' -v --dir "$PUSH_A" build Push
+  test_cmd_eq 0 count ' -> ' "$SERVER_LOG"
+  # A mapping file of nonsense: the build reads the remote one over it
+  mapping="$(find "$PUSH_CACHE/outputs" -name "$basic.json" -print -quit)"
+  test_exp -f "$mapping"
+  echo 'not json' > "$mapping"
+  test_cmd rm -rf "$PUSH_A/.lake/build" "$PUSH_CACHE/artifacts"
+  : > "$SERVER_LOG"
+  on_a test_not_out 'Built Push.Basic' -v --dir "$PUSH_A" build Push
+  test_cmd "$PYTHON" -c 'import json,sys; json.load(open(sys.argv[1]))' "$mapping"
 }
 
 case_push_bad_archive() {
@@ -584,21 +600,7 @@ case_push_bad_archive() {
   # archive, and both of its hashes in the remote mapping name those bytes.
   push_fresh
   build_a
-  local input bad lakehash sha mapping
-  input="$(push_check inputs "$PUSH_QUEUE" Push.Basic)"
-  on_a test_run cache push
-  mapping="$STORE_DIR/a0/$PUSH_SCOPE/in/$input.json"
-  test_exp -f "$mapping"
-  bad="$WORK_DIR/not-an-archive"
-  echo 'this is not a Lean archive' > "$bad"
-  lakehash="$(LEAN_PATH="$BUILD_DIR/lib/lean" "$BUILD_DIR/bin/lean" --run "$TEST_DIR/HashFile.lean" "$bad")"
-  sha="$(sha256sum "$bad" | cut -d' ' -f1)"
-  test_cmd cp "$bad" "$STORE_DIR/a0/$PUSH_SCOPE/a/$sha.art"
-  "$PYTHON" -c 'import json,sys
-m = json.load(open(sys.argv[1]))
-m["data"] = sys.argv[2] + ".ltar"
-m["sha256"] = {sys.argv[2] + ".ltar": sys.argv[3]}
-json.dump(m, open(sys.argv[1], "w"))' "$mapping" "$lakehash" "$sha"
+  seed_bad_archive
   test_cmd rm -rf "$PUSH_B" "$PUSH_CACHE_B"
   test_cmd cp -r "$TEST_DIR/push" "$PUSH_B"
   test_cmd chmod -R u+w "$PUSH_B"
@@ -609,8 +611,69 @@ json.dump(m, open(sys.argv[1], "w"))' "$mapping" "$lakehash" "$sha"
   match_text 'did not unpack' "$PUSH_CACHE_B/remote-status-read.json"
 }
 
+# Replaces `Push.Basic`'s archive in the bucket by bytes that are not an archive, and names
+# those bytes in both of the hashes of its remote mapping. Keeps the archive that the push
+# uploaded in `$WORK_DIR/good-archive`, and the bad archive's cache name in
+# `$WORK_DIR/bad-archive-name`.
+seed_bad_archive() {
+  local input bad lakehash sha mapping
+  input="$(push_check inputs "$PUSH_QUEUE" Push.Basic)"
+  on_a test_run cache push
+  mapping="$STORE_DIR/a0/$PUSH_SCOPE/in/$input.json"
+  test_exp -f "$mapping"
+  test_cmd cp "$STORE_DIR/a0/$PUSH_SCOPE/a/$("$PYTHON" -c 'import json,sys
+m = json.load(open(sys.argv[1]))
+print(m["sha256"][m["data"]])' "$mapping").art" "$WORK_DIR/good-archive"
+  bad="$WORK_DIR/not-an-archive"
+  echo 'this is not a Lean archive' > "$bad"
+  lakehash="$(LEAN_PATH="$BUILD_DIR/lib/lean" "$BUILD_DIR/bin/lean" --run "$TEST_DIR/HashFile.lean" "$bad")"
+  sha="$(sha256sum "$bad" | cut -d' ' -f1)"
+  test_cmd cp "$bad" "$STORE_DIR/a0/$PUSH_SCOPE/a/$sha.art"
+  "$PYTHON" -c 'import json,sys
+m = json.load(open(sys.argv[1]))
+m["data"] = sys.argv[2] + ".ltar"
+m["sha256"] = {sys.argv[2] + ".ltar": sys.argv[3]}
+json.dump(m, open(sys.argv[1], "w"))' "$mapping" "$lakehash" "$sha"
+  echo "$lakehash.ltar" > "$WORK_DIR/bad-archive-name"
+}
+
+case_push_bad_archive_race() {
+  # A build that installs a good archive while another build quarantines the bad one keeps its
+  # archive: the quarantine takes the entry away from its name by renaming it, so only the bytes
+  # it took can go. The build is paused where it takes the entry away, the entry is replaced by
+  # an archive that unpacks, and the build goes on.
+  push_fresh
+  build_a
+  local name entry good
+  seed_bad_archive
+  name="$(cat "$WORK_DIR/bad-archive-name")"
+  good="$WORK_DIR/good-archive"
+  test_cmd rm -rf "$PUSH_B" "$PUSH_CACHE_B" "$WORK_DIR/entry-ready" "$WORK_DIR/entry-release"
+  test_cmd cp -r "$TEST_DIR/push" "$PUSH_B"
+  test_cmd chmod -R u+w "$PUSH_B"
+  entry="$PUSH_CACHE_B/artifacts/$name"
+  build_interpose
+  PROBE_ENTRY_READY="$WORK_DIR/entry-ready" PROBE_ENTRY_RELEASE="$WORK_DIR/entry-release" \
+    LD_PRELOAD="$INTERPOSE" LAKE_CACHE_DIR="$PUSH_CACHE_B" LAKE_REMOTE_CACHE=ok \
+    "$LAKE" -v --dir "$PUSH_B" build Push > "$WORK_DIR/race-build.log" 2>&1 &
+  local build=$!
+  wait_probe "$WORK_DIR/entry-ready"
+  # Another build repairs the entry with an archive that unpacks
+  test_cmd rm -f "$entry"
+  test_cmd cp "$good" "$entry"
+  test_cmd touch "$WORK_DIR/entry-release"
+  wait $build
+  cat "$WORK_DIR/race-build.log"
+  # The repair is still at the entry's name, and no copy of it was quarantined: the build
+  # removes only the bytes it tested
+  test_cmd cmp "$entry" "$good"
+  test_cmd_eq 0 count_files_equal "$PUSH_CACHE_B/quarantine" "$good"
+  match_text 'another process replaced it, which this build kept' "$WORK_DIR/race-build.log"
+  match_text 'Built Push.Basic' "$WORK_DIR/race-build.log"
+}
+
 run_cases case_push_queue case_push_upload case_push_tree_changed case_push_mismatch \
   case_push_missing case_push_custom_target case_push_githash case_push_deny case_push_invalid \
   case_push_many case_push_staging case_push_concurrent case_push_stall case_push_pack_failure \
   case_push_repair_race case_push_mapping_overwrite case_push_unset case_push_local_pruned \
-  case_push_bad_archive
+  case_push_bad_archive case_push_bad_archive_race
