@@ -55,10 +55,11 @@ the 99.9th percentile), and a 134 MB artifact streamed at 100 MB per second or f
 public def remoteReadLimits : TransferLimits := {stallSecs := 3, retries := 1, retryMaxSecs := 10}
 
 /--
-After how many reads of the shared remote cache in a row that failed after waiting at least the
-stall time of `remoteReadLimits` (3 s; a remote that does not answer) a build stops reading the
-remote cache for the rest of the build (see `RemoteReadStatus`): 3. A read that fails sooner (the
-remote refused it) does not count, and any other read resets the count.
+After how many reads of the shared remote cache in a row that failed once their transfers took at
+least the stall time of `remoteReadLimits` (3 s; a remote that does not answer) a build stops
+reading the remote cache for the rest of the build (see `RemoteReadStatus`): 3. A read whose
+transfers failed sooner (the remote refused it) does not count, however long it waited before
+them, and any other read resets the count.
 -/
 public def remoteReadTimeoutLimit : Nat := 3
 
