@@ -42,15 +42,18 @@ in the cache directory. It stages (and packs) the entries of a chunk with severa
 (`pushWorkers`); a failure while one entry is staged fails only that entry. It names each
 artifact by its SHA-256 and uploads it, and then the entry's remote mapping (see
 `RemoteCacheMapping`) once all of the entry's artifacts are present, each only if the object is
-absent. Pushed and dropped entries leave the queue. An entry whose upload failed stays in the
-queue for the next push.
+absent. A chunk uploads while the next one stages. Each upload is bounded, and an upload that
+failed transiently is tried again (see `CacheService.putRemoteObjects`). Pushed and dropped
+entries leave the queue. An entry whose upload failed stays in the queue for the next push.
 
 One pusher at a time holds `Cache.pushLockFile`. It works in passes: each pass reads the queue,
-pushes the entries that it has not tried, and removes the pushed and dropped ones with one rewrite
-of the queue at the start of the next pass. It stops when a pass finds no entry that it has not
-tried, so it pushes an entry that a build appends while it runs. It releases the lock while it
-still holds the queue's lock, so that no append can fall between its last look at the queue and
-the release. At the end, it records its outcome in `Cache.pushStatusFile`.
+pushes the entries that it has not tried, and removes the pushed and dropped ones from the queue
+as it goes, with a rewrite of the queue after a chunk (see `pushFlushFactor`), so that a push that
+is stopped keeps its progress, and with one at the start of the next pass. It stops when a pass
+finds no entry that it has not tried, so it pushes an entry that a build appends while it runs. It
+releases the lock while it still holds the queue's lock, so that no append can fall between its
+last look at the queue and the release. At the end, it records its outcome in
+`Cache.pushStatusFile`.
 -/
 
 open System Lean
@@ -69,14 +72,26 @@ inductive PushOutcome
 | failed
 | dropped
 
-/-- At most how many queue entries the pusher stages, and then uploads with two `curl` runs. -/
+/--
+At most how many queue entries the pusher stages, and then uploads: the artifacts with one `curl`
+run and then the mappings with another (and more runs for the uploads that are tried again).
+-/
 def pushChunkSize : Nat := 64
 
 /--
-The staged bytes after which the pusher stages no more entries before it uploads them, so that
-staging takes at most about this much space in the cache directory (plus one entry per worker).
+The staged bytes after which the pusher stages no more entries before it uploads them. A chunk
+uploads while the next one stages, so staging takes at most about twice this much space in the
+cache directory (plus one entry per worker).
 -/
 def pushChunkBytes : Nat := 256 * 1024 * 1024
+
+/--
+How much longer than its last rewrite of the queue that removed the lines it pushed or dropped
+(`removeFromQueue`) a pass waits before the next such rewrite: 10 times. So these rewrites take at
+most about a tenth of a push, and a push that is stopped (e.g., by a time limit) redoes at most the
+chunks after its last rewrite. A short queue is rewritten after every chunk.
+-/
+def pushFlushFactor : Nat := 10
 
 /--
 How many entries the pusher stages at once: one per CPU, at most 16. Packing a module's archive
@@ -193,6 +208,22 @@ def removeDone (lines : Array String) (done : Std.HashMap String Nat) : Array St
     | some (n + 1) => done := done.insert line n
     | _ => kept := kept.push line
   return kept
+
+/--
+Removes the lines of `done` (see `removeDone`) from the queue, under the queue's lock
+(`queueLock`), with one rewrite. Returns the number of lines that were left out because they are
+not UTF-8 text (see `readQueueLines`).
+-/
+def removeFromQueue
+  (cache : Cache) (queueLock : IO.FS.Handle) (done : Std.HashMap String Nat)
+: IO Nat := do
+  queueLock.lock
+  try
+    let (lines, invalid) ← readQueueLines cache
+    writeQueue cache (removeDone lines done)
+    return invalid
+  finally
+    queueLock.unlock
 
 /-- Returns the `s3` cache service named `name` in the Lake configuration, with the push's key. -/
 def findPushService (ctx : PushContext) (name : String) : Except String CacheService := do
@@ -631,30 +662,49 @@ def markClaimsDone (ctx : PushContext) (entries : Array ReadyEntry) : LoggerIO U
     if let some (some msg) := msg? then
       logVerbose msg
 
+/-- A prefix of some queue lines, staged for upload (see `stageChunk`). -/
+structure StagedChunk where
+  /-- The lines that were staged: a prefix of the lines given, at least one. -/
+  lines : Array String
+  /-- The outcome of each line: `failed` for a ready entry, until its mapping is uploaded. -/
+  outcomes : Array PushOutcome
+  /-- The entries ready for upload. -/
+  ready : Array ReadyEntry
+  /-- The directory that holds the staged files. -/
+  dir : FilePath
+
 /--
-Pushes a prefix of the queue lines `lines`, staged in the push's own staging directory: it stages
-lines until it has staged `pushChunkBytes` (see `stageLines`; `taken` holds the generations of
-the claims this push took), uploads the artifacts of the staged entries, and then the mapping of
-each entry whose artifacts are all present. Returns the outcome of each line that it handled, at
-least one.
+Stages a prefix of the queue lines `lines` in `dir`, which it empties first: it stages lines until
+it has staged `pushChunkBytes` (see `stageLines`; `taken` holds the generations of the claims this
+push took).
 -/
-def pushChunk
-  (ctx : PushContext) (lines : Array String) (taken : Std.HashMap String TakenClaim)
-: LoggerIO (Array PushOutcome) := do
-  let dir := ctx.stagingDir
+def stageChunk
+  (ctx : PushContext) (dir : FilePath) (lines : Array String)
+  (taken : Std.HashMap String TakenClaim)
+: LoggerIO StagedChunk := do
   removeDirAllIfExists dir
   IO.FS.createDirAll dir
+  let mut outcomes : Array PushOutcome := #[]
+  let mut ready : Array ReadyEntry := #[]
+  for (staged, log) in ← stageLines ctx dir lines taken do
+    log.replay
+    match staged with
+    | .ready entry =>
+      ready := ready.push entry
+      outcomes := outcomes.push .failed -- until its mapping is uploaded
+    | .dropped => outcomes := outcomes.push .dropped
+    | .failed => outcomes := outcomes.push .failed
+  return {lines := lines.extract 0 outcomes.size, outcomes, ready, dir}
+
+/--
+Uploads the artifacts of the entries of `chunk`, and then the mapping of each entry whose artifacts
+are all present, and removes the chunk's staging directory. Returns the outcome of each line of the
+chunk.
+-/
+def uploadChunk (ctx : PushContext) (chunk : StagedChunk) : LoggerIO (Array PushOutcome) := do
   try
-    let mut outcomes : Array PushOutcome := #[]
-    let mut ready : Array ReadyEntry := #[]
-    for (staged, log) in ← stageLines ctx dir lines taken do
-      log.replay
-      match staged with
-      | .ready entry =>
-        ready := ready.push entry
-        outcomes := outcomes.push .failed -- until its mapping is uploaded
-      | .dropped => outcomes := outcomes.push .dropped
-      | .failed => outcomes := outcomes.push .failed
+    let mut outcomes := chunk.outcomes
+    let ready := chunk.ready
     let services := ready.foldl (init := #[]) fun services e =>
       if services.any (·.1 == e.serviceName) then services else services.push (e.serviceName, e.service)
     for (name, service) in services do
@@ -678,7 +728,7 @@ def pushChunk
       markClaimsDone ctx (complete.filter (mapped.contains ·.mapping.url))
     return outcomes
   finally
-    discard <| (removeDirAllIfExists dir).toBaseIO
+    discard <| (removeDirAllIfExists chunk.dir).toBaseIO
 
 /-- Records the outcome of a push in `Cache.pushStatusFile`. -/
 def writePushStatus (cache : Cache) (stats : PushStats) (queued : Nat) : IO Unit := do
@@ -757,7 +807,8 @@ partial def claimTaker (ctx : PushContext) (taken : TakenClaims) (stop : IO.Ref 
 /--
 Runs passes of the push until a pass finds no queue line that this push has not tried, then
 stops its claim taker and releases `pushLock` (see the module docs). `done` counts the lines
-that the last pass pushed or dropped, which this pass removes from the queue. `failed` holds the
+that the last pass pushed or dropped and has not yet removed from the queue (it removes them as
+it goes; see `pushFlushFactor`), which this pass removes. `failed` holds the
 lines whose upload failed: they stay in the queue. `taken` holds the claims this push took (see
 `takeLineClaims`): each pass first takes the claims of its lines that it has not taken yet, and
 stages each entry with its claim's new generation. `taker` is the claim taker's task and the
@@ -829,19 +880,40 @@ partial def pushLoop
   queueLock.unlock
   logInfo s!"pushing {todo.size} queue entries to the remote cache"
   takeLineClaims ctx taken todo
+  -- Stages the chunk of `todo` that starts at `start` in the staging directory `slot`
+  let stageAt (start slot : Nat) : LoggerIO (Option StagedChunk) := do
+    if start ≥ todo.size then
+      return none
+    let lines := todo.extract start (start + pushChunkSize)
+    -- A claim that the taker is taking now decides the generation this chunk stages with
+    waitForLineClaims taken lines
+    let claims ← taken.claims.get
+    let dir := ctx.stagingDir / toString slot
+    try
+      some <$> stageChunk ctx dir lines claims
+    catch _ =>
+      discard <| (removeDirAllIfExists dir).toBaseIO
+      return some {lines, outcomes := Array.replicate lines.size .failed, ready := #[], dir}
   let mut stats := stats
   let mut failed := failed
   let mut retryAt := retryAt
   let mut done : Std.HashMap String Nat := {}
+  let mut flushAt := 0
   let mut start := 0
-  while start < todo.size do
-    let chunk := todo.extract start (start + pushChunkSize)
-    -- A claim that the taker is taking now decides the generation this chunk stages with
-    waitForLineClaims taken chunk
-    let claims ← taken.claims.get
-    let outcomes ← try pushChunk ctx chunk claims
-      catch _ => pure (Array.replicate chunk.size .failed)
-    for line in chunk, outcome in outcomes do
+  let mut slot := 0
+  let mut next? ← stageAt start slot
+  repeat
+    let some chunk := next?
+      | break
+    -- The chunk uploads while the next one stages, in the other staging directory
+    let upload ← BaseIO.asTask (prio := .dedicated) (uploadChunk ctx chunk).captureLog
+    start := start + max 1 chunk.lines.size
+    slot := 1 - slot
+    next? ← stageAt start slot
+    let (outcomes?, log) ← IO.wait upload
+    log.replay
+    let outcomes := outcomes?.getD (Array.replicate chunk.lines.size .failed)
+    for line in chunk.lines, outcome in outcomes do
       match outcome with
       | .pushed =>
         stats := {stats with pushed := stats.pushed + 1}
@@ -853,7 +925,18 @@ partial def pushLoop
         stats := {stats with failed := stats.failed + 1}
         failed := failed.insert line
         retryAt := (← IO.monoMsNow) + followRetryMs
-    start := start + max 1 outcomes.size
+    -- So that a push that is stopped keeps its progress, the lines it pushed or dropped leave the
+    -- queue as it goes (see `pushFlushFactor`)
+    let now ← IO.monoMsNow
+    if now ≥ flushAt && !done.isEmpty then
+      match ← (removeFromQueue cache queueLock done).toBaseIO with
+      | .ok invalid =>
+        stats := {stats with dropped := stats.dropped + invalid}
+        taken.claims.modify (·.filter fun line _ => !done.contains line)
+        done := {}
+        flushAt := now + pushFlushFactor * ((← IO.monoMsNow) - now)
+      | .error e =>
+        logWarning s!"could not remove the pushed entries from {cache.pushQueueFile}: {e}"
   pushLoop ctx pushLock queueLock taken taker stats failed done follow? retryAt
 
 /--
@@ -880,11 +963,13 @@ public def pushRemoteCache
     return 0
   /-
   The lock proves that no other push runs, so any staging directory is a dead push's. The `curl`
-  of a push that was killed can outlive it and still open the files it was given: this push
-  stages in a directory of its own, so such a `curl` can never upload this push's files under the
-  dead push's URLs (and finds its own files gone).
+  and `leantar` of a push that was killed can outlive it: this push stages in a directory of its
+  own, so such a `curl` can never upload this push's files under the dead push's URLs (and finds
+  its own files gone), and a `leantar` that writes into the dead push's directory while this push
+  removes it only leaves that directory behind, which the next push removes.
   -/
-  removeDirAllIfExists cache.pushStagingDir
+  if let .error e ← (removeDirAllIfExists cache.pushStagingDir).toBaseIO then
+    logVerbose s!"could not remove {cache.pushStagingDir}: {e}"
   let stagingDir := cache.pushStagingDir /
     s!"{← IO.Process.getPID}-{(Hash.ofByteArray (← IO.getRandomBytes 8)).hex}"
   logVerbose s!"staging uploads in {stagingDir}"
@@ -902,5 +987,6 @@ public def pushRemoteCache
   finally
     stop.set true
     discard <| IO.wait taker
+    discard <| (removeDirAllIfExists stagingDir).toBaseIO
 
 end Lake

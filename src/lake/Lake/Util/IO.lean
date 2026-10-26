@@ -55,6 +55,18 @@ public def wallClockSecs : IO Int := do
   return Std.Time.Internal.UnitVal.val (α := 1) (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch
 
 /--
+Waits until {lean}`task` has finished or the monotonic clock reaches {lean}`deadline` (in
+milliseconds), looking every 20 ms. Returns whether the task finished.
+-/
+public partial def waitUntil (task : Task α) (deadline : Nat) : BaseIO Bool := do
+  if ← IO.hasFinished task then
+    return true
+  if (← IO.monoMsNow) ≥ deadline then
+    return false
+  IO.sleep 20
+  waitUntil task deadline
+
+/--
 Replaces the contents of {lean}`path` with {lean}`content`: writes a temporary file next to it
 (see {lean}`uniqueTmpPath`) and renames it into place, so that a reader sees either the old or
 the new contents, never a part.

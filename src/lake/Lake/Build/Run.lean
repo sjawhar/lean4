@@ -397,12 +397,17 @@ def Workspace.startBuild
   let compute := Job.async build (caption := caption)
   compute.run.run'.run bctx |>.run nilTrace
 
-/-- Atomically replace the status left by remote mapping reads in one build. -/
+/--
+Atomically replace the status left by remote mapping reads in one build, with `stopped` if the
+build stopped reading the remote cache (see `noteRemoteRead`).
+-/
 def writeRemoteReadStatus (cache : Cache) (status : RemoteReadStatus) : IO Unit := do
-  writeFileAtomic cache.readStatusFile <| (JsonObject.empty
+  let obj := JsonObject.empty
     |>.insert "at" (← wallClockSecs)
     |>.insert "failures" status.failures
-    |>.insert "lastError" status.lastError : Json).pretty
+    |>.insert "lastError" status.lastError
+  let obj := status.stopped?.elim obj (obj.insert "stopped" ·)
+  writeFileAtomic cache.readStatusFile (obj : Json).pretty
 
 /--
 At the end of a build that takes claims (see `Env.remoteCacheClaimService?`) on a machine without

@@ -44,6 +44,14 @@ on_a() {
   LAKE_CACHE_DIR="$PUSH_CACHE" LAKE_REMOTE_CACHE="${PUSH_SERVICE:-bearer}" \
     LAKE_CACHE_TOKEN_CMD="$TOKEN_CMD" LAKE_REMOTE_CACHE_QUEUE=true LAKE_REMOTE_CACHE_CLAIMS=false "$@"
 }
+# As `on_a`, but it exports the settings and then replaces this shell with the command, so that a
+# caller that starts it in the background gets the command's own process ID (a prefix assignment
+# before `exec`, a special builtin, is not exported)
+on_a_exec() {
+  export LAKE_CACHE_DIR="$PUSH_CACHE" LAKE_REMOTE_CACHE="${PUSH_SERVICE:-bearer}" \
+    LAKE_CACHE_TOKEN_CMD="$TOKEN_CMD" LAKE_REMOTE_CACHE_QUEUE=true LAKE_REMOTE_CACHE_CLAIMS=false
+  exec "$@"
+}
 # Builds the package on machine A
 build_a() { on_a test_run --dir "$PUSH_A" build $PUSH_TARGETS; }
 # Counts the lines in a queue (by default, machine A's)
@@ -387,8 +395,10 @@ case_push_concurrent() {
 case_push_stall() {
   # An upload whose server reads it and then does not answer gives up, as a download does:
   # the push fails long before the server would answer (after 15 minutes), keeps the queue,
-  # and records the failure. Each upload gives up after 30 s without progress, and `curl`
-  # tries it 4 times; the two small files of `pair` keep that near the minimum.
+  # and records the failure. Each try of an upload gives up after 30 s without progress, and
+  # Lake tries it 4 times (after 1, 2 and 4 s). The two small files of `pair` go to one HTTP/1.1
+  # server, where `curl` 8.5 starts the second upload only once the first has given up, so each
+  # try of the pair can take 60 s and the push about 250 s.
   push_fresh
   PUSH_SERVICE=stallput on_a test_run --dir "$PUSH_A" build pair
   test_cmd_eq 2 queued
@@ -403,9 +413,99 @@ case_push_stall() {
   cat push.out
   echo "lake exited with code $rc after $elapsed seconds"
   test_exp "$rc" = 1
+  test_exp "$elapsed" -lt 300
   match_text 'Operation too slow' push.out
   test_cmd_eq 2 queued
   test_cmd push_check status "$PUSH_STATUS" 0 2 0 2
+}
+
+case_push_busy() {
+  # A server that answers the first upload of each object with 503 (it is busy) gets the upload
+  # again, in a `curl` run of its own, and the push uploads everything. `curl` itself never tries
+  # an upload again: from 8.17.0 to 8.19.0 (curl issue 20669), a parallel `curl` run that waits to
+  # try a transfer again after its other transfers have ended never ends.
+  push_fresh
+  PUSH_SERVICE=busyonce on_a test_run --dir "$PUSH_A" build pair
+  test_cmd_eq 2 queued
+  : > "$SERVER_LOG"
+  local start elapsed rc
+  start="$(date +%s)"
+  if PUSH_SERVICE=busyonce on_a timeout 120 "$LAKE" cache push > push.out 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  elapsed=$(($(date +%s) - start))
+  cat push.out
+  echo "lake exited with code $rc after $elapsed seconds"
+  test_exp "$rc" = 0
+  test_cmd_eq 0 queued
+  test_cmd push_check status "$PUSH_STATUS" 2 0 0 0
+  # Each artifact and mapping was refused once and then created
+  test_cmd_eq 4 count ' -> 503 ' "$SERVER_LOG"
+  test_cmd_eq 4 count ' -> 200 ' "$SERVER_LOG"
+}
+
+case_push_curl_hang() {
+  # A `curl` run that never ends (here, one that sleeps after its transfers) is stopped once it
+  # has run as long as its transfers may take: the push goes on, and the uploads that `curl`
+  # reported before count.
+  push_fresh
+  build_a
+  cat > "$WORK_DIR/hang-curl.sh" << EOF
+#!/bin/sh
+"$(type -P curl)" "\$@"
+exec sleep 900
+EOF
+  test_cmd chmod +x "$WORK_DIR/hang-curl.sh"
+  local start elapsed rc
+  start="$(date +%s)"
+  if CURL="$WORK_DIR/hang-curl.sh" on_a timeout 400 "$LAKE" cache push > push.out 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  elapsed=$(($(date +%s) - start))
+  cat push.out
+  echo "lake exited with code $rc after $elapsed seconds"
+  test_exp "$rc" = 0
+  test_exp "$elapsed" -lt 250
+  match_text 'Lake stopped it' push.out
+  test_cmd_eq 0 queued
+  test_cmd push_check status "$PUSH_STATUS" $PUSH_COMPILES 0 0 0
+}
+
+case_push_resume() {
+  # A push that is stopped keeps what it pushed: it removes the lines of the chunks it pushed
+  # from the queue as it goes, at most a tenth of the time (`pushFlushFactor`). Here 240 lines
+  # (each of the 12 entries for 20 inputs) go up in chunks of 64, each upload taking 4 s. The
+  # push is killed once it has uploaded the mappings of two chunks, so a push that rewrites the
+  # queue only at the end of a pass leaves all 240 lines. The next push then sends the mappings
+  # that are left, and redoes at most the one chunk whose lines the first push had not removed.
+  push_fresh
+  PUSH_SERVICE=slowobj build_a
+  test_cmd push_check spread "$PUSH_CACHE" 20
+  local total left pid sent
+  total="$(queued)"
+  test_exp "$total" = $((PUSH_COMPILES * 20))
+  : > "$SERVER_LOG"
+  # In a subshell that exports the settings and then becomes Lake, so that `$!` is Lake itself
+  PUSH_SERVICE=slowobj on_a_exec "$LAKE" cache push > push1.out 2>&1 &
+  pid=$!
+  sent="$(push_check wait-puts 180 "$SERVER_LOG" /in/ 128)"
+  kill -9 "$pid" 2> /dev/null || true
+  wait "$pid" || true
+  left="$(queued)"
+  cat push1.out
+  echo "the first push sent $sent mappings and left $left of $total lines"
+  test_exp "$sent" -ge 128
+  test_exp "$left" -le $((total - 64))
+  test_exp "$left" -gt 0
+  PUSH_SERVICE=slowobj on_a test_run cache push
+  test_cmd_eq 0 queued
+  # Every mapping went up, and at most one chunk's mappings went up twice
+  test_cmd_eq "$total" count '^PUT .*/in/.* -> 200 ' "$SERVER_LOG"
+  test_exp "$(count '^PUT .*/in/' "$SERVER_LOG")" -le $((total + 64))
 }
 
 case_push_pack_failure() {
@@ -772,7 +872,8 @@ case_push_unpack_readonly() {
 
 run_cases case_push_queue case_push_upload case_push_tree_changed case_push_mismatch \
   case_push_missing case_push_custom_target case_push_githash case_push_deny case_push_invalid \
-  case_push_many case_push_staging case_push_concurrent case_push_stall case_push_pack_failure \
+  case_push_many case_push_staging case_push_concurrent case_push_stall case_push_busy \
+  case_push_curl_hang case_push_resume case_push_pack_failure \
   case_push_repair_race case_push_mapping_overwrite case_push_unset case_push_unset_caption \
   case_push_local_pruned case_push_bad_archive case_push_bad_archive_race \
   case_push_bad_archive_tick case_push_unpack_readonly
