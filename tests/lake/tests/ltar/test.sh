@@ -111,6 +111,8 @@ if command -v jq > /dev/null; then # skip if no jq found
   LAKE_ARTIFACT_CACHE=true test_run build +Test
   cp Test.lean.orig Test.lean
   test_out "leantar" build +Test -v
+  # The next build writes each output's `.hash` file from its contents
+  test_run build +Test
   # check_hash FILE KEY: FILE's `.hash` file, if any, is the content hash its trace records at KEY
   check_hash() {
     local want; want=$(jq -r "$2" .lake/build/lib/lean/Test.trace)
