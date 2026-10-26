@@ -202,6 +202,14 @@ every 5 seconds, in milliseconds.
 public def remoteClaimPollMs : Nat := 5000
 
 /--
+How often a build that leaves an input to another build of the same targets looks for that
+input's mapping again: every second, in milliseconds. It is shorter than `remoteClaimPollMs`
+because the build it waits for has not claimed the input yet, so there is nothing to tell this
+build when to look (see `Lake.Build.Claim`).
+-/
+public def remoteClaimDeferPollMs : Nat := 1000
+
+/--
 How often the holder of a claim rewrites it while it compiles, in seconds: every 60 seconds, or a
 quarter of the takeover time (`LAKE_CLAIM_TAKEOVER_SECS`) if that is shorter, so that a claim
 whose holder still compiles never looks stale.

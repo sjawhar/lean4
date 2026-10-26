@@ -707,7 +707,6 @@ public def resolveArtifact
   | .error (.noFileOrDirectory ..) => withLogErrorPos do
     -- we redownload artifacts on any error
     if let some serviceName := service? then
-      updateAction .fetch
       if let some service := ws.findCacheService? serviceName.toString then
         let some scope := scope?
           | error s!"artifact with associated cache service but no scope"
@@ -723,6 +722,9 @@ public def resolveArtifact
           let some sha256 := sha256s.get? descr.relPath.toString
             | error s!"remote mapping has no SHA-256 for artifact `{descr}`"
           let url := service.remoteArtifactUrl scope.toString sha256
+          -- The job downloads: only now is it a fetch (a job that got this far without one keeps
+          -- the caption of what it did instead, e.g. a replay)
+          updateAction .fetch
           logVerbose s!"\
             downloaded remote artifact {descr.hash}\
             \n  local path: {path}\
@@ -734,6 +736,7 @@ public def resolveArtifact
             error (← recordRemoteReadFailure (← takeLogFrom e) "remote artifact download failed")
         | none =>
           let url := service.artifactUrl descr.hash scope
+          updateAction .fetch
           logVerbose s!"\
             downloaded artifact {descr.hash}\
             \n  local path: {path}\

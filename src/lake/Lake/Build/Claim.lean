@@ -20,34 +20,58 @@ import Init.Data.String.Legacy
 /-! # Claims in the Shared Remote Cache
 
 A build that writes the shared remote cache (with `LAKE_REMOTE_CACHE_QUEUE`, unless
-`LAKE_REMOTE_CACHE_CLAIMS` is false; see `Env.remoteCacheClaimService?`) claims each input that it
-is about to compile, so that two machines that build the same targets at once compile each one
-once. The claim of an input is the object `claim/<remoteScope>/<inputHash>` (see
-`remoteClaimScope`), whose body (`RemoteClaim`) names its holder and what the holder does.
+`LAKE_REMOTE_CACHE_CLAIMS` is false; see `Env.remoteCacheClaimService?`) claims an input that it
+is about to compile when it has no free compile slot, so that machines that build the same
+targets at once, and have more to compile than they can at once, compile each input once and
+share the compiles out. The claim of an input is the object `claim/<remoteScope>/<inputHash>`
+(see `remoteClaimScope`), whose body (`RemoteClaim`) names its holder and what the holder does.
 
+* A build claims, and waits for other builds, only when its compile slots are full: while fewer
+  of its compiles run than `LAKE_CLAIM_SLOTS` (by default its worker threads), it compiles a
+  target at once without a claim (`runningCompiles`). Waiting for another build saves a build time
+  only when it cannot compile more at once, and every claim request and every wait lies on the
+  build's path; a build whose dependency graph leaves its slots idle (one measured cold build ran
+  6 compiles at once on average on 160 cores) waits on nothing but that path.
 * Before it compiles a target whose outputs are neither in the local nor in the remote cache, a
-  build creates the claim of the input (only if it does not exist: `x-goog-if-generation-match: 0`)
-  with state `building` (`claimInput`).
+  build with full slots creates the claim of the input (only if it does not exist:
+  `x-goog-if-generation-match: 0`) with state `building` (`claimInput`).
 * The build that created it compiles the target, and rewrites the claim (only if it still has the
   generation the build last wrote) every 60 seconds until the compile ends (`registerClaim`; see
-  `remoteClaimRefreshSecs`). Then it marks the claim `queued` and queues the outputs with the
-  claim's generation; its first queued output starts the build's one detached `lake cache push`,
-  which follows the build until the build ends and uploads each output as it is queued
-  (`queueCompiledOutputs`, `startBuildPush`, `endBuildPush`), and marks each claim `done` after its
-  mapping is uploaded. A compile that fails, or that publishes nothing, marks the claim `failed`
+  `remoteClaimRefreshSecs`). Then it queues the outputs with the claim's generation, and leaves
+  the claim `building`; its first queued output starts the build's one detached `lake cache
+  push`, which follows the build until the build ends and uploads each output as it is queued
+  (`queueCompiledOutputs`, `startBuildPush`, `endBuildPush`). The push marks each claim `queued`
+  with its own process ID as soon as it has staged the entry, and `done` after the mapping is
+  uploaded, so the holder of a claim is always the process that must still run for the mapping
+  to arrive. A compile that fails, or that publishes nothing, marks the claim `failed`
   (`withClaim`).
 * Another build waits: it looks for the mapping of the input every 5 seconds
   (`remoteClaimPollMs`), and reads through it once it is there. It takes the claim over (a rewrite
   only if the claim still has the generation it read) and compiles when the claim says `failed`,
-  when it says `building` and its holder is a process of this host that no longer runs (a killed
-  build; a `queued` claim waits for its push, which outlives the build), or when the claim is
-  stale: the remote cache last replaced it at least `LAKE_CLAIM_TAKEOVER_SECS` before (by the
-  `Last-Modified` and `Date` of the claim's `GET`, so the machines' clocks do not matter; the same
-  `GET` returns the claim's state), or this build has seen it keep one generation for that long
-  by its own monotonic clock (`observeClaim`). No time that the holder wrote is trusted, and an
-  answer without times, or with times in the future, only leaves the second bound. A module waits
-  with no thread at all (`runWithClaimWaits`); another target waits on its job's thread, which
-  gives its slot in the pool to another job meanwhile (`waitForClaim`).
+  when it says `building` or `queued` and its holder is a process of this host that no longer
+  runs (a killed build or push), or when the claim is stale: the remote cache last replaced it at
+  least `LAKE_CLAIM_TAKEOVER_SECS` before (by the `Last-Modified` and `Date` of the claim's `GET`,
+  so the machines' clocks do not matter; the same `GET` returns the claim's state), or this build
+  has seen it keep one generation for that long by its own monotonic clock (`observeClaim`). No
+  time that the holder wrote is trusted, and an answer without times, or with times in the
+  future, only leaves the second bound. A module waits with no thread at all
+  (`runWithClaimWaits`); another target waits on its job's thread, which gives its slot in the
+  pool to another job meanwhile (`waitForClaim`).
+* Builds share the inputs out instead of racing for them. A build that has read a live claim
+  that says `building` knows the build that holds it (a push holds `queued` and `done` claims
+  with its own process ID, and compiles nothing), and gives each input it is about to compile to
+  one of the builds it knows, by the input's hash (`inputOwner?`): it claims its own and leaves
+  the others. A build that has seen no other build claims everything it reaches, which is what
+  a build alone must do, and it starts to share as soon as it reads such a claim. Without this
+  the build that is ahead takes nearly every input: another build reaches an input only once it
+  has what the input is built from, which it gets from the build ahead, so it always asks too
+  late. An input that its build leaves unclaimed for `LAKE_CLAIM_DEFER_SECS` (15 s by default, 0
+  to leave none) is claimed by whichever build reaches it next, and that build then leaves no
+  more inputs to the one that did not claim it (`forgetHolder`) until it reads a live claim of it
+  that says `building` again: a build that stops costs each other build one wait, not a compile
+  or a wait per input. A build that starts after another has started compiling rarely reads a
+  claim of it before it reaches an input, so it mostly restores what the other compiles, and the
+  two do not share the compiles.
 
 Generations are only compared for equality, as Cloud Storage guarantees nothing else.
 Any failure to read or write a claim is a miss: the build compiles as it would without claims,
@@ -90,6 +114,21 @@ once the claimed input's mapping is uploaded, and returns the HTTP status code o
 -/
 public def markClaimDone (service : CacheService) (url generation holder : String) : LogIO Nat := do
   return (← service.putRemoteObjectIf url (← claimBody holder .done) generation).code
+
+/--
+Marks the claim at `url` (only if it still has `generation`) `queued`, with `holder` as its
+holder: `lake cache push` does this when it starts to upload the input's outputs, so that the
+claim names the process that will publish the mapping, and is not taken over while that process
+runs (see `holderGone`). Returns the claim's new generation if it wrote it, and `none` otherwise
+(the claim is left as it is, and the `done` write still finds `generation`).
+-/
+public def markClaimQueued
+  (service : CacheService) (url generation holder : String)
+: LogIO (Option String) := do
+  let r ← service.putRemoteObjectIf url (← claimBody holder .queued) generation
+  if r.code == 200 then
+    return some ((r.header? "x-goog-generation").getD generation)
+  return none
 
 /-- Records a failure to read or write a claim in the build's read status, and logs it. -/
 def recordClaimFailure (msg : String) : JobM Unit := do
@@ -280,20 +319,84 @@ def HeldClaim.abandon (claim : HeldClaim) : JobM Unit := do
     markClaimFailed claim.url held generation
 
 /--
-Runs `build`, the compile of an input whose claim this build holds (if `claim?`), and then marks
-the claim `failed` if the build did not queue the outputs (see `HeldClaim.abandon`), whether
-`build` succeeded or not.
+How many compiles of inputs this process runs now (see `withClaim`): a build claims an input, and
+waits for other builds, only once these fill `Env.claimSlots` (see `claimInput`).
+-/
+builtin_initialize runningCompiles : IO.Ref Nat ← IO.mkRef 0
+
+/--
+Runs `build`, the compile of an input (counted in `runningCompiles` while it runs) whose claim
+this build holds (if `claim?`), and then marks the claim `failed` if the build did not queue the
+outputs (see `HeldClaim.abandon`), whether `build` succeeded or not.
 -/
 public def withClaim (claim? : Option HeldClaim) (build : JobM α) : JobM α := do
-  let some claim := claim?
-    | build
-  try
-    let a ← build
-    claim.abandon
-    return a
-  catch e =>
-    claim.abandon
-    throw e
+  let run : JobM α := do
+    let some claim := claim?
+      | build
+    try
+      let a ← build
+      claim.abandon
+      return a
+    catch e =>
+      claim.abandon
+      throw e
+  runningCompiles.modify (· + 1)
+  try run finally runningCompiles.modify (· - 1)
+
+/-! ## Sharing the Inputs Out -/
+
+/--
+The holders of the live claims that say `building` that this build has read, and this build's
+own holder (`claimHolder`): the builds that compile these targets together, as far as this build
+has seen (see `inputOwner?`).
+-/
+builtin_initialize claimParty : Std.Mutex (Std.TreeSet String) ← Std.Mutex.new {}
+
+/-- Adds `holder` to the builds this one has seen (see `claimParty`). -/
+def noteHolder (holder : String) : BaseIO Unit :=
+  claimParty.atomically (modify (·.insert holder))
+
+/--
+Removes `holder` from the builds this one has seen (see `claimParty`): it left one of its inputs
+unclaimed for the whole wait, so it has stopped or does not build these targets. It comes back
+once this build reads a live claim of it that says `building` again (see `claimInput`).
+-/
+def forgetHolder (holder : String) : BaseIO Unit :=
+  claimParty.atomically (modify (·.erase holder))
+
+/--
+The build that should compile `inputHash`, of those this build has seen, or `none` while it has
+seen no other build. The holders are ordered and the hash picks one, so every build that has seen
+the same holders gives each input to the same one of them, and each gets about the same share of
+the inputs. A build that has not seen another build yet claims everything it reaches, which is
+what a build alone must do.
+-/
+def inputOwner? (inputHash : Hash) : BaseIO (Option String) := do
+  let holders ← claimParty.atomically do
+    let party ← get
+    if party.size ≤ 1 then return #[] else return party.toArray
+  if holders.isEmpty then return none
+  return holders[inputHash.val.toNat % holders.size]?
+
+/--
+When this build first left each input to another build, by its own monotonic clock
+(milliseconds), by claim URL (see `observeDeferral`).
+-/
+builtin_initialize deferrals : Std.Mutex (Std.HashMap String Nat) ← Std.Mutex.new {}
+
+/--
+Records that this build leaves the input at `url` to another build, and returns for how many
+seconds it has left it so.
+-/
+def observeDeferral (url : String) : BaseIO Nat := do
+  let now ← IO.monoMsNow
+  deferrals.atomically do
+    let s ← get
+    match s[url]? with
+    | some since => return (now - since) / 1000
+    | none =>
+      set (s.insert url now)
+      return 0
 
 /-! ## Taking Claims -/
 
@@ -379,10 +482,13 @@ def takeClaim
 
 /--
 Whether `holder` (`<host>:<pid>`, see `claimHolder`) names a process of this host that no longer
-runs, so that its claim can be taken over at once: its build was killed (Lake writes no claim on a
-signal). This needs `/proc`; elsewhere no holder counts as gone, and its claim goes stale after
-the takeover time. A wrong answer (another host with this host's name, whose process has this
-process ID) costs one more compile of the input, never a wrong output.
+runs, so that its claim can be taken over at once: its build or its push was killed (Lake writes
+no claim on a signal). A `building` claim names the build that compiles the input, and a `queued`
+claim the `lake cache push` that uploads its outputs, so in both states the holder is the process
+that must still run for the mapping to arrive. This needs `/proc`; elsewhere no holder counts as
+gone, and its claim goes stale after the takeover time. A wrong answer (another host with this
+host's name, whose process has this process ID) costs one more compile of the input, never a
+wrong output.
 -/
 def holderGone (holder : String) : BaseIO Bool := do
   let parts := holder.splitOn ":"
@@ -413,10 +519,39 @@ public def claimInput (pkg : Package) (inputHash : Hash) (sawDone := false) : Jo
   -- Claims are only for the service that accepts the cache token (a Cloud Storage bucket)
   unless service.sendsCacheToken url do
     return .compile none
+  -- With a free compile slot, this build compiles at once and neither claims nor waits: waiting
+  -- for another build saves it time only when it cannot compile more at once, and every claim
+  -- request and every wait lies on its path, which is all a build whose dependency graph leaves
+  -- its slots idle waits on
+  if (← runningCompiles.get) < ws.lakeEnv.claimSlots then
+    return .compile none
   let takeoverSecs := ws.lakeEnv.claimTakeoverSecs
+  let deferSecs := ws.lakeEnv.claimDeferSecs
   let holder ← claimHolder
+  noteHolder holder
   try
+    -- An input of another build of these targets is left to it, so that the builds share the
+    -- compiles out instead of racing for them (the first to ask would take nearly all of them:
+    -- the others only reach an input once they have what it is built from, which they get from
+    -- the build that is ahead). It is taken when that build has not claimed it for `deferSecs`.
+    let mut lapsed? : Option String := none
+    if deferSecs > 0 then
+      if let some owner ← inputOwner? inputHash then
+        if owner != holder then
+          let deferredSecs ← observeDeferral url
+          if deferredSecs < deferSecs then
+            logVerbose s!"leaving the input {inputHash} to the build {owner} \
+              ({deferredSecs} s of {deferSecs} s)"
+            return .wait (← ClaimWait.after remoteClaimDeferPollMs false)
+          logVerbose s!"taking the input {inputHash}, which the build {owner} \
+            left unclaimed for {deferredSecs} s"
+          lapsed? := some owner
     if let some claim ← takeClaim service url holder "0" takeoverSecs then
+      -- The owner never claimed the input: it has stopped, or it does not build these targets,
+      -- so it gets no more inputs, and each of them costs no wait, until it is seen again
+      if let some owner := lapsed? then
+        forgetHolder owner
+        logVerbose s!"leaving no more inputs to the build {owner} until it is seen building"
       return .compile (some claim)
     -- Another build holds the claim
     let r ← service.getRemoteObject url
@@ -442,7 +577,13 @@ public def claimInput (pkg : Package) (inputHash : Hash) (sawDone := false) : Jo
     let serverAge? := r.age?
     let unchangedSecs ← observeClaim url generation
     let stale := (serverAge?.any (· ≥ (takeoverSecs : Int))) || unchangedSecs ≥ takeoverSecs
-    let gone ← if state == .building then holderGone claim.holder else pure false
+    let gone ← if state == .building || state == .queued then holderGone claim.holder else pure false
+    -- A live claim that says `building` names a build of these targets, which takes its share
+    -- of the inputs. Any other state was written by a push (`queued`, `done`: its own process
+    -- ID, and a push compiles nothing) or by a build that failed, and a stale claim or one whose
+    -- holder is gone names a build that has stopped: none of them takes a share.
+    if state == .building && !stale && !gone then
+      noteHolder claim.holder
     if state == .failed || state == .done || stale || gone then
       logVerbose s!"taking over the claim {url} (state {state}, last written \
         {serverAge?.map toString |>.getD "?"} s ago, unchanged for {unchangedSecs} s here\
@@ -695,37 +836,15 @@ public def canDetachPush (env : Env) : BaseIO Bool :=
   (detachedPushShell env).pathExists
 
 /--
-Marks the claim at `url`, which this process held as `held` with generation `generation`,
-`queued`: the build queued the outputs for its push, which marks the claim `done` after their
-mapping is uploaded. A claim in this state is not taken over when its holder process has ended
-(see `holderGone`), since the build ends before its push. Returns the generation for the queue
-line: the new one, `none` if another build took the claim over meanwhile (HTTP 412), and
-`generation` if the claim could not be written (it stays `building`).
--/
-def markClaimQueued (url : String) (held : Held) (generation : String) : JobM (Option String) := do
-  let r ← tryLogIO do
-    held.service.putRemoteObjectIf url (← claimBody held.holder .queued) generation
-  match r with
-  | .ok r =>
-    if r.code == 200 then
-      return some ((r.header? "x-goog-generation").getD generation)
-    else if r.code == 412 then
-      return none
-    else
-      logVerbose s!"could not mark the claim {url} queued (HTTP {r.code})"
-      return some generation
-  | .error msg =>
-    logVerbose s!"could not mark the claim {url} queued:\n{msg}"
-    return some generation
-
-/--
-Queues outputs that this build just compiled (see `queueRemotePush`). If this build held the
-input's claim, it stops rewriting it, marks it `queued` (see `markClaimQueued`), and queues the
-outputs with the claim's generation. When this build takes claims, it then starts its one detached
-`lake cache push` if it has not yet (see `startBuildPush`), which uploads the outputs and marks
-the claim `done`, so the builds that wait for the claim find the mapping. If the outputs could not
-be queued, the claim is marked `failed` instead. A push that cannot start is a cache failure:
-the build reports it once, at verbose level, in its read status (see `recordClaimFailure`).
+Queues outputs that this build just compiled (see `queueRemotePush`), with the generation of the
+input's claim if this build held it, which it stops rewriting. The claim stays `building` until
+the build's `lake cache push` takes it over (`queued`, then `done`), so a build killed before its
+queue line exists leaves a `building` claim whose holder's process is gone, which another build
+takes over at once, instead of a `queued` claim that promises a mapping no process will upload.
+When this build takes claims, it then starts its one detached push if it has not yet (see
+`startBuildPush`). If the outputs could not be queued, the claim is marked `failed`. A push that
+cannot start is a cache failure: the build reports it once, at verbose level, in its read status
+(see `recordClaimFailure`).
 -/
 public def queueCompiledOutputs
   (claim? : Option HeldClaim) (pkg : Package) (inputHash : Hash) (target : String)
@@ -734,12 +853,9 @@ public def queueCompiledOutputs
   let released? ← match claim? with
     | some claim => releaseClaim claim.url
     | none => pure none
-  let generation? ← match claim?, released? with
-    | some claim, some (held, generation) => markClaimQueued claim.url held generation
-    | _, _ => pure none
   let queued ← queueRemotePush pkg inputHash target srcHash? data log
-    (claimGeneration? := generation?)
-  if let (some claim, some (held, _), some generation) := (claim?, released?, generation?) then
+    (claimGeneration? := released?.map (·.2))
+  if let (some claim, some (held, generation)) := (claim?, released?) then
     unless queued do
       markClaimFailed claim.url held generation
   let ws ← getWorkspace

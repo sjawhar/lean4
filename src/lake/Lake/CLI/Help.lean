@@ -809,15 +809,26 @@ runs. At the end, the push writes its counts to `remote-status-push.json` in the
 cache directory. It exits with status 1 if entries remain in the queue.
 
 Unless `LAKE_REMOTE_CACHE_CLAIMS` is set to a false value, a build with the
-queue on also claims each input before it compiles it, so that two machines
-that build the same targets at once compile each one once: it creates the
-object `claim/<scope>/<inputHash>` in the remote cache if no build holds it,
-and rewrites it while it compiles. A build that finds the claim taken waits
+queue on also claims an input before it compiles it when it has no free
+compile slot (`LAKE_CLAIM_SLOTS` compiles already run), so that machines that
+build the same targets at once, with more to compile than they can at once,
+compile each one once: it creates the object `claim/<scope>/<inputHash>` in
+the remote cache if no build holds it, and rewrites it while it compiles. With
+a free slot it compiles at once, and neither claims nor waits. A build with
+full slots that finds the claim taken waits
 for the input's mapping instead of compiling, and takes the claim over when the
-claim says that the compile failed, when the claim's compile still runs but its
-holder is a process of this machine that no longer runs, or when the remote
+claim says that the compile failed, when the claim says that its compile or
+its upload still runs but its holder (the build, or the push that uploads its
+outputs) is a process of this machine that no longer runs, or when the remote
 cache has not replaced it for `LAKE_CLAIM_TAKEOVER_SECS` seconds (600 by
 default) or the build has seen it unchanged for that long by its own clock.
+Builds that see each other compiling share the inputs out: each gives every
+input it is about to compile to one of the builds whose live claim saying
+`building` it has read, by the input's hash, claims its own and leaves the
+others. It takes an input that its build left unclaimed for
+`LAKE_CLAIM_DEFER_SECS` seconds (15 by default, 0 to leave none), and then
+leaves that build no more inputs until it sees it compiling again. A build
+that has seen no other build compiling claims every input it reaches.
 Each send of a claim request ends within 20 seconds, or fails, as does one
 whose answer is larger than 64 KiB, and claim requests are not retried. A
 request may first run `LAKE_CACHE_TOKEN_CMD` (when no token is held, or it is
@@ -907,6 +918,16 @@ A build that uploads to such a service (`LAKE_REMOTE_CACHE_QUEUE`; see
                                    default); the holder rewrites its claims
                                    every 60 seconds, or every `n/4` seconds if
                                    that is less
+  LAKE_CLAIM_DEFER_SECS=<n>        claim an input that the build it belongs to
+                                   has left unclaimed for `n` seconds (15 by
+                                   default; 0 claims every input at once, so
+                                   the build that is ahead takes nearly all of
+                                   them)
+  LAKE_CLAIM_SLOTS=<n>             claim an input, and wait for other builds,
+                                   only once `n` compiles already run (by
+                                   default the worker threads:
+                                   `LEAN_NUM_THREADS` or the cores; 0 claims
+                                   every input)
   LAKE_PUSH_SHELL=<path>           the shell that starts the background push
                                    (`/bin/bash` by default); it must close
                                    every descriptor by number, and where it is

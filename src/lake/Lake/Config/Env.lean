@@ -111,6 +111,24 @@ public structure Env where
   -/
   claimTakeoverSecs : Nat := 600
   /--
+  How long a build leaves an input that another build of the same targets should claim, in
+  seconds (i.e., `LAKE_CLAIM_DEFER_SECS`, 15 unless set to another number; 0 leaves none). Each
+  build that takes claims gives every input it is about to compile to one of the builds it has
+  seen, by the input's hash, and compiles only its own; it takes one of another build's inputs
+  after that build has left it unclaimed for this long, so a build that stops costs the others
+  only this wait (see `Lake.Build.Claim`). Lake does not add it to `baseVars`.
+  -/
+  claimDeferSecs : Nat := 15
+  /--
+  How many compiles of inputs a build that takes claims runs at once before it claims the next
+  input and waits for other builds (i.e., `LAKE_CLAIM_SLOTS`, unless set: the build's worker
+  threads, `LEAN_NUM_THREADS` or the machine's cores; 0 claims every input). A build with a
+  free slot compiles at once: waiting for another build only saves this build time when it has
+  no capacity to compile, and every claim request and every wait lies on the build's path (see
+  `Lake.Build.Claim`). Lake does not add it to `baseVars`.
+  -/
+  claimSlots : Nat := 0
+  /--
   The shell with which a build that takes claims starts its detached `lake cache push` (i.e.,
   `LAKE_PUSH_SHELL`, `/bin/bash` unless set). It must be able to close every descriptor by
   number; where it does not exist, the build runs the push in the foreground at its end (see
@@ -234,6 +252,8 @@ public def compute
     remoteCacheQueue := ((← IO.getEnv "LAKE_REMOTE_CACHE_QUEUE").bind envToBool?).getD false
     remoteCacheClaims := ((← IO.getEnv "LAKE_REMOTE_CACHE_CLAIMS").bind envToBool?).getD true
     claimTakeoverSecs := ← computeClaimTakeoverSecs
+    claimDeferSecs := ← computeClaimDeferSecs
+    claimSlots := ← computeClaimSlots
     pushShell := ((← IO.getEnv "LAKE_PUSH_SHELL").filter (!·.trimAscii.isEmpty)).map
       (FilePath.mk ·.trimAscii.copy) |>.getD "/bin/bash"
     githashOverride := (← IO.getEnv "LEAN_GITHASH").getD ""
@@ -270,6 +290,23 @@ where
     | none => throw (badTakeover secs)
   badTakeover (secs : String) : String :=
     s!"'LAKE_CLAIM_TAKEOVER_SECS' must be a positive number of seconds, got '{secs}'"
+  computeClaimDeferSecs := do
+    let some secs ← IO.getEnv "LAKE_CLAIM_DEFER_SECS"
+      | return 15
+    match secs.trimAscii.copy.toNat? with
+    | some n => return n
+    | none => throw s!"'LAKE_CLAIM_DEFER_SECS' must be a number of seconds, got '{secs}'"
+  computeClaimSlots := do
+    -- The build's worker threads, as the runtime counts them (`LEAN_NUM_THREADS`, else the cores)
+    let workers := do
+      if let some n := (← IO.getEnv "LEAN_NUM_THREADS").bind (·.trimAscii.copy.toNat?) then
+        if n > 0 then return n
+      return (System.Platform.Internal.getHardwareConcurrency ()).toNat
+    let some slots ← IO.getEnv "LAKE_CLAIM_SLOTS"
+      | workers
+    match slots.trimAscii.copy.toNat? with
+    | some n => return n
+    | none => throw s!"'LAKE_CLAIM_SLOTS' must be a number of compiles, got '{slots}'"
   @[macro_inline] getUrlD var default := do
     if let some url ← IO.getEnv var then
       return normalizeUrl url
