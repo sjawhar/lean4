@@ -1617,8 +1617,9 @@ def Module.usageCutoffApplies (mod : Module) (presetup : ModulePreSetup) : JobM 
 Records the module's outputs, `arts`, which are in the cache, in the usage index (`Cache.writeUsageIndex`) if a
 lookup can read them: they name a `.usekey`, the build restores artifacts (`restore`), as a lookup requires, and usage
 cutoff can apply to the module. The entry has no archive. With it goes the compact record of its `.usage` that the
-pre-filter reads (`compactUsage?`), unless the index has one already: the entry is named by its `.usekey`, which
-names the `.usage`, so a record under that name never needs to change.
+pre-filter reads (`compactUsage?`), unless the index has a usable one already (`hasCompactUsage`: it decodes and was
+made from the `.usage` the key names). The entry is named by its `.usekey`, which names the `.usage`, so a usable
+record never needs to change; one that is not usable is never read, and is written again here.
 -/
 def Module.indexUsage (mod : Module) (presetup : ModulePreSetup) (arts : ModuleOutputArtifacts) (restore : Bool) :
     JobM Unit := do
@@ -1629,7 +1630,7 @@ def Module.indexUsage (mod : Module) (presetup : ModulePreSetup) (arts : ModuleO
   let compact := Cache.usageIndexCompactFile <|
     cache.usageIndexFile mod.pkg.cacheScope presetup.localTrace.hash usekey.hash
   let compact? ← id do
-    if (← compact.pathExists) then return none
+    if (← hasCompactUsage compact usekey.path) then return none
     let some usage := arts.usage? | return none
     compactUsage? usage.path
   cache.writeUsageIndex mod.pkg.cacheScope presetup.localTrace.hash usekey.hash
