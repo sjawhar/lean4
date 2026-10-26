@@ -45,6 +45,8 @@ check_same() {
   test_exp "$(query restore +User:depHash)" = "$(query cache +User:depHash)"
 }
 check_same
+# Placing the C file leaves no temporary files behind
+test_exp -z "$(find "$WORK" -name '*.tmp')"
 userHash=$(query restore +User:depHash)
 
 # A change to the library's source is compiled in both settings, alike
