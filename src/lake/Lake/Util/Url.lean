@@ -174,6 +174,17 @@ public def TransferLimits.args (limits : TransferLimits) (maxBytes? : Option Nat
     args ++ #["--max-filesize", toString bytes, "--max-time", toString (transferMaxSecs bytes)]
 
 /--
+Whether a transfer that ended with the `curl` exit code `exitCode` and the HTTP status `code` failed
+transiently, as `curl --retry` decides: a timeout (exit code 28), a host that could not be resolved
+(5 or 6), or HTTP 408, 429, 500, 502, 503, 504, 522 or 524.
+-/
+public def isTransientFailure (exitCode code : Nat) : Bool :=
+  if exitCode == 0 then
+    code matches 408 | 429 | 500 | 502 | 503 | 504 | 522 | 524
+  else
+    exitCode matches 5 | 6 | 28
+
+/--
 The scheme and authority of an HTTP(S) URL, lowercased (e.g., `https://storage.googleapis.com`),
 which identify the host (and port) that a request to the URL goes to.
 Returns `none` for a URL of another scheme or with user information in its authority.
@@ -251,27 +262,17 @@ public def retryWithNewToken
   return a
 
 /--
-Runs `request`, a `curl` request to `url`, with the cache token if `cacheToken` (see
-`cacheTokenFor?`). This is the policy of every single request that may carry the token.
-
-`request` gets whether it carries the token and the arguments that must start its `curl`
-command line: `-q` (see `curlLeadArgs`), the temporary configuration file that sends the token
-(see `CacheToken.withCurlArgs`), and, with `follow`, `-L` for a request without the token (see
-`curlFollowArgs`). It returns the HTTP status code of the response and its result. If the service
-refuses the token (HTTP 401), the request runs once more with a new token (see
-`retryWithNewToken`).
+Runs `send`, a request to `url`, with the cache token if `cacheToken` (see `cacheTokenFor?`). This
+is the policy of every single request that may carry the token: `send` gets the token to send, if
+any, and returns the HTTP status code of the response and its result. If the service refuses the
+token (HTTP 401), the request is sent once more with a new token (see `retryWithNewToken`).
 
 Returns the status code and the result of the last request, and whether the request carried the
 token.
 -/
-public def withCacheTokenRequest
-  (url : String) (cacheToken : Bool)
-  (request : (token : Bool) → (args : Array String) → LogIO (Nat × α)) (follow := true)
+public def withCacheToken
+  (url : String) (cacheToken : Bool) (send : Option String → LogIO (Nat × α))
 : LogIO (Nat × α × Bool) := do
-  let send (token? : Option String) : LogIO (Nat × α) :=
-    CacheToken.withCurlArgs token? fun authArgs => do
-      let followArgs := if follow then curlFollowArgs token? else #[]
-      request token?.isSome (curlLeadArgs token? ++ authArgs ++ followArgs)
   let token? ← if cacheToken then cacheTokenFor? url else pure none
   let (code, a) ← send token?
   let some token := token?
@@ -282,6 +283,27 @@ public def withCacheTokenRequest
     let (code, a) ← send token?
     return ((code, a), code == 401)
   return (code, a, true)
+
+/--
+Runs `request`, a `curl` request to `url`, with the cache token if `cacheToken` (see
+`withCacheToken`).
+
+`request` gets whether it carries the token and the arguments that must start its `curl`
+command line: `-q` (see `curlLeadArgs`), the temporary configuration file that sends the token
+(see `CacheToken.withCurlArgs`), and, with `follow`, `-L` for a request without the token (see
+`curlFollowArgs`). It returns the HTTP status code of the response and its result.
+
+Returns the status code and the result of the last request, and whether the request carried the
+token.
+-/
+public def withCacheTokenRequest
+  (url : String) (cacheToken : Bool)
+  (request : (token : Bool) → (args : Array String) → LogIO (Nat × α)) (follow := true)
+: LogIO (Nat × α × Bool) :=
+  withCacheToken url cacheToken fun token? =>
+    CacheToken.withCurlArgs token? fun authArgs => do
+      let followArgs := if follow then curlFollowArgs token? else #[]
+      request token?.isSome (curlLeadArgs token? ++ authArgs ++ followArgs)
 
 /--
 Returns the HTTP status code in the JSON that `curl -w "%{json}"` wrote to `stderr`.
