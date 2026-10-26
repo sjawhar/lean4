@@ -113,8 +113,10 @@ structure ReadyEntry where
   /-- The number of bytes of the entry's staged artifacts. -/
   bytes : Nat
   /--
-  The URL of the claim of the entry's input and the generation that the build that queued the entry
-  gave it, if the build held the claim: the push marks it `done` after the mapping is uploaded.
+  The URL of the claim of the entry's input and the generation that the build that queued the
+  entry left it with, if the build held the claim: the push marks the claim `queued` as its own
+  as soon as it has staged the entry (`takeEntryClaim`), and `done` after the mapping is uploaded
+  (`markClaimsDone`).
   -/
   claim? : Option (String × String) := none
 
@@ -453,14 +455,31 @@ def uniqueUploads (uploads : Array RemoteUpload) : Array RemoteUpload :=
     if urls.contains u.url then (kept, urls) else (kept.push u, urls.insert u.url)).1
 
 /--
+Marks the claim of `entry`, if it names one, `queued` with this push as its holder (see
+`markClaimQueued`), as soon as the entry is staged: until then the claim names the build that
+compiled the input, whose process may already be gone, and a build on this host would take it
+over. Returns the entry with the generation that the claim now has, so that `markClaimsDone`
+writes against it. A claim that another build changed meanwhile is left as it is, with the
+generation that the queue line named.
+-/
+def takeEntryClaim (entry : ReadyEntry) (holder : String) : BaseIO ReadyEntry := do
+  let some (url, generation) := entry.claim?
+    | return entry
+  match ← tryLogIO (markClaimQueued entry.service url generation holder) with
+  | .ok (some new) => return {entry with claim? := some (url, new)}
+  | _ => return entry
+
+/--
 Stages a prefix of the queue lines `lines` in `dir` with `ctx.workers` workers, each in its own
 thread, since staging a module runs `leantar`. A worker takes the next line in order until every
 line is taken or `pushChunkBytes` are staged, so the lines staged are a prefix of `lines` (at least
-one). A failure while a line is staged fails only that line. Returns the result of each staged
-line with the log of its staging, in order.
+one), and takes the claim of each line it staged (see `takeEntryClaim`). A failure while a line is
+staged fails only that line. Returns the result of each staged line with the log of its staging,
+in order.
 -/
 def stageLines (ctx : PushContext) (dir : FilePath) (lines : Array String)
 : BaseIO (Array (StagedEntry × Log)) := do
+  let holder ← claimHolder
   -- The index of the next line to take, and the bytes staged so far
   let progress ← IO.mkRef ((0 : Nat), (0 : Nat))
   let results ← IO.mkRef (Array.replicate lines.size (none : Option (StagedEntry × Log)))
@@ -474,9 +493,11 @@ def stageLines (ctx : PushContext) (dir : FilePath) (lines : Array String)
       let some idx := idx?
         | break
       let (r?, log) ← (stageLine ctx (dir / toString idx) idx lines[idx]!).captureLog
-      let r := r?.getD .failed
-      if let .ready entry := r then
-        progress.modify fun (next, staged) => (next, staged + entry.bytes)
+      let r ← match r?.getD .failed with
+        | .ready entry =>
+          progress.modify fun (next, staged) => (next, staged + entry.bytes)
+          pure (.ready (← takeEntryClaim entry holder))
+        | r => pure r
       results.modify (·.set! idx (some (r, log)))
   let tasks ← (Array.range ctx.workers).mapM fun _ =>
     IO.asTask (prio := .dedicated) (monadLift worker)
@@ -485,35 +506,46 @@ def stageLines (ctx : PushContext) (dir : FilePath) (lines : Array String)
   return (← results.get).filterMap id
 
 /--
+Runs `act` on each entry that names a claim, with `ctx.workers` workers, and returns what it
+returned for each (in the entries' order, `none` for an entry with no claim). A claim write is
+one request, so the writes go in parallel as the uploads do.
+-/
+def forEachClaim
+  (ctx : PushContext) (entries : Array ReadyEntry)
+  (act : CacheService → (url generation holder : String) → BaseIO α)
+: LoggerIO (Array (Option α)) := do
+  let holder ← claimHolder
+  let next ← IO.mkRef 0
+  let results ← IO.mkRef (Array.replicate entries.size (none : Option α))
+  let worker : BaseIO Unit := do
+    repeat
+      let i ← next.modifyGet fun i => (i, i + 1)
+      let some entry := entries[i]?
+        | break
+      let some (url, generation) := entry.claim?
+        | continue
+      let a ← act entry.service url generation holder
+      results.modify (·.set! i (some a))
+  let tasks ← (Array.range (min ctx.workers entries.size)).mapM fun _ =>
+    IO.asTask (prio := .dedicated) (monadLift worker)
+  for task in tasks do
+    discard <| IO.wait task
+  results.get
+
+/--
 Marks the claim of each entry that names one `done` (see `markClaimDone`), now that the entry's
 mapping is uploaded, with `ctx.workers` workers. A claim that another build changed meanwhile
 (HTTP 412) or that could not be written is left as it is, and logged: the outcome of the entry
 does not change, since what other builds wait for is the mapping.
 -/
 def markClaimsDone (ctx : PushContext) (entries : Array ReadyEntry) : LoggerIO Unit := do
-  let claims := entries.filterMap fun e =>
-    e.claim?.map fun (url, generation) => (e.service, url, generation)
-  if claims.isEmpty then
-    return
-  let holder ← claimHolder
-  let next ← IO.mkRef 0
-  let results ← IO.mkRef (Array.replicate claims.size (none : Option String))
-  let worker : BaseIO Unit := do
-    repeat
-      let i ← next.modifyGet fun i => (i, i + 1)
-      let some (service, url, generation) := claims[i]?
-        | break
-      let msg? := match ← tryLogIO (markClaimDone service url generation holder) with
-        | .ok 200 => none
-        | .ok code => some s!"left the claim {url} as it is (HTTP {code})"
-        | .error msg => some s!"could not mark the claim {url} done:\n{msg}"
-      results.modify (·.set! i msg?)
-  let tasks ← (Array.range (min ctx.workers claims.size)).mapM fun _ =>
-    IO.asTask (prio := .dedicated) (monadLift worker)
-  for task in tasks do
-    discard <| IO.wait task
-  for msg? in ← results.get do
-    if let some msg := msg? then
+  let msgs ← forEachClaim ctx entries fun service url generation holder => do
+    match ← tryLogIO (markClaimDone service url generation holder) with
+    | .ok 200 => return none
+    | .ok code => return some s!"left the claim {url} as it is (HTTP {code})"
+    | .error msg => return some s!"could not mark the claim {url} done:\n{msg}"
+  for msg? in msgs do
+    if let some (some msg) := msg? then
       logVerbose msg
 
 /--
@@ -540,6 +572,7 @@ def pushChunk (ctx : PushContext) (lines : Array String) : LoggerIO (Array PushO
     let services := ready.foldl (init := #[]) fun services e =>
       if services.any (·.1 == e.serviceName) then services else services.push (e.serviceName, e.service)
     for (name, service) in services do
+      -- Each claim of these entries is this push's now (`takeEntryClaim`)
       let group := ready.filter (·.serviceName == name)
       -- Artifacts go up before mappings, so a reader that finds a mapping finds its artifacts
       let artifacts := uniqueUploads (group.flatMap (·.artifacts))
