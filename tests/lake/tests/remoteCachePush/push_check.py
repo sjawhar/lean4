@@ -203,6 +203,47 @@ def repeat(args):
     locked(args.cache, lambda lines: [line for line in lines if line.strip() for _ in range(args.n)])
 
 
+def spread(args):
+    """Replaces each non-empty line of the queue with `n` copies, each for an input hash of its own,
+    so that each copy uploads a mapping of its own (and the artifacts that the copies share)."""
+
+    def update(lines):
+        out = []
+        for line in lines:
+            if not line.strip():
+                continue
+            for i in range(args.n):
+                e = json.loads(line)
+                e["inputHash"] = "%08x%08x" % (i, int(e["inputHash"][:8], 16))
+                out.append((json.dumps(e, separators=(",", ":")) + "\n").encode())
+        return out
+
+    locked(args.cache, update)
+
+
+def wait_fewer(args):
+    """Waits until the queue has fewer than `n` entries, and prints how many it has then."""
+    deadline = time.time() + args.timeout
+    while time.time() < deadline:
+        if len(queue_entries(args.queue)) < args.n:
+            break
+        time.sleep(0.1)
+    print(len(queue_entries(args.queue)))
+
+
+def wait_puts(args):
+    """Waits until a mock server log holds `n` successful `PUT`s of objects whose path contains
+    `text`, and prints how many it holds then."""
+    deadline = time.time() + args.timeout
+    n = 0
+    while time.time() < deadline:
+        n = sum(1 for path, status in puts(args.log) if args.text in path and status == "200")
+        if n >= args.n:
+            break
+        time.sleep(0.1)
+    print(n)
+
+
 def flip(args):
     """Changes the last byte of a file in place, through any hard link to it."""
     os.chmod(args.file, 0o644)
@@ -289,6 +330,21 @@ def main():
     p.add_argument("cache")
     p.add_argument("n", type=int)
     p.set_defaults(run=repeat)
+    p = sub.add_parser("spread")
+    p.add_argument("cache")
+    p.add_argument("n", type=int)
+    p.set_defaults(run=spread)
+    p = sub.add_parser("wait-fewer")
+    p.add_argument("timeout", type=float)
+    p.add_argument("queue")
+    p.add_argument("n", type=int)
+    p.set_defaults(run=wait_fewer)
+    p = sub.add_parser("wait-puts")
+    p.add_argument("timeout", type=float)
+    p.add_argument("log")
+    p.add_argument("text")
+    p.add_argument("n", type=int)
+    p.set_defaults(run=wait_puts)
     p = sub.add_parser("flip")
     p.add_argument("file")
     p.set_defaults(run=flip)
