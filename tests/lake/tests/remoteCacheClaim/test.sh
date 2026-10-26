@@ -495,6 +495,17 @@ case_claim_queued_late_line() {
   claims_done 2
 }
 
+case_claim_taker_retry() {
+  # The first conditional write that transfers Claim.A's claim to the push resets. The push can
+  # still upload its mapping, but it must not let its background taker replace the claim after
+  # staging captured the old generation. The mapping's claim must end `done`.
+  claim_fresh
+  CLAIM_SERVICE=resetclaimslowobj run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
+  test_cmd_eq 1 claim_check built-by "$LOG_A"
+  wait_push "$CACHE_A"
+  claims_done 1
+}
+
 case_claim_queued_killed() {
   # A build killed with its push, after the claim of a compiled input says `queued`, leaves no
   # mapping and nothing that will upload one. The next build takes that claim over at once (its
@@ -755,36 +766,19 @@ case_claim_saturated() {
 }
 
 case_claim_free_slot_wake() {
-  # A build that waits for another build's claim looks again as soon as one of its own compiles
-  # ends and leaves a worker free, not only when its 5 s timer fires: it then compiles that input
-  # at once, as a build with a free worker does. Here two workers build `Wide.Three` (6 s) and
-  # `Claim.C`, whose claim another build holds and never finishes, with one slot. `Claim.C` is
-  # ready only after `Claim.A` and `Claim.B` (a fraction of a second), so the build is at its
-  # slot when it reaches `Claim.C` and leaves it waiting. `Wide.Three` ends at 6 s, and the wait
-  # ends with it; without that, the build would wait for the poll at 10 s.
+  # A compile that leaves fewer running inputs than `LAKE_CLAIM_SLOTS` wakes a pending 5 s claim
+  # wait. `freeSlotWake` registers a wait on the seeded claim, completes `withClaim none` with
+  # one configured slot, and fails if its promise did not resolve within one second.
   claim_fresh
-  LAKE_REMOTE_CACHE_CLAIMS=false run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.C
-  local c
-  c="$(inputs "$CACHE_A" Claim.C)"
-  test_cmd rm -rf "$TREE_B" "$CACHE_B" "$OBJECTS" "$CLAIMS"
-  test_cmd cp -r "$TEST_DIR/claim" "$TREE_B"
-  test_cmd chmod -R u+w "$TREE_B"
-  put_claim "$c" building
-  START=$(date +%s)
-  CLAIM_SLOTS=1 LEAN_NUM_THREADS=2 LAKE_TEST_CLAIM_SLEEP=2000 BUILD_TIMEOUT=120 \
-    run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim.C Wide.Three
-  ELAPSED=$(( $(date +%s) - START ))
-  test_cmd_eq 4 claim_check built-by "$LOG_B"
-  match_text 'waiting for the claim' "$LOG_B"
-  test_exp $ELAPSED -ge 6
-  test_exp $ELAPSED -lt 9
-  wait_push "$CACHE_B"
+  put_claim 0000000000000001 building
+  CLAIM_SLOTS=1 run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" freeSlotWake
 }
 
 run_cases case_claim_two_builds case_claim_one_push case_claim_order case_claim_failed \
   case_claim_takeover case_claim_dead_holder case_claim_stale case_claim_detached_push \
   case_claim_pool_slot case_claim_fail_fast case_claim_same_pid case_claim_queued \
   case_claim_queued_late_line case_claim_queued_killed \
+  case_claim_taker_retry \
   case_claim_exe_push case_claim_push_retry case_claim_push_spawn_fails \
   case_claim_push_start_wfail case_claim_foreground_push case_claim_follow_reap \
   case_claim_unreadable case_claim_local_clock case_claim_stream case_claim_off \
