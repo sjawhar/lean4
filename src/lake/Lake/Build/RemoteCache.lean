@@ -11,6 +11,7 @@ public import Lake.Config.Monad
 import Lake.Config.PushQueue
 import Lake.Config.RemoteCache
 import Lake.Util.Url
+import Lake.Util.ReadBroker
 
 /-! # Shared Remote Cache in Builds
 
@@ -62,6 +63,17 @@ public def recordRemoteReadFailure (log : Log) (default : String) : JobM String 
 /-- Whether this build has stopped reading the shared remote cache (see `noteRemoteRead`). -/
 public def remoteReadsStopped : JobM Bool := do
   return (← (← getBuildContext).remoteReadStatus.get).stopped?.isSome
+
+/--
+Fails the current job as canceled if the build was canceled (`--fail-fast` after a failure).
+Lake checks a job between its steps (see `Job.bindM`), but a read of the shared remote cache
+gives this job's worker up and can take seconds, in which another job's failure can end the
+build: without this check, every job that was reading would still compile.
+-/
+public def cancelIfBuildCanceled : JobM Unit := do
+  if let some tk := (← getBuildContext).cancelTk? then
+    if ← tk.isSet then
+      Job.cancelJob
 
 /--
 Records how a read of the shared remote cache that started at the monotonic time `start` (in
@@ -129,8 +141,8 @@ public def readRemoteOutputs?
     let scope := remoteCacheScope ws.lakeEnv.leanGithash pkg.cacheScope
     let url := service.remoteMappingUrl scope inputHash
     let contents? ← timeRemoteRead <| liftM <|
-      getUrl? url (cacheToken := service.sendsCacheToken url)
-        (maxFileSize? := some remoteMappingMaxFileSize) (limits := remoteReadLimits)
+      ReadBroker.getUrl? url (← getLakeCache).dir (cacheToken := service.sendsCacheToken url)
+        remoteMappingMaxFileSize remoteReadLimits
     let some contents := contents?
       | logVerbose s!"remote cache mapping miss for input `{inputHash}` at {url}"
         return none
