@@ -1042,18 +1042,35 @@ public def compactUsage? (path : FilePath) : BaseIO (Option ByteArray) := do
   return usage.toPrefilter.encode (ModuleUsage.Digest.ofBytes bytes)
 
 /--
+The compact record at `compactFile` (`compactUsage?`) if it decodes and was made from a `.usage` with the digest
+`usage`, the one the compile's key records: the only record any reader takes. `none` otherwise.
+-/
+def readCompactUsage? (compactFile : FilePath) (usage : ModuleUsage.Digest) : BaseIO (Option PrefilterUsage) := do
+  let .ok bytes ← (IO.FS.readBinFile compactFile).toBaseIO | return none
+  let some (from_, record) := PrefilterUsage.decode? bytes | return none
+  return if from_ == usage then some record else none
+
+/--
+Whether the usage index has a compact record a reader takes (`readCompactUsage?`) at `compactFile` for the compile
+whose `.usekey` is at `usekeyFile`: one that decodes and was made from the `.usage` that key names. An unusable one
+(e.g., a file a crash left empty after its rename, or one damaged since) is never read, so the index writes it again
+(`Module.indexUsage`).
+-/
+public def hasCompactUsage (compactFile usekeyFile : FilePath) : JobM Bool := do
+  let some key ← readUsageSidecar UsekeySidecar usekeyFile | return false
+  return (← readCompactUsage? compactFile key.usage).isSome
+
+/--
 Reads what the usage index's pre-filter (`usagePrefilter`) reads of a cached compile's `.usage`: from the compile's
 compact record at `compactFile` (`compactUsage?`), if it decodes and was made from a `.usage` with the digest `usage`,
-the one the compile's key records; else from the `.usage` at `usageFile`, without checking its digest. Both give the
-same values while the cached `.usage` has the bytes its key names; the check that decides (`Module.usageVerdict`)
-reads it by that digest. `none` if neither can be read, or the `.usage` cannot be parsed or has another format
-version.
+the one the compile's key records (`readCompactUsage?`); else from the `.usage` at `usageFile`, without checking its
+digest. Both give the same values while the cached `.usage` has the bytes its key names; the check that decides
+(`Module.usageVerdict`) reads it by that digest. `none` if neither can be read, or the `.usage` cannot be parsed or
+has another format version.
 -/
 def readCandidateUsage? (compactFile usageFile : FilePath) (usage : ModuleUsage.Digest) :
     BaseIO (Option PrefilterUsage) := do
-  if let .ok bytes ← (IO.FS.readBinFile compactFile).toBaseIO then
-    if let some (from_, record) := PrefilterUsage.decode? bytes then
-      if from_ == usage then return some record
+  if let some record ← readCompactUsage? compactFile usage then return some record
   let .ok bytes ← (IO.FS.readBinFile usageFile).toBaseIO | return none
   let .ok (some u) := parseUsageSidecar.parse UsageSidecar bytes | return none
   return some u.toPrefilter
