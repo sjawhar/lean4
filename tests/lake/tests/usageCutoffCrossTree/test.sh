@@ -38,6 +38,18 @@ seta() { printf 'def a := %s\ntheorem ta : a = 1 := %s\ndef a3 := 7\n' "$2" "${3
 # edx DIR [V] -- "the unused edit": `X` gains `def x2 := V` (default 1), which no module uses, and which gives every
 # module above `X` a new input hash
 edx() { printf 'def x := 0\ndef x2 := %s\n' "${2:-1}" > "$1/Test/X.lean"; }
+# setnum DIR -- `A` also defines a private constant and a macro whose expansion names a hygienic one, and `B` uses
+# both, so `B`'s `.usage` records names with numeric components (`_private.….0.Secret`, `…._hygCtx._hyg.3`)
+setnum() {
+  cat >> "$1/Test/A.lean" <<'EOS'
+private def Secret : Type := Nat
+def pubv : Secret := (5 : Nat)
+macro "mkt" n:ident : command => `(structure Hid where v : Nat
+  def $n : Hid := ⟨3⟩)
+mkt hv
+EOS
+  printf 'import Test.A\nimport Test.X\ndef bv := pubv\ndef bh := hv\ndef b := a + 1\n' > "$1/Test/B.lean"
+}
 
 # (sed, not jq: entries and traces are pretty-printed, one key per line)
 depHash() { sed -n 's/.*"depHash": *"\([0-9a-f]*\)".*/\1/p' "$1"; }
@@ -267,7 +279,7 @@ case6b() {
   test_exp -d "$d"
   n=$(find "$d" -maxdepth 1 -name '*.json' | wc -l)
   test_exp "$n" -ge 1
-  test_exp "$n" -le 3
+  test_exp "$n" -le 2
   test_exp -z "$(find "$d" -name '*.tmp-*')"
   # every file is complete (when python3 can parse it) and names only artifacts in the cache
   for f in "$d"/*.json; do
@@ -343,14 +355,14 @@ case8() {
   no_match_text "Built Test.E" produced.out
 }
 
-# 9. A module's index keeps the 3 most recently written compiles (`usageIndexSize`), and a hit rewrites the file of the
-# compile it restores, which makes it recent again. t3's compile of `a := 1` is a new file, not the first compile's
-# again: its `.usage` records the provides digest of each import (`digested`), and t3's `X` provides another name. The
-# `a := 2` compile is the oldest of the 3, so t2's hit restores the last candidate the lookup tries.
+# 9. A module's index keeps the 2 most recently written compiles (`usageIndexSize`), and a hit rewrites the file of
+# the compile it restores, which makes it recent again. t3's compile of `a := 1` is a new file, not the first
+# compile's again: its `.usage` records the provides digest of each import (`digested`), and t3's `X` provides
+# another name. The `a := 2` compile is the older of the 2, so t2's hit restores the last candidate the lookup tries.
 case9() {
   local v names=()
   mkpkg t
-  for v in $(seq 4); do
+  for v in $(seq 3); do
     seta t $v
     test_run -d t build Test.B
     names[$v]=$(idxname t B)
@@ -358,26 +370,26 @@ case9() {
   local d
   d=$(idxdir t B)
   test_exp -d "$d"
-  test_exp "$(find "$d" -maxdepth 1 -name '*.json' | wc -l)" = 3
+  test_exp "$(find "$d" -maxdepth 1 -name '*.json' | wc -l)" = 2
   test_exp ! -e "$d/${names[1]}"
   test_exp ! -e "$d/${names[1]%.json}.pre"
-  test_exp -f "$d/${names[4]%.json}.pre"
-  test_exp -f "$d/${names[4]}"
+  test_exp -f "$d/${names[3]%.json}.pre"
+  test_exp -f "$d/${names[3]}"
   mkpkg t2 2
   edx t2
   lake_out -d t2 build -v Test.B
   jobhas Test.B "usage index: restored"
-  jobhas Test.B "(3 candidates,"
-  jobhas Test.B "at rank 3"
+  jobhas Test.B "(2 candidates,"
+  jobhas Test.B "at rank 2"
   mkpkg t3 1
   edx t3
   lake_out -d t3 build -v Test.B
-  jobhas Test.B "usage index: no match (3 candidates"
+  jobhas Test.B "usage index: no match (2 candidates"
   jobhas Test.B "Built Test.B"
   test_exp -f "$d/${names[2]}"
   test_exp ! -e "$d/${names[3]}"
   test_exp -f "$d/$(idxname t3 B)"
-  test_exp "$(find "$d" -maxdepth 1 -name '*.json' | wc -l)" = 3
+  test_exp "$(find "$d" -maxdepth 1 -name '*.json' | wc -l)" = 2
 }
 
 # 10. No lookup and no index write without a writable cache and restored artifacts (each tree has its own value of
@@ -498,6 +510,53 @@ case13() {
   jobhas Test.B "Built Test.B"
 }
 
+# 14. The same, for a candidate whose used constants carry names with numeric components: a private name
+# (`_private.<module>.0.Secret`) and a macro's hygienic one (`Hid._@.Test.A.<n>._hygCtx._hyg.3`), which the record
+# encodes through the name table's number branch. With the cached `.usage` replaced, only the record can carry them,
+# so the pre-filter passes the candidate to the check (which rejects it on the `.usage`) exactly when they
+# round-trip.
+case14() {
+  local art
+  mkpkg f
+  setnum f
+  test_run -d f build Test.B Test.C
+  # (premise) B's `.usage` names a private and a hygienic constant of A, both with a numeric component
+  test_cmd_out '"_private","Test","A",0,"Secret"' cat f/$OUT/B.usage
+  test_cmd_out '"_hygCtx","_hyg",3' cat f/$OUT/B.usage
+  test_exp -f "$(idxdir f B)/$(idxname f B | sed 's/\.json$/.pre/')"
+  art="$LAKE_CACHE_DIR/artifacts/$(entryArt "$(entry f B)" u)"
+  printf 'not a usage record\n' > bad.tmp
+  mv -f bad.tmp "$art"
+  mkpkg t
+  setnum t
+  edx t
+  lake_out -d t build -v Test.B Test.C
+  jobhas Test.C "usage index: restored"
+  jobhas Test.B "usage index: no match (1 candidates, 1 parsed, 1 fully checked"
+  jobhas Test.B "Built Test.B"
+}
+
+# 15. A compact record that no reader takes is written again. Emptied (what a crash can leave after the rename),
+# B's record is not read, so the lookup of the unused edit parses its `.usage` instead; the hit records that compile
+# again, under the `.usekey` it already has, and, finding no usable record, writes one: the record of the first
+# compile, byte for byte.
+case15() {
+  local pre
+  mkpkg f
+  test_run -d f build Test.B
+  pre="$(idxdir f B)/$(idxname f B | sed 's/\.json$/.pre/')"
+  test_exp -s "$pre"
+  test_cmd cp "$pre" pre-first
+  : > "$pre"
+  test_exp ! -s "$pre"
+  mkpkg t
+  edx t
+  lake_out -d t build -v Test.B
+  jobhas Test.B "usage index: restored"
+  test_exp -s "$pre"
+  test_cmd cmp pre-first "$pre"
+}
+
 runcase() {
   echo "=== case $1"
   mkdir -p "c$1"
@@ -508,7 +567,7 @@ runcase() {
   )
 }
 
-if [ $# = 0 ]; then set -- 1 2 3 4 5 6a 6b 7 8 9 10 11 12 13; fi
+if [ $# = 0 ]; then set -- 1 2 3 4 5 6a 6b 7 8 9 10 11 12 13 14 15; fi
 for c in "$@"; do runcase "$c"; done
 
 rm -f produced.out
