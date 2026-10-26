@@ -489,6 +489,8 @@ inductive TakenClaim
 | taken (generation : String)
 /-- There was nothing to take: the line names no claim, or another build changed it. -/
 | none
+/-- The claim request failed. Do not race a retry against this pass's staging. -/
+| retry
   deriving Inhabited
 
 /--
@@ -502,9 +504,9 @@ structure TakenClaims where
 
 /--
 Takes the claims that the queue lines `lines` name (see `takeLineClaim`), with `ctx.workers`
-workers, each line once: until then each claim names the build that compiled the input, whose
-process may already be gone, and a build on this host takes the claim over once it has seen it
-so for `remoteClaimGoneGraceSecs`. A line whose request failed is tried again by a later call.
+workers, each line once. A failed request stays reserved for this pass, so the claim taker cannot
+change its generation while this pass stages it. If its upload fails and the line stays queued,
+the next retry pass may take the claim again.
 -/
 def takeLineClaims (ctx : PushContext) (taken : TakenClaims) (lines : Array String) : BaseIO Unit := do
   let holder ← claimHolder
@@ -523,7 +525,7 @@ def takeLineClaims (ctx : PushContext) (taken : TakenClaims) (lines : Array Stri
       | .taken generation => taken.claims.modify (·.insert line (.taken generation))
       | .none => taken.claims.modify (·.insert line .none)
       | .retry msg =>
-        taken.claims.modify (·.erase line)
+        taken.claims.modify (·.insert line .retry)
         taken.messages.modify (·.push msg)
   let tasks ← (Array.range (min ctx.workers lines.size)).mapM fun _ =>
     IO.asTask (prio := .dedicated) worker
@@ -796,7 +798,15 @@ partial def pushLoop
     if following then
       queueLock.unlock
       if !failed.isEmpty && (← IO.monoMsNow) ≥ retryAt then
-        -- Tries them again: they no longer count as failed unless they fail again
+        -- The retry states protected this pass's staging. A failed entry stays queued, so its
+        -- next pass may try its claim again.
+        taken.claims.modify fun claims =>
+          claims.filter fun line state =>
+            if failed.contains line then
+              match state with
+              | .retry => false
+              | _ => true
+            else true
         logInfo s!"trying {failed.size} failed queue entries again"
         let stats := {stats with failed := stats.failed - failed.size}
         return ← pushLoop ctx pushLock queueLock taken taker stats {} {} follow? retryAt
