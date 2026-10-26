@@ -782,8 +782,10 @@ USAGE:
 OPTIONS:
   --wait                          wait for a push that is running, then push
   --follow <file>                 keep pushing what a build queues while it
-                                  holds the lock on <file> (builds that claim
-                                  inputs start their push this way)
+                                  holds the lock on <file> (builds with the
+                                  claim/push mechanism enabled start their
+                                  push this way; physical claims still need
+                                  `LAKE_CLAIM_SLOTS`)
 
 With `LAKE_REMOTE_CACHE_QUEUE` set to true and `LAKE_REMOTE_CACHE` naming an
 `s3` service (see `lake cache services`), a build appends each output that it
@@ -808,24 +810,26 @@ One push runs at a time. Another one exits at once (with status 0), unless
 runs. At the end, the push writes its counts to `remote-status-push.json` in the
 cache directory. It exits with status 1 if entries remain in the queue.
 
-Unless `LAKE_REMOTE_CACHE_CLAIMS` is set to a false value, a build with the
-queue on also claims an input before it compiles it when every other worker
-thread of it is compiling (when `LAKE_CLAIM_SLOTS` compiles already run; by
-default one less than its worker threads), so that machines that build the
-same targets at once, with more to compile than they can at once, compile
-each one once: it creates the object `claim/<scope>/<inputHash>` in the
+A build with the queue on claims no input unless `LAKE_CLAIM_SLOTS` is set
+(and `LAKE_REMOTE_CACHE_CLAIMS` is not false). It names how many of the
+build's compiles must already run before it claims the next input and waits
+for other builds; `0` claims every input. Claims let machines that build the
+same targets at once compile each one once, but they were measured to cost
+wall time on both machines (see `Lake.Build.Claim`), so they are off by
+default; a build that claims nothing still queues its outputs and pushes
+them.
+
+A build that claims creates the object `claim/<scope>/<inputHash>` in the
 remote cache if no build holds it, and rewrites it while it compiles. With a
-worker free it compiles at once, and neither claims nor waits, so a build
-whose targets keep few compiles running (most of a cold build is often one
-chain of modules) never claims, and two machines may each compile an input.
-A build whose workers are all busy and that finds the claim taken waits for
-the input's mapping instead of compiling, and takes the claim over when the
-claim says that the compile failed, when the claim says that its compile or
-its upload still runs but its holder (the build, or the push that uploads its
-outputs) is a process of this machine that no longer runs and the build has
-seen the claim unchanged for 5 seconds, or when the remote cache has not
-replaced it for `LAKE_CLAIM_TAKEOVER_SECS` seconds (600 by default) or the
-build has seen it unchanged for that long by its own clock.
+worker free it compiles at once, and neither claims nor waits. A build whose
+compiles fill its slots and that finds the claim taken waits for the input's
+mapping instead of compiling, and takes the claim over when the claim says
+that the compile failed, when the claim says that its compile or its upload
+still runs but its holder (the build, or the push that uploads its outputs)
+is a process of this machine that no longer runs and the build has seen the
+claim unchanged for 5 seconds, or when the remote cache has not replaced it
+for `LAKE_CLAIM_TAKEOVER_SECS` seconds (600 by default) or the build has seen
+it unchanged for that long by its own clock.
 Builds that see each other compiling share the inputs out: each gives every
 input it is about to compile to one of the builds whose live claim saying
 `building` it has read, by the input's hash, claims its own and leaves the
@@ -911,11 +915,15 @@ the user's `.curlrc`. A process Lake starts does not get the token, though
 it inherits both variables from Lake's environment.
 
 A build that uploads to such a service (`LAKE_REMOTE_CACHE_QUEUE`; see
-`lake cache push`) also claims each input before it compiles it:
+`lake cache push`) can also claim an input before it compiles it:
 
-  LAKE_REMOTE_CACHE_CLAIMS=false   do not claim, and do not push in the
-                                   background (unset by default: claims are
-                                   taken)
+  LAKE_CLAIM_SLOTS=<n>             claim an input, and wait for other builds,
+                                   once `n` compiles of this build already run
+                                   (unset by default: no input is claimed,
+                                   since claims were measured to cost wall
+                                   time; 0 claims every input)
+  LAKE_REMOTE_CACHE_CLAIMS=false   claim nothing, whatever `LAKE_CLAIM_SLOTS`
+                                   says, and do not push in the background
   LAKE_CLAIM_TAKEOVER_SECS=<n>     take a claim over after the remote cache has
                                    not replaced it, or the build has seen it
                                    unchanged, for `n` seconds (600 by
@@ -927,11 +935,6 @@ A build that uploads to such a service (`LAKE_REMOTE_CACHE_QUEUE`; see
                                    default; 0 claims every input at once, so
                                    the build that is ahead takes nearly all of
                                    them)
-  LAKE_CLAIM_SLOTS=<n>             claim an input, and wait for other builds,
-                                   only once `n` compiles already run (by
-                                   default one less than the worker threads,
-                                   `LEAN_NUM_THREADS` or the cores: every
-                                   other worker compiles; 0 claims every input)
   LAKE_PUSH_SHELL=<path>           the shell that starts the background push
                                    (`/bin/bash` by default); it must close
                                    every descriptor by number, and where it is
