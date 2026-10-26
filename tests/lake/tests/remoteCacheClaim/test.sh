@@ -89,13 +89,15 @@ claim_fresh() {
   test_cmd cp -r "$TEST_DIR/claim" "$TREE_B"
   test_cmd chmod -R u+w "$TREE_A" "$TREE_B"
 }
-# Runs a command as a machine with the queue on (and so, by default, claims): the remote cache
-# `$CLAIM_SERVICE` (by default `bearer`), with a token. Its builds claim every input
+# Runs a command as a machine with the queue on (and so, by default here, claims): the remote
+# cache `$CLAIM_SERVICE` (by default `bearer`), with a token. Its builds claim every input
 # (`LAKE_CLAIM_SLOTS=0`, as a build whose compile slots are full does), unless `$CLAIM_SLOTS`
-# names other slots, or is `default` for the build's own (its worker threads).
+# names other slots, or is `unset` for a build that sets none (which claims nothing, the
+# default of Lake).
 on_m() {
   local slots=(LAKE_CLAIM_SLOTS="${CLAIM_SLOTS:-0}")
-  if [ "${CLAIM_SLOTS:-}" = default ]; then slots=(); fi
+  # An empty value is unset to Lake and blocks any value the test runner inherited
+  if [ "${CLAIM_SLOTS:-}" = unset ]; then slots=(LAKE_CLAIM_SLOTS=); fi
   env "${slots[@]}" LAKE_REMOTE_CACHE="${CLAIM_SERVICE:-bearer}" LAKE_CACHE_TOKEN_CMD="$TOKEN_CMD" \
     LAKE_REMOTE_CACHE_QUEUE=true "$@"
 }
@@ -107,6 +109,8 @@ run_build() {
   shift
   echo "\$ build $*"
   on_m bash "$WORK_DIR/build.sh" "$@" || got=$?
+  # This build has ended, so no later case kills its process ID, which another build may reuse
+  rm -f "$3.pid"
   cat "$3"
   if [ "$got" != "$rc" ]; then
     echo "FAILURE: the build exited with $got, expected $rc"
@@ -704,14 +708,14 @@ case_claim_free_slots() {
   # another build saves it time only when it cannot compile more at once. This package runs at
   # most two compiles at once, so a build with more slots takes no claim, and another build's live
   # claim of an input (here `Claim.A`'s, which that build never finishes) does not hold it up:
-  # with full slots it would wait out the takeover time (600 s).
+  # with full slots it would wait out the takeover time (600 s). A build that sets no slots at
+  # all (`unset`, the default) claims nothing either.
   claim_fresh
   # The input hash of `Claim.A`, from a build that claims nothing
   LAKE_REMOTE_CACHE_CLAIMS=false run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
   local a slots
   a="$(inputs "$CACHE_A" Claim.A)"
-  # Four slots set, and the build's own slots (here three: four workers, less the one that asks)
-  for slots in 4 default; do
+  for slots in 4 unset; do
     test_cmd rm -rf "$TREE_B" "$CACHE_B" "$OBJECTS" "$CLAIMS"
     test_cmd cp -r "$TEST_DIR/claim" "$TREE_B"
     test_cmd chmod -R u+w "$TREE_B"
@@ -730,24 +734,51 @@ case_claim_free_slots() {
 }
 
 case_claim_saturated() {
-  # With its own slots (one less than its workers), a build claims an input when every other
-  # worker compiles, and not before. `Wide`'s three modules import nothing and compile for 2, 4
-  # and 6 seconds. With two workers, the third module starts when one of the first two ends and
-  # the other still compiles, so the build claims it (the first two may start before either
-  # compile counts, so they need not claim). With eight workers, no compile ever waits for a
-  # worker, so the build claims nothing.
+  # A build claims an input once `LAKE_CLAIM_SLOTS` of its compiles run, and not before.
+  # `Wide`'s three modules import nothing and compile for 2, 4 and 6 seconds. With one slot and
+  # two workers, the third module starts when one of the first two ends and the other still
+  # compiles, so the build claims it (the first two may start before either compile counts, so
+  # they need not claim). With eight workers and three slots, no three compiles ever run, so the
+  # build claims nothing.
   claim_fresh
-  CLAIM_SLOTS=default LEAN_NUM_THREADS=2 LAKE_TEST_CLAIM_SLEEP=2000 BUILD_TIMEOUT=120 \
+  CLAIM_SLOTS=1 LEAN_NUM_THREADS=2 LAKE_TEST_CLAIM_SLEEP=2000 BUILD_TIMEOUT=120 \
     run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Wide
   test_cmd_eq 3 claim_check built-by "$LOG_A"
   test_exp "$(claim_check count-files "$CLAIMS")" -ge 1
   wait_push "$CACHE_A"
   claim_fresh
-  CLAIM_SLOTS=default LEAN_NUM_THREADS=8 LAKE_TEST_CLAIM_SLEEP=2000 BUILD_TIMEOUT=120 \
+  CLAIM_SLOTS=3 LEAN_NUM_THREADS=8 LAKE_TEST_CLAIM_SLEEP=2000 BUILD_TIMEOUT=120 \
     run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Wide
   test_cmd_eq 3 claim_check built-by "$LOG_A"
   test_cmd_eq 0 claim_check count-files "$CLAIMS"
   wait_push "$CACHE_A"
+}
+
+case_claim_free_slot_wake() {
+  # A build that waits for another build's claim looks again as soon as one of its own compiles
+  # ends and leaves a worker free, not only when its 5 s timer fires: it then compiles that input
+  # at once, as a build with a free worker does. Here two workers build `Wide.Three` (6 s) and
+  # `Claim.C`, whose claim another build holds and never finishes, with one slot. `Claim.C` is
+  # ready only after `Claim.A` and `Claim.B` (a fraction of a second), so the build is at its
+  # slot when it reaches `Claim.C` and leaves it waiting. `Wide.Three` ends at 6 s, and the wait
+  # ends with it; without that, the build would wait for the poll at 10 s.
+  claim_fresh
+  LAKE_REMOTE_CACHE_CLAIMS=false run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.C
+  local c
+  c="$(inputs "$CACHE_A" Claim.C)"
+  test_cmd rm -rf "$TREE_B" "$CACHE_B" "$OBJECTS" "$CLAIMS"
+  test_cmd cp -r "$TEST_DIR/claim" "$TREE_B"
+  test_cmd chmod -R u+w "$TREE_B"
+  put_claim "$c" building
+  START=$(date +%s)
+  CLAIM_SLOTS=1 LEAN_NUM_THREADS=2 LAKE_TEST_CLAIM_SLEEP=2000 BUILD_TIMEOUT=120 \
+    run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim.C Wide.Three
+  ELAPSED=$(( $(date +%s) - START ))
+  test_cmd_eq 4 claim_check built-by "$LOG_B"
+  match_text 'waiting for the claim' "$LOG_B"
+  test_exp $ELAPSED -ge 6
+  test_exp $ELAPSED -lt 9
+  wait_push "$CACHE_B"
 }
 
 run_cases case_claim_two_builds case_claim_one_push case_claim_order case_claim_failed \
@@ -757,4 +788,5 @@ run_cases case_claim_two_builds case_claim_one_push case_claim_order case_claim_
   case_claim_exe_push case_claim_push_retry case_claim_push_spawn_fails \
   case_claim_push_start_wfail case_claim_foreground_push case_claim_follow_reap \
   case_claim_unreadable case_claim_local_clock case_claim_stream case_claim_off \
-  case_claim_fail_open case_claim_share case_claim_free_slots case_claim_saturated
+  case_claim_fail_open case_claim_share case_claim_free_slots case_claim_saturated \
+  case_claim_free_slot_wake
