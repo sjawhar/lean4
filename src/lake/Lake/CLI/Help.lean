@@ -960,7 +960,10 @@ progress, or after 60 seconds and one more for each MiB that its `curl` run
 uploads, and one that failed transiently (a timeout, a host that could not be
 resolved, or HTTP 408, 429, 500, 502, 503, 504, 522 or 524) is tried again up
 to 3 times. A push removes the entries it uploaded from the queue as it goes,
-so a push that is stopped keeps its progress."
+so a push that is stopped keeps its progress. A push you run whose first
+entries reach no service at all stops there and keeps every entry queued
+(`remote-status-push.json` says so); a build's own push tries them again every
+30 seconds while the build runs."
 
 def helpScriptCli :=
 "Manage Lake scripts
