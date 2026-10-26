@@ -608,8 +608,10 @@ every new duplicate has a declarer this checks.
 Names are compared by `Name.hash`, so a hash collision only rebuilds. The `.olean` reads assume the data layout of
 the Lean that Lake was built with, so with another Lean, or if a read fails, the check fails. A `module` file's kernel
 constants are kept per build and module state, a toolchain module's per build (`BuildContext.kernelProviders`), so a
-later check does not read them again. The workspace modules are read in parallel (`parallelRuns`), and their reads'
-logs and errors are replayed in closure order before any duplicate decides the check, as a serial check meets them.
+later check does not read them again. The check reads those maps once and takes their mutex again only for a module they
+lack: every check of the build takes it, and a module's entry only ever holds what some read of it gave. The
+workspace modules are read in parallel (`parallelRuns`), and their reads' logs and errors are replayed in closure order
+before any duplicate decides the check, as a serial check meets them.
 -/
 def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetup) (hashes : ContentHashes)
     (reads : ImportReads) (importArts : NameMap ImportArtifacts) (changed : Array (Name × UsageImport)) :
@@ -629,6 +631,7 @@ def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetu
   let clash (k : Name) (h : UInt64) : Bool := claims[h]?.any (·.any (· != k))
   let outside (r : Array Name) (i : ModuleImport) := if i.module?.isNone then r.push i.module else r
   let kp := (← getBuildContext).kernelProviders
+  let providers ← kp.atomically get
   readImports hashes reads importArts (keyedModules importArts)
   let known ← reads.get
   let snap ← getBuildStoreSnapshot
@@ -652,7 +655,10 @@ def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetu
   -- whether a `module` file's kernel constants duplicate a claimed one, or `none` if they cannot be read
   let modsysClash (x : Name × ModuleUsage.Digest × Array FilePath) : JobM (Option Bool) := do
     let (m, d, parts) := x
-    let hs ← match ← kp.atomically (return (← get).modsys.find? (m, d)) with
+    let cached ← match providers.modsys.find? (m, d) with
+      | some hs => pure (some hs)
+      | none => kp.atomically (return (← get).modsys.find? (m, d))
+    let hs ← match cached with
       | some hs => pure hs
       | none =>
         let some (hs, _) ← readKernelProvides (readModuleDataParts parts) | return none
@@ -675,12 +681,17 @@ def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetu
     clashes := clashes || c
   let searchPath := (← getLeanPath) ++ [← getLeanLibDir]
   let mut seen : NameSet := {}
+  let mut providers := providers
   while h : 0 < toolchain.size do
     let m := toolchain.back
     toolchain := toolchain.pop
     if seen.contains m || importArts.contains m then continue
     seen := seen.insert m
-    let read? ← match ← kp.atomically (return (← get).toolchain.find? m) with
+    let mut cached := providers.toolchain.find? m
+    if cached.isNone then
+      providers ← kp.atomically get
+      cached := providers.toolchain.find? m
+    let read? ← match cached with
       | some read? => pure read?
       | none =>
         let read? ← match ← Lean.SearchPath.findWithExt searchPath "olean" m with
