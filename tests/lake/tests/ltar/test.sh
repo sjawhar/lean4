@@ -97,3 +97,27 @@ test_cmd rm .lake/build/lib/lean/Test.olean .lake/build/lib/lean/Test.trace
 test_fails build +Test --no-build --old -v
 test_not_out "leantar" build +Test --old -v
 test_exp -f .lake/build/lib/lean/Test.olean
+
+# An archive unpacked from the cache over another source's outputs leaves no `.hash` file of those
+# outputs: Lake trusts `.hash` files, so a stale one would change the input hashes of the module's
+# importers. Build the archived source, then another one, then the archived one with a read-only cache.
+if command -v jq > /dev/null; then # skip if no jq found
+  copy_to_work lakefile.toml restoreAll.toml Test.lean
+  cp Test.lean Test.lean.orig
+  test_run -f restoreAll.toml build +Test --wfail -o .lake/outputs.jsonl
+  rm -rf .lake/build
+  test_run cache add .lake/outputs.jsonl --service reservoir --repo 'foo/bar'
+  echo 'def other := 2' >> Test.lean
+  LAKE_ARTIFACT_CACHE=true test_run build +Test
+  cp Test.lean.orig Test.lean
+  test_out "leantar" build +Test -v
+  # check_hash FILE KEY: FILE's `.hash` file, if any, is the content hash its trace records at KEY
+  check_hash() {
+    local want; want=$(jq -r "$2" .lake/build/lib/lean/Test.trace)
+    if [ -f "$1.hash" ]; then test_exp "$(cat "$1.hash")" = "${want%.*}"; fi
+  }
+  check_hash .lake/build/lib/lean/Test.olean '.outputs.o[0]'
+  check_hash .lake/build/lib/lean/Test.ilean '.outputs.i'
+  check_hash .lake/build/ir/Test.c '.outputs.c'
+  cd ..
+fi

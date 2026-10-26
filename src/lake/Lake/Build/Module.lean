@@ -739,28 +739,36 @@ def Module.recFetchSetup (mod : Module) : FetchM (Job ModuleSetup) := ensureJob 
 public def Module.setupFacetConfig : ModuleFacetConfig setupFacet :=
   mkFacetJobConfig (buildable := false) recFetchSetup
 
-/-- Remove all existing artifacts produced by a Lean build of the module. -/
+/--
+Removes `file` and its `.hash` file. Lake trusts `.hash` files, so one left behind would describe
+whatever later replaces `file` (e.g., outputs unpacked from an archive) with the old contents' hash.
+-/
+def removeOutputFile (file : FilePath) : IO PUnit := do
+  removeFileIfExists file
+  clearFileHash file
+
+/-- Remove all existing artifacts produced by a Lean build of the module, and their `.hash` files. -/
 public def Module.clearOutputArtifacts (mod : Module) : IO PUnit := do
   try
-    removeFileIfExists mod.ltarFile
-    removeFileIfExists mod.oleanFile
-    removeFileIfExists mod.oleanServerFile
-    removeFileIfExists mod.oleanPrivateFile
-    removeFileIfExists mod.ileanFile
-    removeFileIfExists mod.irSigFile
-    removeFileIfExists mod.irFile
-    removeFileIfExists mod.cFile
-    removeFileIfExists mod.bcFile
+    removeOutputFile mod.ltarFile
+    removeOutputFile mod.oleanFile
+    removeOutputFile mod.oleanServerFile
+    removeOutputFile mod.oleanPrivateFile
+    removeOutputFile mod.ileanFile
+    removeOutputFile mod.irSigFile
+    removeOutputFile mod.irFile
+    removeOutputFile mod.cFile
+    removeOutputFile mod.bcFile
   catch e =>
     error s!"failed to remove output artifacts: {e}"
 
-/-- Remove all existing artifacts produced by a `leanir` build of the module. -/
+/-- Remove all existing artifacts produced by a `leanir` build of the module, and their `.hash` files. -/
 public def Module.clearIROutputArtifacts (mod : Module) : IO PUnit := do
   try
-    removeFileIfExists mod.ltarFile
-    removeFileIfExists mod.irSigFile
-    removeFileIfExists mod.irFile
-    removeFileIfExists mod.cFile
+    removeOutputFile mod.ltarFile
+    removeOutputFile mod.irSigFile
+    removeOutputFile mod.irFile
+    removeOutputFile mod.cFile
   catch e =>
     error s!"failed to remove IR output artifacts: {e}"
 
