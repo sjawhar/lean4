@@ -32,6 +32,9 @@ a test picks one by pointing an endpoint at it (e.g. `.../corrupt/a0`):
   slowobj   as `ok`, but each `PUT` of an object outside a `claim` directory
             (an artifact or a mapping, not a claim of the shared remote cache)
             is answered after 4 seconds
+  flakyclaimslowobj
+            as `slowobj`, but the first conditional `PUT` of each claim fails
+            with 503
   denyartonce
             403 for the first `PUT` of each object in an `a/` directory (an
             artifact of the shared remote cache), and otherwise as `ok`
@@ -119,6 +122,9 @@ LAST_GENERATION = [1792925620545348]
 # The object paths that `denyartonce` mode has refused once
 REFUSED_ONCE = set()
 
+# The claim paths that `resetclaimslowobj` has reset once
+RESET_CLAIM_ONCE = set()
+
 
 def first_put(parts):
     """Whether this is the first `PUT` of the object at `parts` (and records it)."""
@@ -127,6 +133,16 @@ def first_put(parts):
         if key in REFUSED_ONCE:
             return False
         REFUSED_ONCE.add(key)
+        return True
+
+
+def first_reset_claim(parts):
+    """Whether this is the first conditional claim write at `parts`."""
+    key = "/".join(parts)
+    with STORE_LOCK:
+        if key in RESET_CLAIM_ONCE:
+            return False
+        RESET_CLAIM_ONCE.add(key)
         return True
 
 
@@ -178,6 +194,7 @@ class Mode(StrEnum):
     DENY_ART = "denyart"
     STALL_PUT = "stallput"
     SLOW_OBJ = "slowobj"
+    RESET_CLAIM_SLOW_OBJ = "resetclaimslowobj"
     DENY_ART_ONCE = "denyartonce"
     BAD_CLAIM = "badclaim"
     STREAM_CLAIM = "streamclaim"
@@ -471,6 +488,13 @@ class Handler(BaseHTTPRequestHandler):
             self.deny()
         elif mode == Mode.DENY_ART_ONCE and parts[-2:-1] == ["a"] and first_put(parts):
             self.deny()
+        elif (
+            mode == Mode.RESET_CLAIM_SLOW_OBJ
+            and parts[1:2] == ["claim"]
+            and self.headers.get("x-goog-if-generation-match") not in (None, "0")
+            and first_reset_claim(parts)
+        ):
+            self.reset()
         elif mode == Mode.BAD_CLAIM and parts[1:2] == ["claim"]:
             # The claim exists: its create is refused
             self.respond(412, PRECONDITION_BODY, "application/xml")
@@ -494,7 +518,10 @@ class Handler(BaseHTTPRequestHandler):
             elif mode == Mode.STALL_PUT:
                 time.sleep(900)
             # A claim is `<endpoint>/claim/...`; any `claim` deeper in the path is a package
-            elif mode == Mode.SLOW_OBJ and parts[1:2] != ["claim"]:
+            elif (
+                mode in (Mode.SLOW_OBJ, Mode.RESET_CLAIM_SLOW_OBJ)
+                and parts[1:2] != ["claim"]
+            ):
                 time.sleep(4)
             path = os.path.join(STORE, *parts)
             os.makedirs(os.path.dirname(path), exist_ok=True)
