@@ -24,7 +24,7 @@ a test picks one by pointing an endpoint at it (e.g. `.../corrupt/a0`):
   redirect  302 to the same object path under the `--redirect` URL
   slow      as `ok`, but each `GET` is answered after 2 seconds
   slowput   as `ok`, but each `PUT` is answered after 2 seconds
-  oversize  mappings are normal; an artifact advertises 119596321 bytes and no body
+  oversize  mappings are normal; an artifact advertises 537138977 bytes and no body
   denyart   403 for a `GET` of an object in an `a/` directory (an artifact of the
             shared remote cache), and otherwise as `ok`
   stallput  as `ok`, but each `PUT` reads its body and then sends no answer for
@@ -43,6 +43,10 @@ a test picks one by pointing an endpoint at it (e.g. `.../corrupt/a0`):
             not end (4 KiB every 100 ms, for 2 minutes)
   notimes   as `ok`, but a `GET` of a claim is answered without `Date` and
             `Last-Modified`
+  busyonce  503 for the first `PUT` of each object outside a `claim` directory
+            (an artifact or a mapping), as a busy server answers, and otherwise
+            as `ok`
+  silent    accepts each request, reads it, and never answers (15 minutes)
 
 A fault that does not apply to a request kind (e.g. `badcount` on a `GET`)
 behaves as `ok`. Like Cloud Storage, each object has a generation, which a new
@@ -119,6 +123,9 @@ LAST_GENERATION = [1792925620545348]
 # The object paths that `denyartonce` mode has refused once
 REFUSED_ONCE = set()
 
+# The object paths that `busyonce` mode has answered 503 once
+BUSY_ONCE = set()
+
 # The claim paths that `resetclaimslowobj` has reset once
 RESET_CLAIM_ONCE = set()
 
@@ -140,6 +147,16 @@ def first_reset_claim(parts):
         if key in RESET_CLAIM_ONCE:
             return False
         RESET_CLAIM_ONCE.add(key)
+        return True
+
+
+def first_busy(parts):
+    """Whether this is the first `PUT` of the object at `parts` in `busyonce` mode (and records it)."""
+    key = "/".join(parts)
+    with STORE_LOCK:
+        if key in BUSY_ONCE:
+            return False
+        BUSY_ONCE.add(key)
         return True
 
 
@@ -196,6 +213,8 @@ class Mode(StrEnum):
     BAD_CLAIM = "badclaim"
     STREAM_CLAIM = "streamclaim"
     NO_TIMES = "notimes"
+    BUSY_ONCE = "busyonce"
+    SILENT = "silent"
 
 
 def content_type(path):
@@ -298,13 +317,19 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
         self.log("reset")
 
+    def silent(self):
+        # The request was read; the answer never comes (the client gives up first)
+        self.log("silent")
+        time.sleep(900)
+        self.close_connection = True
+
     def serve(self, mode, path, ctype=None):
         if mode == Mode.OVERSIZE and f"{os.sep}a{os.sep}" in path:
             # curl checks --max-filesize against the header before receiving the
             # body, so this exercises the reader's bound without allocating it.
             self.send_response(200)
             self.send_header("Content-Type", ctype or content_type(path))
-            self.send_header("Content-Length", "119596321")
+            self.send_header("Content-Length", "537138977")
             self.end_headers()
             self.close_connection = True
             self.log("oversize")
@@ -397,6 +422,8 @@ class Handler(BaseHTTPRequestHandler):
             self.redirect(parts)
         elif mode == Mode.RESET:
             self.reset()
+        elif mode == Mode.SILENT:
+            self.silent()
         elif mode == Mode.DENY or (mode == Mode.DENY_ART and parts[-2:-1] == ["a"]):
             self.deny()
         elif mode == Mode.BAD_CLAIM and parts[1:2] == ["claim"]:
@@ -452,6 +479,8 @@ class Handler(BaseHTTPRequestHandler):
             self.unauthorized()
         elif mode == Mode.RESET:
             self.reset()
+        elif mode == Mode.SILENT:
+            self.silent()
         elif mode == Mode.DENY:
             self.deny()
         else:
@@ -481,8 +510,12 @@ class Handler(BaseHTTPRequestHandler):
             self.redirect(parts)
         elif mode == Mode.RESET:
             self.reset()
+        elif mode == Mode.SILENT:
+            self.silent()
         elif mode == Mode.DENY:
             self.deny()
+        elif mode == Mode.BUSY_ONCE and parts[1:2] != ["claim"] and first_busy(parts):
+            self.respond(503, b"Service Unavailable", "text/plain")
         elif mode == Mode.DENY_ART_ONCE and parts[-2:-1] == ["a"] and first_put(parts):
             self.deny()
         elif (
@@ -552,6 +585,8 @@ class Handler(BaseHTTPRequestHandler):
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
+    # The default (5) resets the connections of a `curl` run that uploads 50 files at once
+    request_queue_size = 128
 
     # Lake aborts transfers on error, which is not a server failure
     def handle_error(self, request, client_address):

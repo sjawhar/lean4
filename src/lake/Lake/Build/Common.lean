@@ -721,6 +721,9 @@ public def resolveArtifact
               `LAKE_REMOTE_CACHE` does not name."
           let some sha256 := sha256s.get? descr.relPath.toString
             | error s!"remote mapping has no SHA-256 for artifact `{descr}`"
+          if ← remoteReadsStopped then
+            error s!"artifact not found in cache:\n  {path}\n\
+              This build has stopped reading the remote cache `{serviceName}`."
           let url := service.remoteArtifactUrl scope.toString sha256
           -- The job downloads: only now is it a fetch (a job that got this far without one keeps
           -- the caption of what it did instead, e.g. a replay)
@@ -730,8 +733,9 @@ public def resolveArtifact
             \n  local path: {path}\
             \n  remote URL: {url}"
           try
-            liftM <| downloadArtifactCore descr.hash url path (service.sendsCacheToken url)
-              (sha256? := some sha256) (maxFileSize? := some remoteCacheMaxFileSize)
+            timeRemoteRead <| liftM <| downloadArtifactCore descr.hash url path
+              (service.sendsCacheToken url) (sha256? := some sha256)
+              (maxFileSize? := some remoteCacheMaxFileSize) (limits := remoteReadLimits)
           catch e =>
             error (← recordRemoteReadFailure (← takeLogFrom e) "remote artifact download failed")
         | none =>

@@ -10,7 +10,7 @@ public import Lake.Util.Log
 import Lake.Util.Proc
 import Lake.Util.FilePath
 import Lake.Util.IO
-import Lake.Util.Url
+public import Lake.Util.Url
 import Lake.Util.CacheToken
 import Init.Data.String.Search
 import Init.Data.String.TakeDrop
@@ -172,8 +172,10 @@ Download a file using `curl`, replacing any existing file.
 
 `curl` writes to a temporary file next to `file`, unique to this download, which `check`
 vets before it is renamed into place. Thus, `file` never holds a partial download, and a
-failed download (whose temporary file is removed) leaves it as it was. The download gives up
-on a stalled transfer (see `transferTimeoutArgs`).
+failed download (whose temporary file is removed) leaves it as it was. The download gives up and
+tries again as `limits` says (see `TransferLimits.args`; by default, it gives up on a stall and is
+not tried again); with `maxFileSize?`, a larger file fails, and each try is bounded by the time
+such a file may take.
 
 With `cacheToken`, the request carries the cache token, ignores the user's `.curlrc` and does not
 follow redirects (see `withCacheTokenRequest`); a redirect is an error that names it.
@@ -182,14 +184,14 @@ public def download
   (url : String) (file : FilePath) (headers : Array String := #[])
   (cacheToken := false) (maxFileSize? : Option Nat := none)
   (check : FilePath → LogIO PUnit := fun _ => pure ())
+  (limits : TransferLimits := {retries := 0})
 : LogIO PUnit := do
   createParentDirs file
   let tmp ← uniqueTmpPath file
   try
     let (code, out, token) ← withCacheTokenRequest url cacheToken fun _ args => do
       let args := args ++ #["-s", "-S", "-f", "-o", tmp.toString, "-w", "%{http_code}"]
-      let args := args ++ transferTimeoutArgs
-      let args := maxFileSize?.elim args fun size => args ++ #["--max-filesize", toString size]
+      let args := args ++ limits.args maxFileSize?
       let args := headers.foldl (init := args) (· ++ #["-H", ·])
       let out ← rawProc {cmd := ← Internal.getCurl, args := args.push url}
       return (out.stdout.trimAscii.toNat?.getD 0, out)

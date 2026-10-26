@@ -9,6 +9,7 @@ prelude
 public import Lake.Config.Artifact
 public import Lake.Util.Log
 public import Lake.Util.Sha256
+public import Lake.Util.Url
 import Lake.Util.JsonObject
 import Init.System.Platform
 
@@ -29,10 +30,37 @@ namespace Lake
 public def remoteCacheSchemaVersion : String := "lake-remote-2026-10-24"
 
 /--
-The largest remote artifact Lake accepts: four times the largest artifact (29,899,080 bytes)
-measured in a full MachCSL build on 2026-10-25.
+The largest remote artifact Lake accepts: four times the largest artifact (134,284,744 bytes, the
+archive of a module) in the shared remote cache of the MachCSL build on 2026-10-26.
 -/
-public def remoteCacheMaxFileSize : Nat := 119596320
+public def remoteCacheMaxFileSize : Nat := 537138976
+
+/--
+The largest remote mapping Lake accepts: 16 MiB, more than 20 times the largest mapping (753,642
+bytes, whose log lists a module's axioms) of the 53,861 in the shared remote cache of the MachCSL
+build on 2026-10-26, whose median is 692 bytes. A mapping holds the build's log, which has no
+bound of its own, so this one is far above what a mapping is. It also bounds how long a read of a
+mapping may take (see `TransferLimits.args`).
+-/
+public def remoteMappingMaxFileSize : Nat := 16777216
+
+/--
+How a build reads an object of the shared remote cache (a mapping or an artifact; see
+`TransferLimits`): a try gives up after 3 s without progress, or 3 s without a connection
+(`transferConnectSecs`), and the read is tried once more, after 1 s. So a read of a remote that
+does not answer ends after 7 s, and the build compiles the target. On 2026-10-26, from an Azure
+VM, Cloud Storage answered 15,000 reads of mappings with its first byte within 0.35 s (0.18 s at
+the 99.9th percentile), and a 134 MB artifact streamed at 100 MB per second or faster.
+-/
+public def remoteReadLimits : TransferLimits := {stallSecs := 3, retries := 1, retryMaxSecs := 10}
+
+/--
+After how many reads of the shared remote cache in a row that failed after waiting at least the
+stall time of `remoteReadLimits` (3 s; a remote that does not answer) a build stops reading the
+remote cache for the rest of the build (see `RemoteReadStatus`): 3. A read that fails sooner (the
+remote refused it) does not count, and any other read resets the count.
+-/
+public def remoteReadTimeoutLimit : Nat := 3
 
 /-- The namespace of a package's input-hash mappings in the shared remote cache. -/
 public def remoteCacheScope (githash packageScope : String) : String :=
