@@ -868,19 +868,23 @@ which will be computed in the resulting `Job` before building.
 
 /--
 Makes the file `src` available at the path `name` (a hard link, or else a copy) and returns `name`.
-The file appears at `name` in one rename, so a concurrent reader of `name` sees either its old or
-its new contents, never a missing file.
+As with `restoreArtifact`, an existing file at `name` is kept: Lake removes its outputs before it
+writes new ones. A copy appears at `name` in one rename, so a concurrent reader never sees part of it.
 -/
 def placeFileAs (src name : FilePath) : JobM FilePath := do
-  if src == name then
+  if src == name || (← name.pathExists) then
     return name
   createParentDirs name
-  let tmp := FilePath.mk s!"{name}.{← IO.Process.getPID}-{← IO.monoNanosNow}.tmp"
-  if let .error e ← (IO.FS.hardLink src tmp).toBaseIO then
-    logVerbose s!"could not hard link {src} to {tmp}, copying instead; error: {e}"
-    copyFile src tmp
-  IO.FS.rename tmp name
-  return name
+  match (← (IO.FS.hardLink src name).toBaseIO) with
+  | .ok _ | .error (.alreadyExists ..) => return name
+  | .error e =>
+    logVerbose s!"could not hard link {src} to {name}, copying instead; error: {e}"
+    let tmp := FilePath.mk s!"{name}.{← IO.Process.getPID}-{← IO.monoNanosNow}.tmp"
+    if let .error e ← (copyFile src tmp *> IO.FS.rename tmp name).toBaseIO then
+      discard <| (IO.FS.removeFile tmp).toBaseIO
+      unless (← name.pathExists) do
+        error s!"could not copy {src} to {name}: {e}"
+    return name
 
 /--
 **For internal use only.**
