@@ -17,6 +17,10 @@ import Lake.Util.Url
 How a build reads the input-to-output mappings of the shared remote cache that `LAKE_REMOTE_CACHE`
 names after a miss in the local cache (`readRemoteOutputs?`), and how it queues the outputs that it
 compiled for `lake cache push` (`queueRemotePush`).
+
+Each read is bounded (`remoteReadLimits`). A build stops reading the remote cache once
+`remoteReadTimeoutLimit` reads in a row waited for a remote that did not answer (see
+`noteRemoteRead`): its other targets then compile.
 -/
 
 open System Lean
@@ -55,6 +59,49 @@ public def recordRemoteReadFailure (log : Log) (default : String) : JobM String 
   liftM (m := BaseIO) <| status.modify (·.add msg)
   return msg
 
+/-- Whether this build has stopped reading the shared remote cache (see `noteRemoteRead`). -/
+public def remoteReadsStopped : JobM Bool := do
+  return (← (← getBuildContext).remoteReadStatus.get).stopped?.isSome
+
+/--
+Records how a read of the shared remote cache that started at the monotonic time `start` (in
+milliseconds) ended. A read that failed after waiting at least the stall time of
+`remoteReadLimits` (the remote did not answer) adds one to the build's reads in a row that did so;
+any other read resets them. The read that makes them `remoteReadTimeoutLimit` stops the build's
+reads of the remote cache (`remoteReadsStopped`), and that is logged once, at verbose level, and
+kept in the read status (`Cache.readStatusFile`).
+-/
+public def noteRemoteRead (start : Nat) (failed : Bool) : JobM Unit := do
+  let waited := (← IO.monoMsNow) - start
+  let timedOut := failed && waited ≥ remoteReadLimits.stallSecs * 1000
+  let status := (← getBuildContext).remoteReadStatus
+  let stopped? ← liftM (m := BaseIO) <| status.modifyGet fun s =>
+    if !timedOut then
+      (none, {s with timeoutsInRow := 0})
+    else
+      let n := s.timeoutsInRow + 1
+      if s.stopped?.isNone && n ≥ remoteReadTimeoutLimit then
+        let msg := s!"stopped reading the remote cache for the rest of this build: {n} reads in \
+          a row waited for it and failed (the last one after {waited} ms)"
+        (some msg, {s with timeoutsInRow := n, stopped? := some msg})
+      else
+        (none, {s with timeoutsInRow := n})
+  if let some msg := stopped? then
+    logVerbose msg
+
+/--
+Runs `read`, a read of the shared remote cache, and records how it ended (see `noteRemoteRead`).
+-/
+@[inline] public def timeRemoteRead (read : JobM α) : JobM α := do
+  let start ← IO.monoMsNow
+  try
+    let a ← read
+    noteRemoteRead start false
+    return a
+  catch e =>
+    noteRemoteRead start true
+    throw e
+
 /--
 **For internal use only.**
 Reads the remote mapping of `inputHash` for `target` from the shared remote cache that
@@ -62,7 +109,9 @@ Reads the remote mapping of `inputHash` for `target` from the shared remote cach
 mapping only with `replace` (one that could not be used, e.g., because its artifacts were pruned).
 A mapping that does not name this input, target and source hash (`srcHash?`, for a module), or
 whose artifacts could not be cache files, is refused. Every failure but a missing mapping is
-recorded (see `recordRemoteReadFailure`), and each is a miss.
+recorded (see `recordRemoteReadFailure`), and each is a miss. The read is bounded
+(`remoteReadLimits`), and none is sent once the build has stopped reading the remote cache
+(`remoteReadsStopped`).
 -/
 public def readRemoteOutputs?
   (inputHash : Hash) (pkg : Package) (target : String) (srcHash? : Option Hash)
@@ -71,14 +120,17 @@ public def readRemoteOutputs?
   let ws ← getWorkspace
   let some serviceName := ws.lakeEnv.remoteCache?
     | return none
+  if ← remoteReadsStopped then
+    return none
   try
     let service ← match ws.lakeConfig.findRemoteCacheService? serviceName with
       | .ok service => pure service
       | .error e => error e
     let scope := remoteCacheScope ws.lakeEnv.leanGithash pkg.cacheScope
     let url := service.remoteMappingUrl scope inputHash
-    let contents? ← getUrl? url (cacheToken := service.sendsCacheToken url)
-      (maxFileSize? := some remoteCacheMaxFileSize)
+    let contents? ← timeRemoteRead <| liftM <|
+      getUrl? url (cacheToken := service.sendsCacheToken url)
+        (maxFileSize? := some remoteMappingMaxFileSize) (limits := remoteReadLimits)
     let some contents := contents?
       | logVerbose s!"remote cache mapping miss for input `{inputHash}` at {url}"
         return none

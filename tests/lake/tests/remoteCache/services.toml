@@ -113,6 +113,20 @@ type = "s3"
 artifactEndpoint = "%URL%/stallput/a0"
 revisionEndpoint = "%URL%/stallput/r0"
 
+# The first upload of each artifact and each mapping is answered 503, as a busy server answers
+[[cache.service]]
+name = "busyonce"
+type = "s3"
+artifactEndpoint = "%URL%/busyonce/a0"
+revisionEndpoint = "%URL%/busyonce/r0"
+
+# Each request is read and gets no answer for 15 minutes
+[[cache.service]]
+name = "silent"
+type = "s3"
+artifactEndpoint = "%URL%/silent/a0"
+revisionEndpoint = "%URL%/silent/r0"
+
 # As `ok`, but every upload of an artifact or a mapping takes 4 seconds (a claim's does not),
 # so that a detached push outlives the build that started it
 [[cache.service]]

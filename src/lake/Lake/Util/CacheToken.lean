@@ -7,6 +7,7 @@ module
 
 prelude
 public import Lake.Util.Log
+import Lake.Util.IO
 import Std.Sync.Mutex
 import Init.Data.String.TakeDrop
 
@@ -75,15 +76,6 @@ Such a token has no quote, backslash, or whitespace, so it is safe in a `curl` c
 -/
 def isTokenChar (c : Char) : Bool :=
   c.isAlphanum || c matches '-' | '.' | '_' | '~' | '+' | '/' | '='
-
-/-- Waits until `task` has finished or the monotonic clock reaches `deadline` (in milliseconds). -/
-partial def waitUntil (task : Task α) (deadline : Nat) : BaseIO Bool := do
-  if ← IO.hasFinished task then
-    return true
-  if (← IO.monoMsNow) ≥ deadline then
-    return false
-  IO.sleep 20
-  waitUntil task deadline
 
 /-- Why a run of the token command gave no token. -/
 inductive RunError
