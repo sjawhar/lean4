@@ -137,11 +137,18 @@ public structure KernelProviders where
 public structure RemoteReadStatus where
   failures : Nat := 0
   lastError : String := ""
+  /--
+  How many reads of the shared remote cache in a row failed after waiting for a remote that did
+  not answer (see `noteRemoteRead`).
+  -/
+  timeoutsInRow : Nat := 0
+  /-- Why this build stopped reading the shared remote cache, once it has (see `noteRemoteRead`). -/
+  stopped? : Option String := none
   deriving Inhabited
 
 /-- Add one read-through failure to a build's remote status. -/
 public def RemoteReadStatus.add (message : String) (status : RemoteReadStatus) : RemoteReadStatus :=
-  {failures := status.failures + 1, lastError := message}
+  {status with failures := status.failures + 1, lastError := message}
 
 
 /-- A Lake context with a build configuration and additional build data. -/
