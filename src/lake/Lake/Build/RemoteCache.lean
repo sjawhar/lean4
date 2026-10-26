@@ -11,6 +11,7 @@ public import Lake.Config.Monad
 import Lake.Config.PushQueue
 import Lake.Config.RemoteCache
 import Lake.Util.Url
+import Lake.Util.ReadBroker
 
 /-! # Shared Remote Cache in Builds
 
@@ -129,8 +130,8 @@ public def readRemoteOutputs?
     let scope := remoteCacheScope ws.lakeEnv.leanGithash pkg.cacheScope
     let url := service.remoteMappingUrl scope inputHash
     let contents? ← timeRemoteRead <| liftM <|
-      getUrl? url (cacheToken := service.sendsCacheToken url)
-        (maxFileSize? := some remoteMappingMaxFileSize) (limits := remoteReadLimits)
+      ReadBroker.getUrl? url (← getLakeCache).dir (cacheToken := service.sendsCacheToken url)
+        remoteMappingMaxFileSize remoteReadLimits
     let some contents := contents?
       | logVerbose s!"remote cache mapping miss for input `{inputHash}` at {url}"
         return none

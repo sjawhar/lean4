@@ -12,6 +12,37 @@ source ../common.sh
 
 source ../remoteCache/lib.sh
 
+# A library of 16 modules, none of which imports another, so that a build of it reads all their
+# mappings (and then their artifacts) at once
+mkdir -p Many
+many_roots=()
+for i in $(seq 1 16); do
+  echo "def m$i := $i" > "Many/M$i.lean"
+  many_roots+=("\"Many.M$i\"")
+done
+cat >> lakefile.toml << EOF
+
+[[lean_lib]]
+name = "Many"
+roots = [$(IFS=,; echo "${many_roots[*]}")]
+EOF
+# A \`curl\` that records how many transfers each of its runs carries (the \`url =\` lines of the
+# configuration file it is given), one line per run
+cat > count-curl.sh << EOF
+#!/usr/bin/env bash
+urls=0
+prev=
+for arg in "\$@"; do
+  if [ "\$prev" = --config ] && [ -f "\$arg" ]; then
+    urls=\$(grep -c '^url = ' "\$arg")
+  fi
+  prev=\$arg
+done
+echo "\$urls" >> '$WORK_DIR/curl-runs'
+exec '$(type -P curl)' "\$@"
+EOF
+chmod +x count-curl.sh
+
 # Build the package once, into the cache of the machine that uploads
 LAKE_CACHE_DIR="$BUILD_CACHE_DIR" test_run build Test native -o remote-outputs.jsonl
 # A remote restore replaces its trace with a synthetic one, so the seeder keeps
@@ -196,6 +227,37 @@ assert status["failures"] >= 3, status
 ' "$CACHE_DIR/remote-status-read.json"
 }
 
+case_read_shared_runs() {
+  # The reads of the jobs that run at the same time go in shared `curl` runs: the 16 modules of
+  # `Many`, which import nothing, restore with their 32 reads (a mapping and an artifact each) in
+  # fewer `curl` runs than reads, and at least one run carries several of them. One `curl`
+  # process per read would be 32 runs of one transfer, each with a connection of its own. The
+  # remote answers each read after 2 s, so the build also shows that a run's transfers go at once
+  # and not one after another.
+  local start elapsed runs most
+  LAKE_CACHE_DIR="$BUILD_CACHE_DIR" test_run build Many -o many-outputs.jsonl
+  test_cmd rm -rf many-build
+  test_cmd cp -r .lake/build many-build
+  "$PYTHON" "$TEST_DIR/seed_remote.py" --store "$STORE_DIR/a0" --scope "$(remote_scope)" \
+    --outputs many-outputs.jsonl --cache "$BUILD_CACHE_DIR" --build many-build
+  fresh
+  : > "$SERVER_LOG"
+  rm -f "$WORK_DIR/curl-runs"
+  start="$(date +%s)"
+  LEAN_NUM_THREADS=16 CURL="$WORK_DIR/count-curl.sh" LAKE_REMOTE_CACHE=slow \
+    test_not_out 'Built ' build Many
+  elapsed=$(($(date +%s) - start))
+  runs="$(grep -c . "$WORK_DIR/curl-runs")"
+  most="$(sort -n "$WORK_DIR/curl-runs" | tail -1)"
+  echo "the restore took $elapsed seconds in $runs curl runs for 32 reads;" \
+    "the largest run carried $most"
+  test_cmd_eq 16 count_path /in/ "$SERVER_LOG"
+  test_cmd_eq 16 count_path /a/ "$SERVER_LOG"
+  test_exp "$most" -ge 2
+  test_exp "$runs" -lt 32
+  test_exp "$elapsed" -lt 60
+}
+
 run_cases case_read_through case_read_404 case_read_invalid_mapping case_read_bad_artifact \
   case_read_bad_descriptor case_read_transport case_read_status case_read_artifact_status \
-  case_read_status_persistence case_read_silent
+  case_read_status_persistence case_read_silent case_read_shared_runs
