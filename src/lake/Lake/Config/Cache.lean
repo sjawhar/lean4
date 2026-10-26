@@ -591,14 +591,15 @@ public def downloadArtifactCore
 Downloads the artifact of the shared remote cache with the content hash `hash` and the SHA-256
 digest `sha256` from `url` to `path`, through the read broker (see `ReadBroker.download`), which
 it replaces only with bytes of that digest and hash. A download larger than
-`remoteCacheMaxFileSize` fails, and the download gives up and tries again as `limits` says.
+`remoteCacheMaxFileSize` fails, and the download gives up and tries again as `limits` says. Adds
+the time its transfers took to `transferMs`.
 -/
 public def downloadRemoteArtifact
   (hash : Hash) (sha256 : Sha256) (url : String) (path : FilePath) (cacheToken : Bool)
-  (limits : TransferLimits)
+  (limits : TransferLimits) (transferMs : IO.Ref Nat)
 : LogIO Unit :=
   ReadBroker.download url path cacheToken remoteCacheMaxFileSize limits
-    (check := checkArtifactDownload hash (some sha256) path)
+    (check := checkArtifactDownload hash (some sha256) path) (transferMs := transferMs)
 
 /--
 Uploads a file to an online bucket using the Amazon S3 protocol. The upload gives up when it

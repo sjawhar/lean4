@@ -596,7 +596,7 @@ public def claimInput (pkg : Package) (inputHash : Hash) (sawDone := false) : Jo
     -- compiles out instead of racing for them (the first to ask would take nearly all of them:
     -- the others only reach an input once they have what it is built from, which they get from
     -- the build that is ahead). It is taken when that build has not claimed it for `deferSecs`.
-    let mut lapsed? : Option String := none
+    let mut lapsed? : Option (String × Nat) := none
     if deferSecs > 0 then
       if let some owner ← inputOwner? inputHash then
         if owner != holder then
@@ -605,13 +605,13 @@ public def claimInput (pkg : Package) (inputHash : Hash) (sawDone := false) : Jo
             logVerbose s!"leaving the input {inputHash} to the build {owner} \
               ({deferredSecs} s of {deferSecs} s)"
             return .wait (← ClaimWait.after remoteClaimDeferPollMs false)
-          logVerbose s!"taking the input {inputHash}, which the build {owner} \
-            left unclaimed for {deferredSecs} s"
-          lapsed? := some owner
+          lapsed? := some (owner, deferredSecs)
     if let some claim ← takeClaim service url holder "0" takeoverSecs then
       -- The owner never claimed the input: it has stopped, or it does not build these targets,
       -- so it gets no more inputs, and each of them costs no wait, until it is seen again
-      if let some owner := lapsed? then
+      if let some (owner, deferredSecs) := lapsed? then
+        logVerbose s!"taking the input {inputHash}, which the build {owner} \
+          left unclaimed for {deferredSecs} s"
         forgetHolder owner
         logVerbose s!"leaving no more inputs to the build {owner} until it is seen building"
       return .compile (some claim)
