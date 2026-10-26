@@ -210,6 +210,15 @@ build when to look (see `Lake.Build.Claim`).
 public def remoteClaimDeferPollMs : Nat := 1000
 
 /--
+How long a build must see a claim unchanged, by its own clock, before it takes the claim over
+because its holder is a process of this host that no longer runs: 5 seconds. A build that ends
+normally leaves its last claims `building` until its push, which outlives it, stages those
+entries and writes `queued` with its own process ID; that write gives the claim a new
+generation, so a waiter's sighting starts again (see `Lake.Build.Claim`).
+-/
+public def remoteClaimGoneGraceSecs : Nat := 5
+
+/--
 How often the holder of a claim rewrites it while it compiles, in seconds: every 60 seconds, or a
 quarter of the takeover time (`LAKE_CLAIM_TAKEOVER_SECS`) if that is shorter, so that a claim
 whose holder still compiles never looks stale.

@@ -120,11 +120,13 @@ public structure Env where
   -/
   claimDeferSecs : Nat := 15
   /--
-  How many compiles of inputs a build that takes claims runs at once before it claims the next
-  input and waits for other builds (i.e., `LAKE_CLAIM_SLOTS`, unless set: the build's worker
-  threads, `LEAN_NUM_THREADS` or the machine's cores; 0 claims every input). A build with a
-  free slot compiles at once: waiting for another build only saves this build time when it has
-  no capacity to compile, and every claim request and every wait lies on the build's path (see
+  How many compiles of inputs must already run before a build that takes claims claims the next
+  input and waits for other builds (i.e., `LAKE_CLAIM_SLOTS`, unless set: one less than the
+  build's worker threads, `LEAN_NUM_THREADS` or the machine's cores; 0 claims every input). The
+  job that asks runs on a worker thread itself, so with `n` workers at most `n - 1` compiles run
+  beside it: the default claims exactly when every other worker compiles. A build with a worker
+  free compiles at once: waiting for another build only saves this build time when it has no
+  capacity to compile, and every claim request and every wait lies on the build's path (see
   `Lake.Build.Claim`). Lake does not add it to `baseVars`.
   -/
   claimSlots : Nat := 0
@@ -291,19 +293,23 @@ where
   badTakeover (secs : String) : String :=
     s!"'LAKE_CLAIM_TAKEOVER_SECS' must be a positive number of seconds, got '{secs}'"
   computeClaimDeferSecs := do
-    let some secs ← IO.getEnv "LAKE_CLAIM_DEFER_SECS"
+    let some secs := (← IO.getEnv "LAKE_CLAIM_DEFER_SECS").filter (!·.trimAscii.isEmpty)
       | return 15
     match secs.trimAscii.copy.toNat? with
     | some n => return n
     | none => throw s!"'LAKE_CLAIM_DEFER_SECS' must be a number of seconds, got '{secs}'"
   computeClaimSlots := do
-    -- The build's worker threads, as the runtime counts them (`LEAN_NUM_THREADS`, else the cores)
-    let workers := do
-      if let some n := (← IO.getEnv "LEAN_NUM_THREADS").bind (·.trimAscii.copy.toNat?) then
-        if n > 0 then return n
-      return (System.Platform.Internal.getHardwareConcurrency ()).toNat
-    let some slots ← IO.getEnv "LAKE_CLAIM_SLOTS"
-      | workers
+    -- The build's worker threads as the runtime counts them, less the one that runs the job that
+    -- asks. The runtime reads `LEAN_NUM_THREADS` with C's `atoi` (its leading digits; 0 workers,
+    -- so tasks run one at a time, when it has none), else takes the cores.
+    let others := do
+      if let some n ← IO.getEnv "LEAN_NUM_THREADS" then
+        let workers := (n.trimAscii.copy.foldl (init := (0, true)) fun (w, digits) c =>
+          if digits && c.isDigit then (w * 10 + (c.toNat - '0'.toNat), true) else (w, false)).1
+        return workers - 1
+      return (System.Platform.Internal.getHardwareConcurrency ()).toNat - 1
+    let some slots := (← IO.getEnv "LAKE_CLAIM_SLOTS").filter (!·.trimAscii.isEmpty)
+      | others
     match slots.trimAscii.copy.toNat? with
     | some n => return n
     | none => throw s!"'LAKE_CLAIM_SLOTS' must be a number of compiles, got '{slots}'"
