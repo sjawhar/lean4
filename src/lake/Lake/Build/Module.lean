@@ -33,27 +33,6 @@ It is opt-in via `compiler.postponeCompile` and only meaningful under the module
   Compiler.compiler.postponeCompile.get self.leanOptions.toOptions
 
 /--
-One snapshot of the build store (a single `ST.Ref.get`). A lookup-only pass over many memoized
-facets reads it instead of the shared cell, since each `get` of a multi-threaded ref is two atomic
-exchanges on that cell. The transitive import walk's facets are already in the store: a module's
-imports are built before it.
--/
-@[inline] def getBuildStoreSnapshot : FetchM BuildStore :=
-  .ofFn fun _ _ _ store _ log => return .ok (← store.get) log
-
-/-- The job memoized for `info` in the snapshot `s`, if any. -/
-@[inline] def BuildStore.getInfo?
-  (s : BuildStore) (info : BuildInfo) [t : FamilyOut BuildData info.key α]
-: Option (Job α) :=
-  cast (by rw [t.fam_eq]) (s.get? info.key)
-
-/-- `info.fetch`, served from the snapshot `s` if already memoized there. -/
-@[inline] def fetchFrom
-  (s : BuildStore) (info : BuildInfo) [FamilyOut BuildData info.key α]
-: FetchM (Job α) := do
-  if let some job := s.getInfo? info then return job else info.fetch
-
-/--
 Fetches the information importers of the module need, including its IR.
 
 Importers need the IR because the language server imports at the `.server` level, where every
@@ -791,7 +770,11 @@ def Module.recFetchSetup (mod : Module) : FetchM (Job ModuleSetup) := ensureJob 
 public def Module.setupFacetConfig : ModuleFacetConfig setupFacet :=
   mkFacetJobConfig (buildable := false) recFetchSetup
 
-/-- Remove all existing artifacts produced by a Lean build of the module. -/
+/--
+Remove all existing artifacts produced by a Lean build of the module. Lake owns the usage-cutoff sidecar paths
+(`.usage`, `.resolved`, `.usekey`) and removes them also with the cutoff off, so that a rebuild never leaves an earlier
+build's sidecars beside its outputs, or saves them to the cache with them (`cacheUsageSidecars`).
+-/
 public def Module.clearOutputArtifacts (mod : Module) : IO PUnit := do
   try
     removeFileIfExists mod.ltarFile
@@ -804,6 +787,7 @@ public def Module.clearOutputArtifacts (mod : Module) : IO PUnit := do
     removeFileIfExists mod.cFile
     removeFileIfExists mod.bcFile
     removeFileIfExists mod.usageFile
+    removeFileIfExists mod.resolvedFile
     removeFileIfExists mod.usekeyFile
   catch e =>
     error s!"failed to remove output artifacts: {e}"
@@ -818,7 +802,8 @@ public def Module.clearIROutputArtifacts (mod : Module) : IO PUnit := do
   catch e =>
     error s!"failed to remove IR output artifacts: {e}"
 
-/-- Remove any cached file hashes of the module build outputs (in `.hash` files). -/
+/-- Remove any cached file hashes of the module build outputs (in `.hash` files), the usage-cutoff sidecars' also with
+the cutoff off (`clearOutputArtifacts`). -/
 public def Module.clearOutputHashes (mod : Module) : IO PUnit := do
   try
     clearFileHash mod.ltarFile
@@ -831,6 +816,7 @@ public def Module.clearOutputHashes (mod : Module) : IO PUnit := do
     clearFileHash mod.cFile
     clearFileHash mod.bcFile
     clearFileHash mod.usageFile
+    clearFileHash mod.resolvedFile
     clearFileHash mod.usekeyFile
   catch e =>
     error s!"failed to remove output hashes: {e}"
@@ -865,20 +851,21 @@ public def Module.cacheOutputHashes (mod : Module) : IO PUnit := do
 /--
 Resolves module outputs' usage-cutoff sidecars. A sidecar the entry names that does not resolve
 (e.g., pruned from the cache) fails, so the entry is a miss: the module rebuilds and writes its
-sidecars again, and its dependents, which use its `.usage` only with its `.usekey` (`importUsage?`),
-keep skipping.
+sidecars again, and its dependents, which read only its `.usekey` and accept it only for its `.olean`
+(`importUsage?`), keep skipping.
 -/
 def ModuleOutputDescrs.resolveSidecars
   (descrs : ModuleOutputDescrs) (service? : Option CacheServiceName) (scope? : Option CacheServiceScope)
-: JobM (Option Artifact × Option Artifact) := do
+: JobM (Option Artifact × Option Artifact × Option Artifact) := do
   let usage? ← descrs.usage?.mapM (resolveArtifact · service? scope?)
+  let resolved? ← descrs.resolved?.mapM (resolveArtifact · service? scope?)
   let usekey? ← descrs.usekey?.mapM (resolveArtifact · service? scope?)
-  return (usage?, usekey?)
+  return (usage?, resolved?, usekey?)
 
 def ModuleOutputDescrs.resolve
   (descrs : ModuleOutputDescrs) (service? : Option CacheServiceName) (scope? : Option CacheServiceScope)
 : JobM ModuleOutputArtifacts := do
-  let (usage?, usekey?) ← descrs.resolveSidecars service? scope?
+  let (usage?, resolved?, usekey?) ← descrs.resolveSidecars service? scope?
   let arts : ModuleOutputArtifacts := {
     isModule := descrs.isModule
     olean := ← resolve descrs.olean
@@ -889,7 +876,7 @@ def ModuleOutputDescrs.resolve
     ilean := ← resolve descrs.ilean
     c? := ← descrs.c?.mapM resolve
     ltar? := ← descrs.ltar?.mapM resolve
-    usage?, usekey?
+    usage?, resolved?, usekey?
     keptFrom? := descrs.keptFrom?
   }
   if Lean.Internal.hasLLVMBackend () then
@@ -910,7 +897,7 @@ instance : ResolveOutputs ModuleOutputArtifacts := ⟨resolveModuleOutputArtifac
 
 inductive ModuleOutputs
 /-- Only the archive, and the entry's sidecars, which the archive does not include. -/
-| ltar (art : Artifact) (usage? usekey? : Option Artifact)
+| ltar (art : Artifact) (usage? resolved? usekey? : Option Artifact)
 | arts (arts : ModuleOutputArtifacts)
 
 instance : Coe ModuleOutputArtifacts ModuleOutputs := ⟨.arts⟩
@@ -929,7 +916,7 @@ def resolveModuleOutputs (out : CacheOutput) : JobM ModuleOutputs := do
   if let some descr := archive? then
     match ArtifactDescr.ofFilePath? descr with
     | .ok descr =>
-      return .ltar (← resolveArtifact descr out.service? out.scope?) none none
+      return .ltar (← resolveArtifact descr out.service? out.scope?) none none none
     | .error e =>
       error s!"ill-formed module archive output:\n{out.data.render.pretty 80 2}\n{e}"
   else
@@ -940,8 +927,8 @@ def resolveModuleOutputs (out : CacheOutput) : JobM ModuleOutputs := do
           descrs.resolve out.service? out.scope?
         catch e =>
           dropLogFrom e
-          let (usage?, usekey?) ← descrs.resolveSidecars out.service? out.scope?
-          return .ltar (← resolveArtifact descr out.service? out.scope?) usage? usekey?
+          let (usage?, resolved?, usekey?) ← descrs.resolveSidecars out.service? out.scope?
+          return .ltar (← resolveArtifact descr out.service? out.scope?) usage? resolved? usekey?
       else
         descrs.resolve out.service? out.scope?
     | .error e => error s!"ill-formed module outputs:\n{out.data.render.pretty 80 2}\n{e}"
@@ -949,12 +936,14 @@ def resolveModuleOutputs (out : CacheOutput) : JobM ModuleOutputs := do
 instance : ResolveOutputs ModuleOutputs := ⟨resolveModuleOutputs⟩
 
 /--
-Saves the module's usage-cutoff sidecars (`.usage`, `.usekey`), where they exist, to the local Lake cache as they
-are: no trace describes them, but the `.usekey` binds the `.usage` (its digest) and the `.olean` (its hash), and Lake
-checks both wherever it reads them.
+Saves the module's usage-cutoff sidecars (`.usage`, `.resolved`, `.usekey`), where they exist, to the local Lake cache
+as they are: no trace describes them, but the `.usekey` binds the `.usage` (its digest), which binds the `.resolved`
+(its digest), and the `.olean` (its hash), and Lake checks each wherever it reads them.
 -/
-def Module.cacheUsageSidecars (mod : Module) (useLocalFile : Bool) : JobM (Option Artifact × Option Artifact) :=
-  return (← cacheIfExists mod.usageFile "usage", ← cacheIfExists mod.usekeyFile "usekey")
+def Module.cacheUsageSidecars (mod : Module) (useLocalFile : Bool) :
+    JobM (Option Artifact × Option Artifact × Option Artifact) :=
+  return (← cacheIfExists mod.usageFile "usage", ← cacheIfExists mod.resolvedFile "resolved",
+    ← cacheIfExists mod.usekeyFile "usekey")
 where
   cacheIfExists file ext : JobM (Option Artifact) := do
     if (← file.pathExists) then
@@ -966,7 +955,7 @@ where
 def Module.cacheOutputArtifacts
   (mod : Module)  (isModule : Bool) (useLocalFile : Bool) (postponesCompile : Bool)
 : JobM ModuleOutputArtifacts := do
-  let (usage?, usekey?) ← mod.cacheUsageSidecars useLocalFile
+  let (usage?, resolved?, usekey?) ← mod.cacheUsageSidecars useLocalFile
   return {
     isModule
     olean := ← cache mod.oleanFile "olean"
@@ -978,7 +967,7 @@ def Module.cacheOutputArtifacts
     c? := ← cacheIf? (!(isModule && postponesCompile)) mod.cFile "c"
     bc? := ← cacheIf? (Lean.Internal.hasLLVMBackend ()) mod.bcFile "bc"
     ltar? := ← cacheIf? (← mod.ltarFile.pathExists) mod.ltarFile "ltar"
-    usage?, usekey?
+    usage?, resolved?, usekey?
   }
 where
   @[inline] cache file ext := do
@@ -1014,7 +1003,7 @@ def Module.recacheOutputArtifacts?
     | none =>
       removeFileIfExists mod.ltarFile
       return some none
-  let (usage?, usekey?) ← mod.cacheUsageSidecars useLocalFile
+  let (usage?, resolved?, usekey?) ← mod.cacheUsageSidecars useLocalFile
   let arts? : Option ModuleOutputArtifacts := do
     return {
       isModule
@@ -1027,7 +1016,7 @@ def Module.recacheOutputArtifacts?
       c? := ← c?
       bc? := ← bc?
       ltar? := ← ltar?
-      usage?, usekey?
+      usage?, resolved?, usekey?
       keptFrom? := descrs.keptFrom?
     }
   return arts?
@@ -1064,6 +1053,7 @@ def Module.restoreAllArtifacts (mod : Module) (cached : ModuleOutputArtifacts) :
     bc? := ← restoreSome mod.bcFile cached.bc?
     ltar? := ← restoreSome mod.ltarFile cached.ltar?
     usage? := ← restoreSome mod.usageFile cached.usage?
+    resolved? := ← restoreSome mod.resolvedFile cached.resolved?
     usekey? := ← restoreSome mod.usekeyFile cached.usekey?
   }
 where
@@ -1192,11 +1182,13 @@ def Module.verifiedLocalLtar? (mod : Module) : JobM (Option Artifact) := do
   return none
 
 def Module.computeArtifacts
-  (mod : Module) (isModule : Bool) (skipIR : Bool)
+  (mod : Module) (isModule : Bool) (skipIR : Bool) (oleanHash? : Option Hash := none)
 : FetchM ModuleOutputArtifacts :=
   return {
     isModule
-    olean := ← compute mod.oleanFile "olean"
+    olean := ← match oleanHash? with
+      | some hash => computeArtifactOfHash mod.oleanFile hash "olean"
+      | none => compute mod.oleanFile "olean"
     oleanServer? := ← computeIf isModule mod.oleanServerFile "olean.server"
     oleanPrivate? := ← computeIf isModule mod.oleanPrivateFile "olean.private"
     ilean := ← compute mod.ileanFile "ilean"
@@ -1388,9 +1380,13 @@ def Module.buildLean
   compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile outputPaths args
     (← getLeanPath) (← getLean)
   mod.checkSourceUnchanged presetup
-  let arts ← mod.computeArtifacts setup.isModule presetup.postponeCompile
+  -- With usage cutoff, one read of the `.olean` gives both the artifact's hash and the `.usekey`'s: the bytes the
+  -- outputs record are the bytes the key binds.
+  let olean? ← if usage then some <$> IO.FS.readBinFile mod.oleanFile else pure none
+  let arts ← mod.computeArtifacts setup.isModule presetup.postponeCompile (olean?.map Hash.ofByteArray)
   if let some (modsysBefore, untrustedBefore?) := before? then
     mod.writeUsekey presetup setup.importArts modsysBefore untrustedBefore?
+      (olean?.map ModuleUsage.fileDigestOfBytes)
   return arts
 
 /--
@@ -1483,7 +1479,7 @@ where
     let some ltarOrArts ← getArtifacts? inputHash savedTrace mod.pkg
       | return .incomplete savedTrace none
     match (ltarOrArts : ModuleOutputs) with
-    | .ltar ltar usage? usekey? =>
+    | .ltar ltar usage? resolved? usekey? =>
       updateAction .unpack
       -- The archive's outputs, and its trace, replace the module's: the `.hash` files of the old
       -- outputs go too, or they would describe the new ones (`fetchFileHash` trusts them)
@@ -1494,6 +1490,7 @@ where
       -- The archive ships no sidecars, so the entry's go to the build directory, from which the entry
       -- below is rewritten.
       if let some art := usage? then discard <| restoreArtifact mod.usageFile art
+      if let some art := resolved? then discard <| restoreArtifact mod.resolvedFile art
       if let some art := usekey? then discard <| restoreArtifact mod.usekeyFile art
       -- Note: This branch implies that only the ltar output is (validly) cached.
       -- Thus, we use only the new trace unpacked from the ltar to resolve further artifacts.
@@ -1528,7 +1525,8 @@ where
         mod.clearOutputArtifacts
         -- The sidecars stay out of the trace, which `.ltar` archives include: a `.usekey` records
         -- an input hash, and an archive depends only on outputs.
-        writeFetchTrace mod.traceFile inputHash (toJson {arts.descrs with usage? := none, usekey? := none})
+        writeFetchTrace mod.traceFile inputHash
+          (toJson {arts.descrs with usage? := none, resolved? := none, usekey? := none})
           (some presetup.localTrace.hash)
       let arts ←
         if restoreAll then
@@ -1721,7 +1719,9 @@ where
   the previous trace, so it is removed. Its usage key is marked kept (`UsekeySidecar.kept`) before
   the outputs are saved: the `.usage` describes its constants as Lean compiled them, and a constant
   they mention may mean something new now, so its importers, here or after a restore from the cache,
-  must not trust its digests (`importUsage?`). A key that cannot be read is removed instead.
+  must not trust its digests (`importUsage?`). The marked key replaces the file whole
+  (`ModuleUsage.writeFileReplacing`), as every sidecar write does: a reader in another workspace must
+  never see a sidecar mid-write. A key that cannot be read is removed instead.
   -/
   acceptKept (presetup : ModulePreSetup) (setup : ModuleSetup) (data : BuildMetadata)
     (descrs : ModuleOutputDescrs) (cacheWith? : Option Bool)
@@ -1738,7 +1738,7 @@ where
     clearFileHash mod.usekeyFile
     if let .ok contents := key? then
       if let .ok key@(.obj _) := Json.parse contents then
-        IO.FS.writeFile mod.usekeyFile (key.setObjVal! "kept" true).compress
+        ModuleUsage.writeFileReplacing mod.usekeyFile (key.setObjVal! "kept" true).compress.toUTF8
     match (← mod.keepOutputs? presetup.isModule presetup.postponeCompile (some descrs) cacheWith?) with
     | none =>
       mod.clearOutputHashes

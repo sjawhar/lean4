@@ -1,0 +1,16 @@
+ext4 nsec=0: 49ms false 51ms false 1999ms false 2001ms true
+ext4 nsec=123456789: 49ms false 51ms true 1999ms true 2001ms true
+xfs nsec=0: 49ms false 51ms false 1999ms false 2001ms true
+xfs nsec=123456789: 49ms false 51ms true 1999ms true 2001ms true
+btrfs nsec=0: 49ms false 51ms false 1999ms false 2001ms true
+btrfs nsec=123456789: 49ms false 51ms true 1999ms true 2001ms true
+tmpfs nsec=0: 49ms false 51ms false 1999ms false 2001ms true
+tmpfs nsec=123456789: 49ms false 51ms true 1999ms true 2001ms true
+nfs: 51ms false 2001ms true
+overlayfs: 51ms false 2001ms true
+fuse: 51ms false 2001ms true
+statfs failed, ext4 type: 51ms false 2001ms true
+ext4, ctime in the future: false
+ext4, 41.7ms tick: 51ms false 166ms false 167ms true
+ext4, tick unknown: 51ms false 2001ms true
+ext4, huge tick: 2001ms false 8001ms true

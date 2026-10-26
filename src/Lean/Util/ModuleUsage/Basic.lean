@@ -32,6 +32,10 @@ a file it checks for usage cutoff is the one it recorded. -/
 @[extern "lean_usage_file_digest"]
 opaque fileDigest (path : @& System.FilePath) : IO Digest
 
+/-- `fileDigest` of a file whose bytes are `bytes`. -/
+@[extern "lean_usage_file_bytes_digest"]
+opaque fileDigestOfBytes (bytes : @& ByteArray) : Digest
+
 /-- What a file system records of a file, besides its bytes, that every write to it, truncation of it or replacement
 of its path changes: its device and inode, its size, and its modification and status-change times in seconds and
 nanoseconds. -/
@@ -50,22 +54,46 @@ structure FileStamp where
 opaque fileStamp (path : @& System.FilePath) : IO (Option FileStamp)
 
 /-- `fileDigest`, with the stamp of the file the bytes were read from if it stands for them: the open file's stamp
-was the same before and after the read, and its status-change time lay more than two seconds in the past (longer
-than any file system's timestamp granularity), so that any later change to the file shows in its stamp. `none` if
-not (or on Windows). -/
+was the same before and after the read, and its status-change time lay far enough before the read began
+(`stampSettled`, against the realtime clock read before the first `fstat`) that any later change to the file shows in
+its stamp. `none` if not (or on Windows). -/
 @[extern "lean_usage_file_digest_stamped"]
 opaque fileDigestStamped (path : @& System.FilePath) : IO (Digest × Option FileStamp)
+
+/-- Whether a stamp whose status-change time has nanosecond field `ctimeNsec` and lay `ageNs` nanoseconds before its
+read began stands for the file's bytes, on a file system whose `statfs` type is `fsType` (`statfsOk`: `statfs`
+succeeded) and whose timestamp clock advances every `tickNs` nanoseconds (not positive: unknown): more than
+`max 50 ms (4 * tickNs)` on ext4, XFS, Btrfs and tmpfs with a nonzero `ctimeNsec` and a known tick, more than 2 s
+otherwise (`src/library/usage_digest.cpp`, `stamp_settled`). -/
+@[extern "lean_usage_stamp_settled"]
+opaque stampSettled (statfsOk : Bool) (fsType ctimeNsec : UInt64) (tickNs ageNs : Int64) : Bool
+
+/-- Writes `bytes` to `path` as a new file renamed over it, never changing the file at `path` in place: a stamp
+(`fileDigestStamped`) cannot tell a file being rewritten in place, whose write stalls mid-copy, from one at rest. -/
+def writeFileReplacing (path : System.FilePath) (bytes : ByteArray) : IO Unit := do
+  let tmp := path.addExtension s!"tmp.{← IO.Process.getPID}"
+  IO.FS.writeBinFile tmp bytes
+  IO.FS.rename tmp path
 
 /-- The file's bytes, with the stamp of the file they were read from if it stands for them, as for
 `fileDigestStamped`. -/
 @[extern "lean_usage_read_file_stamped"]
 opaque readFileStamped (path : @& System.FilePath) : IO (ByteArray × Option FileStamp)
 
-private def hex16 (v : UInt64) : String :=
-  let s := String.ofList (Nat.toDigits 16 v.toNat); "".pushn '0' (16 - s.length) ++ s
+/-- `acc` followed by `v` as 16 lowercase hex digits, most significant first. Shifts a `UInt64` rather than converting
+it to a `Nat`, which goes through big-number division at 2^63 and above. -/
+private def hex16 (acc : String) (v : UInt64) : String := Id.run do
+  let mut s := acc
+  for i in [0:16] do
+    let d := ((v >>> (4 * (15 - i)).toUInt64) &&& 0xf).toUInt8
+    s := s.push (Char.ofUInt8 (if d < 10 then '0'.toUInt8 + d else 'a'.toUInt8 - 10 + d))
+  return s
+
+/-- `acc` followed by `d.hex`. -/
+def Digest.hexInto (acc : String) (d : Digest) : String := hex16 (hex16 acc d.hi) d.lo
 
 /-- 32 lowercase hex digits. -/
-def Digest.hex (d : Digest) : String := hex16 d.hi ++ hex16 d.lo
+def Digest.hex (d : Digest) : String := d.hexInto ""
 
 /-- The order of `hex`, without building the strings. -/
 def Digest.lt (a b : Digest) : Bool := a.hi < b.hi || (a.hi == b.hi && a.lo < b.lo)
@@ -74,13 +102,14 @@ def Digest.lt (a b : Digest) : Bool := a.hi < b.hi || (a.hi == b.hi && a.lo < b.
 def Digest.ofHex? (s : String) : Option Digest := do
   let bs := s.toUTF8
   guard (bs.size == 32)
-  let v ← bs.foldlM (init := 0) fun (n : Nat) b =>
-    if '0'.toUInt8 ≤ b && b ≤ '9'.toUInt8 then
-      some (16 * n + (b.toNat - '0'.toNat))
-    else if 'a'.toUInt8 ≤ b && b ≤ 'f'.toUInt8 then
-      some (16 * n + (b.toNat - 'a'.toNat + 10))
+  let digit (b : UInt8) : Option UInt64 :=
+    if '0'.toUInt8 ≤ b && b ≤ '9'.toUInt8 then some (b - '0'.toUInt8).toUInt64
+    else if 'a'.toUInt8 ≤ b && b ≤ 'f'.toUInt8 then some (b - 'a'.toUInt8 + 10).toUInt64
     else none
-  return ⟨(v >>> 64).toUInt64, v.toUInt64⟩
+  -- Each half in a `UInt64`: a `Nat` fold would pass 2^64 and allocate a big number per digit.
+  let half (start : Nat) : Option UInt64 :=
+    bs.foldlM (start := start) (stop := start + 16) (init := 0) fun v b => (v <<< 4 ||| ·) <$> digit b
+  return ⟨← half 0, ← half 16⟩
 
 instance : ToJson Digest := ⟨fun d => .str d.hex⟩
 instance : FromJson Digest := ⟨fun j => do
@@ -101,14 +130,13 @@ def bool (e : Enc) (v : Bool) : Enc := e.u8 (if v then 1 else 0)
 def str (e : Enc) (s : String) : Enc := let b := s.toUTF8; ⟨(e.u64 b.size.toUInt64).buf ++ b⟩
 def nat (e : Enc) (n : Nat) : Enc := e.str (toString n)
 def digest (e : Enc) (d : Digest) : Enc := e.u64 d.hi |>.u64 d.lo
-/-- The component count, then each component root first, tagged string or number. -/
+/-- The component count, then each component root first, tagged string or number. A fold rather than a recursion on
+the prefix, whose base case would return the buffer it borrows and make the next push copy the whole buffer. -/
 def name (e : Enc) (n : Name) : Enc :=
-  go n (e.nat n.getNumParts)
-where
-  go : Name → Enc → Enc
-    | .anonymous, e => e
-    | .str p s, e => (go p e).u8 1 |>.str s
-    | .num p k, e => (go p e).u8 2 |>.nat k
+  n.components.foldl (init := e.nat n.getNumParts) fun e c => match c with
+    | .str _ s => e.u8 1 |>.str s
+    | .num _ k => e.u8 2 |>.nat k
+    | .anonymous => e
 def names (e : Enc) (ns : List Name) : Enc := ns.foldl name (e.nat ns.length)
 /-- `xs`'s size, then each element encoded by `f`. -/
 @[inline] def array {α : Type} (e : Enc) (xs : Array α) (f : Enc → α → Enc) : Enc := xs.foldl f (e.nat xs.size)
@@ -202,5 +230,24 @@ where
     | .anonymous, acc => acc
     | .str p s, acc => (go p acc).push (.str s)
     | .num p k, acc => (go p acc).push (.num k)
+
+/-- `acc` followed by `nameToJson n` as `Json.compress` prints it, without building the JSON value. -/
+def nameJsonInto (acc : String) (n : Name) : String :=
+  (go acc n).push ']'
+where
+  go (acc : String) : Name → String
+    | .anonymous => acc.push '['
+    | .str p s => Json.renderString s (sep (go acc p) p)
+    | .num p k => sep (go acc p) p ++ toString k
+  sep (acc : String) (p : Name) : String := if p.isAnonymous then acc else acc.push ','
+
+/-- `acc` followed by `toJson d` as `Json.compress` prints it. -/
+def digestJsonInto (acc : String) (d : Digest) : String := (d.hexInto (acc.push '"')).push '"'
+
+/-- `acc` followed by `xs` as `Json.compress` prints a JSON array, each element printed by `f`. -/
+@[inline] def arrayJsonInto {α : Type} (acc : String) (xs : Array α) (f : String → α → String) : String :=
+  let acc := acc.push '['
+  let acc := if h : 0 < xs.size then f acc xs[0] else acc
+  (xs.foldl (start := 1) (init := acc) fun acc x => f (acc.push ',') x).push ']'
 
 end Lean.ModuleUsage
