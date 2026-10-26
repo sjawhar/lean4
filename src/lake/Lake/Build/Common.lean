@@ -740,8 +740,8 @@ public def resolveArtifact
             \n  local path: {path}\
             \n  remote URL: {url}"
           try
-            timeRemoteRead <| liftM <| downloadRemoteArtifact descr.hash sha256 url path
-              (service.sendsCacheToken url) remoteReadLimits
+            timeRemoteRead fun transferMs => liftM <| downloadRemoteArtifact descr.hash sha256
+              url path (service.sendsCacheToken url) remoteReadLimits transferMs
           catch e =>
             error (← recordRemoteReadFailure (← takeLogFrom e) "remote artifact download failed")
         | none =>
