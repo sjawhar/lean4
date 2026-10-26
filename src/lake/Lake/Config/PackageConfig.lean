@@ -293,6 +293,9 @@ public configuration PackageConfig (p : Name) (n : Name) extends WorkspaceConfig
   artifacts into the build directory. This ensures the build results are available
   to external consumers who expect them in the build directory.
 
+  Lake restores some artifacts either way: shared libraries, whose names matter, and the
+  C files it compiles, whose names the compiler records in the object files.
+
   If `none` (the default), this will fallback to (in order):
   * The `LAKE_RESTORE_ARTIFACTS` environment variable (if set).
   * The workspace root's `restoreAllArtifacts` configuration (if set and this package is a dependency).

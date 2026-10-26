@@ -1421,6 +1421,7 @@ def Module.recBuildLeanCToOExport (self : Module) : FetchM (Job FilePath) := do
   let leancArgs := self.leancArgs ++ #["-DLEAN_EXPORTING"]
   let leanIncludeDir? ← self.pkg.getLeanIncludeDir?
   Internal.buildLeanO self.coExportFile (← self.c.fetch) self.weakLeancArgs leancArgs leanIncludeDir?
+    (srcName? := self.cFile)
 
 /-- The `ModuleFacetConfig` for the builtin `coExportFacet`. -/
 public def Module.coExportFacetConfig : ModuleFacetConfig coExportFacet :=
@@ -1436,6 +1437,7 @@ def Module.recBuildLeanCToONoExport (self : Module) : FetchM (Job FilePath) := d
   -- TODO: add option to pass a target triplet for cross compilation
   let leanIncludeDir? ← self.pkg.getLeanIncludeDir?
   Internal.buildLeanO self.coNoExportFile (← self.c.fetch) self.weakLeancArgs self.leancArgs leanIncludeDir?
+    (srcName? := self.cFile)
 
 /-- The `ModuleFacetConfig` for the builtin `coNoExportFacet`. -/
 public def Module.coNoExportFacetConfig : ModuleFacetConfig coNoExportFacet :=
