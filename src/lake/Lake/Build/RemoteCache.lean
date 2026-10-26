@@ -65,6 +65,17 @@ public def remoteReadsStopped : JobM Bool := do
   return (← (← getBuildContext).remoteReadStatus.get).stopped?.isSome
 
 /--
+Fails the current job as canceled if the build was canceled (`--fail-fast` after a failure).
+Lake checks a job between its steps (see `Job.bindM`), but a read of the shared remote cache
+gives this job's worker up and can take seconds, in which another job's failure can end the
+build: without this check, every job that was reading would still compile.
+-/
+public def cancelIfBuildCanceled : JobM Unit := do
+  if let some tk := (← getBuildContext).cancelTk? then
+    if ← tk.isSet then
+      Job.cancelJob
+
+/--
 Records how a read of the shared remote cache that started at the monotonic time `start` (in
 milliseconds) ended. A read that failed after waiting at least the stall time of
 `remoteReadLimits` (the remote did not answer) adds one to the build's reads in a row that did so;

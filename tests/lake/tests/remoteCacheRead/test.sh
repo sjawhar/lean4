@@ -26,6 +26,27 @@ cat >> lakefile.toml << EOF
 name = "Many"
 roots = [$(IFS=,; echo "${many_roots[*]}")]
 EOF
+# A library of 8 modules, none of which imports another, whose compile records when it starts and
+# ends in `$LAKE_TEST_BUSY_LOG`: a `+` line, a second of work, and a `-` line
+mkdir -p Busy
+busy_roots=()
+for i in $(seq 1 8); do
+  cat > "Busy/B$i.lean" << 'EOF'
+#eval show IO Unit from do
+  if let some log ← IO.getEnv "LAKE_TEST_BUSY_LOG" then
+    IO.FS.withFile log .append fun h => h.putStrLn "+"
+    IO.sleep 1000
+    IO.FS.withFile log .append fun h => h.putStrLn "-"
+EOF
+  echo "def b$i := $i" >> "Busy/B$i.lean"
+  busy_roots+=("\"Busy.B$i\"")
+done
+cat >> lakefile.toml << EOF
+
+[[lean_lib]]
+name = "Busy"
+roots = [$(IFS=,; echo "${busy_roots[*]}")]
+EOF
 # A \`curl\` that records how many transfers each of its runs carries (the \`url =\` lines of the
 # configuration file it is given), one line per run
 cat > count-curl.sh << EOF
@@ -258,6 +279,29 @@ case_read_shared_runs() {
   test_exp "$elapsed" -lt 60
 }
 
+case_read_compile_slots() {
+  # A read lets its job give up a worker, so many more jobs run at once than the pool has
+  # workers. What the build runs at once stays bounded all the same: with two workers and eight
+  # modules whose mappings are all missing (each miss waits 2 s for the remote), no more than two
+  # compiles run at the same time.
+  local busy
+  busy="$WORK_DIR/busy-log"
+  fresh
+  : > "$busy"
+  LEAN_NUM_THREADS=2 LAKE_TEST_BUSY_LOG="$busy" LAKE_REMOTE_CACHE=slow \
+    test_out 'Built Busy' build Busy
+  test_cmd_eq 8 count '^+$' "$busy"
+  "$PYTHON" -c '
+import sys
+now = most = 0
+for line in open(sys.argv[1]):
+    now += 1 if line.strip() == "+" else -1
+    most = max(most, now)
+print("at most", most, "compiles ran at once")
+assert most <= int(sys.argv[2]), most
+' "$busy" 2
+}
+
 run_cases case_read_through case_read_404 case_read_invalid_mapping case_read_bad_artifact \
   case_read_bad_descriptor case_read_transport case_read_status case_read_artifact_status \
-  case_read_status_persistence case_read_silent case_read_shared_runs
+  case_read_status_persistence case_read_silent case_read_shared_runs case_read_compile_slots

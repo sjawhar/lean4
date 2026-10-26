@@ -10,6 +10,7 @@ public import Lake.Config.FacetConfig
 public import Lake.Build.Job.Monad
 public import Lake.Build.Infos
 import Lean.Elab.ParseImportsFast
+import Lake.Util.BuildSlots
 import Lake.Util.Proc
 import Lake.Build.Job.Register
 import Lake.Build.Common
@@ -1081,7 +1082,7 @@ def Module.packLtar
     | .ok files => pure files
     | .error e => error e
   let args := ltarPackArgs files self.fileName self.leanLibDir self.irDir self.ltarFile
-  proc (quiet := true) {cmd := (← getLeantar).toString, args}
+  withBuildSlot <| proc (quiet := true) {cmd := (← getLeantar).toString, args}
   if (← self.pkg.isArtifactCacheWritable) then
     cacheArtifact self.ltarFile "ltar" (useLocalFile := ← self.pkg.restoreAllArtifacts)
   else
@@ -1098,7 +1099,7 @@ def Module.unpackLtar (self : Module) (ltar : FilePath) (inputHash : Hash) : Job
     "-C", self.irDir.toString,
     "-x", "-j", "-"
   ]
-  proc (quiet := true) (input? := input.compress) {cmd := (← getLeantar).toString, args}
+  withBuildSlot <| proc (quiet := true) (input? := input.compress) {cmd := (← getLeantar).toString, args}
 
 /--
 The cached archives that this process could not unpack, as `<cache scope>/<input hash>`: a build

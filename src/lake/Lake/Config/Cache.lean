@@ -1001,6 +1001,12 @@ structure TransferState where
   refused : Bool := false
   /-- The transfers that failed transiently (see `isTransientFailure`), to try again. -/
   transient : Array TransferInfo := #[]
+  /--
+  How many answers with an HTTP status the transfers got, successes and failures alike, over
+  every `curl` run (so a transfer tried again can answer more than once). None of them means
+  that nothing reached the service: no connection, or a transfer that never moved.
+  -/
+  answered : Nat := 0
 
 /-- The outcome of two `curl` runs of disjoint transfers, without the transfers left to retry. -/
 def TransferState.merge (a b : TransferState) : TransferState where
@@ -1008,6 +1014,7 @@ def TransferState.merge (a b : TransferState) : TransferState where
   numSuccesses := a.numSuccesses + b.numSuccesses
   uploaded := a.uploaded ++ b.uploaded
   refused := a.refused || b.refused
+  answered := a.answered + b.answered
 
 /--
 Monitors the transfers of a `curl` run. With `cfg.createOnly` (the uploads only create their
@@ -1031,6 +1038,9 @@ partial def monitorTransfer
           | logError s!"{cfg.scope}: unidentifiable transfer completed: {line.trimAscii}"
             modify ({· with didError := true})
             return
+        -- Answered, whatever the status and whether `curl` then received it whole
+        if (out.getAs Nat "http_code").toOption.getD 0 > 0 then
+          modify fun s => {s with answered := s.answered + 1}
         match out.get? "exitcode" with
         | .ok none
         | .ok (some 0) =>
@@ -1477,19 +1487,30 @@ public def uploadArtifacts
   let cacheToken := infos.all (service.sendsCacheToken ·.url)
   transferArtifacts {scope, infos, kind := .put, key := service.impl.key, cacheToken}
 
+/-- What `putRemoteObjects` did with the uploads it was given. -/
+public structure RemotePutResult where
+  /-- The URLs of the uploads that succeeded, objects already present included. -/
+  uploaded : Array String
+  /--
+  How many answers with an HTTP status the uploads got, successes and failures alike (see
+  `TransferState.answered`). None of them means that none reached the service.
+  -/
+  answered : Nat
+
 /--
 Uploads each file of `uploads` with one `curl` run, only creating each object
 (`x-goog-if-generation-match: 0`): an object that is already present (HTTP 412) is left as it is,
 which is not an error. The requests carry the cache token if the service sends it to their host
 (see `sendsCacheToken`), and are otherwise signed with the service's key.
 
-Reports each failed upload, and returns the URLs of the uploads that succeeded.
+Reports each failed upload, and returns the URLs of the uploads that succeeded with how many of
+them the service answered.
 -/
 public def putRemoteObjects
   (service : CacheService) (uploads : Array RemoteUpload) (contentType noun : String)
-: LoggerIO (Array String) := do
+: LoggerIO RemotePutResult := do
   if uploads.isEmpty then
-    return #[]
+    return {uploaded := #[], answered := 0}
   let infos := uploads.map fun {path, url, hash} => ({url, hash, path} : TransferInfo)
   let cacheToken := infos.all (service.sendsCacheToken ·.url)
   let name := service.name?.map (·.toString) |>.getD "the remote cache"
@@ -1499,7 +1520,7 @@ public def putRemoteObjects
     kind := .put, scope := .ofString name, infos, key := service.impl.key
     cacheToken, createOnly := true, contentType, noun
   }
-  return s.uploaded
+  return {uploaded := s.uploaded, answered := s.answered}
 
 /-! ### Output Transfer -/
 

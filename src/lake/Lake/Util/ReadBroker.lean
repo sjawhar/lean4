@@ -9,6 +9,7 @@ prelude
 public import Lake.Util.Log
 public import Lake.Util.Url
 import Lake.Util.IO
+import Lake.Util.BuildSlots
 import Std.Sync.Mutex
 import Init.Data.String.TakeDrop
 import Init.Data.String.Search
@@ -20,8 +21,10 @@ The jobs of a build read the shared remote cache (its mappings and artifacts) th
 per Lake process, which sends their reads in shared `curl` runs (`-Z`) instead of one `curl`
 process per read. A run takes the reads that wait when it starts, up to `runSize`, and at most
 `maxRuns` runs go at a time; a read that comes while they all go waits for the next run. A read
-holds the worker of the job that sent it (see `send`), so the task pool's limit still bounds how
-many targets a build compiles at once.
+lets the job that sent it give its worker up (see `send`), so a build reads at the rate of the
+network and not at the rate of its workers; what the build runs at once stays bounded all the
+same, because every command of a build, and the hashing of what it downloads, takes a slot
+(`withBuildSlot`), of which there are as many as the pool has workers.
 
 So the reads of a build share a few connections (HTTP/2 carries a run's transfers to one host on
 one connection) instead of opening one for each object. Measured on 2026-10-26 from an Azure VM
@@ -91,6 +94,9 @@ structure State where
   deriving Inhabited
 
 builtin_initialize state : Std.Mutex State ← Std.Mutex.new {}
+
+/-- How many reads wait for their outcome with a worker of the pool given up (see `send`). -/
+builtin_initialize waiters : IO.Ref Nat ← IO.mkRef 0
 
 /--
 Takes the reads of the next run: the oldest waiting read, and up to `runSize` in all of those
@@ -238,16 +244,26 @@ end
 /--
 Sends `req` through the broker and waits for its outcome.
 
-The wait holds this job's worker (`IO.waitAny`, unlike `IO.wait`, does not add one to the task
-pool's limit): the pool's limit then still bounds how many targets this build compiles at once,
-as it did when each read ran a `curl` process of its own. So a build has at most as many reads in
-flight as it has workers, and the broker sends them in a few `curl` runs instead of one process
-and one connection each.
+The wait lets another job of the build run: `IO.wait` adds a worker to the task pool's limit
+while this job waits, so a build reads at the rate of the network and not at the rate of its
+workers. What a build runs at once stays bounded all the same, because every command it runs
+takes a slot (`withBuildSlot`), of which there are as many as the pool has workers.
+
+Only `maxRuns * runSize` reads wait that way at once, one for each transfer the broker can have
+in flight; a read beyond them waits holding its worker (`IO.waitAny` adds none), so that a
+build's waiting reads cannot take an unbounded number of threads.
 -/
 public def send (req : Request) : BaseIO Outcome := do
   let promise ← IO.Promise.new
   enqueue {req, promise, sentAt := ← IO.monoMsNow}
-  return (← IO.waitAny [promise.result?]).getD {message := "the read broker dropped the read"}
+  let borrow ← waiters.modifyGet fun n =>
+    if n < maxRuns * runSize then (true, n + 1) else (false, n)
+  let outcome? ←
+    if borrow then
+      try IO.wait promise.result? finally waiters.modify (· - 1)
+    else
+      IO.waitAny [promise.result?]
+  return outcome?.getD {message := "the read broker dropped the read"}
 
 /--
 Sends a read of `url` whose body goes to `out` through the broker, with the cache token if
@@ -320,7 +336,9 @@ public def download
           that `curl` could not follow"
     unless code == 200 do
       error s!"{url}: the download failed (HTTP {code})"
-    check tmp
+    -- `check` reads and hashes the whole file, so it takes a slot of the build, as a command
+    -- would: the transfers of a run end together, and every job that one wakes checks at once
+    withBuildSlot <| check tmp
     IO.FS.rename tmp file
   finally
     -- After a successful download, the temporary file is already gone
