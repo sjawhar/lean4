@@ -1715,41 +1715,48 @@ where
   its current input, if they still are what the trace describes: they go through the skip path's
   check (`Module.keepOutputs?`, which with `cacheWith?` also saves them to the cache), as the
   checker may have taken minutes. Returns `none` if they are not (the caller compiles). Their
-  `.hash` files are rewritten from the trace's descriptions. The module's `.ltar` was packed with
-  the previous trace, so it is removed. Its usage key is marked kept (`UsekeySidecar.kept`) before
-  the outputs are saved: the `.usage` describes its constants as Lean compiled them, and a constant
-  they mention may mean something new now, so its importers, here or after a restore from the cache,
-  must not trust its digests (`importUsage?`). The marked key replaces the file whole
-  (`ModuleUsage.writeFileReplacing`), as every sidecar write does: a reader in another workspace must
-  never see a sidecar mid-write. A key that cannot be read is removed instead.
+  `.hash` files are rewritten from the trace's descriptions, and removed again unless the outputs
+  are kept, also when the check or the save fails: a `.hash` file no output of this build stands
+  behind would be read as that output's hash by the next build (`fetchFileHash`). The module's
+  `.ltar` was packed with the previous trace, so it is removed. Its usage key is marked kept
+  (`UsekeySidecar.kept`) before the outputs are saved: the `.usage` describes its constants as Lean
+  compiled them, and a constant they mention may mean something new now, so its importers, here or
+  after a restore from the cache, must not trust its digests (`importUsage?`). The marked key
+  replaces the file whole (`ModuleUsage.writeFileReplacing`), as every sidecar write does: a reader
+  in another workspace must never see a sidecar mid-write. A key that cannot be read is removed
+  instead.
   -/
   acceptKept (presetup : ModulePreSetup) (setup : ModuleSetup) (data : BuildMetadata)
     (descrs : ModuleOutputDescrs) (cacheWith? : Option Bool)
   : JobM (Option ModuleOutputArtifacts) := do
-    writeFileHash mod.oleanFile descrs.olean.hash
-    writeFileHash mod.ileanFile descrs.ilean.hash
-    if let some c := descrs.c? then writeFileHash mod.cFile c.hash
-    if let some bc := descrs.bc? then writeFileHash mod.bcFile bc.hash
-    removeFileIfExists mod.ltarFile
-    clearFileHash mod.ltarFile
-    let key? ← (IO.FS.readFile mod.usekeyFile).toBaseIO
-    -- under an artifact cache the key is a read-only link: it is replaced, never written through
-    removeFileIfExists mod.usekeyFile
-    clearFileHash mod.usekeyFile
-    if let .ok contents := key? then
-      if let .ok key@(.obj _) := Json.parse contents then
-        ModuleUsage.writeFileReplacing mod.usekeyFile (key.setObjVal! "kept" true).compress.toUTF8
-    match (← mod.keepOutputs? presetup.isModule presetup.postponeCompile (some descrs) cacheWith?) with
-    | none =>
-      mod.clearOutputHashes
-      return none
-    | some arts =>
-      some <$> buildAction (← getTrace) mod.traceFile (action := .check)
-          (localHash? := some presetup.localTrace.hash) do
-        data.log.replay
-        createParentDirs mod.setupFile
-        IO.FS.writeFile mod.setupFile (toJson setup).pretty
-        return {arts with keptFrom? := descrs.keptFrom? <|> some data.depHash}
+    try
+      writeFileHash mod.oleanFile descrs.olean.hash
+      writeFileHash mod.ileanFile descrs.ilean.hash
+      if let some c := descrs.c? then writeFileHash mod.cFile c.hash
+      if let some bc := descrs.bc? then writeFileHash mod.bcFile bc.hash
+      removeFileIfExists mod.ltarFile
+      clearFileHash mod.ltarFile
+      let key? ← (IO.FS.readFile mod.usekeyFile).toBaseIO
+      -- under an artifact cache the key is a read-only link: it is replaced, never written through
+      removeFileIfExists mod.usekeyFile
+      clearFileHash mod.usekeyFile
+      if let .ok contents := key? then
+        if let .ok key@(.obj _) := Json.parse contents then
+          ModuleUsage.writeFileReplacing mod.usekeyFile (key.setObjVal! "kept" true).compress.toUTF8
+      match (← mod.keepOutputs? presetup.isModule presetup.postponeCompile (some descrs) cacheWith?) with
+      | none =>
+        mod.clearOutputHashes
+        return none
+      | some arts =>
+        some <$> buildAction (← getTrace) mod.traceFile (action := .check)
+            (localHash? := some presetup.localTrace.hash) do
+          data.log.replay
+          createParentDirs mod.setupFile
+          IO.FS.writeFile mod.setupFile (toJson setup).pretty
+          return {arts with keptFrom? := descrs.keptFrom? <|> some data.depHash}
+    catch e =>
+      try mod.clearOutputHashes catch _ => pure ()
+      throw e
   -- Unpacks the module's own `.ltar` (stamped with `inputHash`) into the build directory and
   -- returns whether it did. The archive carries its own trace, which vouches only for the archive,
   -- so it must still have the hash recorded when it was packed; if it does not, or none is

@@ -738,6 +738,22 @@ test_cmd_fails grep -q 'waiting for another Lake process' t51nb.out
 # With the artifact cache
 export LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true
 
+# An accept that fails after it has written the outputs' hashes leaves none of them behind: the
+# accept writes the hashes the trace records before it records the outputs (`acceptKept`), and a
+# later build takes a `.hash` file as its output's hash (`fetchFileHash`). Here the module's setup
+# file, which the accept writes last, is a directory, so that write fails
+export LAKE_CACHE_DIR="$PWD/cache63"
+mkp t63
+test_run -d t63 build P
+seta t63 2
+export STUB_LOG="$PWD/t63.log"
+test_cmd rm -f t63/.lake/build/ir/P/B.setup.json
+test_cmd mkdir t63/.lake/build/ir/P/B.setup.json
+LAKE_KEPT_CHECKER="$STUB" test_status 1 -d t63 build P.B
+test_exp ! -e "t63/$OUT/B.olean.hash"
+test_exp ! -e "t63/$OUT/B.ilean.hash"
+test_cmd rmdir t63/.lake/build/ir/P/B.setup.json
+
 # Outputs a build without the cutoff wrote, restored from the cache (their trace records no inputs),
 # are no candidate either, and the build says why
 export LAKE_CACHE_DIR="$PWD/cache56"
