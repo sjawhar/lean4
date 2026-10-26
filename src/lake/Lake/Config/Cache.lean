@@ -778,8 +778,10 @@ def parseResponseHeaders (text : String) : Array (String × String) :=
 
 /--
 How long one request for an object of the shared remote cache that a build makes for a claim may
-take in all, in seconds (`curl --max-time`), and how long its retries may go on
-(`--retry-max-time`): a request that is answered but keeps sending stays bounded.
+take in all, in seconds (`curl --max-time`), so that a request that is answered but keeps sending
+stays bounded. Claim requests are not retried (a claim that fails is a cache miss), so each
+request ends within this time; one that the remote cache refuses for its token (401) is sent once
+more with a renewed token, so a claim request takes at most about twice this time.
 -/
 def remoteObjectMaxSecs : Nat := 20
 
@@ -792,9 +794,10 @@ never following a redirect, and returns the answer with its header fields. `args
 request's own `curl` arguments. Errors if the request cannot carry the token: these requests are
 for the service that `LAKE_REMOTE_CACHE` names, which accepts no other credential. A transfer
 that `curl` could not finish (e.g., a connection that failed) is an error, as is a stall (see
-`transferTimeoutArgs`), a request that has not ended after `remoteObjectMaxSecs` (with its
-retries; a request renewed for a refused token is sent once more), and a body larger than
-`remoteObjectMaxBytes`. The body goes to a temporary file, never to memory, while it arrives.
+`transferTimeoutArgs`), a request that has not ended after `remoteObjectMaxSecs`, and a body larger
+than `remoteObjectMaxBytes`. A request is not retried, except once with a renewed token after a
+401 (see `withCacheTokenRequest`). The body goes to a temporary file, never to memory, while it
+arrives.
 -/
 def requestRemoteObject
   (service : CacheService) (url : String) (args : Array String)
@@ -808,7 +811,6 @@ def requestRemoteObject
         args := lead ++ #["-s", "-w", "%{stderr}%{json}\n", "-D", headerFile.toString,
           "-o", bodyFile.toString,
           "--max-time", toString remoteObjectMaxSecs,
-          "--retry-max-time", toString remoteObjectMaxSecs,
           "--max-filesize", toString remoteObjectMaxBytes] ++
           transferTimeoutArgs ++ args ++ #[url]
       }
@@ -826,10 +828,10 @@ def requestRemoteObject
 
 /--
 Reads the object at `url` (with the cache token; see `requestRemoteObject`). A missing object is
-an answer with code 404.
+an answer with code 404. The read is not retried: a claim that cannot be read is a cache miss.
 -/
 public def getRemoteObject (service : CacheService) (url : String) : LogIO RemoteObjectResponse :=
-  service.requestRemoteObject url #["--retry", "3"]
+  service.requestRemoteObject url #[]
 
 /--
 Writes `body` as the object at `url` (with the cache token; see `requestRemoteObject`) only if the
