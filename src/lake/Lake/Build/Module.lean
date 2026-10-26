@@ -1111,6 +1111,37 @@ builtin_initialize rejectedArchives : Std.Mutex (Std.HashSet String) ← Std.Mut
 def Module.archiveKey (mod : Module) (inputHash : Hash) : String :=
   s!"{mod.pkg.cacheScope}/{inputHash}"
 
+/--
+Whether this process has removed the witnesses (see `Module.rejectArchive`) that killed builds
+left in the cache's quarantine directory (see `reapWitnesses`).
+-/
+builtin_initialize witnessesReaped : IO.Ref Bool ← IO.mkRef false
+
+/-- The day of the Unix epoch of `secs` seconds, which a witness's name holds. -/
+def witnessDay (secs : Int) : Int := secs / (24 * 60 * 60)
+
+/--
+Removes, once per process, the witnesses in `cache`'s quarantine directory that were made before
+yesterday: a build removes each witness it makes after the unpack, so these are the ones of
+builds killed during an unpack. Each would keep its archive's bytes on disk after the cache
+removed the archive. A witness's name holds the day it was made (`witness.<day>.…`, see
+`witnessDay`), as its modification time is the archive's (it is a hard link). No unpack takes a
+day, so a witness in use is never removed.
+-/
+def reapWitnesses (cache : Cache) : BaseIO Unit := do
+  if ← witnessesReaped.modifyGet (fun done => (done, true)) then
+    return
+  let .ok entries ← cache.quarantineDir.readDir.toBaseIO
+    | return
+  let .ok now ← wallClockSecs.toBaseIO
+    | return
+  let today := s!"witness.{witnessDay now}."
+  let yesterday := s!"witness.{witnessDay now - 1}."
+  for entry in entries do
+    let name := entry.fileName
+    if name.startsWith "witness." && !name.startsWith today && !name.startsWith yesterday then
+      discard <| (IO.FS.removeFile entry.path).toBaseIO
+
 /-- Unpacks `ltar` (see `Module.unpackLtar`), and returns the messages of its log if it failed. -/
 def Module.tryUnpackLtar (mod : Module) (ltar : FilePath) (inputHash : Hash) :
     JobM (Except Log Unit) := do
@@ -1130,14 +1161,17 @@ in this process.
 As the push does with an entry it found wrong (see `Lake.quarantineUnlessReplaced`), it takes the
 archive away from its name only by renaming it into the cache's quarantine directory, which
 captures exactly the file that is there, and then checks that it took the file that did not
-unpack: `was` is that file's size and modification time (to the nanosecond), read before the
-unpack. A file that another process installed in the meantime differs, even one of the same size
-written within the same second, and goes back to its name, so this build
-removes only the bytes it tested. The archive is left where it is when it is not in this cache's
-artifacts.
+unpack: `witness?` is a hard link to that file, made before the unpack, and
+`System.FilePath.isSameFile` compares the device and inode, so a file that another process
+installed in the meantime differs however it was written (a size and a modification time cannot
+tell a same-size replacement written within one kernel tick from the original). Such a file goes
+back to its name, so this build removes only the bytes it tested. Without a witness (a cache
+this package does not write, or the link failed) the archive stays where it is: this build could
+not tell it from a replacement, and this process does not restore it again. The archive is also
+left where it is when it is not in this cache's artifacts.
 -/
 def Module.rejectArchive
-  (mod : Module) (inputHash : Hash) (ltar : FilePath) (was : Option (UInt64 × IO.FS.SystemTime))
+  (mod : Module) (inputHash : Hash) (ltar : FilePath) (witness? : Option FilePath)
   (log : Log)
 : JobM Unit := do
   rejectedArchives.atomically (modify (·.insert (mod.archiveKey inputHash)))
@@ -1145,7 +1179,9 @@ def Module.rejectArchive
   discard <| (removeFileIfExists mod.traceFile).toBaseIO
   let cache ← getLakeCache
   let moved ←
-    if ltar.toString.startsWith (cache.artifactDir.toString ++ "/") then
+    if !ltar.toString.startsWith (cache.artifactDir.toString ++ "/") then
+      pure "it is not in the cache"
+    else if let some witness := witness? then
       let take : IO String := do
         IO.FS.createDirAll cache.quarantineDir
         let name := ltar.fileName.getD "archive.ltar"
@@ -1155,10 +1191,8 @@ def Module.rejectArchive
         catch
           | .noFileOrDirectory .. => return "another process moved it away first"
           | e => throw e
-        let now ← match (← captured.metadata.toBaseIO) with
-          | .ok md => pure (some (md.byteSize, md.modified))
-          | .error _ => pure none
-        if now != was then
+        let tested ← (· matches .ok true) <$> (captured.isSameFile witness).toBaseIO
+        unless tested do
           -- Another process installed an archive after the unpack failed: it is not this
           -- build's to remove
           discard <| (IO.FS.rename captured ltar).toBaseIO
@@ -1170,7 +1204,8 @@ def Module.rejectArchive
       match (← take.toBaseIO) with
       | .ok msg => pure msg
       | .error e => pure s!"could not move it into quarantine: {e}"
-    else pure "it is not in the cache"
+    else
+      pure "left where it is: this build has no link to tell it from a replacement"
   let why := log.entries.foldl (init := "") fun msg entry =>
     if msg.isEmpty then entry.message else s!"{msg}\n- {entry.message}"
   let msg := s!"{mod.name}: the cached archive {ltar} did not unpack ({moved}); \
@@ -1259,13 +1294,31 @@ where
       updateAction .unpack
       mod.clearOutputArtifacts
       -- A cached archive whose digests match but which does not unpack is a cache miss: the
-      -- module compiles, and this process does not restore that archive again
-      let was ← match (← ltar.path.metadata.toBaseIO) with
-        | .ok md => pure (some (md.byteSize, md.modified))
-        | .error _ => pure none
+      -- module compiles, and this process does not restore that archive again. A hard link made
+      -- now names the exact file that the unpack reads, whatever another process later puts at
+      -- the entry's name (see `Module.rejectArchive`). Only an archive in the cache's artifacts
+      -- can be taken out of the cache, and only a cache this package writes gets a link (by
+      -- default the artifact cache is read and not written): any failure leaves no witness, and
+      -- the unpack goes on.
+      let cache ← getLakeCache
+      let witness? ← do
+        if (← mod.pkg.isArtifactCacheWritable) &&
+            ltar.path.toString.startsWith (cache.artifactDir.toString ++ "/") then
+          let make : IO FilePath := do
+            let day := witnessDay (← wallClockSecs)
+            let witness ← uniqueTmpPath (cache.quarantineDir / s!"witness.{day}")
+            createParentDirs witness
+            reapWitnesses cache
+            IO.FS.hardLink ltar.path witness
+            return witness
+          pure (← make.toBaseIO).toOption
+        else
+          pure none
       if let .error log ← mod.tryUnpackLtar ltar.path inputHash then
-        mod.rejectArchive inputHash ltar.path was log
+        mod.rejectArchive inputHash ltar.path witness? log
+        discard <| (removeFileIfExists (witness?.getD "")).toBaseIO
         return .incomplete .missing none
+      discard <| (removeFileIfExists (witness?.getD "")).toBaseIO
       -- Note: This branch implies that only the ltar output is (validly) cached.
       -- Thus, we use only the new trace unpacked from the ltar to resolve further artifacts.
       let savedTrace ← readTraceFile mod.traceFile
