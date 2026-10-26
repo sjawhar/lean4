@@ -50,10 +50,11 @@ One pusher at a time holds `Cache.pushLockFile`. It works in passes: each pass r
 pushes the entries that it has not tried, and removes the pushed and dropped ones from the queue
 as it goes, with a rewrite of the queue after a chunk (see `pushFlushFactor`), so that a push that
 is stopped keeps its progress, and with one at the start of the next pass. It stops when a pass
-finds no entry that it has not tried, so it pushes an entry that a build appends while it runs. It
-releases the lock while it still holds the queue's lock, so that no append can fall between its
-last look at the queue and the release. At the end, it records its outcome in
-`Cache.pushStatusFile`.
+finds no entry that it has not tried, so it pushes an entry that a build appends while it runs,
+and also when the remote cache answered none of the uploads of its first chunk, which keeps every
+entry queued; a push whose build still runs tries those again instead (see `pushLoop`). It releases
+the lock while it still holds the queue's lock, so that no append can fall between its last look
+at the queue and the release. At the end, it records its outcome in `Cache.pushStatusFile`.
 -/
 
 open System Lean
@@ -696,49 +697,80 @@ def stageChunk
     | .failed => outcomes := outcomes.push .failed
   return {lines := lines.extract 0 outcomes.size, outcomes, ready, dir}
 
+/-- What `uploadChunk` did with a staged chunk. -/
+structure UploadedChunk where
+  /-- The outcome of each line of the chunk. -/
+  outcomes : Array PushOutcome
+  /-- How many uploads the chunk sent: a chunk whose entries were all dropped sends none. -/
+  attempted : Nat
+  /--
+  Whether the chunk sent uploads and no service answered any of them: no connection reached a
+  service, or none of them moved (see `TransferState.answered`). A failure that the service
+  answered (e.g., 403) is not this, and neither is an upload that never left (e.g., no token).
+  -/
+  unreachable : Bool
+
 /--
 Uploads the artifacts of the entries of `chunk`, and then the mapping of each entry whose artifacts
-are all present, and removes the chunk's staging directory. Returns the outcome of each line of the
-chunk.
+are all present, and removes the chunk's staging directory. An upload that could not be sent at
+all (`putRemoteObjects` failed, e.g. for want of a credential) counts for neither `attempted` nor
+`answered`, so it neither fires the push's breaker nor turns it off (see `pushLoop`).
 -/
-def uploadChunk (ctx : PushContext) (chunk : StagedChunk) : LoggerIO (Array PushOutcome) := do
+def uploadChunk (ctx : PushContext) (chunk : StagedChunk) : LoggerIO UploadedChunk := do
   try
     let mut outcomes := chunk.outcomes
+    let mut answered := 0
+    let mut attempted := 0
     let ready := chunk.ready
     let services := ready.foldl (init := #[]) fun services e =>
       if services.any (·.1 == e.serviceName) then services else services.push (e.serviceName, e.service)
+    -- The URLs that went up, how many uploads were sent, and how many the service answered
+    let send (uploads : Array RemoteUpload) (contentType noun : String) (service : CacheService)
+    : LoggerIO (Std.HashSet String × Nat × Nat) := do
+      let put? ← try some <$> service.putRemoteObjects uploads contentType noun
+        catch _ => pure none
+      let some put := put?
+        | return ({}, 0, 0)
+      return (({} : Std.HashSet String).insertMany put.uploaded, uploads.size, put.answered)
     for (name, service) in services do
       -- Each claim of these entries is this push's now (`takeLineClaims`)
       let group := ready.filter (·.serviceName == name)
       -- Artifacts go up before mappings, so a reader that finds a mapping finds its artifacts
       let artifacts := uniqueUploads (group.flatMap (·.artifacts))
-      let uploaded : Std.HashSet String ← (({} : Std.HashSet String).insertMany ·) <$>
-        try service.putRemoteObjects artifacts CacheService.artifactContentType "artifact"
-        catch _ => pure #[]
+      let (uploaded, sent, got) ← send artifacts CacheService.artifactContentType "artifact" service
+      attempted := attempted + sent
+      answered := answered + got
       -- An entry with an artifact that did not go up sends no mapping, and stays queued
       let complete := group.filter (·.artifacts.all (uploaded.contains ·.url))
       let mappings := uniqueUploads (complete.map (·.mapping))
-      let mapped : Std.HashSet String ← (({} : Std.HashSet String).insertMany ·) <$>
-        try service.putRemoteObjects mappings remoteMappingContentType "mapping"
-        catch _ => pure #[]
+      let (mapped, sent, got) ← send mappings remoteMappingContentType "mapping" service
+      attempted := attempted + sent
+      answered := answered + got
       for e in complete do
         if mapped.contains e.mapping.url then
           outcomes := outcomes.set! e.idx .pushed
       -- The builds that wait for these claims look for the mappings, which are there now
       markClaimsDone ctx (complete.filter (mapped.contains ·.mapping.url))
-    return outcomes
+    return {outcomes, attempted, unreachable := attempted > 0 && answered == 0}
   finally
     discard <| (removeDirAllIfExists chunk.dir).toBaseIO
 
-/-- Records the outcome of a push in `Cache.pushStatusFile`. -/
-def writePushStatus (cache : Cache) (stats : PushStats) (queued : Nat) : IO Unit := do
-  writeFileAtomic cache.pushStatusFile <| (JsonObject.empty
+/--
+Records the outcome of a push in `Cache.pushStatusFile`, with `stopped?` if the push gave up (see
+`pushLoop`).
+-/
+def writePushStatus
+  (cache : Cache) (stats : PushStats) (queued : Nat) (stopped? : Option String := none)
+: IO Unit := do
+  let obj := JsonObject.empty
     |>.insert "at" (← wallClockSecs)
     |>.insert "rc" (if queued == 0 then 0 else 1)
     |>.insert "pushed" stats.pushed
     |>.insert "failed" stats.failed
     |>.insert "dropped" stats.dropped
-    |>.insert "queued" queued : Json).pretty
+    |>.insert "queued" queued
+  let obj := stopped?.elim obj (obj.insert "stopped" ·)
+  writeFileAtomic cache.pushStatusFile (obj : Json).pretty
 
 /--
 Whether the build that holds the lock on its follow file `file` (see `startBuildPush`) still
@@ -768,7 +800,7 @@ def followRetryMs : Nat := 30000
 Takes the claims of the lines that appear in the queue every `followPollMs`, apart from the
 push's passes, which can take long (staging and uploads): so each claim is the push's within
 about a second of its line, however long the uploads take, and well within
-`remoteClaimGoneGraceSecs`. Every push runs this; the last pass stops it and waits for it before
+`remoteClaimGoneGraceSecs`. Every push runs this; its end stops it and waits for it before
 it lets the push lock go (`pushLoop`), so a claim this push took always names a push that is
 still there to upload that line. It reads the queue under the queue lock with a handle of its
 own (a `flock` excludes only other handles). It tries the lock instead of blocking for it, and
@@ -805,6 +837,30 @@ partial def claimTaker (ctx : PushContext) (taken : TakenClaims) (stop : IO.Ref 
   loop
 
 /--
+Ends the push, with the queue locked and `queued` lines left in it: stops the claim taker while
+the push still holds the queue (so no claim of this push names it after it has let the queue go),
+records the outcome in `Cache.pushStatusFile` (with `stopped?` if the push gave up), and releases
+`pushLock` while the queue is locked, so that a line appended after this is the next push's.
+Returns `queued`.
+-/
+def finishPush
+  (ctx : PushContext) (pushLock queueLock : IO.FS.Handle) (taken : TakenClaims)
+  (taker : IO.Ref Bool × Task Unit) (stats : PushStats) (queued : Nat)
+  (follow? : Option FilePath) (stopped? : Option String := none)
+: LoggerIO Nat := do
+  taker.1.set true
+  discard <| IO.wait taker.2
+  for msg in ← taken.messages.modifyGet (·, #[]) do
+    logVerbose msg
+  if let .error e ← (writePushStatus ctx.cache stats queued stopped?).toBaseIO then
+    logWarning s!"could not write {ctx.cache.pushStatusFile}: {e}"
+  pushLock.unlock
+  queueLock.unlock
+  if let some file := follow? then
+    discard <| (removeFileIfExists file).toBaseIO
+  return queued
+
+/--
 Runs passes of the push until a pass finds no queue line that this push has not tried, then
 stops its claim taker and releases `pushLock` (see the module docs). `done` counts the lines
 that the last pass pushed or dropped and has not yet removed from the queue (it removes them as
@@ -812,9 +868,15 @@ it goes; see `pushFlushFactor`), which this pass removes. `failed` holds the
 lines whose upload failed: they stay in the queue. `taken` holds the claims this push took (see
 `takeLineClaims`): each pass first takes the claims of its lines that it has not taken yet, and
 stages each entry with its claim's new generation. `taker` is the claim taker's task and the
-flag that stops it (`claimTaker`); the last pass stops it and waits for it while it still holds
-the queue, so no claim of this push names it after it has let the queue go. Returns the number
-of lines left in the queue.
+flag that stops it (`claimTaker`). Returns the number of lines left in the queue.
+
+A push that follows no build that still runs stops after the first chunk it sent uploads for if
+the remote cache answered none of them (`firstChunk`, `UploadedChunk.unreachable`): the chunks
+after it would fail the same way, each for as long as its uploads may take. Every line stays in
+the queue, and `Cache.pushStatusFile` says why (`stopped`). `firstChunk` stays set through a chunk
+that sent no upload (one whose entries were all dropped, or whose staging failed), so such a chunk
+does not turn the breaker off. A push whose build still runs tries again after `followRetryMs`
+instead: the build goes on queuing outputs, and it starts no second push.
 
 With `follow?` (the follow file of a build; see `startBuildPush`), a pass that finds nothing to
 push waits `followPollMs` and looks again while that build runs, so the build's one push uploads
@@ -827,7 +889,7 @@ partial def pushLoop
   (ctx : PushContext) (pushLock queueLock : IO.FS.Handle) (taken : TakenClaims)
   (taker : IO.Ref Bool × Task Unit)
   (stats : PushStats) (failed : Std.HashSet String) (done : Std.HashMap String Nat)
-  (follow? : Option FilePath := none) (retryAt : Nat := 0)
+  (follow? : Option FilePath := none) (retryAt : Nat := 0) (firstChunk := true)
 : LoggerIO Nat := do
   let cache := ctx.cache
   let following ← match follow? with
@@ -860,23 +922,10 @@ partial def pushLoop
             else true
         logInfo s!"trying {failed.size} failed queue entries again"
         let stats := {stats with failed := stats.failed - failed.size}
-        return ← pushLoop ctx pushLock queueLock taken taker stats {} {} follow? retryAt
+        return ← pushLoop ctx pushLock queueLock taken taker stats {} {} follow? retryAt firstChunk
       IO.sleep followPollMs
-      return ← pushLoop ctx pushLock queueLock taken taker stats failed {} follow? retryAt
-    -- The taker stops while this pass holds the queue, so that it cannot take the claim of a
-    -- line that this push leaves behind
-    taker.1.set true
-    discard <| IO.wait taker.2
-    for msg in ← taken.messages.modifyGet (·, #[]) do
-      logVerbose msg
-    if let .error e ← (writePushStatus cache stats lines.size).toBaseIO then
-      logWarning s!"could not write {cache.pushStatusFile}: {e}"
-    -- Released while the queue is locked: a line appended after this is the next push's
-    pushLock.unlock
-    queueLock.unlock
-    if let some file := follow? then
-      discard <| (removeFileIfExists file).toBaseIO
-    return lines.size
+      return ← pushLoop ctx pushLock queueLock taken taker stats failed {} follow? retryAt firstChunk
+    return ← finishPush ctx pushLock queueLock taken taker stats lines.size follow?
   queueLock.unlock
   logInfo s!"pushing {todo.size} queue entries to the remote cache"
   takeLineClaims ctx taken todo
@@ -901,6 +950,8 @@ partial def pushLoop
   let mut flushAt := 0
   let mut start := 0
   let mut slot := 0
+  let mut firstChunk := firstChunk
+  let mut stopped? : Option String := none
   let mut next? ← stageAt start slot
   repeat
     let some chunk := next?
@@ -910,9 +961,9 @@ partial def pushLoop
     start := start + max 1 chunk.lines.size
     slot := 1 - slot
     next? ← stageAt start slot
-    let (outcomes?, log) ← IO.wait upload
+    let (uploaded?, log) ← IO.wait upload
     log.replay
-    let outcomes := outcomes?.getD (Array.replicate chunk.lines.size .failed)
+    let outcomes := (uploaded?.map (·.outcomes)).getD (Array.replicate chunk.lines.size .failed)
     for line in chunk.lines, outcome in outcomes do
       match outcome with
       | .pushed =>
@@ -937,11 +988,53 @@ partial def pushLoop
         flushAt := now + pushFlushFactor * ((← IO.monoMsNow) - now)
       | .error e =>
         logWarning s!"could not remove the pushed entries from {cache.pushQueueFile}: {e}"
-  pushLoop ctx pushLock queueLock taken taker stats failed done follow? retryAt
+    -- The remote cache answered nothing of the first chunk this push sent: the chunks after it
+    -- would fail the same way, each for as long as its uploads may take (see `uploadChunk`)
+    if firstChunk && uploaded?.any (·.unreachable) then
+      let sent := (uploaded?.map (·.attempted)).getD 0
+      stopped? := some s!"the remote cache answered none of the {sent} uploads of this push's \
+        first entries"
+      -- The next chunk is already staged, and staging recorded its drops: those lines leave the
+      -- queue, so that no later push records them as dropped again
+      if let some staged := next? then
+        for line in staged.lines, outcome in staged.outcomes do
+          if outcome matches .dropped then
+            stats := {stats with dropped := stats.dropped + 1}
+            done := done.alter line fun n? => some (n?.getD 0 + 1)
+        -- Nothing uploads it, so its staged bytes go now, not at the end of the push
+        discard <| (removeDirAllIfExists staged.dir).toBaseIO
+      break
+    if uploaded?.any (·.attempted > 0) then
+      firstChunk := false
+  if let some why := stopped? then
+    -- The build may have ended while this pass ran
+    let following ← match follow? with
+      | some file => followedBuildRuns file
+      | none => pure false
+    if following then
+      -- The build this push follows goes on queuing outputs, so this push tries again (as it does
+      -- for the lines whose upload failed) instead of leaving the build without a push
+      logWarning s!"{why}; the push tries them again in {followRetryMs / 1000} s"
+      IO.sleep followRetryMs.toUInt32
+      -- Every line of this pass holds a claim state of this push; the next pass takes them again
+      taken.claims.modify (·.filter fun _ state => !(state matches .retry))
+      stats := {stats with failed := stats.failed - failed.size}
+      return ← pushLoop ctx pushLock queueLock taken taker stats {} done follow? retryAt
+    let msg := s!"{why}; the push stops and the queue keeps its entries"
+    logError msg
+    queueLock.lock
+    let (lines, invalid) ← try readQueueLines cache catch e => queueLock.unlock; throw e
+    let lines := removeDone lines done
+    if invalid > 0 || !done.isEmpty then
+      try writeQueue cache lines catch e => queueLock.unlock; throw e
+    stats := {stats with dropped := stats.dropped + invalid}
+    return ← finishPush ctx pushLock queueLock taken taker stats lines.size follow? (some msg)
+  pushLoop ctx pushLock queueLock taken taker stats failed done follow? retryAt firstChunk
 
 /--
 Uploads the write-back queue of `cache` to the shared remote cache (see the module docs).
-Returns the number of entries left in the queue, which only failed uploads leave.
+Returns the number of entries left in the queue: those whose upload failed, and, if the push gave
+up because the remote cache answered nothing (see `pushLoop`), those it did not try.
 
 If another `lake cache push` holds the push lock, returns `0` at once and changes nothing, since
 that push uploads the queue. With `wait`, waits for that push to end instead, then pushes.
@@ -979,7 +1072,7 @@ public def pushRemoteCache
   let ctx : PushContext := {cache, env, lakeCfg, stagingDir, workers}
   let taken : TakenClaims := {claims := ← IO.mkRef {}, messages := ← IO.mkRef #[]}
   -- Every push takes the claims of the lines it reads as they come (see `claimTaker`), and the
-  -- loop's last pass stops this task and waits for it before it lets the push lock go
+  -- end of the loop stops this task and waits for it before it lets the push lock go
   let stop ← IO.mkRef false
   let taker ← BaseIO.asTask (prio := .dedicated) (claimTaker ctx taken stop)
   try
