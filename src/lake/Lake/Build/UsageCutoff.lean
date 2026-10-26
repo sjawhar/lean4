@@ -321,23 +321,26 @@ public def ContentHashes.record (hashes : ContentHashes) (file : FilePath) (hash
 /--
 The hash of `file`'s current bytes (`Lean.ModuleUsage.fileDigest`, 128 bits), never read from a
 `.hash` file: an `.olean` rewritten behind Lake's back (e.g., by `lean -o`) keeps its old `.hash`,
-and a usage-cutoff decision must see the new bytes. One hash per check (`hashes`): the first one a task of the check
-records (`ContentHashes.record`). Taken from an earlier check of the build only if the file's stamp
+and a usage-cutoff decision must see the new bytes. Taken from an earlier check of the build only if the file's stamp
 (`Lean.ModuleUsage.fileStamp`) is the one recorded when those bytes were read (`BuildContext.fileDigests`).
+-/
+def stampedDigest (file : FilePath) : JobM ModuleUsage.Digest := do
+  let memo := (← getBuildContext).fileDigests.get (Hashable.hash file)
+  if let some stamp ← ModuleUsage.fileStamp file then
+    if let some (recorded, hash) ← memo.atomically (return (← get).find? file) then
+      if recorded == stamp then return hash
+  let (hash, stamp?) ← ModuleUsage.fileDigestStamped file
+  if let some stamp := stamp? then
+    memo.atomically (modify (·.insert file (stamp, hash)))
+  return hash
+
+/--
+The hash of `file`'s bytes (`stampedDigest`) for one check (`hashes`): the first one a task of the check records
+(`ContentHashes.record`).
 -/
 def contentHash (hashes : ContentHashes) (file : FilePath) : JobM ModuleUsage.Digest := do
   if let some hash ← hashes.find? file then return hash
-  hashes.record file (← stampedDigest)
-where
-  stampedDigest : JobM ModuleUsage.Digest := do
-    let memo := (← getBuildContext).fileDigests.get (Hashable.hash file)
-    if let some stamp ← ModuleUsage.fileStamp file then
-      if let some (recorded, hash) ← memo.atomically (return (← get).find? file) then
-        if recorded == stamp then return hash
-    let (hash, stamp?) ← ModuleUsage.fileDigestStamped file
-    if let some stamp := stamp? then
-      memo.atomically (modify (·.insert file (stamp, hash)))
-    return hash
+  hashes.record file (← stampedDigest file)
 
 /-- A run of a `JobM` action on its own: the entries it logged, and its value or the position in those entries of the
 error it threw. -/
@@ -635,6 +638,12 @@ def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetu
   readImports hashes reads importArts (keyedModules importArts)
   let known ← reads.get
   let snap ← getBuildStoreSnapshot
+  -- the digest of a `module` file's state, from its `.olean` parts' hashes
+  let partsDigest (hash : FilePath → JobM ModuleUsage.Digest) (parts : Array FilePath) : JobM ModuleUsage.Digest := do
+    let mut e : ModuleUsage.Enc := {}
+    for p in parts do
+      e := e.digest (← hash p)
+    return e.finish
   -- a workspace module of the closure: the toolchain modules it imports, and whether its kernel constants duplicate a
   -- claimed one or, for a `module` file, the digest of its state and its `.olean` parts, whose constants are read next;
   -- `none` if they cannot be read
@@ -646,13 +655,11 @@ def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetu
     if arts.oleanServer?.isSome then
       if arts.oleanPrivate?.isNone then return none
       let parts := arts.oleanParts false
-      let mut e : ModuleUsage.Enc := {}
-      for p in parts do
-        e := e.digest (← contentHash hashes p)
-      return some (imports, .inr (m, e.finish, parts))
+      return some (imports, .inr (m, ← partsDigest (contentHash hashes) parts, parts))
     let some (_, imp) ← replayRun (known[m]?.getD (#[], .ok none)) | return none
     return some (imports, .inl (imp.provides.1.any (clash m ·.hash)))
-  -- whether a `module` file's kernel constants duplicate a claimed one, or `none` if they cannot be read
+  -- whether a `module` file's kernel constants duplicate a claimed one, or `none` if they cannot be read or the parts no
+  -- longer have the bytes the check hashed
   let modsysClash (x : Name × ModuleUsage.Digest × Array FilePath) : JobM (Option Bool) := do
     let (m, d, parts) := x
     let cached ← match providers.modsys.find? (m, d) with
@@ -662,6 +669,8 @@ def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetu
       | some hs => pure hs
       | none =>
         let some (hs, _) ← readKernelProvides (readModuleDataParts parts) | return none
+        -- the read opens the parts again: another workspace's build may have replaced them since the check hashed them
+        unless (← partsDigest stampedDigest parts) == d do return none
         kp.atomically (modify fun s => { s with modsys := s.modsys.insert (m, d) hs })
         pure hs
     return some (hs.any (clash m))
