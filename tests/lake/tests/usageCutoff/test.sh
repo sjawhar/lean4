@@ -34,6 +34,27 @@ test_cmd_out '[["Test","H"],[[["h"],"' cat .lake/build/lib/lean/Test/HU.usage
 test_cmd_out '[["Test","Rules"],' cat .lake/build/lib/lean/Test/Ex.usage
 # `.usekey` names its `extra` modules the same way
 test_cmd_out '"extra":[[["Test","Rules"],"' cat .lake/build/lib/lean/Test/Ex.usekey
+# One `.usekey` format per `usekeyVersion`, as `tests/elab/moduleUsageFormat.lean` pins the `.usage`'s: Lake reads a
+# key of another version as absent, so two toolchains that write different fields under one number would read each
+# other's keys as their own, and a kept module's digests would be trusted. Each row is a version with the top-level
+# fields a key of that version carries. A field change that keeps the version fails the comparison below, and two
+# branches that each take the next number give the table two rows with that number.
+usekey_formats='16 closure,extra,importer,local,modsys,olean,usage,version
+17 closure,extra,importer,kept,local,modsys,olean,usage,version'
+# the fields of a `.usekey`: its top-level names, with the `importer` object (whose own fields `UsageImport` reads)
+# replaced first, sorted and comma-separated
+usekey_fields() {
+  sed 's/"importer":{[^}]*}/"importer":0/' "$1" | grep -o '"[A-Za-z0-9_]*":' | tr -d '":' | sort | tr '\n' ',' |
+    sed 's/,$//'
+}
+usekey_version=$(sed 's/.*"version":\([0-9]*\).*/\1/' .lake/build/lib/lean/Test/Ex.usekey)
+usekey_row=$(printf '%s\n' "$usekey_formats" | grep -E "^$usekey_version " || true)
+test_exp -n "$usekey_row"
+test_exp "${usekey_row#* }" = "$(usekey_fields .lake/build/lib/lean/Test/Ex.usekey)"
+test_exp "$(printf '%s\n' "$usekey_formats" | wc -l)" \
+  = "$(printf '%s\n' "$usekey_formats" | cut -d' ' -f1 | sort -u | wc -l)"
+test_exp "$(printf '%s\n' "$usekey_formats" | wc -l)" \
+  = "$(printf '%s\n' "$usekey_formats" | cut -d' ' -f2- | sort -u | wc -l)"
 # the reader rebuilds component-array names: an unrelated edit to H replays HU with no warning
 printf 'macro "mk" : command => `(def hyg := 5)\nmk\ndef h := 1\ndef unrelatedH := 0\n' > Test/H.lean
 test_not_out "warning" build -v Test.HU

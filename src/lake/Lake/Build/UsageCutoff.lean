@@ -804,8 +804,9 @@ def UsageSidecar.resolvedUnchanged (usage : UsageSidecar) (presetup : ModulePreS
 /--
 Writes the module's `.usekey` from the `.usage` Lean just wrote: the digest of the `.usage` bytes, the module's
 local trace hash, the hash of its `.olean`, the `modsysHash` of its closure, the `closureHash` of its direct imports,
-for each workspace `extra` module, the hash of its `.olean` and its current `moduleDigest`, and the `.usage` fields its
-importers read (`UsageSidecar.importerJson`). Each `.olean` hash is of its bytes (`contentHash`).
+for each workspace `extra` module, the hash of its `.olean` and its current `moduleDigest`, `kept` as `false` (only a
+kept-module check's accept sets it, `acceptKept`, so a key of this version always carries the field), and the
+`.usage` fields its importers read (`UsageSidecar.importerJson`). Each `.olean` hash is of its bytes (`contentHash`).
 
 The key must describe what the compile read, and another workspace can rebuild a shared dependency while the module
 compiles. So every direct import's `closure` and every `extra` module's `moduleDigest`, read now through
@@ -854,6 +855,7 @@ public def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     ("modsys", toJson modsys),
     ("closure", toJson closure),
     ("extra", Json.arr extra),
+    ("kept", toJson false),
     ("importer", usage.importerJson)
   ]
   ModuleUsage.writeFileReplacing mod.usekeyFile key.compress.toUTF8
