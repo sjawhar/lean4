@@ -554,13 +554,45 @@ case_push_unset() {
   push_fresh
   build_a
   on_a test_run cache push
-  restore_b pair
+  restore_b $PUSH_TARGETS
   test_exp -d "$PUSH_CACHE_B/outputs"
   test_cmd rm -rf "$PUSH_CACHE_B/artifacts" "$PUSH_B/.lake/build"
   : > "$SERVER_LOG"
-  LAKE_CACHE_DIR="$PUSH_CACHE_B" test_run -v --dir "$PUSH_B" build pair
+  LAKE_CACHE_DIR="$PUSH_CACHE_B" test_out 'Built push/pair' -v --dir "$PUSH_B" build $PUSH_TARGETS
+  # `test_cmd_eq` writes the output of its own command to `produced.out`, so a count of the
+  # build's output reads a copy of it
+  test_cmd cp produced.out "$WORK_DIR/unset.out"
   test_cmd_eq 0 count ' -> ' "$SERVER_LOG"
+  test_cmd_eq 0 count ' Fetched ' "$WORK_DIR/unset.out"
   test_cmd cmp "$PUSH_B/.lake/build/b.out" "$PUSH_B/b.in"
+  # Every target of the library, with its artifacts pruned from the cache and the remote cache
+  # unset: the build sends no request, so no target is `Fetched`. A job that kept its outputs
+  # replays them, and one that lost them compiles again; the caption says which.
+  : > "$SERVER_LOG"
+  test_cmd rm -rf "$PUSH_CACHE_B/artifacts"
+  LAKE_CACHE_DIR="$PUSH_CACHE_B" test_out 'Replayed push/pair' -v --dir "$PUSH_B" build Push pair
+  test_cmd cp produced.out "$WORK_DIR/unset.out"
+  test_cmd_eq 0 count ' -> ' "$SERVER_LOG"
+  test_cmd_eq 0 count ' Fetched ' "$WORK_DIR/unset.out"
+}
+
+case_push_unset_caption() {
+  # A target whose mapping names a cache service, whose cache artifact was pruned, and whose
+  # outputs are still in the build directory: with `LAKE_REMOTE_CACHE` unset the build sends no
+  # request and puts the outputs back in the cache from the build directory. It is not a fetch,
+  # so no target is captioned `Fetched`. (The r7 acceptance's first C7 attempt captioned 422
+  # `c.o` targets and 3 links that way.)
+  push_fresh
+  build_a
+  on_a test_run cache push
+  # The mappings of the restore name the service, and the build directories stay
+  restore_b $PUSH_TARGETS
+  test_cmd rm -rf "$PUSH_CACHE_B/artifacts"
+  : > "$SERVER_LOG"
+  LAKE_CACHE_DIR="$PUSH_CACHE_B" test_out 'Pre.Hello:dynlib' -v --dir "$PUSH_B" build $PUSH_TARGETS
+  test_cmd cp produced.out "$WORK_DIR/unset.out"
+  test_cmd_eq 0 count ' -> ' "$SERVER_LOG"
+  test_cmd_eq 0 count ' Fetched ' "$WORK_DIR/unset.out"
 }
 
 case_push_local_pruned() {
@@ -672,8 +704,75 @@ case_push_bad_archive_race() {
   match_text 'Built Push.Basic' "$WORK_DIR/race-build.log"
 }
 
+case_push_bad_archive_tick() {
+  # The build tells its own archive from a replacement by the file, not by its size and its
+  # modification time: a Linux modification time advances on a tick of about a millisecond, so
+  # a replacement of the same size written within one tick carries the same size and the same
+  # time as the file the build tested. Here the replacement is given both, and the build must
+  # still keep it.
+  push_fresh
+  build_a
+  local name entry other
+  seed_bad_archive
+  name="$(cat "$WORK_DIR/bad-archive-name")"
+  other="$WORK_DIR/other-archive"
+  test_cmd rm -rf "$PUSH_B" "$PUSH_CACHE_B" "$WORK_DIR/entry-ready" "$WORK_DIR/entry-release"
+  test_cmd cp -r "$TEST_DIR/push" "$PUSH_B"
+  test_cmd chmod -R u+w "$PUSH_B"
+  entry="$PUSH_CACHE_B/artifacts/$name"
+  build_interpose
+  PROBE_ENTRY_READY="$WORK_DIR/entry-ready" PROBE_ENTRY_RELEASE="$WORK_DIR/entry-release" \
+    LD_PRELOAD="$INTERPOSE" LAKE_CACHE_DIR="$PUSH_CACHE_B" LAKE_REMOTE_CACHE=ok \
+    "$LAKE" -v --dir "$PUSH_B" build Push > "$WORK_DIR/race-build.log" 2>&1 &
+  local build=$!
+  wait_probe "$WORK_DIR/entry-ready"
+  # Another build writes another archive of the same size, in the same tick of the clock
+  sed 's/Lean/lean/' "$WORK_DIR/not-an-archive" > "$other"
+  test_cmd_eq "$(stat -c %s "$WORK_DIR/not-an-archive")" stat -c %s "$other"
+  test_cmd touch -r "$entry" "$other"
+  test_cmd rm -f "$entry"
+  test_cmd cp -p "$other" "$entry"
+  test_cmd touch "$WORK_DIR/entry-release"
+  wait $build
+  cat "$WORK_DIR/race-build.log"
+  # The other archive is still at the entry's name and no copy of it was quarantined
+  test_cmd cmp "$entry" "$other"
+  test_cmd_eq 0 count_files_equal "$PUSH_CACHE_B/quarantine" "$other"
+  match_text 'another process replaced it, which this build kept' "$WORK_DIR/race-build.log"
+  match_text 'Built Push.Basic' "$WORK_DIR/race-build.log"
+}
+
+case_push_unpack_readonly() {
+  # A package that reads the artifact cache and does not write it (the default) writes nothing
+  # into the cache when it unpacks an archive from it: the build makes no link to the archive.
+  # So its restores leave no quarantine directory, and a cache directory that it cannot write
+  # does not fail them.
+  push_fresh
+  build_a
+  on_a test_run cache push
+  test_cmd rm -rf "$PUSH_B" "$PUSH_CACHE_B"
+  test_cmd cp -r "$TEST_DIR/push" "$PUSH_B"
+  test_cmd chmod -R u+w "$PUSH_B"
+  test_cmd sed -i '/enableArtifactCache/d' "$PUSH_B/lakefile.lean"
+  # The modules' archives come from the remote cache and are unpacked
+  LAKE_CACHE_DIR="$PUSH_CACHE_B" LAKE_REMOTE_CACHE=ok \
+    test_not_out 'Built ' -v --dir "$PUSH_B" build Push
+  match_text 'leantar' produced.out
+  test_exp ! -e "$PUSH_CACHE_B/quarantine"
+  # Again from the local cache, which the build now cannot write
+  test_cmd rm -rf "$PUSH_B/.lake/build"
+  test_cmd chmod -R a-w "$PUSH_CACHE_B"
+  local rc=0
+  LAKE_CACHE_DIR="$PUSH_CACHE_B" test_out 'Push.Basic' -v --dir "$PUSH_B" build Push || rc=$?
+  test_cmd chmod -R u+w "$PUSH_CACHE_B"
+  test_exp "$rc" = 0
+  match_text 'leantar' produced.out
+  no_match_pat 'Built Push(\.Basic)?( |$)' produced.out
+}
+
 run_cases case_push_queue case_push_upload case_push_tree_changed case_push_mismatch \
   case_push_missing case_push_custom_target case_push_githash case_push_deny case_push_invalid \
   case_push_many case_push_staging case_push_concurrent case_push_stall case_push_pack_failure \
-  case_push_repair_race case_push_mapping_overwrite case_push_unset case_push_local_pruned \
-  case_push_bad_archive case_push_bad_archive_race
+  case_push_repair_race case_push_mapping_overwrite case_push_unset case_push_unset_caption \
+  case_push_local_pruned case_push_bad_archive case_push_bad_archive_race \
+  case_push_bad_archive_tick case_push_unpack_readonly
