@@ -457,6 +457,46 @@ for v in false off no; do
   LAKE_USAGE_CUTOFF=$v test_run build Test.EV
   test_exp ! -f .lake/build/lib/lean/Test/EV.usage
 done
+# `LAKE_USAGE_CUTOFF_READ_TASKS=2` lets a check read its closure in tasks, each taking at least 64 modules: PN's
+# closure has 71 workspace modules (PP, PQ0-PQ69), so its reads run in two tasks, the second taking the modules from
+# the 65th on in Lake's order of the closure (a `NameMap`'s). An unrelated edit to PP must still replay PN, which needs
+# every closure module read and each read bound to its own module; an edit to a value PN uses must still build it; and
+# so must a constant PP now duplicates from the first or the last PQ module in that order, one read by each task (the
+# build then fails, as from scratch)
+export LAKE_USAGE_CUTOFF_READ_TASKS=2
+for i in $(seq 0 69); do printf 'def pq%s : Nat := %s\n' $i $i > Test/PQ$i.lean; done
+printf 'def pp : Nat := 0\n' > Test/PP.lean
+{ printf 'import Test.PP\n'; for i in $(seq 0 69); do printf 'import Test.PQ%s\n' $i; done
+  printf 'theorem pn : pq0 + pq69 = 69 := rfl\ndef pv : Nat := pp\n'; } > Test/PN.lean
+cat > order.lean <<'EOF'
+import Lean
+open Lean
+-- the PQ modules first and last in Lake's order of PN's closure, with the index of the last
+#eval show IO Unit from do
+  let names := #[Name.mkStr2 "Test" "PP"] ++ (Array.range 70).map (Name.mkStr2 "Test" s!"PQ{·}")
+  let order := (names.foldl (·.insert · ()) (∅ : Std.TreeMap Name Unit Name.quickCmp)).keys.toArray
+  let pq := order.filter (· != Name.mkStr2 "Test" "PP")
+  IO.println s!"{pq[0]!.getString!.drop 2} {pq.back!.getString!.drop 2} {order.idxOf pq.back!}"
+EOF
+read -r pfirst plast plastAt <<< "$("$LAKE" env lean order.lean)"
+test_exp "$plastAt" -ge 64
+test_run build Test.PN
+printf 'def pp : Nat := 0\ndef unrelated := 1\n' > Test/PP.lean
+lake_out build -v Test.PN
+match_text "Built Test.PP" produced.out
+match_text "Replayed Test.PN" produced.out
+printf 'def pq69 : Nat := 70\n' > Test/PQ69.lean
+test_err "error: Test/PN.lean" build -v Test.PN
+printf 'def pq69 : Nat := 69\n' > Test/PQ69.lean
+test_run build Test.PN
+for k in $plast $pfirst; do
+  printf 'def pp : Nat := 0\ndef unrelated := 1\ndef pq%s : Nat := 0\n' $k > Test/PP.lean
+  test_err "environment already contains 'pq$k'" build -v Test.PN
+  no_match_text "Replayed Test.PN" produced.out
+  printf 'def pp : Nat := 0\ndef unrelated := 1\n' > Test/PP.lean
+  test_run build Test.PN
+done
+unset LAKE_USAGE_CUTOFF_READ_TASKS
 # control: a C body change behind a precompiled module's `@[extern]` reaches M only through `libext_X.so`, which
 # links `libleanext.so` dynamically, so its bytes and M's trace do not change. Lake with the cutoff off replays M
 # too; the cutoff must do the same here, not worse

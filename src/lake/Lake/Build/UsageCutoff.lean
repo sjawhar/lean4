@@ -311,25 +311,19 @@ The hashes of the files one usage-cutoff check (`Module.usageVerdict`, `Module.w
 read, so that every `importUsage?` binding of the check is to one hash of each file, also in the check's parallel
 tasks (`parallelRuns`), which share it. A check never reuses another's: another workspace's build can
 rebuild a shared dependency between two checks. Across checks, a file's hash is reused only while its stamp shows its
-bytes unchanged (`BuildContext.fileDigests`). Split into 256 shards by the path's hash, each behind its own mutex: the
-check's tasks hash about every file of the closure, and one mutex for all of them is contended. Persistent, because
-the tasks share it: an insert into a hash map that other threads can reach copies the whole map.
+bytes unchanged (`BuildContext.fileDigests`). Split into 256 shards by the path's hash (`Shards`): the check's tasks
+hash about every file of the closure, and one mutex for all of them is contended. Persistent, because the tasks share
+it: an insert into a hash map that other threads can reach copies the whole map.
 -/
-public structure ContentHashes where
-  shards : Vector (Std.Mutex (PHashMap FilePath ModuleUsage.Digest)) 256
+public abbrev ContentHashes := Shards 256 (PHashMap FilePath ModuleUsage.Digest)
 
 /-- An empty `ContentHashes`, for one check. -/
 public def ContentHashes.new : BaseIO ContentHashes :=
-  return ⟨← (Vector.replicate 256 ()).mapM fun _ => Std.Mutex.new {}⟩
-
-/-- The shard of `file`, from the top bits of its hash: a `Lean.PersistentHashMap` in a shard branches on the low bits. -/
-@[inline] def ContentHashes.shard (hashes : ContentHashes) (file : FilePath) :
-    Std.Mutex (PHashMap FilePath ModuleUsage.Digest) :=
-  hashes.shards[(⟨(hash file >>> 56).toNat % 256, Nat.mod_lt _ (by decide)⟩ : Fin 256)]
+  Shards.new _ {}
 
 /-- The hash the check recorded for `file`, if any. -/
 public def ContentHashes.find? (hashes : ContentHashes) (file : FilePath) : BaseIO (Option ModuleUsage.Digest) :=
-  (hashes.shard file).atomically (return (← get).find? file)
+  (hashes.get (Hashable.hash file)).atomically (return (← get).find? file)
 
 /--
 Records `hash` for `file` unless the check recorded a hash for it first, and returns the recorded one. A path has one
@@ -337,7 +331,7 @@ shard, and the first insert under that shard's mutex wins, so every task of the 
 -/
 public def ContentHashes.record (hashes : ContentHashes) (file : FilePath) (hash : ModuleUsage.Digest) :
     BaseIO ModuleUsage.Digest :=
-  (hashes.shard file).atomically <| modifyGet fun all => match all.find? file with
+  (hashes.get (Hashable.hash file)).atomically <| modifyGet fun all => match all.find? file with
     | some first => (first, all)
     | none => (hash, all.insert file hash)
 
@@ -378,25 +372,51 @@ def replayRun (r : LoggedRun β) : JobM β := do
 def minRunsPerTask : Nat := 64
 
 /--
-Runs `f` on each element of `xs` on its own (`LoggedRun`), so that the caller replays the runs it needs, in order
-(`replayRun`). Many elements run in parallel tasks, each over a slice of `xs`.
+Runs `x`, a usage-cutoff check or key write, counted in `BuildContext.usageCutoffInFlight`. The count goes down on
+every exit path: a return, an error, or the end of a cancelled job's run.
 -/
-def parallelRuns (xs : Array α) (f : α → JobM β) :
-    JobM (Array (LoggedRun β)) := JobM.ofFn fun fetch pkg? stack store ctx s => do
-  let run (x : α) : BaseIO (LoggedRun β) := do
-    return match ← (f x).toFn fetch pkg? stack store ctx {} with
-      | .ok b s' => (s'.log.entries, .ok b)
-      | .error e s' => (s'.log.entries, .error e.val)
-  let tasks := 2 * max 1 (System.Platform.Internal.getHardwareConcurrency ()).toNat
-  let size := max minRunsPerTask ((xs.size + tasks - 1) / tasks)
-  if xs.size ≤ size then
-    return .ok (← xs.mapM run) s
-  let chunks ← (Array.range ((xs.size + size - 1) / size)).mapM fun i => BaseIO.asTask do
-    (xs.extract (i * size) ((i + 1) * size)).mapM run
-  let mut runs := Array.mkEmpty xs.size
-  for chunk in chunks do
-    runs := runs ++ (← IO.wait chunk)
-  return .ok runs s
+@[inline] def countedInFlight (x : JobM α) : JobM α := do
+  let inFlight := (← getBuildContext).usageCutoffInFlight
+  inFlight.modify (· + 1)
+  try x finally inFlight.modify (· - 1)
+
+/--
+How many tasks one usage-cutoff check or key write may spawn for its reads: `LAKE_USAGE_CUTOFF_READ_TASKS` if set
+(`Lake.Env.usageCutoffReadTasks?`), else twice the hardware threads shared by the checks and key writes that run now
+(`BuildContext.usageCutoffInFlight`). At least 1, so that a slice is never empty and the count of slices is never a
+division by zero.
+-/
+def usageCutoffReadTasks : JobM Nat := do
+  if let some n := (← getLakeEnv).usageCutoffReadTasks? then return max 1 n
+  let threads := 2 * max 1 (System.Platform.Internal.getHardwareConcurrency ()).toNat
+  return max 1 (threads / max 1 (← (← getBuildContext).usageCutoffInFlight.get))
+
+/--
+Runs `f` on each element of `xs` on its own (`LoggedRun`), so that the caller replays the runs it needs, in order
+(`replayRun`). Up to `usageCutoffReadTasks` tasks take slices of `xs`; with one, the runs are serial.
+
+A check alone in a build, or one of a few, is on the build's critical path, and its reads in tasks use idle cores. A
+round of a large workspace runs hundreds of checks at once, each its own job, so the reads already use every core,
+and a check's own tasks only add traffic on the Lean runtime's task manager and on Lake's build-wide maps. Measured on
+the Linux tree on 96 cores: a round that checks 13,000 modules takes 100-125 s of wall time with serial reads against
+125-143 s with a task per 64 modules, and a round that rebuilds 1-3 modules 23-31 s serial against 13-17 s.
+-/
+def parallelRuns (xs : Array α) (f : α → JobM β) : JobM (Array (LoggedRun β)) := do
+  let tasks ← usageCutoffReadTasks
+  JobM.ofFn fun fetch pkg? stack store ctx s => do
+    let run (x : α) : BaseIO (LoggedRun β) := do
+      return match ← (f x).toFn fetch pkg? stack store ctx {} with
+        | .ok b s' => (s'.log.entries, .ok b)
+        | .error e s' => (s'.log.entries, .error e.val)
+    let size := max minRunsPerTask ((xs.size + tasks - 1) / tasks)
+    if xs.size ≤ size then
+      return .ok (← xs.mapM run) s
+    let chunks ← (Array.range ((xs.size + size - 1) / size)).mapM fun i => BaseIO.asTask do
+      (xs.extract (i * size) ((i + 1) * size)).mapM run
+    let mut runs := Array.mkEmpty xs.size
+    for chunk in chunks do
+      runs := runs ++ (← IO.wait chunk)
+    return .ok runs s
 
 /--
 A hash of every artifact of every module-system module in an import closure, with its name.
@@ -576,9 +596,10 @@ The closure state `Module.writeUsekey` must find unchanged after the compile: th
 (`modsysBefore`), and whether any workspace module of the closure is untrusted — kept, or without a key binding its
 fields to its `.olean` (`untrustedClosureModule?`). A compile reads these at its start; `writeUsekey` writes a key
 only when they still hold, because another workspace can change a shared dependency while the module compiles.
+Counted in `BuildContext.usageCutoffInFlight` while it runs (`countedInFlight`), as the key write is.
 -/
 public def usekeyBefore (importArts : NameMap ImportArtifacts) :
-    JobM (ModuleUsage.Digest × Option Name) := do
+    JobM (ModuleUsage.Digest × Option Name) := countedInFlight do
   let hashes ← ContentHashes.new
   let reads ← IO.mkRef {}
   return (← modsysHash hashes importArts, ← untrustedClosureModule? hashes reads importArts)
@@ -822,11 +843,12 @@ module of its closure is untrusted — kept, or without a key binding its fields
 the next time it is stale. That check is read twice: `untrustedBefore?` is its result as the compile started, and it
 is run again here. Another workspace can rebuild a kept dependency normally while this module compiles, so a module
 untrusted when the compile read it can have an ordinary key by the time the compile ends; the key is written only
-when neither the state the compile read nor the state now has an untrusted closure module.
+when neither the state the compile read nor the state now has an untrusted closure module. Counted in
+`BuildContext.usageCutoffInFlight` while it runs (`countedInFlight`).
 -/
 public def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
-    (importArts : NameMap ImportArtifacts) (modsysBefore : ModuleUsage.Digest)
-    (untrustedBefore? : Option Name) (oleanDigest? : Option ModuleUsage.Digest := none) : JobM Unit := do
+    (importArts : NameMap ImportArtifacts) (modsysBefore : ModuleUsage.Digest) (untrustedBefore? : Option Name)
+    (oleanDigest? : Option ModuleUsage.Digest := none) : JobM Unit := countedInFlight do
   let some (usage, usageDigest) ← readOwnUsage mod.usageFile | return
   unless usage.coversClosure importArts do return
   let hashes ← ContentHashes.new
@@ -899,10 +921,10 @@ used changed, the providers of a specialization-cache key it looked up, or a mod
 `recheck`: a kept module's digests describe its declarations as Lean compiled them, so an importer of a kept module is
 re-checked or compiled, never skipped, until that module compiles again. A kept import's recorded closure is the one
 before the accept (`closureHash` and `closureEdgesCurrent` with `kept`): it serves only to tell whether the closure
-changed.
+changed. Counted in `BuildContext.usageCutoffInFlight` while it runs (`countedInFlight`).
 -/
 public def Module.usageVerdict (mod : Module) (presetup : ModulePreSetup)
-    (importArts : NameMap ImportArtifacts) : JobM UsageVerdict := do
+    (importArts : NameMap ImportArtifacts) : JobM UsageVerdict := countedInFlight do
   let some key ← readUsageSidecar UsekeySidecar usekeyVersion mod.usekeyFile
     | return .compile "it has no usage key"
   let some (usage, _) ← readOwnUsage mod.usageFile (expected? := key.usage)
