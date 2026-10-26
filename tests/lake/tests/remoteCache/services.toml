@@ -121,6 +121,14 @@ type = "s3"
 artifactEndpoint = "%URL%/slowobj/a0"
 revisionEndpoint = "%URL%/slowobj/r0"
 
+# As `slowobj`, but the first conditional claim write closes without an HTTP response. This lets
+# the claim taker retry while the first pass uploads the entry.
+[[cache.service]]
+name = "resetclaimslowobj"
+type = "s3"
+artifactEndpoint = "%URL%/resetclaimslowobj/a0"
+revisionEndpoint = "%URL%/resetclaimslowobj/r0"
+
 # As `ok`, but the first upload of each artifact is refused (403), so that a push must try it again
 [[cache.service]]
 name = "denyartonce"

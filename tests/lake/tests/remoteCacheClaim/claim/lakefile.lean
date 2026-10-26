@@ -1,4 +1,5 @@
 import Lake
+import Lake.Build.Claim
 open System Lake DSL
 
 /-!
@@ -28,6 +29,18 @@ milliseconds, built only when named: a build with fewer workers than three runs 
 -/
 lean_lib Wide where
   roots := #[`Wide.One, `Wide.Two, `Wide.Three]
+
+
+/-- Checks that a compile ending below the slot limit wakes a pending claim wait. -/
+target freeSlotWake pkg : Unit := Job.async do
+  let start ← IO.monoMsNow
+  let wait ← withClaim none do
+    match ← claimInput pkg (Hash.ofHex "0000000000000001") with
+    | .wait wait => pure wait
+    | .compile _ => error "expected the seeded claim to make this job wait"
+  discard <| IO.wait wait.promise.result?
+  unless (← IO.monoMsNow) - start < 1000 do
+    error "claim wait did not wake when the compile slot freed"
 
 lean_exe claimexe where
   root := `Main
