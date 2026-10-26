@@ -419,6 +419,96 @@ case_push_stall() {
   test_cmd push_check status "$PUSH_STATUS" 0 2 0 2
 }
 
+case_push_dead() {
+  # A push whose first chunk reaches no service at all stops there, instead of taking each later
+  # chunk's full time too: every line stays in the queue, and the status file says why. Here the
+  # service reads each upload and never answers, and 120 lines make two chunks of 64 and 56, so a
+  # push that does not stop takes twice as long. A later push, with the service answering, sends
+  # them all.
+  push_fresh
+  cat > "$WORK_DIR/dead.toml" << EOF
+[[cache.service]]
+name = "deadput"
+type = "s3"
+artifactEndpoint = "$URL/silent/a0"
+revisionEndpoint = "$URL/silent/r0"
+EOF
+  sed -e 's|/silent/|/ok/|g' "$WORK_DIR/dead.toml" > "$WORK_DIR/live.toml"
+  LAKE_CONFIG="$WORK_DIR/dead.toml" PUSH_SERVICE=deadput build_a
+  test_cmd push_check spread "$PUSH_CACHE" 10
+  local total start elapsed rc
+  total="$(queued)"
+  test_exp "$total" = $((PUSH_COMPILES * 10))
+  start="$(date +%s)"
+  if LAKE_CONFIG="$WORK_DIR/dead.toml" PUSH_SERVICE=deadput on_a timeout 600 "$LAKE" cache push \
+      > push.out 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  elapsed=$(($(date +%s) - start))
+  tail -n 5 push.out
+  echo "lake exited with code $rc after $elapsed seconds"
+  test_exp "$rc" = 1
+  test_exp "$elapsed" -lt 300
+  match_text 'the push stops' push.out
+  test_cmd_eq "$total" queued
+  test_cmd push_check status "$PUSH_STATUS" 0 64 0 "$total"
+  "$PYTHON" -c '
+import json, sys
+status = json.load(open(sys.argv[1]))
+assert "the push stops" in status["stopped"], status
+' "$PUSH_STATUS"
+  # The service answers again: the next push sends every entry
+  LAKE_CONFIG="$WORK_DIR/live.toml" PUSH_SERVICE=deadput on_a test_run cache push
+  test_cmd_eq 0 queued
+  test_cmd push_check status "$PUSH_STATUS" "$total" 0 0 0
+}
+
+case_push_dead_follow() {
+  # A push that follows a build does not stop when it reaches no service: the build goes on
+  # queuing outputs and starts no second push, so this push waits and tries again. Here nothing
+  # listens on the service's port, so every upload fails without an answer; a lock on the follow
+  # file stands for the build that still runs, and once it goes the push stops as any other does.
+  push_fresh
+  local port_dead=1
+  cat > "$WORK_DIR/refused.toml" << EOF
+[[cache.service]]
+name = "refused"
+type = "s3"
+artifactEndpoint = "http://127.0.0.1:$port_dead/ok/a0"
+revisionEndpoint = "http://127.0.0.1:$port_dead/ok/r0"
+EOF
+  LAKE_CONFIG="$WORK_DIR/refused.toml" PUSH_SERVICE=refused on_a \
+    test_run --dir "$PUSH_A" build pair
+  test_cmd_eq 2 queued
+  local follow="$WORK_DIR/follow-lock" pid rc
+  : > "$follow"
+  # Holds the follow file's lock, as the build that started the push does
+  flock "$follow" sleep 45 &
+  local holder=$!
+  # The push must find the lock held, as it finds a build that still runs
+  until ! flock -n "$follow" true; do sleep 0.05; done
+  LAKE_CONFIG="$WORK_DIR/refused.toml" PUSH_SERVICE=refused on_a \
+    timeout 200 "$LAKE" cache push --follow "$follow" > push.out 2>&1 &
+  pid=$!
+  test_cmd push_check wait-text 60 'tries them again' push.out
+  # It is still running, and nothing of its queue is lost
+  test_exp -d /proc/$pid
+  test_cmd_eq 2 queued
+  test_exp ! -e "$PUSH_STATUS"
+  # The build ends: the push gives up and records why
+  wait $holder
+  if wait $pid; then rc=0; else rc=$?; fi
+  cat push.out
+  echo "lake exited with code $rc"
+  test_exp "$rc" = 1
+  test_cmd_eq 2 queued
+  test_cmd push_check status "$PUSH_STATUS" 0 2 0 2
+  match_text 'the push stops' push.out
+  test_exp ! -e "$follow"
+}
+
 case_push_busy() {
   # A server that answers the first upload of each object with 503 (it is busy) gets the upload
   # again, in a `curl` run of its own, and the push uploads everything. `curl` itself never tries
@@ -872,7 +962,8 @@ case_push_unpack_readonly() {
 
 run_cases case_push_queue case_push_upload case_push_tree_changed case_push_mismatch \
   case_push_missing case_push_custom_target case_push_githash case_push_deny case_push_invalid \
-  case_push_many case_push_staging case_push_concurrent case_push_stall case_push_busy \
+  case_push_many case_push_staging case_push_concurrent case_push_stall case_push_dead \
+  case_push_dead_follow case_push_busy \
   case_push_curl_hang case_push_resume case_push_pack_failure \
   case_push_repair_race case_push_mapping_overwrite case_push_unset case_push_unset_caption \
   case_push_local_pruned case_push_bad_archive case_push_bad_archive_race \
