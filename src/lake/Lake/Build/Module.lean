@@ -14,6 +14,7 @@ import Lake.Util.BuildSlots
 import Lake.Util.Proc
 import Lake.Build.Job.Register
 import Lake.Build.Common
+import Lake.Build.RemoteExec
 import Lake.Build.RemoteCache
 import Lake.Build.Target
 import Init.Omega
@@ -1033,6 +1034,169 @@ where
 
 instance : ToOutputJson ModuleOutputArtifacts := ⟨(toJson ·.descrs)⟩
 
+section RemoteExec
+/-! ## Build service (contract C2.1, C5.1)
+
+The parts of service mode that need this file's private helpers (`mkModuleSetup`,
+`computeArtifacts`): the per-module action's head, its `run` request, and the fetch that replaces
+a local compile. The session, path rewriting and typed calls are in `Lake.Build.RemoteExec`.
+-/
+
+/-- The platform/path part of a module's action (contract C2.1): plugins, dynlibs, `LEAN_PATH`
+and platform, rewritten to input-root-relative form. -/
+def Module.remoteHead (mod : Module) (presetup : ModulePreSetup) (s : RemoteSession) : JobM RemoteHead := do
+  let ws ← getWorkspace
+  let sysrootStr := s.sysroot.toString
+  -- A toolchain plugin is found under the LOCAL sysroot and named under the remote one (C2.1).
+  let localSysroot := (← getLeanInstall).sysroot
+  let localSysrootReal ← (IO.FS.realPath localSysroot).catchExceptions fun _ => pure localSysroot
+  let dirRel (dir p : FilePath) : Option String :=
+    match p.toString.dropPrefix? (dir.toString ++ "/") with
+    | some rest => some rest.toString
+    | none => none
+  let classify (p : FilePath) : JobM ((String × Option RemoteExec.Digest) × Option (FilePath × String)) := do
+    for pkg in ws.packages do
+      if let some rel := dirRel pkg.leanLibDir p then
+        let r := s!"lib/{pkg.keyName}/{rel}"
+        return ((r, none), some (p, r))
+      if let some rel := dirRel pkg.buildDir p then
+        let r := s!"native/{pkg.keyName}/{rel}"
+        return ((r, none), some (p, r))
+    if let some rel := (dirRel localSysroot p).orElse fun _ => dirRel localSysrootReal p then
+      return ((s!"{sysrootStr}/{rel}", none), none)
+    error s!"plugin {p} is outside the workspace"
+  let mut plugins := #[]
+  let mut dynlibs := #[]
+  let mut inputFiles := #[]
+  for pl in presetup.plugins do
+    let ((r, d), f?) ← classify pl.path
+    plugins := plugins.push (r, d)
+    if let some f := f? then inputFiles := inputFiles.push f
+  for dl in presetup.dynlibs do
+    let ((r, d), f?) ← classify dl.path
+    dynlibs := dynlibs.push (r, d)
+    if let some f := f? then inputFiles := inputFiles.push f
+  -- In `Workspace.leanPath` order (`Config/Workspace.lean:356-357`), each package's dir rewritten.
+  let leanPath := String.intercalate ":" <|
+    ws.packages.foldl (fun dirs pkg => s!"lib/{pkg.keyName}" :: dirs) []
+  let platform := #[("arch", "x86_64"), ("memory", "std"), ("os", "linux"), ("toolchain", s.toolchain)]
+  return {platform, sysroot := sysrootStr, leanPath, plugins, dynlibs, inputFiles}
+
+/-- The exact module-compile `run` request (contract C2.1): relative paths, `setup.json` inline,
+the toolchain as a platform property. -/
+def Module.remoteRunRequest (mod : Module) (presetup : ModulePreSetup) (s : RemoteSession)
+    (head : RemoteHead) : JobM Json := do
+  let setup ← mkModuleSetup mod presetup
+  let (importArts, importFiles) ← rewriteImportArts setup.importArts
+  let newSetup : ModuleSetup := {setup with
+    importArts
+    dynlibs := head.dynlibs.map (fun d => FilePath.mk d.1)
+    plugins := head.plugins.map (fun p => Lean.Plugin.ofFilePath (FilePath.mk p.1))}
+  let setupJson := (toJson newSetup).compress
+  let srcRel := remoteSrcPath mod
+  let oleanRel := remoteLibPath mod "olean"
+  let ileanRel := remoteLibPath mod "ilean"
+  let cRel := remoteIrPath mod "c"
+  let bcRel := remoteIrPath mod "bc"
+  let hasLLVM := Lean.Internal.hasLLVMBackend ()
+  -- As `compileLeanModule` (`Build/Actions.lean`): code generation is postponed only for a module.
+  let postpone := presetup.isModule && presetup.postponeCompile
+  let mut argv := #[s!"{head.sysroot}/bin/lean"]
+  argv := argv ++ mod.weakLeanArgs ++ mod.leanArgs
+  argv := argv.push srcRel
+  argv := argv ++ #["-o", oleanRel, "-i", ileanRel]
+  unless postpone do
+    argv := argv ++ #["-c", cRel]
+  if hasLLVM then
+    argv := argv ++ #["-b", bcRel]
+  argv := argv ++ #["--setup", "setup.json", "--json"]
+  let mut outs := #[oleanRel, ileanRel]
+  if presetup.isModule then
+    outs := outs ++ #[remoteLibPath mod "olean.server", remoteLibPath mod "olean.private"]
+    unless postpone do
+      outs := outs ++ #[remoteLibPath mod "ir.sig", remoteLibPath mod "ir"]
+  unless postpone do
+    outs := outs.push cRel
+  if hasLLVM then
+    outs := outs.push bcRel
+  outs := outs.qsort (fun a b => compare a b == .lt)
+  let inputs := #[(presetup.srcFile, srcRel)] ++ importFiles ++ head.inputFiles
+  let inputsJson := inputs.map fun (path, rel) => Json.mkObj [("rel", rel), ("path", path.toString)]
+  let platformJson := Json.mkObj (head.platform.map (fun (k, v) => (k, (toJson v : Json)))).toList
+  return Json.mkObj [
+    ("argv", (toJson argv : Json)),
+    ("env", Json.mkObj [("LEAN_PATH", head.leanPath)]),
+    ("workingDirectory", ""),
+    ("inputs", Json.arr inputsJson),
+    ("inputDirs", Json.arr #[]),
+    ("files", Json.arr #[Json.mkObj [("rel", "setup.json"), ("contents", setupJson)]]),
+    ("outputs", (toJson outs : Json)),
+    ("platform", platformJson),
+    ("timeoutSecs", (toJson (3600 : Nat) : Json)),
+    ("mnemonic", "LeanModule"),
+    ("target", mod.name.toString)]
+
+/-- Fetch a module's outputs from the build service (contract C5.1): replay an up-to-date trace
+with no request, otherwise `run` the action, materialize the outputs, and write the trace as a
+local compile does. In slice 1 every miss runs on the service; an unreachable service fails. -/
+def Module.fetchRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSession) :
+    JobM ModuleOutputArtifacts := do
+  let depTrace ← getTrace
+  let inputHash := depTrace.hash
+  let savedTrace ← readTraceFile mod.traceFile
+  -- The outputs are checked before the saved log is replayed, so a module that is rebuilt because
+  -- an output went missing does not print its messages twice.
+  if (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) then
+    if (← savedTrace.replayCachedIfUpToDate inputHash) then
+      return ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
+  buildAction depTrace mod.traceFile do
+    let session ← activeSession
+    let start ← IO.monoMsNow
+    let head ← mod.remoteHead presetup session
+    let params ← mod.remoteRunRequest presetup session head
+    let result ← match ← runAction session params with
+      | .ok r => pure r
+      | .error e =>
+        -- These answers say the service ran the action and it failed there (contract C5.1).
+        if e.code == .oom || e.code == .timeout || e.code == .diskLimit then
+          recordRemoteModule (cached := false)
+        error s!"the build service's run of {mod.name} failed: {e.message}"
+    let locMap : List (String × String × FilePath) := [
+      (remoteLibPath mod "olean", "olean", mod.oleanFile),
+      (remoteLibPath mod "olean.server", "olean.server", mod.oleanServerFile),
+      (remoteLibPath mod "olean.private", "olean.private", mod.oleanPrivateFile),
+      (remoteLibPath mod "ilean", "ilean", mod.ileanFile),
+      (remoteLibPath mod "ir.sig", "ir.sig", mod.irSigFile),
+      (remoteLibPath mod "ir", "ir", mod.irFile),
+      (remoteIrPath mod "c", "c", mod.cFile),
+      (remoteIrPath mod "bc", "bc", mod.bcFile)]
+    let found ← result.outputs.mapM fun o =>
+      match locMap.find? (·.1 == o.rel) with
+      | some (_, ext, path) => pure (ext, o.digest, path, o.executable)
+      | none => error s!"the build service returned an unexpected output {o.rel} for {mod.name}"
+    -- Counted before Lean's output is checked: a compile that failed on the service was executed
+    -- there (contract C5.1).
+    recordRemoteModule result.cached
+    appendRemoteLog session "lean" mod.name.toString (if result.cached then "cached" else "executed")
+      result.action result.exitCode (found.map fun (ext, d, _, _) => (ext, d))
+      ((← IO.monoMsNow) - start)
+    mod.clearOutputArtifacts
+    mod.clearOutputHashes
+    -- Replay the compile's output and fail on a bad exit, as a local compile does.
+    let out : IO.Process.Output := {
+      exitCode := (if result.exitCode < 0 then 255 else result.exitCode.toNat).toUInt32
+      stdout := result.stdout, stderr := result.stderr}
+    withLogErrorPos <| logLeanOutput out (relPathFrom mod.pkg.dir presetup.srcFile)
+    match ← materializeFiles session (found.map fun (_, d, p, x) => (d, p, x)) with
+    | .ok _ => pure ()
+    | .error e => error s!"materializing {mod.name} from the build service failed: {e.message}"
+    -- Hashing the outputs takes a build slot, as the read broker's check of a download does
+    -- (`ReadBroker.lean`): after a lent wait, more jobs run than the pool has workers.
+    withBuildSlot do
+      mod.computeArtifacts presetup.isModule presetup.postponeCompile
+
+end RemoteExec
+
 /--
 The outputs that a module's archive (`.ltar`) holds after its trace, in archive order, each with
 the base directory it is relative to: `false` for the library directory (the `.olean` parts,
@@ -1360,6 +1524,9 @@ where
       return .complete arts
   fetchCore (presetup : ModulePreSetup) (sawDone : Bool) :
       JobM (ClaimLoop ModuleOutputArtifacts) := do
+    -- Service mode bypasses the local compile and the shared-bucket machinery (contract C5.1).
+    if let some s ← remoteSession? then
+      return .done (← mod.fetchRemote presetup s)
     -- Whether this call compiles the module (not an earlier action of the job it continues)
     let compiledHere ← trackBuilds
     let depTrace ← getTrace
