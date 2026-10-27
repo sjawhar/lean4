@@ -403,7 +403,7 @@ def mkBuildContext
   sidecarCache := ← Std.Mutex.new {}
   fileDigests := ← Std.Mutex.new {}
   kernelProviders := ← Std.Mutex.new {}
-  usageViews := ← Std.Mutex.new {}
+  usageViews := ← Shards.new 1024 {}
   leanTrace := .ofHash (pureHash ws.lakeEnv.leanGithash)
     s!"Lean {Lean.versionStringCore}, commit {ws.lakeEnv.leanGithash}"
   cancelTk?
