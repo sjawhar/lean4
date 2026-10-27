@@ -15,6 +15,8 @@ import Lake.Util.JsonObject
 import Lake.Util.IO
 import Lake.Config.PushQueue
 import Lake.Build.Claim
+import Lake.Util.RemoteExec
+import Lake.Build.RemoteExec
 
 /-! # Build Runner
 
@@ -368,6 +370,7 @@ def mkBuildContext
       return none
   registeredJobs := jobs
   remoteReadStatus := ← IO.mkRef {}
+  remoteStats := ← IO.mkRef {}
   leanTrace := .ofHash (pureHash ws.lakeEnv.leanGithash)
     s!"Lean {Lean.versionStringCore}, commit {ws.lakeEnv.leanGithash}"
   cancelTk?
@@ -437,6 +440,14 @@ def finalizeBuild
   (cfg : BuildConfig) (bctx : BuildContext) (mctx : MonitorContext) (result : BuildResult α)
 : IO α := do
   reportResult cfg mctx.out result
+  if bctx.workspace.lakeEnv.remoteExec?.isSome && cfg.verbosity != .quiet then
+    let stats ← bctx.remoteStats.get
+    -- `ok`, `unreachable` or `off: <reason>` from this process's decision; `idle` when no `hello`.
+    let state ← remoteDecisionState
+    print! mctx.out s!"{({stats with state}).line}\n"
+    flush mctx.out
+  -- The build is done with the service; stop the bridge before Lake goes on (e.g. `lake exe` runs).
+  RemoteExec.shutdown
   let remoteStatus ← bctx.remoteReadStatus.get
   if remoteStatus.failures > 0 then
     if let .error e ← (writeRemoteReadStatus bctx.workspace.lakeCache remoteStatus).toBaseIO then
