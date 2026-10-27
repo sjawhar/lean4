@@ -241,6 +241,12 @@ open Lean.Parser
 structure LeanProcessingContext extends ProcessingContext where
   /-- Position of the first file difference if there was a previous invocation. -/
   firstDiffPos? : Option String.Pos.Raw
+  /--
+  The first file difference, if the change against the previous invocation keeps the byte length
+  but moves text after it that keeps its bytes to another line or column (see
+  `sameLengthLineShift?`).
+  -/
+  lineShiftPos? : Thunk (Option String.Pos.Raw) := .pure none
 
 /-- Monad transformer holding all relevant data for Lean processing. -/
 abbrev LeanProcessingT m := ReaderT LeanProcessingContext m
@@ -254,6 +260,47 @@ instance : MonadLift (ProcessingT m) (LeanProcessingT m) where
   monadLift := fun act ctx => act ctx.toProcessingContext
 
 /--
+Returns `start`, the first difference of the inputs `old` and `new`, if the change keeps the byte
+length but moves text after `start` that has the same bytes at the same byte offset in both inputs
+to another line or column, as when a comment `-- a\n-- b` becomes `-- a -- b`. Syntax comparisons
+(`Syntax.eqWithInfo`) accept old elaboration results for such text, but the lines and columns of
+their messages are those of the old input, and so are the editor ranges that the language server
+keeps for their message logs.
+
+The text from the end of the change on, and each byte inside the change that is equal in both
+inputs and starts a character, is checked. Columns count code points (`Position`) and UTF-16 units
+(editor positions).
+-/
+def sameLengthLineShift? (old new : String) (start : String.Pos.Raw) :
+    Option String.Pos.Raw := Id.run do
+  if old.utf8ByteSize != new.utf8ByteSize then
+    return none
+  let byte (s : String) (i : Nat) : UInt8 :=
+    if h : (⟨i⟩ : String.Pos.Raw) < s.rawEndPos then s.getUTF8Byte ⟨i⟩ h else 0
+  -- the end of the change, the same byte position in both inputs
+  let mut stop := old.utf8ByteSize
+  while stop > start.byteIdx && byte old (stop - 1) == byte new (stop - 1) do
+    stop := stop - 1
+  -- move to a character boundary inside the common suffix
+  while stop < old.utf8ByteSize && byte old stop &&& 0xC0 == 0x80 do
+    stop := stop + 1
+  -- lines, code-point columns and UTF-16 columns since `start`, where both inputs agree
+  let step (pos : Nat × Nat × Nat) (b : UInt8) : Nat × Nat × Nat :=
+    let (line, col, col16) := pos
+    if b == 10 then (line + 1, 0, 0)
+    else if b &&& 0xC0 == 0x80 then pos
+    else (line, col + 1, col16 + if b ≥ 0xF0 then 2 else 1)
+  let mut posOld := (0, 0, 0)
+  let mut posNew := (0, 0, 0)
+  for i in [start.byteIdx:stop + 1] do
+    let b := byte old i
+    if (i == stop || (b == byte new i && b &&& 0xC0 != 0x80)) && posOld != posNew then
+      return some start
+    posOld := step posOld b
+    posNew := step posNew (byte new i)
+  return none
+
+/--
 Embeds a `LeanProcessingM` action into `ProcessingM`, optionally using the old input string to speed
 up reuse analysis and supplying a cancellation token that should be triggered as soon as reuse is
 ruled out.
@@ -261,8 +308,11 @@ ruled out.
 def LeanProcessingM.run (act : LeanProcessingM α) (oldInputCtx? : Option InputContext) :
     ProcessingM α := do
   -- compute position of syntactic change once
-  let firstDiffPos? := oldInputCtx?.map (·.inputString.firstDiffPos (← read).inputString)
-  ReaderT.adapt ({ · with firstDiffPos? }) act
+  let ctx ← read
+  let firstDiffPos? := oldInputCtx?.map (·.inputString.firstDiffPos ctx.inputString)
+  let lineShiftPos? := Thunk.mk fun _ => do
+    sameLengthLineShift? (← oldInputCtx?).inputString ctx.inputString (← firstDiffPos?)
+  ReaderT.adapt ({ · with firstDiffPos?, lineShiftPos? }) act
 
 /--
 Returns true if there was a previous run and the given position is before any textual change
@@ -601,12 +651,19 @@ where
       profileit "parsing" scope.opts fun _ =>
         Parser.parseCommand ctx.toInputContext pmctx parserState .empty
 
+    -- After a change that keeps the byte length but moves the text after it to another line or
+    -- column, the old results of a command that ends after the first changed byte can have the
+    -- same bytes and positions as the new ones and still hold the old lines and columns in their
+    -- messages. (The fast path above reuses only commands that end before the change.)
+    let resultsValid (old : CommandParsedSnapshot) : Bool :=
+      ctx.lineShiftPos?.get.all (old.parserState.pos ≤ ·)
+
     -- semi-fast path
     if let some old := old? then
       -- NOTE: as `parserState.pos` includes trailing whitespace, this forces reprocessing even if
       -- only that whitespace changes, which is wasteful but still necessary because it may
       -- influence the range of error messages such as from a trailing `exact`
-      if stx.eqWithInfo old.stx then
+      if stx.eqWithInfo old.stx && resultsValid old then
         -- Here we must make sure to pass the *new* parser state; see NOTE in `unchanged`
         return (← unchanged old parserState)
       -- On first change, immediately cancel old invocation for all subsequent commands. This
@@ -615,7 +672,9 @@ where
       -- old invocation from this point on.
       old.nextCmdSnap?.forM (·.cancelRec)
       -- For the current command, we depend on the elaborator to either reuse parts of `old` or
-      -- cancel them as soon as reuse can be ruled out.
+      -- cancel them as soon as reuse can be ruled out, unless no part of it may be reused.
+      unless resultsValid old do
+        old.elabSnap.elabSnap.cancelRec
 
     -- check for cancellation, most likely during elaboration of previous command, before starting
     -- processing of next command
@@ -681,7 +740,8 @@ where
         }
       }
       let cmdState ← doElab stx revCmds cmdState beginPos
-        { old? := old?.map fun old => ⟨old.stx, old.elabSnap.elabSnap⟩, new := elabPromise }
+        { old? := old?.filter resultsValid |>.map fun old => ⟨old.stx, old.elabSnap.elabSnap⟩
+          new := elabPromise }
         elabCmdCancelTk ctx
 
       let mut reportedCmdState := cmdState
