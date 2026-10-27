@@ -756,6 +756,10 @@ def DoElemCont.withDuplicableCont (nondupDec : DoElemCont) (callerInfo : Control
     for (x, newX) in mutVars.zip muts do Term.addTermInfo' x.ident newX
     let e ← withErasedProjs mutVars (nondupDec.withDeadCodeFromInfo callerInfo).k
     mkLambdaFVars (#[r] ++ muts) e
+  -- `joinRhs` holds the rest of the `do` block. On an assigned metavariable `checkedAssign`'s quick check gives up
+  -- and its full check walks the whole term, once per nested join point; instantiated, the term usually passes the
+  -- quick check. `checkAssignment` instantiates the term before its full check anyway, so that check is unchanged.
+  let joinRhs ← instantiateMVars joinRhs
   unless ← joinRhsMVar.mvarId!.checkedAssign joinRhs do
     joinRhsMVar.mvarId!.withContext do
       throwError "Bug in a `do` elaborator. Failed to assign join point RHS{indentExpr joinRhs}\n\

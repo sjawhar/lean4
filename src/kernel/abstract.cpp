@@ -34,13 +34,28 @@ expr abstract(expr const & e, unsigned n, expr const * subst) {
 static object * lean_expr_abstract_core(object * e0, size_t n, object * subst) {
     lean_assert(n <= lean_array_size(subst));
     expr const & e = reinterpret_cast<expr const &>(e0);
-    if (!has_fvar(e) && !has_mvar(e)) {
+    /* Only occurrences of the free variables and expression metavariables in `subst` are replaced, so a subterm
+       that cannot contain one is returned as is. Universe metavariables never matter (`has_mvar` includes them). */
+    if (!has_fvar(e) && !has_expr_mvar(e)) {
+        lean_inc(e0);
+        return e0;
+    }
+    bool subst_fvar = false, subst_mvar = false;
+    for (size_t i = 0; i < n && !(subst_fvar && subst_mvar); i++) {
+        object * v = lean_array_get_core(subst, i);
+        if (is_fvar_core(v)) subst_fvar = true;
+        else if (is_mvar_core(v)) subst_mvar = true;
+    }
+    auto may_occur = [=](expr const & m) {
+        return (subst_fvar && has_fvar(m)) || (subst_mvar && has_expr_mvar(m));
+    };
+    if (!may_occur(e)) {
         lean_inc(e0);
         return e0;
     }
     expr r = replace(e, [=](expr const & m, unsigned offset) -> optional<expr> {
-            if (!has_fvar(m) && !has_mvar(m))
-                return some_expr(m); // expression m does not contain free/meta variables
+            if (!may_occur(m))
+                return some_expr(m); // `m` contains none of the free/meta variables of `subst`
             bool fv = is_fvar(m);
             bool mv = is_mvar(m);
             if (fv || mv) {

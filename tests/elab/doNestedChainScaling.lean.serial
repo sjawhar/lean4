@@ -1,0 +1,1 @@
+The test compares two elaboration times; tests running in parallel would load the machine unevenly between them.

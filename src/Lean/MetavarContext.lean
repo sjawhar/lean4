@@ -1137,8 +1137,14 @@ private def mkMVarApp (lctx : LocalContext) (mvar : Expr) (xs : Array Expr) (kin
 
 mutual
 
+  /-
+  `elim` rewrites expression metavariables only, so a subterm without one is its own result. The test is
+  `hasExprMVar`, not `hasMVar`: until the final `instantiateMVars`, many subterms the elaborator builds mention
+  assigned universe metavariables, and traversing them would make each binder cost time proportional to the whole
+  term below it.
+  -/
   private partial def visit (xs : Array Expr) (e : Expr) : M Expr :=
-    if !e.hasMVar then pure e else checkCache { val := e : ExprStructEq } fun _ => elim xs e
+    if !e.hasExprMVar then pure e else checkCache { val := e : ExprStructEq } fun _ => elim xs e
 
   private partial def elim (xs : Array Expr) (e : Expr) : M Expr :=
     match e with
@@ -1289,7 +1295,7 @@ mutual
 end
 
 partial def elimMVarDeps (xs : Array Expr) (e : Expr) : M Expr :=
-  if !e.hasMVar then
+  if !e.hasExprMVar then
     return e
   else
     withFreshCache do
