@@ -13,6 +13,7 @@ public import Lake.CLI.Shake
 public import Lake.CLI.Check
 import Lake.Version
 import Lake.Build.Run
+import Lake.Build.RemoteExec
 import Lake.Build.Infos
 import Lake.Build.Targets
 import Lake.Build.Target.Fetch
@@ -1059,6 +1060,9 @@ protected def build : CliM PUnit := do
     | none, some _ => error "`--package` requires `-o`"
     | none, none => return none
   let buildConfig := mkBuildConfig opts (out := .stdout) (showSuccess := true) outputsPackage?
+  -- Say `hello` to the build service at the build's start, so its GetCapabilities carries the
+  -- build's invocation id (contract C5.1). A no-op when service mode is off.
+  startRemoteSession ws
   ws.runBuild (buildSpecs specs) {buildConfig with forgetContext := opts.oneShot}
 
 protected def checkBuild : CliM PUnit := do
@@ -1553,5 +1557,5 @@ def lake : CliM PUnit := do
         throw <| CliError.missingCommand
 
 /-- Runs the Lake command `args`. With `oneShot`, the process exits when it returns (`LakeOptions.oneShot`). -/
-public def cli (args : List String) (oneShot := false) : BaseIO ExitCode :=
-  inline <| (lake).run args oneShot
+public def cli (args : List String) (oneShot := false) : BaseIO ExitCode := do
+  try inline <| (lake).run args oneShot finally RemoteExec.shutdown

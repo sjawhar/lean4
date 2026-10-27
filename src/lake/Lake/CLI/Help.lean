@@ -172,7 +172,25 @@ mappings of each to a file specified by the `-o` option. By default, with `-o`,
 Lake will track the targets of the root package, use `--package` to select a
 different one. These mappings can then be used to upload the build artifacts
 to a remote cache with `lake cache put`. This will only include the artifacts
-from the covered targets. Other targets in the package will not be tracked."
+from the covered targets. Other targets in the package will not be tracked.
+
+BUILD SERVICE:          compile Lean modules on a shared service instead of locally
+  LAKE_REMOTE_EXEC            service endpoint (grpc://host:port or grpcs://host:port); the switch
+  LAKE_REMOTE_EXEC_TOOLCHAIN  sha256:<hex> of the toolchain image (required with the switch)
+  LAKE_REMOTE_EXEC_SYSROOT    Lean sysroot inside the image (default: the local sysroot)
+  LAKE_REMOTE_EXEC_INSTANCE   service instance name (default: lean)
+  LAKE_REMOTE_EXEC_CLIENT     the `lean-remote` executable (default: lean-remote)
+  LAKE_REMOTE_EXEC_SOCKET     daemon socket passed to the bridge
+  LAKE_REMOTE_EXEC_LOG        append one JSON line per module resolved through the service
+  LEAN_REMOTE_CLIENT_LABEL    overrides the client label reported to the service
+
+A service whose toolchain does not run this Lake's Lean fails the build, and a module that needs
+the service fails when the service does not answer. C files and plugins still compile locally, and
+outputs are downloaded as soon as they are built.
+
+The build ends with `lake: remote: <state>; <c> cached (<m> from manifest), <e> executed, <l> local;
+other actions: …`. `executed` counts every action the service ran for this build, compiles that
+failed there included; `<state>` is ok, unreachable, off: <reason>, or idle."
 
 def helpQuery :=
 "Build targets and output results

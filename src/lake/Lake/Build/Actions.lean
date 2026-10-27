@@ -43,6 +43,41 @@ public def compileLeanIR
   }
 
 /--
+Replays the stdout and stderr of a Lean module compile into the build log and fails on a bad
+exit, exactly as a local compile does. Shared by `compileLeanModule` and the build service's
+`fetchRemote`, so a module compiled on the service reports as a local compile would.
+-/
+public def logLeanOutput (out : IO.Process.Output) (relLeanFile : FilePath) : LogIO Unit := do
+  let outLogPos ← getLogPos
+  unless out.stdout.isEmpty do
+    let txt ← out.stdout.split '\n' |>.foldM (init := "") fun (txt : String) ln => do
+      let ln := ln.copy
+      if let .ok (msg : SerialMessage) := Json.parse ln >>= fromJson? then
+        unless txt.isEmpty do
+          logInfo s!"stdout:\n{txt}"
+        let msg := {msg with fileName := mkRelPathString relLeanFile}
+        logSerialMessage msg
+        return txt
+      else if txt.isEmpty && ln.isEmpty then
+        return txt
+      else
+        return txt ++ ln ++ "\n"
+    unless txt.isEmpty do
+      logInfo s!"stdout:\n{txt}"
+  unless out.stderr.isEmpty do
+    logInfo s!"stderr:\n{out.stderr.trimAscii}"
+  -- Elide the generic "Lean exited with code 1" when Lean already
+  -- reported errors (the usual compiler-failure case). Keep it for other
+  -- nonzero codes, for code 1 without diagnostics, and for the anomalous
+  -- case where Lean logs errors but exits successfully.
+  -- See https://github.com/leanprover/lean4/issues/10825
+  let hasErrors := (← getLog).takeFrom outLogPos |>.any (·.level matches .error)
+  if out.exitCode = 1 && hasErrors then
+    failure
+  else if out.exitCode ≠ 0 || hasErrors then
+    error s!"Lean exited with code {out.exitCode}"
+
+/--
 Compiles a Lean module with `lean`, in a build slot (`withBuildSlot`), unless `takeSlot` is false:
 then the caller holds one for it (`withJobBuildSlot`).
 -/
@@ -84,34 +119,7 @@ public def compileLeanModule
     ]
   }
   let out ← if takeSlot then withBuildSlot run else run
-  let outLogPos ← getLogPos
-  unless out.stdout.isEmpty do
-    let txt ← out.stdout.split '\n' |>.foldM (init := "") fun (txt : String) ln => do
-      let ln := ln.copy
-      if let .ok (msg : SerialMessage) := Json.parse ln >>= fromJson? then
-        unless txt.isEmpty do
-          logInfo s!"stdout:\n{txt}"
-        let msg := {msg with fileName := mkRelPathString relLeanFile}
-        logSerialMessage msg
-        return txt
-      else if txt.isEmpty && ln.isEmpty then
-        return txt
-      else
-        return txt ++ ln ++ "\n"
-    unless txt.isEmpty do
-      logInfo s!"stdout:\n{txt}"
-  unless out.stderr.isEmpty do
-    logInfo s!"stderr:\n{out.stderr.trimAscii}"
-  -- Elide the generic "Lean exited with code 1" when Lean already
-  -- reported errors (the usual compiler-failure case). Keep it for other
-  -- nonzero codes, for code 1 without diagnostics, and for the anomalous
-  -- case where Lean logs errors but exits successfully.
-  -- See https://github.com/leanprover/lean4/issues/10825
-  let hasErrors := (← getLog).takeFrom outLogPos |>.any (·.level matches .error)
-  if out.exitCode = 1 && hasErrors then
-    failure
-  else if out.exitCode ≠ 0 || hasErrors then
-    error s!"Lean exited with code {out.exitCode}"
+  logLeanOutput out relLeanFile
 
 public def compileO
   (oFile srcFile : FilePath)
