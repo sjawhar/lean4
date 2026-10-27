@@ -35,6 +35,15 @@ to the one that asked first. A module's compile asks at the priority its job was
 module compile that waits for a slot. When Lake's other jobs run at `Task.Priority.max` and module
 compiles at their own priority (as with the module-times record), this is the order in which the
 task pool would have started them.
+
+Neither a job that waits for a slot nor a job whose command holds one keeps a worker of the task
+pool from other jobs: the wait (`takeBuildSlot`) and the command (`Lake.outputLending`) each lend
+their worker. So while every slot is busy and jobs wait for one, the pool still starts the jobs
+that become ready (the reads of a module whose imports are done, a job on the critical path), and
+such a job asks for a slot at its own priority. The slots bound the commands; the pool's workers
+bound Lake's own work in jobs (trace checks, hashing, usage-cutoff checks), which runs beside the
+commands. Two waits keep their worker: a slot wait beyond `maxLentSlotWaits`, and the hashing of a
+downloaded artifact, which holds a slot without a command.
 -/
 
 namespace Lake
@@ -59,7 +68,26 @@ structure BuildSlotState where
 
 builtin_initialize buildSlots : Std.Mutex (Option BuildSlotState) ← Std.Mutex.new none
 
-/-- Takes a slot, waiting for one if none is free; returns how long it waited (in milliseconds). -/
+/--
+How many jobs wait for a slot with their worker lent to the task pool at once (see
+`takeBuildSlot`): as many as the read broker lends for reads (`Lake.ReadBroker.send`).
+-/
+def maxLentSlotWaits : Nat := 1024
+
+/-- How many jobs wait for a slot with their worker lent (see `takeBuildSlot`). -/
+builtin_initialize lentSlotWaits : IO.Ref Nat ← IO.mkRef 0
+
+/--
+Takes a slot, waiting for one if none is free; returns how long it waited (in milliseconds).
+
+The wait lends this job's worker to the task pool (`IO.wait` adds a worker to the pool's limit while
+it waits), as the command of a slot holder does (`Lake.outputLending`): after a burst of
+remote-cache reads more jobs run than the pool has workers, and a wait that held its worker would
+keep the pool from starting any queued job (the next module's reads, a job on the critical path)
+until every waiting compile had run. Only `maxLentSlotWaits` jobs wait that way at once; a job
+beyond them waits holding its worker (`IO.waitAny` adds none), so waiting jobs cannot take an
+unbounded number of threads.
+-/
 def takeBuildSlot (prio : Task.Priority) : BaseIO Nat := do
   let wait? ← buildSlots.atomically do
     let s ← match ← get with
@@ -73,12 +101,15 @@ def takeBuildSlot (prio : Task.Priority) : BaseIO Nat := do
     let promise ← IO.Promise.new
     set (some {s with waiting := s.waiting.push (prio, promise)})
     return some promise
-  -- The wait holds this job's worker (`IO.waitAny` adds none to the pool's limit): the job has
-  -- nothing to do until a command of another job ends.
   let some promise := wait?
     | return 0
   let start ← IO.monoMsNow
-  discard <| IO.waitAny [promise.result?]
+  let lend ← lentSlotWaits.modifyGet fun n =>
+    if n < maxLentSlotWaits then (true, n + 1) else (false, n)
+  if lend then
+    try discard <| IO.wait promise.result? finally lentSlotWaits.modify (· - 1)
+  else
+    discard <| IO.waitAny [promise.result?]
   return (← IO.monoMsNow) - start
 
 /--
