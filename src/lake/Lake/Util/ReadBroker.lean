@@ -10,6 +10,7 @@ public import Lake.Util.Log
 public import Lake.Util.Url
 import Lake.Util.IO
 import Lake.Util.BuildSlots
+import Lake.Util.Proc
 import Std.Sync.Mutex
 import Init.Data.String.TakeDrop
 import Init.Data.String.Search
@@ -267,9 +268,11 @@ takes a slot (`withBuildSlot`), of which there are as many as the pool has worke
 
 Only `maxRuns * runSize` reads wait that way at once, one for each transfer the broker can have
 in flight; a read beyond them waits holding its worker (`IO.waitAny` adds none), so that a
-build's waiting reads cannot take an unbounded number of threads.
+build's waiting reads cannot take an unbounded number of threads. The first read also turns on
+`Lake.lendingWorkers`: from then on the build's slot holders and slot waits lend their workers too.
 -/
 public def send (req : Request) : BaseIO Outcome := do
+  lendingWorkers.set true
   let promise ← IO.Promise.new
   enqueue {req, promise, sentAt := ← IO.monoMsNow}
   let borrow ← waiters.modifyGet fun n =>
