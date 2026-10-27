@@ -759,8 +759,9 @@ def DoElemCont.withDuplicableCont (nondupDec : DoElemCont) (callerInfo : Control
   -- `joinRhs` holds the rest of the `do` block. On an assigned metavariable `checkedAssign`'s quick check gives up
   -- and its full check walks the whole term, once per nested join point; instantiated, the term usually passes the
   -- quick check. `checkAssignment` instantiates the term before its full check anyway, so that check is unchanged.
-  let joinRhs ← instantiateMVars joinRhs
-  unless ← joinRhsMVar.mvarId!.checkedAssign joinRhs do
+  -- The one-exit case below substitutes the uninstantiated `joinRhs`: which `let`s an enclosing `mkLetFVars` keeps
+  -- depends on the metavariables in the substituted term (doJoinPointLetUse.lean).
+  unless ← joinRhsMVar.mvarId!.checkedAssign (← instantiateMVars joinRhs) do
     joinRhsMVar.mvarId!.withContext do
       throwError "Bug in a `do` elaborator. Failed to assign join point RHS{indentExpr joinRhs}\n\
         to metavariable\n{joinRhsMVar.mvarId!}"
