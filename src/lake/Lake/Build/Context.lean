@@ -9,6 +9,7 @@ prelude
 public import Lake.Config.Cache
 public import Lake.Config.Context
 public import Lake.Build.Job.Basic
+public import Lake.Build.RemoteStats
 
 open System
 namespace Lake
@@ -107,6 +108,8 @@ public structure BuildContext extends BuildConfig, Context where
   registeredJobs : JobQueue
   /-- Read-through failures that `finalizeBuild` writes to `remote-status-read.json`. -/
   remoteReadStatus : IO.Ref RemoteReadStatus
+  /-- Counts and state for the build-service end-of-build line (`lake: remote: …`, contract C5.1). -/
+  remoteStats : IO.Ref RemoteStats
   /--
   Input-to-output(s) map for hashes of the tracked package's artifacts.
   If `none`, tracking outputs is disabled for this build.

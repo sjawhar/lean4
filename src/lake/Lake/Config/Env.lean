@@ -21,6 +21,46 @@ user-specified CLI options and the process environment.
 
 namespace Lake
 
+/-- What a build does when the build service does not answer (`LAKE_REMOTE_EXEC_FALLBACK`). -/
+public inductive RemoteFallback
+  /-- Compile on this machine and publish nothing (the default; design "Failure"). -/
+  | compileLocally
+  /-- Never compile on this machine: wait for the service. -/
+  | wait
+  /-- Fail the build at once (exit code 75). -/
+  | fail
+  deriving Inhabited, DecidableEq, Repr
+
+/-- When Lake fetches the bytes of outputs that are only on the build service (`LAKE_REMOTE_EXEC_MATERIALIZE`). -/
+public inductive RemoteMaterialize
+  /-- When a local process will read them (`needed`, the default). -/
+  | needed
+  /-- As soon as a build records them (`all`). -/
+  | all
+  /-- Only for processes Lake itself starts that read them (`none`): `setup-file` prints absent paths. -/
+  | never
+  deriving Inhabited, DecidableEq, Repr
+
+/-- The build service settings of this Lake process (`LAKE_REMOTE_EXEC*`, contract C5.1). -/
+public structure RemoteExecConfig where
+  endpoint : String
+  instanceName : String := "lean"
+  toolchain? : Option String := none
+  sysroot? : Option System.FilePath := none
+  cc : System.FilePath := "/usr/bin/cc"
+  path : String := "/theorem/llvm-bin:/usr/local/bin:/usr/bin:/bin"
+  client : System.FilePath := "lean-remote"
+  socket? : Option System.FilePath := none
+  fallback : RemoteFallback := .compileLocally
+  repo? : Option String := none
+  largeModules? : Option System.FilePath := none
+  materialize : RemoteMaterialize := .needed
+  log? : Option System.FilePath := none
+  manifestOut? : Option System.FilePath := none
+  skipCache : Bool := false
+  rerunFailures : Bool := false
+  deriving Inhabited, Repr
+
 /-- A Lake environment. -/
 public structure Env where
   /-- The Lake installation of the environment. -/
@@ -90,6 +130,12 @@ public structure Env where
   environment.
   -/
   remoteCache? : Option String := none
+  /--
+  The build service settings of this Lake process (`LAKE_REMOTE_EXEC*`, contract C5.1), if service
+  mode is on. Lake does not add these to `baseVars`; a process Lake starts inherits them from
+  Lake's own environment, as it does `LAKE_REMOTE_CACHE`.
+  -/
+  remoteExec? : Option RemoteExecConfig := none
   /--
   Whether builds queue the outputs they compile for upload to the `LAKE_REMOTE_CACHE` service by
   `lake cache push` (i.e., `LAKE_REMOTE_CACHE_QUEUE`; see `Cache.pushQueueFile`). Lake does not
@@ -255,6 +301,7 @@ public def compute
     cacheService? := (← IO.getEnv "LAKE_CACHE_SERVICE").map (.ofString ·.trimAscii.copy)
     cacheTokenCmd? := (← IO.getEnv "LAKE_CACHE_TOKEN_CMD").filter (!·.trimAscii.isEmpty)
     remoteCache? := (← IO.getEnv "LAKE_REMOTE_CACHE").map (·.trimAscii.copy) |>.filter (!·.isEmpty)
+    remoteExec? := ← computeRemoteExec
     remoteCacheQueue := ((← IO.getEnv "LAKE_REMOTE_CACHE_QUEUE").bind envToBool?).getD false
     remoteCacheClaims := ((← IO.getEnv "LAKE_REMOTE_CACHE_CLAIMS").bind envToBool?).getD true
     claimTakeoverSecs := ← computeClaimTakeoverSecs
@@ -315,6 +362,39 @@ where
        return default
   normalizeUrl url :=
     if url.back == '/' then url.dropEnd 1 |>.copy else url
+  computeRemoteExec : EIO String (Option RemoteExecConfig) := do
+    let get (v : String) : BaseIO (Option String) :=
+      return (← IO.getEnv v).map (·.trimAscii.copy) |>.filter (!·.isEmpty)
+    let some endpoint ← get "LAKE_REMOTE_EXEC"
+      | return none
+    unless endpoint.startsWith "grpc://" || endpoint.startsWith "grpcs://" do
+      throw s!"'LAKE_REMOTE_EXEC' must be a grpc:// or grpcs:// URL, got '{endpoint}'"
+    let fallback : RemoteFallback ← match ← get "LAKE_REMOTE_EXEC_FALLBACK" with
+      | none | some "local" => pure .compileLocally
+      | some "wait" => pure .wait
+      | some "fail" => pure .fail
+      | some v => throw s!"'LAKE_REMOTE_EXEC_FALLBACK' must be local, wait or fail, got '{v}'"
+    let materialize : RemoteMaterialize ← match ← get "LAKE_REMOTE_EXEC_MATERIALIZE" with
+      | none | some "needed" => pure .needed
+      | some "all" => pure .all
+      | some "none" => pure .never
+      | some v => throw s!"'LAKE_REMOTE_EXEC_MATERIALIZE' must be needed, all or none, got '{v}'"
+    return some {
+      endpoint, fallback, materialize
+      toolchain? := ← get "LAKE_REMOTE_EXEC_TOOLCHAIN"
+      sysroot? := (← get "LAKE_REMOTE_EXEC_SYSROOT").map FilePath.mk
+      cc := (← get "LAKE_REMOTE_EXEC_CC").getD "/usr/bin/cc"
+      path := (← get "LAKE_REMOTE_EXEC_PATH").getD "/theorem/llvm-bin:/usr/local/bin:/usr/bin:/bin"
+      client := (← get "LAKE_REMOTE_EXEC_CLIENT").getD "lean-remote"
+      socket? := (← get "LAKE_REMOTE_EXEC_SOCKET").map FilePath.mk
+      repo? := ← get "LAKE_REMOTE_EXEC_REPO"
+      largeModules? := (← get "LAKE_REMOTE_EXEC_LARGE_MODULES").map FilePath.mk
+      log? := (← get "LAKE_REMOTE_EXEC_LOG").map FilePath.mk
+      manifestOut? := (← get "LAKE_REMOTE_EXEC_MANIFEST_OUT").map FilePath.mk
+      instanceName := (← get "LAKE_REMOTE_EXEC_INSTANCE").getD "lean"
+      skipCache := (← get "LAKE_REMOTE_EXEC_SKIP_CACHE") == some "1"
+      rerunFailures := (← get "LAKE_REMOTE_EXEC_RERUN_FAILURES") == some "1"
+    }
 
 /--
 The name of the cache service that receives the cache token, if any:

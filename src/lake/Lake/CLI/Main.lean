@@ -13,6 +13,7 @@ public import Lake.CLI.Shake
 public import Lake.CLI.Check
 import Lake.Version
 import Lake.Build.Run
+import Lake.Build.RemoteExec
 import Lake.Build.Infos
 import Lake.Build.Targets
 import Lake.Build.Target.Fetch
@@ -1033,6 +1034,9 @@ protected def build : CliM PUnit := do
     | none, some _ => error "`--package` requires `-o`"
     | none, none => return none
   let buildConfig := mkBuildConfig opts (out := .stdout) (showSuccess := true) outputsPackage?
+  -- Say `hello` to the build service at the build's start, so its GetCapabilities carries the
+  -- build's invocation id (contract C5.1). A no-op when service mode is off.
+  startRemoteSession ws
   ws.runBuild (buildSpecs specs) buildConfig
 
 protected def checkBuild : CliM PUnit := do
@@ -1496,5 +1500,7 @@ def lake : CliM PUnit := do
       else
         throw <| CliError.missingCommand
 
-public def cli (args : List String) : BaseIO ExitCode :=
-  inline <| (lake).run args
+public def cli (args : List String) : BaseIO ExitCode := do
+  -- However a command ends (an exception included), stop the build-service bridge: its read task
+  -- would otherwise keep this process from exiting.
+  try inline <| (lake).run args finally RemoteExec.shutdown
