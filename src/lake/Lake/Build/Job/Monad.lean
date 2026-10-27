@@ -165,12 +165,15 @@ namespace Job
   .ofTask (caption := caption) <$> Task.pure <$>
     (withLoggedIO act).toFn fetch pkg? stack store ctx {}
 
-/-- Spawn a job that asynchronously performs `act`. -/
+/--
+Spawn a job that asynchronously performs `act`. Its module compile asks for a build slot at `prio`
+(`JobState.slotPrio`).
+-/
 @[nospecialize] public protected def async
   [OptDataKind α] (act : JobM α) (prio := Task.Priority.default) (caption := "")
 : SpawnM (Job α) := .ofFn fun fetch pkg? stack store ctx _ =>
   .ofTask (caption := caption) <$> BaseIO.asTask (prio := prio) do
-    (withLoggedIO act).toFn fetch pkg? stack store ctx {}
+    (withLoggedIO act).toFn fetch pkg? stack store ctx {slotPrio := prio}
 
 /-- Wait for a job to complete and return the result. -/
 @[inline] public protected def wait (self : Job α) : BaseIO (JobResult α) := do
@@ -218,6 +221,7 @@ message to replay; classification uses `JobState.canceled`.
 /--
 Apply `f` asynchronously to the job's output.
 If the build's cancellation token is set, errors without running `f`.
+A module compile in `f` asks for a build slot at `prio` (`JobState.slotPrio`).
 -/
 @[nospecialize] public protected def mapM
   [kind : OptDataKind β] (self : Job α) (f : α → JobM β)
@@ -229,13 +233,14 @@ If the build's cancellation token is set, errors without running `f`.
       if let some tk := ctx.cancelTk? then
         if ← tk.isSet then return canceledResult s
       let trace := mixTrace trace s.trace
-      withLoggedIO (f a) |>.toFn fetch pkg? stack store ctx {s with trace}
+      withLoggedIO (f a) |>.toFn fetch pkg? stack store ctx {s with trace, slotPrio := prio}
     | .error n s => return .error n s
 
 /--
 Apply `f` asynchronously to the job's output
 and asynchronously await the resulting job.
 If the build's cancellation token is set, errors without running `f`.
+A module compile in `f` asks for a build slot at `prio` (`JobState.slotPrio`).
 -/
 @[nospecialize] public def bindM
   [kind : OptDataKind β] (self : Job α) (f : α → JobM (Job β))
@@ -247,7 +252,8 @@ If the build's cancellation token is set, errors without running `f`.
       if let some tk := ctx.cancelTk? then
         if ← tk.isSet then return Task.pure (canceledResult sa)
       let trace := mixTrace trace sa.trace
-      match (← withLoggedIO (f a) |>.toFn fetch pkg? stack store ctx {sa with trace}) with
+      let st := {sa with trace, slotPrio := prio}
+      match (← withLoggedIO (f a) |>.toFn fetch pkg? stack store ctx st) with
       | .ok job sa =>
         return job.task.map (prio := prio) (sync := true) fun
         | .ok b sb => .ok b {sa.merge sb with trace := sb.trace}

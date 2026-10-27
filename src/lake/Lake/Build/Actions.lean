@@ -42,6 +42,10 @@ public def compileLeanIR
     env := #[("LEAN_PATH", leanPath.toString)]
   }
 
+/--
+Compiles a Lean module with `lean`, in a build slot (`withBuildSlot`), unless `takeSlot` is false:
+then the caller holds one for it (`withJobBuildSlot`).
+-/
 public def compileLeanModule
   (leanFile relLeanFile : FilePath)
   (setup : ModuleSetup) (setupFile : FilePath)
@@ -49,6 +53,7 @@ public def compileLeanModule
   (leanArgs : Array String := #[])
   (leanPath : SearchPath := [])
   (lean : FilePath := "lean")
+  (takeSlot := true)
 : LogIO Unit := do
   let mut args := leanArgs.push leanFile.toString
   if let some oleanFile := arts.olean? then
@@ -71,13 +76,14 @@ public def compileLeanModule
   args := args ++ #["--setup", setupFile.toString]
   args := args.push "--json"
   withLogErrorPos do
-  let out ← withBuildSlot <| rawProc {
+  let run := rawProc {
     args
     cmd := lean.toString
     env := #[
       ("LEAN_PATH", leanPath.toString)
     ]
   }
+  let out ← if takeSlot then withBuildSlot run else run
   let outLogPos ← getLogPos
   unless out.stdout.isEmpty do
     let txt ← out.stdout.split '\n' |>.foldM (init := "") fun (txt : String) ln => do

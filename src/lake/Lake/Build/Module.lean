@@ -1243,8 +1243,8 @@ def Module.buildLean
   let arts := mod.mkArtifacts presetup.srcFile presetup.isModule
   mod.clearOutputArtifacts
   mod.clearOutputHashes
-  compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile arts args
-    (← getLeanPath) (← getLean)
+  withJobBuildSlot <| compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile arts args
+    (← getLeanPath) (← getLean) (takeSlot := false)
   mod.computeArtifacts setup.isModule presetup.postponeCompile
 
 def  adjustMTime (arts : ModuleOutputArtifacts) (traceFile : FilePath) : JobM ModuleOutputArtifacts := do

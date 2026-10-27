@@ -78,8 +78,18 @@ public structure JobState where
   canceled : Bool := false
   /-- Current trace of a build job. -/
   trace : BuildTrace := .nil
-  /-- How long the job spent building (in milliseconds). -/
+  /--
+  How long the job spent building (in milliseconds), not counting the time it waited for a build
+  slot through `withJobBuildSlot` (`slotWait`).
+  -/
   buildTime : Nat := 0
+  /--
+  The priority at which the job's module compile asks for a build slot (`withJobBuildSlot`): the
+  priority the job was scheduled with (`Job.mapM`, `Job.bindM`, `Job.async`).
+  -/
+  slotPrio : Task.Priority := .max
+  /-- How long the job's commands waited for a build slot (in milliseconds; `withJobBuildSlot`). -/
+  slotWait : Nat := 0
   /--
   Whether a build action of this job (see `buildAction`) completed: this process ran the compiler
   or linker. It is merged from the jobs this job continues, so read it only through `trackBuilds`,
@@ -95,6 +105,8 @@ public def JobState.merge (a b : JobState) : JobState where
   canceled := a.canceled || b.canceled
   trace := mixTrace a.trace b.trace
   buildTime := a.buildTime + b.buildTime
+  slotPrio := max a.slotPrio b.slotPrio
+  slotWait := a.slotWait + b.slotWait
   built := a.built || b.built
 
 @[inline] public def JobState.modifyLog (f : Log → Log) (s : JobState) : JobState :=

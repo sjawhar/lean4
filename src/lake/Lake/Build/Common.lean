@@ -13,6 +13,7 @@ public import Lake.Util.IO
 public import Lake.Build.Actions
 public import Lake.Build.RemoteCache
 public import Lake.Build.Claim
+import Lake.Util.BuildSlots
 
 /-! # Common Build Tools
 This file defines general utilities that abstract common
@@ -317,6 +318,16 @@ public class ToOutputJson (α : Type u) where
 public instance : ToOutputJson PUnit := ⟨fun _ => Json.null⟩
 public instance : ToOutputJson Artifact := ⟨(toJson ·.descr)⟩
 
+/--
+Runs `act`, a command of this job (a module's compile), in a build slot (`withBuildSlot`) at the
+priority the job was scheduled with (`JobState.slotPrio`), and adds the time it waited for the slot
+to `JobState.slotWait`, which `buildAction` leaves out of the job's build time: the time recorded
+for a compile is then the compile's own, however long other jobs' commands kept every slot busy.
+-/
+public def withJobBuildSlot (act : JobM α) : JobM α := do
+  withBuildSlot act (prio := (← getThe JobState).slotPrio)
+    (waited := fun ms => modify fun s => {s with slotWait := s.slotWait + ms})
+
 open ToOutputJson in
 /--
 Runs `build` as a build action of kind `action`.
@@ -341,6 +352,7 @@ cannot clear it for this action.
     error s!"target is out-of-date and needs to be rebuilt"
   else
     let startTime ← IO.monoMsNow
+    let waitedBefore := (← getThe JobState).slotWait
     try
       let iniPos ← getLogPos
       let a ← build -- fatal errors will abort here
@@ -352,7 +364,8 @@ cannot clear it for this action.
       return a
     finally
       let endTime ← IO.monoMsNow
-      let elapsed := endTime - startTime
+      let waited := (← getThe JobState).slotWait - waitedBefore
+      let elapsed := endTime - startTime - waited
       modify fun s => {s with buildTime := s.buildTime + elapsed}
 
 /--

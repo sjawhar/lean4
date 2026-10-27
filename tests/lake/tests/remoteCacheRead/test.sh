@@ -302,6 +302,38 @@ assert most <= int(sys.argv[2]), most
 ' "$busy" 2
 }
 
+case_read_slot_wait_time() {
+  # A job's build time (the time its `Built` line shows) does not count the time its compile waited
+  # for a build slot. With one worker and the eight modules of `Busy`, whose mappings are all
+  # missing (each miss waits 2 s for the remote) and each of whose compiles takes a second, the
+  # compiles run one at a time after their reads, so the last one waits about 7 s for its slot; each
+  # line still shows about the second of its own compile.
+  local busy
+  busy="$WORK_DIR/busy-log"
+  fresh
+  : > "$busy"
+  LEAN_NUM_THREADS=1 LAKE_TEST_BUSY_LOG="$busy" LAKE_REMOTE_CACHE=slow \
+    test_out 'Built Busy' build Busy
+  test_cmd cp produced.out slotwait.out
+  test_cmd_eq 8 count '^+$' "$busy"
+  "$PYTHON" -c '
+import re, sys
+now = most = 0
+for line in open(sys.argv[1]):
+    now += 1 if line.strip() == "+" else -1
+    most = max(most, now)
+assert most == 1, most
+times = {}
+for line in open(sys.argv[2]):
+    m = re.search(r"Built (Busy\.B\d+) \(([0-9.]+)(ms|s)\)", line)
+    if m:
+        times[m.group(1)] = float(m.group(2)) * (1 if m.group(3) == "ms" else 1000)
+print("build times (ms):", sorted(times.values()))
+assert len(times) == 8, times
+assert max(times.values()) < 3000, times
+' "$busy" slotwait.out
+}
+
 case_read_fast_refusals() {
   # A read that the remote cache refuses at once does not count as one that waited for the remote,
   # however long the read waited before its transfer started. Here every read of the build waits
@@ -329,4 +361,4 @@ assert status["failures"] >= 16, status
 run_cases case_read_through case_read_404 case_read_invalid_mapping case_read_bad_artifact \
   case_read_bad_descriptor case_read_transport case_read_status case_read_artifact_status \
   case_read_status_persistence case_read_silent case_read_shared_runs case_read_compile_slots \
-  case_read_fast_refusals
+  case_read_slot_wait_time case_read_fast_refusals

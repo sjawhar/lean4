@@ -690,7 +690,8 @@ public partial def runWithClaimWaits
     return .ofTask (.pure (.ok a {trace := ← getTrace}))
   | .wait wait =>
     let waited : Job Unit := .ofTask (wait.promise.result?.map (sync := true) fun _ => .ok () {})
-    waited.bindM fun _ => do
+    -- The run after the wait keeps the job's priority, which its compile asks for a slot with
+    waited.bindM (prio := (← getThe JobState).slotPrio) fun _ => do
       setTrace trace
       runWithClaimWaits step wait.sawDone
 
