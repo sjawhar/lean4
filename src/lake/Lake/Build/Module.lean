@@ -1082,7 +1082,7 @@ def Module.packLtar
     | .ok files => pure files
     | .error e => error e
   let args := ltarPackArgs files self.fileName self.leanLibDir self.irDir self.ltarFile
-  withBuildSlot <| proc (quiet := true) {cmd := (← getLeantar).toString, args}
+  withBuildSlot <| proc (quiet := true) (lend := true) {cmd := (← getLeantar).toString, args}
   if (← self.pkg.isArtifactCacheWritable) then
     cacheArtifact self.ltarFile "ltar" (useLocalFile := ← self.pkg.restoreAllArtifacts)
   else
@@ -1099,7 +1099,8 @@ def Module.unpackLtar (self : Module) (ltar : FilePath) (inputHash : Hash) : Job
     "-C", self.irDir.toString,
     "-x", "-j", "-"
   ]
-  withBuildSlot <| proc (quiet := true) (input? := input.compress) {cmd := (← getLeantar).toString, args}
+  withBuildSlot <| proc (quiet := true) (input? := input.compress) (lend := true)
+    {cmd := (← getLeantar).toString, args}
 
 /--
 The cached archives that this process could not unpack, as `<cache scope>/<input hash>`: a build
