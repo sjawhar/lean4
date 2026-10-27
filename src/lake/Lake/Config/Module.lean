@@ -55,9 +55,18 @@ public def LeanLib.findModuleBySrc? (path : FilePath) (self : LeanLib) : Option 
   let modName := FilePath.components modPath.toString |>.foldl .str .anonymous
   self.findModule? modName
 
-/-- Locate the named, buildable, importable, local module in the package.  -/
+/--
+Locate the named, buildable, importable, local module in the package. Makes a `LeanLib` only for the library that has
+the module, where `leanLibs` would make one for each library, on each call.
+-/
 public def Package.findModule? (mod : Name) (self : Package) : Option Module :=
-  self.leanLibs.findSomeRev? (·.findModule? mod)
+  self.targetDecls.findSomeRev? fun t =>
+    let {name := n, kind := k, config, pkg_eq, ..} := t
+    if kind_eq : k = LeanLib.configKind then
+      let lib : LeanLib := ⟨self, n, kind_eq ▸ pkg_eq ▸ config⟩
+      if lib.isBuildableModule mod then some {lib, name := mod} else none
+    else
+      none
 
 /-- Get an `Array` of the library's modules (as specified by its globs). -/
 public def LeanLib.getModuleArray (self : LeanLib) : IO (Array Module) :=
