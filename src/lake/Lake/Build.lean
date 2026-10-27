@@ -7,6 +7,7 @@ module
 
 prelude
 public import Lake.Build.Actions
+public import Lake.Build.CcIdentity
 public import Lake.Build.Common
 public import Lake.Build.Context
 public import Lake.Build.Data
