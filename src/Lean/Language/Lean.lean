@@ -407,9 +407,8 @@ where
           ictx
           stx := newStx
           diagnostics := .empty
-          metaSnap := .finished newStx {
-            diagnostics := old.diagnostics
-          }
+          -- the header's parse messages are in the old `metaSnap`, which is always finished
+          metaSnap := .finished newStx old.metaSnap.get
           result? := some {
             parserState := newParserState
             processedSnap := (← oldSuccess.processedSnap.bindIO
@@ -425,9 +424,8 @@ where
                     cancelTk [] ctx
                   return .finished none {
                     diagnostics := .empty
-                    metaSnap := .finished newStx {
-                      diagnostics := oldProcessed.diagnostics
-                    }
+                    -- the import messages and the header info tree are in the old `metaSnap`
+                    metaSnap := .finished newStx oldProcessed.metaSnap.get
                     result? := some {
                       cmdState := oldProcSuccess.cmdState
                       firstCmdSnap := { stx? := none, task := prom.result!, cancelTk? := cancelTk } } }
@@ -468,7 +466,10 @@ where
       -- to uphold the invariant that concatenating all top-level snapshots' syntax trees results in
       -- the original file.
       if let some old := old? then
-        if trimmedStx.eqWithInfo old.stx.unsetTrailing then
+        if trimmedStx.eqWithInfo old.stx.unsetTrailing &&
+            -- `Elab.checkDeprecatedImports` reads a directive in the comment after the last import
+            stx.raw.getTrailing?.map (·.toString.contains "deprecated_module: ignore") ==
+              old.stx.getTrailing?.map (·.toString.contains "deprecated_module: ignore") then
           -- Here we must make sure to pass the *new* syntax and parser state; see NOTE in
           -- `unchanged`
           return (← unchanged old stx parserState)
