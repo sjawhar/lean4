@@ -36,7 +36,7 @@ public def compileLeanIR
   createParentDirs irFile
   createParentDirs cFile
   withBuildSlot do
-  proc {
+  proc (lend := true) {
     cmd := leanir.toString
     args := #[setupFile.toString, irFile.toString, cFile.toString]
     env := #[("LEAN_PATH", leanPath.toString)]
@@ -76,7 +76,7 @@ public def compileLeanModule
   args := args ++ #["--setup", setupFile.toString]
   args := args.push "--json"
   withLogErrorPos do
-  let run := rawProc {
+  let run := rawProc (lend := true) {
     args
     cmd := lean.toString
     env := #[
@@ -119,7 +119,7 @@ public def compileO
 : LogIO Unit := do
   createParentDirs oFile
   withBuildSlot do
-  proc {
+  proc (lend := true) {
     cmd := compiler.toString
     args := #["-c", "-o", oFile.toString, srcFile.toString] ++ moreArgs
   }
@@ -150,7 +150,7 @@ public def compileStaticLib
   let args := #["rcs"]
   let args := if thin then args.push "--thin" else args
   let args := args.push libFile.toString ++ (← mkArgs libFile <| oFiles.map toString)
-  withBuildSlot <| proc {cmd := ar.toString, args}
+  withBuildSlot <| proc (lend := true) {cmd := ar.toString, args}
 
 public def compileSharedLib
   (libFile : FilePath) (linkArgs : Array String)
@@ -158,7 +158,7 @@ public def compileSharedLib
 : LogIO Unit := do
   createParentDirs libFile
   withBuildSlot do
-  proc {
+  proc (lend := true) {
     cmd := linker.toString
     args := #["-shared", "-o", libFile.toString] ++ (← mkArgs libFile linkArgs)
     -- See `BuildConfig.macosxDeploymentTarget?` for details
@@ -171,7 +171,7 @@ public def compileExe
 : LogIO Unit := do
   createParentDirs binFile
   withBuildSlot do
-  proc {
+  proc (lend := true) {
     cmd := linker.toString
     args := #["-o", binFile.toString] ++ (← mkArgs binFile linkArgs)
     -- See `BuildConfig.macosxDeploymentTarget?` for details
@@ -236,7 +236,7 @@ public def untar (file : FilePath) (dir : FilePath) (gzip := true) : LogIO PUnit
   if gzip then
     opts := opts.push 'z'
   withBuildSlot do
-  proc (quiet := true) {
+  proc (quiet := true) (lend := true) {
     cmd := "tar",
     args := #[opts, "-f", file.toString, "-C", dir.toString]
   }

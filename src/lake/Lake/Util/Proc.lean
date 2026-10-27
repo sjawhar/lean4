@@ -26,20 +26,39 @@ public def mkCmdLog (args : IO.Process.SpawnArgs) : String :=
   unless out.stderr.isEmpty do
     log s!"stderr:\n{out.stderr.trimAscii}"
 
+/--
+Runs a process to completion, as `IO.Process.output` does, on a dedicated thread, while this thread
+waits for it with `IO.wait`, which lends this thread's worker to Lean's task pool for as long as the
+process runs. A command that holds a build slot (`Lake.withBuildSlot`) runs this way, so that while
+every slot is busy the pool can still start other jobs (e.g., the reads of a module that has just
+become ready): the commands stay bounded by the slots, and Lake's own work by the pool's workers.
+-/
+public def outputLending (args : IO.Process.SpawnArgs) (input? : Option String := none) :
+    IO IO.Process.Output := do
+  IO.ofExcept (← IO.wait (← IO.asTask (prio := .dedicated) (IO.Process.output args input?)))
+
+/--
+Runs a command and returns its output. With `lend`, the command runs with `outputLending`: only a
+command that holds a build slot may lend its worker, or a build could run any number of commands
+at once.
+-/
 @[inline] public def rawProc
-  (args : IO.Process.SpawnArgs) (quiet := false) (input? : Option String := none)
+  (args : IO.Process.SpawnArgs) (quiet := false) (input? : Option String := none) (lend := false)
 : LogIO IO.Process.Output := do
   withLogErrorPos do
   unless quiet do logVerbose (mkCmdLog args)
-  match (← IO.Process.output args input? |>.toBaseIO) with
+  let run := if lend then outputLending args input? else IO.Process.output args input?
+  let out ← run.toBaseIO
+  match out with
   | .ok out => return out
   | .error err => error s!"failed to execute '{args.cmd}': {err}"
 
+/-- Runs a command (see `rawProc`, also for `lend`) and logs its output; fails if it fails. -/
 public def proc
-  (args : IO.Process.SpawnArgs) (quiet := false) (input? : Option String := none)
+  (args : IO.Process.SpawnArgs) (quiet := false) (input? : Option String := none) (lend := false)
 : LogIO Unit := do
   withLogErrorPos do
-  let out ← rawProc args (input? := input?)
+  let out ← rawProc args (input? := input?) (lend := lend)
   if out.exitCode = 0 then
     logOutput out (if quiet then logVerbose else logInfo)
   else
