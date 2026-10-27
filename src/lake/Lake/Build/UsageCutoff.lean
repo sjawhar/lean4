@@ -376,7 +376,7 @@ it, and whether it was made now. A view is never replaced.
 -/
 def freezeUsageView (usageFile : FilePath) (read? : Option (Option ModuleUsage.Digest × UsageImport)) :
     JobM (Option (Option ModuleUsage.Digest × UsageImport) × Bool) := do
-  (← getBuildContext).usageViews.atomically do
+  ((← getBuildContext).usageViews.get (hash usageFile)).atomically do
     if let some view := (← getThe (Lean.PHashMap FilePath Dynamic)).find? usageFile then
       let some view := view.get? UsageView | error s!"{usageFile}: cached usage view has the wrong type"
       return (view.read?, false)
@@ -392,7 +392,7 @@ public def usageView? (importArts : NameMap ImportArtifacts) (m : Name) :
   let some arts := importArts.find? m | return (none, false)
   let some olean := arts.olean? | return (none, false)
   let usageFile := olean.withExtension "usage"
-  let frozen? ← (← getBuildContext).usageViews.atomically do
+  let frozen? ← ((← getBuildContext).usageViews.get (hash usageFile)).atomically do
     return (← getThe (Lean.PHashMap FilePath Dynamic)).find? usageFile
   if let some view := frozen? then
     let some view := view.get? UsageView | error s!"{usageFile}: cached usage view has the wrong type"
