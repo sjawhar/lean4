@@ -87,6 +87,26 @@ public def JobQueue := IO.Ref (Array OpaqueJob)
   IO.mkRef #[]
 
 /--
+A value split into `n` shards, each behind its own mutex, so that threads that use different shards do not wait for
+each other. The data of a key with hash `h` is in shard `Shards.index n h`.
+-/
+public structure Shards (n : Nat) (α : Type) where
+  shards : Vector (Std.Mutex α) n
+
+/-- `n` shards, each holding `a`. -/
+public def Shards.new (n : Nat) (a : α) : BaseIO (Shards n α) :=
+  return ⟨← (Vector.replicate n ()).mapM fun _ => Std.Mutex.new a⟩
+
+/-- The shard of hash `h` among `n`, from its high bits: a `Lean.PersistentHashMap` in a shard branches on the low
+bits. -/
+@[inline] public def Shards.index (n : Nat) [NeZero n] (h : UInt64) : Fin n :=
+  ⟨(h >>> 32).toNat % n, Nat.mod_lt _ (Nat.pos_of_ne_zero (NeZero.ne n))⟩
+
+/-- The shard of a key with hash `h`. -/
+@[inline] public def Shards.get [NeZero n] (s : Shards n α) (h : UInt64) : Std.Mutex α :=
+  s.shards[Shards.index n h]
+
+/--
 The kernel constants of the modules a usage-cutoff check may find a changed module's kernel constants duplicated in
 (`Lake.UsageSidecar.kernelDisjoint`), as name hashes (`Name.hash`). The checks of concurrent jobs share it, so its
 maps are persistent: an update copies only the nodes it changes, where a shared hash map would be copied whole.
@@ -154,11 +174,12 @@ public structure BuildContext extends BuildConfig, Context where
   What this build first read of each imported module's usage-cutoff sidecars, keyed by the module's `.usage`, as a
   `Lake.UsageView` (`Lake.freezeUsageView`): an entry is added once and never replaced, so a view can be older
   than the files when another process rewrote them since. Only the usage index's pre-filter reads views, and it only
-  rejects: a check that accepts reads the files again. Concurrent jobs share it, so the map is persistent, as
-  `KernelProviders`' are: a shared hash map is never updated in place, so each view added would copy its whole bucket
-  array, one entry for each importee the build has viewed.
+  rejects: a check that accepts reads the files again. Concurrent jobs share it, so the maps are persistent, as
+  `KernelProviders`' are: a shared hash map is never updated in place, so each view added would copy its shard's
+  whole bucket array. Sharded by the path's hash: each read or fill of a view (`usageView?`, `freezeUsageView`) takes
+  only the mutex of its path's shard.
   -/
-  usageViews : Std.Mutex (Lean.PHashMap FilePath Dynamic)
+  usageViews : Shards 1024 (Lean.PHashMap FilePath Dynamic)
   /--
   The kept-module checker (`LAKE_KEPT_CHECKER`): a module whose own source and options did not
   change since its outputs were built, but whose imports did, keeps those outputs if the usage
