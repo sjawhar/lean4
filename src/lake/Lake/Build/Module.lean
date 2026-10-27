@@ -1548,8 +1548,8 @@ def Module.buildLean
   mod.clearOutputArtifacts
   mod.clearOutputHashes
   let before? ← if usage then some <$> usekeyBefore setup.importArts hashes? else pure none
-  compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile outputPaths args
-    (← getLeanPath) (← getLean)
+  withJobBuildSlot <| compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile outputPaths args
+    (← getLeanPath) (← getLean) (takeSlot := false)
   mod.checkSourceUnchanged presetup
   -- With usage cutoff, one read of the `.olean` gives both the artifact's hash and the `.usekey`'s: the bytes the
   -- outputs record are the bytes the key binds.

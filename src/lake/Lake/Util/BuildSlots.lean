@@ -28,6 +28,13 @@ itself. A job that waits for the shared remote cache no longer holds one (see
 its workers, and many more jobs run at once. The slots keep the commands of those jobs bounded as
 the workers used to: a build that misses in the cache and compiles everything runs no more
 compiles at once than it did before.
+
+A slot that comes free goes to the waiting job of highest priority, and among jobs of one priority
+to the one that asked first. A module's compile asks at the priority its job was scheduled with
+(`JobState.slotPrio`); every other command asks at `Task.Priority.max`, so it goes before any
+module compile that waits for a slot. When Lake's other jobs run at `Task.Priority.max` and module
+compiles at their own priority (as with the module-times record), this is the order in which the
+task pool would have started them.
 -/
 
 namespace Lake
@@ -47,13 +54,13 @@ def buildSlotCount : BaseIO Nat := do
 structure BuildSlotState where
   /-- How many slots are free. -/
   free : Nat
-  /-- The jobs that wait for a slot, in the order in which they asked. -/
-  waiting : Array (IO.Promise Unit) := #[]
+  /-- The jobs that wait for a slot, each with its priority, in the order in which they asked. -/
+  waiting : Array (Task.Priority × IO.Promise Unit) := #[]
 
 builtin_initialize buildSlots : Std.Mutex (Option BuildSlotState) ← Std.Mutex.new none
 
-/-- Takes a slot, waiting for one if none is free. -/
-def takeBuildSlot : BaseIO Unit := do
+/-- Takes a slot, waiting for one if none is free; returns how long it waited (in milliseconds). -/
+def takeBuildSlot (prio : Task.Priority) : BaseIO Nat := do
   let wait? ← buildSlots.atomically do
     let s ← match ← get with
       | some s => pure s
@@ -64,21 +71,28 @@ def takeBuildSlot : BaseIO Unit := do
       set (some {s with free := s.free - 1})
       return none
     let promise ← IO.Promise.new
-    set (some {s with waiting := s.waiting.push promise})
+    set (some {s with waiting := s.waiting.push (prio, promise)})
     return some promise
   -- The wait holds this job's worker (`IO.waitAny` adds none to the pool's limit): the job has
   -- nothing to do until a command of another job ends.
-  if let some promise := wait? then
-    discard <| IO.waitAny [promise.result?]
+  let some promise := wait?
+    | return 0
+  let start ← IO.monoMsNow
+  discard <| IO.waitAny [promise.result?]
+  return (← IO.monoMsNow) - start
 
-/-- Gives a slot back, to the job that has waited longest for one, if any. -/
+/--
+Gives a slot back: to the waiting job of highest priority, and among those to the one that asked
+first, if any job waits.
+-/
 def giveBuildSlot : BaseIO Unit := do
   let wake? ← buildSlots.atomically do
     let some s ← get
       | return none
-    if h : 0 < s.waiting.size then
-      let promise := s.waiting[0]
-      set (some {s with waiting := s.waiting.extract 1 s.waiting.size})
+    let top := s.waiting.foldl (fun top (prio, _) => max top prio) 0
+    if let some i := s.waiting.findFinIdx? (·.1 == top) then
+      let promise := s.waiting[i].2
+      set (some {s with waiting := s.waiting.eraseIdx i})
       return some promise
     set (some {s with free := s.free + 1})
     return none
@@ -87,11 +101,15 @@ def giveBuildSlot : BaseIO Unit := do
 
 /--
 Runs `act`, a command of the build, in a slot of this build (see `buildSlotCount`): it waits
-until one is free, and gives it back when `act` ends, also when it fails.
+until one is free, and gives it back when `act` ends, also when it fails. A waiting command gets
+the next slot before those of lower `prio`. `waited` receives how long it waited (in
+milliseconds) before `act` runs.
 -/
-@[inline] public def withBuildSlot [Monad m] [MonadFinally m] [MonadLiftT BaseIO m] (act : m α) : m α := do
-  liftM takeBuildSlot
+@[inline] public def withBuildSlot [Monad m] [MonadFinally m] [MonadLiftT BaseIO m] (act : m α)
+    (prio := Task.Priority.max) (waited : Nat → m PUnit := fun _ => pure ()) : m α := do
+  let ms ← liftM (takeBuildSlot prio)
   try
+    waited ms
     act
   finally
     liftM giveBuildSlot
