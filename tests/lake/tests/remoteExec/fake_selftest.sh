@@ -205,14 +205,25 @@ check("FAKE_OMIT_VERIFIED leaves out toolchainVerified and toolchainGithash",
       h9.get("reachable") is True and "toolchainVerified" not in h9 and "toolchainGithash" not in h9, json.dumps(h9))
 b9.close()
 
-# --- FAKE_TIMEOUT_TARGET: that target's run answers TIMEOUT, another target's runs
-b10 = Bridge(FAKE_TIMEOUT_TARGET="selftest-timeout")
-result(b10.call("hello", {"protocol": 1}))
-t1 = b10.call("run", dict(req, target="selftest-timeout"))
-check("FAKE_TIMEOUT_TARGET answers TIMEOUT for that target", t1.get("error", {}).get("code") == "TIMEOUT", json.dumps(t1))
-t2 = b10.call("run", req)
-check("and another target runs", t2.get("result", {}).get("exitCode") == 0, json.dumps(t2))
-b10.close()
+# --- FAKE_TIMEOUT_TARGET, FAKE_OOM_TARGET, FAKE_DISK_TARGET: that target's run fails so, another runs
+for var, code in (("FAKE_TIMEOUT_TARGET", "TIMEOUT"), ("FAKE_OOM_TARGET", "OOM"), ("FAKE_DISK_TARGET", "DISK_LIMIT")):
+    b10 = Bridge(**{var: "selftest-fail"})
+    result(b10.call("hello", {"protocol": 1}))
+    t1 = b10.call("run", dict(req, target="selftest-fail"))
+    check(f"{var} answers {code} for that target", t1.get("error", {}).get("code") == code, json.dumps(t1))
+    t2 = b10.call("run", req)
+    check("and another target runs", t2.get("result", {}).get("exitCode") == 0, json.dumps(t2))
+    b10.close()
+
+# --- FAKE_UNREACHABLE_LATER: the first connection's hello is reachable, every later one is not
+later = os.path.join(work, "later.state")
+answers = []
+for _ in range(3):
+    bl = Bridge(FAKE_UNREACHABLE_LATER=later)
+    answers.append(result(bl.call("hello", {"protocol": 1})).get("reachable"))
+    bl.close()
+check("FAKE_UNREACHABLE_LATER makes every connection after the first unreachable",
+      answers == [True, False, False], str(answers))
 
 # --- end of input means the client is gone: the request in flight is cancelled and the bridge exits
 b11 = Bridge(FAKE_SLEEP_MS="30000")
@@ -246,18 +257,29 @@ check("no write starts after end of input",
       not os.path.exists(os.path.join(slowdir, "after.out")) and r12.get("error", {}).get("code") == "UNAVAILABLE",
       json.dumps(r12))
 
-# --- like the bridge, the fake ignores SIGINT and SIGHUP; only end of input ends it (FAKE_EXIT_LOG)
+# --- like a connected bridge, the fake ignores SIGINT, SIGHUP and SIGTERM; only end of input ends it
 exitlog = os.path.join(work, "exit.log")
 b13 = Bridge(FAKE_EXIT_LOG=exitlog)
 result(b13.call("hello", {"protocol": 1}))
-b13.p.send_signal(signal.SIGINT); b13.p.send_signal(signal.SIGHUP); time.sleep(0.2)
-check("the bridge ignores SIGINT and SIGHUP", b13.p.poll() is None)
+for s in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM): b13.p.send_signal(s)
+time.sleep(0.2)
+check("the bridge ignores SIGINT, SIGHUP and SIGTERM", b13.p.poll() is None)
 check("and exits on end of input", b13.close() == 0)
 check("FAKE_EXIT_LOG records the exit on end of input", open(exitlog).read().count("end of input") == 1)
 b14 = Bridge(FAKE_EXIT_LOG=exitlog)
 result(b14.call("hello", {"protocol": 1}))
 b14.p.kill(); b14.p.wait()
 check("and records nothing for a killed fake", open(exitlog).read().count("end of input") == 1)
+
+# --- FAKE_IGNORE_EOF_S: the fake stays that long after end of input
+b15 = Bridge(FAKE_IGNORE_EOF_S="1")
+result(b15.call("hello", {"protocol": 1}))
+t0 = time.time(); b15.p.stdin.close()
+time.sleep(0.5)
+still = b15.p.poll() is None
+rc15 = b15.p.wait(timeout=10); dt15 = time.time() - t0
+check("FAKE_IGNORE_EOF_S keeps the fake after end of input", still and rc15 == 0 and 1 <= dt15 < 3,
+      f"alive at 0.5 s: {still}, exit {rc15} after {dt15:.2f} s")
 
 print(f"\n{len(failures)} failed")
 sys.exit(1 if failures else 0)

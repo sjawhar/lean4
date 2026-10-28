@@ -97,22 +97,6 @@ public def mkHelloParams (cfg : RemoteExecConfig) (sysroot : FilePath)
 
 /-! ## Session -/
 
-/-- The build-service session of this build, built from the environment without any request.
-`none` when service mode is off; errors when it is on but the toolchain is not named. -/
-public def remoteSession? : JobM (Option RemoteSession) := do
-  let some cfg := (← getLakeEnv).remoteExec?
-    | return none
-  let toolchain ← match cfg.toolchain? with
-    | some t => pure t
-    | none => error "LAKE_REMOTE_EXEC is set but LAKE_REMOTE_EXEC_TOOLCHAIN is not"
-  let sysroot ← match cfg.sysroot? with
-    | some s => pure s
-    | none => IO.FS.realPath (← getLeanInstall).sysroot
-  let leanGithash := (← getLeanInstall).githash
-  let helloParams ← mkHelloParams cfg sysroot leanGithash (command? := none)
-  let client : RemoteExec.ClientConfig := {exe := cfg.client, socket? := cfg.socket?, helloParams}
-  return some {cfg, client, sysroot, toolchain, leanGithash}
-
 /-- This process's verdict on the build service, made once (see `ensureDecision`). -/
 public inductive SessionDecision
   /-- The service answered and its toolchain runs this Lake's Lean: in use. -/
@@ -127,33 +111,77 @@ public inductive SessionDecision
 builtin_initialize remoteDecisionRef : Std.Mutex (Option SessionDecision) ← Std.Mutex.new none
 
 /--
-The verdict of one `hello` (contract C5.1). No output is recorded unless the daemon answers
+The verdict of one `hello` answer (contract C5.1). No output is recorded unless the daemon answers
 `toolchainVerified = true`, which it sets only when the toolchain image's `lean --githash` equals
 `leanGithash` (fails closed: a missing field is false), so a wrong toolchain fails the build instead
 of recording another Lean's outputs.
 -/
+def helloVerdict (endpoint leanGithash : String) (j : Json) : SessionDecision := Id.run do
+  let str? (k : String) : Option String :=
+    (j.getObjValAs? String k).toOption.filter (!·.isEmpty)
+  unless (j.getObjValAs? Bool "reachable").toOption.getD false do
+    return .unreachable s!"build service at {endpoint} did not answer: \
+      {(str? "reason").getD "no reason given"}"
+  if (j.getObjValAs? Bool "toolchainVerified").toOption.getD false then
+    return .active
+  match str? "toolchainGithash" with
+  | some g =>
+    return .refused s!"build service at {endpoint} runs Lean {g}, but this Lake uses Lean \
+      {leanGithash}; refusing to record its outputs (check LAKE_REMOTE_EXEC_TOOLCHAIN and \
+      LAKE_REMOTE_EXEC_SYSROOT)"
+  | none =>
+    return .refused s!"build service at {endpoint} did not verify its toolchain: \
+      {(str? "reason").getD "no reason given"}; refusing to record its outputs"
+
+/-- Records that a service in use can no longer be used, so that the end-of-build line says so
+(`remoteDecisionState`). A decision that did not put the service in use is kept. -/
+def noteUnusable (d : SessionDecision) : BaseIO Unit :=
+  remoteDecisionRef.atomically do
+    if let some .active ← getThe (Option SessionDecision) then
+      set (some d : Option SessionDecision)
+
+/--
+Whether requests may go on a connection whose `hello` answered `j` (`ClientConfig.admit`): only if
+it passes the decision's check. `lake build` decides before it waits for the workspace build lock
+and starts the bridge that carries its actions after the wait, so that bridge's own `hello` can find
+the service gone or another toolchain. Such a `hello` refuses every request and is recorded.
+-/
+def admitHello (endpoint leanGithash : String) (j : Json) : BaseIO (Option String) := do
+  match helloVerdict endpoint leanGithash j with
+  | .active => return none
+  | .unreachable msg =>
+    noteUnusable (.unreachable msg)
+    return some msg
+  | .refused msg =>
+    noteUnusable (.refused msg)
+    return some msg
+
+/-- The build-service session of this build, built from the environment without any request.
+`none` when service mode is off; errors when it is on but the toolchain is not named. -/
+public def remoteSession? : JobM (Option RemoteSession) := do
+  let some cfg := (← getLakeEnv).remoteExec?
+    | return none
+  let toolchain ← match cfg.toolchain? with
+    | some t => pure t
+    | none => error "LAKE_REMOTE_EXEC is set but LAKE_REMOTE_EXEC_TOOLCHAIN is not"
+  let sysroot ← match cfg.sysroot? with
+    | some s => pure s
+    | none => IO.FS.realPath (← getLeanInstall).sysroot
+  let leanGithash := (← getLeanInstall).githash
+  let helloParams ← mkHelloParams cfg sysroot leanGithash (command? := none)
+  let client : RemoteExec.ClientConfig := {
+    exe := cfg.client, socket? := cfg.socket?, helloParams
+    admit := admitHello cfg.endpoint leanGithash }
+  return some {cfg, client, sysroot, toolchain, leanGithash}
+
+/-- The verdict of the `hello` of this process's connection (started if there is none). -/
 def decide (client : RemoteExec.ClientConfig) (endpoint leanGithash : String) : BaseIO SessionDecision := do
   match ← RemoteExec.hello client with
   | .error e =>
     if e.code == .invalid then
       return .refused e.message
     return .unreachable s!"build service at {endpoint} did not answer: {e.message}"
-  | .ok j =>
-    let str? (k : String) : Option String :=
-      (j.getObjValAs? String k).toOption.filter (!·.isEmpty)
-    unless (j.getObjValAs? Bool "reachable").toOption.getD false do
-      return .unreachable s!"build service at {endpoint} did not answer: \
-        {(str? "reason").getD "no reason given"}"
-    if (j.getObjValAs? Bool "toolchainVerified").toOption.getD false then
-      return .active
-    match str? "toolchainGithash" with
-    | some g =>
-      return .refused s!"build service at {endpoint} runs Lean {g}, but this Lake uses Lean \
-        {leanGithash}; refusing to record its outputs (check LAKE_REMOTE_EXEC_TOOLCHAIN and \
-        LAKE_REMOTE_EXEC_SYSROOT)"
-    | none =>
-      return .refused s!"build service at {endpoint} did not verify its toolchain: \
-        {(str? "reason").getD "no reason given"}; refusing to record its outputs"
+  | .ok j => return helloVerdict endpoint leanGithash j
 
 /--
 The decision, made once per process while holding the lock: every worker waits for the one `hello`
@@ -196,10 +224,11 @@ public def startRemoteSession (ws : Workspace) : IO Unit := do
   let helloParams ← mkHelloParams cfg sysroot leanGithash (command? := some "build")
   let client : RemoteExec.ClientConfig := {exe := cfg.client, socket? := cfg.socket?, helloParams}
   let decision ← ensureDecision client cfg.endpoint leanGithash
-  -- This bridge starts before the build does, so it does not inherit what the build holds, such as
-  -- the workspace build lock. The build's first request starts the bridge again, which then holds
-  -- the lock for as long as it can write into `.lake/build` (`RemoteExec.bridgeExitTimeoutMs`).
-  RemoteExec.shutdown
+  -- This bridge starts before the build does, so it does not hold the workspace build lock, and it
+  -- carried nothing but `hello`, so no write of it can land: it is killed at once, and a stuck daemon
+  -- does not delay the build's start. The build's first request starts the bridge again, which then
+  -- holds the lock for as long as it can write into `.lake/build` (`RemoteExec.bridgeExitTimeoutMs`).
+  RemoteExec.killBridge
   if let .refused msg := decision then
     throw (IO.userError msg)
 
@@ -276,10 +305,20 @@ public def rewriteImportArts (arts : NameMap ImportArtifacts) :
 
 /-! ## Typed `run` and `materialize` -/
 
+/-- Sends one request on the session's connection. An `UNAVAILABLE` answer means the service did
+not answer (contract C5.1), so the end-of-build line says `unreachable`. -/
+def callService (s : RemoteSession) (method : String) (params : Json) :
+    BaseIO (Except RemoteExec.Error Json) := do
+  let r ← RemoteExec.call s.client method params
+  if let .error e := r then
+    if e.code == .unavailable then
+      noteUnusable (.unreachable e.message)
+  return r
+
 /-- Sends a `run` request and parses its result. -/
 public def runAction (s : RemoteSession) (params : Json) :
     JobM (Except RemoteExec.Error RemoteExec.RunResult) := do
-  match ← RemoteExec.call s.client "run" params with
+  match ← callService s "run" params with
   | .error e => return .error e
   | .ok j => match RemoteExec.RunResult.ofJson? j with
     | .ok r => return .ok r
@@ -290,7 +329,7 @@ public def materializeFiles (s : RemoteSession) (files : Array (RemoteExec.Diges
     JobM (Except RemoteExec.Error RemoteExec.MaterializeResult) := do
   let arr := files.map fun (d, p, exe) =>
     Json.mkObj [("digest", (toJson d : Json)), ("path", p.toString), ("executable", exe)]
-  match ← RemoteExec.call s.client "materialize" (Json.mkObj [("files", Json.arr arr)]) with
+  match ← callService s "materialize" (Json.mkObj [("files", Json.arr arr)]) with
   | .error e => return .error e
   | .ok j => match RemoteExec.MaterializeResult.ofJson? j with
     | .ok r => return .ok r

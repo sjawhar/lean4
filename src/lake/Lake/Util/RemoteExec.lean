@@ -73,6 +73,10 @@ public structure ClientConfig where
   socket? : Option FilePath := none
   /-- The `hello` params each new bridge connection starts with (contract C5.1). -/
   helloParams : Json
+  /-- Whether requests may go on a connection whose `hello` answered this: `none` admits them,
+  `some why` refuses each request with `why` (Lake: `Lake.admitHello`). Every connection is
+  checked, a bridge started again after the first included. -/
+  admit : Json → BaseIO (Option String) := fun _ => pure none
 
 /-! ## One bridge per process, with its requests multiplexed -/
 
@@ -172,6 +176,9 @@ started again after one exited says `hello` again with the same params, so the i
 the build's. -/
 def connect (cfg : ClientConfig) : BaseIO (Except Error Conn) := do
   let args := #["bridge"] ++ (cfg.socket?.elim #[] fun s => #["--socket", s.toString])
+  -- The bridge writes its messages to Lake's standard error. A reader of that stream (a pipe, `tee`)
+  -- therefore sees it end only when the bridge exits too, which after a killed Lake is once the
+  -- daemon has cancelled that Lake's requests (`bridgeExitTimeoutMs`).
   let spawned ← (IO.Process.spawn {cmd := cfg.exe.toString, args, stdin := .piped, stdout := .piped, stderr := .inherit}).toBaseIO
   let spawnedChild ← match spawned with
     | .ok c => pure c
@@ -224,6 +231,14 @@ public def shutdown : BaseIO Unit :=
       stopBridge conn
     set (none : Option Conn)
 
+/-- Kills this process's bridge, if any, without `shutdown`'s wait: for a bridge that carried no
+request but `hello`, so that no write of it can land in the workspace. -/
+public def killBridge : BaseIO Unit :=
+  connRef.atomically do
+    if let some conn ← getThe (Option Conn) then
+      reap conn.child
+    set (none : Option Conn)
+
 /-- Sends one request and waits for its answer, lending this build's worker to the task pool while
 the daemon answers — by the base's one rule `Lake.lendingWorkers`, the same bounded `IO.wait`/
 `IO.waitAny` path a broker read (`ReadBroker.send`) and a slot wait (`takeBuildSlot`) use. Without
@@ -233,6 +248,8 @@ public def call (cfg : ClientConfig) (method : String) (params : Json) : BaseIO 
   let conn ← match ← getConn cfg with
     | .ok c => pure c
     | .error e => return .error e
+  if let some why ← cfg.admit conn.hello then
+    return .error {code := .unavailable, message := why}
   let id ← conn.nextId.modifyGet fun n => (n, n + 1)
   let promise ← IO.Promise.new
   conn.pending.atomically (modify (·.insert id promise))
