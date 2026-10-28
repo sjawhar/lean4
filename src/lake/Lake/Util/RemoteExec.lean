@@ -179,6 +179,8 @@ def connect (cfg : ClientConfig) : BaseIO (Except Error Conn) := do
   -- The bridge writes its messages to Lake's standard error. A reader of that stream (a pipe, `tee`)
   -- therefore sees it end only when the bridge exits too, which after a killed Lake is once the
   -- daemon has cancelled that Lake's requests; no limit of Lake's applies then.
+  -- It stays in Lake's process group (no `setsid`), so a signal to the group reaches it as the build
+  -- lock design expects: a connected bridge ignores it and outlives Lake until end of input.
   let spawned ← (IO.Process.spawn {cmd := cfg.exe.toString, args, stdin := .piped, stdout := .piped, stderr := .inherit}).toBaseIO
   let spawnedChild ← match spawned with
     | .ok c => pure c
