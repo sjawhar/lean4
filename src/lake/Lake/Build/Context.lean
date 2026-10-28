@@ -143,6 +143,72 @@ public structure RemoteReadStatus where
 public def RemoteReadStatus.add (message : String) (status : RemoteReadStatus) : RemoteReadStatus :=
   {status with failures := status.failures + 1, lastError := message}
 
+/-! ## The stamped digest log -/
+
+namespace DigestLog
+
+/-- The file in a workspace's `.lake` directory that keeps `BuildContext.fileDigests` across Lake processes. -/
+public def file (lakeDir : FilePath) : FilePath := lakeDir / "usage-digests"
+
+/-- The first bytes of every record, with the format version; a change to `Lean.ModuleUsage.fileDigest` must change it,
+so that no record of the old hash is taken. -/
+public def magic : UInt64 := 0x01474b4447534b4c
+
+@[inline] def putU64 (b : ByteArray) (v : UInt64) : ByteArray :=
+  b.push v.toUInt8 |>.push (v >>> 8).toUInt8 |>.push (v >>> 16).toUInt8 |>.push (v >>> 24).toUInt8
+    |>.push (v >>> 32).toUInt8 |>.push (v >>> 40).toUInt8 |>.push (v >>> 48).toUInt8 |>.push (v >>> 56).toUInt8
+
+@[inline] def getU64 (b : ByteArray) (i : Nat) : UInt64 :=
+  let g (k : Nat) : UInt64 := (b.get! (i + k)).toUInt64
+  g 0 ||| g 1 <<< 8 ||| g 2 <<< 16 ||| g 3 <<< 24 ||| g 4 <<< 32 ||| g 5 <<< 40 ||| g 6 <<< 48 ||| g 7 <<< 56
+
+/--
+One record: `magic`, the path's UTF-8 length and bytes, the stamp's seven fields, the digest, and `ByteArray.hash` of
+all the bytes before it, so that a record a crash cut short, or bytes damaged since, are never taken.
+-/
+public def encode (path : FilePath) (stamp : Lean.ModuleUsage.FileStamp) (digest : Lean.ModuleUsage.Digest) :
+    ByteArray :=
+  let p := path.toString.toUTF8
+  let b := putU64 (putU64 (ByteArray.emptyWithCapacity (p.size + 96)) magic) p.size.toUInt64 |>.append p
+  let b := [stamp.dev, stamp.ino, stamp.size, stamp.mtimeSec, stamp.mtimeNsec, stamp.ctimeSec, stamp.ctimeNsec,
+    digest.hi, digest.lo].foldl putU64 b
+  putU64 b b.hash
+
+/-- The records of a log's bytes, in order, up to the first that is not whole and intact, and the number of bytes
+they take. -/
+public def decode (bytes : ByteArray) :
+    Array (FilePath × Lean.ModuleUsage.FileStamp × Lean.ModuleUsage.Digest) × Nat := Id.run do
+  let mut out := #[]
+  let mut i := 0
+  while i + 16 ≤ bytes.size do
+    unless getU64 bytes i == magic do break
+    let len := (getU64 bytes (i + 8)).toNat
+    let fields := i + 16 + len
+    let stop := fields + 72
+    unless stop + 8 ≤ bytes.size do break
+    unless (bytes.extract i stop).hash == getU64 bytes stop do break
+    let some path := String.fromUTF8? (bytes.extract (i + 16) fields) | break
+    let f (k : Nat) := getU64 bytes (fields + 8 * k)
+    out := out.push (FilePath.mk path,
+      { dev := f 0, ino := f 1, size := f 2, mtimeSec := f 3, mtimeNsec := f 4, ctimeSec := f 5, ctimeNsec := f 6 },
+      ⟨f 7, f 8⟩)
+    i := stop + 8
+  return (out, i)
+
+end DigestLog
+
+/--
+The stamped digests of a workspace's log (`DigestLog`), the last record of each path, read in a task while the build
+starts, and the open handle that appends to it.
+-/
+public structure DigestLogState where
+  /-- The digests the log holds, by path, with the stamp each was taken under; empty if it has none or cannot be read. -/
+  loaded : Task (Std.HashMap FilePath (Lean.ModuleUsage.FileStamp × Lean.ModuleUsage.Digest))
+  /-- The log's path, or `none` if the build keeps no log (usage cutoff off). -/
+  file? : Option FilePath
+  /-- The handle that appends to it: unopened (`none`), open, or not openable (`some none`). -/
+  handle : Std.Mutex (Option (Option IO.FS.Handle))
+
 
 /-- A Lake context with a build configuration and additional build data. -/
 public structure BuildContext extends BuildConfig, Context where
@@ -186,6 +252,15 @@ public structure BuildContext extends BuildConfig, Context where
   reads `MAP_PRIVATE` (`:528`).
   -/
   fileDigests : Shards 1024 (Lean.PHashMap FilePath (Lean.ModuleUsage.FileStamp × Lean.ModuleUsage.Digest))
+  /--
+  The workspace's stamped digest log (`DigestLog`): a hash `fileDigests` lacks is taken from it under the same rule, the
+  file's current stamp being the recorded one, and a hash a check computes is appended to it when its stamp was judged
+  by the fine rule (`Lean.ModuleUsage.stampsFine`: a file system that sets status-change times itself), so that the
+  next Lake process does not read the file again. Such a stamp stood when the bytes were read
+  (`Lean.ModuleUsage.fileDigestStamped`), and every later change to the file changes it. Whoever can write the log can
+  write the workspace's build outputs and usage keys, which it takes digests of.
+  -/
+  digestLog : DigestLogState
   /-- The kernel constants usage-cutoff checks read from `.olean` files in this build. -/
   kernelProviders : Std.Mutex KernelProviders
   /--

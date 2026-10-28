@@ -1533,8 +1533,11 @@ def Module.buildLean
   let olean? ← if usage then some <$> IO.FS.readBinFile mod.oleanFile else pure none
   let arts ← mod.computeArtifacts setup.isModule presetup.postponeCompile (olean?.map Hash.ofByteArray)
   if let some (modsysBefore, untrustedBefore?) := before? then
+    -- the `.usage` is kept for the usage index only where `Module.indexUsage` takes it after the build
+    let indexed := !presetup.isModule && !mod.shouldPrecompile && (← mod.pkg.isArtifactCacheWritable) &&
+      (← mod.pkg.restoreAllArtifacts)
     mod.writeUsekey presetup setup.importArts modsysBefore untrustedBefore?
-      (olean?.map ModuleUsage.fileDigestOfBytes)
+      (olean?.map ModuleUsage.fileDigestOfBytes) (usageArt? := if indexed then arts.usage?.map (·.hash) else none)
   return arts
 
 /--
@@ -1770,8 +1773,11 @@ def Module.indexUsage (mod : Module) (presetup : ModulePreSetup) (arts : ModuleO
   let compact := Cache.usageIndexCompactFile <|
     cache.usageIndexFile mod.pkg.cacheScope presetup.localTrace.hash usekey.hash
   let compact? ← id do
-    if (← hasCompactUsage compact usekey.path) then return none
     let some usage := arts.usage? | return none
+    -- the record of the `.usage` this process's compile parsed, if it did (`takeCompactUsage?`)
+    let made? ← takeCompactUsage? usage.hash
+    if (← hasCompactUsage compact usekey.path) then return none
+    if let some made := made? then return made
     compactUsage? usage.path
   cache.writeUsageIndex mod.pkg.cacheScope presetup.localTrace.hash usekey.hash
     (toJson {arts.descrs with ltar? := none}) log compact?

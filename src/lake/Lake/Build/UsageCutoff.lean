@@ -218,6 +218,11 @@ instance : FromJson UsekeySidecar where
       kept := (j.getObjValAs? Bool "kept").toOption.getD false
     }
 
+/-- The closure of direct import `m` that the key's compile imported (`UsageImport.importedClosures`, sorted by
+`Name.quickLt` as Lean writes it). -/
+def UsekeySidecar.importedClosure? (key : UsekeySidecar) (m : Name) : Option ModuleUsage.Digest :=
+  (key.importer.importedClosures.binSearch (m, ⟨0, 0⟩) (Name.quickLt ·.1 ·.1)).map (·.2)
+
 /--
 The bytes of the usage-cutoff sidecar at `path` with their digest and the stamp of the file they were read from, if
 it stands for them (`Lean.ModuleUsage.readFileStamped`), or `none` if it does not exist or its bytes do not have the
@@ -336,6 +341,12 @@ public structure ContentHashes where
   imports : IO.Ref (Std.HashMap Name ImportRead)
   /-- The read of each importee by a read that accepts a kept module's key (`importUsage?` with `kept`). -/
   keptImports : IO.Ref (Std.HashMap Name ImportRead)
+  /-- The decision's `closureHash` with `kept` and no `importedClosures?`, once computed: it folds bound reads, so it
+  is the same for every check of the decision, which the usage index's pre-filter uses (`usagePrefilter`). -/
+  keptClosure : IO.Ref (Option (Option ModuleUsage.Digest))
+  /-- A direct import whose closure the decision found changed, with its bound closure (`changedDirectImport?`): the
+  pre-filter rejects a candidate whose key records another closure for it (`usagePrefilter`). -/
+  changedImport : IO.Ref (Option (Name × Option ModuleUsage.Digest))
 
 /-- An empty `ContentHashes`, for one decision. -/
 public def ContentHashes.new : BaseIO ContentHashes :=
@@ -343,6 +354,8 @@ public def ContentHashes.new : BaseIO ContentHashes :=
     shards := ← Shards.new 256 {}
     imports := ← IO.mkRef {}
     keptImports := ← IO.mkRef {}
+    keptClosure := ← IO.mkRef none
+    changedImport := ← IO.mkRef none
   }
 
 /-- The hash the decision recorded for `file`, if any. -/
@@ -360,20 +373,50 @@ public def ContentHashes.record (hashes : ContentHashes) (file : FilePath) (hash
     | some first => (first, all)
     | none => (hash, all.insert file hash)
 
+/-- Appends a record of `file`'s digest under `stamp` to the workspace's stamped digest log (`DigestLogState`), one
+`write` per record; after a failure to open it, the build appends nothing more. -/
+def appendDigestLog (log : DigestLogState) (file : FilePath) (stamp : ModuleUsage.FileStamp)
+    (digest : ModuleUsage.Digest) : BaseIO Unit := do
+  let some path := log.file? | return
+  -- after the read, which can write the log again (`loadDigestLog`)
+  discard <| IO.wait log.loaded
+  log.handle.atomically do
+    let h? ← match (← get) with
+      | some h? => pure h?
+      | none =>
+        let h? := (← (IO.FS.Handle.mk path .append).toBaseIO).toOption
+        set (some h?)
+        pure h?
+    let some h := h? | return
+    if (← (do h.write (DigestLog.encode file stamp digest); h.flush : IO Unit).toBaseIO) matches .error _ then
+      set (some (none : Option IO.FS.Handle))
+
 /--
 The hash of `file`'s current bytes (`Lean.ModuleUsage.fileDigest`, 128 bits), never read from a
 `.hash` file: an `.olean` rewritten behind Lake's back (e.g., by `lean -o`) keeps its old `.hash`,
-and a usage-cutoff decision must see the new bytes. Taken from an earlier decision of the build only if the file's stamp
-(`Lean.ModuleUsage.fileStamp`) is the one recorded when those bytes were read (`BuildContext.fileDigests`).
+and a usage-cutoff decision must see the new bytes. Taken from an earlier decision of the build, or from the
+workspace's stamped digest log that earlier Lake processes wrote (`BuildContext.digestLog`), only if the file's stamp
+(`Lean.ModuleUsage.fileStamp`) is the one recorded when those bytes were read (`BuildContext.fileDigests`). A hash
+computed here under a settled stamp goes to the build's memo, and to the log only if the stamp's file system sets
+status-change times itself (`Lean.ModuleUsage.stampsFine`, with a nonzero nanosecond field): on others (NFS, FUSE such
+as sshfs, which copies the modification time) a stamp can stay while the bytes change, or look older than the server's
+file, across processes.
 -/
 def stampedDigest (file : FilePath) : JobM ModuleUsage.Digest := do
-  let memo := (← getBuildContext).fileDigests.get (Hashable.hash file)
+  let ctx ← getBuildContext
+  let memo := ctx.fileDigests.get (Hashable.hash file)
   if let some stamp ← ModuleUsage.fileStamp file then
     if let some (recorded, hash) ← memo.atomically (return (← get).find? file) then
       if recorded == stamp then return hash
+    if let some (recorded, hash) := ctx.digestLog.loaded.get[file]? then
+      if recorded == stamp then
+        memo.atomically (modify (·.insert file (stamp, hash)))
+        return hash
   let (hash, stamp?) ← ModuleUsage.fileDigestStamped file
   if let some stamp := stamp? then
     memo.atomically (modify (·.insert file (stamp, hash)))
+    if ctx.digestLog.file?.isSome && stamp.ctimeNsec != 0 then
+      if (← ModuleUsage.stampsFine file) then appendDigestLog ctx.digestLog file stamp hash
   return hash
 
 /--
@@ -650,12 +693,43 @@ def closureHash (hashes : ContentHashes) (presetup : ModulePreSetup)
     (importArts : NameMap ImportArtifacts)
     (importedClosures? : Option (NameMap ModuleUsage.Digest) := none) (kept := false) :
     JobM (Option ModuleUsage.Digest) := do
+  let memo? := if kept && importedClosures?.isNone then some hashes.keptClosure else none
+  if let some memo := memo? then
+    if let some closure ← memo.get then return closure
   readImports hashes importArts (directModules presetup) (kept := kept)
-  foldClosureHash presetup fun m => do
+  let closure ← foldClosureHash presetup fun m => do
     let some (_, imp) ← importUsage? hashes importArts m (kept := kept) | return none
     if let some imported := importedClosures? then
       unless imported.find? m == some imp.closure do return none
     return some imp.closure
+  if let some memo := memo? then memo.set (some closure)
+  return closure
+
+/--
+A direct workspace import whose closure now is not the one the module's compile imported, as the module's key records
+it (`UsekeySidecar.importer`, `UsageImport.importedClosures`), with its current closure (`none` if `importUsage?` with
+`kept` accepts nothing for it), looked for only among the imports whose `.usekey` changed after `usekeyFile`, the
+module's own; `none` if each of those has the closure the compile imported. The key's `closure` folds the imported
+closures (`Module.writeUsekey`), so such an import shows that the closure `closureHash` with `kept` folds now is not
+the key's: the verdict that reads every direct import would compile too. A root module that imports every module of a
+workspace finds it among the few imports a round rebuilt, where `closureHash` reads every direct import. The
+imports' stamps are read in parallel (`parallelRuns`); an import whose `.usekey` cannot be stamped is read.
+-/
+def changedDirectImport? (hashes : ContentHashes) (presetup : ModulePreSetup) (importArts : NameMap ImportArtifacts)
+    (key : UsekeySidecar) (usekeyFile : FilePath) : JobM (Option (Name × Option ModuleUsage.Digest)) := do
+  let some own ← ModuleUsage.fileStamp usekeyFile | return none
+  let mods := directModules presetup
+  let runs ← parallelRuns mods fun m => do
+    let some olean := (importArts.find? m).bind (·.olean?) | return false
+    let some s ← ModuleUsage.fileStamp (olean.withExtension "usekey") | return true
+    return s.mtimeSec > own.mtimeSec || (s.mtimeSec == own.mtimeSec && s.mtimeNsec > own.mtimeNsec)
+  for m in mods, r in runs do
+    unless (← replayRun r) do continue
+    let current := (← importUsage? hashes importArts m (kept := true)).map (·.2.closure)
+    let recorded := key.importedClosure? m
+    if current.isNone || current != recorded then
+      return some (m, current)
+  return none
 
 /--
 The first workspace module of the closure (`importArts`; module-system files aside, which `modsysHash` pins) whose
@@ -951,6 +1025,18 @@ def UsageSidecar.resolvedUnchanged (usage : UsageSidecar) (presetup : ModulePreS
   usage.kernelDisjoint presetup hashes importArts changed
 
 /--
+The `.usage` files this process's compiles wrote a key for, as `Module.writeUsekey` parsed them, with the digest of
+their bytes, by their artifact hash (`Artifact.hash`): the usage index's compact record of one is made from here
+(`takeCompactUsage?`), not from a second parse. An entry is removed when it is taken, and all are dropped once
+`maxParsedUsages` wait, so that compiles whose outputs no index takes cannot keep their records for the whole build.
+-/
+builtin_initialize parsedUsages : Std.Mutex (Std.HashMap Hash (UsageSidecar × ModuleUsage.Digest)) ←
+  Std.Mutex.new {}
+
+/-- How many entries `parsedUsages` holds at most. -/
+def maxParsedUsages : Nat := 64
+
+/--
 Writes the module's `.usekey` from the `.usage` Lean just wrote: the digest of the `.usage` bytes, the module's
 local trace hash, the hash of its `.olean`, the `modsysHash` of its closure, the `closureHash` of its direct imports,
 for each workspace `extra` module, the hash of its `.olean` and its current `moduleDigest`, and the `.usage` fields its
@@ -972,11 +1058,13 @@ read twice: `untrustedBefore?` is its result as the compile started, and it is r
 rebuild a kept dependency normally while this module compiles, so a module untrusted when the compile read it can
 have an ordinary key by the time the compile ends; the key is written only when neither the state the compile read
 nor the state now has an untrusted closure module. Counted in `BuildContext.usageCutoffInFlight` while it runs
-(`countedInFlight`).
+(`countedInFlight`). With `usageArt?`, the artifact hash of the `.usage`, it keeps the `.usage` it read for the usage
+index when it writes the key (`parsedUsages`), so that the index does not parse it again (`Module.indexUsage`).
 -/
 public def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     (importArts : NameMap ImportArtifacts) (modsysBefore : ModuleUsage.Digest) (untrustedBefore? : Option Name)
-    (oleanDigest? : Option ModuleUsage.Digest := none) : JobM Unit := countedInFlight do
+    (oleanDigest? : Option ModuleUsage.Digest := none) (usageArt? : Option Hash := none) : JobM Unit :=
+    countedInFlight do
   let some (usage, usageDigest) ← readOwnUsage mod.usageFile | return
   unless usage.coversClosure importArts do return
   let hashes ← ContentHashes.new
@@ -1007,6 +1095,11 @@ public def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     ("importer", usage.importerJson)
   ]
   ModuleUsage.writeFileReplacing mod.usekeyFile key.compress.toUTF8
+  if let some art := usageArt? then
+    -- a few entries at most: `Module.indexUsage` takes each one after the module's build, unless the build fails or
+    -- does not cache; an entry no build takes is dropped at the next insert past `maxParsedUsages`
+    parsedUsages.atomically <| modify fun m =>
+      (if m.size ≥ maxParsedUsages then {} else m).insert art (usage, usageDigest)
 
 /-- What a stale module's usage records say about it (`Module.usageVerdict`). -/
 public inductive UsageVerdict
@@ -1070,16 +1163,25 @@ public def Module.usageVerdict (mod : Module) (presetup : ModulePreSetup)
     JobM UsageVerdict := countedInFlight do
   let some key ← readUsageSidecar UsekeySidecar usekeyVersion files.usekey
     | return .compile "it has no usage key"
-  let some (usage, _) ← readOwnUsage files.usage (expected? := key.usage)
-    | return .compile "its usage record is missing or is not the one its key was written from"
-  if usage.noskip then return .compile "its usage record may be incomplete"
+  -- The checks that need only the key come first: they all lead to `compile`, and a module whose closure changed (a
+  -- library's root, which imports every module) then never parses its `.usage`.
   if key.localHash != presetup.localTrace.hash then return .compile "its local inputs changed"
-  unless usage.coversClosure importArts do
-    return .compile "a module of its closure had no usage digests when it was compiled"
   unless (← contentHash hashes files.olean) == key.olean do
     return .compile "its usage record describes another .olean"
   unless (← modsysHash hashes importArts) == key.modsys do
     return .compile "a module-system file of its closure changed"
+  if let some changed ← changedDirectImport? hashes presetup importArts key files.usekey then
+    hashes.changedImport.set (some changed)
+    return .compile "its import closure changed, so a name it looked up, used or referred to may resolve elsewhere"
+  let some closure ← closureHash hashes presetup importArts (kept := true)
+    | return .compile "a direct import has no usage record that shows its closure"
+  unless closure == key.closure do
+    return .compile "its import closure changed, so a name it looked up, used or referred to may resolve elsewhere"
+  let some (usage, _) ← readOwnUsage files.usage (expected? := key.usage)
+    | return .compile "its usage record is missing or is not the one its key was written from"
+  if usage.noskip then return .compile "its usage record may be incomplete"
+  unless usage.coversClosure importArts do
+    return .compile "a module of its closure had no usage digests when it was compiled"
   for m in usage.extra do
     if (← findModule? m).isNone then continue
     let some (oleanHash, digest) := key.extra.find? m
@@ -1088,10 +1190,6 @@ public def Module.usageVerdict (mod : Module) (presetup : ModulePreSetup)
       | return .compile s!"{m}, whose machinery it used, has no current usage record"
     unless (← contentHash hashes olean) == oleanHash && imp.moduleDigest == digest do
       return .compile s!"{m}, whose machinery it used, changed"
-  let some closure ← closureHash hashes presetup importArts (kept := true)
-    | return .compile "a direct import has no usage record that shows its closure"
-  unless closure == key.closure do
-    return .compile "its import closure changed, so a name it looked up, used or referred to may resolve elsewhere"
   unless (← closureEdgesCurrent hashes importArts (kept := true)) do
     return .compile "an import's closure changed after a module of its closure was compiled or kept"
   unless (← usage.resolvedUnchanged presetup files.resolved? hashes importArts) do
@@ -1284,6 +1382,12 @@ public def compactUsage? (path : FilePath) : BaseIO (Option ByteArray) := do
   let .ok (some usage) := parseUsageSidecar.parse UsageSidecar ModuleUsage.usageVersion bytes | return none
   return usage.toPrefilter.encode (ModuleUsage.Digest.ofBytes bytes)
 
+/-- `compactUsage?` of the `.usage` with artifact hash `art` that `Module.writeUsekey` parsed in this process
+(`parsedUsages`), which it removes, if there is one; `none` otherwise. -/
+public def takeCompactUsage? (art : Hash) : BaseIO (Option (Option ByteArray)) := do
+  let parsed? ← parsedUsages.atomically (modifyGet fun m => (m[art]?, m.erase art))
+  return parsed?.map fun (usage, digest) => usage.toPrefilter.encode digest
+
 /--
 The compact record at `compactFile` (`compactUsage?`) if it decodes and was made from a `.usage` with the digest
 `usage`, the one the compile's key records: the only record any reader takes. `none` otherwise.
@@ -1337,8 +1441,11 @@ The usage index's pre-filter of a cached compile of the module, whose `.usekey` 
 the cutoff's check (`Module.usageVerdict`) against the module's current imports (`importArts`). It only rejects, and
 it binds no importee: it compares the importees as `importee? m` gives them (the module's own bindings,
 `ContentHashes`, or else the build's views, `UsageView`), and hashes no `.olean`; the check, which every accept
-passes, reads them again. It looks at the importees the check binds. In order: the key's local inputs and its
-`closure` against the fold of the direct imports' recorded closures; then the `.usage`, which must have no `noskip`,
+passes, reads them again. It looks at the importees the check binds. In order: the key's local inputs; a direct import
+whose closure the decision found changed (`ContentHashes.changedImport`), whose closure the candidate's key must
+record; the key's `closure` against the fold of the direct imports' recorded closures, which is the decision's own
+`closureHash` with `kept` once its check computed it (`ContentHashes.keptClosure`). A candidate rejected on either of
+these two fails the check, which folds the same closures. Then the `.usage`, which must have no `noskip`,
 cover the closure, and record for each constant it used from a workspace module the digest that module's `.usage`
 records, for each workspace `extra` module the `moduleDigest` and, unless it is a module-system file (pinned by
 `modsys`), the `.olean` hash its `.usekey` records, and for its specialization-cache lookups the providers in the
@@ -1352,7 +1459,14 @@ public def usagePrefilter (presetup : ModulePreSetup) (importArts : NameMap Impo
     (usekeyFile usageFile compactFile : FilePath) : JobM UsagePrefilter := do
   let some key ← readUsageSidecar UsekeySidecar usekeyVersion usekeyFile | return .key
   if key.localHash != presetup.localTrace.hash then return .key
-  let closure ← foldClosureHash presetup fun m => return (← importee? m).map (·.2.closure)
+  -- A direct import whose closure the decision found changed rejects a candidate that imported another closure of it,
+  -- and the decision's own closure digest, if its check computed it, is the one the candidate's check compares
+  if let some (m, current) ← hashes.changedImport.get then
+    let recorded := key.importedClosure? m
+    if current.isNone || current != recorded then return .key
+  let closure ← match (← hashes.keptClosure.get) with
+    | some closure => pure closure
+    | none => foldClosureHash presetup fun m => return (← importee? m).map (·.2.closure)
   unless closure == some key.closure do return .key
   let some usage ← readCandidateUsage? compactFile usageFile key.usage | return .usage
   if usage.noskip || !usage.coversClosure importArts then return .usage

@@ -379,6 +379,40 @@ def mkKeptCheck (ws : Workspace) : IO (Option KeptChecker × Lean.NameSet) := do
       exclude := exclude.insert name
   return (checker?, exclude)
 
+/--
+The last record of each path in the stamped digest log at `file` (`DigestLog`) whose file still has the recorded stamp,
+or none if the log cannot be read. A log with more than 10,000 paths has each path's file stamped (in this task, off
+the build's way): a record whose file is gone or changed can never be used again. The log is written again from the
+records kept (a new file renamed over it) when it has bytes after its last intact record (a crash cut a record short,
+or bytes were damaged: records appended after them would never be read), when more than a tenth of its paths are
+dead, or when it holds more than twice as many records as paths. A process that appends meanwhile (a check without
+the build lock, `Workspace.checkNoBuild`) loses its appends to the replaced file, which costs it hashes, never a wrong
+one. Every append of this process waits for this read (`appendDigestLog`).
+-/
+def loadDigestLog (file : FilePath) :
+    BaseIO (Std.HashMap FilePath (Lean.ModuleUsage.FileStamp × Lean.ModuleUsage.Digest)) := do
+  let .ok bytes ← (IO.FS.readBinFile file).toBaseIO | return {}
+  let (records, intact) := DigestLog.decode bytes
+  let latest := records.foldl (fun m (p, s, d) => m.insert p (s, d)) ({} : Std.HashMap _ _)
+  let live ← if latest.size ≤ 10000 then pure latest else
+    latest.foldM (init := {}) fun m p (s, d) => do
+      let now? := match (← (Lean.ModuleUsage.fileStamp p).toBaseIO) with
+        | .ok s? => s?
+        | .error _ => none
+      return if now? == some s then m.insert p (s, d) else m
+  if intact < bytes.size || 10 * (latest.size - live.size) > latest.size || records.size > 2 * latest.size then
+    let compact := live.fold (fun b p (s, d) => b.append (DigestLog.encode p s d)) ByteArray.empty
+    let tmp := file.addExtension s!"tmp.{← IO.Process.getPID}"
+    discard <| (do IO.FS.writeBinFile tmp compact; IO.FS.rename tmp file : IO Unit).toBaseIO
+  return live
+
+/-- The workspace's stamped digest log (`DigestLogState`), read in a task, if usage cutoff is on. -/
+def mkDigestLog (ws : Workspace) : BaseIO DigestLogState := do
+  unless ws.lakeEnv.usageCutoff do
+    return { loaded := .pure {}, file? := none, handle := ← Std.Mutex.new (some none) }
+  let file := DigestLog.file ws.root.lakeDir
+  return { loaded := ← BaseIO.asTask (loadDigestLog file), file? := some file, handle := ← Std.Mutex.new none }
+
 def mkBuildContext
   (ws : Workspace) (cfg : BuildConfig) (jobs : JobQueue)
   (cancelTk? : Option IO.CancelToken := none)
@@ -406,6 +440,7 @@ def mkBuildContext
   registeredJobs := jobs
   sidecarCache := ← Shards.new 1024 {}
   fileDigests := ← Shards.new 1024 {}
+  digestLog := ← mkDigestLog ws
   kernelProviders := ← Std.Mutex.new {}
   remoteReadStatus := ← IO.mkRef {}
   usageViews := ← Shards.new 1024 {}
