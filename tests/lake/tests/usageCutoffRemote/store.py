@@ -8,6 +8,8 @@
   store.py kept ROOT MOD HNEW HK       `kept/HNEW.json` exists, names MOD and `compiledFor` HK
   store.py kepts ROOT                  the number of `kept/` objects
   store.py forge ROOT MOD HNEW HK SRC  writes `kept/HNEW.json` naming MOD's compile of input HK
+  store.py naming ROOT HK              the number of `kept/` objects whose `compiledFor` is HK
+  store.py remap ROOT MOD INPUT NAME SHA  points MOD's mapping for INPUT at the archive `NAME.ltar` with SHA-256 SHA
 
 ROOT is the scope's directory, e.g. `<store>/a0/v1/<githash>/<platform>/test`.
 """
@@ -99,6 +101,26 @@ def main():
         with open(os.path.join(root, "kept", f"{hnew}.json"), "w") as f:
             json.dump({"schemaVersion": version, "inputHash": hnew, "target": mod,
                        "srcHash": json.loads(src), "compiledFor": hk}, f)
+    elif cmd == "naming":
+        (hk,) = args
+        d = os.path.join(root, "kept")
+        n = 0
+        if os.path.isdir(d):
+            for name in os.listdir(d):
+                with open(os.path.join(d, name)) as f:
+                    n += json.load(f).get("compiledFor") == hk
+        print(n)
+    elif cmd == "remap":
+        mod, inp, name, sha = args
+        path = os.path.join(root, "in", f"{inp}.json")
+        with open(path) as f:
+            m = json.load(f)
+        if m.get("target") != mod:
+            fail(f"in/{inp}.json is not {mod}'s mapping")
+        m["data"] = f"{name}.ltar"
+        m["sha256"] = {f"{name}.ltar": sha}
+        with open(path, "w") as f:
+            json.dump(m, f)
     else:
         fail(f"unknown command {cmd}")
 

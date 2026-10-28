@@ -189,8 +189,10 @@ restored. Returns whether the outputs were queued.
 
 With usage cutoff on (`Env.usageCutoff`), the queued outputs are still a compile of exactly this
 input: outputs that the cutoff kept for another input never reach this function. The cutoff setting
-is a local input of every module (`usageCutoffTrace`), so readers with the cutoff off never read
-them. The data of a module names its usage sidecars, which `lake cache push` uploads with it.
+is a local input of every module (`usageCutoffTrace`), so readers with the cutoff off never read the
+outputs of a module that it queues. Other targets (objects, libraries, executables) have no such
+input: their key covers their own inputs, and any reader of the scope reads them. The data of a
+module names its usage sidecars, which `lake cache push` packs into its archive.
 -/
 public def queueRemotePush
   (pkg : Package) (inputHash : Hash) (target : String) (srcHash? : Option Hash)
