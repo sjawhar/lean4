@@ -26,7 +26,8 @@ off). A moved delta-derived instance, which no info tree binder names, gets the 
 of a fresh run.
 
 After every edit, with the option on or off, the snapshot tree must hold the same messages, at the
-same positions, and the same number of `import` info nodes as a fresh processor on the new text.
+same positions, the same number of `import` info nodes, and info nodes with the same source ranges
+as a fresh processor on the new text.
 This includes the header's messages after an edit below the header (which reuses the header), a
 `-- deprecated_module: ignore` directive that is added after the last import or removed again, and
 messages after non-ASCII text on a line whose comment changes (columns count code points, not UTF-16
@@ -38,10 +39,11 @@ are those of a fresh run.
 
 Gates: an error in the changed command (also when the change is in its trailing whitespace),
 `set_option pp.sorrySource true in`, a message whose text holds `⟨LINE, COL⟩`, `LINE:COL` or
-`line := ` text, a comment edit inside a command whose message is not fixed text, a suggestion on
-the line whose columns change, a term with a panic position (`panicWithPos`, no `panic!` syntax), a
-panel widget (`#widget`), and a trailing comment that becomes unterminated (the same tokens, other
-parse errors) are elaborated again. An edit while the old run is still elaborating (a proof that
+`line := ` text (also a tactic's message, which later snapshots of the proof hold as reported
+copies), a comment edit inside a command whose message is not fixed text, a suggestion on the line
+whose columns change, a term with a panic position (`panicWithPos`, no `panic!` syntax), a panel
+widget (`#widget`), and a trailing comment that becomes unterminated (the same tokens, other parse
+errors) are elaborated again. An edit while the old run is still elaborating (a proof that
 sleeps) gives the same result as a fresh run and does not hang. With the option off, a comment edit
 above the imports imports again.
 
@@ -100,6 +102,14 @@ def sorrySource : String :=
 /-- `base` and a message whose text is `s`, which looks like a printed position. -/
 def posText (s : String) : String :=
   base ++ s!"\n#check \"{s}\"\n"
+
+/--
+`base` and a message of a tactic whose text looks like a printed position (a deprecation warning):
+the tactic's snapshot shows it, and the later snapshots of the proof hold reported copies of it.
+-/
+def posTactic : String :=
+  base ++ "\n@[deprecated \"see 12:3\" (since := \"2024-01-01\")] theorem dep : True := trivial\n\
+  theorem tr : True := by\n  exact dep\n"
 
 /-- `base` and a proof that sleeps for 2 s. -/
 def slow : String :=
@@ -236,6 +246,27 @@ partial def countImportNodes : Elab.InfoTree → Nat
 def treeImportNodes (t : SnapshotTree) : Nat :=
   t.getAll.foldl (fun n s => n + (s.infoTree?.map countImportNodes).getD 0) 0
 
+/--
+The source range of each info node (and of a macro expansion's output) in a snapshot tree, sorted:
+what hover and references read. A tactic snapshot's info tree is also part of the command's info
+tree, so shared nodes are listed once per tree that holds them.
+-/
+partial def treeInfo (t : SnapshotTree) : Array String :=
+  (t.getAll.foldl (fun acc s => (s.infoTree?.map (go acc)).getD acc) #[]).qsort (· < ·)
+where
+  range (stx : Syntax) : String :=
+    match stx.getRange? with
+    | some r => s!"{r.start.byteIdx}-{r.stop.byteIdx}"
+    | none => "none"
+  go (acc : Array String) : Elab.InfoTree → Array String
+    | .context _ t => go acc t
+    | .node i cs =>
+      let here := match i with
+        | .ofMacroExpansionInfo m => s!"{i.stx.getKind} {range m.stx} => {range m.output}"
+        | _ => s!"{i.stx.getKind} {range i.stx}"
+      cs.foldl go (acc.push here)
+    | .hole _ => acc
+
 structure Cmd where
   /-- Address of the info state of the command's resulting elaboration state. -/
   state : USize
@@ -318,6 +349,7 @@ structure Tree where
   snap : InitialSnapshot
   msgs : Array String
   importNodes : Nat
+  info : Array String
 
 unsafe def runTree (p : Processor) (text : String) : IO Tree := do
   let snap ← p.step (Parser.mkInputContext text "Test.lean")
@@ -326,7 +358,7 @@ unsafe def runTree (p : Processor) (text : String) : IO Tree := do
   let msgs ← treeMsgs tree
   if (cmdsOf snap).isEmpty then
     throw <| .userError s!"header failed: {msgs}"
-  return { snap, msgs, importNodes := treeImportNodes tree }
+  return { snap, msgs, importNodes := treeImportNodes tree, info := treeInfo tree }
 
 /-- One incremental run of `p` on `text`, a fresh run on `text`, and the imports of `p` so far. -/
 structure Run where
@@ -364,6 +396,12 @@ def checkFresh (name : String) (new : Run) : Array String := Id.run do
   if new.inc.importNodes != new.fresh.importNodes then
     errs := errs.push s!"{name}: {new.inc.importNodes} import info nodes, fresh has \
       {new.fresh.importNodes}"
+  if new.inc.info != new.fresh.info then
+    let missing := new.fresh.info.filter (!new.inc.info.contains ·)
+    let extra := new.inc.info.filter (!new.fresh.info.contains ·)
+    errs := errs.push s!"{name}: info trees differ from a fresh elaboration ({new.inc.info.size} \
+      against {new.fresh.info.size} nodes)\n  only fresh: {missing.toList.take 10}\n  \
+      only incremental: {extra.toList.take 10}"
   errs
 
 /--
@@ -626,7 +664,8 @@ unsafe def main : IO UInt32 := do
   -- `pp.sorrySource` and a message text that looks like a position, after a comment line between
   -- the first commands
   for (name, text, n) in [("pp.sorrySource", sorrySource, 4), ("⟨1, 2⟩ text", posText "⟨1, 2⟩", 4),
-      ("12:3 text", posText "12:3", 4), ("line := text", posText "line := 5", 4)] do
+      ("12:3 text", posText "12:3", 4), ("line := text", posText "line := 5", 4),
+      ("12:3 text of a tactic", posTactic, 4)] do
     let g0 ← runText processor text
     errs := errs ++ expectMsgs name g0 n
     let lastPos : String.Pos.Raw := ⟨base.utf8ByteSize⟩
