@@ -178,7 +178,7 @@ def connect (cfg : ClientConfig) : BaseIO (Except Error Conn) := do
   let args := #["bridge"] ++ (cfg.socket?.elim #[] fun s => #["--socket", s.toString])
   -- The bridge writes its messages to Lake's standard error. A reader of that stream (a pipe, `tee`)
   -- therefore sees it end only when the bridge exits too, which after a killed Lake is once the
-  -- daemon has cancelled that Lake's requests (`bridgeExitTimeoutMs`).
+  -- daemon has cancelled that Lake's requests; no limit of Lake's applies then.
   let spawned ← (IO.Process.spawn {cmd := cfg.exe.toString, args, stdin := .piped, stdout := .piped, stderr := .inherit}).toBaseIO
   let spawnedChild ← match spawned with
     | .ok c => pure c
@@ -232,10 +232,13 @@ public def shutdown : BaseIO Unit :=
     set (none : Option Conn)
 
 /-- Kills this process's bridge, if any, without `shutdown`'s wait: for a bridge that carried no
-request but `hello`, so that no write of it can land in the workspace. -/
+request but `hello`, so that no write of it can land in the workspace. Its input is closed first:
+a client that runs the bridge as its child (a wrapper without `exec`, `timeout`, `strace -f`) passes
+the kill to the wrapper only, and the child exits at end of input. -/
 public def killBridge : BaseIO Unit :=
   connRef.atomically do
     if let some conn ← getThe (Option Conn) then
+      conn.writeLock.atomically (m := BaseIO) do conn.stdin.set none
       reap conn.child
     set (none : Option Conn)
 
