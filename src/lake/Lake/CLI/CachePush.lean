@@ -35,8 +35,10 @@ and then hashes what it took, so it only ever quarantines bytes that it hashed a
 `quarantineUnlessReplaced`). It also drops an entry whose artifact is gone.
 `Cache.pushDroppedFile` records each drop with its reason.
 
-A module's outputs go up as one archive (`.ltar`), which the pusher packs from the bytes it
-verified and a trace that it writes from the entry alone: it never reads a file of a workspace.
+A module's outputs go up as one archive (`.ltar`), with its usage-cutoff files when the build
+wrote them, which the pusher packs from the bytes it verified and a trace that it writes from the
+entry alone: it never reads a file of a workspace. An alias (`RemotePushEntry.compiledFor?`) goes
+up alone, as its object `kept/<inputHash>.json` (see `stageAlias`).
 The pusher copies the bytes it uploads into a directory of its own below `Cache.pushStagingDir`,
 in the cache directory. It stages (and packs) the entries of a chunk with several workers at once
 (`pushWorkers`); a failure while one entry is staged fails only that entry. It names each
@@ -395,13 +397,18 @@ def stageOutputs
 /--
 Stages the outputs of a module as one archive, as `Module.packLtar` packs it, from the verified
 bytes of its artifacts and a trace written from the entry alone: the outputs, the log and the
-input hash (which `-s` strips, and which a reader supplies again when it unpacks).
+input hash (which `-s` strips, and which a reader supplies again when it unpacks). With the
+module's usage-cutoff sidecars (`.usage`, `.resolved`, `.usekey`) too, when the build wrote them:
+a reader with usage cutoff needs them to check the module and its importers, and the archive
+compresses them.
 -/
 def stageModule
   (ctx : PushContext) (dir : FilePath) (idx : Nat) (entry : RemotePushEntry) (json : Json)
   (service : CacheService) (stem : String) (descrs : ModuleOutputDescrs)
   (files : Array (ArtifactDescr × Bool))
 : LoggerIO StagedEntry := do
+  let sidecars := #[descrs.usage?, descrs.resolved?, descrs.usekey?].filterMap id
+  let files := files ++ sidecars.map (·, false)
   let contents ← match ← verifyArtifacts ctx.cache entry.target json (files.map (·.1)) with
     | .ok contents => pure contents
     | .dropped => return .dropped
@@ -440,6 +447,22 @@ def moduleFileStem? (target : String) : Option String :=
       some stem
   | _ => none
 
+/--
+Stages an alias (`RemoteAlias`, see `queueRemoteAlias`): the object alone, which goes up as a mapping
+goes up, if absent. It has no artifacts: the compile it names has its own mapping.
+-/
+def stageAlias
+  (dir : FilePath) (idx : Nat) (entry : RemotePushEntry) (service : CacheService)
+  (srcHash compiledFor : Hash)
+: IO StagedEntry := do
+  let alias : RemoteAlias := {inputHash := entry.inputHash, target := entry.target, srcHash, compiledFor}
+  let path := dir / "alias.json"
+  IO.FS.writeFile path (toJson alias).compress
+  return .ready {
+    idx, serviceName := entry.service, service, artifacts := #[], bytes := 0
+    mapping := {path, url := service.remoteAliasUrl entry.remoteScope entry.inputHash, hash := entry.inputHash}
+  }
+
 /-- Prepares the queue line `line`, the `idx`-th of its chunk, for upload in `dir`. -/
 def stageLine (ctx : PushContext) (dir : FilePath) (idx : Nat) (line : String) : LoggerIO StagedEntry := do
   let json ← match Json.parse line with
@@ -461,6 +484,10 @@ def stageLine (ctx : PushContext) (dir : FilePath) (idx : Nat) (line : String) :
       logError s!"{entry.target}: {e}"
       return .failed
   IO.FS.createDirAll dir
+  if let some compiledFor := entry.compiledFor? then
+    let some srcHash := entry.srcHash?
+      | return ← invalid s!"{entry.target}: an alias names no source hash"
+    return ← stageAlias dir idx entry service srcHash compiledFor
   if entry.srcHash?.isSome then
     let some stem := moduleFileStem? entry.target
       | return ← invalid s!"`{entry.target}` is not a module name"
@@ -472,6 +499,10 @@ def stageLine (ctx : PushContext) (dir : FilePath) (idx : Nat) (line : String) :
       | .error e => return ← invalid s!"{entry.target}: {e}"
     unless files.all (ArtifactDescr.isCacheExtension ·.1.ext) do
       return ← invalid s!"{entry.target}: an output has an unsupported extension"
+    let sidecarOk (descr? : Option ArtifactDescr) (ext : String) := descr?.all (·.ext == ext)
+    unless sidecarOk descrs.usage? "usage" && sidecarOk descrs.resolved? "resolved" &&
+        sidecarOk descrs.usekey? "usekey" do
+      return ← invalid s!"{entry.target}: a usage-cutoff file has another extension"
     stageModule ctx dir idx entry json service stem descrs files
   else
     let descrs ← match outputArtifactDescrs? entry.data with

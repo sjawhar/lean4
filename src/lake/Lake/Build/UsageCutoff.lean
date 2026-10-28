@@ -219,6 +219,16 @@ instance : FromJson UsekeySidecar where
     }
 
 /--
+The input hash of the compile that wrote the `.usekey` at `path` (its `input` field, which `Module.writeUsekey`
+records), if the file exists, parses, has this format version and records one.
+-/
+public def usekeyInputHash? (path : FilePath) : BaseIO (Option Hash) := do
+  let .ok contents ← (IO.FS.readFile path).toBaseIO | return none
+  let .ok j := Json.parse contents | return none
+  unless (j.getObjValAs? Nat "version").toOption == some usekeyVersion do return none
+  return (j.getObjValAs? Hash "input").toOption
+
+/--
 The bytes of the usage-cutoff sidecar at `path` with their digest and the stamp of the file they were read from, if
 it stands for them (`Lean.ModuleUsage.readFileStamped`), or `none` if it does not exist or its bytes do not have the
 digest `expected?` (the `.usage` a `.usekey` was written from). Fails if it exists but cannot be read.
@@ -971,12 +981,14 @@ the direct imports and the `extra` modules) — gets no key, and it compiles the
 read twice: `untrustedBefore?` is its result as the compile started, and it is run again here. Another workspace can
 rebuild a kept dependency normally while this module compiles, so a module untrusted when the compile read it can
 have an ordinary key by the time the compile ends; the key is written only when neither the state the compile read
-nor the state now has an untrusted closure module. Counted in `BuildContext.usageCutoffInFlight` while it runs
-(`countedInFlight`).
+nor the state now has an untrusted closure module. The key also records `inputHash?`, the input hash of the compile,
+so that a build that later keeps these outputs for another input can name the compile that made them
+(`queueRemoteAlias`). Counted in `BuildContext.usageCutoffInFlight` while it runs (`countedInFlight`).
 -/
 public def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     (importArts : NameMap ImportArtifacts) (modsysBefore : ModuleUsage.Digest) (untrustedBefore? : Option Name)
-    (oleanDigest? : Option ModuleUsage.Digest := none) : JobM Unit := countedInFlight do
+    (oleanDigest? : Option ModuleUsage.Digest := none)
+    (inputHash? : Option Hash := none) : JobM Unit := countedInFlight do
   let some (usage, usageDigest) ← readOwnUsage mod.usageFile | return
   unless usage.coversClosure importArts do return
   let hashes ← ContentHashes.new
@@ -996,7 +1008,7 @@ public def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     unless usage.importedDigests.find? m == some imp.moduleDigest do return
     extra := extra.push <|
       Json.arr #[ModuleUsage.nameToJson m, toJson (← contentHash hashes olean), toJson imp.moduleDigest]
-  let key := Json.mkObj [
+  let fields : List (String × Json) := [
     ("version", usekeyVersion),
     ("usage", toJson usageDigest),
     ("local", toJson presetup.localTrace.hash.hex),
@@ -1006,6 +1018,7 @@ public def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     ("extra", Json.arr extra),
     ("importer", usage.importerJson)
   ]
+  let key := Json.mkObj <| fields ++ (inputHash?.map fun h => ("input", toJson h.hex)).toList
   ModuleUsage.writeFileReplacing mod.usekeyFile key.compress.toUTF8
 
 /-- What a stale module's usage records say about it (`Module.usageVerdict`). -/

@@ -24,7 +24,8 @@ namespace Lake
 /--
 Outputs that a build compiled, queued for upload to the shared remote cache: one line of the
 write-back queue (`Cache.pushQueueFile`), which `lake cache push` empties. Its `data` are the
-outputs as the local mapping records them (for a module, its per-file descriptors).
+outputs as the local mapping records them (for a module, its per-file descriptors). An alias
+(`compiledFor?`) names no outputs: its `data` is `null`.
 -/
 public structure RemotePushEntry extends RemoteOutputs where
   /-- The name of the cache service that `LAKE_REMOTE_CACHE` named for the build. -/
@@ -37,6 +38,12 @@ public structure RemotePushEntry extends RemoteOutputs where
   claim `done` if it still has this generation.
   -/
   claimGeneration? : Option String := none
+  /--
+  Set for the alias of a module that usage cutoff kept for this input (see `queueRemoteAlias`):
+  the input hash of the compile whose outputs it kept. `lake cache push` uploads the alias
+  (`RemoteAlias`), not a mapping.
+  -/
+  compiledFor? : Option Hash := none
 
 namespace RemotePushEntry
 
@@ -50,6 +57,7 @@ public protected def toJson (entry : RemotePushEntry) : Json :=
   |>.insert "data" entry.data
   |>.insert "log" entry.log
   |>.insertSome "claimGeneration" entry.claimGeneration?
+  |>.insertSome "compiledFor" entry.compiledFor?
 
 public instance : ToJson RemotePushEntry := ⟨RemotePushEntry.toJson⟩
 
@@ -64,6 +72,7 @@ public protected def fromJson? (json : Json) : Except String RemotePushEntry := 
     data := ← obj.get "data"
     log := ← obj.get "log"
     claimGeneration? := ← obj.get? "claimGeneration"
+    compiledFor? := ← obj.get? "compiledFor"
   }
 
 public instance : FromJson RemotePushEntry := ⟨RemotePushEntry.fromJson?⟩

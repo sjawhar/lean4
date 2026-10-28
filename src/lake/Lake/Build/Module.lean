@@ -1515,7 +1515,8 @@ def Module.buildLean
   (mod : Module) (presetup : ModulePreSetup) (setup? : Option ModuleSetup := none)
   (hashes? : Option ContentHashes := none)
 : JobM ModuleOutputArtifacts := do
-  buildAction (← getTrace) mod.traceFile (localHash? := some presetup.localTrace.hash) do
+  let depTrace ← getTrace
+  buildAction depTrace mod.traceFile (localHash? := some presetup.localTrace.hash) do
   let usage ← usageCutoffEnabled
   let args := mod.weakLeanArgs ++ mod.leanArgs
   let args := if usage then args.push s!"--usage={mod.usageFile}" else args
@@ -1534,7 +1535,7 @@ def Module.buildLean
   let arts ← mod.computeArtifacts setup.isModule presetup.postponeCompile (olean?.map Hash.ofByteArray)
   if let some (modsysBefore, untrustedBefore?) := before? then
     mod.writeUsekey presetup setup.importArts modsysBefore untrustedBefore?
-      (olean?.map ModuleUsage.fileDigestOfBytes)
+      (olean?.map ModuleUsage.fileDigestOfBytes) (inputHash? := some depTrace.hash)
   return arts
 
 /--
@@ -1864,8 +1865,8 @@ def Module.recBuildElabArts (mod : Module) : FetchM (Job ModuleOutputArtifacts) 
       | .done arts => return .done (← adjustMTime arts mod.traceFile)
       | .wait wait => return .wait wait
 where
-  fetchFromCache? presetup savedTrace restoreAll : JobM ModuleFetchState := do
-    let inputHash := (← getTrace).hash
+  fetchFromCache? presetup savedTrace restoreAll (inputHash? : Option Hash := none) : JobM ModuleFetchState := do
+    let inputHash := inputHash?.getD (← getTrace).hash
     -- An archive of this input that this process could not unpack is not tried again.
     if (← rejectedArchives.atomically (return (← get).contains (mod.archiveKey inputHash)) : Bool) then
       return .incomplete savedTrace none
@@ -1912,8 +1913,9 @@ where
         discard <| (removeFileIfExists (witness?.getD "")).toBaseIO
         return .incomplete .missing none
       discard <| (removeFileIfExists (witness?.getD "")).toBaseIO
-      -- The archive ships no sidecars, so the entry's go to the build directory, from which the entry
-      -- below is rewritten.
+      -- An archive of `lake build -o` ships no sidecars, so the entry's go to the build directory,
+      -- from which the entry below is rewritten. (An archive that `lake cache push` packed holds
+      -- them itself, and its entry names none.)
       if let some art := usage? then discard <| restoreArtifact mod.usageFile art
       if let some art := resolved? then discard <| restoreArtifact mod.resolvedFile art
       if let some art := usekey? then discard <| restoreArtifact mod.usekeyFile art
@@ -1967,6 +1969,59 @@ where
         if let some ltar ← mod.verifiedLocalLtar? then
           return .complete {arts with ltar? := some ltar}
       return .complete arts
+  /-
+  A tree with no previous build of a module that usage cutoff can apply to takes, as its previous
+  build, the compile whose outputs a writer of the shared remote cache kept for this input, if the
+  remote cache has the alias of the input (`readRemoteAlias?`): it restores that compile, under
+  that compile's own input hash, as a restore from the cache does. The cutoff's same-tree decision
+  (`Module.skipOrBuild`) then checks it against the module's current imports, so the alias vouches
+  for nothing. Not with `--old`, which would take the restored files as up to date by their
+  modification times, and not unless the build restores artifacts, which the check needs in the
+  build directory (as the usage index needs, `Module.skipOrBuild`). Returns the saved trace and
+  archive to go on with, and, if the compile is now the module's previous build, its input hash
+  and `.olean` hash.
+  -/
+  aliasedPrevious? (presetup : ModulePreSetup) (savedTrace : SavedTrace) (ltar? : Option Artifact)
+      (restore : Bool) (depTrace : BuildTrace) :
+      JobM (SavedTrace × Option Artifact × Option (Hash × Hash)) := do
+    let skip := return (savedTrace, ltar?, none)
+    if (← getLakeEnv).remoteCache?.isNone || (← getNoBuild) || (← getIsOldMode) || !restore then
+      return ← skip
+    unless (← mod.usageIndexApplies presetup) do return ← skip
+    if savedTrace matches .ok _ then
+      if (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) then return ← skip
+    let some compiledFor ← readRemoteAlias? depTrace.hash mod.pkg mod.name.toString presetup.srcHash
+      | skip
+    -- The read gave this job's worker up, in which another job's failure can have ended the build
+    cancelIfBuildCanceled
+    if compiledFor == depTrace.hash then return ← skip
+    -- A restore of an archive that leaves its outputs in the build directory with the trace it
+    -- unpacked ends `incomplete`, as a restore by input hash does before its replay: either way the
+    -- build directory now holds the compile, if its trace names it
+    discard <| fetchFromCache? presetup savedTrace restore (inputHash? := some compiledFor)
+    let candidate ← readTraceFile mod.traceFile
+    if let .ok data := candidate then
+      if let some descrs := candidate.moduleOutputDescrs? then
+        if data.depHash == compiledFor &&
+            (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) then
+          return (candidate, none, some (compiledFor, descrs.olean.hash))
+    logVerbose s!"remote cache alias: input {depTrace.hash} names input {compiledFor}, \
+      which could not be restored"
+    return (candidate, none, none)
+  /-
+  Queues the alias of the module's outputs `arts`, which this build kept for the input `inputHash`
+  without compiling them (a usage skip or a restore from the usage index): the input hash of the
+  compile that made them, which their `.usekey` records (`usekeyInputHash?`). Outputs that a
+  kept-module check accepted get none: they are not the compile of any input.
+  -/
+  queueKeptAlias (presetup : ModulePreSetup) (arts : ModuleOutputArtifacts) (inputHash : Hash) : JobM Unit := do
+    unless (← getLakeEnv).remoteCacheAliases do return
+    if arts.keptFrom?.isSome then return
+    unless (← mod.usageIndexApplies presetup) do return
+    let some usekey := arts.usekey? | return
+    let some compiledFor ← usekeyInputHash? usekey.path | return
+    if compiledFor == inputHash then return
+    queueRemoteAlias mod.pkg inputHash mod.name.toString presetup.srcHash compiledFor
   fetchCore (presetup : ModulePreSetup) (sawDone : Bool) :
       JobM (ClaimLoop ModuleOutputArtifacts) := do
     -- Whether this call compiles the module (not an earlier action of the job it continues)
@@ -1985,6 +2040,7 @@ where
       | .complete arts =>
         return .done arts
       | .incomplete savedTrace ltar? =>
+        let (savedTrace, ltar?, alias?) ← aliasedPrevious? presetup savedTrace ltar? restore depTrace
         let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
         -- Whether the build directory holds the outputs the saved trace describes
         let mut replayed := false
@@ -2012,6 +2068,13 @@ where
           let cached? ← if status.isUpToDate then pure none else
             some <$> mod.skipOrBuild presetup savedTrace depTrace (cacheWith? := some restore)
               (compile := checkOrBuild presetup savedTrace (some restore))
+          if let (some (compiledFor, olean), some arts) := (alias?, cached?) then
+            if !(← compiledHere) && arts.olean.hash == olean then
+              logVerbose s!"remote cache alias: restored the compile of input {compiledFor} \
+                for input {depTrace.hash}"
+            else
+              logVerbose s!"remote cache alias: the compile of input {compiledFor} does not pass \
+                for input {depTrace.hash}"
           if status.isCacheable then
             let arts ← id do
               if let some arts := cached? then return arts
@@ -2035,6 +2098,8 @@ where
               -- `lake cache push` packs the per-file outputs into the archive it uploads
               queueCompiledOutputs claim? mod.pkg depTrace.hash mod.name.toString
                 (some presetup.srcHash) (toJson {arts.descrs with ltar? := none}) log
+            else if cached?.isSome && alias?.isNone then
+              queueKeptAlias presetup arts depTrace.hash
             (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs (log := log)
             mod.indexUsage presetup arts restore log
             return .done arts

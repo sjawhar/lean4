@@ -874,6 +874,10 @@ public def remoteObjectUrl (service : CacheService) (scope object : String) : St
 public def remoteMappingUrl (service : CacheService) (scope : String) (inputHash : Hash) : String :=
   service.remoteObjectUrl scope s!"in/{inputHash}.json"
 
+/-- The remote alias URL for an input hash (see `RemoteAlias`). -/
+public def remoteAliasUrl (service : CacheService) (scope : String) (inputHash : Hash) : String :=
+  service.remoteObjectUrl scope s!"kept/{inputHash}.json"
+
 /-- The remote artifact URL for a SHA-256 digest. -/
 public def remoteArtifactUrl (service : CacheService) (scope : String) (sha256 : Sha256) : String :=
   service.remoteObjectUrl scope s!"a/{sha256}.art"

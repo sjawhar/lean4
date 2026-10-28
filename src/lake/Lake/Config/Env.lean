@@ -103,6 +103,14 @@ public structure Env where
   -/
   remoteCacheQueue : Bool := false
   /--
+  Whether a build that queues its outputs (see `remoteCacheQueue`) also queues an alias of each
+  module that usage cutoff keeps for a new input (i.e., `LAKE_REMOTE_CACHE_ALIASES`, off unless set;
+  see `queueRemoteAlias`): the input hash of the compile whose outputs the module keeps, which a
+  reader checks with the cutoff before it uses them (`readRemoteAlias?`). Lake does not add it to
+  `baseVars`.
+  -/
+  remoteCacheAliases : Bool := false
+  /--
   Whether a build that queues its outputs (see `remoteCacheQueue`) enables the claim and
   build-following-push mechanism (i.e., `LAKE_REMOTE_CACHE_CLAIMS`, on unless set to a false
   value; see `Lake.Build.Claim`). It starts one detached `lake cache push` that follows the
@@ -263,6 +271,7 @@ public def compute
     cacheTokenCmd? := (← IO.getEnv "LAKE_CACHE_TOKEN_CMD").filter (!·.trimAscii.isEmpty)
     remoteCache? := (← IO.getEnv "LAKE_REMOTE_CACHE").map (·.trimAscii.copy) |>.filter (!·.isEmpty)
     remoteCacheQueue := ((← IO.getEnv "LAKE_REMOTE_CACHE_QUEUE").bind envToBool?).getD false
+    remoteCacheAliases := ((← IO.getEnv "LAKE_REMOTE_CACHE_ALIASES").bind envToBool?).getD false
     remoteCacheClaims := ((← IO.getEnv "LAKE_REMOTE_CACHE_CLAIMS").bind envToBool?).getD true
     claimTakeoverSecs := ← computeClaimTakeoverSecs
     claimDeferSecs := ← computeClaimDeferSecs
@@ -346,8 +355,9 @@ public def remoteCacheQueueService? (env : Env) : Option String :=
 
 /--
 The name of the cache service whose claims builds take, if any: the queue's service (see
-`remoteCacheQueueService?`), unless `LAKE_REMOTE_CACHE_CLAIMS` is false or usage cutoff is on
-(a build that publishes nothing claims nothing).
+`remoteCacheQueueService?`), unless `LAKE_REMOTE_CACHE_CLAIMS` is false or usage cutoff is on. A
+build with usage cutoff claims an input before it knows whether the cutoff keeps the module, and a
+kept module publishes no mapping for its claim.
 -/
 public def remoteCacheClaimService? (env : Env) : Option String :=
   if env.remoteCacheClaims && !env.usageCutoff then env.remoteCacheQueueService? else none

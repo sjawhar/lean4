@@ -791,19 +791,25 @@ With `LAKE_REMOTE_CACHE_QUEUE` set to true and `LAKE_REMOTE_CACHE` naming an
 `s3` service (see `lake cache services`), a build appends each output that it
 compiled (not one it replayed or restored) to the queue `push.jsonl` in the
 Lake cache directory. It uploads nothing itself. It queues nothing while
-`LEAN_GITHASH` names a Lean other than the one it runs, or while
-`LAKE_USAGE_CUTOFF` is true.
+`LEAN_GITHASH` names a Lean other than the one it runs. With
+`LAKE_USAGE_CUTOFF` true, a module's entry also names its usage-cutoff files
+(`.usage`, `.resolved`, `.usekey`), and with `LAKE_REMOTE_CACHE_ALIASES` true
+as well, the build also queues an alias for each module that the cutoff keeps
+for a new input: `kept/<inputHash>.json`, the input hash of the compile whose
+outputs it kept. An alias names no outputs: a build that reads one restores
+that compile and keeps it only if the cutoff's check passes for its own
+imports.
 
 This command empties the queue without loading a workspace. For each entry, it
 hashes the cache artifacts again. An entry whose artifact is gone, or no longer
 matches its hash, is dropped and recorded in `push-dropped.jsonl`, and a
 changed artifact is moved to the cache's `quarantine` directory. A module's
-outputs are packed into one archive. The push copies the bytes it uploads into
-`push-staging` in the cache directory, preparing up to 16 entries at once (one
-per CPU). Each artifact is uploaded under its SHA-256, then, once all of its
-artifacts are present, the entry's input-to-output mapping, each only if the
-object is not present yet. An entry that fails to be packed or uploaded stays
-in the queue.
+outputs are packed into one archive, with its usage-cutoff files. The push
+copies the bytes it uploads into `push-staging` in the cache directory,
+preparing up to 16 entries at once (one per CPU). Each artifact is uploaded
+under its SHA-256, then, once all of its artifacts are present, the entry's
+input-to-output mapping (or alias), each only if the object is not present
+yet. An entry that fails to be packed or uploaded stays in the queue.
 
 One push runs at a time. Another one exits at once (with status 0), unless
 `--wait` is set, and the running one also uploads any entry appended while it
@@ -817,7 +823,9 @@ for other builds; `0` claims every input. Claims let machines that build the
 same targets at once compile each one once, but they were measured to cost
 wall time on both machines (see `Lake.Build.Claim`), so they are off by
 default; a build that claims nothing still queues its outputs and pushes
-them.
+them. A build with `LAKE_USAGE_CUTOFF` true claims nothing and starts no push:
+it decides whether the cutoff keeps a module only after the point where it
+would claim it.
 
 A build that claims creates the object `claim/<scope>/<inputHash>` in the
 remote cache if no build holds it, and rewrites it while it compiles. With a
