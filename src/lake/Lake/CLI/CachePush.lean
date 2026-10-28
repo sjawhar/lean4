@@ -488,6 +488,8 @@ def stageLine (ctx : PushContext) (dir : FilePath) (idx : Nat) (line : String) :
       return .failed
   IO.FS.createDirAll dir
   if let some compiledFor := entry.compiledFor? then
+    unless entry.data.isNull do
+      return ← invalid s!"{entry.target}: an alias names outputs"
     let some srcHash := entry.srcHash?
       | return ← invalid s!"{entry.target}: an alias names no source hash"
     return ← stageAlias dir idx entry service srcHash compiledFor
