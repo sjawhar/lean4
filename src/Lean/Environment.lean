@@ -871,7 +871,18 @@ def addDeclCore (env : Environment) (maxHeartbeats : USize) (maxRecDepth : USize
         prefix {ctx.declPrefix}"
   let mut env ← if doCheck then
     addDeclCheck env maxHeartbeats maxRecDepth decl cancelTk?
-  else
+  else do
+    -- Without `check`, the kernel checks the names of inductives and `Quot` only. Check the others
+    -- as it does with `check`: no module may declare a name of its imports again, which
+    -- `checkImportConflicts` relies on.
+    let kenv := env.toKernelEnv
+    let mut seen : NameSet := {}
+    for n in decl.getNames do
+      if (decl matches .mutualDefnDecl _) && seen.contains n then
+        throw <| .other s!"invalid mutual definition, duplicate declaration name '{n}'"
+      seen := seen.insert n
+      if (kenv.find? n).isSome then
+        throw <| .alreadyDeclared kenv n
     addDeclWithoutChecking env decl
 
   -- Let the elaborator know about the new constants. This uses the same constant for both
