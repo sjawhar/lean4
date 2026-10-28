@@ -435,7 +435,7 @@ def runFrontend
 
   -- Last of the outputs: the usage data records every name resolved in writing the others.
   if let some (usageFileName, nodes, own, closure, provides, indirect) := usage? then
-    let used := ModuleUsage.usedFromInfoTrees trees (← usedNames)
+    let used ← ModuleUsage.usedFromInfoTrees trees (← usedNames)
     ModuleUsage.writeUsage env nodes own closure provides indirect used (← lookedUpSpecKeys)
       (incrLoaded := incrLoadFileName?.isSome) usageFileName
 

@@ -672,6 +672,158 @@ extern "C" LEAN_EXPORT obj_res lean_usage_read_file_stamped(b_obj_arg path) {
     return io_result_mk_ok(r);
 }
 
+/* The metavariable-context lookups the core exports for `instantiate_mvars.cpp` (src/Lean/MetavarContext.lean), which
+take their arguments owned. */
+extern "C" object * lean_get_mvar_assignment(obj_arg mctx, obj_arg mid);
+extern "C" object * lean_get_delayed_mvar_assignment(obj_arg mctx, obj_arg mid);
+extern "C" object * lean_delayed_mvar_assignment_mvar_id_pending(obj_arg d);
+
+namespace {
+/* An open-addressing set of object pointers that empties in constant time: a slot holds a pointer only for the
+generation it was filled in. */
+class ptr_set {
+    struct slot { object * m_ptr; uint64_t m_gen; };
+    std::vector<slot> m_slots;
+    size_t            m_size = 0;
+    uint64_t          m_gen = 1;
+    unsigned          m_shift;
+    size_t index(object * k) const {
+        return static_cast<size_t>((reinterpret_cast<uint64_t>(k) * 0x9E3779B97F4A7C15ull) >> m_shift);
+    }
+    bool live(slot const & s) const { return s.m_gen == m_gen; }
+    void place(object * k) {
+        size_t mask = m_slots.size() - 1;
+        size_t i = index(k);
+        while (live(m_slots[i])) i = (i + 1) & mask;
+        m_slots[i] = slot{k, m_gen};
+    }
+public:
+    ptr_set():m_slots(size_t(1) << 10, slot{nullptr, 0}), m_shift(64 - 10) {}
+    /* Adds `k`; returns whether it was absent. */
+    bool insert(object * k) {
+        size_t mask = m_slots.size() - 1;
+        size_t i = index(k);
+        for (; live(m_slots[i]); i = (i + 1) & mask)
+            if (m_slots[i].m_ptr == k) return false;
+        m_slots[i] = slot{k, m_gen};
+        if (2 * ++m_size > m_slots.size()) {
+            std::vector<slot> old(m_slots.size() * 2, slot{nullptr, 0});
+            old.swap(m_slots);
+            m_shift--;
+            for (slot const & s : old)
+                if (s.m_gen == m_gen) place(s.m_ptr);
+        }
+        return true;
+    }
+    void clear() { m_gen++; m_size = 0; }
+};
+
+/* `Lean.ModuleUsage.ConstWalker`. Every expression and name it records is reachable from the info trees that
+`usedFromInfoTrees` walks (their terms, or the assignments of their metavariable contexts), which that function takes
+borrowed (`@&`), so its caller holds them for the whole walk and pointers stay valid and distinct without references. */
+class const_walker {
+    ptr_set                m_closed;    // visited subterms without metavariables
+    ptr_set                m_opened;    // visited subterms with metavariables, under `m_mctx`
+    ptr_set                m_seen;      // the name objects in `m_names`
+    std::vector<object *>  m_names;
+    std::vector<object *>  m_todo;
+    object *               m_mctx = nullptr;  // held, so that its address is not reused while it is compared
+
+    void use(name const & n) {
+        if (m_seen.insert(n.raw())) m_names.push_back(n.raw());
+    }
+
+    /* Pushes `m`'s assignment, or that of the pending metavariable of its delayed assignment, recursively. The context
+    holds every value and metavariable read here, so they stay valid after the lookup results are released. */
+    void push_mvar(object * m) {
+        while (true) {
+            lean_inc(m_mctx); lean_inc(m);
+            object * v = lean_get_mvar_assignment(m_mctx, m);
+            if (!lean_is_scalar(v)) {
+                m_todo.push_back(lean_ctor_get(v, 0));
+                lean_dec(v);
+                return;
+            }
+            lean_inc(m_mctx); lean_inc(m);
+            object * d = lean_get_delayed_mvar_assignment(m_mctx, m);
+            if (lean_is_scalar(d)) return;
+            object * da = lean_ctor_get(d, 0);
+            lean_inc(da);
+            lean_dec(d);
+            object * p = lean_delayed_mvar_assignment_mvar_id_pending(da);
+            m = p;
+            lean_dec(p);
+        }
+    }
+
+public:
+    ~const_walker() { if (m_mctx) lean_dec(m_mctx); }
+
+    void walk(b_obj_arg mctx, b_obj_arg root) {
+        if (mctx != m_mctx) {
+            m_opened.clear();
+            lean_inc(mctx);
+            if (m_mctx) lean_dec(m_mctx);
+            m_mctx = mctx;
+        }
+        m_todo.push_back(root);
+        while (!m_todo.empty()) {
+            object * o = m_todo.back();
+            m_todo.pop_back();
+            expr const & e = TO_REF(expr, o);
+            if (!(has_mvar(e) ? m_opened : m_closed).insert(o)) continue;
+            switch (e.kind()) {
+            case expr_kind::Lambda: case expr_kind::Pi:
+                m_todo.push_back(binding_body(e).raw()); m_todo.push_back(binding_domain(e).raw()); break;
+            case expr_kind::Let:
+                m_todo.push_back(let_body(e).raw()); m_todo.push_back(let_value(e).raw());
+                m_todo.push_back(let_type(e).raw()); break;
+            case expr_kind::App:    m_todo.push_back(app_arg(e).raw()); m_todo.push_back(app_fn(e).raw()); break;
+            case expr_kind::MData:  m_todo.push_back(mdata_expr(e).raw()); break;
+            case expr_kind::Proj:   use(proj_sname(e)); m_todo.push_back(proj_expr(e).raw()); break;
+            case expr_kind::Const:  use(const_name(e)); break;
+            case expr_kind::MVar:   push_mvar(mvar_name(e).raw()); break;
+            default: break;
+            }
+        }
+    }
+
+    object * names() const {
+        size_t n = m_names.size();
+        object * r = lean_alloc_array(n, n);
+        for (size_t i = 0; i < n; i++) {
+            lean_inc(m_names[i]);
+            lean_array_set_core(r, i, m_names[i]);
+        }
+        return r;
+    }
+};
+
+void const_walker_finalize(void * p) { delete static_cast<const_walker *>(p); }
+void const_walker_foreach(void *, b_obj_arg) {}
+
+external_object_class * get_const_walker_class() {
+    static external_object_class * c = lean_register_external_class(const_walker_finalize, const_walker_foreach);
+    return c;
+}
+
+const_walker & to_const_walker(b_obj_arg o) { return *static_cast<const_walker *>(lean_get_external_data(o)); }
+}
+
+// `BaseIO` externs take no world token and return their value directly.
+extern "C" LEAN_EXPORT obj_res lean_usage_const_walker_new() {
+    return lean_alloc_external(get_const_walker_class(), new const_walker());
+}
+
+extern "C" LEAN_EXPORT obj_res lean_usage_const_walker_walk(b_obj_arg w, b_obj_arg mctx, b_obj_arg e) {
+    to_const_walker(w).walk(mctx, e);
+    return box(0);
+}
+
+extern "C" LEAN_EXPORT obj_res lean_usage_const_walker_names(b_obj_arg w) {
+    return to_const_walker(w).names();
+}
+
 namespace {
 /* A set of names, each held by a reference, with open addressing on `Name.hash`: a probe compares the pointer, then
 the stored hash, and only then the names. */
