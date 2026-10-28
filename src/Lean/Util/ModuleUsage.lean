@@ -142,13 +142,26 @@ def derivedBase? : Name → Option Name
   | .str p s => if derivedSuffixes.contains s then some p else none
   | _ => none
 
+/-- How many prefixes `internalPrefixes n` lists: the components after `n`'s root-most internal one (one that starts
+with `_`) and one more, or none if no component is internal. -/
+private def internalPrefixCount (n : Name) : Nat :=
+  go n 0 0
+where
+  /-- `t` components walked so far, `k` the count up to the root-most internal component met. -/
+  go : Name → Nat → Nat → Nat
+    | .str p s, t, k => go p (t + 1) (if s.front == '_' then t + 1 else k)
+    | .num p _, t, k => go p (t + 1) k
+    | .anonymous, _, k => k
+
 /-- The prefixes of `n` whose attributes the compiler reads when it compiles a use of `n`: while the name is internal
 (a component starts with `_`), its `getPrefix` (`hasNeverExtractAttribute`; `toDecl` reads the base of an
-`_unsafe_rec` name, `isUnsafeRecName?`). -/
+`_unsafe_rec` name, `isUnsafeRecName?`). A prefix stays internal down to the root-most internal component, so these
+are the first `internalPrefixCount n` prefixes, longest first. -/
 def internalPrefixes (n : Name) : Array Name := Id.run do
-  let mut out := #[]
+  let k := internalPrefixCount n
+  let mut out := Array.emptyWithCapacity k
   let mut c := n
-  while c.isInternal do
+  for _ in [0:k] do
     c := c.getPrefix
     out := out.push c
   return out
@@ -158,8 +171,10 @@ prefix's own `internalPrefixes`: the result holds every name's `internalPrefixes
 first call is passed here too. -/
 def addInternalPrefixes (ps : NameHashSet) (x : Name) : NameHashSet := Id.run do
   let mut ps : Std.HashSet Name := ps
-  for p in internalPrefixes x do
-    let (had, ps') := ps.containsThenInsert p
+  let mut c := x
+  for _ in [0:internalPrefixCount x] do
+    c := c.getPrefix
+    let (had, ps') := ps.containsThenInsert c
     ps := ps'
     if had then break
   return ps
@@ -416,15 +431,17 @@ def moduleUsed (env : Environment) (extra : NameSet) (nodes := ownNodes env (own
   let sources := nodes.foldl (·.insert ·.name) (extra.foldl (·.insert ·) used)
   let used := (derivedReads env sources).foldl (fun u d => (s.usedNodes env d).foldl (·.insert ·) u) used
   let used := env.getImportedKernelDuplicates.foldl (·.insert ·.1) used
-  let push (m : Std.HashMap Name (Array (Name × Digest))) (i : ModuleIdx) (c : Name) :=
+  -- Grouped by module index; distinct indices are distinct modules.
+  let push (m : Array (Array (Name × Digest))) (i : ModuleIdx) (c : Name) :=
     match s.findAt? i c with
-    | some d => m.alter env.header.modules[i.toNat]!.module fun o => some ((o.getD #[]).push (c, d))
+    | some d => m.modify i.toNat (·.push (c, d))
     | none => m
-  let byMod := (used : Std.HashSet Name).fold (init := (∅ : Std.HashMap Name (Array (Name × Digest)))) fun m c =>
+  let byMod := (used : Std.HashSet Name).fold (init := Array.replicate env.header.modules.size #[]) fun m c =>
     let r? := env.getModuleIdxFor? c
     let m := r?.elim m (push m · c)
     (env.getKernelDeclarersIfOther? c r?).elim m (·.foldl (fun m k => if r? == some k then m else push m k c) m)
-  byMod.toArray.map (fun (k, v) => (k, v.qsort fun a b => Name.quickLt a.1 b.1))
+  byMod.zipIdx.filterMap (fun (v, i) =>
+      if v.isEmpty then none else some (env.header.modules[i]!.module, v.qsort fun a b => Name.quickLt a.1 b.1))
     |>.qsort fun a b => Name.quickLt a.1 b.1
 
 private opaque ConstWalkerPointed : NonemptyType
