@@ -218,12 +218,17 @@ def State.hasEntries (s : State) (i : ModuleIdx) : Bool :=
 def moduleDigestOf (own : Array (Name × Digest)) : Digest :=
   (({} : Enc).array own fun e (n, d) => e.name n |>.digest d).finish
 
-/-- Module `i`'s `moduleDigest` and `closureDigest` as the current module imported them, from its `.olean`, or
-`none` if it carries no digests. -/
-def State.importedDigests? (s : State) (i : ModuleIdx) : Option (Digest × Digest) := do
+/-- Module `i`'s `moduleDigest` as the current module imported it, from its `.olean`, or `none` if it carries no
+digests. -/
+def State.importedModuleDigest? (s : State) (i : ModuleIdx) : Option Digest := do
   let es ← s.importedModuleEntries[i.toNat]?
-  let m ← Markers.ofPayload? es
-  return (moduleDigestOf (es.extract Markers.count es.size), m.closure)
+  _ ← Markers.ofPayload? es
+  return moduleDigestOf (es.extract Markers.count es.size)
+
+/-- Module `i`'s `closureDigest` as the current module imported it, from its `.olean`, or `none` if it carries no
+digests. -/
+def State.importedClosure? (s : State) (i : ModuleIdx) : Option Digest := do
+  (·.closure) <$> Markers.ofPayload? (← s.importedModuleEntries[i.toNat]?)
 
 /-- Module `i`'s provides digest (`providesDigestOf`), from its `.olean`, or `none` if it carries no digests. -/
 def State.importedProvides? (s : State) (i : ModuleIdx) : Option Digest := do
@@ -1002,9 +1007,9 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
   let extraMods := allExtra.toArray.filter (fun u => (env.getModuleIdx? u.module).any s.hasEntries)
     |>.qsort fun a b => let k (u : ExtraModUse) := 2 * u.isExported.toNat + u.isMeta.toNat
       Name.quickLt a.module b.module || (a.module == b.module && k a < k b)
-  let imported (ms : Array Name) (field : Digest × Digest → Digest) : Array (Name × Digest) :=
+  let imported (ms : Array Name) (digest? : ModuleIdx → Option Digest) : Array (Name × Digest) :=
     (ms.qsort Name.quickLt).eraseReps.filterMap fun m => do
-      return (m, field (← s.importedDigests? (← env.getModuleIdx? m)))
+      return (m, ← digest? (← env.getModuleIdx? m))
   let usedMods := moduleUsed env used nodes
   let resolvedAll ← allResolved
   -- Every name whose resolution can reach an output: used, looked up, referred to by a node, an imported kernel
@@ -1028,8 +1033,10 @@ def writeUsage (env : Environment) (nodes : Array Node) (own : Array (Name × Di
   out := arrayJsonInto (out ++ ",\"digested\":") (digestedModules env) pair
   out := arrayJsonInto (out ++ ",\"extra\":") extraMods fun acc u =>
     nameJsonInto (acc.push '[') u.module ++ (if u.isMeta then ",true]" else ",false]")
-  out := arrayJsonInto (out ++ ",\"importedClosures\":") (imported (env.header.imports.map (·.module)) (·.2)) pair
-  out := arrayJsonInto (out ++ ",\"importedDigests\":") (imported (extraMods.map (·.module)) (·.1)) pair
+  out := arrayJsonInto (out ++ ",\"importedClosures\":")
+    (imported (env.header.imports.map (·.module)) s.importedClosure?) pair
+  out := arrayJsonInto (out ++ ",\"importedDigests\":")
+    (imported (extraMods.map (·.module)) s.importedModuleDigest?) pair
   out := arrayJsonInto (out ++ ",\"indirect\":") indirect nameJsonInto
   out := digestJsonInto (out ++ ",\"moduleDigest\":") (moduleDigestOf own)
   out := out ++ ",\"noskip\":" ++ toString incrLoaded
