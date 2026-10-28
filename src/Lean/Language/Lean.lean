@@ -564,8 +564,8 @@ where
                 if server.reuseMovedPositions.get oldProcSuccess.cmdState.scopes.head!.opts &&
                     !mentionsHeaderDirective old.stx && !mentionsHeaderDirective stx.raw &&
                     shift.get.syntaxMoved old.stx stx.raw then
-                  if let .ok metaSnap ← shift.get.mapSnapshot? (shift.get.moveScope old.stx)
-                      oldProcessed.metaSnap.get.toSnapshot then
+                  if let .ok metaSnap ← ((shift.get.mapSnapshot? (shift.get.moveScope old.stx)
+                      oldProcessed.metaSnap.get.toSnapshot).run' {}).run then
                     return (← unchangedMoved oldProcSuccess metaSnap stx parserState msgLog)
         -- on first change, make sure to cancel old invocation
         old.result?.forM (·.processedSnap.cancelRec)
@@ -754,7 +754,7 @@ where
       -- tokens at moved positions, and their old elaboration can be reused.
       if let some shift := ctx.shift? then
         if server.reuseMovedPositions.get scope.opts && shift.get.syntaxMoved old.stx stx then
-          match (← collectMoved shift.get cmdState cmdState old stx parserState msgLog #[]) with
+          match (← collectMoved shift.get cmdState cmdState old stx parserState msgLog {} #[]) with
           | .ok cmds =>
             resolveMoved shift.get cmds prom
             return
@@ -913,14 +913,15 @@ where
   /-
   Collects the moved results of `old` and each later old command while the new input has the same
   tokens at moved positions, or names why a command cannot be reused and where it starts in the new
-  input. `prevOld` and `prevNew` are the state after the previous command before and after its move.
+  input. `prevOld` and `prevNew` are the state after the previous command before and after its move,
+  and `cache` holds the moves of the objects that the earlier commands' results hold.
   All or nothing: when one command cannot be reused, the caller takes the path of any other edit at
   the first changed command. This never waits: it fails if old elaboration has not finished, so that
   the caller cancels the old run at once as in a normal edit.
   -/
   collectMoved (shift : PosShift) (prevOld prevNew : Command.State) (old : CommandParsedSnapshot)
       (stx : Syntax) (parserState : Parser.ModuleParserState) (msgLog : MessageLog)
-      (acc : Array MovedCmd) :
+      (cache : PosShift.MoveCache) (acc : Array MovedCmd) :
       LeanProcessingM (Except (String × String.Pos.Raw) (Array MovedCmd)) := do
     let ctx ← read
     let scope := shift.moveScope old.stx
@@ -943,8 +944,9 @@ where
     let names := Thunk.mk fun _ => PosShift.declaredNames oldTree
     let cmdState := shift.mapCmdState names prevOld prevNew res.cmdState
     let lineShift := ctx.lineShiftPos?.get.isSome
-    let elabSnap ← match (← shift.mapElabSnap? scope lineShift stx cmdState old.elabSnap) with
-      | .ok e => pure e
+    let (elabSnap, cache) ←
+      match (← ((shift.mapElabSnap? scope lineShift stx cmdState old.elabSnap).run cache).run) with
+      | .ok r => pure r
       | .error reason => return fail reason
     let unmoved := scope.moves &&
       holdsUnmovedPositions old.stx oldTree old.diagnostics.msgLog res.cmdState
@@ -962,7 +964,7 @@ where
       let (stx, parserState', msgLog) :=
         profileit "parsing" scope.opts fun _ =>
           Parser.parseCommand ctx.toInputContext pmctx parserState .empty
-      collectMoved shift res.cmdState cmdState oldNext stx parserState' msgLog acc
+      collectMoved shift res.cmdState cmdState oldNext stx parserState' msgLog cache acc
     | _, _ => return fail "end of input differs"
 
   /--
