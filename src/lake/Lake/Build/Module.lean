@@ -1921,8 +1921,8 @@ where
       if let some art := usekey? then discard <| restoreArtifact mod.usekeyFile art
       -- The `.usekey` of a compile records its input hash. A pushed archive whose key records another
       -- input carries some other compile's records: the module then keeps no key, so nothing keeps it
-      -- or names that compile from it (`queueKeptAlias`)
-      if usage?.isNone && resolved?.isNone && usekey?.isNone then
+      -- or names that compile from it (`queueKeptAlias`). Only a build with usage cutoff reads keys
+      if (← usageCutoffEnabled) && usage?.isNone && resolved?.isNone && usekey?.isNone then
         if let some recorded ← usekeyInputHash? mod.usekeyFile then
           if recorded != inputHash then
             logVerbose s!"{mod.usekeyFile}: records input {recorded}, not {inputHash}; dropping it"
