@@ -467,14 +467,18 @@ an `.olean`. */
 constexpr int64_t stamp_settle_fine_min_ns = 50'000'000;
 constexpr int64_t stamp_settle_ns = 2'000'000'000;
 
+/* Whether the kernel stamps files of `statfs` type `fs_type` from its own clock in nanoseconds: EXT4_SUPER_MAGIC (also
+ext2/ext3), XFS_SUPER_MAGIC, BTRFS_SUPER_MAGIC, TMPFS_MAGIC (<linux/magic.h>). */
+bool fine_fs_type(uint64_t fs_type) {
+    uint32_t t = static_cast<uint32_t>(fs_type);
+    return t == 0xEF53u || t == 0x58465342u || t == 0x9123683Eu || t == 0x01021994u;
+}
+
 /* Whether a stamp whose status-change time has nanosecond field `ctime_nsec` and lay `age_ns` before its read began
 stands for the file's bytes, on a file system of `statfs` type `fs_type` (`statfs_ok`: `statfs` succeeded) whose
 timestamp clock advances every `tick_ns` (not positive: unknown). */
 bool stamp_settled(bool statfs_ok, uint64_t fs_type, uint64_t ctime_nsec, int64_t tick_ns, int64_t age_ns) {
-    uint32_t t = static_cast<uint32_t>(fs_type);
-    // EXT4_SUPER_MAGIC (also ext2/ext3), XFS_SUPER_MAGIC, BTRFS_SUPER_MAGIC, TMPFS_MAGIC (<linux/magic.h>)
-    bool fine = statfs_ok && ctime_nsec != 0 && tick_ns > 0 &&
-        (t == 0xEF53u || t == 0x58465342u || t == 0x9123683Eu || t == 0x01021994u);
+    bool fine = statfs_ok && ctime_nsec != 0 && tick_ns > 0 && fine_fs_type(fs_type);
     // `tick_ns` is capped so that the product cannot overflow; a capped bound exceeds the general one anyway.
     int64_t bound = fine ? std::max(stamp_settle_fine_min_ns, 4 * std::min(tick_ns, stamp_settle_ns)) : stamp_settle_ns;
     return age_ns > bound;
@@ -525,7 +529,8 @@ extern "C" LEAN_EXPORT uint8_t lean_usage_stamp_settled(uint8_t statfs_ok, uint6
         static_cast<int64_t>(age_ns));
 }
 
-/* The XXH3-128 hash of a file's bytes (`Lean.ModuleUsage.fileDigest`). */
+/* The XXH3-128 hash of a file's bytes (`Lean.ModuleUsage.fileDigest`). Lake keeps these across processes: a change to
+this hash must change `Lake.DigestLog.magic`. */
 extern "C" LEAN_EXPORT obj_res lean_usage_file_digest(b_obj_arg path) {
     obj_res err;
     FILE * f = open_for_digest(path, err);
@@ -558,6 +563,23 @@ extern "C" LEAN_EXPORT obj_res lean_usage_file_stamp(b_obj_arg path) {
     uint64_t s[stamp_fields];
     stamp_of(st, s);
     return io_result_mk_ok(mk_option_some(mk_stamp(s)));
+#endif
+}
+
+/* `Lean.ModuleUsage.stampsFine`: whether the file system holding `path` is one whose stamps `stamp_settled` judges by
+its fine rule (`fine_fs_type`, with a known timestamp tick). Such a file system's kernel sets a file's status-change
+time from its own clock at every change, so a stamp with a nonzero nanosecond field that stood when it was taken
+stands for the same bytes in a later process. The digest log of Lake keeps only these (`DigestLog`). Keep in step
+with `stamp_settled`. */
+extern "C" LEAN_EXPORT obj_res lean_usage_stamps_fine(b_obj_arg path) {
+#if defined(__linux__)
+    char const * fname = string_cstr(path);
+    struct statfs sf;
+    if (strlen(fname) != lean_string_size(path) - 1 || statfs(fname, &sf) != 0) return io_result_mk_ok(box(0));
+    bool fine = coarse_tick_ns() > 0 && fine_fs_type(static_cast<uint64_t>(static_cast<uint32_t>(sf.f_type)));
+    return io_result_mk_ok(box(fine ? 1 : 0));
+#else
+    return io_result_mk_ok(box(0));
 #endif
 }
 
