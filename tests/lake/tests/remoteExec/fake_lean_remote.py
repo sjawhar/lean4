@@ -5,7 +5,8 @@ each action locally in a scratch input root, for Lake's tests of service mode.
 It stands in for `lean-remote bridge` and the daemon behind it, with their lifetime: end of input
 means the client is gone, so the requests in flight are cancelled (answered UNAVAILABLE), no write
 into the workspace starts after it, a write in progress finishes, and the fake exits once they have
-returned. Like the bridge, it ignores SIGINT, SIGHUP and SIGPIPE.
+returned. Like a connected bridge, it ignores SIGINT, SIGHUP, SIGTERM and SIGPIPE, so that it
+outlives a client killed with its process group.
 
 Knobs, all through the environment:
   FAKE_CAS            directory of the content store and the action cache; persists across Lake runs
@@ -13,11 +14,15 @@ Knobs, all through the environment:
                       action, which names no path of this machine, so a test can check that the
                       action a client sends is the same on every machine
   FAKE_UNREACHABLE    `1`: `hello` answers `reachable: false`, as a build service that does not answer
+  FAKE_UNREACHABLE_LATER  a file counting connections: `hello` answers `reachable: false` on every
+                      connection after the first, as a service that stops answering mid-build
   FAKE_GITHASH        the Lean githash the service's toolchain reports (default: the client's own
                       `leanGithash`); `toolchainVerified` is true only when it is the client's, as the
                       daemon's toolchain probe decides
   FAKE_OMIT_VERIFIED  `1`: `hello` answers without `toolchainVerified` and `toolchainGithash`
   FAKE_TIMEOUT_TARGET a target name: its `run` answers TIMEOUT, as an action that ran past its timeout
+  FAKE_OOM_TARGET     a target name: its `run` answers OOM, as an action that ran out of memory
+  FAKE_DISK_TARGET    a target name: its `run` answers DISK_LIMIT, as an action that filled its disk
   FAKE_SLEEP_MS       sleep this long in every `run`, standing in for the service's latency
   FAKE_CONCURRENT     `1`: answer each request after `hello` on a thread of its own, as the daemon
                       does, so requests overlap (default: one at a time, in order)
@@ -31,6 +36,8 @@ Knobs, all through the environment:
   FAKE_HELLO_STAMP    file taking the time (seconds since the epoch) at which `hello` arrived
   FAKE_EXIT_LOG       file taking a line `end of input` when the fake exits after its input ended
                       (a fake that is killed writes none)
+  FAKE_IGNORE_EOF_S   stay this many seconds after end of input before exiting, as a bridge whose
+                      daemon does not close the connection
 """
 import hashlib, json, os, queue, shutil, signal, subprocess, sys, tempfile, threading, time
 
@@ -85,9 +92,12 @@ def append(name, obj):
 def run(p):
     global _inflight, _max_inflight
     check_gone()
-    target = os.environ.get("FAKE_TIMEOUT_TARGET")
-    if target and p.get("target") == target:
-        raise Err("TIMEOUT", f"{target}: the action ran past its timeout")
+    for var, code, what in (("FAKE_TIMEOUT_TARGET", "TIMEOUT", "ran past its timeout"),
+                            ("FAKE_OOM_TARGET", "OOM", "ran out of memory"),
+                            ("FAKE_DISK_TARGET", "DISK_LIMIT", "filled its disk")):
+        target = os.environ.get(var)
+        if target and p.get("target") == target:
+            raise Err(code, f"{target}: the action {what}")
     with _lock:
         _inflight += 1
         if _inflight > _max_inflight:
@@ -172,7 +182,12 @@ def materialize(p):
 def hello(p):
     if os.environ.get("FAKE_HELLO_STAMP"):
         with open(os.environ["FAKE_HELLO_STAMP"], "w") as f: f.write(repr(time.time()))
-    if os.environ.get("FAKE_UNREACHABLE") == "1":
+    later = os.environ.get("FAKE_UNREACHABLE_LATER")
+    nth = 1
+    if later:
+        with _lock, open(later, "a+") as f:
+            f.seek(0); nth = len(f.read().splitlines()) + 1; f.write("hello\n")
+    if os.environ.get("FAKE_UNREACHABLE") == "1" or nth > 1:
         return {"daemonVersion": "fake", "daemonPid": os.getpid(), "reachable": False,
                 "reason": "fake: unreachable", "toolchainVerified": False}
     client = p.get("leanGithash") or ""
@@ -223,7 +238,7 @@ def main():
     args = sys.argv[1:]
     if not args or args[0] != "bridge":
         sys.stderr.write(f"usage: {sys.argv[0]} bridge [--socket S]\n"); return 2
-    for s in (signal.SIGINT, signal.SIGHUP, signal.SIGPIPE): signal.signal(s, signal.SIG_IGN)
+    for s in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM, signal.SIGPIPE): signal.signal(s, signal.SIG_IGN)
     pidfile = os.environ.get("FAKE_PIDFILE")
     if pidfile:
         with open(pidfile, "w") as f: f.write(str(os.getpid()))
@@ -262,6 +277,7 @@ def main():
     _gone.set()
     work.put(None)
     for t in threads: t.join()
+    time.sleep(float(os.environ.get("FAKE_IGNORE_EOF_S") or 0))
     append(os.environ.get("FAKE_EXIT_LOG"), "end of input")
     return 0
 
