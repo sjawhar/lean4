@@ -558,12 +558,18 @@ partial def collectDupsAux (covered : Array UInt64) (key : Name)
 /--
 Collects the names declared by more than one of the given modules, with their declarations in
 module order, without building a merged view: only name prefixes occurring in several modules are
-walked. `covered` optionally gives each module a bitmask of covering direct imports; subtrees
+walked. `covered` gives each module a bitmask of covering direct imports (`#[]`: none); subtrees
 whose modules share a mask bit are skipped, as their pairs are conflict-checked already (see
 `checkImportConflicts`).
+
+Implemented natively (`lean_imported_consts_collect_duplicates` in `src/library/const_cache.cpp`) by
+the walk of `collectDupsAux`: the same duplicates in the same order, except among sibling keys of one
+module with equal hashes, which neither sort orders. `covered` has no default value: under an
+`optParam` the compiler drops the `@&` mark, and the native side, which borrows it, would leak it.
 -/
-def collectDuplicates (trees : Array (Nat × ConstTrie α))
-    (covered : Array UInt64 := #[]) : Array (Duplicate α) :=
+@[extern "lean_imported_consts_collect_duplicates"]
+def collectDuplicates (trees : @& Array (Nat × ConstTrie α))
+    (covered : @& Array UInt64) : Array (Duplicate α) :=
   if trees.size < 2 then #[]
   else collectDupsAux covered .anonymous trees #[]
 

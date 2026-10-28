@@ -3,7 +3,9 @@ Copyright (c) 2026 Lean FRO, LLC. All rights reserved.
 Released under Apache 2.0 license as described in the file LICENSE.
 Author: Sebastian Ullrich
 */
+#include <algorithm>
 #include <atomic>
+#include <vector>
 #include <lean/lean.h>
 #include "runtime/alloc.h"
 
@@ -375,5 +377,151 @@ extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_cache_reset() {
     // occupancy is only ever an estimate; a racing insert after the reset merely re-adds one
     t->m_num_entries.store(0, std::memory_order_relaxed);
     return lean_io_result_mk_ok(lean_box(0));
+}
+
+namespace {
+/*
+`ImportedConsts.collectDuplicates`, walking the per-module tries (`ConstTrie`: key, val?, children, childIndex) as
+`collectDupsAux` does, node for node and in the same order, but over plain vectors: no object per flattened child, and
+a sort without boxed keys. A trie's nodes are never modified after it is built, so they are read without locks.
+*/
+inline lean_object * trie_key(lean_object * t) { return lean_ctor_get(t, 0); }
+inline lean_object * trie_val(lean_object * t) { return lean_ctor_get(t, 1); }
+inline lean_object * trie_children(lean_object * t) { return lean_ctor_get(t, 2); }
+
+/* `lastPartEq`: whether two names whose prefixes are equal have equal final components. */
+inline bool last_part_eq(lean_object * a, lean_object * b) {
+    if (lean_is_scalar(a) || lean_is_scalar(b)) return lean_is_scalar(a) && lean_is_scalar(b);
+    if (lean_ptr_tag(a) != lean_ptr_tag(b)) return false;
+    lean_object * x = lean_ctor_get(a, 1);
+    lean_object * y = lean_ctor_get(b, 1);
+    // tag 1: `.str`, tag 2: `.num`
+    return lean_ptr_tag(a) == 1 ? lean_string_eq(x, y) : lean_nat_eq(x, y);
+}
+
+struct dup_cand {
+    size_t         m_idx;
+    lean_object *  m_node;
+};
+
+struct dup_child {
+    uint64_t       m_hash;
+    size_t         m_idx;
+    lean_object *  m_node;
+};
+
+class dup_sweep {
+    b_lean_obj_arg          m_covered;
+    size_t                  m_num_covered;
+    // the flattened children of the nodes on the current path, each node's after its parent's
+    std::vector<dup_child>  m_children;
+    lean_object *           m_acc;
+
+    uint64_t covered(size_t i) const {
+        return i < m_num_covered ? lean_unbox_uint64(lean_array_get_core(m_covered, i)) : 0;
+    }
+
+    /* `acc.push { name := key, entries }` when more than one candidate has a value. */
+    void push_entries(lean_object * key, std::vector<dup_cand> const & cands) {
+        size_t n = 0;
+        for (dup_cand const & c : cands)
+            if (!lean_is_scalar(trie_val(c.m_node))) n++;
+        if (n < 2) return;
+        lean_object * entries = lean_alloc_array(n, n);
+        size_t k = 0;
+        for (dup_cand const & c : cands) {
+            lean_object * v = trie_val(c.m_node);
+            if (lean_is_scalar(v)) continue;
+            lean_object * val = lean_ctor_get(v, 0);
+            lean_inc(val);
+            lean_object * e = lean_alloc_ctor(0, 2, 0);
+            lean_ctor_set(e, 0, val);
+            lean_ctor_set(e, 1, lean_usize_to_nat(c.m_idx));
+            lean_array_set_core(entries, k++, e);
+        }
+        lean_inc(key);
+        lean_object * d = lean_alloc_ctor(0, 2, 0);
+        lean_ctor_set(d, 0, key);
+        lean_ctor_set(d, 1, entries);
+        m_acc = lean_array_push(m_acc, d);
+    }
+
+public:
+    dup_sweep(b_lean_obj_arg covered, lean_object * acc) :
+        m_covered(covered), m_num_covered(lean_array_size(covered)), m_acc(acc) {}
+
+    lean_object * result() { return m_acc; }
+
+    /* `collectDupsAux covered key cands`. */
+    void visit(lean_object * key, std::vector<dup_cand> const & cands) {
+        if (m_num_covered != 0) {
+            uint64_t common = ~static_cast<uint64_t>(0);
+            for (dup_cand const & c : cands) common &= covered(c.m_idx);
+            if (common != 0) return;
+        }
+        push_entries(key, cands);
+        // `foldChildGroups`: the children by (key hash, module order), each run of one hash split by key
+        size_t begin = m_children.size();
+        for (dup_cand const & c : cands) {
+            lean_object * cs = trie_children(c.m_node);
+            size_t n = lean_array_size(cs);
+            for (size_t j = 0; j < n; j++) {
+                lean_object * ch = lean_array_get_core(cs, j);
+                m_children.push_back(dup_child{lean_name_hash(trie_key(ch)), c.m_idx, ch});
+            }
+        }
+        size_t end = m_children.size();
+        std::sort(m_children.begin() + begin, m_children.begin() + end, [](dup_child const & a, dup_child const & b) {
+            return a.m_hash < b.m_hash || (a.m_hash == b.m_hash && a.m_idx < b.m_idx);
+        });
+        std::vector<dup_cand> group;
+        std::vector<bool> taken;
+        size_t i = begin;
+        while (i < end) {
+            size_t j = i + 1;
+            while (j < end && m_children[j].m_hash == m_children[i].m_hash) j++;
+            // a child alone in its run is in one module only: nothing below it can be a duplicate
+            if (j > i + 1) {
+                taken.assign(j - i, false);
+                for (size_t a = i; a < j; a++) {
+                    if (taken[a - i]) continue;
+                    // `m_children` may grow (and move) in the recursive `visit` below; indices stay valid
+                    lean_object * k = trie_key(m_children[a].m_node);
+                    group.clear();
+                    group.push_back(dup_cand{m_children[a].m_idx, m_children[a].m_node});
+                    for (size_t b = a + 1; b < j; b++) {
+                        if (!taken[b - i] && last_part_eq(k, trie_key(m_children[b].m_node))) {
+                            taken[b - i] = true;
+                            group.push_back(dup_cand{m_children[b].m_idx, m_children[b].m_node});
+                        }
+                    }
+                    if (group.size() > 1) visit(k, group);
+                }
+            }
+            i = j;
+        }
+        m_children.resize(begin);
+    }
+};
+}
+
+/* ImportedConsts.collectDuplicates (trees : @& Array (Nat × ConstTrie α)) (covered : @& Array UInt64) :
+   Array (Duplicate α) */
+extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_collect_duplicates(b_lean_obj_arg trees,
+        b_lean_obj_arg covered) {
+    size_t n = lean_array_size(trees);
+    if (n < 2) return lean_alloc_array(0, 0);
+    std::vector<dup_cand> cands;
+    cands.reserve(n);
+    for (size_t i = 0; i < n; i++) {
+        lean_object * p = lean_array_get_core(trees, i);
+        lean_object * idx = lean_ctor_get(p, 0);
+        // module indices are array positions, always small
+        assert(lean_is_scalar(idx));
+        cands.push_back(dup_cand{lean_unbox(idx), lean_ctor_get(p, 1)});
+    }
+    dup_sweep s(covered, lean_alloc_array(0, 16));
+    s.visit(lean_box(0), cands);
+    return s.result();
 }
 }
