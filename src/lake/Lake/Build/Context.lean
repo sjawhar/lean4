@@ -125,6 +125,8 @@ public structure KernelProviders where
   /-- The kernel constants and direct imports of each toolchain module read, or `none` if its `.olean` could not be
   read. -/
   toolchain : Lean.PHashMap Lean.Name (Option (Array UInt64 × Array Lean.Name)) := {}
+  /-- For the hash of each kernel constant of a toolchain module in `toolchain`, the modules that declare it. -/
+  toolchainIndex : Lean.PHashMap UInt64 (Array Lean.Name) := {}
 
 /-- Non-404 failures observed while reading input-hash mappings in one Lake build. -/
 public structure RemoteReadStatus where

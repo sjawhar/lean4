@@ -499,6 +499,35 @@ for k in $plast $pfirst; do
   test_run build Test.PN
 done
 unset LAKE_USAGE_CUTOFF_READ_TASKS
+# a constant that a changed workspace module newly declares and a toolchain module of the importer's closure declares
+# too, found through the build's index of the toolchain modules' constants (`KernelProviders.toolchainIndex`): DN
+# imports DP and `Std.Data.HashMap`. An unrelated edit to DP replays DN; DP declaring `Std.HashMap.insertMany` makes DN
+# fail at the import, as from scratch
+printf 'def dp : Nat := 0\n' > Test/DP.lean
+printf 'import Test.DP\nimport Std.Data.HashMap\ndef dn := dp\n' > Test/DN.lean
+test_run build Test.DN
+printf 'def dp : Nat := 0\ndef unrelated := 1\n' > Test/DP.lean
+test_out "Replayed Test.DN" build -v Test.DN
+printf 'def dp : Nat := 0\ndef unrelated := 1\ndef Std.HashMap.insertMany : Nat := 0\n' > Test/DP.lean
+test_err "environment already contains 'Std.HashMap.insertMany'" build -v Test.DN
+no_match_text "Replayed Test.DN" produced.out
+# the same with the index filled by an earlier check of the build: DA imports DQ and `Std.Data.HashMap`, and DN reaches
+# the toolchain modules only through DA. DQ gains a constant, so DA's check, which comes first, reads them
+printf 'def dq : Nat := 0\n' > Test/DQ.lean
+printf 'def dp : Nat := 0\n' > Test/DP.lean
+printf 'import Test.DQ\nimport Std.Data.HashMap\ndef da := dq\n' > Test/DA.lean
+printf 'import Test.DA\nimport Test.DP\ndef dn := dp + da\n' > Test/DN.lean
+test_run build Test.DN
+printf 'def dq : Nat := 0\ndef u0 := 1\n' > Test/DQ.lean
+printf 'def dp : Nat := 0\ndef unrelated := 1\n' > Test/DP.lean
+lake_out build -v Test.DN
+match_text "Replayed Test.DA" produced.out
+match_text "Replayed Test.DN" produced.out
+printf 'def dq : Nat := 0\ndef u0 := 1\ndef u1 := 2\n' > Test/DQ.lean
+printf 'def dp : Nat := 0\ndef unrelated := 1\ndef Std.HashMap.insertMany : Nat := 0\n' > Test/DP.lean
+test_err "environment already contains 'Std.HashMap.insertMany'" build -v Test.DN
+match_text "Replayed Test.DA" produced.out
+no_match_text "Replayed Test.DN" produced.out
 # control: a C body change behind a precompiled module's `@[extern]` reaches M only through `libext_X.so`, which
 # links `libleanext.so` dynamically, so its bytes and M's trace do not change. Lake with the cutoff off replays M
 # too; the cutoff must do the same here, not worse
