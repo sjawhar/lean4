@@ -134,6 +134,11 @@ public structure UsageImport where
   /-- `Lean.ModuleUsage.providedIds provides`, computed when a dependent's `UsageSidecar.resolvedUnchanged` first
   asks about the module, at most once per parse: every importer shares the parse the build's sidecar cache keeps. -/
   providedIds : Thunk (Array (ModuleUsage.Digest × UInt8))
+  /-- `Lean.ModuleUsage.resolvedId` of each name of `indirect`, computed once per parse as `providedIds` is. -/
+  indirectIds : Thunk (Array ModuleUsage.Digest)
+  /-- The low 32 bits of the `Name.hash` of each kernel constant of `provides`, in its order, computed once per parse as
+  `providedIds` is: scalars, so that `UsageSidecar.kernelDisjoint` scans them without following a pointer each. -/
+  kernelLows : Thunk (Array UInt32)
   specKeys : Array (ModuleUsage.Digest × Name)
   deriving TypeName
 
@@ -144,6 +149,7 @@ instance : FromJson UsageImport where
     let own ← j.getObjValAs? (Array (SidecarName × ModuleUsage.Digest)) "own"
     let specKeys ← j.getObjValAs? (Array (ModuleUsage.Digest × SidecarName)) "specKeys"
     let provides ← providesOfJson (← j.getObjVal? "provides")
+    let indirect ← namesOfJson (← j.getObjVal? "indirect")
     return {
       moduleDigest := ← j.getObjValAs? ModuleUsage.Digest "moduleDigest"
       closure := ← j.getObjValAs? ModuleUsage.Digest "closure"
@@ -152,8 +158,10 @@ instance : FromJson UsageImport where
       own := own.foldl (init := {}) fun m (n, d) => m.insert n.name d
       providesDigest := ← j.getObjValAs? ModuleUsage.Digest "providesDigest"
       provides
-      indirect := ← namesOfJson (← j.getObjVal? "indirect")
+      indirect
       providedIds := .mk fun _ => ModuleUsage.providedIds provides
+      indirectIds := .mk fun _ => indirect.map ModuleUsage.resolvedId
+      kernelLows := .mk fun _ => provides.1.map (·.hash.toUInt32)
       specKeys := specKeys.map fun (d, n) => (d, n.name)
     }
 
@@ -319,6 +327,11 @@ def replayRun (r : LoggedRun β) : JobM β := do
 /-- A read of an importee that binds it (`readImportUsage?`), with what it logged. -/
 public abbrev ImportRead := LoggedRun (Option (FilePath × UsageImport))
 
+/-- A read of an importee's sidecars (`readImportSidecars?`) with its `.olean`, and what it logged: the bindings of the
+importee with `kept` and without it (`readImportUsage?`) both take it, so that a decision reads each importee's
+sidecars once. -/
+public abbrev SidecarRead := LoggedRun (Option (FilePath × Option (Option ModuleUsage.Digest × UsageImport × Bool)))
+
 /--
 What one module's decision before its build has read: its same-tree check (`Module.usageVerdict` of its own
 outputs) and the check of each cached compile the usage index offers (`Module.restoreFromUsageIndex?`), so that the
@@ -341,6 +354,8 @@ public structure ContentHashes where
   imports : IO.Ref (Std.HashMap Name ImportRead)
   /-- The read of each importee by a read that accepts a kept module's key (`importUsage?` with `kept`). -/
   keptImports : IO.Ref (Std.HashMap Name ImportRead)
+  /-- The read of each importee's sidecars that both of its bindings take (`readImports`). -/
+  sidecarReads : IO.Ref (Std.HashMap Name SidecarRead)
   /-- The decision's `closureHash` with `kept` and no `importedClosures?`, once computed: it folds bound reads, so it
   is the same for every check of the decision, which the usage index's pre-filter uses (`usagePrefilter`). -/
   keptClosure : IO.Ref (Option (Option ModuleUsage.Digest))
@@ -354,6 +369,7 @@ public def ContentHashes.new : BaseIO ContentHashes :=
     shards := ← Shards.new 256 {}
     imports := ← IO.mkRef {}
     keptImports := ← IO.mkRef {}
+    sidecarReads := ← IO.mkRef {}
     keptClosure := ← IO.mkRef none
     changedImport := ← IO.mkRef none
   }
@@ -451,6 +467,14 @@ def usageCutoffReadTasks : JobM Nat := do
   let threads := 2 * max 1 (System.Platform.Internal.getHardwareConcurrency ()).toNat
   return max 1 (threads / max 1 (← (← getBuildContext).usageCutoffInFlight.get))
 
+/-- Runs `x` on its own: the entries it logged, and its value or the position in those entries of the error it threw
+(`LoggedRun`), which `replayRun` logs and returns or throws. -/
+def loggedRun (x : JobM β) : JobM (LoggedRun β) :=
+  JobM.ofFn fun fetch pkg? stack store ctx s => do
+    return .ok (match ← x.toFn fetch pkg? stack store ctx {} with
+      | .ok b s' => (s'.log.entries, .ok b)
+      | .error e s' => (s'.log.entries, .error e.val)) s
+
 /--
 Runs `f` on each element of `xs` on its own (`LoggedRun`), so that the caller replays the runs it needs, in order
 (`replayRun`). Up to `usageCutoffReadTasks` tasks take slices of `xs`; with one, the runs are serial.
@@ -498,16 +522,28 @@ public def modsysHash (hashes : ContentHashes) (importArts : NameMap ImportArtif
 /--
 Reads the sidecars of the importee whose `.olean` is `olean` as `importUsage?` does, without hashing the `.olean`:
 for a module-system file (`modsys`), its `.usage`; otherwise its `.usekey` alone, whose `importer` holds the fields an
-importer reads (`UsekeySidecar.importer`), with the `olean` hash the key records. `none` if `importUsage?` (with
-`kept`) would take nothing from them.
+importer reads (`UsekeySidecar.importer`), with the `olean` hash the key records and whether a kept-module check kept
+the module (`UsekeySidecar.kept`). `none` if there is no such sidecar of this format version.
 -/
-def readImportSidecars (olean : FilePath) (modsys : Bool) (kept := false) :
-    JobM (Option (Option ModuleUsage.Digest × UsageImport)) := do
+def readImportSidecars? (olean : FilePath) (modsys : Bool) :
+    JobM (Option (Option ModuleUsage.Digest × UsageImport × Bool)) := do
   if modsys then
-    return (none, ·) <$> (← readUsageSidecar UsageImport ModuleUsage.usageVersion (olean.withExtension "usage"))
+    let usage? ← readUsageSidecar UsageImport ModuleUsage.usageVersion (olean.withExtension "usage")
+    return usage?.map (none, ·, false)
   let some key ← readUsageSidecar UsekeySidecar usekeyVersion (olean.withExtension "usekey") | return none
-  if key.kept && !kept then return none
-  return some (some key.olean, key.importer)
+  return some (some key.olean, key.importer, key.kept)
+
+/-- What a read with `kept` or without it (`importUsage?`) takes from `read?` (`readImportSidecars?`): without `kept`,
+nothing of a kept module's key. -/
+def importSidecars (read? : Option (Option ModuleUsage.Digest × UsageImport × Bool)) (kept : Bool) :
+    Option (Option ModuleUsage.Digest × UsageImport) :=
+  read?.bind fun (keyOlean?, imp, keptKey) => if keptKey && !kept then none else some (keyOlean?, imp)
+
+/-- `readImportSidecars?` of the importee whose `.olean` is `olean`, as a read with `kept` or without it takes it
+(`importSidecars`). -/
+def readImportSidecars (olean : FilePath) (modsys : Bool) (kept := false) :
+    JobM (Option (Option ModuleUsage.Digest × UsageImport)) :=
+  return importSidecars (← readImportSidecars? olean modsys) kept
 
 /--
 What a build first read of an imported module's sidecars (`readImportSidecars`), kept in `BuildContext.usageViews`
@@ -549,15 +585,24 @@ public def usageView? (importArts : NameMap ImportArtifacts) (m : Name) :
     return (view.read?, false)
   freezeUsageView usageFile (← readImportSidecars olean arts.oleanServer?.isSome)
 
+/-- The `.olean` of importee `m` in `importArts` and what a read of its sidecars found (`readImportSidecars?`), or
+`none` if `importArts` has no `.olean` for it: what both bindings of `m` take (`readImportUsage?`). -/
+def readImportSidecarsOf? (importArts : NameMap ImportArtifacts) (m : Name) :
+    JobM (Option (FilePath × Option (Option ModuleUsage.Digest × UsageImport × Bool))) := do
+  let some arts := importArts.find? m | return none
+  let some olean := arts.olean? | return none
+  return some (olean, ← readImportSidecars? olean arts.oleanServer?.isSome)
+
 /--
-The `.olean` of importee `m` in `importArts` and what its importers read of its `.usage` (`UsageImport`), or `none`
-if nothing shows that those fields describe that `.olean`. Unless `m` is a module-system file, they come from its
-`.usekey` alone (`UsekeySidecar.importer`, copied from the `.usage` the key was written from), and only if the key
-records the `.olean`'s current bytes (`UsekeySidecar.olean`, `contentHash`). The key is one file, read once, so the
-check sees one state of the module or none even while another workspace rebuilds it. An `.olean` rewritten behind
-Lake's back (e.g., by `lean -o` of other contents, which leaves the old sidecars and `.hash`) is not checked against
-the old key either, and a `.usage` beside the key is never read: one from another compile changes nothing. A
-module-system file's `.usage` is read instead, its bytes pinned by `modsysHash`.
+The `.olean` of an importee and what its importers read of its `.usage` (`UsageImport`), from `read`, the decision's
+read of its sidecars (`readImportSidecarsOf?`, whose log this replays), or `none` if nothing shows that those fields
+describe that `.olean`. Unless the importee is a module-system file, they come from its `.usekey` alone
+(`UsekeySidecar.importer`, copied from the `.usage` the key was written from), and only if the key records the
+`.olean`'s current bytes (`UsekeySidecar.olean`, `contentHash`). The key is one file, read once per decision for both
+bindings, so the check sees one state of the module or none even while another workspace rebuilds it. An `.olean`
+rewritten behind Lake's back (e.g., by `lean -o` of other contents, which leaves the old sidecars and `.hash`) is not
+checked against the old key either, and a `.usage` beside the key is never read: one from another compile changes
+nothing. A module-system file's `.usage` is read instead, its bytes pinned by `modsysHash`.
 
 Nor is the key of a module that a kept-module check kept (`UsekeySidecar.kept`) taken, unless `kept`: its meaning
 digests, and the table digests its recorded `closure` folds in (`Lean.ModuleUsage.closureDigest`), describe the
@@ -565,14 +610,13 @@ module's declarations as Lean compiled them, which the accept did not compile ag
 it only what the unchanged `.olean` fixes: what the module provides (`UsageSidecar.resolvedUnchanged`,
 `UsageSidecar.kernelDisjoint`), and its recorded closures as the ones before the accept, to tell whether an
 importer's closure changed (`Module.usageVerdict`). No key is written and no module is skipped over a kept module's
-digests (`untrustedClosureModule?`). Without `kept`, the build's view of `m` (`UsageView`) is what this read found,
-if the build had none.
+digests (`untrustedClosureModule?`). Without `kept`, the build's view of the importee (`UsageView`) is what this
+binding takes, if the build had none.
 -/
-def readImportUsage? (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) (kept : Bool) (m : Name) :
+def readImportUsage? (hashes : ContentHashes) (kept : Bool) (read : SidecarRead) :
     JobM (Option (FilePath × UsageImport)) := do
-  let some arts := importArts.find? m | return none
-  let some olean := arts.olean? | return none
-  let read? ← readImportSidecars olean arts.oleanServer?.isSome (kept := kept)
+  let some (olean, read?) ← replayRun read | return none
+  let read? := importSidecars read? kept
   unless kept do discard <| freezeUsageView (olean.withExtension "usage") read?
   let some (keyOlean?, imp) := read? | return none
   if let some keyOlean := keyOlean? then
@@ -584,9 +628,10 @@ def readImportUsage? (hashes : ContentHashes) (importArts : NameMap ImportArtifa
   if kept then hashes.keptImports else hashes.imports
 
 /--
-Reads (`readImportUsage?`, with `kept`) each module of `mods` that the decision has not read yet
+Binds (`readImportUsage?`, with `kept`) each module of `mods` that the decision has not bound so yet
 (`ContentHashes.reads`), many in parallel (`parallelRuns`), each with its log and error, which the step that binds
-the module replays (`importUsage?`).
+the module replays (`importUsage?`). A module's sidecars are read once per decision (`readImportSidecarsOf?`): its
+other binding takes that read (`ContentHashes.sidecarReads`).
 -/
 def readImports (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) (mods : Array Name)
     (kept := false) : JobM Unit := do
@@ -594,12 +639,22 @@ def readImports (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) 
   let known ← reads.get
   let mods := mods.filter (!known.contains ·)
   if mods.isEmpty then return
-  let runs ← parallelRuns mods (readImportUsage? hashes importArts kept)
+  let sidecars ← hashes.sidecarReads.get
+  let runs ← parallelRuns mods fun m => do
+    let (read, fresh) ← match sidecars[m]? with
+      | some read => pure (read, false)
+      | none => do pure (← loggedRun (readImportSidecarsOf? importArts m), true)
+    return (if fresh then some read else none, ← readImportUsage? hashes kept read)
   reads.modify fun reads => Id.run do
     let mut reads := reads
     for m in mods, r in runs do
-      reads := reads.insert m r
+      reads := reads.insert m (r.1, r.2.map (·.2))
     return reads
+  hashes.sidecarReads.modify fun all => Id.run do
+    let mut all := all
+    for m in mods, r in runs do
+      if let .ok (some read, _) := r.2 then all := all.insert m read
+    return all
 
 /--
 `readImportUsage?` of `m`, read once per decision, and once with `kept` (`readImports`): a decision binds `m` once,
@@ -614,6 +669,17 @@ def importUsage? (hashes : ContentHashes) (importArts : NameMap ImportArtifacts)
   if !r.1.isEmpty && (r.2 matches .ok _) then
     reads.modify (·.insert m (#[], r.2))
   replayRun r
+
+/--
+`importUsage?` of `m`, taken from `bound`, a snapshot of the decision's bindings (`ContentHashes.reads`), when that
+binding logged nothing and threw nothing: `importUsage?` then only returns it, and an entry with no log is never
+replaced. Otherwise `importUsage?` itself. A loop over the closure takes the snapshot once for all of its modules.
+-/
+@[inline] def importUsageIn? (hashes : ContentHashes) (importArts : NameMap ImportArtifacts)
+    (bound : Std.HashMap Name ImportRead) (m : Name) (kept := false) : JobM (Option (FilePath × UsageImport)) := do
+  if let some (log, .ok b) := bound[m]? then
+    if log.isEmpty then return b
+  importUsage? hashes importArts m (kept := kept)
 
 /-- The modules of the closure that are not `module` files: `importUsage?` reads their fields from their `.usekey`. -/
 def keyedModules (importArts : NameMap ImportArtifacts) : Array Name := Id.run do
@@ -741,10 +807,11 @@ describe its declarations as Lean compiled them, as what it used. The closure's 
 def untrustedClosureModule? (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) :
     JobM (Option Name) := do
   readImports hashes importArts (keyedModules importArts)
+  let bound ← hashes.imports.get
   for (m, arts) in importArts do
     if arts.oleanServer?.isSome then continue
     if (← findModule? m).isNone then continue
-    if (← importUsage? hashes importArts m).isNone then return some m
+    if (← importUsageIn? hashes importArts bound m).isNone then return some m
   return none
 
 /--
@@ -778,10 +845,16 @@ were current at the accept. The closure's modules are read in parallel (`readImp
 def closureEdgesCurrent (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) (kept := false) :
     JobM Bool := do
   readImports hashes importArts (keyedModules importArts) (kept := kept)
+  let bound ← (hashes.reads kept).get
   for (x, arts) in importArts do
     if arts.oleanServer?.isSome then continue
-    let some (_, imp) ← importUsage? hashes importArts x (kept := kept) | return false
+    let some (_, imp) ← importUsageIn? hashes importArts bound x (kept := kept) | return false
     for (y, recorded) in imp.importedClosures do
+      -- an importee bound to an `.olean` is one of the closure
+      if let some (log, .ok (some (_, cur))) := bound[y]? then
+        if log.isEmpty then
+          unless cur.closure == recorded do return false
+          continue
       unless importArts.contains y do continue
       let some (_, cur) ← importUsage? hashes importArts y (kept := kept) | return false
       unless cur.closure == recorded do return false
@@ -797,8 +870,13 @@ the local trace instead.
 -/
 def UsageSidecar.coversClosure (usage : UsageSidecar) (importArts : NameMap ImportArtifacts) : Bool :=
   Id.run do
+    -- both in `Name.quickLt` order: one walk of `digested`
+    let ds := usage.digested
+    let mut i := 0
     for (m, _) in importArts do
-      unless (usage.digested.binSearch (m, default) (Name.quickLt ·.1 ·.1)).isSome do return false
+      while h : i < ds.size do
+        if Name.quickLt ds[i].1 m then i := i + 1 else break
+      unless ds[i]?.any (·.1 == m) do return false
     return true
 
 /-- A copy of the module name `n` that shares no object with it, for a name read from a compacted region that is freed
@@ -834,6 +912,37 @@ where
     let imports := (parts[0]?.elim #[] (·.1.imports)).foldl (·.push <| copyName ·.module) #[]
     freeRegionsThen (parts.map (·.2)) (hashes, imports)
 
+/-- A filter of the hashes of `claims` (`UsageSidecar.kernelDisjoint`): the bit `h &&& mask` of its bytes is set for
+each claimed hash `h`, at least 32 bits per claim and at most `2 ^ 32` bits, so that most constants that are not claimed
+are told apart by one bit instead of a lookup, and the low 32 bits of a hash (`UsageImport.kernelLows`) select the same
+bit as the whole hash. -/
+def claimFilter (claims : Std.HashMap UInt64 (Array Name)) : ByteArray × UInt64 := Id.run do
+  let bits := min (2 ^ 32) (max 512 (32 * claims.size).nextPowerOfTwo)
+  let mut b := ByteArray.emptyWithCapacity (bits / 8)
+  for _ in [0:bits / 8] do
+    b := b.push 0
+  let mask := (bits - 1).toUInt64
+  for (h, _) in claims do
+    let i := ((h &&& mask) >>> 3).toNat
+    b := b.set! i (b.get! i ||| ((1 : UInt8) <<< (h &&& 7).toUInt8))
+  return (b, mask)
+
+/-- Whether the claim filter `f` (`claimFilter`) may hold hash `h`: `false` only if no claim has it. -/
+@[inline] def claimFilterMayHave (f : ByteArray × UInt64) (h : UInt64) : Bool :=
+  f.1.get! ((h &&& f.2) >>> 3).toNat &&& ((1 : UInt8) <<< (h &&& 7).toUInt8) != 0
+
+/-- Whether module `k`, bound to `imp`, declares a kernel constant that another module claims (`kernelDisjoint`'s
+`clash`): the claim filter (`claimFilter`) tests the low bits of each constant's hash (`UsageImport.kernelLows`), and
+only a constant it may hold is looked up. -/
+def declaresClaimed (filter : ByteArray × UInt64) (claims : Std.HashMap UInt64 (Array Name)) (k : Name)
+    (imp : UsageImport) : Bool := Id.run do
+  let lows := imp.kernelLows.get
+  for i in [0:lows.size] do
+    if claimFilterMayHave filter lows[i]!.toUInt64 then
+      if let some n := imp.provides.1[i]? then
+        if claims[n.hash]?.any (·.any (· != k)) then return true
+  return false
+
 /--
 Whether no closure module whose provides changed (`changed`, each with its `provides` as `importUsage?` binds them)
 declares a kernel constant that another module of the compile declares too, unless the compile depended on that
@@ -855,10 +964,12 @@ duplicate has a declarer this checks.
 Names are compared by `Name.hash`, so a hash collision only rebuilds. The `.olean` reads assume the data layout of
 the Lean that Lake was built with, so with another Lean, or if a read fails, the check fails. A `module` file's kernel
 constants are kept per build and module state, a toolchain module's per build (`BuildContext.kernelProviders`), so a
-later check does not read them again. The check reads those maps once and takes their mutex again only for a module they
-lack: every check of the build takes it, and a module's entry only ever holds what some read of it gave. The
-workspace modules are read in parallel (`readImports`, `parallelRuns`), and their reads' logs and errors are replayed
-in closure order before any duplicate decides the check, as a serial check meets them.
+later check does not read them again. The check reads those maps once, takes their mutex again for each module they
+lack, and, when no other duplicate decided it, once more at the end, to read the build's index of the toolchain
+modules' kernel constants by hash (`KernelProviders.toolchainIndex`), in which it looks up each claimed constant: every
+check of the build takes the mutex, and a module's entry only ever holds what some read of it gave. The workspace
+modules are read in parallel (`readImports`, `parallelRuns`), and their reads' logs and errors are replayed in closure
+order before any duplicate decides the check, as a serial check meets them.
 -/
 def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetup) (hashes : ContentHashes)
     (importArts : NameMap ImportArtifacts) (changed : Array (Name × UsageImport)) :
@@ -874,8 +985,10 @@ def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetu
       if (declared.binSearch (n, default) (Name.quickLt ·.1 ·.1)).isSome then continue
       if usage.provides.1.binSearchContains n Name.quickLt then clashes := true
       claims := claims.alter n.hash fun ms? => some ((ms?.getD #[]).push m)
-  -- whether module `k` declaring the constant with hash `h` duplicates a claimed constant
-  let clash (k : Name) (h : UInt64) : Bool := claims[h]?.any (·.any (· != k))
+  -- whether module `k` declaring the constant with hash `h` duplicates a claimed constant: most constants of the
+  -- closure and the toolchain are claimed by none, which the filter tells without a lookup
+  let filter := claimFilter claims
+  let clash (k : Name) (h : UInt64) : Bool := claimFilterMayHave filter h && claims[h]?.any (·.any (· != k))
   let outside (r : Array Name) (i : ModuleImport) := if i.module?.isNone then r.push i.module else r
   let kp := (← getBuildContext).kernelProviders
   let providers ← kp.atomically get
@@ -901,7 +1014,7 @@ def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetu
       let parts := arts.oleanParts false
       return some (imports, .inr (m, ← partsDigest (contentHash hashes) parts, parts))
     let some (_, imp) ← replayRun (known[m]?.getD (#[], .ok none)) | return none
-    return some (imports, .inl (imp.provides.1.any (clash m ·.hash)))
+    return some (imports, .inl (declaresClaimed filter claims m imp))
   -- whether a `module` file's kernel constants duplicate a claimed one, or `none` if they cannot be read or the parts no
   -- longer have the bytes the check hashed
   let modsysClash (x : Name × ModuleUsage.Digest × Array FilePath) : JobM (Option Bool) := do
@@ -950,11 +1063,21 @@ def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetu
         let read? ← match ← Lean.SearchPath.findWithExt searchPath "olean" m with
           | some olean => readKernelProvides (readModuleDataPartsOfFile olean)
           | none => pure none
-        kp.atomically (modify fun s => { s with toolchain := s.toolchain.insert m read? })
+        kp.atomically (modify fun s => { s with
+          toolchain := s.toolchain.insert m read?
+          toolchainIndex := (read?.elim #[] (·.1)).foldl (init := s.toolchainIndex) fun ix h =>
+            ix.insert h (((ix.find? h).getD #[]).push m) })
         pure read?
-    let some (hs, imports) := read? | return false
-    clashes := clashes || hs.any (clash m)
+    let some (_, imports) := read? | return false
     toolchain := toolchain ++ imports
+  -- A toolchain module the walk read declares a claimed constant: every claimer is a module of the closure, which the
+  -- walk skips, so any such declarer clashes. The walk's modules are all in the index, with their kernel constants.
+  unless clashes do
+    let index := (← kp.atomically get).toolchainIndex
+    for (h, _) in claims do
+      if (index.find? h).any (·.any seen.contains) then
+        clashes := true
+        break
   return !clashes
 
 /--
@@ -1003,13 +1126,19 @@ A module-system module's provides are pinned by `modsysHash`, a toolchain module
 def UsageSidecar.resolvedUnchanged (usage : UsageSidecar) (presetup : ModulePreSetup)
     (resolvedFile? : Option FilePath) (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) : JobM Bool := do
   readImports hashes importArts (keyedModules importArts) (kept := true)
+  let bound ← hashes.keptImports.get
   let mut changed := #[]
   let mut table? : Option ModuleUsage.ResolvedTable := none
+  -- `digested` is in `Name.quickLt` order, as the closure is: one walk of it
+  let ds := usage.digested
+  let mut i := 0
   for (m, arts) in importArts do
     if arts.oleanServer?.isSome then continue
     if (← findModule? m).isNone then continue
-    let some (_, recorded) := usage.digested.binSearch (m, default) (Name.quickLt ·.1 ·.1) | return false
-    let some (_, imp) ← importUsage? hashes importArts m (kept := true) | return false
+    while h : i < ds.size do
+      if Name.quickLt ds[i].1 m then i := i + 1 else break
+    let some (_, recorded) := ds[i]?.filter (·.1 == m) | return false
+    let some (_, imp) ← importUsageIn? hashes importArts bound m (kept := true) | return false
     if imp.providesDigest == recorded then continue
     if usage.resolvedAll then return false
     if table?.isNone then
@@ -1019,7 +1148,7 @@ def UsageSidecar.resolvedUnchanged (usage : UsageSidecar) (presetup : ModulePreS
     let some table := table? | return false
     let declared := (usage.used.binSearch (m, #[]) (Name.quickLt ·.1 ·.1)).elim #[] (·.2.map (·.1))
     unless table.providerUnchanged m imp.providedIds.get declared do return false
-    if imp.indirect.any (table.entries.contains <| ModuleUsage.resolvedId ·) then return false
+    if imp.indirectIds.get.any table.entries.contains then return false
     changed := changed.push (m, imp)
   if changed.isEmpty then return true
   usage.kernelDisjoint presetup hashes importArts changed
