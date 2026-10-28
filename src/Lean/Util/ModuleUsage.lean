@@ -6,7 +6,6 @@ module
 prelude
 public import Lean.Util.SCC
 public import Lean.Util.FoldConsts
-public import Lean.Util.PtrSet
 public import Lean.Elab.InfoTree.Types
 public import Lean.Util.UsedByChecks
 public import Lean.Util.ModuleUsage.Basic
@@ -428,60 +427,40 @@ def moduleUsed (env : Environment) (extra : NameSet) (nodes := ownNodes env (own
   byMod.toArray.map (fun (k, v) => (k, v.qsort fun a b => Name.quickLt a.1 b.1))
     |>.qsort fun a b => Name.quickLt a.1 b.1
 
-unsafe structure WalkState where
-  /-- Visited metavariable-free subterms: their constants do not depend on any assignment. -/
-  closed : PtrSet Expr := mkPtrSet
-  /-- Visited subterms with metavariables, valid for `mctx` only. -/
-  opened : PtrSet Expr := mkPtrSet
-  mctx : MetavarContext := {}
-  used : NameSet
+private opaque ConstWalkerPointed : NonemptyType
 
-/-- Whether `e` was visited, marking it visited. -/
-@[inline] unsafe def WalkState.visit (s : WalkState) (e : Expr) : Bool × WalkState :=
-  if e.hasMVar then
-    let (seen, opened) := s.opened.containsThenInsert { value := e }
-    (seen, { s with opened })
-  else
-    let (seen, closed) := s.closed.containsThenInsert { value := e }
-    (seen, { s with closed })
+/-- The state of `usedFromInfoTrees`'s walk, in `src/library/usage_digest.cpp`: the subterms visited, the metavariable
+context of the last walk, and the constants met. -/
+private def ConstWalker : Type := ConstWalkerPointed.type
 
-/-- `s` with `c` used. -/
-@[inline] unsafe def WalkState.use (s : WalkState) (c : Name) : WalkState :=
-  { s with used := s.used.insert c }
+private instance : Nonempty ConstWalker := by exact ConstWalkerPointed.property
 
-/-- Adds the constants of `e` with its metavariables instantiated by `s.mctx`, following assignments in place
-of building the instantiated term. -/
-unsafe def walkExpr (e : Expr) : StateM WalkState Unit := do
-  if ← modifyGet (·.visit e) then return
-  match e with
-  | .forallE _ d b _ | .lam _ d b _ => walkExpr d; walkExpr b
-  | .letE _ t v b _ => walkExpr t; walkExpr v; walkExpr b
-  | .app f a => walkExpr f; walkExpr a
-  | .mdata _ b => walkExpr b
-  | .proj n _ b => modify (·.use n); walkExpr b
-  | .const c _ => modify (·.use c)
-  | .mvar m =>
-    let mctx := (← get).mctx
-    if let some v := mctx.getExprAssignmentCore? m then walkExpr v
-    else if let some d := mctx.getDelayedMVarAssignmentCore? m then walkExpr (.mvar d.mvarIdPending)
-  | _ => pure ()
+@[extern "lean_usage_const_walker_new"]
+private opaque ConstWalker.new : BaseIO ConstWalker
 
-unsafe def usedFromInfoTreesImpl (trees : Array Elab.InfoTree) (init : NameSet) : NameSet :=
-  let walk : StateM WalkState Unit := trees.forM fun t => t.foldInfoM (init := ()) fun ctx i _ => match i with
-    | .ofTermInfo ti => do
-      unless ptrEq (← get).mctx ctx.mctx do
-        modify fun s => { s with mctx := ctx.mctx, opened := mkPtrSet }
-      walkExpr ti.expr
-    | .ofFieldInfo fi => modify (·.use fi.projName)
-    | _ => pure ()
-  (walk.run { used := init }).2.used
+/-- Adds the constants of `e` (those of its `const` and `proj` nodes) with its metavariables instantiated by `mctx`,
+following assignments, and the pending metavariables of delayed ones, in place of building the instantiated term.
+A visited subterm is not visited again: one without metavariables in the whole walk, one with metavariables until
+a walk under another `mctx` (by pointer) begins. -/
+@[extern "lean_usage_const_walker_walk"]
+private opaque ConstWalker.walk (w : @& ConstWalker) (mctx : @& MetavarContext) (e : @& Expr) : BaseIO Unit
+
+/-- The constants the walks met, each name object once. -/
+@[extern "lean_usage_const_walker_names"]
+private opaque ConstWalker.names (w : @& ConstWalker) : BaseIO (Array Name)
 
 /-- `init` plus every constant in a `TermInfo.expr` of `trees`, metavariables instantiated with the node's
 `ContextInfo.mctx`, and every `FieldInfo.projName`. Visited subterms are shared by all nodes, so a subterm that
 many nested nodes carry is walked once. Assignments are followed rather than instantiated, so the result can
-keep a constant that instantiation's beta reduction would drop: a superset, never less. -/
-@[implemented_by usedFromInfoTreesImpl]
-opaque usedFromInfoTrees (trees : Array Elab.InfoTree) (init : NameSet) : NameSet
+keep a constant that instantiation's beta reduction would drop: a superset, never less. `trees` is borrowed: the
+walker keeps unreferenced pointers into the trees' terms and contexts until `ConstWalker.names`. -/
+def usedFromInfoTrees (trees : @& Array Elab.InfoTree) (init : NameSet) : BaseIO NameSet := do
+  let w ← ConstWalker.new
+  let used ← trees.foldlM (init := init) fun used t => t.foldInfoM (init := used) fun ctx i used => match i with
+    | .ofTermInfo ti => do w.walk ctx.mctx ti.expr; return used
+    | .ofFieldInfo fi => return used.insert fi.projName
+    | _ => return used
+  return (← w.names).foldl (·.insert ·) used
 
 /-! Cross-module compiler tables: entries a module adds for declarations of other modules, which change how
 every importer compiles without changing any digest of those declarations. -/
