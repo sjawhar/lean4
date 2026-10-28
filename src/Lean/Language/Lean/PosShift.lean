@@ -197,12 +197,61 @@ private def mapRawVal (s : PosShift) (ss : Substring.Raw) : Substring.Raw :=
   else
     ss
 
+/-- The address of an old object; hashed with `hash64`, as aligned addresses have equal low bits. -/
+structure ObjAddr where
+  addr : USize
+  deriving BEq
+
+instance : Hashable ObjAddr := ⟨fun a => hash64 a.addr.toUInt64⟩
+
+/--
+The moved results of the old objects that one move has moved, by object address. Elaboration
+shares objects widely: each info node holds a part of the command's syntax, and each tactic
+snapshot's info tree is also a part of the command's info tree and of the info trees of the
+enclosing tactic snapshots. With the cache, each shared object is moved once and its moved result is
+shared in the same way; without it, each share is copied again. Each entry also holds the old
+object, so that no other object can take its address while the cache is in use.
+-/
+structure MoveCache where
+  /-- Old object address to the old object and its moved result. -/
+  objs : Std.HashMap ObjAddr (NonScalar × NonScalar) := {}
+
+/-- Moves results, once for each shared object (see `MoveCache`). -/
+abbrev MoveM := StateM MoveCache
+
+private unsafe def findMovedImpl {α : Type} (x : α) : MoveM (Option α) :=
+  return (← get).objs[ObjAddr.mk (ptrAddrUnsafe x)]?.map fun (_, r) => unsafeCast r
+
+/-- The moved result of `x`, if this move has moved the same object before. -/
+@[implemented_by findMovedImpl]
+private def findMoved? {α : Type} (_x : α) : MoveM (Option α) := pure none
+
+private unsafe def recordMovedImpl {α : Type} (x r : α) : MoveM Unit :=
+  modify fun c => { c with objs := c.objs.insert ⟨ptrAddrUnsafe x⟩ (unsafeCast x, unsafeCast r) }
+
+/-- Records `r` as the moved result of `x`. -/
+@[implemented_by recordMovedImpl]
+private def recordMoved {α : Type} (_x _r : α) : MoveM Unit := pure ()
+
+/-- Moves `x` with `f`, or returns the moved result of the same object. -/
+@[inline] private def memo {α : Type} (x : α) (f : α → MoveM α) : MoveM α := do
+  if let some r ← findMoved? x then
+    return r
+  let r ← f x
+  recordMoved x r
+  return r
+
 /-- Moves all positions in `stx`. -/
-partial def mapSyntax (s : PosShift) : Syntax → Syntax
-  | .missing => .missing
-  | .node info k args => .node (s.mapInfo info) k (args.map s.mapSyntax)
-  | .atom info val => .atom (s.mapInfo info) val
-  | .ident info rawVal val pre => .ident (s.mapInfo info) (s.mapRawVal rawVal) val pre
+partial def mapSyntaxM (s : PosShift) (stx : Syntax) : MoveM Syntax :=
+  if stx matches .missing then pure .missing else memo stx fun
+    | .node info k args => return .node (s.mapInfo info) k (← args.mapM s.mapSyntaxM)
+    | .atom info val => return .atom (s.mapInfo info) val
+    | .ident info rawVal val pre => return .ident (s.mapInfo info) (s.mapRawVal rawVal) val pre
+    | .missing => return .missing
+
+/-- Moves all positions in `stx`. -/
+def mapSyntax (s : PosShift) (stx : Syntax) : Syntax :=
+  (s.mapSyntaxM stx).run' {}
 
 /--
 Whether `new` is `old` with its positions moved: the same node kinds, atoms and identifiers, and each
@@ -230,56 +279,61 @@ where
     | .none, .none => true
     | _, _ => false
 
-private def mapElabInfo (s : PosShift) (i : ElabInfo) : ElabInfo :=
-  { i with stx := s.mapSyntax i.stx }
+private def mapElabInfoM (s : PosShift) (i : ElabInfo) : MoveM ElabInfo :=
+  return { i with stx := ← s.mapSyntaxM i.stx }
 
-private def mapCompletionInfo (s : PosShift) : CompletionInfo → CompletionInfo
-  | .dot ti e? => .dot { ti with toElabInfo := s.mapElabInfo ti.toElabInfo } e?
-  | .id stx n dd lctx e? => .id (s.mapSyntax stx) n dd lctx e?
-  | .dotId stx n lctx e? => .dotId (s.mapSyntax stx) n lctx e?
-  | .fieldId stx n? lctx sn => .fieldId (s.mapSyntax stx) n? lctx sn
-  | .namespaceId stx => .namespaceId (s.mapSyntax stx)
-  | .option stx => .option (s.mapSyntax stx)
-  | .errorName stx pid => .errorName (s.mapSyntax stx) (s.mapSyntax pid)
-  | .endSection stx id? dd ns => .endSection (s.mapSyntax stx) id? dd ns
-  | .tactic stx => .tactic (s.mapSyntax stx)
+private def mapCompletionInfoM (s : PosShift) : CompletionInfo → MoveM CompletionInfo
+  | .dot ti e? => return .dot { ti with toElabInfo := ← s.mapElabInfoM ti.toElabInfo } e?
+  | .id stx n dd lctx e? => return .id (← s.mapSyntaxM stx) n dd lctx e?
+  | .dotId stx n lctx e? => return .dotId (← s.mapSyntaxM stx) n lctx e?
+  | .fieldId stx n? lctx sn => return .fieldId (← s.mapSyntaxM stx) n? lctx sn
+  | .namespaceId stx => return .namespaceId (← s.mapSyntaxM stx)
+  | .option stx => return .option (← s.mapSyntaxM stx)
+  | .errorName stx pid => return .errorName (← s.mapSyntaxM stx) (← s.mapSyntaxM pid)
+  | .endSection stx id? dd ns => return .endSection (← s.mapSyntaxM stx) id? dd ns
+  | .tactic stx => return .tactic (← s.mapSyntaxM stx)
 
 /-- Moves custom info: its syntax, and the edit range of a "Try this" code action. -/
-private def mapCustomInfo (s : PosShift) (i : CustomInfo) : CustomInfo :=
+private def mapCustomInfoM (s : PosShift) (i : CustomInfo) : MoveM CustomInfo := do
   let value := match i.value.get? TryThisInfo with
     | some t => Dynamic.mk { t with edit.range := s.mapLspRange t.edit.range }
     | none => i.value
-  { stx := s.mapSyntax i.stx, value }
+  return { stx := ← s.mapSyntaxM i.stx, value }
 
 /-- Moves the positions of an info node. -/
-def mapInfoNode (s : PosShift) : Info → Info
-  | .ofTacticInfo i => .ofTacticInfo { i with toElabInfo := s.mapElabInfo i.toElabInfo }
-  | .ofTermInfo i => .ofTermInfo { i with toElabInfo := s.mapElabInfo i.toElabInfo }
-  | .ofPartialTermInfo i => .ofPartialTermInfo { i with toElabInfo := s.mapElabInfo i.toElabInfo }
-  | .ofCommandInfo i => .ofCommandInfo { i with toElabInfo := s.mapElabInfo i.toElabInfo }
+def mapInfoNodeM (s : PosShift) (i : Info) : MoveM Info := memo i fun
+  | .ofTacticInfo i => return .ofTacticInfo { i with toElabInfo := ← s.mapElabInfoM i.toElabInfo }
+  | .ofTermInfo i => return .ofTermInfo { i with toElabInfo := ← s.mapElabInfoM i.toElabInfo }
+  | .ofPartialTermInfo i =>
+    return .ofPartialTermInfo { i with toElabInfo := ← s.mapElabInfoM i.toElabInfo }
+  | .ofCommandInfo i => return .ofCommandInfo { i with toElabInfo := ← s.mapElabInfoM i.toElabInfo }
   | .ofMacroExpansionInfo i =>
-    .ofMacroExpansionInfo { i with stx := s.mapSyntax i.stx, output := s.mapSyntax i.output }
-  | .ofOptionInfo i => .ofOptionInfo { i with stx := s.mapSyntax i.stx }
-  | .ofErrorNameInfo i => .ofErrorNameInfo { i with stx := s.mapSyntax i.stx }
-  | .ofFieldInfo i => .ofFieldInfo { i with stx := s.mapSyntax i.stx }
-  | .ofCompletionInfo i => .ofCompletionInfo (s.mapCompletionInfo i)
-  | .ofUserWidgetInfo i => .ofUserWidgetInfo { i with stx := s.mapSyntax i.stx }
-  | .ofCustomInfo i => .ofCustomInfo (s.mapCustomInfo i)
-  | .ofFVarAliasInfo i => .ofFVarAliasInfo i
-  | .ofFieldRedeclInfo i => .ofFieldRedeclInfo { i with stx := s.mapSyntax i.stx }
+    return .ofMacroExpansionInfo
+      { i with stx := ← s.mapSyntaxM i.stx, output := ← s.mapSyntaxM i.output }
+  | .ofOptionInfo i => return .ofOptionInfo { i with stx := ← s.mapSyntaxM i.stx }
+  | .ofErrorNameInfo i => return .ofErrorNameInfo { i with stx := ← s.mapSyntaxM i.stx }
+  | .ofFieldInfo i => return .ofFieldInfo { i with stx := ← s.mapSyntaxM i.stx }
+  | .ofCompletionInfo i => return .ofCompletionInfo (← s.mapCompletionInfoM i)
+  | .ofUserWidgetInfo i => return .ofUserWidgetInfo { i with stx := ← s.mapSyntaxM i.stx }
+  | .ofCustomInfo i => return .ofCustomInfo (← s.mapCustomInfoM i)
+  | .ofFVarAliasInfo i => return .ofFVarAliasInfo i
+  | .ofFieldRedeclInfo i => return .ofFieldRedeclInfo { i with stx := ← s.mapSyntaxM i.stx }
   | .ofDelabTermInfo i =>
-    .ofDelabTermInfo { i with toTermInfo := { i.toTermInfo with toElabInfo := s.mapElabInfo i.toElabInfo } }
-  | .ofChoiceInfo i => .ofChoiceInfo { i with toElabInfo := s.mapElabInfo i.toElabInfo }
-  | .ofChoiceResolutionInfo i => .ofChoiceResolutionInfo { i with stx := s.mapSyntax i.stx }
-  | .ofDocInfo i => .ofDocInfo { i with toElabInfo := s.mapElabInfo i.toElabInfo }
-  | .ofDocElabInfo i => .ofDocElabInfo { i with toElabInfo := s.mapElabInfo i.toElabInfo }
+    return .ofDelabTermInfo
+      { i with toTermInfo := { i.toTermInfo with toElabInfo := ← s.mapElabInfoM i.toElabInfo } }
+  | .ofChoiceInfo i => return .ofChoiceInfo { i with toElabInfo := ← s.mapElabInfoM i.toElabInfo }
+  | .ofChoiceResolutionInfo i =>
+    return .ofChoiceResolutionInfo { i with stx := ← s.mapSyntaxM i.stx }
+  | .ofDocInfo i => return .ofDocInfo { i with toElabInfo := ← s.mapElabInfoM i.toElabInfo }
+  | .ofDocElabInfo i => return .ofDocElabInfo { i with toElabInfo := ← s.mapElabInfoM i.toElabInfo }
 
 /-- Moves all positions of an info tree and gives its contexts the new file map. -/
-partial def mapInfoTree (s : PosShift) : InfoTree → InfoTree
-  | .context (.commandCtx ci) t => .context (.commandCtx { ci with fileMap := s.newMap }) (s.mapInfoTree t)
-  | .context ci t => .context ci (s.mapInfoTree t)
-  | .node i cs => .node (s.mapInfoNode i) (cs.map s.mapInfoTree)
-  | .hole id => .hole id
+partial def mapInfoTreeM (s : PosShift) (t : InfoTree) : MoveM InfoTree := memo t fun
+  | .context (.commandCtx ci) t =>
+    return .context (.commandCtx { ci with fileMap := s.newMap }) (← s.mapInfoTreeM t)
+  | .context ci t => return .context ci (← s.mapInfoTreeM t)
+  | .node i cs => return .node (← s.mapInfoNodeM i) (← cs.mapM s.mapInfoTreeM)
+  | .hole id => return .hole id
 
 /--
 Moves a declaration range. Its UTF-16 columns come from the new file map, as in
@@ -307,7 +361,7 @@ def mapScope (s : PosShift) (sc : Command.Scope) : Command.Scope :=
 end PosShift
 
 /--
-Whether an info tree holds data whose positions `PosShift.mapInfoTree` cannot move: a panel widget
+Whether an info tree holds data whose positions `PosShift.mapInfoTreeM` cannot move: a panel widget
 (its props can hold editor ranges), or a `panic!`, `assert!` or `unreachable!` call, whose term holds
 the line and column of the call.
 -/
@@ -421,8 +475,8 @@ Moves a message, or names why a new elaboration could give other bytes: an error
 than fixed text of a command that holds the changed bytes (embedded syntax prints its comments,
 hints print the source text of their span, some errors print the command's source text), a message
 that is not fixed text on the line whose columns change (suggestions take their indentation from
-the column), or a position that cannot be mapped. `mapSnapshot?` also checks the rendered text
-(`textHoldsLineCol`).
+the column), or a position that cannot be mapped. `mapSnapshot?` also checks the rendered text of
+the messages that the server shows (`textHoldsLineCol`).
 -/
 def mapMessage? (s : PosShift) (scope : MoveScope) (m : Message) : Except String Message := do
   if scope.touches && m.severity == .error then
@@ -443,21 +497,31 @@ def mapMessageLog? (s : PosShift) (scope : MoveScope) (log : MessageLog) : Excep
   let unreported ← log.unreported.mapM (s.mapMessage? scope)
   return { log with reported, unreported }
 
-private def mapTraces (s : PosShift) (t : TraceState) : TraceState :=
-  { t with traces := t.traces.map fun e => { e with ref := s.mapSyntax e.ref } }
+private def mapTracesM (s : PosShift) (t : TraceState) : MoveM TraceState :=
+  return { t with traces := ← t.traces.mapM fun e => return { e with ref := ← s.mapSyntaxM e.ref } }
+
+/-- Moves snapshots (see `MoveM`), or names why a result cannot be moved. -/
+abbrev MoveIO := StateT MoveCache (ExceptT String BaseIO)
+
+private def liftMove (x : MoveM α) : MoveIO α := fun c => pure (Id.run (x.run c))
 
 /--
 Moves the positions of a snapshot: messages, info tree and trace references; or names why a message
 or the info tree cannot be moved (see `mapMessage?` and `InfoTree.holdsUnmovablePositions`).
 -/
-def mapSnapshot? (s : PosShift) (scope : MoveScope) (snap : Snapshot) :
-    BaseIO (Except String Snapshot) := ExceptT.run do
+def mapSnapshot? (s : PosShift) (scope : MoveScope) (snap : Snapshot) : MoveIO Snapshot := do
   let log := snap.diagnostics.msgLog
-  let log' ← ExceptT.mk <| pure <| s.mapMessageLog? scope log
+  let log' ← match s.mapMessageLog? scope log with
+    | .ok log' => pure log'
+    | .error reason => throw reason
   if scope.moves then
     if snap.infoTree?.any InfoTree.holdsUnmovablePositions then
       throw "info tree holds a panel widget or a panic position"
-    for m in log.reportedPlusUnreported do
+    -- The server shows only the unreported messages of a snapshot. A reported message is a copy of
+    -- one that a snapshot of the same command shows (for example `CoreM.lean:686-687`,
+    -- `Elab/Command.lean:569-572`), where its text is checked; the snapshots of a tactic proof hold
+    -- many such copies.
+    for m in log.unreported do
       if textHoldsLineCol (← m.data.toString) then
         throw "message text holds LINE:COL"
   -- a new `Diagnostics` value, as the old one memoizes the editor ranges of its messages
@@ -467,19 +531,19 @@ def mapSnapshot? (s : PosShift) (scope : MoveScope) (snap : Snapshot) :
       Snapshot.Diagnostics.ofMessageLog log'
   return { snap with
     diagnostics
-    infoTree? := snap.infoTree?.map s.mapInfoTree
-    traces := s.mapTraces snap.traces }
+    infoTree? := ← liftMove <| snap.infoTree?.mapM s.mapInfoTreeM
+    traces := ← liftMove <| s.mapTracesM snap.traces }
 
 /--
 Moves the positions of a finished snapshot tree and all its children, which must be finished too.
 -/
 partial def mapTree? (s : PosShift) (scope : MoveScope) (t : SnapshotTree) :
-    BaseIO (Except String SnapshotTree) := ExceptT.run do
-  let element ← ExceptT.mk <| s.mapSnapshot? scope t.element
+    MoveIO SnapshotTree := do
+  let element ← s.mapSnapshot? scope t.element
   let mut children := #[]
   for c in t.children do
-    let c' ← ExceptT.mk <| s.mapTree? scope c.get
-    children := children.push (.finished (c.stx?.map s.mapSyntax) c')
+    let c' ← s.mapTree? scope c.get
+    children := children.push (.finished (← liftMove <| c.stx?.mapM s.mapSyntaxM) c')
   return ⟨element, children⟩
 
 /-- How the old command `stx` relates to the changed bytes. -/
@@ -606,14 +670,14 @@ snapshot tree is still reported.
 -/
 def mapElabSnap? (s : PosShift) (scope : MoveScope) (lineShift : Bool) (stx : Syntax)
     (cmdState : Command.State) (e : CommandElaboratingSnapshot) :
-    BaseIO (Except String CommandElaboratingSnapshot) := ExceptT.run do
-  let toSnapshot ← ExceptT.mk <| s.mapSnapshot? scope e.toSnapshot
+    MoveIO CommandElaboratingSnapshot := do
+  let toSnapshot ← s.mapSnapshot? scope e.toSnapshot
   let dyn := e.elabSnap.get
-  let dynTree ← ExceptT.mk <| s.mapTree? scope (toSnapshotTree dyn)
+  let dynTree ← s.mapTree? scope (toSnapshotTree dyn)
   let res := e.resultSnap.get
-  let resSnap ← ExceptT.mk <| s.mapSnapshot? scope res.toSnapshot
-  let infoSnap ← ExceptT.mk <| s.mapSnapshot? scope e.infoTreeSnap.get.toSnapshot
-  let report ← ExceptT.mk <| s.mapTree? scope e.reportSnap.get
+  let resSnap ← s.mapSnapshot? scope res.toSnapshot
+  let infoSnap ← s.mapSnapshot? scope e.infoTreeSnap.get.toSnapshot
+  let report ← s.mapTree? scope e.reportSnap.get
   let val := if scope.firstStays && !lineShift then dyn.val else (default : DynamicSnapshot).val
   return {
     toSnapshot
