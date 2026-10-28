@@ -10,7 +10,7 @@ WORK="$TEST_DIR/work"; mkdir -p "$WORK"
 # The fake itself first, so that the cases below test Lake and not the fake.
 test_cmd bash "$TEST_DIR/fake_selftest.sh"
 
-for d in local remote remote2 failed timeout unreach later later2 wrongtc killed termed stuck late late-ref; do
+for d in local remote remote2 failed timeout unreach later later2 wrongtc killed termed termed-write stuck late late-ref; do
   mkdir -p "$WORK/$d"; cp -r lakefile.toml Rx.lean Rx "$WORK/$d/"
 done
 export LAKE_REMOTE_EXEC_CLIENT="$TEST_DIR/fake_lean_remote.py" FAKE_CAS="$WORK/cas" FAKE_LOG="$WORK/fake.log"
@@ -156,6 +156,17 @@ rm -rf "$WORK/timeout/.lake"
   test_err "the build service's run of Rx.B failed" build Rx)
 match_text "lake: remote: unreachable; 2 cached (0 from manifest), 0 executed, 0 local;" "$WORK/timeout/produced.out"
 
+# After an UNAVAILABLE answer, a module whose job starts later (Rq.N waits 2 s for a local target) sends
+# no request and fails at once, and its error names the service. Rx.A and Rx.B are the only runs:
+# Rx.M, which Rq.N imports, starts after `slow` too.
+mkdir -p "$WORK/unavail-later/Rq"; cp -r Rx.lean Rx "$WORK/unavail-later/"
+printf 'import Lake\nopen Lake DSL\npackage rz\ntarget slow : Unit := Job.async do\n  IO.sleep 2000\nlean_lib Rx\nlean_lib Rq where\n  extraDepTargets := #[`slow]\n' > "$WORK/unavail-later/lakefile.lean"
+printf 'import Rx.M\n\n/-! A module whose build starts after a slow local target. -/\n\ndef n := m + 1\n' > "$WORK/unavail-later/Rq/N.lean"
+runs=$(count_method run)
+(cd "$WORK/unavail-later" && FAKE_UNAVAILABLE_TARGET=Rx.B LAKE_REMOTE_EXEC=grpc://fake:1 \
+  test_err "error: build service at grpc://fake:1 did not answer: Rx.B: the service did not answer" build Rx.B Rq.N)
+test_cmd_eq "$((runs + 2))" count_method run
+
 # A service that does not answer fails the build (slice 1), and the end-of-build line says so.
 (cd "$WORK/unreach" && FAKE_UNREACHABLE=1 LAKE_REMOTE_EXEC=grpc://fake:1 \
   test_err "build service at grpc://fake:1 did not answer" build Rx)
@@ -223,6 +234,37 @@ test_exp ! -e "$WORK/wrongtc/.lake/build/lib/lean/Rx/A.olean"
     sleep 0.05
   done
   test_cmd_eq 1 grep -c "end of input" "$WORK/termed.exits"
+)
+
+# The same SIGTERM during a write of the bridge into the workspace: the bridge finishes that write
+# before it exits, so the workspace build lock stays held until the file has landed whole.
+(
+  cd "$WORK/termed-write"
+  FAKE_SLOW_WRITE=lib/lean/Rx/A.olean FAKE_SLOW_WRITE_MS=3000 FAKE_EXIT_LOG="$WORK/termedw.exits" \
+    LAKE_REMOTE_EXEC=grpc://fake:1 setsid "$LAKE" build Rx >"$WORK/termedw.out" 2>&1 &
+  lake_pid=$!
+  write_started() { compgen -G '.lake/build/lib/lean/Rx/A.olean.fake-*.tmp' > /dev/null; }
+  for _ in $(seq 1 300); do
+    write_started && break
+    sleep 0.05
+  done
+  test_cmd write_started
+  if [ ! -e .lake/build.lock ]; then
+    echo "SKIP: this Lake takes no workspace build lock, so nothing holds the write's lock"
+    kill -9 "$lake_pid"; wait "$lake_pid" || true
+    exit 0
+  fi
+  pgid=$(ps -o pgid= -p "$lake_pid" | tr -d ' ')
+  test_exp "$pgid" = "$lake_pid" -a "$pgid" != "$(ps -o pgid= -p $$ | tr -d ' ')"
+  ms=$(kill_lake TERM "-$pgid" .lake/build.lock); wait "$lake_pid" || true
+  echo "workspace build lock free $ms ms after SIGTERM to Lake's process group during a 3 s write"
+  test_exp "$ms" -ge 1000 -a "$ms" -lt 10000
+  for _ in $(seq 1 100); do
+    [ -s "$WORK/termedw.exits" ] && break
+    sleep 0.05
+  done
+  test_cmd_eq 1 grep -c "end of input" "$WORK/termedw.exits"
+  test_cmd cmp .lake/build/lib/lean/Rx/A.olean "$WORK/local/.lake/build/lib/lean/Rx/A.olean"
 )
 
 # A bridge that does not exit on end of input (its daemon never closes the connection) is killed
