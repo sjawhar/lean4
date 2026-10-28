@@ -1314,7 +1314,7 @@ The `leantar` arguments that pack a module's outputs into the archive `ltar`: it
 `fileName "trace"`, then the file `fileName ext` of each output of `files` (see `ltarFiles`),
 relative to `libDir` or `irDir`.
 
-`-s` strips the trace's `depHash`, so that the archive's bytes depend only on the outputs.
+`-s` strips the trace's `depHash`, so that the archive's bytes depend only on the files it holds.
 Consumers supply the hash again on unpack (see `Module.unpackLtar`).
 -/
 public def ltarPackArgs
@@ -1954,8 +1954,8 @@ where
     | .arts arts =>
       unless (← savedTrace.replayCachedIfUpToDate inputHash) do
         mod.clearOutputArtifacts
-        -- The sidecars stay out of the trace, which `.ltar` archives include: a `.usekey` records
-        -- an input hash, and an archive depends only on outputs.
+        -- The sidecars stay out of the trace, which the archives of `lake build -o` include, so that
+        -- such an archive holds only outputs: a `.usekey` records the input hash of its compile.
         writeFetchTrace mod.traceFile inputHash
           (toJson {arts.descrs with usage? := none, resolved? := none, usekey? := none}) log
           (some presetup.localTrace.hash)
