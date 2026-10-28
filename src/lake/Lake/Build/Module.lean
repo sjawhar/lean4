@@ -1978,12 +1978,11 @@ where
   for nothing. Not with `--old`, which would take the restored files as up to date by their
   modification times, and not unless the build restores artifacts, which the check needs in the
   build directory (as the usage index needs, `Module.skipOrBuild`). Returns the saved trace and
-  archive to go on with, and, if the compile is now the module's previous build, its input hash
-  and `.olean` hash.
+  archive to go on with, and, if the compile is now the module's previous build, its input hash.
   -/
   aliasedPrevious? (presetup : ModulePreSetup) (savedTrace : SavedTrace) (ltar? : Option Artifact)
       (restore : Bool) (depTrace : BuildTrace) :
-      JobM (SavedTrace × Option Artifact × Option (Hash × Hash)) := do
+      JobM (SavedTrace × Option Artifact × Option Hash) := do
     let skip := return (savedTrace, ltar?, none)
     if (← getLakeEnv).remoteCache?.isNone || (← getNoBuild) || (← getIsOldMode) || !restore then
       return ← skip
@@ -2001,10 +2000,9 @@ where
     discard <| fetchFromCache? presetup savedTrace restore (inputHash? := some compiledFor)
     let candidate ← readTraceFile mod.traceFile
     if let .ok data := candidate then
-      if let some descrs := candidate.moduleOutputDescrs? then
-        if data.depHash == compiledFor &&
-            (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) then
-          return (candidate, none, some (compiledFor, descrs.olean.hash))
+      if candidate.moduleOutputDescrs?.isSome && data.depHash == compiledFor &&
+          (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) then
+        return (candidate, none, some compiledFor)
     logVerbose s!"remote cache alias: input {depTrace.hash} names input {compiledFor}, \
       which could not be restored"
     return (candidate, none, none)
@@ -2068,8 +2066,14 @@ where
           let cached? ← if status.isUpToDate then pure none else
             some <$> mod.skipOrBuild presetup savedTrace depTrace (cacheWith? := some restore)
               (compile := checkOrBuild presetup savedTrace (some restore))
-          if let (some (compiledFor, olean), some arts) := (alias?, cached?) then
-            if !(← compiledHere) && arts.olean.hash == olean then
+          if let (some compiledFor, some arts) := (alias?, cached?) then
+            -- The outputs are the alias's compile only if no other decision gave them: not a compile,
+            -- not the kept-module checker's accept, and not another compile from the usage index (each
+            -- compile's `.usekey` records its own input hash)
+            let usekeyInput? ← match arts.usekey? with
+              | some usekey => usekeyInputHash? usekey.path
+              | none => pure none
+            if !(← compiledHere) && arts.keptFrom?.isNone && usekeyInput? == some compiledFor then
               logVerbose s!"remote cache alias: restored the compile of input {compiledFor} \
                 for input {depTrace.hash}"
             else

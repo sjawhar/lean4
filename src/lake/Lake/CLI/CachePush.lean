@@ -421,7 +421,10 @@ def stageModule
   IO.FS.createDirAll irDir
   for (descr, inIrDir) in files, bytes in contents do
     IO.FS.writeBinFile ((if inIrDir then irDir else libDir) / fileName descr.ext) bytes
-  (BuildMetadata.ofFetch entry.inputHash (toJson descrs) entry.log).writeFile
+  -- The sidecars stay out of the trace, as in every trace that a restore writes: they are files of
+  -- the build directory, and a kept module's `.usekey` is rewritten later
+  let traceDescrs := {descrs with usage? := none, resolved? := none, usekey? := none}
+  (BuildMetadata.ofFetch entry.inputHash (toJson traceDescrs) entry.log).writeFile
     (libDir / fileName "trace")
   let ltar := dir / "outputs.ltar"
   let args := ltarPackArgs files fileName libDir irDir ltar
