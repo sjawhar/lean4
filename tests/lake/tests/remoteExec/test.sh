@@ -10,7 +10,7 @@ WORK="$TEST_DIR/work"; mkdir -p "$WORK"
 # The fake itself first, so that the cases below test Lake and not the fake.
 test_cmd bash "$TEST_DIR/fake_selftest.sh"
 
-for d in local remote remote2 failed timeout unreach later wrongtc killed termed stuck late late-ref; do
+for d in local remote remote2 failed timeout unreach later later2 wrongtc killed termed stuck late late-ref; do
   mkdir -p "$WORK/$d"; cp -r lakefile.toml Rx.lean Rx "$WORK/$d/"
 done
 export LAKE_REMOTE_EXEC_CLIENT="$TEST_DIR/fake_lean_remote.py" FAKE_CAS="$WORK/cas" FAKE_LOG="$WORK/fake.log"
@@ -90,6 +90,16 @@ test_cmd same_outputs "$WORK/remote2"
 test_cmd_eq 2 echo "$(($(count_method hello) - hellos))"
 test_cmd_eq 1 grep -c "end of input" "$WORK/exits.log"
 
+# A client that runs the bridge as its child (a wrapper script without `exec`, as `timeout` or
+# `strace -f` also do): when Lake kills the decision bridge, that child keeps Lake's pipes and exits
+# only at end of input, so Lake must close the bridge's input too, or it never exits.
+printf '#!/bin/sh\n"%s" "$@"\n' "$TEST_DIR/fake_lean_remote.py" > "$WORK/fork-bridge"; chmod +x "$WORK/fork-bridge"
+rc=0
+(cd "$WORK/remote" && FAKE_PIDFILE="$WORK/fork.pid" LAKE_REMOTE_EXEC_CLIENT="$WORK/fork-bridge" \
+  LAKE_REMOTE_EXEC=grpc://fake:1 timeout 30 "$LAKE" build Rx > "$WORK/fork.out" 2>&1) || rc=$?
+kill -9 "$(cat "$WORK/fork.pid")" 2> /dev/null || true
+test_exp "$rc" = 0
+
 # An up-to-date module sends no request.
 (cd "$WORK/remote" && LAKE_REMOTE_EXEC=grpc://fake:1 \
   test_out "lake: remote: ok; 0 cached (0 from manifest), 0 executed, 0 local;" build Rx)
@@ -131,6 +141,20 @@ match_text "lake: remote: unreachable;" "$WORK/later/produced.out"
 test_cmd_eq 2 grep -c hello "$WORK/later.state"
 test_cmd_eq "$runs" count_method run
 test_exp ! -e "$WORK/later/.lake/build/lib/lean/Rx/A.olean"
+
+# A later hello that answers but did not verify the toolchain refuses every request too, and the line says why.
+runs=$(count_method run)
+(cd "$WORK/later2" && FAKE_UNVERIFIED_LATER="$WORK/later2.state" LAKE_REMOTE_EXEC=grpc://fake:1 \
+  test_err "runs Lean 0000000000000000000000000000000000000000, but this Lake uses Lean" build Rx)
+match_text "lake: remote: off: build service at grpc://fake:1 runs Lean 0000000000000000000000000000000000000000" "$WORK/later2/produced.out"
+test_cmd_eq "$runs" count_method run
+test_exp ! -e "$WORK/later2/.lake/build/lib/lean/Rx/A.olean"
+
+# An UNAVAILABLE answer to a request means the service did not answer: the line says `unreachable`.
+rm -rf "$WORK/timeout/.lake"
+(cd "$WORK/timeout" && FAKE_UNAVAILABLE_TARGET=Rx.B LAKE_REMOTE_EXEC=grpc://fake:1 \
+  test_err "the build service's run of Rx.B failed" build Rx)
+match_text "lake: remote: unreachable; 2 cached (0 from manifest), 0 executed, 0 local;" "$WORK/timeout/produced.out"
 
 # A service that does not answer fails the build (slice 1), and the end-of-build line says so.
 (cd "$WORK/unreach" && FAKE_UNREACHABLE=1 LAKE_REMOTE_EXEC=grpc://fake:1 \

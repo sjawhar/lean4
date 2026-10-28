@@ -205,8 +205,10 @@ check("FAKE_OMIT_VERIFIED leaves out toolchainVerified and toolchainGithash",
       h9.get("reachable") is True and "toolchainVerified" not in h9 and "toolchainGithash" not in h9, json.dumps(h9))
 b9.close()
 
-# --- FAKE_TIMEOUT_TARGET, FAKE_OOM_TARGET, FAKE_DISK_TARGET: that target's run fails so, another runs
-for var, code in (("FAKE_TIMEOUT_TARGET", "TIMEOUT"), ("FAKE_OOM_TARGET", "OOM"), ("FAKE_DISK_TARGET", "DISK_LIMIT")):
+# --- FAKE_TIMEOUT_TARGET, FAKE_OOM_TARGET, FAKE_DISK_TARGET, FAKE_UNAVAILABLE_TARGET: that target's
+# run fails so, another runs
+for var, code in (("FAKE_TIMEOUT_TARGET", "TIMEOUT"), ("FAKE_OOM_TARGET", "OOM"), ("FAKE_DISK_TARGET", "DISK_LIMIT"),
+                  ("FAKE_UNAVAILABLE_TARGET", "UNAVAILABLE")):
     b10 = Bridge(**{var: "selftest-fail"})
     result(b10.call("hello", {"protocol": 1}))
     t1 = b10.call("run", dict(req, target="selftest-fail"))
@@ -224,6 +226,17 @@ for _ in range(3):
     bl.close()
 check("FAKE_UNREACHABLE_LATER makes every connection after the first unreachable",
       answers == [True, False, False], str(answers))
+
+# --- FAKE_UNVERIFIED_LATER: every later connection answers, but with another Lean's toolchain
+later2 = os.path.join(work, "later2.state")
+answers = []
+for _ in range(2):
+    bl = Bridge(FAKE_UNVERIFIED_LATER=later2)
+    h = result(bl.call("hello", {"protocol": 1, "leanGithash": "a" * 40}))
+    answers.append((h.get("reachable"), h.get("toolchainVerified"), h.get("toolchainGithash")))
+    bl.close()
+check("FAKE_UNVERIFIED_LATER makes every later connection verify another Lean",
+      answers == [(True, True, "a" * 40), (True, False, "0" * 40)], str(answers))
 
 # --- end of input means the client is gone: the request in flight is cancelled and the bridge exits
 b11 = Bridge(FAKE_SLEEP_MS="30000")

@@ -312,7 +312,7 @@ def callService (s : RemoteSession) (method : String) (params : Json) :
   let r ← RemoteExec.call s.client method params
   if let .error e := r then
     if e.code == .unavailable then
-      noteUnusable (.unreachable e.message)
+      noteUnusable (.unreachable s!"build service at {s.cfg.endpoint} did not answer: {e.message}")
   return r
 
 /-- Sends a `run` request and parses its result. -/

@@ -16,6 +16,8 @@ Knobs, all through the environment:
   FAKE_UNREACHABLE    `1`: `hello` answers `reachable: false`, as a build service that does not answer
   FAKE_UNREACHABLE_LATER  a file counting connections: `hello` answers `reachable: false` on every
                       connection after the first, as a service that stops answering mid-build
+  FAKE_UNVERIFIED_LATER   the same, but every later `hello` answers with the toolchain of another
+                      Lean (`toolchainGithash` 000…0, `toolchainVerified: false`)
   FAKE_GITHASH        the Lean githash the service's toolchain reports (default: the client's own
                       `leanGithash`); `toolchainVerified` is true only when it is the client's, as the
                       daemon's toolchain probe decides
@@ -23,6 +25,7 @@ Knobs, all through the environment:
   FAKE_TIMEOUT_TARGET a target name: its `run` answers TIMEOUT, as an action that ran past its timeout
   FAKE_OOM_TARGET     a target name: its `run` answers OOM, as an action that ran out of memory
   FAKE_DISK_TARGET    a target name: its `run` answers DISK_LIMIT, as an action that filled its disk
+  FAKE_UNAVAILABLE_TARGET a target name: its `run` answers UNAVAILABLE, as a service that did not answer
   FAKE_SLEEP_MS       sleep this long in every `run`, standing in for the service's latency
   FAKE_CONCURRENT     `1`: answer each request after `hello` on a thread of its own, as the daemon
                       does, so requests overlap (default: one at a time, in order)
@@ -92,12 +95,13 @@ def append(name, obj):
 def run(p):
     global _inflight, _max_inflight
     check_gone()
-    for var, code, what in (("FAKE_TIMEOUT_TARGET", "TIMEOUT", "ran past its timeout"),
-                            ("FAKE_OOM_TARGET", "OOM", "ran out of memory"),
-                            ("FAKE_DISK_TARGET", "DISK_LIMIT", "filled its disk")):
+    for var, code, what in (("FAKE_TIMEOUT_TARGET", "TIMEOUT", "the action ran past its timeout"),
+                            ("FAKE_OOM_TARGET", "OOM", "the action ran out of memory"),
+                            ("FAKE_DISK_TARGET", "DISK_LIMIT", "the action filled its disk"),
+                            ("FAKE_UNAVAILABLE_TARGET", "UNAVAILABLE", "the service did not answer")):
         target = os.environ.get(var)
         if target and p.get("target") == target:
-            raise Err(code, f"{target}: the action {what}")
+            raise Err(code, f"{target}: {what}")
     with _lock:
         _inflight += 1
         if _inflight > _max_inflight:
@@ -182,16 +186,16 @@ def materialize(p):
 def hello(p):
     if os.environ.get("FAKE_HELLO_STAMP"):
         with open(os.environ["FAKE_HELLO_STAMP"], "w") as f: f.write(repr(time.time()))
-    later = os.environ.get("FAKE_UNREACHABLE_LATER")
+    later = os.environ.get("FAKE_UNREACHABLE_LATER") or os.environ.get("FAKE_UNVERIFIED_LATER")
     nth = 1
     if later:
         with _lock, open(later, "a+") as f:
             f.seek(0); nth = len(f.read().splitlines()) + 1; f.write("hello\n")
-    if os.environ.get("FAKE_UNREACHABLE") == "1" or nth > 1:
+    if os.environ.get("FAKE_UNREACHABLE") == "1" or (nth > 1 and os.environ.get("FAKE_UNREACHABLE_LATER")):
         return {"daemonVersion": "fake", "daemonPid": os.getpid(), "reachable": False,
                 "reason": "fake: unreachable", "toolchainVerified": False}
     client = p.get("leanGithash") or ""
-    githash = os.environ.get("FAKE_GITHASH") or client
+    githash = "0" * 40 if nth > 1 else (os.environ.get("FAKE_GITHASH") or client)
     res = {"daemonVersion": "fake", "daemonPid": os.getpid(), "reachable": True,
            "toolchainVerified": bool(githash) and githash == client}
     if githash:
