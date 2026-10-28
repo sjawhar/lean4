@@ -68,6 +68,13 @@ otherwise (`src/library/usage_digest.cpp`, `stamp_settled`). -/
 @[extern "lean_usage_stamp_settled"]
 opaque stampSettled (statfsOk : Bool) (fsType ctimeNsec : UInt64) (tickNs ageNs : Int64) : Bool
 
+/-- Whether the file system holding `path` is one whose stamps `stampSettled` judges by its fine rule (ext4, XFS,
+Btrfs and tmpfs on Linux, with a known timestamp tick): its kernel sets a file's status-change time at every change,
+so a settled stamp there with a nonzero `ctimeNsec` stands for the same bytes in a later process too. `false` if
+`statfs` fails, and off Linux. -/
+@[extern "lean_usage_stamps_fine"]
+opaque stampsFine (path : @& System.FilePath) : IO Bool
+
 /-- Writes `bytes` to `path` as a new file renamed over it, never changing the file at `path` in place: a stamp
 (`fileDigestStamped`) cannot tell a file being rewritten in place, whose write stalls mid-copy, from one at rest. -/
 def writeFileReplacing (path : System.FilePath) (bytes : ByteArray) : IO Unit := do
