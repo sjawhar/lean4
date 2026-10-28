@@ -187,9 +187,10 @@ the build held it. Call it only where this process ran the compiler or linker th
 `data` (see `JobState.built`): never for outputs that were replayed, unpacked, fetched or
 restored. Returns whether the outputs were queued.
 
-Nothing is queued while usage cutoff is on (`Env.usageCutoff`): a build with usage cutoff can keep
-outputs that were compiled for another input, and only fresh compiles with usage cutoff off are
-published.
+With usage cutoff on (`Env.usageCutoff`), the queued outputs are still a compile of exactly this
+input: outputs that the cutoff kept for another input never reach this function. The cutoff setting
+is a local input of every module (`usageCutoffTrace`), so readers with the cutoff off never read
+them. The data of a module names its usage sidecars, which `lake cache push` uploads with it.
 -/
 public def queueRemotePush
   (pkg : Package) (inputHash : Hash) (target : String) (srcHash? : Option Hash)
@@ -198,8 +199,6 @@ public def queueRemotePush
   let ws ← getWorkspace
   let some service := ws.lakeEnv.remoteCacheQueueService?
     | return false
-  if ws.lakeEnv.usageCutoff then
-    return false
   let entry : RemotePushEntry := {
     service, inputHash, target, srcHash?, data, claimGeneration?
     remoteScope := remoteCacheScope ws.lakeEnv.leanGithash pkg.cacheScope
@@ -210,3 +209,74 @@ public def queueRemotePush
     logWarning s!"could not queue the outputs of `{target}` for the remote cache: {e}"
     return false
   return true
+
+/--
+**For internal use only.**
+Queues the alias of a module that usage cutoff kept for the input `inputHash` (`RemoteAlias`): the
+input hash `compiledFor` of the compile whose outputs it kept, which `lake cache push` uploads if
+absent. Only with the queue on and `LAKE_REMOTE_CACHE_ALIASES` set (`Env.remoteCacheAliases`).
+An alias names no outputs and vouches for nothing: a reader checks the compile it names with the
+cutoff before it uses it (`readRemoteAlias?`), so the shared remote cache still holds only the
+outputs of fresh compiles.
+-/
+public def queueRemoteAlias
+  (pkg : Package) (inputHash : Hash) (target : String) (srcHash compiledFor : Hash)
+: JobM Unit := do
+  let ws ← getWorkspace
+  unless ws.lakeEnv.remoteCacheAliases do return
+  let some service := ws.lakeEnv.remoteCacheQueueService?
+    | return
+  let entry : RemotePushEntry := {
+    service, inputHash, target, srcHash? := some srcHash, data := Json.null, log := {}
+    compiledFor? := some compiledFor
+    remoteScope := remoteCacheScope ws.lakeEnv.leanGithash pkg.cacheScope
+  }
+  if let .error e ← (ws.lakeCache.appendPushQueue entry).toBaseIO then
+    logWarning s!"could not queue the alias of `{target}` for the remote cache: {e}"
+
+/--
+**For internal use only.**
+Reads the alias of `inputHash` for the module `target` with the source hash `srcHash` from the
+shared remote cache that `LAKE_REMOTE_CACHE` names (`RemoteAlias`, see `queueRemoteAlias`), and
+returns the input hash of the compile it names, or `none` if there is none. An alias that does not
+name this input, module and source hash is refused. Every failure but a missing alias is recorded
+(see `recordRemoteReadFailure`), and each is a miss. The read is bounded as a mapping's is.
+-/
+public def readRemoteAlias?
+  (inputHash : Hash) (pkg : Package) (target : String) (srcHash : Hash)
+: JobM (Option Hash) := do
+  let ws ← getWorkspace
+  let some serviceName := ws.lakeEnv.remoteCache?
+    | return none
+  if ← remoteReadsStopped then
+    return none
+  try
+    let service ← match ws.lakeConfig.findRemoteCacheService? serviceName with
+      | .ok service => pure service
+      | .error e => error e
+    let scope := remoteCacheScope ws.lakeEnv.leanGithash pkg.cacheScope
+    let url := service.remoteAliasUrl scope inputHash
+    let tmpDir := (← getLakeCache).dir
+    let contents? ← timeRemoteRead fun transferMs => liftM <|
+      ReadBroker.getUrl? url tmpDir (cacheToken := service.sendsCacheToken url)
+        remoteMappingMaxFileSize remoteReadLimits transferMs
+    let some contents := contents?
+      | logVerbose s!"remote cache alias miss for input `{inputHash}` at {url}"
+        return none
+    let json ← match Json.parse contents with
+      | .ok json => pure json
+      | .error e => error s!"remote alias is invalid JSON: {e}"
+    let alias ← match RemoteAlias.fromJson? json with
+      | .ok alias => pure alias
+      | .error e => error s!"remote alias is invalid: {e}"
+    unless alias.inputHash == inputHash do
+      error s!"remote alias inputHash mismatch: expected {inputHash}, got {alias.inputHash}"
+    unless alias.target == target do
+      error s!"remote alias target mismatch: expected {target}, got {alias.target}"
+    unless alias.srcHash == srcHash do
+      error s!"remote alias srcHash mismatch"
+    return some alias.compiledFor
+  catch e =>
+    let msg ← recordRemoteReadFailure (← takeLogFrom e) "remote cache alias read failed"
+    logVerbose s!"remote cache alias read for input `{inputHash}` failed:\n{msg}"
+    return none

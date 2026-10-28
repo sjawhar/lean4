@@ -240,14 +240,16 @@ case_push_custom_target() {
 }
 
 case_push_githash() {
-  # Nothing is queued while `LEAN_GITHASH` names another Lean or usage cutoff is
-  # on. Under `lake env`, which sets `LEAN_GITHASH` to this Lean's, a build queues.
+  # Nothing is queued while `LEAN_GITHASH` names another Lean. Under `lake env`,
+  # which sets `LEAN_GITHASH` to this Lean's, a build queues. With usage cutoff
+  # on, a build queues its compiles too (`../usageCutoffRemote` checks what they
+  # carry).
   push_fresh
   LEAN_GITHASH=0123456789abcdef0123456789abcdef01234567 build_a
   test_cmd_eq 0 queued
   push_fresh
   LAKE_USAGE_CUTOFF=true build_a
-  test_cmd_eq 0 queued
+  test_cmd_eq $PUSH_COMPILES queued
   push_fresh
   on_a test_run --dir "$PUSH_A" env "$LAKE" --dir "$PUSH_A" build $PUSH_TARGETS
   test_cmd_eq $PUSH_COMPILES queued

@@ -145,6 +145,52 @@ public structure RemoteUpload where
   /-- The Lake content hash that names the file in messages (for a mapping, its input hash). -/
   hash : Hash
 
+/-! ## Aliases -/
+
+/--
+An alias of the shared remote cache: for an input hash with no mapping of its own, the input hash
+of the compile whose outputs a build with usage cutoff kept for it (see `queueRemoteAlias`). It
+names no outputs, and nothing trusts it: a reader restores the compile's own mapping and runs the
+cutoff's check on it before it uses it (see `readRemoteAlias?`).
+-/
+public structure RemoteAlias where
+  /-- The input hash that the alias is for. -/
+  inputHash : Hash
+  /-- The build key of the module. -/
+  target : String
+  /-- The hash of the module's source. -/
+  srcHash : Hash
+  /-- The input hash of the compile whose outputs the build kept. -/
+  compiledFor : Hash
+
+namespace RemoteAlias
+
+public protected def toJson (alias : RemoteAlias) : Json :=
+  JsonObject.empty
+  |>.insert "schemaVersion" remoteCacheSchemaVersion
+  |>.insert "inputHash" alias.inputHash
+  |>.insert "target" alias.target
+  |>.insert "srcHash" alias.srcHash
+  |>.insert "compiledFor" alias.compiledFor
+
+public instance : ToJson RemoteAlias := ⟨RemoteAlias.toJson⟩
+
+public protected def fromJson? (json : Json) : Except String RemoteAlias := do
+  let obj ← JsonObject.fromJson? json
+  let schemaVersion : String ← obj.get "schemaVersion"
+  unless schemaVersion == remoteCacheSchemaVersion do
+    throw s!"unknown remote cache schema version: {schemaVersion}"
+  return {
+    inputHash := ← obj.get "inputHash"
+    target := ← obj.get "target"
+    srcHash := ← obj.get "srcHash"
+    compiledFor := ← obj.get "compiledFor"
+  }
+
+public instance : FromJson RemoteAlias := ⟨RemoteAlias.fromJson?⟩
+
+end RemoteAlias
+
 /-! ## Claims -/
 
 /--
