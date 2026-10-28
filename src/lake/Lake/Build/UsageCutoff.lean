@@ -203,6 +203,8 @@ structure UsekeySidecar where
   skipped while it is kept, and none compiled meanwhile gets a key (`untrustedClosureModule?`).
   -/
   kept : Bool := false
+  /-- The input hash of the compile that wrote the key (`input`), if it records one (`Module.writeUsekey`). -/
+  input? : Option Hash := none
   deriving TypeName
 
 instance : FromJson UsekeySidecar where
@@ -216,17 +218,8 @@ instance : FromJson UsekeySidecar where
       extra := ← nameDigestPairs (← j.getObjVal? "extra")
       importer := ← j.getObjValAs? UsageImport "importer"
       kept := (j.getObjValAs? Bool "kept").toOption.getD false
+      input? := (j.getObjValAs? Hash "input").toOption
     }
-
-/--
-The input hash of the compile that wrote the `.usekey` at `path` (its `input` field, which `Module.writeUsekey`
-records), if the file exists, parses, has this format version and records one.
--/
-public def usekeyInputHash? (path : FilePath) : BaseIO (Option Hash) := do
-  let .ok contents ← (IO.FS.readFile path).toBaseIO | return none
-  let .ok j := Json.parse contents | return none
-  unless (j.getObjValAs? Nat "version").toOption == some usekeyVersion do return none
-  return (j.getObjValAs? Hash "input").toOption
 
 /--
 The bytes of the usage-cutoff sidecar at `path` with their digest and the stamp of the file they were read from, if
@@ -297,6 +290,21 @@ def readUsageSidecar (α : Type) [FromJson α] [TypeName α] (version : Nat) (pa
     let some value ← parseUsageSidecar α version path bytes | return none
     modifyThe (PHashMap FilePath SidecarEntry) (·.insert path (stamp?, digest, Dynamic.mk value))
     return some value
+
+/--
+The input hash of the compile that wrote the `.usekey` at `path` (its `input`, which `Module.writeUsekey` records), if
+it exists, has this format version and records one. Reads it as `readUsageSidecar` does, so a key that the cutoff's
+check read is not parsed again.
+-/
+public def usekeyInputHash? (path : FilePath) : JobM (Option Hash) :=
+  return (← readUsageSidecar UsekeySidecar usekeyVersion path).bind (·.input?)
+
+/--
+The local-input hash and the input hash (`input`, if it records one) of the compile that wrote the `.usekey` at
+`path`, if it exists and has this format version, read as `readUsageSidecar` does.
+-/
+public def usekeyIdentity? (path : FilePath) : JobM (Option (Hash × Option Hash)) :=
+  return (← readUsageSidecar UsekeySidecar usekeyVersion path).map fun key => (key.localHash, key.input?)
 
 /--
 Reads a module's own `.usage` as `readUsageSidecar` does, but parses it on every read and keeps no parse: only the

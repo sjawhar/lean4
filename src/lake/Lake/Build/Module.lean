@@ -1919,6 +1919,15 @@ where
       if let some art := usage? then discard <| restoreArtifact mod.usageFile art
       if let some art := resolved? then discard <| restoreArtifact mod.resolvedFile art
       if let some art := usekey? then discard <| restoreArtifact mod.usekeyFile art
+      -- The `.usekey` of a compile records its input hash. A pushed archive whose key records another
+      -- input carries some other compile's records: the module then keeps no key, so nothing keeps it
+      -- or names that compile from it (`queueKeptAlias`)
+      if usage?.isNone && resolved?.isNone && usekey?.isNone then
+        if let some recorded ← usekeyInputHash? mod.usekeyFile then
+          if recorded != inputHash then
+            logVerbose s!"{mod.usekeyFile}: records input {recorded}, not {inputHash}; dropping it"
+            for file in #[mod.usageFile, mod.resolvedFile, mod.usekeyFile] do
+              removeFileIfExists file
       -- Note: This branch implies that only the ltar output is (validly) cached.
       -- Thus, we use only the new trace unpacked from the ltar to resolve further artifacts.
       let savedTrace ← readTraceFile mod.traceFile
@@ -1956,9 +1965,10 @@ where
         mod.clearOutputArtifacts
         -- The sidecars stay out of the trace, which the archives of `lake build -o` include, so that
         -- such an archive holds only outputs: a `.usekey` records the input hash of its compile.
+        -- The local hash is this build's only for this build's own input.
         writeFetchTrace mod.traceFile inputHash
           (toJson {arts.descrs with usage? := none, resolved? := none, usekey? := none}) log
-          (some presetup.localTrace.hash)
+          (if inputHash?.isNone then some presetup.localTrace.hash else none)
       let arts ←
         if restoreAll then
           mod.restoreAllArtifacts arts
@@ -1996,16 +2006,29 @@ where
     if compiledFor == depTrace.hash then return ← skip
     -- A restore of an archive that leaves its outputs in the build directory with the trace it
     -- unpacked ends `incomplete`, as a restore by input hash does before its replay: either way the
-    -- build directory now holds the compile, if its trace names it
+    -- build directory now holds the compile, if its trace names it. A restore replays the
+    -- compile's log, the log of another input: only the decision that keeps it replays that log
+    let logPos ← getLogPos
     discard <| fetchFromCache? presetup savedTrace restore (inputHash? := some compiledFor)
+    for entry in (← takeLogFrom logPos).entries do
+      if entry.level == .trace then logEntry entry
+    -- The candidate is the named compile of this module only if its `.usekey` says so: a local
+    -- mapping of `compiledFor` is read without the remote mapping's module and source checks
     let candidate ← readTraceFile mod.traceFile
     if let .ok data := candidate then
       if candidate.moduleOutputDescrs?.isSome && data.depHash == compiledFor &&
-          (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) then
+          (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) &&
+          (← usekeyIdentity? mod.usekeyFile) == some (presetup.localTrace.hash, some compiledFor) then
         return (candidate, none, some compiledFor)
     logVerbose s!"remote cache alias: input {depTrace.hash} names input {compiledFor}, \
       which could not be restored"
-    return (candidate, none, none)
+    -- Whatever the restore left is not this module's previous build
+    mod.clearOutputArtifacts
+    mod.clearOutputHashes
+    removeFileIfExists mod.traceFile
+    removeFileIfExists mod.ltarFile
+    clearFileHash mod.ltarFile
+    return (.missing, none, none)
   /-
   Queues the alias of the module's outputs `arts`, which this build kept for the input `inputHash`
   without compiling them (a usage skip or a restore from the usage index): the input hash of the
@@ -2273,8 +2296,11 @@ where
   -- recorded, it is removed instead (the caller then rebuilds). The old trace and outputs (but not
   -- the archive) are removed first: leantar skips members that already exist when the trace's
   -- input hash matches, and an unpack that is killed must not leave outputs that are not the
-  -- archive's next to its trace. If the unpack fails, the module's outputs, their `.hash` files and
-  -- its trace are removed, so that a retry cannot replay a partial result.
+  -- archive's next to its trace. The usage-cutoff sidecars stay, because only an archive that
+  -- `lake cache push` packed holds them: a killed unpack can leave old ones, which then do not bind
+  -- the unpacked `.olean` (`.usekey`), so the cutoff compiles the module. If the unpack fails, the
+  -- module's outputs, their `.hash` files and its trace are removed, so that a retry cannot replay
+  -- a partial result.
   unpackLocalLtar (inputHash : Hash) : JobM Bool := do
     let expected? ← Hash.load? (mod.ltarFile.toString ++ ".hash")
     unless expected? == some (← computeFileHash mod.ltarFile) do
