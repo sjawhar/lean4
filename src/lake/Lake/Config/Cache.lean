@@ -213,7 +213,10 @@ def insertCore
   (platformIndependent := false)
 : CacheMap := cache.insertCore inputHash (toJson val) platformIndependent
 
-/-- Extract each output from their structured data into a flat array of artifact descriptions. -/
+/--
+Extract each output from their structured data into a flat array of artifact descriptions
+(`outputArtifactDescrs?`, which reads the `kf` entry of kept module outputs as metadata, not an artifact).
+-/
 public def collectOutputDescrs (map : CacheMap) : LogIO (Array ArtifactDescr) := do
   throwIfLogs <| map.foldM (init := #[]) fun as _ e => do
     match outputArtifactDescrs? e.out with
@@ -428,11 +431,28 @@ public def getArtifact (cache : Cache) (descr : ArtifactDescr) : EIO String Arti
 @[inline] public def outputsFile (cache : Cache) (scope : String) (inputHash : Hash) : FilePath  :=
   cache.outputsDir / scope / s!"{inputHash}.json"
 
+/-- The data of the input-to-output mapping stored in `file`, if any can be read. -/
+def readOutputsData? (file : FilePath) : BaseIO (Option Json) := do
+  let .ok contents ← (IO.FS.readFile file).toBaseIO | return none
+  match Json.parse contents >>= fromJson? with
+  | .ok (out : CacheOutput) => return some out.data
+  | .error _ => return none
+
 /--
-Cache the outputs corresponding to the given input for the package. With `overwrite`, the new
-mapping replaces any old one through a new temporary file that is renamed over it (see
-`writeFileAtomic`), so two processes that write the same mapping at once leave one of their two
-whole mappings, never a mix of both. Without `overwrite`, an existing mapping is kept.
+The part of a build's log that the cache keeps with its outputs, replayed when they are restored (`CacheOutput.log?`):
+its entries of level `info` and above, or `none` if there are none. Verbose entries (e.g., the command line of the
+build) are diagnostics of the build in the tree that ran it and name its paths, so they are not kept with the outputs.
+-/
+def cachedLog? (log : Log) : Option Log :=
+  let log := log.filter (·.level ≥ .info)
+  if log.isEmpty then none else some log
+
+/--
+Cache the outputs corresponding to the given input for the package. With `overwrite`, the new mapping replaces any
+old one through a new temporary file that is renamed over it (see `writeFileAtomic`), so two processes that write the
+same mapping at once leave one of their two whole mappings, never a mix of both. Module outputs that a kept-module
+check accepted (marked with `kf`, see `ModuleOutputDescrs.keptFrom?`) never replace an existing mapping, while outputs
+compiled from source replace accepted ones.
 -/
 def writeOutputsCore
   (cache : Cache) (scope : String) (inputHash : Hash) (out : Json)
@@ -440,17 +460,13 @@ def writeOutputsCore
   (log : Log) (sha256? : Option Sha256Map) (overwrite : Bool)
 : IO Unit := do
   let file := cache.outputsFile scope inputHash
-  unless overwrite do
-    -- A mapping that is kept as it is need not be rendered
-    if (← file.pathExists) then return
   createParentDirs file
-  -- Verbose entries (e.g., the command line of the build) are diagnostics of the build
-  -- in the tree that ran it and name its paths, so they are not kept with the outputs.
-  let log := log.filter (·.level ≥ .info)
-  let log? := if log.isEmpty then none else some log
-  let out := {service?, scope? := remoteScope?, data := out, log?, sha256? : CacheOutput}
+  let out := {service?, scope? := remoteScope?, data := out, log? := cachedLog? log, sha256? : CacheOutput}
+  let isKept (data : Json) := (data.getObjVal? "kf").isOk
   let contents := (toJson out).pretty
-  if overwrite then
+  if isKept out.data then
+    writeFileIfNew file contents
+  else if overwrite || (← readOutputsData? file).any isKept then
     writeFileAtomic file contents
   else
     writeFileIfNew file contents
@@ -484,6 +500,106 @@ public def readOutputs? (cache : Cache) (scope : String) (inputHash : Hash) : Lo
       error s!"{path}: invalid JSON: {e}"
   | .error (.noFileOrDirectory ..) => return none
   | .error e => error s!"{path}: read failed: {e}"
+
+/--
+The directory of the usage index for a package's modules (`scope`) whose local inputs (`ModulePreSetup.localTrace`)
+have the hash `localHash`: one file per compile of such a module, named by the content hash of its `.usekey`
+(`writeUsageIndex`). A build that misses the cache by input hash reads them for an earlier compile whose outputs pass
+the usage cutoff's check against its current imports.
+-/
+@[inline] public def usageIndexDir (cache : Cache) (scope : String) (localHash : Hash) : FilePath :=
+  cache.dir / "usage-index" / scope / localHash.toString
+
+/-- The usage-index file (`usageIndexDir`) of the compile whose `.usekey` has the content hash `usekey`. -/
+@[inline] public def usageIndexFile (cache : Cache) (scope : String) (localHash usekey : Hash) : FilePath :=
+  cache.usageIndexDir scope localHash / s!"{usekey}.json"
+
+/--
+The compact record of the `.usage` of the compile that the usage-index file `file` records (`writeUsageIndex`), which
+a lookup's pre-filter reads instead of parsing the `.usage` (`Lake.PrefilterUsage`), beside it.
+-/
+@[inline] public def usageIndexCompactFile (file : FilePath) : FilePath :=
+  file.withExtension "pre"
+
+/--
+How many compiles of a module with one set of local inputs the usage index keeps, the most recently written: a
+lookup checks at most these. Each candidate it rejects costs a pre-filter, so the cap bounds what a lookup that
+finds no match costs: its 99th percentile times this, plus the views a lookup reads, against 1% of the build's CPU
+per compiled module. Measured on a gate build of a 33,639-module tree whose most used theorem's proof changed
+(13.00 ms and 2.73 ms), two holds against that build's own CPU and against both builds of the same workload before
+the lookups were made cheaper: 28.73 ms against budgets of 42.01, 39.47 and 38.70 ms. Three holds against the
+first alone. On an integrate round of nineteen agents' unit builds, no restored compile was older than the second
+newest, so two loses none of them either.
+-/
+public def usageIndexSize : Nat := 2
+
+/--
+The files in a usage-index directory (`usageIndexDir`) whose names `select` takes, with their modification times, most
+recently written first (ties by name). A file another process removes while they are listed is left out.
+-/
+def usageIndexFiles (dir : FilePath) (select : String → Bool) : IO (Array (FilePath × IO.FS.SystemTime)) := do
+  let entries ← match (← dir.readDir.toBaseIO) with
+    | .ok entries => pure entries
+    | .error (.noFileOrDirectory ..) => return #[]
+    | .error e => throw e
+  let mut files := #[]
+  for entry in entries do
+    unless select entry.fileName do continue
+    match (← entry.path.metadata.toBaseIO) with
+    | .ok md => files := files.push (entry.path, md.modified)
+    | .error (.noFileOrDirectory ..) => pure ()
+    | .error e => throw e
+  return files.qsort fun (p, t) (q, u) =>
+    match compare t u with
+    | .gt => true
+    | .lt => false
+    | .eq => p.toString < q.toString
+
+/--
+Records a compile in the usage index (`usageIndexDir`): `out`, its outputs entry, with `log`, the log of the compile
+as the cache keeps it (`cachedLog?`), which a lookup that restores the compile replays, as the file named by the
+content hash of its `.usekey` (`usekey`), with no cache service, so that it resolves only against this cache, and
+`compact?`, if given, as its compact usage record (`usageIndexCompactFile`), written first, so that a lookup that
+finds the entry finds the record too. Each file is written whole under a temporary name and renamed onto its own: a
+reader sees the old complete file or the new one, and two writers of one name write the outputs of compiles with
+the same `.usekey`, either of which is valid. A rewrite makes the file recent again. Then removes the files beyond
+the `usageIndexSize` most recently written with their records, temporary files an hour older than this one (left by
+a writer that stopped), and records as old whose file is gone. Two writers that trim at once can remove more than
+needed, which loses a candidate or its record (the lookup then reads the `.usage`) and never adds one. Nothing else
+removes them: a file whose artifacts were pruned from the cache no longer resolves and ages out.
+-/
+public def writeUsageIndex (cache : Cache) (scope : String) (localHash usekey : Hash) (out : Json)
+    (log : Log := {}) (compact? : Option ByteArray := none) : IO Unit := do
+  let dir := cache.usageIndexDir scope localHash
+  IO.FS.createDirAll dir
+  let file := cache.usageIndexFile scope localHash usekey
+  let tmp (ext : String) : IO FilePath :=
+    return dir / s!"{usekey}.{ext}.tmp-{← IO.Process.getPID}-{← IO.monoNanosNow}"
+  if let some compact := compact? then
+    let t ← tmp "pre"
+    IO.FS.writeBinFile t compact
+    IO.FS.rename t (usageIndexCompactFile file)
+  let t ← tmp "json"
+  IO.FS.writeFile t (toJson {data := out, log? := cachedLog? log : CacheOutput}).pretty
+  IO.FS.rename t file
+  let files ← usageIndexFiles dir (·.endsWith ".json")
+  for (old, _) in files.extract usageIndexSize files.size do
+    removeFileIfExists old
+    removeFileIfExists (usageIndexCompactFile old)
+  let .ok written ← file.metadata.toBaseIO | return
+  for (stale, mtime) in ← usageIndexFiles dir (!·.endsWith ".json") do
+    if written.modified.sec - mtime.sec > 3600 then
+      if stale.extension == some "pre" && (← (stale.withExtension "json").pathExists) then continue
+      removeFileIfExists stale
+
+/--
+The compiles that the usage index (`usageIndexDir`) records for a package's modules (`scope`) whose local inputs
+have the hash `localHash`, most recently written first, at most `usageIndexSize`: the files `writeUsageIndex` wrote,
+none if it wrote none.
+-/
+public def usageCandidates (cache : Cache) (scope : String) (localHash : Hash) : IO (Array FilePath) := do
+  let files ← usageIndexFiles (cache.usageIndexDir scope localHash) (·.endsWith ".json")
+  return (files.extract 0 usageIndexSize).map (·.1)
 
 /-- The directory where input-to-output mappings of downloaded package revisions are cached. -/
 @[inline] public def revisionDir (cache : Cache) : FilePath :=
@@ -1258,7 +1374,7 @@ def runTransfer
           return curlLeadArgs token? ++ parallelArgs ++ #["-X", "PUT"] ++ curlFollowArgs token? ++
             #["-H", s!"Content-Type: {cfg.contentType}"] ++ transferTimeoutArgs ++ maxTime ++
             auth ++ #["-s", "-w", "%{stderr}%{json}\n", "--config", path.toString]
-      let child ← IO.Process.spawn {
+      let child ← spawnProc {
         cmd := ← Internal.getCurl, args
         stdout := .piped, stderr := .piped
       }
@@ -1427,7 +1543,7 @@ where
       stdout := .piped, stderr := .piped
     }
     logVerbose (mkCmdLog spawnArgs)
-    let {stdout, stderr, exitCode} ← IO.Process.output spawnArgs
+    let {stdout, stderr, exitCode} ← outputProc spawnArgs
     match Json.parse stdout >>= fromJson? with
     | .ok (resp :  ReservoirResp (Array String)) =>
       match resp with

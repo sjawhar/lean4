@@ -83,7 +83,9 @@ end ArtifactDescr
 
 /--
 Extracts the artifact descriptors of one output value (as a cache mapping records it), failing on
-the first one that is malformed. `null` and boolean values are metadata, not artifacts.
+the first one that is malformed. `null` and boolean values are metadata, not artifacts, and so is the `kf` entry of
+module outputs that a kept-module check accepted (the input hash they were compiled for,
+`ModuleOutputDescrs.keptFrom?`).
 -/
 public partial def outputArtifactDescrs? (output : Json) : Except String (Array ArtifactDescr) :=
   go #[] output
@@ -101,7 +103,7 @@ where
     | .arr values =>
       values.foldlM (init := descrs) go
     | .obj values =>
-      values.foldlM (init := descrs) fun descrs _ value => go descrs value
+      values.foldlM (init := descrs) fun descrs key value => if key == "kf" then pure descrs else go descrs value
 
 /-- A file with a known content hash. -/
 public structure Artifact extends descr : ArtifactDescr where

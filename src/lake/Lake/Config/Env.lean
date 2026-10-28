@@ -49,6 +49,12 @@ public structure Env where
   off unless set to a true value).
   -/
   usageCutoff : Bool
+  /--
+  A fixed number of tasks each usage-cutoff check may spawn to read its closure (i.e., `LAKE_USAGE_CUTOFF_READ_TASKS`,
+  a number; at least 1 is used). Unset, a check takes more tasks the fewer checks run (`Lake.parallelRuns`). The
+  variable is for measuring that choice on another machine.
+  -/
+  usageCutoffReadTasks? : Option Nat := none
   /-- Whether the system cache has been disabled (`LAKE_CACHE_DIR` is set but empty). -/
   noSystemCache : Bool := false
   /--
@@ -248,6 +254,7 @@ public def compute
     enableArtifactCache? := (← IO.getEnv "LAKE_ARTIFACT_CACHE").bind envToBool?
     restoreAllArtifacts? := (← IO.getEnv "LAKE_RESTORE_ARTIFACTS").bind envToBool?
     usageCutoff := ((← IO.getEnv "LAKE_USAGE_CUTOFF").bind envToBool?).getD false
+    usageCutoffReadTasks? := (← IO.getEnv "LAKE_USAGE_CUTOFF_READ_TASKS").bind (·.trimAscii.toNat?)
     lakeConfig? := (← IO.getEnv "LAKE_CONFIG") <|> userHome?.map (· / ".lake" / "config.toml" |>.toString)
     cacheKey? := (← IO.getEnv "LAKE_CACHE_KEY").map (·.trimAscii.copy)
     cacheArtifactEndpoint? := (← IO.getEnv "LAKE_CACHE_ARTIFACT_ENDPOINT").map normalizeUrl
@@ -440,6 +447,7 @@ public def vars (env : Env) : Array (String × Option String)  :=
     ("LAKE_CACHE_DIR", if let some cache := env.lakeCache? then cache.dir.toString else ""),
     ("LAKE_ARTIFACT_CACHE", if let some b := env.enableArtifactCache? then toString b else ""),
     ("LAKE_RESTORE_ARTIFACTS", if let some b := env.restoreAllArtifacts? then toString b else ""),
+    ("LAKE_USAGE_CUTOFF", some (toString env.usageCutoff)),
     ("LEAN_PATH", some env.leanPath.toString),
     ("LEAN_SRC_PATH", some env.leanSrcPath.toString),
     ("LEAN_GITHASH", env.leanGithash),

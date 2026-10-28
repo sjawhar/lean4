@@ -421,6 +421,12 @@ to wall clock time.
 @[extern "lean_io_mono_nanos_now"] opaque monoNanosNow : BaseIO Nat
 
 /--
+CPU time consumed by the current thread in nanoseconds. Returns `0` where the platform has no current-thread CPU
+clock.
+-/
+@[extern "lean_io_thread_cpu_nanos_now"] opaque threadCpuNanosNow : BaseIO Nat
+
+/--
 Reads bytes from a system entropy source. It is not guaranteed to be cryptographically secure.
 
 If `nBytes` is `0`, returns immediately with an empty buffer.
@@ -813,6 +819,16 @@ works on Unix-like systems but not on Windows.
 Releases any previously-acquired lock on the handle. Succeeds even if no lock has been acquired.
 -/
 @[extern "lean_io_prim_handle_unlock"] opaque unlock (h : @& Handle) : IO Unit
+/--
+Sets whether processes spawned afterwards inherit the handle's underlying file descriptor (or
+Windows handle). Handles are not inherited by default.
+
+On Unix-like systems, where a lock belongs to the open file, a child that inherited a locked
+handle's descriptor keeps the lock after the handle is freed, until the child exits (`unlock`
+still releases it at once).
+-/
+@[extern "lean_io_prim_handle_set_inheritable"]
+opaque setInheritable (h : @& Handle) (inheritable : Bool) : IO Unit
 
 /--
 Returns `true` if a handle refers to a Windows console or a Unix terminal.

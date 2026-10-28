@@ -7,6 +7,7 @@ module
 
 prelude
 public import Lean.Meta.SynthInstance
+import Lean.Util.UsedByChecks
 
 public section
 
@@ -113,6 +114,8 @@ def tryUnificationHints (t s : Expr) : MetaM Bool := do
     return false
   let hints ← getRecordedHints
   let candidates ← withConfigWithKey config <| hints.discrTree.getMatch t
+  -- Inside a compile, the hints that apply are recorded (`recordHintsIfCompiling`).
+  unless candidates.isEmpty do recordHintsIfCompiling (← getOptionsUnrestricted) candidates
   for candidate in candidates do
     if (← tryCandidate candidate) then
       return true

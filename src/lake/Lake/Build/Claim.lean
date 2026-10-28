@@ -11,6 +11,7 @@ public import Lake.Config.Monad
 import Lake.Build.RemoteCache
 import Lake.Config.PushQueue
 import Lake.Util.IO
+import Lake.Util.Proc
 import Std.Internal.UV.Timer
 import Std.Internal.UV.System
 import Std.Sync.Mutex
@@ -839,7 +840,9 @@ the build's next queued output starts a push again; the build reports the failur
 cache failure (see `queueCompiledOutputs`).
 
 The push runs in a session of its own, with the environment of this process and its cache, so it
-outlives the build and a Ctrl-C that stops it. Its output goes to `Cache.pushLogFile`.
+outlives the build and a Ctrl-C that stops it. Its output goes to `Cache.pushLogFile`. It is spawned
+without the workspace build lock (`spawnProc` with `inheritBuildLock := false`), which it would hold
+until it ends, past the build.
 -/
 public def startBuildPush (env : Env) (cache : Cache) : IO Bool :=
   buildPush.atomically do
@@ -856,7 +859,7 @@ public def startBuildPush (env : Env) (cache : Cache) : IO Bool :=
     modify ({· with followLock? := some lock})
     reapFollowFiles cache followFile
     rotatePushLog cache
-    match (← (IO.Process.spawn {
+    match (← (spawnProc (inheritBuildLock := false) {
       cmd := (detachedPushShell env).toString
       args := #["-c", detachedPushScript, "sh", cache.pushLogFile.toString,
         env.lake.lake.toString, "cache", "push", "--wait", "--follow", followFile.toString]
@@ -895,7 +898,7 @@ by then. Returns its exit code.
 -/
 public def runForegroundPush (env : Env) (cache : Cache) : IO UInt32 := do
   rotatePushLog cache
-  let out ← IO.Process.output {
+  let out ← outputProc {
     cmd := env.lake.lake.toString, args := #["cache", "push", "--wait"], env := pushEnv env cache
   }
   let h ← IO.FS.Handle.mk cache.pushLogFile .append

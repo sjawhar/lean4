@@ -21,6 +21,7 @@ import Lake.Load.Workspace
 import Lake.Load.Toml
 import Lake.Util.IO
 import Lake.Util.Git
+import Lake.Util.Proc
 import Lake.Util.MainM
 import Lake.Util.Cli
 import Lake.CLI.Init
@@ -108,6 +109,9 @@ public structure LakeOptions where
   builtinOnly : Bool := false
   samplyRaw : Bool := false
   samplyNoServe : Bool := false
+  /-- Whether the process exits after this command (`main`), so a build may leave its context allocated
+  (`BuildConfig.forgetContext`). -/
+  oneShot : Bool := false
 
 def LakeOptions.outLv (opts : LakeOptions) : LogLevel :=
   opts.outLv?.getD opts.verbosity.minLogLv
@@ -181,9 +185,9 @@ abbrev CliMainM := ExceptT CliError MainM
 abbrev CliStateM := StateT LakeOptions CliMainM
 abbrev CliM := ArgsT CliStateM
 
-def CliM.run (self : CliM α) (args : List String) : BaseIO ExitCode := do
+def CliM.run (self : CliM α) (args : List String) (oneShot := false) : BaseIO ExitCode := do
   let (elanInstall?, leanInstall?, lakeInstall?) ← findInstall?
-  let main := self.run' args |>.run' {args, elanInstall?, leanInstall?, lakeInstall?}
+  let main := self.run' args |>.run' {args, elanInstall?, leanInstall?, lakeInstall?, oneShot}
   let main := main.run >>= fun | .ok a => pure a | .error e => error e.toString
   main.run
 
@@ -1033,7 +1037,7 @@ protected def build : CliM PUnit := do
     | none, some _ => error "`--package` requires `-o`"
     | none, none => return none
   let buildConfig := mkBuildConfig opts (out := .stdout) (showSuccess := true) outputsPackage?
-  ws.runBuild (buildSpecs specs) buildConfig
+  ws.runBuild (buildSpecs specs) {buildConfig with forgetContext := opts.oneShot}
 
 protected def checkBuild : CliM PUnit := do
   processOptions lakeOption
@@ -1316,7 +1320,7 @@ protected def env : CliM PUnit := do
     else
       pure config.lakeEnv.vars
   if let some cmd ← takeArg? then
-    let child ← IO.Process.spawn {cmd, args := (← takeArgs).toArray, env}
+    let child ← spawnProc {cmd, args := (← takeArgs).toArray, env}
     exit <| ← child.wait
   else
     env.forM fun (var, val?) =>
@@ -1496,5 +1500,6 @@ def lake : CliM PUnit := do
       else
         throw <| CliError.missingCommand
 
-public def cli (args : List String) : BaseIO ExitCode :=
-  inline <| (lake).run args
+/-- Runs the Lake command `args`. With `oneShot`, the process exits when it returns (`LakeOptions.oneShot`). -/
+public def cli (args : List String) (oneShot := false) : BaseIO ExitCode :=
+  inline <| (lake).run args oneShot
