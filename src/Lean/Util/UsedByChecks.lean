@@ -163,16 +163,21 @@ private def declConstVals : Declaration → Option (Array (Name × Expr × Optio
   | .mutualDefnDecl vs => some (vs.toArray.map fun v => (v.name, v.type, some v.value))
   | _ => none
 
+/-- The constants of `e`, as `Expr.foldConsts` visits them (its `const` names and the structure names of its `proj`
+nodes), collected natively (`src/library/usage_digest.cpp`): each name object once, in no particular order. -/
+@[extern "lean_usage_expr_consts"]
+opaque exprConsts (e : @& Expr) : Array Name
+
 /-- When recording is on, records the constants of `decl` as used and, per constant it adds as given, its
 `DeclConsts`, computed here from `decl` itself. -/
 def recordDeclConsts (decl : Declaration) : BaseIO Unit := do
   unless (← usageRecordingRef.get) do return
   let some vals := declConstVals decl | do
-    let used := decl.foldExprM (m := Id) (fun s e => e.foldConsts s fun c s => s.insert c) ({} : NameSet)
+    let used := decl.foldExprM (m := Id) (fun s e => (exprConsts e).foldl (·.insert ·) s) ({} : NameSet)
     usedByChecksRef.modify fun acc => used.foldl (·.insert ·) acc
   -- one walk of type and value, so that a subterm they share is visited once
   let recs := vals.map fun (n, type, value?) =>
-    let consts := (value?.elim type (.app type ·)).foldConsts ({} : NameSet) fun c s => s.insert c
+    let consts := (exprConsts (value?.elim type (.app type ·))).foldl (·.insert ·) ({} : NameSet)
     (n, ({ type, value?, consts } : DeclConsts))
   usedByChecksRef.modify fun acc => recs.foldl (fun acc (_, r) => r.consts.foldl (·.insert ·) acc) acc
   declConstsRef.modify fun m => recs.foldl (fun m (n, r) => m.insert n r) m

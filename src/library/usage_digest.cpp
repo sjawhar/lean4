@@ -698,7 +698,7 @@ class ptr_set {
         m_slots[i] = slot{k, m_gen};
     }
 public:
-    ptr_set():m_slots(size_t(1) << 10, slot{nullptr, 0}), m_shift(64 - 10) {}
+    explicit ptr_set(unsigned log_size = 6):m_slots(size_t(1) << log_size, slot{nullptr, 0}), m_shift(64 - log_size) {}
     /* Adds `k`; returns whether it was absent. */
     bool insert(object * k) {
         size_t mask = m_slots.size() - 1;
@@ -718,9 +718,10 @@ public:
     void clear() { m_gen++; m_size = 0; }
 };
 
-/* `Lean.ModuleUsage.ConstWalker`. Every expression and name it records is reachable from the info trees that
-`usedFromInfoTrees` walks (their terms, or the assignments of their metavariable contexts), which that function takes
-borrowed (`@&`), so its caller holds them for the whole walk and pointers stay valid and distinct without references. */
+/* `Lean.ModuleUsage.ConstWalker`, and `Lean.exprConsts` without a metavariable context. Every expression and name it
+records is reachable from the terms the caller holds for the whole walk (for `usedFromInfoTrees`, which takes them
+borrowed (`@&`), the info trees: their terms and the assignments of their metavariable contexts; for `exprConsts`, its
+borrowed argument), so pointers stay valid and distinct without references. */
 class const_walker {
     ptr_set                m_closed;    // visited subterms without metavariables
     ptr_set                m_opened;    // visited subterms with metavariables, under `m_mctx`
@@ -759,13 +760,9 @@ class const_walker {
 public:
     ~const_walker() { if (m_mctx) lean_dec(m_mctx); }
 
-    void walk(b_obj_arg mctx, b_obj_arg root) {
-        if (mctx != m_mctx) {
-            m_opened.clear();
-            lean_inc(mctx);
-            if (m_mctx) lean_dec(m_mctx);
-            m_mctx = mctx;
-        }
+    /* Visits `root`'s subterms not visited yet: `const` and `proj` nodes add their names, and metavariables their
+    assignments under `m_mctx`, if set. */
+    void walk(b_obj_arg root) {
         m_todo.push_back(root);
         while (!m_todo.empty()) {
             object * o = m_todo.back();
@@ -782,10 +779,21 @@ public:
             case expr_kind::MData:  m_todo.push_back(mdata_expr(e).raw()); break;
             case expr_kind::Proj:   use(proj_sname(e)); m_todo.push_back(proj_expr(e).raw()); break;
             case expr_kind::Const:  use(const_name(e)); break;
-            case expr_kind::MVar:   push_mvar(mvar_name(e).raw()); break;
+            case expr_kind::MVar:   if (m_mctx) push_mvar(mvar_name(e).raw()); break;
             default: break;
             }
         }
+    }
+
+    /* `walk` under `mctx`: the subterms with metavariables visited under another context are visited again. */
+    void walk(b_obj_arg mctx, b_obj_arg root) {
+        if (mctx != m_mctx) {
+            m_opened.clear();
+            lean_inc(mctx);
+            if (m_mctx) lean_dec(m_mctx);
+            m_mctx = mctx;
+        }
+        walk(root);
     }
 
     object * names() const {
@@ -822,6 +830,13 @@ extern "C" LEAN_EXPORT obj_res lean_usage_const_walker_walk(b_obj_arg w, b_obj_a
 
 extern "C" LEAN_EXPORT obj_res lean_usage_const_walker_names(b_obj_arg w) {
     return to_const_walker(w).names();
+}
+
+/* `Lean.exprConsts`: without a metavariable context, metavariables are not followed, as in `Expr.foldConsts`. */
+extern "C" LEAN_EXPORT obj_res lean_usage_expr_consts(b_obj_arg e) {
+    const_walker w;
+    w.walk(e);
+    return w.names();
 }
 
 namespace {
