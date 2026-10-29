@@ -59,9 +59,6 @@ which does not count their computation either.
 */
 
 extern "C" void lean_mark_persistent_unshared(lean_object * o);
-extern "C" lean_object * lean_imported_consts_find_entry_core(lean_obj_arg root, lean_obj_arg n);
-extern "C" lean_object * lean_imported_consts_mod_idx_core(lean_obj_arg entry, lean_obj_arg extras,
-    lean_obj_arg n);
 
 namespace {
 /* `modIdxCached?`'s result for an entry's key. */
@@ -185,16 +182,232 @@ lean_external_class * get_cache_class() {
     static lean_external_class * cls = lean_register_external_class(cache_finalize, cache_foreach);
     return cls;
 }
+}  // namespace
+
+namespace {
+/*
+The lookups of an imported view (`ImportedConsts.findEntry?` and `modIdxCore` in src/Lean/ConstTrie.lean), walked
+natively: the same nodes, the same child-index probes and the same results, but over the name's prefixes on the stack
+instead of an array of them. Views and tries are never modified after they are built, and a lazy node's thunks are
+forced as `ImportedConsts.forceShared` forces them (the callers here do not count the heartbeats of a lookup), so
+everything is read without locks and borrowed from the view.
+*/
+// `ConstTrie`: key, val?, children, childIndex
+inline lean_object * trie_key(lean_object * t) { return lean_ctor_get(t, 0); }
+inline lean_object * trie_val(lean_object * t) { return lean_ctor_get(t, 1); }
+inline lean_object * trie_children(lean_object * t) { return lean_ctor_get(t, 2); }
+inline lean_object * trie_index(lean_object * t) { return lean_ctor_get(t, 3); }
+
+// `ImportedNode` constructors: `mod` (modIdx, tree), `merged` (key, entry?, children, childIndex),
+// `lazy` (key, entry, expanded), `cached` (cache, tree; `cached_tag`)
+constexpr unsigned node_mod = 0;
+constexpr unsigned node_lazy = 2;
+
+/* `lastPartEq`: whether two names whose prefixes are equal have equal final components. */
+inline bool last_part_eq(lean_object * a, lean_object * b) {
+    if (lean_is_scalar(a) || lean_is_scalar(b)) return lean_is_scalar(a) && lean_is_scalar(b);
+    if (lean_ptr_tag(a) != lean_ptr_tag(b)) return false;
+    lean_object * x = lean_ctor_get(a, 1);
+    lean_object * y = lean_ctor_get(b, 1);
+    // tag 1: `.str`, tag 2: `.num`
+    return lean_ptr_tag(a) == 1 ? lean_string_eq(x, y) : lean_nat_eq(x, y);
 }
 
-/* Looks `n` up in the view `root` through the cache `c`, computing a miss with `core`: returns the
+/* `prefixesOf n`: `n` and its prefixes, innermost first, without the anonymous root. */
+class name_path {
+    static constexpr size_t inline_size = 16;
+    lean_object *               m_inline[inline_size];
+    std::vector<lean_object *>  m_heap;
+    lean_object **              m_data = m_inline;
+    size_t                      m_size = 0;
+public:
+    explicit name_path(b_lean_obj_arg n) {
+        for (lean_object * p = n; !lean_is_scalar(p); p = lean_ctor_get(p, 0)) m_size++;
+        if (m_size > inline_size) {
+            m_heap.resize(m_size);
+            m_data = m_heap.data();
+        }
+        size_t i = 0;
+        for (lean_object * p = n; !lean_is_scalar(p); p = lean_ctor_get(p, 0)) m_data[i++] = p;
+    }
+    size_t size() const { return m_size; }
+    lean_object * operator[](size_t i) const { return m_data[i]; }
+};
+
+inline size_t get_u16(uint8_t const * b, size_t o) { return static_cast<size_t>(b[o]) | (static_cast<size_t>(b[o + 1]) << 8); }
+inline size_t get_u32(uint8_t const * b, size_t o) {
+    return static_cast<size_t>(b[o]) | (static_cast<size_t>(b[o + 1]) << 8) | (static_cast<size_t>(b[o + 2]) << 16) |
+        (static_cast<size_t>(b[o + 3]) << 24);
+}
+
+/* `findHashIdx?`: the child of `cs` (sorted by key hash, indexed by `index`) whose key is `k`, or null. */
+template <class KeyOf>
+inline lean_object * find_child(lean_object * index, lean_object * cs, lean_object * k, KeyOf key_of) {
+    size_t size = lean_sarray_size(index);
+    if (size == 0) return nullptr;
+    uint8_t const * b = lean_sarray_cptr(index);
+    uint64_t h = lean_name_hash(k);
+    uint8_t header = b[0];
+    unsigned bits = header & 0x1F;
+    // `buildChildIndex` writes `1 ≤ bits ≤ maxSlotBits`
+    size_t slot = static_cast<size_t>(h >> (64 - bits));
+    size_t lo, hi, fp_off;
+    if ((header & 0x80) == 0) {
+        lo = get_u16(b, 1 + 2 * slot);
+        hi = get_u16(b, 3 + 2 * slot);
+        fp_off = 3 + 2 * (static_cast<size_t>(1) << bits);
+    } else {
+        lo = get_u32(b, 1 + 4 * slot);
+        hi = get_u32(b, 5 + 4 * slot);
+        fp_off = 5 + 4 * (static_cast<size_t>(1) << bits);
+    }
+    uint8_t fp = static_cast<uint8_t>(h >> 32);
+    for (size_t j = lo; j < hi; j++) {
+        lean_object * c = lean_array_get_core(cs, j);
+        if (b[fp_off + j] == fp && last_part_eq(key_of(c), k)) return c;
+    }
+    return nullptr;
+}
+
+/* `ImportedConsts.key`. */
+inline lean_object * node_key(lean_object * t) {
+    while (true) {
+        switch (lean_ptr_tag(t)) {
+        case node_mod:   return trie_key(lean_ctor_get(t, 1));
+        case cached_tag: t = lean_ctor_get(t, 1); break;
+        default:         return lean_ctor_get(t, 0);
+        }
+    }
+}
+
+/* `ConstTrie.findAux t path i`: the `val?` of the node for `path[0]` below `t`, the node for `path[i]`, or null if there
+   is no such node. */
+inline lean_object * trie_find(lean_object * t, name_path const & path, size_t i) {
+    for (; i > 0; i--) {
+        t = find_child(trie_index(t), trie_children(t), path[i - 1], trie_key);
+        if (!t) return nullptr;
+    }
+    return trie_val(t);
+}
+
+/* The `Array ImportedNode × ByteArray` of a lazy node's children, forced as `forceShared` forces it. */
+inline lean_object * lazy_expanded(lean_object * t) { return lean_thunk_get(lean_ctor_get(t, 2)); }
+
+/* `findEntryAux t path i`, owned. */
+lean_object * node_find_entry(lean_object * t, name_path const & path, size_t i) {
+    while (true) {
+        switch (lean_ptr_tag(t)) {
+        case node_mod: {
+            lean_object * v = trie_find(lean_ctor_get(t, 1), path, i);
+            if (!v || lean_is_scalar(v)) return lean_box(0);
+            lean_object * val = lean_ctor_get(v, 0);
+            lean_object * idx = lean_ctor_get(t, 0);
+            lean_inc(val); lean_inc(idx);
+            lean_object * p = lean_alloc_ctor(0, 2, 0);
+            lean_ctor_set(p, 0, val);
+            lean_ctor_set(p, 1, idx);
+            lean_object * r = lean_alloc_ctor(1, 1, 0);
+            lean_ctor_set(r, 0, p);
+            return r;
+        }
+        case node_lazy:
+            if (i == 0) {
+                lean_object * e = lean_thunk_get(lean_ctor_get(t, 1));
+                lean_inc(e);
+                return e;
+            } else {
+                lean_object * ex = lazy_expanded(t);
+                t = find_child(lean_ctor_get(ex, 1), lean_ctor_get(ex, 0), path[--i], node_key);
+                if (!t) return lean_box(0);
+            }
+            break;
+        case cached_tag:
+            t = lean_ctor_get(t, 1);
+            break;
+        default: // merged
+            if (i == 0) {
+                lean_object * e = lean_ctor_get(t, 1);
+                lean_inc(e);
+                return e;
+            }
+            t = find_child(lean_ctor_get(t, 3), lean_ctor_get(t, 2), path[--i], node_key);
+            if (!t) return lean_box(0);
+        }
+    }
+}
+
+/* The module index of an `Option (α × Nat)` entry, or null for `none`. */
+inline lean_object * entry_mod_idx(lean_object * e) {
+    return lean_is_scalar(e) ? nullptr : lean_ctor_get(lean_ctor_get(e, 0), 1);
+}
+
+/* `findModIdxAux t path i` if `bound` is null, else `findModIdxBelowAux bound t path i`: the borrowed module index, or
+   null for `none`. */
+lean_object * node_find_mod_idx(lean_object * t, name_path const & path, size_t i, lean_object * bound) {
+    while (true) {
+        switch (lean_ptr_tag(t)) {
+        case node_mod: {
+            lean_object * idx = lean_ctor_get(t, 0);
+            if (bound && !lean_nat_lt(idx, bound)) return nullptr;
+            lean_object * v = trie_find(lean_ctor_get(t, 1), path, i);
+            return v && !lean_is_scalar(v) ? idx : nullptr;
+        }
+        case node_lazy:
+            if (i == 0) {
+                lean_object * idx = entry_mod_idx(lean_thunk_get(lean_ctor_get(t, 1)));
+                return idx && (!bound || lean_nat_lt(idx, bound)) ? idx : nullptr;
+            } else {
+                lean_object * ex = lazy_expanded(t);
+                t = find_child(lean_ctor_get(ex, 1), lean_ctor_get(ex, 0), path[--i], node_key);
+                if (!t) return nullptr;
+            }
+            break;
+        case cached_tag:
+            t = lean_ctor_get(t, 1);
+            break;
+        default: // merged
+            if (i == 0) {
+                lean_object * idx = entry_mod_idx(lean_ctor_get(t, 1));
+                return idx && (!bound || lean_nat_lt(idx, bound)) ? idx : nullptr;
+            }
+            t = find_child(lean_ctor_get(t, 3), lean_ctor_get(t, 2), path[--i], node_key);
+            if (!t) return nullptr;
+        }
+    }
+}
+
+/* `findEntry? root n`, owned. */
+lean_object * find_entry_native(b_lean_obj_arg root, b_lean_obj_arg n) {
+    name_path path(n);
+    return node_find_entry(root, path, path.size());
+}
+
+inline lean_object * mk_some_nat(lean_object * idx) {
+    lean_inc(idx);
+    lean_object * r = lean_alloc_ctor(1, 1, 0);
+    lean_ctor_set(r, 0, idx);
+    return r;
+}
+
+/* `modIdxCore entry extras n`, owned. */
+lean_object * mod_idx_native(b_lean_obj_arg entry, b_lean_obj_arg extras, b_lean_obj_arg n) {
+    name_path path(n);
+    if (lean_object * i = entry_mod_idx(entry)) {
+        lean_object * j = node_find_mod_idx(extras, path, path.size(), i);
+        return mk_some_nat(j ? j : i);
+    }
+    lean_object * j = node_find_mod_idx(extras, path, path.size(), nullptr);
+    return j ? mk_some_nat(j) : lean_box(0);
+}
+}
+
+/* Looks `n` up in the view `root` through the cache `c`, computing a miss with `find_entry_native`: returns the
    entry, with a reference for the caller, and sets `*e_out` to the cache entry holding it, or to null
    if the cache does not keep it. Specialized per `owned` and inlined into `find_cached`: a shared
    out-of-line copy measurably slows down the hot path. */
 template <bool owned>
 static inline __attribute__((always_inline)) lean_obj_res find_cached_in(cache & c,
-        b_lean_obj_arg root, b_lean_obj_arg n, lean_object * (*core)(lean_obj_arg, lean_obj_arg),
-        entry ** e_out) {
+        b_lean_obj_arg root, b_lean_obj_arg n, entry ** e_out) {
     table * t = c.m_table.load(std::memory_order_acquire);
     uint64_t h = entry_hash(root, n);
     size_t slot = static_cast<size_t>(h) & (t->m_num_slots - 1);
@@ -216,8 +429,7 @@ static inline __attribute__((always_inline)) lean_obj_res find_cached_in(cache &
     }
     // not counted, see above
     uint64_t heartbeats = get_num_heartbeats();
-    lean_inc(root); lean_inc(n);
-    lean_object * r = core(root, n);
+    lean_object * r = find_entry_native(root, n);
     // The value is handed to and `inc`ed by arbitrary reader threads; marking it persistent keeps
     // hits free of atomic RC and of coherence traffic on hot values. The unshared variant only
     // writes thread-owned counts, so it is race-free where plain `lean_mark_persistent` is not.
@@ -277,16 +489,15 @@ static bool has_own_cache(b_lean_obj_arg root) {
     return own_cache(root) != nullptr;
 }
 
-static lean_obj_res find_cached(b_lean_obj_arg root, b_lean_obj_arg n,
-        lean_object * (*core)(lean_obj_arg, lean_obj_arg), entry ** e_out) {
+static lean_obj_res find_cached(b_lean_obj_arg root, b_lean_obj_arg n, entry ** e_out) {
     if (cache * c = own_cache(root))
-        return find_cached_in<true>(*c, root, n, core, e_out);
-    return find_cached_in<false>(g_global_cache, root, n, core, e_out);
+        return find_cached_in<true>(*c, root, n, e_out);
+    return find_cached_in<false>(g_global_cache, root, n, e_out);
 }
 
 extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_find_entry_cached(b_lean_obj_arg root, b_lean_obj_arg n) {
     entry * e;
-    return find_cached(root, n, lean_imported_consts_find_entry_core, &e);
+    return find_cached(root, n, &e);
 }
 
 /* ImportedConsts.modIdxCached? (consts : @& ImportedConsts ConstantInfo)
@@ -294,7 +505,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_find_entry_cached(b_lea
 extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_find_mod_idx_cached(b_lean_obj_arg consts,
         b_lean_obj_arg extras, b_lean_obj_arg n) {
     entry * e;
-    lean_object * val = find_cached(consts, n, lean_imported_consts_find_entry_core, &e);
+    lean_object * val = find_cached(consts, n, &e);
     if (e) {
         mod_memo * m = e->m_mod.load(std::memory_order_acquire);
         if (m && m->m_extras == extras) {
@@ -306,8 +517,8 @@ extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_find_mod_idx_cached(b_l
     }
     // not counted, see above
     uint64_t heartbeats = get_num_heartbeats();
-    lean_inc(extras); lean_inc(n);
-    lean_object * r = lean_imported_consts_mod_idx_core(val, extras, n);
+    lean_object * r = mod_idx_native(val, extras, n);
+    lean_dec(val);
     // marked and leaked like an entry's value, also when not memoized
     lean_mark_persistent_unshared(r);
     if (e && !e->m_mod.load(std::memory_order_relaxed)) {
@@ -385,19 +596,7 @@ namespace {
 `collectDupsAux` does, node for node and in the same order, but over plain vectors: no object per flattened child, and
 a sort without boxed keys. A trie's nodes are never modified after it is built, so they are read without locks.
 */
-inline lean_object * trie_key(lean_object * t) { return lean_ctor_get(t, 0); }
-inline lean_object * trie_val(lean_object * t) { return lean_ctor_get(t, 1); }
-inline lean_object * trie_children(lean_object * t) { return lean_ctor_get(t, 2); }
-
-/* `lastPartEq`: whether two names whose prefixes are equal have equal final components. */
-inline bool last_part_eq(lean_object * a, lean_object * b) {
-    if (lean_is_scalar(a) || lean_is_scalar(b)) return lean_is_scalar(a) && lean_is_scalar(b);
-    if (lean_ptr_tag(a) != lean_ptr_tag(b)) return false;
-    lean_object * x = lean_ctor_get(a, 1);
-    lean_object * y = lean_ctor_get(b, 1);
-    // tag 1: `.str`, tag 2: `.num`
-    return lean_ptr_tag(a) == 1 ? lean_string_eq(x, y) : lean_nat_eq(x, y);
-}
+/* `ConstTrie` accessors and `last_part_eq` are those of the lookups above. */
 
 struct dup_cand {
     size_t         m_idx;

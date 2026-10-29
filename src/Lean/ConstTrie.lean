@@ -400,16 +400,11 @@ def findEntry? (t : ImportedConsts α) (n : Name) : Option (α × Nat) :=
   let path := prefixesOf n
   findEntryAux t.root path path.size
 
-@[export lean_imported_consts_find_entry_core]
-def findEntryCore (t : ImportedConsts ConstantInfo) (n : Name) :
-    Option (ConstantInfo × Nat) :=
-  t.findEntry? n
-
 /--
 `findEntry?` for the constants view, memoized in a lock-free cache: the one owned by a `cached`
 root, or else a process-global one; sound because the imported view is immutable per import set.
 Implemented in C++ (`src/library/const_cache.cpp`) where cache hits can avoid reference counting
-on the view and key.
+on the view and key, and a miss walks the view natively, as `findEntry?` does.
 -/
 @[extern "lean_imported_consts_find_entry_cached"]
 opaque findEntryCached? (t : @& ImportedConsts ConstantInfo) (n : @& Name) :
@@ -454,9 +449,9 @@ partial def findModIdxBelowAux (bound : Nat) : ImportedNode α → Array Name �
 The index of the first module that has `n` as a constant or as an extra constant, given the
 constants view's entry for `n` and the view of the extra constants. This is the index stock Lean's
 `const2ModIdx` gives: it inserts each module's constants and then its extra constants, in module
-order, and keeps the first insertion of each name.
+order, and keeps the first insertion of each name. `modIdxCached?` computes it natively; this is the
+reference its tests compare with.
 -/
-@[export lean_imported_consts_mod_idx_core]
 def modIdxCore (entry : Option (ConstantInfo × Nat)) (extras : ImportedConsts Unit) (n : Name) :
     Option Nat :=
   let path := prefixesOf n
