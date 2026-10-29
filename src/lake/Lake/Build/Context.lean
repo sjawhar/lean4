@@ -127,6 +127,30 @@ public structure KernelProviders where
   toolchain : Lean.PHashMap Lean.Name (Option (Array UInt64 × Array Lean.Name)) := {}
   /-- For the hash of each kernel constant of a toolchain module in `toolchain`, the modules that declare it. -/
   toolchainIndex : Lean.PHashMap UInt64 (Array Lean.Name) := {}
+  /-- The toolchain modules whose walk is complete: the module and every module its `.olean` imports, transitively,
+  were read without a failure and are no workspace module, so a walk from them reads and logs nothing
+  (`Lake.UsageSidecar.kernelDisjoint`). -/
+  complete : Lean.PHashMap Lean.Name Unit := {}
+
+/--
+What usage-cutoff checks of this build read of their closures and may take again instead of reading it again: by
+module, the importer-side record of its sidecars (a `Lake.ImportFact`), the hashes of a `module` file's artifacts (a
+`Lake.ArtsFact`, by name and number of paths) and the module's import data (a `Lake.ModuleCell`); and the `.usage` paths
+whose `Lake.UsageView` exists. The values are `Dynamic` because their types are Lake's usage-cutoff types. A check
+takes one snapshot per pass and publishes what it read in one batch; it takes a record only if each file the record
+was read from still has the recorded stamp (`Lake.readImports`). Only this build reads it.
+-/
+public structure UsageFacts where
+  imports : Lean.PHashMap Lean.Name Dynamic := {}
+  arts : Lean.PHashMap (Lean.Name × Nat) Dynamic := {}
+  cells : Lean.PHashMap Lean.Name Dynamic := {}
+  frozen : Lean.PHashMap FilePath Unit := {}
+  /-- How many closure modules checks took from earlier reads, and how many they read again. -/
+  taken : Nat := 0
+  read : Nat := 0
+  /-- The same for `module` files' artifact hashes (`Lake.modsysHash`). -/
+  artsTaken : Nat := 0
+  artsRead : Nat := 0
 
 /-- Non-404 failures observed while reading input-hash mappings in one Lake build. -/
 public structure RemoteReadStatus where
@@ -275,6 +299,8 @@ public structure BuildContext extends BuildConfig, Context where
   only the mutex of its path's shard.
   -/
   usageViews : Shards 1024 (Lean.PHashMap FilePath Dynamic)
+  /-- What this build's usage-cutoff checks read of their closures (`UsageFacts`). -/
+  usageFacts : Std.Mutex UsageFacts
   /--
   The kept-module checker (`LAKE_KEPT_CHECKER`): a module whose own source and options did not
   change since its outputs were built, but whose imports did, keeps those outputs if the usage

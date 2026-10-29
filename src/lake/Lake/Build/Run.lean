@@ -444,6 +444,7 @@ def mkBuildContext
   kernelProviders := ← Std.Mutex.new {}
   remoteReadStatus := ← IO.mkRef {}
   usageViews := ← Shards.new 1024 {}
+  usageFacts := ← Std.Mutex.new {}
   usageCutoffInFlight := ← IO.mkRef 0
   leanTrace := .ofHash (pureHash ws.lakeEnv.leanGithash)
     s!"Lean {Lean.versionStringCore}, commit {ws.lakeEnv.leanGithash}"
@@ -518,6 +519,10 @@ def finalizeBuild
   if remoteStatus.failures > 0 then
     if let .error e ← (writeRemoteReadStatus bctx.workspace.lakeCache remoteStatus).toBaseIO then
       mctx.logger.logEntry (.trace s!"could not write remote cache read status: {e}")
+  let facts ← bctx.usageFacts.atomically get
+  if facts.taken + facts.read + facts.artsTaken + facts.artsRead > 0 then
+    mctx.logger.logEntry (.trace s!"usage cutoff: closure records taken from earlier reads {facts.taken}, \
+      read {facts.read}; module-system artifact hashes taken {facts.artsTaken}, read {facts.artsRead}")
   -- The build's push (if it started one) ends with the build, not with this process
   endBuildPush
   runQueuedPush bctx.workspace mctx.logger
