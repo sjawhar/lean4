@@ -14,6 +14,7 @@ public import Lake.Build.Actions
 public import Lake.Build.RemoteCache
 public import Lake.Build.Claim
 import Lake.Util.BuildSlots
+import Lean.Util.ModuleUsage.Basic
 
 /-! # Common Build Tools
 This file defines general utilities that abstract common
@@ -529,6 +530,15 @@ public def buildFileUnlessUpToDate'
   setTrace (← fetchFileTrace file text)
 
 /--
+Sets the access rights of `file` to `rights` unless its permission bits already are those: a `chmod`, even to the same
+bits, changes the file's status-change time, and with it the stamp under which the usage cutoff's digest log keeps the
+file's records (`Lean.ModuleUsage.fileDigestStamped`).
+-/
+def setAccessRightsIfChanged (file : FilePath) (rights : IO.FileRight) : IO Unit := do
+  if (← Lean.ModuleUsage.fileMode file) != some rights.flags then
+    IO.setAccessRights file rights
+
+/--
 Like `Cache.saveArtifact`, but if `expected?` is a hash that `file`'s contents do not have,
 caches nothing, leaves `file` and its `.hash` untouched, and returns `file`'s actual hash (`none`
 for text that is not valid UTF-8, which has no hash).
@@ -552,13 +562,13 @@ public def Cache.saveArtifactIfMatches
       -- make the local file unwritable where possible to discourage users from
       -- writing to such paths as this can corrupt the cache if the file was hard linked
       let r := {read := true, write := false, execution := false}
-      IO.setAccessRights file ⟨r, r, r⟩
+      setAccessRightsIfChanged file ⟨r, r, r⟩
       unless (← cacheFile.pathExists) do
         createParentDirs cacheFile
         -- other functions can race to create the file
         -- use `writeFileIfNew` to prevent errors on races
         writeFileIfNew cacheFile normalized
-      IO.setAccessRights cacheFile ⟨r, r, r⟩
+      setAccessRightsIfChanged cacheFile ⟨r, r, r⟩
       writeFileHash file hash
       let mtime ← getMTime cacheFile
       let path := if useLocalFile then file else cacheFile
@@ -573,7 +583,7 @@ public def Cache.saveArtifactIfMatches
       -- make the local file unwritable where possible to discourage users from
       -- writing to such paths as this can corrupt the cache if the file is hard linked
       let r := {read := true, write := false, execution := exe}
-      IO.setAccessRights file ⟨r, r, r⟩
+      setAccessRightsIfChanged file ⟨r, r, r⟩
       unless (← cacheFile.pathExists) do
         createParentDirs cacheFile
         if let .error e ← (IO.FS.hardLink file cacheFile).toBaseIO then
@@ -581,7 +591,7 @@ public def Cache.saveArtifactIfMatches
           unless e matches .alreadyExists .. do
             -- use `writeBinFileIfNew` to prevent errors on races
             writeBinFileIfNew cacheFile contents
-      IO.setAccessRights cacheFile ⟨r, r, r⟩
+      setAccessRightsIfChanged cacheFile ⟨r, r, r⟩
       writeFileHash file hash
       let mtime ← getMTime cacheFile
       let path := if useLocalFile then file else cacheFile
@@ -834,7 +844,7 @@ public def resolveArtifact
             \n  remote URL: {url}"
           liftM <| downloadArtifactCore descr.hash url path (service.sendsCacheToken url)
         let r := {read := true, write := false, execution := exe}
-        if let .error e ← IO.setAccessRights path ⟨r, r, r⟩ |>.toBaseIO then
+        if let .error e ← setAccessRightsIfChanged path ⟨r, r, r⟩ |>.toBaseIO then
           logWarning s!"could not mark downloaded artifact read-only: {e}"
         match (← getMTime path |>.toBaseIO) with
         | .ok mtime =>
@@ -932,7 +942,7 @@ public def restoreArtifact
             IO.FS.rename tmp file
             if exe then
               let r := {read := true, write := false, execution := exe}
-              IO.setAccessRights file ⟨r, r, r⟩
+              setAccessRightsIfChanged file ⟨r, r, r⟩
         else
           logWarning s!"{art.path}: cached artifact does not match its content hash; \
             {← quarantineEntry art}"
@@ -954,12 +964,12 @@ public def restoreArtifact
     -- make the local file unwritable where possible to discourage users from
     -- writing to such paths as this can corrupt the cache if the file was hard linked instead
     let r := {read := true, write := false, execution := exe}
-    IO.setAccessRights file ⟨r, r, r⟩
+    setAccessRightsIfChanged file ⟨r, r, r⟩
   else if exe then
     -- Ensure restored executables are executable
     -- They may not have been if acquired through `lake cache get`
     let r := {read := true, write := false, execution := exe}
-    IO.setAccessRights file ⟨r, r, r⟩
+    setAccessRightsIfChanged file ⟨r, r, r⟩
   logVerbose s!"restored artifact from cache to: {file}"
   writeFileHash file art.hash
   return art.useLocalFile file
