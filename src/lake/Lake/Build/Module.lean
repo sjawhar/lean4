@@ -1875,6 +1875,15 @@ def Module.skipOrBuild (mod : Module) (presetup : ModulePreSetup) (savedTrace : 
   unless (← mod.usageCutoffApplies presetup) do return ← noVerdict "its outputs are missing"
   let setup ← mkModuleSetup mod presetup
   let verdict ← mod.usageVerdict presetup setup.importArts hashes
+  -- With `-v` only: the decision, and the importees whose records it took, which the usage-cutoff tests match
+  if ← getIsVerbose then
+    let listed (ms : Array Name) :=
+      String.intercalate "," (ms.map (·.toString) |>.qsort (fun a b => compare a b == .lt)).toList
+    logVerbose s!"usage cutoff: decision {mod.name}"
+    let imports := (← hashes.facts.get).toArray.map (·.1)
+    unless imports.isEmpty do logVerbose s!"usage cutoff: decision {mod.name} fact imports {listed imports}"
+    let arts := (← hashes.arts.get).toArray.map (·.1)
+    unless arts.isEmpty do logVerbose s!"usage cutoff: decision {mod.name} fact arts {listed arts}"
   unless verdict matches .upToDate do return ← lookupOrBuild (verdict, setup)
   let some arts ← mod.keepOutputs? presetup.isModule presetup.postponeCompile savedTrace.moduleOutputDescrs?
       cacheWith?
