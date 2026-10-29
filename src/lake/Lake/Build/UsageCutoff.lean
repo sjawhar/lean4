@@ -358,7 +358,15 @@ public structure ImportFact where
   stamp : ModuleUsage.FileStamp
   read? : Option (Option ModuleUsage.Digest × UsageImport × Bool)
   olean? : Option (ModuleUsage.FileStamp × ModuleUsage.Digest)
+  /-- When a check of this build last saw every file of the record with the recorded stamp (`observedSince`). -/
+  observed : ModuleUsage.ObservedAt
   deriving TypeName
+
+/-- The files of `f` with the stamps it was read under. -/
+def ImportFact.files (f : ImportFact) : Array (FilePath × ModuleUsage.FileStamp) :=
+  match f.olean? with
+  | some (s, _) => #[(f.sidecar, f.stamp), (f.olean, s)]
+  | none => #[(f.sidecar, f.stamp)]
 
 /-- The hashes of a `module` file's artifacts (`paths`, its `ImportArtifacts.toArrays` flattened, its `.olean` first)
 that a decision's `modsysHash` read, each with the stamp it was read under, kept for the build's later decisions as
@@ -367,6 +375,8 @@ public structure ArtsFact where
   paths : Array FilePath
   stamps : Array ModuleUsage.FileStamp
   digests : Array ModuleUsage.Digest
+  /-- As `ImportFact.observed`. -/
+  observed : ModuleUsage.ObservedAt
   deriving TypeName
 
 /-- What a module's import data gives its importers, constant for the build (`BuildContext.usageFacts`): its
@@ -411,7 +421,8 @@ public structure ContentHashes where
   /-- The `module` files whose artifact hashes the decision took from the build's earlier reads (`bindArts`). -/
   arts : IO.Ref (Std.HashMap Name ArtsFact)
   /-- The hash of each file the decision took from those reads: an importee's `.olean`, a `module` file's artifacts.
-  `ContentHashes.find?` reads it first; no file is in it and in `shards` too. -/
+  `ContentHashes.find?` prefers it. A path can also be in `shards` when two parallel passes of one decision raced to
+  bind it; both digests then stood for the same bytes, and later readers take this one. -/
   taken : IO.Ref (Std.HashMap FilePath ModuleUsage.Digest)
   /-- The decision's `closureHash` with `kept` and no `importedClosures?`, once computed: it folds bound reads, so it
   is the same for every check of the decision, which the usage index's pre-filter uses (`usagePrefilter`). -/
@@ -419,6 +430,9 @@ public structure ContentHashes where
   /-- A direct import whose closure the decision found changed, with its bound closure (`changedDirectImport?`): the
   pre-filter rejects a candidate whose key records another closure for it (`usagePrefilter`). -/
   changedImport : IO.Ref (Option (Name × Option ModuleUsage.Digest))
+  /-- The decision's start (`Lean.ModuleUsage.monoNow`): it takes a record only after each of its files was seen with
+  the recorded stamp after this (`observedSince`). -/
+  t0 : UInt64
 
 /-- An empty `ContentHashes`, for one decision. -/
 public def ContentHashes.new : BaseIO ContentHashes :=
@@ -432,6 +446,7 @@ public def ContentHashes.new : BaseIO ContentHashes :=
     taken := ← IO.mkRef {}
     keptClosure := ← IO.mkRef none
     changedImport := ← IO.mkRef none
+    t0 := ← ModuleUsage.monoNow
   }
 
 /-- The hash the decision took or recorded for `file`, if any, with the stamp it was read under if the decision read
@@ -648,10 +663,28 @@ def stampIs (path : FilePath) (stamp : ModuleUsage.FileStamp) : BaseIO Bool := d
   | _ => return false
 
 /--
+Whether each file of `files`, a record's files with the stamps it was read under, was seen with its stamp after `t0`,
+the start of the decision that asks (`ContentHashes.t0`). Either a check of this build saw them all in one sweep and
+then raised `observed` to a reading it took before that sweep, and that reading is later than `t0`
+(`Lean.ModuleUsage.ObservedAt.after`: acquire order, strictly greater); or the caller sees them all now, after which
+`observed` is raised to `t`, a reading the caller took before its first stat (`ObservedAt.raise`: release order, after
+the whole sweep matched). A reading of another process or an earlier build is never in `observed`, which only this
+build's checks make and raise.
+-/
+public def observedSince (observed : ModuleUsage.ObservedAt) (files : Array (FilePath × ModuleUsage.FileStamp))
+    (t0 t : UInt64) : BaseIO Bool := do
+  if ← observed.after t0 then return true
+  for (p, s) in files do
+    unless ← stampIs p s do return false
+  observed.raise t
+  return true
+
+/--
 Takes the artifact hashes of each `module` file of the closure (`importArts`) that the decision has not hashed from the
-build's earlier reads (`ArtsFact`): one read of the same paths each of whose files has the recorded stamp now. The
-decision then holds those hashes (`ContentHashes.arts`, `ContentHashes.taken`) for every later `contentHash` of them.
-A module of which the decision hashed a file already keeps the hashes it read. Returns how many modules it took.
+build's earlier reads (`ArtsFact`): one read of the same paths each of whose files was seen with the recorded stamp
+after the decision started (`observedSince`). The decision then holds those hashes (`ContentHashes.arts`,
+`ContentHashes.taken`) for every later `contentHash` of them. A module of which the decision hashed a file already keeps
+the hashes it read. Returns how many modules it took.
 -/
 def bindArts (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) : JobM Nat := do
   let bound ← hashes.arts.get
@@ -666,10 +699,10 @@ def bindArts (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) : J
     if ← paths.anyM fun p => return (← hashes.findStamped? p).isSome then continue
     cands := cands.push (m, f)
   if cands.isEmpty then return 0
-  let ok ← parallelMap cands fun (_, f) => do
-    for p in f.paths, s in f.stamps do
-      unless ← stampIs p s do return false
-    return true
+  -- before the first stat of the pass
+  let t ← ModuleUsage.monoNow
+  let ok ← parallelMap cands fun (_, f) =>
+    observedSince f.observed (f.paths.zip f.stamps) hashes.t0 t
   let mut taken := #[]
   let mut took := #[]
   for c in cands, b in ok do
@@ -714,8 +747,11 @@ public def modsysHash (hashes : ContentHashes) (importArts : NameMap ImportArtif
           digests := digests.push d
           stamps := stamps.push s?
         if fresh then read := read.push (m, paths, stamps, digests)
-  publishFacts { artsTaken, artsRead := read.size, arts := read.filterMap fun (m, paths, stamps, digests) => do
-    return ((m, paths.size), ({ paths, stamps := ← stamps.mapM id, digests } : ArtsFact)) }
+  let mut arts := #[]
+  for (m, paths, stamps, digests) in read do
+    let some stamps := stamps.mapM id | continue
+    arts := arts.push ((m, paths.size), ({ paths, stamps, digests, observed := ← ModuleUsage.ObservedAt.new } : ArtsFact))
+  publishFacts { artsTaken, artsRead := read.size, arts }
   return e.finish
 
 /--
@@ -851,9 +887,10 @@ def ImportFact.project (f : ImportFact) (kept : Bool) : Option (Option (FilePath
 
 /--
 Takes from the build's earlier reads (`BuildContext.usageFacts`) the record (`ImportFact`) of each module of `mods`,
-which the decision has not read: one of the importee's `.olean` and kind in `importArts`, each of whose files has the
-recorded stamp now, and whose `.olean` the decision has not hashed. A taken record serves both bindings of its module
-in the decision (`ContentHashes.facts`), and its `.olean` hash every `contentHash` of that file
+which the decision has not read: one of the importee's `.olean` and kind in `importArts`, each of whose files was seen
+with the recorded stamp after the decision started (`observedSince`: in a stat of this pass, or of another check of the
+build that came after the decision's start), and whose `.olean` the decision has not hashed. A taken record serves both
+bindings of its module in the decision (`ContentHashes.facts`), and its `.olean` hash every `contentHash` of that file
 (`ContentHashes.taken`). The stamps are read in parallel (`parallelMap`). Returns the snapshot it looked in and how
 many records it took.
 -/
@@ -870,11 +907,9 @@ def bindFacts (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) (m
       if (← hashes.findStamped? olean).isSome then continue
     cands := cands.push (m, f)
   if cands.isEmpty then return (snap, 0)
-  let ok ← parallelMap cands fun (_, f) => do
-    unless ← stampIs f.sidecar f.stamp do return false
-    match f.olean? with
-    | some (s, _) => stampIs f.olean s
-    | none => return true
+  -- before the first stat of the pass
+  let t ← ModuleUsage.monoNow
+  let ok ← parallelMap cands fun (_, f) => observedSince f.observed f.files hashes.t0 t
   let mut took := #[]
   let mut taken := #[]
   for c in cands, b in ok do
@@ -958,7 +993,7 @@ def readImports (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) 
     let .ok (_, _, olean?, (#[], .ok (some (olean, read?))), some stamp) := r.2 | continue
     let modsys := (importArts.find? m).any (·.oleanServer?.isSome)
     let sidecar := olean.withExtension (if modsys then "usage" else "usekey")
-    imports := imports.push (m, { olean, modsys, sidecar, stamp, read?, olean? })
+    imports := imports.push (m, { olean, modsys, sidecar, stamp, read?, olean?, observed := ← ModuleUsage.ObservedAt.new })
   publishFacts { imports, frozen, taken, read }
 
 /--

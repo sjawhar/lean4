@@ -521,8 +521,13 @@ def finalizeBuild
       mctx.logger.logEntry (.trace s!"could not write remote cache read status: {e}")
   let facts ← bctx.usageFacts.atomically get
   if facts.taken + facts.read + facts.artsTaken + facts.artsRead > 0 then
+    let imports := facts.imports.toArray.size
+    let arts := facts.arts.toArray.size
+    let cells := facts.cells.toArray.size
+    let frozen := facts.frozen.toArray.size
     mctx.logger.logEntry (.trace s!"usage cutoff: closure records taken from earlier reads {facts.taken}, \
-      read {facts.read}; module-system artifact hashes taken {facts.artsTaken}, read {facts.artsRead}")
+      read {facts.read}; module-system artifact hashes taken {facts.artsTaken}, read {facts.artsRead}; \
+      retained imports {imports}, arts {arts}, cells {cells}, frozen {frozen}")
   -- The build's push (if it started one) ends with the build, not with this process
   endBuildPush
   runQueuedPush bctx.workspace mctx.logger

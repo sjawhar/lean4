@@ -58,6 +58,31 @@ be read (or on Windows). -/
 @[extern "lean_usage_file_mode"]
 opaque fileMode (path : @& System.FilePath) : IO (Option UInt32)
 
+/-- CLOCK_MONOTONIC, in nanoseconds: never decreasing, on any CPU, and never ahead of real time. -/
+@[extern "lean_usage_mono_now"]
+opaque monoNow : BaseIO UInt64
+
+/-- A `monoNow` reading that only ever rises (`ObservedAt.raise`), stored with release order and read with acquire
+order (`ObservedAt.after`): Lake's record that every file of a usage-cutoff record had the recorded stamp in a stat that
+began after the reading. -/
+opaque ObservedAtImpl : NonemptyType := ⟨Unit, inferInstance⟩
+
+abbrev ObservedAt : Type := ObservedAtImpl.type
+
+instance : Nonempty ObservedAt := ObservedAtImpl.property
+
+/-- A new `ObservedAt` whose reading is 0, which no `ObservedAt.after` accepts. -/
+@[extern "lean_usage_observed_new"]
+opaque ObservedAt.new : BaseIO ObservedAt
+
+/-- Raises `o`'s reading to `t` if it is below `t` (a `compare_exchange` with release order). -/
+@[extern "lean_usage_observed_raise"]
+opaque ObservedAt.raise (o : @& ObservedAt) (t : UInt64) : BaseIO Unit
+
+/-- Whether `o`'s reading, loaded with acquire order, is strictly greater than `t0`. -/
+@[extern "lean_usage_observed_after"]
+opaque ObservedAt.after (o : @& ObservedAt) (t0 : UInt64) : BaseIO Bool
+
 /-- `fileDigest`, with the stamp of the file the bytes were read from if it stands for them: the open file's stamp
 was the same before and after the read, and its status-change time lay far enough before the read began
 (`stampSettled`, against the realtime clock read before the first `fstat`) that any later change to the file shows in
