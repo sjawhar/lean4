@@ -53,6 +53,11 @@ structure FileStamp where
 @[extern "lean_usage_file_stamp"]
 opaque fileStamp (path : @& System.FilePath) : IO (Option FileStamp)
 
+/-- The permission bits (`st_mode & 0o7777`) of the file at `path`, following symbolic links, or `none` if it cannot
+be read (or on Windows). -/
+@[extern "lean_usage_file_mode"]
+opaque fileMode (path : @& System.FilePath) : IO (Option UInt32)
+
 /-- `fileDigest`, with the stamp of the file the bytes were read from if it stands for them: the open file's stamp
 was the same before and after the read, and its status-change time lay far enough before the read began
 (`stampSettled`, against the realtime clock read before the first `fstat`) that any later change to the file shows in
