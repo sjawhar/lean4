@@ -848,10 +848,12 @@ class resolved_set {
     size_t m_mask;
     size_t m_size = 0;
     void grow() {
-        slot * old = m_slots;
         size_t n = m_mask + 1;
+        // the new table first: on a failed allocation the set keeps the one it has
+        slot * fresh = new slot[2 * n]();
+        slot * old = m_slots;
         m_mask = 2 * n - 1;
-        m_slots = new slot[2 * n]();
+        m_slots = fresh;
         for (size_t i = 0; i < n; i++)
             if (old[i].m_name) {
                 size_t j = old[i].m_hash & m_mask;
