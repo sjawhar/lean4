@@ -250,13 +250,14 @@ def readSidecarBytes? (path : FilePath) (expected? : Option ModuleUsage.Digest) 
 /-- An entry of `BuildContext.sidecarCache`. -/
 abbrev SidecarEntry := Option ModuleUsage.FileStamp × ModuleUsage.Digest × Dynamic
 
-/-- The build's parse of the sidecar at `path`, with the digest of the contents it was parsed from, if the file's
-current stamp is the one recorded with it (`BuildContext.sidecarCache`). -/
-def stampedSidecar? (path : FilePath) : JobM (Option (ModuleUsage.Digest × Dynamic)) := do
+/-- The build's parse of the sidecar at `path`, with the digest of the contents it was parsed from and the file's
+current stamp, if that stamp is the one recorded with it (`BuildContext.sidecarCache`). -/
+def stampedSidecar? (path : FilePath) :
+    JobM (Option (ModuleUsage.Digest × Dynamic × ModuleUsage.FileStamp)) := do
   let some stamp ← ModuleUsage.fileStamp path | return none
   let shard := (← getBuildContext).sidecarCache.get (hash path)
   let some (some recorded, digest, value) ← shard.atomically (return (← get).find? path) | return none
-  return if recorded == stamp then some (digest, value) else none
+  return if recorded == stamp then some (digest, value, stamp) else none
 
 /-- Parses the bytes of the usage-cutoff sidecar at `path`: `none` if it has another format version than `version`
 (`Lean.ModuleUsage.usageVersion` for a `.usage`, `usekeyVersion` for a `.usekey`; another toolchain wrote it), or,
@@ -277,6 +278,29 @@ where
     some <$> fromJson? (α := α) j
 
 /--
+Reads a usage-cutoff sidecar, as `readUsageSidecar` does, with the stamp of the file its value stands for: the file's
+current stamp when the build's parse is reused, else the stamp of the read if it stands for the bytes
+(`Lean.ModuleUsage.readFileStamped`). No stamp if the file does not exist or the read's stamp does not stand.
+-/
+def readUsageSidecarStamped (α : Type) [FromJson α] [TypeName α] (version : Nat) (path : FilePath)
+    (expected? : Option ModuleUsage.Digest := none) : JobM (Option α × Option ModuleUsage.FileStamp) := do
+  if let some (digest, cached, stamp) ← stampedSidecar? path then
+    if expected?.any (· != digest) then return (none, none)
+    let some value := cached.get? α | error s!"{path}: cached sidecar has the wrong type"
+    return (some value, some stamp)
+  let some (bytes, digest, stamp?) ← readSidecarBytes? path expected? | return (none, none)
+  (← getBuildContext).sidecarCache.get (hash path) |>.atomically do
+    let entries ← getThe (PHashMap FilePath SidecarEntry)
+    if let some (_, parsedFrom, cached) := entries.find? path then
+      if parsedFrom == digest then
+        let some value := cached.get? α | error s!"{path}: cached sidecar has the wrong type"
+        modifyThe (PHashMap FilePath SidecarEntry) (·.insert path (stamp?, digest, cached))
+        return (some value, stamp?)
+    let some value ← parseUsageSidecar α version path bytes | return (none, stamp?)
+    modifyThe (PHashMap FilePath SidecarEntry) (·.insert path (stamp?, digest, Dynamic.mk value))
+    return (some value, stamp?)
+
+/--
 Reads a usage-cutoff sidecar. Returns `none` if it does not exist, has another format version
 (`parseUsageSidecar`), or its bytes do not have the digest `expected?` (the `.usage` a `.usekey` was written
 from). If it exists but is not valid, logs a warning and returns `none`, so the module builds normally. Reuses
@@ -284,22 +308,8 @@ the build's parse of the same contents (`BuildContext.sidecarCache`), without re
 one recorded with that parse.
 -/
 def readUsageSidecar (α : Type) [FromJson α] [TypeName α] (version : Nat) (path : FilePath)
-    (expected? : Option ModuleUsage.Digest := none) : JobM (Option α) := do
-  if let some (digest, cached) ← stampedSidecar? path then
-    if expected?.any (· != digest) then return none
-    let some value := cached.get? α | error s!"{path}: cached sidecar has the wrong type"
-    return some value
-  let some (bytes, digest, stamp?) ← readSidecarBytes? path expected? | return none
-  (← getBuildContext).sidecarCache.get (hash path) |>.atomically do
-    let entries ← getThe (PHashMap FilePath SidecarEntry)
-    if let some (_, parsedFrom, cached) := entries.find? path then
-      if parsedFrom == digest then
-        let some value := cached.get? α | error s!"{path}: cached sidecar has the wrong type"
-        modifyThe (PHashMap FilePath SidecarEntry) (·.insert path (stamp?, digest, cached))
-        return some value
-    let some value ← parseUsageSidecar α version path bytes | return none
-    modifyThe (PHashMap FilePath SidecarEntry) (·.insert path (stamp?, digest, Dynamic.mk value))
-    return some value
+    (expected? : Option ModuleUsage.Digest := none) : JobM (Option α) :=
+  return (← readUsageSidecarStamped α version path expected?).1
 
 /--
 Reads a module's own `.usage` as `readUsageSidecar` does, but parses it on every read and keeps no parse: only the
@@ -333,29 +343,76 @@ sidecars once. -/
 public abbrev SidecarRead := LoggedRun (Option (FilePath × Option (Option ModuleUsage.Digest × UsageImport × Bool)))
 
 /--
+What a decision's read of an importee found (`readImports`), kept for the build's later decisions
+(`BuildContext.usageFacts`): the importer-side sidecar read (`readImportSidecars?`) of the importee whose `.olean` is
+`olean` (a `module` file if `modsys`), from the bytes of `sidecar` (its `.usekey`, or a `module` file's `.usage`) under
+`stamp`, and, if that read went on to hash the `.olean` (`readImportUsage?`), the `.olean`'s stamp and hash. Made only
+from reads that logged nothing, threw nothing and stood for their bytes (settled stamps), so a later read of the same
+files under the same stamps computes the same values and logs nothing. A decision takes it only if each of its files
+has its stamp now (`bindFacts`).
+-/
+public structure ImportFact where
+  olean : FilePath
+  modsys : Bool
+  sidecar : FilePath
+  stamp : ModuleUsage.FileStamp
+  read? : Option (Option ModuleUsage.Digest × UsageImport × Bool)
+  olean? : Option (ModuleUsage.FileStamp × ModuleUsage.Digest)
+  deriving TypeName
+
+/-- The hashes of a `module` file's artifacts (`paths`, its `ImportArtifacts.toArrays` flattened, its `.olean` first)
+that a decision's `modsysHash` read, each with the stamp it was read under, kept for the build's later decisions as
+`ImportFact`s are. -/
+public structure ArtsFact where
+  paths : Array FilePath
+  stamps : Array ModuleUsage.FileStamp
+  digests : Array ModuleUsage.Digest
+  deriving TypeName
+
+/-- What a module's import data gives its importers, constant for the build (`BuildContext.usageFacts`): its
+artifacts at the private level (`ModuleMetaExportInfo.allArts`), its imports that are workspace modules, the names of
+the others, and whether its name is a workspace module (`findModule?`). -/
+public structure ModuleCell where
+  allArts : ImportArtifacts
+  children : Array Module
+  outside : Array Name
+  findable : Bool
+  deriving TypeName
+
+/--
 What one module's decision before its build has read: its same-tree check (`Module.usageVerdict` of its own
 outputs) and the check of each cached compile the usage index offers (`Module.restoreFromUsageIndex?`), so that the
 decision reads each file once and every `importUsage?` binding in it, in every candidate's check, is to the same
 bytes, also in the checks' parallel tasks (`parallelRuns`), which share it. Another module's decision, and
 `Module.writeUsekey` after the module's own compile, never reuse it: another workspace's build can rebuild a shared
 dependency between two decisions. Across decisions, a file's hash is reused only while its stamp shows its bytes
-unchanged (`BuildContext.fileDigests`). What a build keeps across modules, its views of importees (`UsageView`), is
-frozen at their first read and may be stale: only the usage index's pre-filter reads them (`usagePrefilter`), and it
-only rejects, so a stale view can cost a miss but never a restore, since the check that accepts reads the files
-again.
+unchanged (`BuildContext.fileDigests`), and a closure module's records only while each of their files has the stamp
+they were read under (`BuildContext.usageFacts`, `bindFacts`). What a build keeps across modules, its views of
+importees (`UsageView`), is frozen at their first read and may be stale: only the usage index's pre-filter reads them
+(`usagePrefilter`), and it only rejects, so a stale view can cost a miss but never a restore, since the check that
+accepts reads the files again.
 
 The file hashes are split into 256 shards by the path's hash (`Shards`): the tasks hash about every file of the
 closure, and one mutex for all of them is contended. A shard is persistent, because the tasks share it:
 an insert into a hash map that other threads can reach copies the whole map.
 -/
 public structure ContentHashes where
-  shards : Shards 256 (PHashMap FilePath ModuleUsage.Digest)
+  /-- Each file's hash, with the stamp it was read under if that stood for the bytes. -/
+  shards : Shards 256 (PHashMap FilePath (ModuleUsage.Digest × Option ModuleUsage.FileStamp))
   /-- The read of each importee that binds it (`importUsage?`). -/
   imports : IO.Ref (Std.HashMap Name ImportRead)
   /-- The read of each importee by a read that accepts a kept module's key (`importUsage?` with `kept`). -/
   keptImports : IO.Ref (Std.HashMap Name ImportRead)
-  /-- The read of each importee's sidecars that both of its bindings take (`readImports`). -/
-  sidecarReads : IO.Ref (Std.HashMap Name SidecarRead)
+  /-- The read of each importee's sidecars that both of its bindings take (`readImports`), with the stamp of the
+  sidecar its value stands for. -/
+  sidecarReads : IO.Ref (Std.HashMap Name (SidecarRead × Option ModuleUsage.FileStamp))
+  /-- The importees the decision took from the build's earlier reads (`bindFacts`), for both of their bindings. -/
+  facts : IO.Ref (Std.HashMap Name ImportFact)
+  /-- The `module` files whose artifact hashes the decision took from the build's earlier reads (`bindArts`). -/
+  arts : IO.Ref (Std.HashMap Name ArtsFact)
+  /-- The hash of each file the decision took from those reads: an importee's `.olean`, a `module` file's artifacts.
+  `ContentHashes.find?` reads it first; no file is in it and in `shards` too. -/
+  taken : IO.Ref (Std.HashMap FilePath ModuleUsage.Digest)
   /-- The decision's `closureHash` with `kept` and no `importedClosures?`, once computed: it folds bound reads, so it
   is the same for every check of the decision, which the usage index's pre-filter uses (`usagePrefilter`). -/
   keptClosure : IO.Ref (Option (Option ModuleUsage.Digest))
@@ -370,24 +427,35 @@ public def ContentHashes.new : BaseIO ContentHashes :=
     imports := ← IO.mkRef {}
     keptImports := ← IO.mkRef {}
     sidecarReads := ← IO.mkRef {}
+    facts := ← IO.mkRef {}
+    arts := ← IO.mkRef {}
+    taken := ← IO.mkRef {}
     keptClosure := ← IO.mkRef none
     changedImport := ← IO.mkRef none
   }
 
-/-- The hash the decision recorded for `file`, if any. -/
-public def ContentHashes.find? (hashes : ContentHashes) (file : FilePath) : BaseIO (Option ModuleUsage.Digest) :=
+/-- The hash the decision took or recorded for `file`, if any, with the stamp it was read under if the decision read
+it (`ContentHashes.shards`) and that stood for the bytes. -/
+def ContentHashes.findStamped? (hashes : ContentHashes) (file : FilePath) :
+    BaseIO (Option (ModuleUsage.Digest × Option ModuleUsage.FileStamp)) := do
+  if let some d := (← hashes.taken.get)[file]? then return some (d, none)
   (hashes.shards.get (Hashable.hash file)).atomically (return (← get).find? file)
 
+/-- The hash the decision took or recorded for `file`, if any. -/
+public def ContentHashes.find? (hashes : ContentHashes) (file : FilePath) : BaseIO (Option ModuleUsage.Digest) :=
+  return (← hashes.findStamped? file).map (·.1)
+
 /--
-Records `hash` for `file` unless the decision recorded a hash for it first, and returns the recorded one. A path has
-one shard, and the first insert under that shard's mutex wins, so every task of the decision gets one hash for each
-path.
+Records `hash` for `file`, read under `stamp?`, unless the decision took or recorded a hash for it first, and returns
+the one it holds. A path has one shard, and the first insert under that shard's mutex wins, so every task of the
+decision gets one hash for each path.
 -/
-public def ContentHashes.record (hashes : ContentHashes) (file : FilePath) (hash : ModuleUsage.Digest) :
-    BaseIO ModuleUsage.Digest :=
+public def ContentHashes.record (hashes : ContentHashes) (file : FilePath) (hash : ModuleUsage.Digest)
+    (stamp? : Option ModuleUsage.FileStamp) : BaseIO (ModuleUsage.Digest × Option ModuleUsage.FileStamp) := do
+  if let some d := (← hashes.taken.get)[file]? then return (d, none)
   (hashes.shards.get (Hashable.hash file)).atomically <| modifyGet fun all => match all.find? file with
     | some first => (first, all)
-    | none => (hash, all.insert file hash)
+    | none => ((hash, stamp?), all.insert file (hash, stamp?))
 
 /-- Appends a record of `file`'s digest under `stamp` to the workspace's stamped digest log (`DigestLogState`), one
 `write` per record; after a failure to open it, the build appends nothing more. -/
@@ -418,30 +486,41 @@ status-change times itself (`Lean.ModuleUsage.stampsFine`, with a nonzero nanose
 as sshfs, which copies the modification time) a stamp can stay while the bytes change, or look older than the server's
 file, across processes.
 -/
-def stampedDigest (file : FilePath) : JobM ModuleUsage.Digest := do
+def stampedDigestStamped (file : FilePath) : JobM (ModuleUsage.Digest × Option ModuleUsage.FileStamp) := do
   let ctx ← getBuildContext
   let memo := ctx.fileDigests.get (Hashable.hash file)
   if let some stamp ← ModuleUsage.fileStamp file then
     if let some (recorded, hash) ← memo.atomically (return (← get).find? file) then
-      if recorded == stamp then return hash
+      if recorded == stamp then return (hash, some stamp)
     if let some (recorded, hash) := ctx.digestLog.loaded.get[file]? then
       if recorded == stamp then
         memo.atomically (modify (·.insert file (stamp, hash)))
-        return hash
+        return (hash, some stamp)
   let (hash, stamp?) ← ModuleUsage.fileDigestStamped file
   if let some stamp := stamp? then
     memo.atomically (modify (·.insert file (stamp, hash)))
     if ctx.digestLog.file?.isSome && stamp.ctimeNsec != 0 then
       if (← ModuleUsage.stampsFine file) then appendDigestLog ctx.digestLog file stamp hash
-  return hash
+  return (hash, stamp?)
+
+@[inherit_doc stampedDigestStamped]
+def stampedDigest (file : FilePath) : JobM ModuleUsage.Digest :=
+  return (← stampedDigestStamped file).1
 
 /--
-The hash of `file`'s bytes (`stampedDigest`) for one decision (`hashes`): the first one a task of the decision records
-(`ContentHashes.record`).
+The hash of `file`'s bytes (`stampedDigest`) for one decision (`hashes`): the one the decision took from the build's
+earlier reads (`ContentHashes.taken`), else the first one a task of the decision records (`ContentHashes.record`),
+with the stamp it was read under if that stood for the bytes.
 -/
-def contentHash (hashes : ContentHashes) (file : FilePath) : JobM ModuleUsage.Digest := do
-  if let some hash ← hashes.find? file then return hash
-  hashes.record file (← stampedDigest file)
+def contentHashStamped (hashes : ContentHashes) (file : FilePath) :
+    JobM (ModuleUsage.Digest × Option ModuleUsage.FileStamp) := do
+  if let some r ← hashes.findStamped? file then return r
+  let (hash, stamp?) ← stampedDigestStamped file
+  hashes.record file hash stamp?
+
+@[inherit_doc contentHashStamped]
+def contentHash (hashes : ContentHashes) (file : FilePath) : JobM ModuleUsage.Digest :=
+  return (← contentHashStamped hashes file).1
 
 /-- The fewest elements `parallelRuns` gives a task. -/
 def minRunsPerTask : Nat := 64
@@ -503,35 +582,162 @@ def parallelRuns (xs : Array α) (f : α → JobM β) : JobM (Array (LoggedRun �
     return .ok runs s
 
 /--
+`f` of each element of `xs`, in order, for reads that log nothing and throw nothing: in up to `usageCutoffReadTasks`
+tasks that take slices of `xs`, as `parallelRuns` slices, but with no `JobM` run per element.
+-/
+def parallelMap (xs : Array α) (f : α → BaseIO β) : JobM (Array β) := do
+  let tasks ← usageCutoffReadTasks
+  let size := max minRunsPerTask ((xs.size + tasks - 1) / tasks)
+  if xs.size ≤ size then return ← xs.mapM fun x => f x
+  let chunks ← (Array.range ((xs.size + size - 1) / size)).mapM fun i => BaseIO.asTask do
+    (xs.extract (i * size) ((i + 1) * size)).mapM f
+  let mut out := Array.mkEmpty xs.size
+  for chunk in chunks do
+    out := out ++ (← IO.wait chunk)
+  return out
+
+/-- The build's reads of closures (`BuildContext.usageFacts`) as they are now: a pass of a decision takes one snapshot
+and looks its records up in it without a lock. -/
+public def usageFactsSnapshot [Monad m] [MonadBuild m] [MonadLiftT BaseIO m] : m UsageFacts := do
+  let ctx ← getBuildContext
+  let s ← (ctx.usageFacts.atomically get : BaseIO UsageFacts)
+  return s
+
+@[inline] def UsageFacts.importFact? (s : UsageFacts) (m : Name) : Option ImportFact :=
+  (s.imports.find? m).bind (·.get? ImportFact)
+
+@[inline] def UsageFacts.artsFact? (s : UsageFacts) (m : Name) (paths : Nat) : Option ArtsFact :=
+  (s.arts.find? (m, paths)).bind (·.get? ArtsFact)
+
+@[inline] public def UsageFacts.cell? (s : UsageFacts) (m : Name) : Option ModuleCell :=
+  (s.cells.find? m).bind (·.get? ModuleCell)
+
+/-- What a pass read that the build's later passes may take (`publishFacts`), and how many records it took from
+earlier reads or read again. -/
+public structure FactBatch where
+  imports : Array (Name × ImportFact) := #[]
+  arts : Array ((Name × Nat) × ArtsFact) := #[]
+  cells : Array (Name × ModuleCell) := #[]
+  frozen : Array FilePath := #[]
+  taken : Nat := 0
+  read : Nat := 0
+  artsTaken : Nat := 0
+  artsRead : Nat := 0
+
+/-- Adds `b` to the build's reads (`BuildContext.usageFacts`) in one update: a record replaces the one it has for the
+same module, whatever file state each describes, since a decision takes a record only after it checked each file's
+stamp. -/
+public def publishFacts [Monad m] [MonadBuild m] [MonadLiftT BaseIO m] (b : FactBatch) : m Unit := do
+  if b.imports.isEmpty && b.arts.isEmpty && b.cells.isEmpty && b.frozen.isEmpty &&
+      b.taken + b.read + b.artsTaken + b.artsRead == 0 then
+    return
+  let ctx ← getBuildContext
+  (ctx.usageFacts.atomically <| modify fun s => { s with
+    imports := b.imports.foldl (fun m (k, v) => m.insert k (Dynamic.mk v)) s.imports
+    arts := b.arts.foldl (fun m (k, v) => m.insert k (Dynamic.mk v)) s.arts
+    cells := b.cells.foldl (fun m (k, v) => m.insert k (Dynamic.mk v)) s.cells
+    frozen := b.frozen.foldl (fun m p => m.insert p ()) s.frozen
+    taken := s.taken + b.taken, read := s.read + b.read
+    artsTaken := s.artsTaken + b.artsTaken, artsRead := s.artsRead + b.artsRead
+  } : BaseIO Unit)
+
+/-- Whether the file at `path` has the stamp `stamp` now, all of its fields (`Lean.ModuleUsage.FileStamp`'s `BEq`). -/
+def stampIs (path : FilePath) (stamp : ModuleUsage.FileStamp) : BaseIO Bool := do
+  match ← (ModuleUsage.fileStamp path).toBaseIO with
+  | .ok (some s) => return s == stamp
+  | _ => return false
+
+/--
+Takes the artifact hashes of each `module` file of the closure (`importArts`) that the decision has not hashed from the
+build's earlier reads (`ArtsFact`): one read of the same paths each of whose files has the recorded stamp now. The
+decision then holds those hashes (`ContentHashes.arts`, `ContentHashes.taken`) for every later `contentHash` of them.
+A module of which the decision hashed a file already keeps the hashes it read. Returns how many modules it took.
+-/
+def bindArts (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) : JobM Nat := do
+  let bound ← hashes.arts.get
+  let snap ← usageFactsSnapshot
+  let mut cands := #[]
+  for (m, arts) in importArts do
+    unless arts.oleanServer?.isSome do continue
+    if bound.contains m then continue
+    let paths := arts.toArrays.flatten
+    let some f := snap.artsFact? m paths.size | continue
+    unless f.paths == paths do continue
+    if ← paths.anyM fun p => return (← hashes.findStamped? p).isSome then continue
+    cands := cands.push (m, f)
+  if cands.isEmpty then return 0
+  let ok ← parallelMap cands fun (_, f) => do
+    for p in f.paths, s in f.stamps do
+      unless ← stampIs p s do return false
+    return true
+  let mut taken := #[]
+  let mut took := #[]
+  for c in cands, b in ok do
+    if b then
+      took := took.push c
+      for p in c.2.paths, d in c.2.digests do
+        taken := taken.push (p, d)
+  if took.isEmpty then return 0
+  hashes.arts.modify fun all => took.foldl (fun a (m, f) => a.insert m f) all
+  hashes.taken.modify fun all => taken.foldl (fun a (p, d) => a.insert p d) all
+  return took.size
+
+/--
 A hash of every artifact of every module-system module in an import closure, with its name.
 Module-system files carry no meaning digests (Lean writes them at the private level only), so a
 non-module importer's digest chain cannot see through one; its skip requires these bytes unchanged
-(`contentHash`).
+(`contentHash`). A module's hashes come from one earlier read of the build whose files all have their stamps now
+(`bindArts`), or else from `contentHash` of each file; such a read, if each of its stamps stood for its bytes, is
+published for later decisions (`publishFacts`).
 -/
 public def modsysHash (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) :
     JobM ModuleUsage.Digest := do
+  let artsTaken ← bindArts hashes importArts
+  let bound ← hashes.arts.get
   let mut e : ModuleUsage.Enc := {}
+  let mut read := #[]
   for (m, arts) in importArts do
     if arts.oleanServer?.isSome then
       let paths := arts.toArrays.flatten
       e := e.name m |>.nat paths.size
-      for path in paths do
-        e := e.digest (← contentHash hashes path)
+      if let some f := bound[m]? then
+        for d in f.digests do
+          e := e.digest d
+      else
+        -- a module this decision hashed already gives the same hashes again, and was published then
+        let fresh := (← paths.anyM fun p => return (← hashes.findStamped? p).isSome) == false
+        let mut stamps := #[]
+        let mut digests := #[]
+        for path in paths do
+          let (d, s?) ← contentHashStamped hashes path
+          e := e.digest d
+          digests := digests.push d
+          stamps := stamps.push s?
+        if fresh then read := read.push (m, paths, stamps, digests)
+  publishFacts { artsTaken, artsRead := read.size, arts := read.filterMap fun (m, paths, stamps, digests) => do
+    return ((m, paths.size), ({ paths, stamps := ← stamps.mapM id, digests } : ArtsFact)) }
   return e.finish
 
 /--
 Reads the sidecars of the importee whose `.olean` is `olean` as `importUsage?` does, without hashing the `.olean`:
 for a module-system file (`modsys`), its `.usage`; otherwise its `.usekey` alone, whose `importer` holds the fields an
 importer reads (`UsekeySidecar.importer`), with the `olean` hash the key records and whether a kept-module check kept
-the module (`UsekeySidecar.kept`). `none` if there is no such sidecar of this format version.
+the module (`UsekeySidecar.kept`). `none` if there is no such sidecar of this format version. With the stamp of the
+sidecar the value stands for (`readUsageSidecarStamped`).
 -/
-def readImportSidecars? (olean : FilePath) (modsys : Bool) :
-    JobM (Option (Option ModuleUsage.Digest × UsageImport × Bool)) := do
+def readImportSidecarsStamped? (olean : FilePath) (modsys : Bool) :
+    JobM (Option (Option ModuleUsage.Digest × UsageImport × Bool) × Option ModuleUsage.FileStamp) := do
   if modsys then
-    let usage? ← readUsageSidecar UsageImport ModuleUsage.usageVersion (olean.withExtension "usage")
-    return usage?.map (none, ·, false)
-  let some key ← readUsageSidecar UsekeySidecar usekeyVersion (olean.withExtension "usekey") | return none
-  return some (some key.olean, key.importer, key.kept)
+    let (usage?, stamp?) ← readUsageSidecarStamped UsageImport ModuleUsage.usageVersion (olean.withExtension "usage")
+    return (usage?.map (none, ·, false), stamp?)
+  let (key?, stamp?) ← readUsageSidecarStamped UsekeySidecar usekeyVersion (olean.withExtension "usekey")
+  let some key := key? | return (none, stamp?)
+  return (some (some key.olean, key.importer, key.kept), stamp?)
+
+@[inherit_doc readImportSidecarsStamped?]
+def readImportSidecars? (olean : FilePath) (modsys : Bool) :
+    JobM (Option (Option ModuleUsage.Digest × UsageImport × Bool)) :=
+  return (← readImportSidecarsStamped? olean modsys).1
 
 /-- What a read with `kept` or without it (`importUsage?`) takes from `read?` (`readImportSidecars?`): without `kept`,
 nothing of a kept module's key. -/
@@ -586,12 +792,15 @@ public def usageView? (importArts : NameMap ImportArtifacts) (m : Name) :
   freezeUsageView usageFile (← readImportSidecars olean arts.oleanServer?.isSome)
 
 /-- The `.olean` of importee `m` in `importArts` and what a read of its sidecars found (`readImportSidecars?`), or
-`none` if `importArts` has no `.olean` for it: what both bindings of `m` take (`readImportUsage?`). -/
+`none` if `importArts` has no `.olean` for it: what both bindings of `m` take (`readImportUsage?`). With the stamp of
+the sidecar the read stands for. -/
 def readImportSidecarsOf? (importArts : NameMap ImportArtifacts) (m : Name) :
-    JobM (Option (FilePath × Option (Option ModuleUsage.Digest × UsageImport × Bool))) := do
-  let some arts := importArts.find? m | return none
-  let some olean := arts.olean? | return none
-  return some (olean, ← readImportSidecars? olean arts.oleanServer?.isSome)
+    JobM (Option (FilePath × Option (Option ModuleUsage.Digest × UsageImport × Bool)) ×
+      Option ModuleUsage.FileStamp) := do
+  let some arts := importArts.find? m | return (none, none)
+  let some olean := arts.olean? | return (none, none)
+  let (read?, stamp?) ← readImportSidecarsStamped? olean arts.oleanServer?.isSome
+  return (some (olean, read?), stamp?)
 
 /--
 The `.olean` of an importee and what its importers read of its `.usage` (`UsageImport`), from `read`, the decision's
@@ -612,26 +821,81 @@ it only what the unchanged `.olean` fixes: what the module provides (`UsageSidec
 importer's closure changed (`Module.usageVerdict`). No key is written and no module is skipped over a kept module's
 digests (`untrustedClosureModule?`). Without `kept`, the build's view of the importee (`UsageView`) is what this
 binding takes, if the build had none.
+
+With the `.olean`'s hash and stamp, if the binding hashed it and the stamp stood for the bytes.
 -/
 def readImportUsage? (hashes : ContentHashes) (kept : Bool) (read : SidecarRead) :
-    JobM (Option (FilePath × UsageImport)) := do
-  let some (olean, read?) ← replayRun read | return none
+    JobM (Option (FilePath × UsageImport) × Option (ModuleUsage.FileStamp × ModuleUsage.Digest)) := do
+  let some (olean, read?) ← replayRun read | return (none, none)
   let read? := importSidecars read? kept
   unless kept do discard <| freezeUsageView (olean.withExtension "usage") read?
-  let some (keyOlean?, imp) := read? | return none
+  let some (keyOlean?, imp) := read? | return (none, none)
   if let some keyOlean := keyOlean? then
-    unless keyOlean == (← contentHash hashes olean) do return none
-  return some (olean, imp)
+    let (hash, stamp?) ← contentHashStamped hashes olean
+    let olean? := stamp?.map (·, hash)
+    unless keyOlean == hash do return (none, olean?)
+    return (some (olean, imp), olean?)
+  return (some (olean, imp), none)
 
 /-- The reads of the decision's importees that `importUsage?` binds, with `kept` or without (`ContentHashes`). -/
 @[inline] def ContentHashes.reads (hashes : ContentHashes) (kept : Bool) : IO.Ref (Std.HashMap Name ImportRead) :=
   if kept then hashes.keptImports else hashes.imports
 
+/-- The binding with `kept` or without it that `readImportUsage?` computes from `f`'s read, or `none` if it needs the
+hash of the `.olean`, which `f` does not hold. -/
+def ImportFact.project (f : ImportFact) (kept : Bool) : Option (Option (FilePath × UsageImport)) :=
+  match importSidecars f.read? kept with
+  | none => some none
+  | some (none, imp) => some (some (f.olean, imp))
+  | some (some keyOlean, imp) => f.olean?.map fun (_, d) => if keyOlean == d then some (f.olean, imp) else none
+
+/--
+Takes from the build's earlier reads (`BuildContext.usageFacts`) the record (`ImportFact`) of each module of `mods`,
+which the decision has not read: one of the importee's `.olean` and kind in `importArts`, each of whose files has the
+recorded stamp now, and whose `.olean` the decision has not hashed. A taken record serves both bindings of its module
+in the decision (`ContentHashes.facts`), and its `.olean` hash every `contentHash` of that file
+(`ContentHashes.taken`). The stamps are read in parallel (`parallelMap`). Returns the snapshot it looked in and how
+many records it took.
+-/
+def bindFacts (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) (mods : Array Name) :
+    JobM (UsageFacts × Nat) := do
+  let snap ← usageFactsSnapshot
+  let mut cands := #[]
+  for m in mods do
+    let some arts := importArts.find? m | continue
+    let some olean := arts.olean? | continue
+    let some f := snap.importFact? m | continue
+    unless f.olean == olean && f.modsys == arts.oleanServer?.isSome do continue
+    if f.olean?.isSome then
+      if (← hashes.findStamped? olean).isSome then continue
+    cands := cands.push (m, f)
+  if cands.isEmpty then return (snap, 0)
+  let ok ← parallelMap cands fun (_, f) => do
+    unless ← stampIs f.sidecar f.stamp do return false
+    match f.olean? with
+    | some (s, _) => stampIs f.olean s
+    | none => return true
+  let mut took := #[]
+  let mut taken := #[]
+  for c in cands, b in ok do
+    if b then
+      took := took.push c
+      if let some (_, d) := c.2.olean? then taken := taken.push (c.2.olean, d)
+  unless took.isEmpty do
+    hashes.facts.modify fun all => took.foldl (fun a (m, f) => a.insert m f) all
+    hashes.taken.modify fun all => taken.foldl (fun a (p, d) => a.insert p d) all
+  return (snap, took.size)
+
 /--
 Binds (`readImportUsage?`, with `kept`) each module of `mods` that the decision has not bound so yet
-(`ContentHashes.reads`), many in parallel (`parallelRuns`), each with its log and error, which the step that binds
-the module replays (`importUsage?`). A module's sidecars are read once per decision (`readImportSidecarsOf?`): its
-other binding takes that read (`ContentHashes.sidecarReads`).
+(`ContentHashes.reads`), each with its log and error, which the step that binds the module replays (`importUsage?`).
+A module is bound for both kinds from one source in a decision. Either the build's earlier read of it whose files all
+have their stamps now (`bindFacts`), whose binding is what `readImportUsage?` computes from the same bytes, with no
+log; or a read of its sidecars once per decision (`readImportSidecarsOf?`), whose other binding takes that read
+(`ContentHashes.sidecarReads`), many in parallel (`parallelRuns`). A read of the second kind that logged nothing,
+threw nothing and stood for its bytes is published for later decisions (`ImportFact`, `publishFacts`). A binding
+without `kept` freezes the importee's view (`freezeUsageView`) as `readImportUsage?` does, unless the build's snapshot
+shows the view exists.
 -/
 def readImports (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) (mods : Array Name)
     (kept := false) : JobM Unit := do
@@ -640,21 +904,62 @@ def readImports (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) 
   let mods := mods.filter (!known.contains ·)
   if mods.isEmpty then return
   let sidecars ← hashes.sidecarReads.get
-  let runs ← parallelRuns mods fun m => do
-    let (read, fresh) ← match sidecars[m]? with
-      | some read => pure (read, false)
-      | none => do pure (← loggedRun (readImportSidecarsOf? importArts m), true)
-    return (if fresh then some read else none, ← readImportUsage? hashes kept read)
+  let had ← hashes.facts.get
+  let (snap, taken) ← bindFacts hashes importArts (mods.filter fun m => !had.contains m && !sidecars.contains m)
+  let facts ← hashes.facts.get
+  let mut fast : Array (Name × ImportRead) := #[]
+  let mut slow : Array Name := #[]
+  let mut frozen : Array FilePath := #[]
+  for m in mods do
+    let some (f, b) := facts[m]?.bind fun f => (f, ·) <$> f.project kept
+      | slow := slow.push m
+    if kept then
+      fast := fast.push (m, (#[], .ok b))
+      continue
+    let usageFile := f.olean.withExtension "usage"
+    if snap.frozen.contains usageFile then
+      fast := fast.push (m, (#[], .ok b))
+      continue
+    let r ← loggedRun do
+      discard <| freezeUsageView usageFile (importSidecars f.read? false)
+      return b
+    if r.1.isEmpty && r.2 matches .ok _ then frozen := frozen.push usageFile
+    fast := fast.push (m, r)
+  unless fast.isEmpty do
+    reads.modify fun all => fast.foldl (fun a (m, r) => a.insert m r) all
+  if slow.isEmpty then
+    publishFacts { frozen, taken }
+    return
+  let runs ← parallelRuns slow fun m => do
+    let (read, stamp?, fresh) ← match sidecars[m]? with
+      | some (read, stamp?) => pure (read, stamp?, false)
+      | none => match facts[m]? with
+        | some f => pure (((#[], .ok (some (f.olean, f.read?))) : SidecarRead), some f.stamp, false)
+        | none => do
+          let r ← loggedRun (readImportSidecarsOf? importArts m)
+          pure ((r.1, r.2.map (·.1)), r.2.toOption.bind (·.2), true)
+    let (b, olean?) ← readImportUsage? hashes kept read
+    return (if fresh then some (read, stamp?) else none, b, olean?, read, stamp?)
   reads.modify fun reads => Id.run do
     let mut reads := reads
-    for m in mods, r in runs do
-      reads := reads.insert m (r.1, r.2.map (·.2))
+    for m in slow, r in runs do
+      reads := reads.insert m (r.1, r.2.map (·.2.1))
     return reads
   hashes.sidecarReads.modify fun all => Id.run do
     let mut all := all
-    for m in mods, r in runs do
+    for m in slow, r in runs do
       if let .ok (some read, _) := r.2 then all := all.insert m read
     return all
+  let mut imports : Array (Name × ImportFact) := #[]
+  let mut read := 0
+  for m in slow, r in runs do
+    if r.2 matches .ok (some _, _) then read := read + 1
+    unless r.1.isEmpty do continue
+    let .ok (_, _, olean?, (#[], .ok (some (olean, read?))), some stamp) := r.2 | continue
+    let modsys := (importArts.find? m).any (·.oleanServer?.isSome)
+    let sidecar := olean.withExtension (if modsys then "usage" else "usekey")
+    imports := imports.push (m, { olean, modsys, sidecar, stamp, read?, olean? })
+  publishFacts { imports, frozen, taken, read }
 
 /--
 `readImportUsage?` of `m`, read once per decision, and once with `kept` (`readImports`): a decision binds `m` once,
@@ -797,6 +1102,12 @@ def changedDirectImport? (hashes : ContentHashes) (presetup : ModulePreSetup) (i
       return some (m, current)
   return none
 
+/-- Whether `m`, a module of a closure, is a workspace module (`findModule?`): its cell's answer in `snap`
+(`ModuleCell.findable`), which a build computes once per module, or else `findModule?`. -/
+def closureFindable (snap : UsageFacts) (m : Name) : JobM Bool := do
+  if let some c := snap.cell? m then return c.findable
+  return (← findModule? m).isSome
+
 /--
 The first workspace module of the closure (`importArts`; module-system files aside, which `modsysHash` pins) whose
 `.usage` importers do not trust (`importUsage?`): a module a kept-module check kept, or one without a usage key that
@@ -808,9 +1119,10 @@ def untrustedClosureModule? (hashes : ContentHashes) (importArts : NameMap Impor
     JobM (Option Name) := do
   readImports hashes importArts (keyedModules importArts)
   let bound ← hashes.imports.get
+  let snap ← usageFactsSnapshot
   for (m, arts) in importArts do
     if arts.oleanServer?.isSome then continue
-    if (← findModule? m).isNone then continue
+    unless ← closureFindable snap m do continue
     if (← importUsageIn? hashes importArts bound m).isNone then return some m
   return none
 
@@ -943,6 +1255,43 @@ def declaresClaimed (filter : ByteArray × UInt64) (claims : Std.HashMap UInt64 
         if claims[n.hash]?.any (·.any (· != k)) then return true
   return false
 
+/-- Whether toolchain module `t`'s walk is complete in `p` (`KernelProviders.complete`): it was read without a failure
+and each of its imports is no workspace module (`findable`) and complete; `memo` holds the answers so far. -/
+partial def toolchainCompleteIn (p : KernelProviders) (findable : NameSet) (memo : Std.HashMap Name Bool)
+    (t : Name) : Bool × Std.HashMap Name Bool :=
+  if p.complete.contains t then (true, memo) else
+  match memo[t]? with
+  | some b => (b, memo)
+  | none =>
+    match p.toolchain.find? t with
+    | some (some (_, imports)) =>
+      let (b, memo) := imports.foldl (init := (true, memo.insert t false)) fun (b, memo) i =>
+        if !b then (b, memo)
+        else if findable.contains i then (false, memo)
+        else toolchainCompleteIn p findable memo i
+      (b, memo.insert t b)
+    | _ => (false, memo.insert t false)
+
+/-- Marks complete (`KernelProviders.complete`) each module of `seen`, the toolchain modules a walk of
+`UsageSidecar.kernelDisjoint` read without a failure, whose walk is complete (`toolchainCompleteIn`). -/
+def markToolchainComplete (seen : NameSet) : JobM Unit := do
+  let kp := (← getBuildContext).kernelProviders
+  let p ← kp.atomically get
+  let mut todo : Array Name := #[]
+  for t in seen do
+    unless p.complete.contains t do todo := todo.push t
+  if todo.isEmpty then return
+  let mut findable : NameSet := {}
+  for t in todo do
+    let some (some (_, imports)) := p.toolchain.find? t | continue
+    for i in imports do
+      if (← findModule? i).isSome then findable := findable.insert i
+  let memo := todo.foldl (init := ({} : Std.HashMap Name Bool)) fun memo t =>
+    (toolchainCompleteIn p findable memo t).2
+  let done := todo.filter (memo[·]? == some true)
+  unless done.isEmpty do
+    kp.atomically (modify fun s => { s with complete := done.foldl (init := s.complete) (·.insert · ()) })
+
 /--
 Whether no closure module whose provides changed (`changed`, each with its `provides` as `importUsage?` binds them)
 declares a kernel constant that another module of the compile declares too, unless the compile depended on that
@@ -967,9 +1316,12 @@ constants are kept per build and module state, a toolchain module's per build (`
 later check does not read them again. The check reads those maps once, takes their mutex again for each module they
 lack, and, when no other duplicate decided it, once more at the end, to read the build's index of the toolchain
 modules' kernel constants by hash (`KernelProviders.toolchainIndex`), in which it looks up each claimed constant: every
-check of the build takes the mutex, and a module's entry only ever holds what some read of it gave. The workspace
-modules are read in parallel (`readImports`, `parallelRuns`), and their reads' logs and errors are replayed in closure
-order before any duplicate decides the check, as a serial check meets them.
+check of the build takes the mutex, and a module's entry only ever holds what some read of it gave. A closure module's
+outside imports come from its cell (`ModuleCell.outside`) when the build has one. The walk is skipped when every
+toolchain module it starts from is complete (`KernelProviders.complete`, `markToolchainComplete`): such a walk reads
+nothing, logs nothing and fails nowhere, so it can decide only through a claimed constant in the index, and the walk
+runs if one is there. The workspace modules' reads' logs and errors are replayed in closure order before any duplicate
+decides the check, as a serial check meets them.
 -/
 def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetup) (hashes : ContentHashes)
     (importArts : NameMap ImportArtifacts) (changed : Array (Name × UsageImport)) :
@@ -995,26 +1347,13 @@ def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetu
   readImports hashes importArts (keyedModules importArts) (kept := true)
   let known ← hashes.keptImports.get
   let snap ← getBuildStoreSnapshot
+  let facts ← usageFactsSnapshot
   -- the digest of a `module` file's state, from its `.olean` parts' hashes
   let partsDigest (hash : FilePath → JobM ModuleUsage.Digest) (parts : Array FilePath) : JobM ModuleUsage.Digest := do
     let mut e : ModuleUsage.Enc := {}
     for p in parts do
       e := e.digest (← hash p)
     return e.finish
-  -- a workspace module of the closure: the toolchain modules it imports, and whether its kernel constants duplicate a
-  -- claimed one or, for a `module` file, the digest of its state and its `.olean` parts, whose constants are read next;
-  -- `none` if they cannot be read
-  let scan (x : Name × ImportArtifacts) :
-      JobM (Option (Array Name × (Bool ⊕ (Name × ModuleUsage.Digest × Array FilePath)))) := do
-    let (m, arts) := x
-    let some mod ← findModule? m | return some (#[], .inl false)
-    let imports := (← (← fetchFrom snap mod.input).await).imports.foldl outside #[]
-    if arts.oleanServer?.isSome then
-      if arts.oleanPrivate?.isNone then return none
-      let parts := arts.oleanParts false
-      return some (imports, .inr (m, ← partsDigest (contentHash hashes) parts, parts))
-    let some (_, imp) ← replayRun (known[m]?.getD (#[], .ok none)) | return none
-    return some (imports, .inl (declaresClaimed filter claims m imp))
   -- whether a `module` file's kernel constants duplicate a claimed one, or `none` if they cannot be read or the parts no
   -- longer have the bytes the check hashed
   let modsysClash (x : Name × ModuleUsage.Digest × Array FilePath) : JobM (Option Bool) := do
@@ -1031,20 +1370,36 @@ def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetu
         kp.atomically (modify fun s => { s with modsys := s.modsys.insert (m, d) hs })
         pure hs
     return some (hs.any (clash m))
-  let mut closure := #[]
-  for x in importArts do
-    closure := closure.push x
+  -- Each workspace module of the closure, in order: the toolchain modules it imports, from its cell if the build has
+  -- one; whether its kernel constants duplicate a claimed one, or, for a `module` file, the digest of its state and its
+  -- `.olean` parts, whose constants are read next. A module without a kept binding, or a `module` file without its
+  -- private part, fails the check.
   let mut toolchain := presetup.directImports.foldl outside #[]
   let mut modsys := #[]
-  for r in ← parallelRuns closure scan do
-    let some (imports, kernel) ← replayRun r | return false
+  for (m, arts) in importArts do
+    let imports? ← match facts.cell? m with
+      | some c => pure (if c.findable then some c.outside else none)
+      | none => do
+        let some mod ← findModule? m | pure none
+        pure (some ((← (← fetchFrom snap mod.input).await).imports.foldl outside #[]))
+    let some imports := imports? | continue
+    if arts.oleanServer?.isSome then
+      if arts.oleanPrivate?.isNone then return false
+      let parts := arts.oleanParts false
+      modsys := modsys.push (m, ← partsDigest (contentHash hashes) parts, parts)
+    else
+      let some (_, imp) ← replayRun (known[m]?.getD (#[], .ok none)) | return false
+      clashes := clashes || declaresClaimed filter claims m imp
     toolchain := toolchain ++ imports
-    match kernel with
-    | .inl c => clashes := clashes || c
-    | .inr x => modsys := modsys.push x
   for r in ← parallelRuns modsys modsysClash do
     let some c ← replayRun r | return false
     clashes := clashes || c
+  -- A walk from toolchain modules that are all `complete` reads nothing, logs nothing and fails nowhere, and its modules
+  -- are all in the index: it decides only through the index, and only if a claimed constant is there.
+  if toolchain.all providers.complete.contains then
+    if clashes then return false
+    let index := (← kp.atomically get).toolchainIndex
+    unless claims.toArray.any fun (h, _) => (index.find? h).any (!·.isEmpty) do return true
   let searchPath := (← getLeanPath) ++ [← getLeanLibDir]
   let mut seen : NameSet := {}
   let mut providers := providers
@@ -1070,6 +1425,7 @@ def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetu
         pure read?
     let some (_, imports) := read? | return false
     toolchain := toolchain ++ imports
+  markToolchainComplete seen
   -- A toolchain module the walk read declares a claimed constant: every claimer is a module of the closure, which the
   -- walk skips, so any such declarer clashes. The walk's modules are all in the index, with their kernel constants.
   unless clashes do
@@ -1127,6 +1483,7 @@ def UsageSidecar.resolvedUnchanged (usage : UsageSidecar) (presetup : ModulePreS
     (resolvedFile? : Option FilePath) (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) : JobM Bool := do
   readImports hashes importArts (keyedModules importArts) (kept := true)
   let bound ← hashes.keptImports.get
+  let snap ← usageFactsSnapshot
   let mut changed := #[]
   let mut table? : Option ModuleUsage.ResolvedTable := none
   -- `digested` is in `Name.quickLt` order, as the closure is: one walk of it
@@ -1134,7 +1491,7 @@ def UsageSidecar.resolvedUnchanged (usage : UsageSidecar) (presetup : ModulePreS
   let mut i := 0
   for (m, arts) in importArts do
     if arts.oleanServer?.isSome then continue
-    if (← findModule? m).isNone then continue
+    unless ← closureFindable snap m do continue
     while h : i < ds.size do
       if Name.quickLt ds[i].1 m then i := i + 1 else break
     let some (_, recorded) := ds[i]?.filter (·.1 == m) | return false
@@ -1325,10 +1682,14 @@ public def Module.usageVerdict (mod : Module) (presetup : ModulePreSetup)
     return .compile "a name it looked up, used or referred to may now resolve to another module"
   -- A module outside the workspace is a toolchain module, pinned by the Lean githash in `localTrace`.
   let ws ← getWorkspace
-  readImports hashes importArts <| usage.used.filterMap fun (m, _) =>
-    if (ws.findModule? m).isSome then some m else none
+  let snap ← usageFactsSnapshot
+  -- a module of the closure is a workspace module as its cell says; any other is one if the workspace finds it
+  let inWorkspace (m : Name) : JobM Bool :=
+    if importArts.contains m then closureFindable snap m else return (ws.findModule? m).isSome
+  readImports hashes importArts <| ← usage.used.filterMapM fun (m, _) => do
+    return if ← inWorkspace m then some m else none
   for (m, consts) in usage.used do
-    if (ws.findModule? m).isNone then continue
+    unless ← inWorkspace m do continue
     let some (_, imp) ← importUsage? hashes importArts m | return .recheck
     for (c, d) in consts do
       unless imp.own.find? c == some d do return .recheck

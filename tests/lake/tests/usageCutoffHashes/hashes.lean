@@ -15,7 +15,7 @@ def own (t i : Nat) : Lean.ModuleUsage.Digest := .ofBytes s!"{t}:{i}".toUTF8
   let hashes ← ContentHashes.new
   let tasks ← (Array.range 64).mapM fun t => IO.asTask do
     let order := if t % 2 == 0 then Array.range paths.size else (Array.range paths.size).reverse
-    order.mapM fun i => return (i, ← hashes.record paths[i]! (own t i))
+    order.mapM fun i => return (i, (← hashes.record paths[i]! (own t i) none).1)
   let mut first : Std.HashMap Nat Lean.ModuleUsage.Digest := {}
   for task in tasks do
     for (i, got) in ← IO.ofExcept task.get do
