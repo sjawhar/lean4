@@ -328,6 +328,57 @@ where
         else q
       else q
 
+/-- The build's cell of `mod` (`ModuleCell`): the one `fresh` (made by this walk) or `facts` (the build's) holds, else
+one made now from the jobs `fetchTransImportArts` awaits for `mod`, added to `fresh`. -/
+def cellFor (snap : BuildStore) (facts : UsageFacts) (fresh : Std.HashMap Name ModuleCell) (mod : Module) :
+    FetchM (ModuleCell × Std.HashMap Name ModuleCell) := do
+  if let some c := fresh[mod.name]? then return (c, fresh)
+  if let some c := facts.cell? mod.name then return (c, fresh)
+  let info ← (← mod.fetchExportInfo snap).await
+  let input ← (← fetchFrom snap mod.input).await
+  let c : ModuleCell := {
+    allArts := info.allArts
+    children := input.imports.filterMap (·.module?)
+    outside := input.imports.filterMap fun i => if i.module?.isNone then some i.module else none
+    findable := (← findModule? mod.name).isSome
+  }
+  return (c, fresh.insert mod.name c)
+
+/--
+`fetchTransImportArts` of a non-`module` importer (`nonModule`), from the build's cells of the modules it reaches
+(`ModuleCell`, `BuildContext.usageFacts`), each made once per build from the jobs that walk awaits. A non-`module`
+importer imports every module its imports reach, each at the private level (`allArts`): the map starts from
+`directArts`, and a module the walk reaches gets its cell's `allArts` and its imports are walked, unless the map holds
+it already with an entry that is not a `module` file's, as in `fetchTransImportArts`. So the map has the same entries,
+and the walk waits on the same jobs the first time it meets a module. The cells it made are published in one batch.
+-/
+def fetchNonModuleImportArts (directImports : Array ModuleImport) (directArts : NameMap ImportArtifacts) :
+    FetchM (NameMap ImportArtifacts) := do
+  let snap ← getBuildStoreSnapshot
+  let facts ← usageFactsSnapshot
+  let mut fresh : Std.HashMap Name ModuleCell := {}
+  let mut q : Array Module := #[]
+  for imp in directImports do
+    let some mod := imp.module? | continue
+    let (c, f) ← cellFor snap facts fresh mod
+    fresh := f
+    q := q ++ c.children
+  let mut s := directArts
+  let mut visited : Std.HashSet Name := {}
+  while h : 0 < q.size do
+    let mod := q.back
+    q := q.pop
+    if let some arts := s.find? mod.name then
+      unless arts.oleanServer?.isSome do continue
+    if visited.contains mod.name then continue
+    visited := visited.insert mod.name
+    let (c, f) ← cellFor snap facts fresh mod
+    fresh := f
+    s := s.insert mod.name c.allArts
+    q := q ++ c.children
+  publishFacts { cells := fresh.toArray }
+  return s
+
 def ModuleImportInfo.nil (modName : Name) : ModuleImportInfo where
   directArts := {}
   trace := .nil s!"imports"
@@ -750,8 +801,10 @@ public def Module.depsFacetConfig : ModuleFacetConfig depsFacet :=
   mkFacetJobConfig fun mod => (·.toOpaque) <$> mod.presetup.fetch
 
 def mkModuleSetup (mod : Module) (presetup : ModulePreSetup) : FetchM ModuleSetup := do
-  let importArts ← fetchTransImportArts
-    presetup.directImports presetup.directImportArts !presetup.isModule
+  let importArts ← if presetup.isModule then
+      fetchTransImportArts presetup.directImports presetup.directImportArts false
+    else
+      fetchNonModuleImportArts presetup.directImports presetup.directImportArts
   return {
     name := mod.name
     isModule := presetup.isModule
