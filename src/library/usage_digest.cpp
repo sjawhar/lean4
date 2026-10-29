@@ -3,6 +3,9 @@ Copyright (c) 2026 Theorem Labs. All rights reserved.
 Released under Apache 2.0 license as described in the file LICENSE.
 */
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <ctime>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -550,6 +553,55 @@ extern "C" LEAN_EXPORT obj_res lean_usage_file_bytes_digest(b_obj_arg bytes) {
     lean_ctor_set_uint64(r, 0, h.high64);
     lean_ctor_set_uint64(r, sizeof(uint64_t), h.low64);
     return r;
+}
+
+/* `Lean.ModuleUsage.monoNow`: CLOCK_MONOTONIC, in nanoseconds (`std::chrono::steady_clock` off POSIX). */
+extern "C" LEAN_EXPORT uint64_t lean_usage_mono_now() {
+#if defined(LEAN_WINDOWS)
+    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    return static_cast<uint64_t>(ns);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000u + static_cast<uint64_t>(ts.tv_nsec);
+#endif
+}
+
+/* `Lean.ModuleUsage.ObservedAt`: a `monoNow` reading, only ever raised (`lean_usage_observed_raise`), with the release
+and acquire order that lets a reader of a raised value rely on what the raiser did before raising it. */
+namespace {
+struct observed_at {
+    std::atomic<uint64_t> m_value{0};
+};
+void observed_at_finalize(void * p) { delete static_cast<observed_at *>(p); }
+void observed_at_foreach(void *, b_obj_arg) {}
+lean_external_class * observed_at_class() {
+    static lean_external_class * c = lean_register_external_class(observed_at_finalize, observed_at_foreach);
+    return c;
+}
+std::atomic<uint64_t> & observed_value(b_obj_arg o) {
+    return static_cast<observed_at *>(lean_get_external_data(o))->m_value;
+}
+}
+
+/* `Lean.ModuleUsage.ObservedAt.new`: a new reading of 0, which no `ObservedAt.after` accepts. */
+extern "C" LEAN_EXPORT obj_res lean_usage_observed_new() {
+    return lean_alloc_external(observed_at_class(), new observed_at());
+}
+
+/* `Lean.ModuleUsage.ObservedAt.raise`: sets the reading to `t` if it is below `t`, with a release store. */
+extern "C" LEAN_EXPORT obj_res lean_usage_observed_raise(b_obj_arg o, uint64_t t) {
+    std::atomic<uint64_t> & v = observed_value(o);
+    uint64_t cur = v.load(std::memory_order_relaxed);
+    while (cur < t && !v.compare_exchange_weak(cur, t, std::memory_order_release, std::memory_order_relaxed)) {
+    }
+    return box(0);
+}
+
+/* `Lean.ModuleUsage.ObservedAt.after`: whether the reading, loaded with acquire order, is strictly greater than `t0`. */
+extern "C" LEAN_EXPORT uint8_t lean_usage_observed_after(b_obj_arg o, uint64_t t0) {
+    return observed_value(o).load(std::memory_order_acquire) > t0;
 }
 
 /* `Lean.ModuleUsage.fileStamp`: the stamp of the file at `path` (following symbolic links, as `open` does). */
