@@ -119,7 +119,8 @@ class ptr_digest_map {
         m_slots[i] = slot{k, v};
     }
 public:
-    ptr_digest_map():m_slots(size_t(1) << 10, slot{nullptr, {}}), m_shift(64 - 10) {}
+    // Small at first: a digester is made per digest call, most of which see few distinct objects.
+    ptr_digest_map():m_slots(size_t(1) << 4, slot{nullptr, {}}), m_shift(64 - 4) {}
     digest const * find(object * k) const {
         size_t mask = m_slots.size() - 1;
         for (size_t i = index(k);; i = (i + 1) & mask) {
@@ -863,7 +864,8 @@ class resolved_set {
         delete[] old;
     }
 public:
-    resolved_set(): m_slots(new slot[1024]()), m_mask(1023) {}
+    // Small at first: each thread that resolves a name makes one, and most see few names.
+    resolved_set(): m_slots(new slot[64]()), m_mask(63) {}
     resolved_set(resolved_set const &) = delete;
     ~resolved_set() {
         for (size_t i = 0; i <= m_mask; i++) if (m_slots[i].m_name) lean_dec(m_slots[i].m_name);
