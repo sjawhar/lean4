@@ -711,6 +711,9 @@ def bindArts (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) : J
       for p in c.2.paths, d in c.2.digests do
         taken := taken.push (p, d)
   if took.isEmpty then return 0
+  -- With `-v` only: the records this pass took, which the usage-cutoff tests match
+  if ← getIsVerbose then
+    for (m, _) in took do logVerbose s!"usage cutoff: fact arts taken {m}"
   hashes.arts.modify fun all => took.foldl (fun a (m, f) => a.insert m f) all
   hashes.taken.modify fun all => taken.foldl (fun a (p, d) => a.insert p d) all
   return took.size
@@ -879,7 +882,7 @@ def readImportUsage? (hashes : ContentHashes) (kept : Bool) (read : SidecarRead)
 
 /-- The binding with `kept` or without it that `readImportUsage?` computes from `f`'s read, or `none` if it needs the
 hash of the `.olean`, which `f` does not hold. -/
-def ImportFact.project (f : ImportFact) (kept : Bool) : Option (Option (FilePath × UsageImport)) :=
+public def ImportFact.project (f : ImportFact) (kept : Bool) : Option (Option (FilePath × UsageImport)) :=
   match importSidecars f.read? kept with
   | none => some none
   | some (none, imp) => some (some (f.olean, imp))
@@ -917,6 +920,9 @@ def bindFacts (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) (m
       took := took.push c
       if let some (_, d) := c.2.olean? then taken := taken.push (c.2.olean, d)
   unless took.isEmpty do
+    -- With `-v` only: the records this pass took, which the usage-cutoff tests match
+    if ← getIsVerbose then
+      for (m, _) in took do logVerbose s!"usage cutoff: fact import taken {m}"
     hashes.facts.modify fun all => took.foldl (fun a (m, f) => a.insert m f) all
     hashes.taken.modify fun all => taken.foldl (fun a (p, d) => a.insert p d) all
   return (snap, took.size)
