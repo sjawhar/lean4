@@ -566,6 +566,19 @@ extern "C" LEAN_EXPORT obj_res lean_usage_file_stamp(b_obj_arg path) {
 #endif
 }
 
+/* `Lean.ModuleUsage.fileMode`: the permission bits (`st_mode & 07777`) of the file at `path`, following symbolic links
+as `chmod` does. */
+extern "C" LEAN_EXPORT obj_res lean_usage_file_mode(b_obj_arg path) {
+#if defined(LEAN_WINDOWS)
+    return io_result_mk_ok(mk_option_none());
+#else
+    char const * fname = string_cstr(path);
+    struct stat st;
+    if (strlen(fname) != lean_string_size(path) - 1 || stat(fname, &st) != 0) return io_result_mk_ok(mk_option_none());
+    return io_result_mk_ok(mk_option_some(lean_box_uint32(static_cast<uint32_t>(st.st_mode & 07777))));
+#endif
+}
+
 /* `Lean.ModuleUsage.stampsFine`: whether the file system holding `path` is one whose stamps `stamp_settled` judges by
 its fine rule (`fine_fs_type`, with a known timestamp tick). Such a file system's kernel sets a file's status-change
 time from its own clock at every change, so a stamp with a nonzero nanosecond field that stood when it was taken

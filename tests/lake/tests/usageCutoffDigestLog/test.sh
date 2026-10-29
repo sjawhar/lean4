@@ -238,6 +238,27 @@ case4() {
   jobhas P.R "Built P.R"
 }
 
+# 7. With the artifact cache on, a build leaves the stamps of the outputs it keeps alone, so that the log's records of
+# them hold for the next process: the `.olean`s of `P.D`, `P.L2` (never rebuilt) and `P.M` (replayed, and saved to the
+# cache again) keep their inode and status-change time across a no-op build and a build after an unused edit to `P.E`,
+# each in a new Lake process. Lake marks cached outputs read-only; a `chmod` to the bits a file already has still sets
+# its status-change time on XFS and ext4, so the case tells something only on such a file system.
+case7() {
+  export LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true
+  mkpkg t
+  test_run -d t build P.R
+  ctimes() { for m in D L2 M; do stat -c "$m %i %Z %z" t/$OUT/$m.olean; done; }
+  ctimes > ctimes.before
+  cat ctimes.before
+  sleep 1
+  test_run -d t build P.R
+  ctimes > ctimes.noop
+  test_cmd diff ctimes.before ctimes.noop
+  replays_m t 1
+  ctimes > ctimes.edit
+  test_cmd diff ctimes.before ctimes.edit
+}
+
 # joblog MOD [FILE] -- what a build's output (FILE, default `produced.out`) prints for MOD's job
 joblog() {
   awk -v m=" $1" '/^[^ ]+ \[[0-9]+\/[0-9]+\]/ {
@@ -256,7 +277,7 @@ runcase() {
   )
 }
 
-if [ $# = 0 ]; then set -- 1 1b 2 3 3b 4; fi
+if [ $# = 0 ]; then set -- 1 1b 2 3 3b 4 7; fi
 for c in "$@"; do runcase "$c"; done
 
 rm -f produced.out
