@@ -559,8 +559,9 @@ whose modules share a mask bit are skipped, as their pairs are conflict-checked 
 
 Implemented natively (`lean_imported_consts_collect_duplicates` in `src/library/const_cache.cpp`) by
 the walk of `collectDupsAux`: the same duplicates in the same order, except among sibling keys of one
-module with equal hashes, which neither sort orders. `covered` has no default value: under an
-`optParam` the compiler drops the `@&` mark, and the native side, which borrows it, would leak it.
+module with equal hashes, which neither sort orders. `covered` has no default value: a compiler
+without the `optParam` fix of `isMarkedBorrowed` (stage0, until its next update) drops the `@&`
+mark under an `optParam`, and the native side, which borrows it, would leak it.
 -/
 @[extern "lean_imported_consts_collect_duplicates"]
 def collectDuplicates (trees : @& Array (Nat × ConstTrie α))
