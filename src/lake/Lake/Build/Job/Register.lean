@@ -43,7 +43,10 @@ Registers the job for the top-level build monitor,
   (← getBuildContext).registeredJobs.modify (job :: ·)
   return job.renew
 
-/-- Wraps stray I/O, logs, and errors in `x` into the produced job.  -/
+/--
+Wraps stray I/O, logs, and errors in `x` into the produced job. If `x` fails without an error entry
+once the build is canceled, the job is canceled (`JobState.canceled`, see `isCanceledFetch`).
+-/
 @[nospecialize] public def ensureJob
   [OptDataKind α] (x : FetchM (Job α))
 : FetchM (Job α) := .ofFn fun fetch pkg? stack store ctx log => do
@@ -58,7 +61,8 @@ Registers the job for the top-level build monitor,
       return .ok job log
   | .error _ log =>
     let (log, jobLog) := log.split iniPos
-    return .ok (.error jobLog) log
+    let canceled ← isCanceledFetch ctx.cancelTk? jobLog
+    return .ok (.ofTask (.pure (.error 0 {log := jobLog, canceled}))) log
 
 /--
 Registers the produced job for the top-level build monitor

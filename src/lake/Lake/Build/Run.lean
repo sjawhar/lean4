@@ -113,10 +113,10 @@ def reportJob (job : OpaqueJob) : MonitorM PUnit := do
   let {jobNo, totalJobs, ..} ← get
   let {failLv, outLv, showOptional, out, useAnsi, showProgress, minAction, showTime, ..} ← read
   let {task, caption, optional, ..} := job
-  let {log, action, wantsRebuild, canceled, buildTime, ..} := task.get.state
+  let {log, action, wantsRebuild, buildTime, ..} := task.get.state
   let maxLv := log.maxLv
   let failed := strictAnd log.hasEntries (maxLv ≥ failLv)
-  let canceled := canceled && !failed
+  let canceled := task.get.isCanceled && !failed
   if wantsRebuild then
     modify fun s => if s.wantsRebuild then s else {s with wantsRebuild := true}
   if failed && !optional then
