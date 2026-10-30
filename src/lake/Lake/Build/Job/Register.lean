@@ -24,12 +24,13 @@ job-local state that should not be inherited by downstream jobs.
 Resets the job's state after a checkpoint (e.g., registering the job).
 Preserves information that downstream jobs want to depend on while resetting
 job-local information that should not be inherited by downstream jobs.
+A canceled result stays canceled, so that the jobs that await or continue it are canceled too.
 -/
 public def Job.renew (self : Job α) : Job α :=
   have : OptDataKind α := self.kind
   self.mapResult (sync := true) fun
   | .ok a s => .ok a s.renew
-  | .error _ s => .error 0 s.renew
+  | .error _ s => .error 0 {s.renew with canceled := s.canceled}
 
 /--
 Registers the job for the top-level build monitor,

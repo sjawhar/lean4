@@ -5,9 +5,10 @@ source ../common.sh
 
 # The targets are given in the order Lake fetches them: each one before `Slow` is fetched before the token is set.
 
-echo "# TEST: without --fail-fast, nothing is canceled: the executable builds"
-test_err "Some required targets logged failures" build Fail slowA app Slow awaitsCanceled lateNoError
+echo "# TEST: without --fail-fast, nothing is canceled: the executable and the shared library build"
+test_err "Some required targets logged failures" build Fail slowA app sharedSlow Slow awaitsCanceled lateNoError
 test_exp -f .lake/build/bin/app
+test_exp -n "$(grep -E '^✔ .*Built Slow:shared' produced.out)"
 if grep -E 'Canceled' produced.out; then
   echo "FAILURE: a job reported as canceled without --fail-fast"
   exit 1
@@ -27,6 +28,19 @@ if grep -E '^- (app:exe|App|Slow)$' produced.out; then
   exit 1
 fi
 test_exp -n "$(grep -E '^⊘ .*Canceled app:exe$' produced.out)"
+
+./clean.sh
+
+# Verbose, so that a job that only ran is shown (`✔ ... Ran`)
+echo "# TEST: under --fail-fast, jobs that depend on a canceled module through registered jobs are canceled, not run"
+test_err "Some required targets logged failures" build --fail-fast -v Fail slowA sharedSlow Slow
+if grep -E '^✔ .*Ran (Slow:c\.o|Slow:shared|test/sharedSlow)' produced.out; then
+  echo "FAILURE: a job that depends on a canceled job reported as run"
+  exit 1
+fi
+test_exp -n "$(grep -E '^(⊘|ℹ) .*Canceled Slow:c\.o' produced.out)"
+test_exp -n "$(grep -E '^(⊘|ℹ) .*Canceled Slow:shared$' produced.out)"
+test_exp -n "$(grep -E '^(⊘|ℹ) .*Canceled test/sharedSlow$' produced.out)"
 
 ./clean.sh
 
