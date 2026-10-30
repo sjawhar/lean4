@@ -55,6 +55,12 @@ public structure Env where
   variable is for measuring that choice on another machine.
   -/
   usageCutoffReadTasks? : Option Nat := none
+  /--
+  Whether usage-cutoff checks log, at the verbose level, which closure records each one took from earlier reads of
+  the build (i.e., `LAKE_USAGE_CUTOFF_TRACE`, off unless set to a true value). The lines are for tests: a check logs
+  one per module of its closure, and a build keeps every job's log until it ends.
+  -/
+  logUsageCutoffRecords : Bool := false
   /-- Whether the system cache has been disabled (`LAKE_CACHE_DIR` is set but empty). -/
   noSystemCache : Bool := false
   /--
@@ -255,6 +261,7 @@ public def compute
     restoreAllArtifacts? := (← IO.getEnv "LAKE_RESTORE_ARTIFACTS").bind envToBool?
     usageCutoff := ((← IO.getEnv "LAKE_USAGE_CUTOFF").bind envToBool?).getD false
     usageCutoffReadTasks? := (← IO.getEnv "LAKE_USAGE_CUTOFF_READ_TASKS").bind (·.trimAscii.toNat?)
+    logUsageCutoffRecords := ((← IO.getEnv "LAKE_USAGE_CUTOFF_TRACE").bind envToBool?).getD false
     lakeConfig? := (← IO.getEnv "LAKE_CONFIG") <|> userHome?.map (· / ".lake" / "config.toml" |>.toString)
     cacheKey? := (← IO.getEnv "LAKE_CACHE_KEY").map (·.trimAscii.copy)
     cacheArtifactEndpoint? := (← IO.getEnv "LAKE_CACHE_ARTIFACT_ENDPOINT").map normalizeUrl
