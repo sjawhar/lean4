@@ -440,6 +440,12 @@ def fetchImportInfo
   (allowNonModules : Bool := false)
 : FetchM (Job ModuleImportInfo) := do
   let nonModule := !header.isModule
+  -- The fold below reaches an import's own imports only after it awaits that import's header. Fetched here first,
+  -- the headers of all the imports are read side by side instead of one after another.
+  for imp in header.imports do
+    unless modName = imp.module do
+      for mod in ← findModules imp.module do
+        discard mod.header.fetch
   let info := ModuleImportInfo.nil modName
   let impArtsJob : Job ModuleImportInfo := .pure info
   header.imports.foldlM (init := impArtsJob) fun s imp => do
