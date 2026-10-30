@@ -119,6 +119,182 @@ instance : FromJson UsageSidecar where
       specLookups := ← j.getObjValAs? (Array (ModuleUsage.Digest × ModuleUsage.Digest)) "specLookups"
     }
 
+/-!
+A reader of the bytes `Lean.ModuleUsage.writeUsage` writes: the JSON text of the fields in its order (keys sorted), with
+no whitespace, each name a JSON array of its components (`nameJsonInto`), each number as `toString` writes it, and each
+string without an escape. It reads them without the JSON tree of `Json.parse`; `UsageSidecar.parse?` reads every other
+text with `Json.parse`.
+-/
+namespace UsageLayout
+
+/-- The byte of `b` at `i`, or `0` past its end: no byte the layout reads as such is `0`. -/
+@[inline] def byteAt (b : ByteArray) (i : Nat) : UInt8 := if h : i < b.size then b[i] else 0
+
+/-- The position after the bytes of `lit` at `i` in `b`, if `b` holds them there. -/
+def lit? (b : ByteArray) (i : Nat) (lit : ByteArray) : Option Nat :=
+  go 0
+where
+  go (k : Nat) : Option Nat :=
+    if h : k < lit.size then
+      if byteAt b (i + k) == lit[k] then go (k + 1) else none
+    else some (i + lit.size)
+  termination_by lit.size - k
+
+/-- The position of the `"` that ends the string whose contents start at `j`, if none of its bytes is a `\` or a
+control character: `Json.parse` reads an escape and refuses a control character, so this reader leaves both to it. -/
+def strEnd (b : ByteArray) (j : Nat) : Option Nat :=
+  if h : j < b.size then
+    let c := b[j]
+    if c == 34 then some j else if c == 92 || c < 32 then none else strEnd b (j + 1)
+  else none
+termination_by b.size - j
+
+/-- A string at `i` (`"`, its UTF-8 bytes, `"`) and the position after it. -/
+@[inline] def str? (b : ByteArray) (i : Nat) : Option (String × Nat) := do
+  guard (byteAt b i == 34)
+  let e ← strEnd b (i + 1)
+  return (← String.fromUTF8? (b.extract (i + 1) e), e + 1)
+
+@[inline] def isDigit (c : UInt8) : Bool := 48 ≤ c && c ≤ 57
+
+/-- The decimal digits from `j` on, read into `acc`, and the position after them. -/
+def digits (b : ByteArray) (j acc : Nat) : Nat × Nat :=
+  if h : j < b.size then
+    if isDigit b[j] then digits b (j + 1) (10 * acc + (b[j] - 48).toNat) else (acc, j)
+  else (acc, j)
+termination_by b.size - j
+
+/-- A natural number at `i` as `toString` writes one (no sign, no leading zero) and the position after it. -/
+@[inline] def nat? (b : ByteArray) (i : Nat) : Option (Nat × Nat) :=
+  let c := byteAt b i
+  if c == 48 then if isDigit (byteAt b (i + 1)) then none else some (0, i + 1)
+  else if isDigit c then some (digits b i 0) else none
+
+/-- 16 lowercase hex digits from `i` on, most significant first (`Digest.ofHex?`). -/
+def hex16 (b : ByteArray) (i : Nat) : Option UInt64 := go 0 0
+where
+  go (k : Nat) (v : UInt64) : Option UInt64 :=
+    if k < 16 then
+      let c := byteAt b (i + k)
+      if 48 ≤ c && c ≤ 57 then go (k + 1) (v <<< 4 ||| (c - 48).toUInt64)
+      else if 97 ≤ c && c ≤ 102 then go (k + 1) (v <<< 4 ||| (c - 87).toUInt64)
+      else none
+    else some v
+  termination_by 16 - k
+
+/-- A digest at `i` (`"`, 32 lowercase hex digits, `"`: `toJson`, `Digest.ofHex?`) and the position after it. -/
+@[inline] def digest? (b : ByteArray) (i : Nat) : Option (ModuleUsage.Digest × Nat) := do
+  guard (byteAt b i == 34 && byteAt b (i + 33) == 34)
+  return (⟨← hex16 b (i + 1), ← hex16 b (i + 17)⟩, i + 34)
+
+/-- `true` or `false` at `i` and the position after it. -/
+@[inline] def bool? (b : ByteArray) (i : Nat) : Option (Bool × Nat) :=
+  match lit? b i "true".toUTF8 with
+  | some j => some (true, j)
+  | none => (false, ·) <$> lit? b i "false".toUTF8
+
+/-- The components of a name from `j` on, each a string or a number, added to `n`, up to the `]` that ends them, and
+the position after it. -/
+partial def comps (b : ByteArray) (j : Nat) (n : Name) : Option (Name × Nat) := do
+  let (n, k) ← if byteAt b j == 34 then (fun (s, k) => (Name.mkStr n s, k)) <$> str? b j
+    else (fun (v, k) => (Name.mkNum n v, k)) <$> nat? b j
+  match byteAt b k with
+  | 44 => comps b (k + 1) n
+  | 93 => some (n, k + 1)
+  | _ => none
+
+/-- A name at `i` as `nameJsonInto` writes it (`[`, its components root first, `]`) and the position after it. -/
+def name? (b : ByteArray) (i : Nat) : Option (Name × Nat) :=
+  if byteAt b i != 91 then none
+  else if byteAt b (i + 1) == 93 then some (.anonymous, i + 2)
+  else comps b (i + 1) .anonymous
+
+/-- The elements of an array from `j` on, each read by `elem`, added to `acc`, up to the `]` that ends them, and the
+position after it. -/
+@[specialize] partial def elems (elem : ByteArray → Nat → Option (α × Nat)) (b : ByteArray) (j : Nat)
+    (acc : Array α) : Option (Array α × Nat) := do
+  let (a, k) ← elem b j
+  match byteAt b k with
+  | 44 => elems elem b (k + 1) (acc.push a)
+  | 93 => some (acc.push a, k + 1)
+  | _ => none
+
+/-- An array at `i` whose elements `elem` reads, and the position after it. -/
+@[inline] def arr? (elem : ByteArray → Nat → Option (α × Nat)) (b : ByteArray) (i : Nat) :
+    Option (Array α × Nat) :=
+  if byteAt b i != 91 then none
+  else if byteAt b (i + 1) == 93 then some (#[], i + 2)
+  else elems elem b (i + 1) #[]
+
+/-- A pair at `i` (`[`, its first element, `,`, its second, `]`) and the position after it. -/
+@[inline] def pair? (fa : ByteArray → Nat → Option (α × Nat)) (fb : ByteArray → Nat → Option (β × Nat))
+    (b : ByteArray) (i : Nat) : Option ((α × β) × Nat) := do
+  guard (byteAt b i == 91)
+  let (x, j) ← fa b (i + 1)
+  guard (byteAt b j == 44)
+  let (y, k) ← fb b (j + 1)
+  guard (byteAt b k == 93)
+  return ((x, y), k + 1)
+
+/-- A name with a digest, as `writeUsage` writes the elements of most of its lists. -/
+def nameDigest? : ByteArray → Nat → Option ((Name × ModuleUsage.Digest) × Nat) := pair? name? digest?
+
+/-- A map of the pairs at `i`, each inserted in its order (`FromJson UsageSidecar`), and the position after them. -/
+@[inline] def nameMap? (b : ByteArray) (i : Nat) : Option (NameMap ModuleUsage.Digest × Nat) := do
+  let (ps, j) ← arr? nameDigest? b i
+  return (ps.foldl (init := {}) fun m (n, d) => m.insert n d, j)
+
+/--
+The sidecar of `b` if `b` is in the layout `writeUsage` writes (the module docstring above), `some none` if it is but
+has another format version than `ModuleUsage.usageVersion`, and `none` if it is not. Where it returns `some`, `b` is
+valid UTF-8 and JSON, and `parseUsageSidecar.parse` returns the same value: it reads the same fields, each under the
+rule of its `FromJson` instance, and each string as `Json.parse` does one without an escape.
+-/
+def decode? (b : ByteArray) : Option (Option UsageSidecar) := do
+  let i ← lit? b 0 "{\"closure\":".toUTF8
+  let (closure, i) ← digest? b i
+  let i ← lit? b i ",\"digested\":".toUTF8
+  let (digested, i) ← arr? nameDigest? b i
+  let i ← lit? b i ",\"extra\":".toUTF8
+  let (extra, i) ← arr? (pair? name? bool?) b i
+  let i ← lit? b i ",\"importedClosures\":".toUTF8
+  let (importedClosures, i) ← nameMap? b i
+  let i ← lit? b i ",\"importedDigests\":".toUTF8
+  let (importedDigests, i) ← nameMap? b i
+  let i ← lit? b i ",\"indirect\":".toUTF8
+  let (indirect, i) ← arr? name? b i
+  let i ← lit? b i ",\"moduleDigest\":".toUTF8
+  let (moduleDigest, i) ← digest? b i
+  let i ← lit? b i ",\"noskip\":".toUTF8
+  let (noskip, i) ← bool? b i
+  let i ← lit? b i ",\"own\":".toUTF8
+  let (own, i) ← nameMap? b i
+  let i ← lit? b i ",\"provides\":".toUTF8
+  let (provides, i) ← pair? (arr? name?) (arr? name?) b i
+  let i ← lit? b i ",\"providesDigest\":".toUTF8
+  let (providesDigest, i) ← digest? b i
+  let i ← lit? b i ",\"resolvedAll\":".toUTF8
+  let (resolvedAll, i) ← bool? b i
+  let i ← lit? b i ",\"resolvedDigest\":".toUTF8
+  let (resolvedDigest, i) ← digest? b i
+  let i ← lit? b i ",\"specKeys\":".toUTF8
+  let (specKeys, i) ← arr? (pair? digest? name?) b i
+  let i ← lit? b i ",\"specLookups\":".toUTF8
+  let (specLookups, i) ← arr? (pair? digest? digest?) b i
+  let i ← lit? b i ",\"used\":".toUTF8
+  let (used, i) ← arr? (pair? name? (arr? nameDigest?)) b i
+  let i ← lit? b i ",\"version\":".toUTF8
+  let (version, i) ← nat? b i
+  guard (byteAt b i == 125 && i + 1 == b.size)
+  if version != ModuleUsage.usageVersion then return none
+  return some {
+    noskip, moduleDigest, closure, digested, importedClosures, importedDigests, own, used
+    extra := extra.map (·.1)
+    resolvedDigest, resolvedAll, providesDigest, provides, indirect, specKeys, specLookups
+  }
+
+end UsageLayout
+
 /-- The parts of a module's `.usage` that its importers' checks read (`importUsage?`), which its `.usekey` carries
 (`UsekeySidecar.importer`): a `UsageSidecar` without the lists only the module's own checks read. -/
 public structure UsageImport where
@@ -277,6 +453,13 @@ where
     if v != version then return none
     some <$> fromJson? (α := α) j
 
+/-- What `parseUsageSidecar.parse` reads from the bytes of a `.usage`, read without the JSON tree where the bytes are
+in the layout `Lean.ModuleUsage.writeUsage` writes (`UsageLayout.decode?`). -/
+def UsageSidecar.parse? (bytes : ByteArray) : Except String (Option UsageSidecar) :=
+  match UsageLayout.decode? bytes with
+  | some r => .ok r
+  | none => parseUsageSidecar.parse UsageSidecar ModuleUsage.usageVersion bytes
+
 /--
 Reads a usage-cutoff sidecar, as `readUsageSidecar` does, with the stamp of the file its value stands for: the file's
 current stamp when the build's parse is reused, else the stamp of the read if it stands for the bytes
@@ -319,8 +502,12 @@ the digest of its bytes.
 def readOwnUsage (path : FilePath) (expected? : Option ModuleUsage.Digest := none) :
     JobM (Option (UsageSidecar × ModuleUsage.Digest)) := do
   let some (bytes, digest, _) ← readSidecarBytes? path expected? | return none
-  let some usage ← parseUsageSidecar UsageSidecar ModuleUsage.usageVersion path bytes | return none
-  return some (usage, digest)
+  match UsageSidecar.parse? bytes with
+  | .ok (some usage) => return some (usage, digest)
+  | .ok none => return none
+  | .error e =>
+    logWarning s!"{path}: {e}"
+    return none
 
 /-- A run of a `JobM` action on its own: the entries it logged, and its value or the position in those entries of the
 error it threw. -/
@@ -2024,7 +2211,7 @@ names, or `none` if it cannot be read or parsed, or has another format version (
 -/
 public def compactUsage? (path : FilePath) : BaseIO (Option ByteArray) := do
   let .ok bytes ← (IO.FS.readBinFile path).toBaseIO | return none
-  let .ok (some usage) := parseUsageSidecar.parse UsageSidecar ModuleUsage.usageVersion bytes | return none
+  let .ok (some usage) := UsageSidecar.parse? bytes | return none
   return usage.toPrefilter.encode (ModuleUsage.Digest.ofBytes bytes)
 
 /-- `compactUsage?` of the `.usage` with artifact hash `art` that `Module.writeUsekey` parsed in this process
@@ -2068,7 +2255,7 @@ def readCandidateUsage? (compactFile usageFile : FilePath) (usage : ModuleUsage.
     BaseIO (Option PrefilterUsage) := do
   if let some record ← readCompactUsage? compactFile usage then return some record
   let .ok bytes ← (IO.FS.readBinFile usageFile).toBaseIO | return none
-  let .ok (some u) := parseUsageSidecar.parse UsageSidecar ModuleUsage.usageVersion bytes | return none
+  let .ok (some u) := UsageSidecar.parse? bytes | return none
   return some u.toPrefilter
 
 /-- How far a cached compile got in the usage index's pre-filter (`usagePrefilter`). -/
