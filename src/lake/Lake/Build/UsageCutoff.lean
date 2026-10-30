@@ -349,7 +349,8 @@ What a decision's read of an importee found (`readImports`), kept for the build'
 `stamp`, and, if that read went on to hash the `.olean` (`readImportUsage?`), the `.olean`'s stamp and hash. Made only
 from reads that logged nothing, threw nothing and stood for their bytes (settled stamps), so a later read of the same
 files under the same stamps computes the same values and logs nothing. A decision takes it only if each of its files
-has its stamp now (`bindFacts`).
+has its stamp now (`bindFacts`). What every decision that takes it derives from these fields is computed once, when the
+record is made (`ImportFact.make`): its files with their stamps, its binding of each kind and its `.usage` path.
 -/
 public structure ImportFact where
   olean : FilePath
@@ -360,21 +361,24 @@ public structure ImportFact where
   olean? : Option (ModuleUsage.FileStamp × ModuleUsage.Digest)
   /-- When a check of this build last saw every file of the record with the recorded stamp (`observedSince`). -/
   observed : ModuleUsage.ObservedAt
+  /-- The files of the record with the stamps it was read under: `sidecar`, and the `.olean` if `olean?` is some. -/
+  files : Array (FilePath × ModuleUsage.FileStamp)
+  /-- The binding with `kept` that `readImportUsage?` computes from `read?` (`ImportFact.bindingOf`). -/
+  keptBinding : Option (Option (FilePath × UsageImport))
+  /-- The binding without `kept`, likewise. -/
+  plainBinding : Option (Option (FilePath × UsageImport))
+  /-- The importee's `.usage` (`olean` with the extension `usage`), whose view a binding without `kept` freezes. -/
+  usageFile : FilePath
   deriving TypeName
 
-/-- The files of `f` with the stamps it was read under. -/
-def ImportFact.files (f : ImportFact) : Array (FilePath × ModuleUsage.FileStamp) :=
-  match f.olean? with
-  | some (s, _) => #[(f.sidecar, f.stamp), (f.olean, s)]
-  | none => #[(f.sidecar, f.stamp)]
-
 /-- The hashes of a `module` file's artifacts (`paths`, its `ImportArtifacts.toArrays` flattened, its `.olean` first)
-that a decision's `modsysHash` read, each with the stamp it was read under, kept for the build's later decisions as
-`ImportFact`s are. -/
+that a decision's `modsysHash` read, each with the stamp it was read under (`files` pairs the two), kept for the
+build's later decisions as `ImportFact`s are. -/
 public structure ArtsFact where
   paths : Array FilePath
   stamps : Array ModuleUsage.FileStamp
   digests : Array ModuleUsage.Digest
+  files : Array (FilePath × ModuleUsage.FileStamp) := paths.zip stamps
   /-- As `ImportFact.observed`. -/
   observed : ModuleUsage.ObservedAt
   deriving TypeName
@@ -741,8 +745,7 @@ def bindArts (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) : J
   if cands.isEmpty then return 0
   -- before the first stat of the pass
   let t ← ModuleUsage.monoNow
-  let ok ← parallelMap cands fun (_, f) =>
-    observedSince f.observed (f.paths.zip f.stamps) hashes.t0 t
+  let ok ← parallelMap cands fun (_, f) => observedSince f.observed f.files hashes.t0 t
   let mut taken := #[]
   let mut took := #[]
   for c in cands, b in ok do
@@ -920,13 +923,37 @@ def readImportUsage? (hashes : ContentHashes) (kept : Bool) (read : SidecarRead)
 @[inline] def ContentHashes.reads (hashes : ContentHashes) (kept : Bool) : IO.Ref (Std.HashMap Name ImportRead) :=
   if kept then hashes.keptImports else hashes.imports
 
-/-- The binding with `kept` or without it that `readImportUsage?` computes from `f`'s read, or `none` if it needs the
-hash of the `.olean`, which `f` does not hold. -/
-public def ImportFact.project (f : ImportFact) (kept : Bool) : Option (Option (FilePath × UsageImport)) :=
-  match importSidecars f.read? kept with
+/-- The binding with `kept` or without it that `readImportUsage?` computes from the read `read?` of the importee whose
+`.olean` is `olean`, with the `.olean`'s stamp and hash `olean?` if that read hashed it, or `none` if the binding needs
+that hash and `olean?` does not hold it. -/
+def ImportFact.bindingOf (olean : FilePath) (read? : Option (Option ModuleUsage.Digest × UsageImport × Bool))
+    (olean? : Option (ModuleUsage.FileStamp × ModuleUsage.Digest)) (kept : Bool) :
+    Option (Option (FilePath × UsageImport)) :=
+  match importSidecars read? kept with
   | none => some none
-  | some (none, imp) => some (some (f.olean, imp))
-  | some (some keyOlean, imp) => f.olean?.map fun (_, d) => if keyOlean == d then some (f.olean, imp) else none
+  | some (none, imp) => some (some (olean, imp))
+  | some (some keyOlean, imp) => olean?.map fun (_, d) => if keyOlean == d then some (olean, imp) else none
+
+/-- A new record (`ImportFact`) of the read `read?` of the importee whose `.olean` is `olean` from the bytes of
+`sidecar` under `stamp`, with what every decision that takes it derives from those (`ImportFact.bindingOf` of each
+kind, the files with their stamps, the `.usage` path), and an observation reading of 0 (`observedSince`). -/
+public def ImportFact.make (olean : FilePath) (modsys : Bool) (sidecar : FilePath) (stamp : ModuleUsage.FileStamp)
+    (read? : Option (Option ModuleUsage.Digest × UsageImport × Bool))
+    (olean? : Option (ModuleUsage.FileStamp × ModuleUsage.Digest)) : BaseIO ImportFact :=
+  return {
+    olean, modsys, sidecar, stamp, read?, olean?
+    observed := ← ModuleUsage.ObservedAt.new
+    files := match olean? with
+      | some (s, _) => #[(sidecar, stamp), (olean, s)]
+      | none => #[(sidecar, stamp)]
+    keptBinding := ImportFact.bindingOf olean read? olean? true
+    plainBinding := ImportFact.bindingOf olean read? olean? false
+    usageFile := olean.withExtension "usage"
+  }
+
+/-- `f`'s binding with `kept` or without it (`ImportFact.bindingOf`, as `ImportFact.make` computed it). -/
+@[inline] public def ImportFact.project (f : ImportFact) (kept : Bool) : Option (Option (FilePath × UsageImport)) :=
+  if kept then f.keptBinding else f.plainBinding
 
 /--
 Takes from the build's earlier reads (`BuildContext.usageFacts`) the record (`ImportFact`) of each module of `mods`,
@@ -997,7 +1024,7 @@ def readImports (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) 
     if kept then
       fast := fast.push (m, (#[], .ok b))
       continue
-    let usageFile := f.olean.withExtension "usage"
+    let usageFile := f.usageFile
     if snap.frozen.contains usageFile then
       fast := fast.push (m, (#[], .ok b))
       continue
@@ -1039,7 +1066,7 @@ def readImports (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) 
     let .ok (_, _, olean?, (#[], .ok (some (olean, read?))), some stamp) := r.2 | continue
     let modsys := (importArts.find? m).any (·.oleanServer?.isSome)
     let sidecar := olean.withExtension (if modsys then "usage" else "usekey")
-    imports := imports.push (m, { olean, modsys, sidecar, stamp, read?, olean?, observed := ← ModuleUsage.ObservedAt.new })
+    imports := imports.push (m, ← ImportFact.make olean modsys sidecar stamp read? olean?)
   publishFacts { imports, frozen, taken, read }
 
 /--
