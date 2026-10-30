@@ -141,16 +141,34 @@ example : MonadLiftT JobM FetchM := inferInstance
 /-- Ensures that `SpawnM` lifts into `FetchM`. -/
 example : MonadLiftT SpawnM FetchM := inferInstance
 
-/-- Run a `FetchM` action in `JobM`. -/
+/--
+Run a `FetchM` action in `JobM`. If it fails without an error entry once the build is canceled, the
+job is canceled (`JobState.canceled`, see `isCanceledFetch`).
+-/
 @[inline] public def JobM.runFetchM (x : FetchM α) : JobM α := .ofFn fun fetch pkg? stack store ctx s => do
   match (← x.toFn fetch pkg? stack store ctx s.log) with
   | .ok a log => return .ok a {s with log}
-  | .error e log => return .error e {s with log}
+  | .error e log =>
+    let canceled ← isCanceledFetch ctx.cancelTk? log
+    return .error e {s with log, canceled := s.canceled || canceled}
 
 public instance : MonadLift FetchM JobM := ⟨JobM.runFetchM⟩
 
 /-- Ensures that `FetchM` lifts into `JobM`. -/
 example : MonadLiftT FetchM JobM := inferInstance
+
+/--
+How a computation fails when a job that it awaits was canceled (see `Job.await`). In `JobM`, it
+cancels the current job (`Job.cancelJob`). Elsewhere it throws as for any other failure: a fetch
+(`FetchM`) has no job state, and where its failure becomes a job's (`ensureJob`, `JobM.runFetchM`),
+that job is canceled (see `isCanceledFetch`).
+-/
+public class MonadAwaitCanceled (m : Type → Type) where
+  /-- Fails the computation. The canceled job failed at `pos`, a position of its own log. -/
+  awaitCanceled (pos : Log.Pos) : m α
+
+public instance (priority := low) [MonadLiftT LogIO m] : MonadAwaitCanceled m :=
+  ⟨fun pos => liftM (throw pos : LogIO _)⟩
 
 namespace Job
 
@@ -186,17 +204,24 @@ If an error occurred, return `none` and discarded any logs produced.
 
 /--
 Wait for a job to complete and return the produced value.
-Logs the job's log and throws if there was an error.
+Logs the job's log and throws if there was an error. A canceled job (`JobState.canceled`) cancels
+the current computation as well (see `MonadAwaitCanceled`).
 -/
-public protected def await (self : Job α) : LogIO α := do
-  match (← self.wait) with
-  | .error n {log, ..} => log.replay; throw n
-  | .ok a {log, ..} => log.replay; pure a
+@[inline] public protected def await
+  [Monad m] [MonadLiftT LogIO m] [MonadAwaitCanceled m] (self : Job α)
+: m α := do
+  match (← (liftM self.wait : LogIO (JobResult α))) with
+  | .error n {log, canceled, ..} =>
+    (log.replay : LogIO PUnit)
+    if canceled then MonadAwaitCanceled.awaitCanceled n else liftM (throw n : LogIO α)
+  | .ok a {log, ..} => (log.replay : LogIO PUnit); pure a
 
 /-- Fail the current job as canceled (no log entry; see `JobState.canceled`). -/
 public def cancelJob : JobM α := do
   modify ({· with canceled := true})
   failure
+
+public instance : MonadAwaitCanceled JobM := ⟨fun _ => cancelJob⟩
 
 /--
 Like `wait?`, but a canceled job cancels the current job as well (via

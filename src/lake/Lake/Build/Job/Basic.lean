@@ -117,6 +117,28 @@ for failure (as the monitor does).
   | .error _ s => s.canceled
   | .ok .. => false
 
+/--
+Whether a fetch (`FetchM`) that failed with `log` was canceled: whether it failed without an error
+entry once the build was canceled (`cancelTk?`, the build's cancellation token, is set; see
+`BuildConfig.failFast`). A fetch has no job state, so this is how the job that its failure makes
+(`ensureJob`, `JobM.runFetchM`) keeps the cancellation of a job that it awaited (see `Job.await`):
+a canceled job logs at most a trace entry, and Lake logs a failure as an error.
+
+A fetch that fails without an error entry for another reason once the build was canceled is taken
+as canceled too. Most often it awaited a registered job that failed: registration gives the jobs
+that depend on a job its result without its log (`registerJob`). Such a job is then labeled
+canceled, a fair label for a job that the build stopped after its first failure, but it is so
+only if the monitor has set the token by then, which can differ from run to run. Only the label
+changes: the job that failed is reported as failed, and the monitor still reports this one as a
+failure if it logged an entry at the failure level (`failLv`).
+-/
+public def isCanceledFetch (cancelTk? : Option IO.CancelToken) (log : Log) : BaseIO Bool := do
+  if log.maxLv ≥ .error then
+    return false
+  match cancelTk? with
+  | some tk => tk.isSet
+  | none => return false
+
 /-- The `Task` of a Lake job. -/
 public abbrev JobTask α := BaseIOTask (JobResult α)
 
