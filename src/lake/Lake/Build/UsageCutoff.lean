@@ -401,9 +401,9 @@ public structure ClosureEntry where
   keyed? : Option Nat
 
 /-- A decision's closure (`importArts`) in its order, as every closure-wide check of the decision walks it: its
-modules (`entries`), the names of those that are not `module` files (`keyed`, as `keyedModules` lists them) and the
-names of the others (`modsys`). The closure, the build's cells and `findModule?` do not change during a build, so a
-decision makes it once (`ContentHashes.view`). -/
+modules (`entries`), the names of those that are not `module` files (`keyed`: `importUsage?` reads their fields from
+their `.usekey`) and the names of the others (`modsys`). The closure, the build's cells and `findModule?` do not
+change during a build, so a decision makes it once (`ContentHashes.view`). -/
 public structure ClosureView where
   entries : Array ClosureEntry
   keyed : Array Name
@@ -1056,24 +1056,6 @@ def importUsage? (hashes : ContentHashes) (importArts : NameMap ImportArtifacts)
     reads.modify (·.insert m (#[], r.2))
   replayRun r
 
-/--
-`importUsage?` of `m`, taken from `bound`, a snapshot of the decision's bindings (`ContentHashes.reads`), when that
-binding logged nothing and threw nothing: `importUsage?` then only returns it, and an entry with no log is never
-replaced. Otherwise `importUsage?` itself. A loop over the closure takes the snapshot once for all of its modules.
--/
-@[inline] def importUsageIn? (hashes : ContentHashes) (importArts : NameMap ImportArtifacts)
-    (bound : Std.HashMap Name ImportRead) (m : Name) (kept := false) : JobM (Option (FilePath × UsageImport)) := do
-  if let some (log, .ok b) := bound[m]? then
-    if log.isEmpty then return b
-  importUsage? hashes importArts m (kept := kept)
-
-/-- The modules of the closure that are not `module` files: `importUsage?` reads their fields from their `.usekey`. -/
-def keyedModules (importArts : NameMap ImportArtifacts) : Array Name := Id.run do
-  let mut mods := #[]
-  for (m, arts) in importArts do
-    if arts.oleanServer?.isNone then mods := mods.push m
-  return mods
-
 unsafe def sameClosureUnsafe (a b : NameMap ImportArtifacts) : Bool := ptrEq a b
 
 /-- Whether `a` and `b` are one map object: a decision's view describes the closure it was made from, and is made again
@@ -1159,28 +1141,25 @@ def specProvidersIn (lookups : Array ModuleUsage.Digest) (importArts : NameMap I
     modules := modules.push (m, keys)
   return some (ModuleUsage.specProviders lookups modules)
 
-/-- `specProvidersIn` of the module's own lookups (`UsageSidecar.specLookups`). -/
-def UsageSidecar.closureSpecProviders (usage : UsageSidecar) (importArts : NameMap ImportArtifacts)
-    (specKeys? : Name → JobM (Option (Array (ModuleUsage.Digest × Name)))) :
-    JobM (Option (Array (ModuleUsage.Digest × ModuleUsage.Digest))) :=
-  specProvidersIn (usage.specLookups.map (·.1)) importArts specKeys?
-
 /--
 Whether every key the module looked up in the specialization cache (`UsageSidecar.specLookups`) has the same
 providers in its closure as when Lean compiled it: the closure's non-module workspace modules that map the key, each
 with the specialization it maps the key to, digested by the function Lean used (`Lean.ModuleUsage.specProviders`).
-Each closure module's keys come from `importUsage?`, which binds them to the module's current `.olean` in this check's
-`hashes`. An import that starts providing a key the module missed, stops providing one it
-hit, or maps it elsewhere changes which specialization a fresh compile uses, so the module rebuilds. A module-system
-module's keys are pinned by `modsysHash`, a toolchain module's by the Lean githash.
+Each closure module's keys come from its binding without `kept` (`boundKeyed`, `importUsage?`), which binds them to
+the module's current `.olean` in this check's `hashes`. An import that starts providing a key the module missed, stops
+providing one it hit, or maps it elsewhere changes which specialization a fresh compile uses, so the module rebuilds. A
+module-system module's keys are pinned by `modsysHash`, a toolchain module's by the Lean githash.
 -/
 def UsageSidecar.specProvidersUnchanged (usage : UsageSidecar) (hashes : ContentHashes)
     (importArts : NameMap ImportArtifacts) : JobM Bool := do
   if usage.specLookups.isEmpty then return true
-  readImports hashes importArts (keyedModules importArts)
-  let providers ← usage.closureSpecProviders importArts fun m =>
-    return (← importUsage? hashes importArts m).map (·.2.specKeys)
-  return providers == some usage.specLookups
+  let (view, bound) ← boundKeyed hashes importArts (kept := false)
+  let mut modules : Array (Name × Array (ModuleUsage.Digest × Name)) := #[]
+  for e in view.entries do
+    if e.keyed?.isNone then continue
+    let some (_, imp) ← bound.usage? hashes importArts e | return false
+    modules := modules.push (e.name, imp.specKeys)
+  return ModuleUsage.specProviders (usage.specLookups.map (·.1)) modules == usage.specLookups
 
 /-- The direct workspace imports of the module, sorted by `Name.quickLt`, each once. -/
 def directModules (presetup : ModulePreSetup) : Array Name :=
@@ -1263,18 +1242,16 @@ def closureFindable (snap : UsageFacts) (m : Name) : JobM Bool := do
 The first workspace module of the closure (`importArts`; module-system files aside, which `modsysHash` pins) whose
 `.usage` importers do not trust (`importUsage?`): a module a kept-module check kept, or one without a usage key that
 binds its `.usage` to its current `.olean`. A compile against a kept module records that module's digests, which
-describe its declarations as Lean compiled them, as what it used. The closure's modules are read in parallel
-(`readImports`).
+describe its declarations as Lean compiled them, as what it used. The closure's modules are read in parallel and
+walked from the decision's view (`boundKeyed`).
 -/
 def untrustedClosureModule? (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) :
     JobM (Option Name) := do
-  readImports hashes importArts (keyedModules importArts)
-  let bound ← hashes.imports.get
-  let snap ← usageFactsSnapshot
-  for (m, arts) in importArts do
-    if arts.oleanServer?.isSome then continue
-    unless ← closureFindable snap m do continue
-    if (← importUsageIn? hashes importArts bound m).isNone then return some m
+  let (view, bound) ← boundKeyed hashes importArts (kept := false)
+  for e in view.entries do
+    if e.keyed?.isNone then continue
+    unless e.findable do continue
+    if (← bound.usage? hashes importArts e).isNone then return some e.name
   return none
 
 /--
