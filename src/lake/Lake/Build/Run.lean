@@ -7,6 +7,8 @@ module
 
 prelude
 public import Lake.Config.Workspace
+import Std.Sync.Mutex
+import Std.Internal.UV.Timer
 import Lake.Config.Monad
 import Lake.Build.Job.Monad
 import Lake.Build.Index
@@ -26,6 +28,50 @@ namespace Lake
 def Monitor.spinnerFrames :=
   #['⣾','⣷','⣯','⣟','⡿','⢿','⣻','⣽']
 
+/--
+Ends the monitor's sleep between two polls once every job it saw unfinished has finished, so that a build does not
+wait for the next poll after its last job (see `Monitor.sleep`).
+-/
+structure MonitorWake where
+  /--
+  How many of the jobs the monitor saw unfinished have not finished yet. The thread that finishes a job decrements it
+  (`watch`); `IO.Ref.modifyGet` is atomic on a ref that threads share.
+  -/
+  pending : IO.Ref Nat
+  /-- Whether the sleep should end: `pending` reached zero, or the poll interval passed. -/
+  woken : Std.Mutex Bool
+  condvar : Std.Condvar
+
+def MonitorWake.new : BaseIO MonitorWake :=
+  return {pending := ← IO.mkRef 0, woken := ← Std.Mutex.new false, condvar := ← Std.Condvar.new}
+
+def MonitorWake.signal (self : MonitorWake) : BaseIO Unit := do
+  self.woken.atomically (set true)
+  self.condvar.notifyAll
+
+/-- Counts `job` in `pending` until it finishes. The monitor calls it once per job, when it first sees it unfinished. -/
+def MonitorWake.watch (self : MonitorWake) (job : OpaqueJob) : BaseIO Unit := do
+  self.pending.modify (· + 1)
+  BaseIO.chainTask (sync := true) job.task fun _ => do
+    if (← self.pending.modifyGet fun n => (n - 1, n - 1)) == 0 then
+      self.signal
+
+/-- Sleeps for `ms` milliseconds, or until every watched job has finished, whichever comes first. -/
+def MonitorWake.sleep (self : MonitorWake) (ms : Nat) : BaseIO Unit := do
+  let timer? ← (do
+    let timer ← Std.Internal.UV.Timer.mk ms.toUInt64 false
+    let tick ← timer.next
+    -- A stopped timer drops its promise, which then resolves to `none`. `sync`: the libuv loop thread signals, as no
+    -- pool worker may be free; `signal` only takes the wake mutex.
+    BaseIO.chainTask (sync := true) tick.result? fun r? => if r?.isSome then self.signal else pure ()
+    return timer : IO _).toBaseIO
+  match timer? with
+  | .ok timer =>
+    self.woken.atomicallyOnce self.condvar get (set false)
+    discard <| timer.stop.toBaseIO
+  | .error _ =>
+    IO.sleep ms.toUInt32
+
 /-- Context of the Lake build monitor. -/
 structure MonitorContext where
   jobs : JobQueue
@@ -43,6 +89,7 @@ structure MonitorContext where
   failFast : Bool := false
   /-- The build's cancellation token, if any. -/
   cancelTk? : Option IO.CancelToken := none
+  wake : MonitorWake
 
 @[inline, instance_reducible] def MonitorContext.logger (ctx : MonitorContext) : MonadLog BaseIO :=
   .stream ctx.out ctx.outLv ctx.useAnsi
@@ -155,25 +202,27 @@ def drainQueue : MonitorM (Array OpaqueJob) := do
   return newJobs
 
 def scanJobs (new unfinished : Array OpaqueJob) : MonitorM (Array OpaqueJob × Array OpaqueJob) := do
-  let pollJobs := fun (running, unfinished) job => do
+  let pollJobs := fun (isNew : Bool) (running, unfinished) job => do
     match (← IO.getTaskState job.task) with
     | .finished =>
       reportJob job
       modify fun s => {s with jobNo := s.jobNo + 1}
       return (running, unfinished)
     | .running =>
+      if isNew then (← read).wake.watch job
       return (running.push job, unfinished.push job)
     | .waiting =>
+      if isNew then (← read).wake.watch job
       return (running, unfinished.push job)
-  let r ← unfinished.foldlM pollJobs (#[], #[])
-  new.foldlM pollJobs r
+  let r ← unfinished.foldlM (pollJobs false) (#[], #[])
+  new.foldlM (pollJobs true) r
 
 def sleep : MonitorM PUnit := do
   let now ← IO.monoMsNow
   let lastUpdate := (← get).lastUpdate
   let sleepTime : Nat := (← read).updateFrequency - (now - lastUpdate)
   if sleepTime > 0 then
-    IO.sleep sleepTime.toUInt32
+    (← read).wake.sleep sleepTime
   let now ← IO.monoMsNow
   modify fun s => {s with lastUpdate := now}
 
@@ -199,6 +248,7 @@ partial def loop
       loop new unfinished
 
 def main (init : Array OpaqueJob) : MonitorM PUnit := do
+  init.forM ((← read).wake.watch ·)
   let new ← drainQueue
   loop new init
   let resetCtrl ← modifyGet fun s => (s.resetCtrl, {s with resetCtrl := ""})
@@ -235,6 +285,7 @@ def mkMonitorContext
     jobs, out, failLv, outLv, minAction, showOptional
     useAnsi, showProgress, showTime, updateFrequency, cancelTk?
     failFast := cfg.failFast
+    wake := ← MonitorWake.new
   }
 
 def monitorJobs'
@@ -271,6 +322,7 @@ public def monitorJobs
   let ctx := {
     jobs, out, failLv, outLv, minAction, showOptional
     useAnsi, showProgress, showTime, updateFrequency
+    wake := ← MonitorWake.new
   }
   monitorJobs' ctx initJobs initFailures resetCtrl
 
