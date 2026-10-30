@@ -501,3 +501,7 @@ match_text "Built C.VA" view-kept.log
 match_text "Checked C.VM" view-kept.log
 no_match_text "Replayed C.VM" view-kept.log
 no_match_text "Built C.VM" view-kept.log
+
+# The reader of a `.usage` in the layout Lean writes agrees with `Json.parse` on every `.usage` this test's builds
+# wrote, on generated texts in that layout, and on each of those changed.
+test_out "ok" env lean --run ../usagelayout.lean c/.lake/build/lib/lean/C/*.usage
