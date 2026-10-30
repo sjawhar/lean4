@@ -389,6 +389,41 @@ public structure ModuleCell where
   findable : Bool
   deriving TypeName
 
+/-- A module of a decision's closure (`importArts`), as every closure-wide check of the decision walks it
+(`ClosureView`): its artifacts, its cell (`ModuleCell`) if the build had one when the view was made, whether it is a
+workspace module (`findModule?`: its cell's answer, else `findModule?`'s), and, if it is not a `module` file, its
+position among those (`ClosureView.keyed`). -/
+public structure ClosureEntry where
+  name : Name
+  arts : ImportArtifacts
+  cell? : Option ModuleCell
+  findable : Bool
+  keyed? : Option Nat
+
+/-- A decision's closure (`importArts`) in its order, as every closure-wide check of the decision walks it: its
+modules (`entries`), and the names of those that are not `module` files (`keyed`, as `keyedModules` lists them). The
+closure, the build's cells and `findModule?` do not change during a build, so a decision makes it once
+(`ContentHashes.view`). -/
+public structure ClosureView where
+  entries : Array ClosureEntry
+  keyed : Array Name
+
+/-- A decision's bindings of one kind (`kept`, `ContentHashes.reads`) of the keyed modules of its view
+(`ClosureView.keyed`), in order (`boundKeyed`): a check reads them only through `KeyedBindings.usage?` and
+`KeyedBindings.now`, which take the kind from here. -/
+public structure KeyedBindings where
+  kept : Bool
+  bound : Array (Option ImportRead)
+
+/-- What a decision keeps of its closure (`ContentHashes.view`): the closure it describes (`importArts`, by identity),
+its view, and for each kind (`kept` and not) the bindings of the view's `keyed` modules, once they were all bound
+(`boundKeyed`). -/
+public structure ViewCache where
+  importArts : NameMap ImportArtifacts
+  view : ClosureView
+  kept? : Option KeyedBindings := none
+  plain? : Option KeyedBindings := none
+
 /--
 What one module's decision before its build has read: its same-tree check (`Module.usageVerdict` of its own
 outputs) and the check of each cached compile the usage index offers (`Module.restoreFromUsageIndex?`), so that the
@@ -430,6 +465,9 @@ public structure ContentHashes where
   /-- A direct import whose closure the decision found changed, with its bound closure (`changedDirectImport?`): the
   pre-filter rejects a candidate whose key records another closure for it (`usagePrefilter`). -/
   changedImport : IO.Ref (Option (Name × Option ModuleUsage.Digest))
+  /-- The decision's view of its closure and its bindings of the view's modules (`ViewCache`), once made
+  (`ContentHashes.closureView`, `boundKeyed`). -/
+  view : IO.Ref (Option ViewCache)
   /-- The decision's start (`Lean.ModuleUsage.monoNow`): it takes a record only after each of its files was seen with
   the recorded stamp after this (`observedSince`). -/
   t0 : UInt64
@@ -446,6 +484,7 @@ public def ContentHashes.new : BaseIO ContentHashes :=
     taken := ← IO.mkRef {}
     keptClosure := ← IO.mkRef none
     changedImport := ← IO.mkRef none
+    view := ← IO.mkRef none
     t0 := ← ModuleUsage.monoNow
   }
 
@@ -1034,6 +1073,75 @@ def keyedModules (importArts : NameMap ImportArtifacts) : Array Name := Id.run d
     if arts.oleanServer?.isNone then mods := mods.push m
   return mods
 
+unsafe def sameClosureUnsafe (a b : NameMap ImportArtifacts) : Bool := ptrEq a b
+
+/-- Whether `a` and `b` are one map object: a decision's view describes the closure it was made from, and is made again
+for any other. Opaque: compiled code compares the pointers (`sameClosureUnsafe`), and nothing may be proved of it. -/
+@[implemented_by sameClosureUnsafe] opaque sameClosure (a b : NameMap ImportArtifacts) : Bool
+
+/-- The decision's view of its closure `importArts` (`ClosureView`): made from `importArts` and the build's cells
+(`UsageFacts.cell?`, else `findModule?`) the first time a check of the decision asks, then kept
+(`ContentHashes.view`). -/
+def ContentHashes.closureView (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) : JobM ClosureView := do
+  if let some c ← hashes.view.get then
+    if sameClosure c.importArts importArts then return c.view
+  let snap ← usageFactsSnapshot
+  let mut entries := Array.emptyWithCapacity importArts.size
+  let mut keyed := #[]
+  for (m, arts) in importArts do
+    let cell? := snap.cell? m
+    let findable ← match cell? with
+      | some c => pure c.findable
+      | none => do pure (← findModule? m).isSome
+    let keyed? := if arts.oleanServer?.isSome then none else some keyed.size
+    entries := entries.push { name := m, arts, cell?, findable, keyed? }
+    if arts.oleanServer?.isNone then keyed := keyed.push m
+  let view := { entries, keyed }
+  hashes.view.set (some { importArts, view })
+  return view
+
+/--
+The view of `importArts` with the decision's binding of each of its keyed modules (`ClosureView.keyed`, in order) with
+`kept` or without (`ContentHashes.reads`): after `readImports` of them all, the first time a check of the decision asks
+for that kind, then kept (`ContentHashes.view`). It holds what a snapshot of `ContentHashes.reads` taken then holds; a
+check takes a binding through `KeyedBindings.usage?` or `KeyedBindings.now`, which go to the decision's map for one with
+a log, as a snapshot of its own would.
+-/
+def boundKeyed (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) (kept : Bool) :
+    JobM (ClosureView × KeyedBindings) := do
+  let view ← hashes.closureView importArts
+  if let some c ← hashes.view.get then
+    if let some b := if kept then c.kept? else c.plain? then return (view, b)
+  readImports hashes importArts view.keyed (kept := kept)
+  let reads ← (hashes.reads kept).get
+  let b : KeyedBindings := { kept, bound := view.keyed.map (reads[·]?) }
+  -- the closure view just made or checked is this closure's: `closureView` keeps only the last one it made
+  hashes.view.modify (·.map fun c => if kept then { c with kept? := some b } else { c with plain? := some b })
+  return (view, b)
+
+/-- The binding of the view's entry `e` in `b` (`none` for a `module` file, which `b` does not hold). -/
+@[inline] def KeyedBindings.get? (b : KeyedBindings) (e : ClosureEntry) : Option ImportRead :=
+  match e.keyed? with
+  | some k => b.bound[k]?.join
+  | none => none
+
+/-- `importUsage?` of the view's entry `e`, with `b`'s kind, from its binding in `b` when that binding logged nothing
+and threw nothing: `importUsage?` then only returns it, and an entry with no log is never replaced. Otherwise
+`importUsage?` itself, which replays the binding's log the first time a step of the decision meets it. -/
+@[inline] def KeyedBindings.usage? (b : KeyedBindings) (hashes : ContentHashes) (importArts : NameMap ImportArtifacts)
+    (e : ClosureEntry) : JobM (Option (FilePath × UsageImport)) := do
+  if let some (log, .ok r) := b.get? e then
+    if log.isEmpty then return r
+  importUsage? hashes importArts e.name (kept := b.kept)
+
+/-- The binding of the view's entry `e` with `b`'s kind that a snapshot of `ContentHashes.reads` taken now holds (none:
+`(#[], .ok none)`): its binding in `b`, unless that holds a log, which a step may have replayed and dropped since
+(`importUsage?`). -/
+def KeyedBindings.now (b : KeyedBindings) (hashes : ContentHashes) (e : ClosureEntry) : BaseIO ImportRead := do
+  if let some r := b.get? e then
+    if r.1.isEmpty then return r
+  return (← (hashes.reads b.kept).get)[e.name]?.getD (#[], .ok none)
+
 /--
 `Lean.ModuleUsage.specProviders` of the specialization-cache keys a module looked up (`lookups`, the first components
 of `UsageSidecar.specLookups`) over the keys (`UsageImport.specKeys`) of its closure's non-module workspace modules,
@@ -1385,10 +1493,8 @@ def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetu
   let outside (r : Array Name) (i : ModuleImport) := if i.module?.isNone then r.push i.module else r
   let kp := (← getBuildContext).kernelProviders
   let providers ← kp.atomically get
-  readImports hashes importArts (keyedModules importArts) (kept := true)
-  let known ← hashes.keptImports.get
+  let (view, known) ← boundKeyed hashes importArts (kept := true)
   let snap ← getBuildStoreSnapshot
-  let facts ← usageFactsSnapshot
   -- the digest of a `module` file's state, from its `.olean` parts' hashes
   let partsDigest (hash : FilePath → JobM ModuleUsage.Digest) (parts : Array FilePath) : JobM ModuleUsage.Digest := do
     let mut e : ModuleUsage.Enc := {}
@@ -1417,20 +1523,21 @@ def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetu
   -- private part, fails the check.
   let mut toolchain := presetup.directImports.foldl outside #[]
   let mut modsys := #[]
-  for (m, arts) in importArts do
-    let imports? ← match facts.cell? m with
+  for e in view.entries do
+    let imports? ← match e.cell? with
       | some c => pure (if c.findable then some c.outside else none)
       | none => do
-        let some mod ← findModule? m | pure none
+        let some mod ← findModule? e.name | pure none
         pure (some ((← (← fetchFrom snap mod.input).await).imports.foldl outside #[]))
     let some imports := imports? | continue
-    if arts.oleanServer?.isSome then
-      if arts.oleanPrivate?.isNone then return false
-      let parts := arts.oleanParts false
-      modsys := modsys.push (m, ← partsDigest (contentHash hashes) parts, parts)
-    else
-      let some (_, imp) ← replayRun (known[m]?.getD (#[], .ok none)) | return false
-      clashes := clashes || declaresClaimed filter claims m imp
+    match e.keyed? with
+    | none =>
+      if e.arts.oleanPrivate?.isNone then return false
+      let parts := e.arts.oleanParts false
+      modsys := modsys.push (e.name, ← partsDigest (contentHash hashes) parts, parts)
+    | some _ =>
+      let some (_, imp) ← replayRun (← known.now hashes e) | return false
+      clashes := clashes || declaresClaimed filter claims e.name imp
     toolchain := toolchain ++ imports
   for r in ← parallelRuns modsys modsysClash do
     let some c ← replayRun r | return false
@@ -1522,21 +1629,20 @@ A module-system module's provides are pinned by `modsysHash`, a toolchain module
 -/
 def UsageSidecar.resolvedUnchanged (usage : UsageSidecar) (presetup : ModulePreSetup)
     (resolvedFile? : Option FilePath) (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) : JobM Bool := do
-  readImports hashes importArts (keyedModules importArts) (kept := true)
-  let bound ← hashes.keptImports.get
-  let snap ← usageFactsSnapshot
+  let (view, bound) ← boundKeyed hashes importArts (kept := true)
   let mut changed := #[]
   let mut table? : Option ModuleUsage.ResolvedTable := none
   -- `digested` is in `Name.quickLt` order, as the closure is: one walk of it
   let ds := usage.digested
   let mut i := 0
-  for (m, arts) in importArts do
-    if arts.oleanServer?.isSome then continue
-    unless ← closureFindable snap m do continue
+  for e in view.entries do
+    if e.keyed?.isNone then continue
+    unless e.findable do continue
+    let m := e.name
     while h : i < ds.size do
       if Name.quickLt ds[i].1 m then i := i + 1 else break
     let some (_, recorded) := ds[i]?.filter (·.1 == m) | return false
-    let some (_, imp) ← importUsageIn? hashes importArts bound m (kept := true) | return false
+    let some (_, imp) ← bound.usage? hashes importArts e | return false
     if imp.providesDigest == recorded then continue
     if usage.resolvedAll then return false
     if table?.isNone then

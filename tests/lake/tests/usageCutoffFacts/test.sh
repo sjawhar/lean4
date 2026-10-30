@@ -466,3 +466,36 @@ if [ "$(id -u)" != 0 ]; then
   test_exp "$(grep -c 'OU.usekey: read failed' unread.log)" = 1
   no_match_text "Replayed C.X1" unread.log
 fi
+
+# A decision's checks take each closure module's own binding, of each kind, from the decision's view of its closure
+# (`ClosureView`, `boundKeyed`). `C.VM` imports `C.VB`, `C.VC` and `C.VK`, which import `C.VA`, and uses no constant
+# of `C.VK`. After an unused edit of `C.VA`, `C.VM` finds one closure module whose provides changed, checks it against
+# its `.resolved` and the closure's kernel constants, and is replayed. Then `C.VK`'s key is marked kept: after another
+# unused edit, `C.VM`'s kept bindings (closure edges, resolved names) take `C.VK`'s key and its plain ones (untrusted
+# modules) do not, so `C.VM` is re-checked (the stub checker accepts it), neither replayed nor compiled. A binding of
+# another module, or of the other kind, replays or compiles it.
+STUB="$(cd ../../keptCheck && pwd)/stub.sh"
+printf 'def va1 : Nat := 1\ndef va2 : Nat := 2\n' > c/C/VA.lean
+printf 'import C.VA\ndef vb : Nat := va1\n' > c/C/VB.lean
+printf 'import C.VA\ndef vc : Nat := va2 + 1\n' > c/C/VC.lean
+printf 'import C.VA\ndef vk : Nat := va1 + 2\n' > c/C/VK.lean
+printf 'import C.VB\nimport C.VC\nimport C.VK\ntheorem vm : vb + vc = 4 := rfl\n' > c/C/VM.lean
+(cd c && test_run build C.VM)
+printf 'def va1 : Nat := 1\ndef va2 : Nat := 2\ndef vaUnused : Nat := 0\n' > c/C/VA.lean
+sleep 3
+(cd c && STUB_LOG="$PWD/../view-stub.log" LAKE_KEPT_CHECKER="$STUB" "$LAKE" build -v C.VM) > view.log 2>&1 \
+  || { cat view.log; test_exp false; }
+cat view.log
+match_text "Built C.VA" view.log
+match_text "Replayed C.VM" view.log
+sed -i 's/"local":/"kept":true,"local":/' c/.lake/build/lib/lean/C/VK.usekey
+test_cmd grep -q '"kept":true' c/.lake/build/lib/lean/C/VK.usekey
+printf 'def va1 : Nat := 1\ndef va2 : Nat := 2\ndef vaUnused2 : Nat := 0\n' > c/C/VA.lean
+sleep 3
+(cd c && STUB_LOG="$PWD/../view-stub.log" LAKE_KEPT_CHECKER="$STUB" "$LAKE" build -v C.VM) > view-kept.log 2>&1 \
+  || { cat view-kept.log; test_exp false; }
+cat view-kept.log
+match_text "Built C.VA" view-kept.log
+match_text "Checked C.VM" view-kept.log
+no_match_text "Replayed C.VM" view-kept.log
+no_match_text "Built C.VM" view-kept.log
