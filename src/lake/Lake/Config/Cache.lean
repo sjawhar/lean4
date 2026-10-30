@@ -13,9 +13,9 @@ public import Lake.Util.Version
 public import Lake.Config.Artifact
 public import Lake.Config.RemoteCache
 public import Lake.Util.Sha256
+public import Lake.Util.ReadBroker
 import Lake.Config.InstallPath
 import Lake.Build.Actions
-import Lake.Util.ReadBroker
 import Lake.Util.Url
 import Lake.Util.Proc
 import Lake.Util.CacheToken
@@ -591,15 +591,15 @@ public def downloadArtifactCore
 Downloads the artifact of the shared remote cache with the content hash `hash` and the SHA-256
 digest `sha256` from `url` to `path`, through the read broker (see `ReadBroker.download`), which
 it replaces only with bytes of that digest and hash. A download larger than
-`remoteCacheMaxFileSize` fails, and the download gives up and tries again as `limits` says. Adds
-the time its transfers took to `transferMs`.
+`remoteCacheMaxFileSize` fails, and the download gives up and tries again as `limits` says. Records
+its sends in `meter` (see `ReadBroker.Meter`).
 -/
 public def downloadRemoteArtifact
   (hash : Hash) (sha256 : Sha256) (url : String) (path : FilePath) (cacheToken : Bool)
-  (limits : TransferLimits) (transferMs : IO.Ref Nat)
+  (limits : TransferLimits) (meter : IO.Ref ReadBroker.Meter)
 : LogIO Unit :=
   ReadBroker.download url path cacheToken remoteCacheMaxFileSize limits
-    (check := checkArtifactDownload hash (some sha256) path) (transferMs := transferMs)
+    (check := checkArtifactDownload hash (some sha256) path) (meter := meter)
 
 /--
 Uploads a file to an online bucket using the Amazon S3 protocol. The upload gives up when it

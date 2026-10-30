@@ -335,13 +335,13 @@ assert max(times.values()) < 3000, times
 }
 
 case_read_fast_refusals() {
-  # A read that the remote cache refuses at once does not count as one that waited for the remote,
-  # however long the read waited before its transfer started. Here every read of the build waits
-  # 4 s for the token command, which the first read runs, and then the remote refuses each read
-  # (403) at once: the build reads on, and does not stop reading the remote cache after 3 of them,
-  # as it does after 3 reads that waited for a remote that did not answer (`case_read_silent`).
-  # A read that waits for a run of the read broker (every run busy) waits outside its transfer in
-  # the same way.
+  # A read that the remote cache answers at once with an error (here 403) does not count as one that
+  # waited for the remote, however long the read waited before its transfer started. Here every read
+  # of the build waits 4 s for the token command, which the first read runs, and then the remote
+  # answers each read with 403 at once: the build reads on, and does not stop reading the remote
+  # cache after 3 of them, as it does after 3 reads that waited for a remote that did not answer
+  # (`case_read_silent`). A read that waits for a run of the read broker (every run busy) waits
+  # outside its transfer in the same way.
   fresh
   : > "$SERVER_LOG"
   LEAN_NUM_THREADS=16 LAKE_REMOTE_CACHE=deny LAKE_CACHE_TOKEN_CMD="sleep 4; $TOKEN_CMD" \
