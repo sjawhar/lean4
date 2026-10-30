@@ -14,6 +14,8 @@ test_out "ok" env lean ../resolved.lean
 # Store the Lake cache in the test directory, never the system cache
 export LAKE_CACHE_DIR=
 export LAKE_ARTIFACT_CACHE=false LAKE_USAGE_CUTOFF=1
+# The checks' `usage cutoff: decision ...` and `fact ... taken` lines that the test matches (with `-v`)
+export LAKE_USAGE_CUTOFF_TRACE=1
 
 # A check takes a closure module's records from an earlier read of the same build (`Lake.readImports`) only if each file
 # they were read from has the recorded stamp after the check started. Workspaces `a` and `b` require the same path
