@@ -26,32 +26,66 @@ open System (FilePath)
 namespace Lake
 
 /--
-Returns the job of `key` from the build store, or makes it with `create` and stores it. Atomic across the build's
-threads (`BuildStore.reserve`): while one fetch runs `create`, another fetch of `key` waits until it returns and then
-returns the job that it stored. If `create` fails, the next waiting fetch runs `create` itself.
-
-So a fetch can block. A fetch in a `(sync := true)` continuation (`Job.mapM`, `Job.bindM`) panics if it has to wait
-(`Task.get` from a sync task); fetch in the `FetchM` code that makes the job instead.
+The part of `fetchOrCreateJob` after a miss in a store whose `stores` was `missedAt`. While another fetch has
+reserved `key`, it waits on the promise of that reservation's waiters (`BuildStore.wait`), which only a waiting fetch
+makes, and then looks again. `IO.wait` lets the task pool start another thread while this one waits.
 -/
-partial def fetchOrCreateJob
+def fetchOrCreateJobAfterMiss
+  (key : BuildKey) [t : FamilyOut (Job <| BuildData ·) key α] (create : FetchM α) (missedAt : Nat)
+: FetchM α := do
+  let mut missedAt := missedAt
+  repeat
+    match ← modifyGetThe BuildStore (·.reserve key missedAt) with
+    | .stored job => return cast t.fam_eq job
+    | .made =>
+      let job ← try create catch e =>
+        if let some waiters ← modifyGetThe BuildStore (·.release key) then waiters.resolve ()
+        throw e
+      if let some waiters ← modifyGetThe BuildStore (·.finish key (cast t.fam_eq.symm job)) then
+        waiters.resolve ()
+      return job
+    | .taken =>
+      let promise ← IO.Promise.new
+      match ← modifyGetThe BuildStore (·.wait key promise) with
+      | .stored job => return cast t.fam_eq job
+      | .until waiters => discard <| IO.wait waiters.result?
+      | .free => pure ()
+      let store ← getThe BuildStore
+      if let some job := store.get? key then
+        return cast t.fam_eq job
+      missedAt := store.stores
+  error s!"{key}: fetch loop ended"
+
+/--
+Returns the job of `key` from the build store, or makes it with `create` and stores it. Atomic across the build's
+threads (`BuildStore.reserve`): while one fetch runs `create`, another fetch of `key` waits until it has returned and
+then returns the job that it stored. If `create` fails, the next waiting fetch runs `create` itself.
+
+A fetch that waits uses `IO.wait`, which panics in a `(sync := true)` continuation (`Job.mapM`, `Job.bindM`); Lake's
+own continuations fetch nothing.
+-/
+@[inline] def fetchOrCreateJob
   (key : BuildKey) [t : FamilyOut (Job <| BuildData ·) key α] (create : FetchM α)
 : FetchM α := do
-  if let some job := (← getThe BuildStore).get? key then
+  -- The lookup of a hit, the common case, is inlined here, so that it uses map code specialized for the key order.
+  let store ← getThe BuildStore
+  if let some job := store.jobs.get? key then
     return cast t.fam_eq job
-  let promise ← IO.Promise.new
-  match ← modifyGetThe BuildStore (·.reserve key promise) with
-  | .stored job => return cast t.fam_eq job
-  | .taken other =>
-    discard <| IO.wait other.result?
-    fetchOrCreateJob key create
-  | .made =>
-    let job ← try create catch e =>
-      modifyThe BuildStore (·.release key)
-      promise.resolve ()
-      throw e
-    modifyThe BuildStore (·.finish key (cast t.fam_eq.symm job))
-    promise.resolve ()
-    return job
+  fetchOrCreateJobAfterMiss key create store.stores
+
+/--
+Like `fetchOrCreateJob`, but not atomic across the build's threads: two fetches of `key` at the same time can both run
+`create`, and the second job replaces the first in the store. For facets that only compute information from files
+and write no build output (not `buildable`), where a second run only repeats the reads.
+-/
+@[inline] def fetchOrCreateInfoJob
+  (key : BuildKey) [t : FamilyOut (Job <| BuildData ·) key α] (create : FetchM α)
+: FetchM α := do
+  if let some job := (← getThe BuildStore).jobs.get? key then
+    return cast t.fam_eq job
+  let job ← create
+  modifyThe BuildStore (·.insert key (cast t.fam_eq.symm job))
+  return job
 
 /-- Recursive build function for anything in the Lake build index. -/
 def recBuildWithIndex (info : BuildInfo) : FetchM (Job (BuildData info.key)) :=
@@ -73,7 +107,10 @@ def recBuildWithIndex (info : BuildInfo) : FetchM (Job (BuildData info.key)) :=
         let recFetch := config.fetchFn <| cast (by simp [h]) data
         if config.memoize then
           let key := BuildKey.facet target facet
-          fetchOrCreateJob key recFetch
+          if config.buildable then
+            fetchOrCreateJob key recFetch
+          else
+            fetchOrCreateInfoJob key recFetch
         else
           recFetch
       else

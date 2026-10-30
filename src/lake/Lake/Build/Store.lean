@@ -31,55 +31,91 @@ public structure BuildStore where
   /-- The job of each build key fetched so far. -/
   jobs : Std.DTreeMap BuildKey (Job <| BuildData ·) BuildKey.quickCmp := Std.DTreeMap.empty
   /--
-  The keys whose jobs a fetch is making now, each with the promise that the fetch resolves once it has stored the
-  job, or once making it failed.
+  The keys whose jobs a fetch is making now, each with the promise of the fetches that wait for it, if any (see
+  `BuildStore.wait`). The fetch that makes the job resolves it when it ends the reservation.
   -/
-  reserved : Std.DTreeMap BuildKey (fun _ => IO.Promise Unit) BuildKey.quickCmp := Std.DTreeMap.empty
+  reserved : Std.DTreeMap BuildKey (fun _ => Option (IO.Promise Unit)) BuildKey.quickCmp := Std.DTreeMap.empty
+  /--
+  How many jobs have been stored. Every change of `jobs` must increase it (`insert`, `finish`): `reserve` relies on it.
+  -/
+  stores : Nat := 0
 
 @[inline] public def BuildStore.empty : BuildStore := {}
 
 namespace BuildStore
 
 /-- The job stored for `key`, if any. -/
-@[inline] public def get? (self : BuildStore) (key : BuildKey) : Option (Job (BuildData key)) :=
+public def get? (self : BuildStore) (key : BuildKey) : Option (Job (BuildData key)) :=
   self.jobs.get? key
 
 /--
 Stores `job` as the job of `key`, without regard to reservations. A fetch that makes a job uses `reserve` and `finish`
 (`fetchOrCreateJob`), so that two threads do not both make it.
 -/
-@[inline] public def insert (self : BuildStore) (key : BuildKey) (job : Job (BuildData key)) : BuildStore :=
-  {self with jobs := self.jobs.insert key job}
+public def insert (self : BuildStore) (key : BuildKey) (job : Job (BuildData key)) : BuildStore :=
+  {self with jobs := self.jobs.insert key job, stores := self.stores + 1}
 
 /-- The outcome of `BuildStore.reserve`. -/
 public inductive Reservation (key : BuildKey)
   /-- The store has the job of the key. -/
   | stored (job : Job (BuildData key))
-  /-- Another fetch is making the job of the key: it resolves this promise once it has stored it or failed. -/
-  | taken (other : IO.Promise Unit)
+  /-- Another fetch is making the job of the key. -/
+  | taken
   /-- The caller now makes the job of the key. It must then call `finish` or `release`. -/
   | made
 
 /--
-Reserves `key` for the caller, who then makes its job and resolves `promise`, unless the store has the job of `key`
-or another fetch has reserved it. Run it atomically (`modifyGet` of the store's reference).
+Reserves `key` for the caller, who then makes its job, unless the store has the job of `key` or another fetch has
+reserved it. Run it atomically (`modifyGet` of the store's reference). `missedAt` is `stores` of a store in which
+the caller found no job for `key`: if no job was stored since, the store still has none, and `reserve` does not look
+again.
 -/
-public def reserve (self : BuildStore) (key : BuildKey) (promise : IO.Promise Unit) :
-    Reservation key × BuildStore :=
+public def reserve (self : BuildStore) (key : BuildKey) (missedAt : Nat) : Reservation key × BuildStore :=
+  let stored? := if self.stores == missedAt then none else self.jobs.get? key
+  match stored? with
+  | some job => (.stored job, self)
+  | none =>
+    if self.reserved.contains key then (.taken, self)
+    else (.made, {self with reserved := self.reserved.insert key none})
+
+/-- The outcome of `BuildStore.wait`. -/
+public inductive Wait (key : BuildKey)
+  /-- The store has the job of the key. -/
+  | stored (job : Job (BuildData key))
+  /-- Another fetch is making the job of the key: it resolves this promise when it ends the reservation. -/
+  | until (promise : IO.Promise Unit)
+  /-- Nobody has reserved the key. -/
+  | free
+
+/--
+Joins the fetches that wait for the reservation of `key`, if there is one: the result is the promise that the fetch
+that holds the reservation resolves when it ends it. `promise` becomes that promise if no fetch waits yet. Run it
+atomically (`modifyGet` of the store's reference).
+-/
+public def wait (self : BuildStore) (key : BuildKey) (promise : IO.Promise Unit) : Wait key × BuildStore :=
   match self.jobs.get? key with
   | some job => (.stored job, self)
   | none =>
     match Std.DTreeMap.Const.get? self.reserved key with
-    | some other => (.taken other, self)
-    | none => (.made, {self with reserved := self.reserved.insert key promise})
+    | some (some other) => (.until other, self)
+    | some none => (.until promise, {self with reserved := self.reserved.insert key (some promise)})
+    | none => (.free, self)
 
-/-- Stores `job` as the job of the reserved `key` and ends the reservation. -/
-@[inline] public def finish (self : BuildStore) (key : BuildKey) (job : Job (BuildData key)) : BuildStore :=
-  {jobs := self.jobs.insert key job, reserved := self.reserved.erase key}
+/--
+Stores `job` as the job of the reserved `key` and ends the reservation. The result is the promise of the fetches that
+wait for it, if any, which the caller must resolve.
+-/
+public def finish (self : BuildStore) (key : BuildKey) (job : Job (BuildData key)) :
+    Option (IO.Promise Unit) × BuildStore :=
+  ((Std.DTreeMap.Const.get? self.reserved key).join,
+    {jobs := self.jobs.insert key job, reserved := self.reserved.erase key, stores := self.stores + 1})
 
-/-- Ends the reservation of `key` without a job. -/
-@[inline] public def release (self : BuildStore) (key : BuildKey) : BuildStore :=
-  {self with reserved := self.reserved.erase key}
+/--
+Ends the reservation of `key` without a job. The result is the promise of the fetches that wait for it, if any, which
+the caller must resolve.
+-/
+public def release (self : BuildStore) (key : BuildKey) : Option (IO.Promise Unit) × BuildStore :=
+  ((Std.DTreeMap.Const.get? self.reserved key).join, {self with reserved := self.reserved.erase key})
 
 /-- Reads and writes the store's jobs without regard to reservations (see `BuildStore.insert`). -/
 public instance [MonadLiftT (ST ω) m] [Monad m] :
