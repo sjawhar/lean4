@@ -401,12 +401,13 @@ public structure ClosureEntry where
   keyed? : Option Nat
 
 /-- A decision's closure (`importArts`) in its order, as every closure-wide check of the decision walks it: its
-modules (`entries`), and the names of those that are not `module` files (`keyed`, as `keyedModules` lists them). The
-closure, the build's cells and `findModule?` do not change during a build, so a decision makes it once
-(`ContentHashes.view`). -/
+modules (`entries`), the names of those that are not `module` files (`keyed`, as `keyedModules` lists them) and the
+names of the others (`modsys`). The closure, the build's cells and `findModule?` do not change during a build, so a
+decision makes it once (`ContentHashes.view`). -/
 public structure ClosureView where
   entries : Array ClosureEntry
   keyed : Array Name
+  modsys : Array Name
 
 /-- A decision's bindings of one kind (`kept`, `ContentHashes.reads`) of the keyed modules of its view
 (`ClosureView.keyed`), in order (`boundKeyed`): a check reads them only through `KeyedBindings.usage?` and
@@ -1088,6 +1089,7 @@ def ContentHashes.closureView (hashes : ContentHashes) (importArts : NameMap Imp
   let snap ← usageFactsSnapshot
   let mut entries := Array.emptyWithCapacity importArts.size
   let mut keyed := #[]
+  let mut modsys := #[]
   for (m, arts) in importArts do
     let cell? := snap.cell? m
     let findable ← match cell? with
@@ -1095,8 +1097,8 @@ def ContentHashes.closureView (hashes : ContentHashes) (importArts : NameMap Imp
       | none => do pure (← findModule? m).isSome
     let keyed? := if arts.oleanServer?.isSome then none else some keyed.size
     entries := entries.push { name := m, arts, cell?, findable, keyed? }
-    if arts.oleanServer?.isNone then keyed := keyed.push m
-  let view := { entries, keyed }
+    if arts.oleanServer?.isNone then keyed := keyed.push m else modsys := modsys.push m
+  let view := { entries, keyed, modsys }
   hashes.view.set (some { importArts, view })
   return view
 
@@ -1292,32 +1294,34 @@ public def usekeyBefore (importArts : NameMap ImportArtifacts) (decision? : Opti
 
 /--
 Whether every edge of the closure is current: for every module `x` of the closure that is not a module-system file
-(`keyedModules`) and every direct import `y` of `x` recorded with a closure (`UsageImport.importedClosures`), `y`'s
-current `closure`, read through `importUsage?`, is the one `x`'s compile imported. `closureHash` reads only the direct
-imports' records of their closures, and such a record names the closures its compile read: another workspace can
-rewrite a shared dependency after this build kept or compiled an intermediate module, which then still records the
-dependency's old closure. With every edge current, every recorded closure describes the current files. A module-system
-file imports only module-system files, whose bytes `modsysHash` pins, so no edge into a keyed module starts at one.
-An `x` whose `y` is a toolchain module or a module-system file, or has no digests, records no closure for it, or one
-pinned as above: only `y`s that `importUsage?` reads are compared, and one it cannot read fails the check. With
-`kept`, a kept module's recorded closures count too: a module is kept only when its closure was unchanged, so they
-were current at the accept. The closure's modules are read in parallel (`readImports`).
+(`ClosureView.keyed`) and every direct import `y` of `x` recorded with a closure (`UsageImport.importedClosures`),
+`y`'s current `closure`, read through `importUsage?` with `kept`, is the one `x`'s compile imported. `closureHash`
+reads only the direct imports' records of their closures, and such a record names the closures its compile read:
+another workspace can rewrite a shared dependency after this build kept or compiled an intermediate module, which then
+still records the dependency's old closure. With every edge current, every recorded closure describes the current
+files. A module-system file imports only module-system files, whose bytes `modsysHash` pins, so no edge into a keyed
+module starts at one. An `x` whose `y` is a toolchain module or a module-system file, or has no digests, records no
+closure for it, or one pinned as above: only `y`s of the closure are compared, and one `importUsage?` accepts nothing
+for fails the check. A kept module's recorded closures count too: a module is kept only when its closure was
+unchanged, so they were current at the accept. The closure's modules are bound in two passes, its keyed modules
+(`boundKeyed`) and then its module-system files (`readImports`), each in parallel; a binding's log is replayed when
+the walk first meets the module, as before.
 -/
-def closureEdgesCurrent (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) (kept := false) :
-    JobM Bool := do
-  readImports hashes importArts (keyedModules importArts) (kept := kept)
-  let bound ← (hashes.reads kept).get
-  for (x, arts) in importArts do
-    if arts.oleanServer?.isSome then continue
-    let some (_, imp) ← importUsageIn? hashes importArts bound x (kept := kept) | return false
+def closureEdgesCurrent (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) : JobM Bool := do
+  let (view, bound) ← boundKeyed hashes importArts (kept := true)
+  readImports hashes importArts view.modsys (kept := true)
+  let reads ← hashes.keptImports.get
+  for e in view.entries do
+    if e.keyed?.isNone then continue
+    let some (_, imp) ← bound.usage? hashes importArts e | return false
     for (y, recorded) in imp.importedClosures do
       -- an importee bound to an `.olean` is one of the closure
-      if let some (log, .ok (some (_, cur))) := bound[y]? then
+      if let some (log, .ok (some (_, cur))) := reads[y]? then
         if log.isEmpty then
           unless cur.closure == recorded do return false
           continue
       unless importArts.contains y do continue
-      let some (_, cur) ← importUsage? hashes importArts y (kept := kept) | return false
+      let some (_, cur) ← importUsage? hashes importArts y (kept := true) | return false
       unless cur.closure == recorded do return false
   return true
 
@@ -1784,7 +1788,7 @@ used changed, the providers of a specialization-cache key it looked up, or a mod
 `recheck`: a kept module's digests describe its declarations as Lean compiled them, so an importer of a kept module is
 re-checked or compiled, never skipped, until that module compiles again. A kept import's recorded closure is the one
 before the accept (`closureHash` with `kept`): it serves only to tell whether the closure changed, and its recorded
-closures only to tell whether the closure's edges are current (`closureEdgesCurrent` with `kept`).
+closures only to tell whether the closure's edges are current (`closureEdgesCurrent`, which reads with `kept`).
 
 The records are `files`: by default the module's own, in its build directory; the usage index's lookup
 (`Module.restoreFromUsageIndex?`) decides a cached compile of the module the same way. Every file is read in
@@ -1823,7 +1827,7 @@ public def Module.usageVerdict (mod : Module) (presetup : ModulePreSetup)
       | return .compile s!"{m}, whose machinery it used, has no current usage record"
     unless (← contentHash hashes olean) == oleanHash && imp.moduleDigest == digest do
       return .compile s!"{m}, whose machinery it used, changed"
-  unless (← closureEdgesCurrent hashes importArts (kept := true)) do
+  unless (← closureEdgesCurrent hashes importArts) do
     return .compile "an import's closure changed after a module of its closure was compiled or kept"
   unless (← usage.resolvedUnchanged presetup files.resolved? hashes importArts) do
     return .compile "a name it looked up, used or referred to may now resolve to another module"
