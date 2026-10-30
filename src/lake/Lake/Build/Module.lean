@@ -106,11 +106,20 @@ structure ModuleImportData where
           let impSet := if imp.includeSelf then impSet.insert imp.module else impSet
           .ok impSet s
         | .error e s => .error e s
-      | .error _ _ =>
-        let entry := LogEntry.error s!"{fileName}: bad import '{imp.module.name}'"
-        match r with
-        | .ok _ s => .error 0 (s.logEntry entry)
-        | .error e s => .error e (s.logEntry entry)
+      | .error _ si =>
+        -- A failed import whose log holds no error was canceled (`--fail-fast`): Lake logs every genuine failure as an
+        -- error, and `Job.await` replays a canceled job's log without its `canceled` flag. It cancels the importer and
+        -- is not a bad import. The threshold is error level, not the monitor's `failLv`.
+        if !(si.log.hasEntries && si.log.maxLv ≥ .error) then
+          match r with
+          | .ok _ s => .error s.log.endPos
+            {s.logEntry (.trace "canceled after earlier build failure") with canceled := true}
+          | .error e s => .error e {s with canceled := true}
+        else
+          let entry := LogEntry.error s!"{fileName}: bad import '{imp.module.name}'"
+          match r with
+          | .ok _ s => .error 0 (s.logEntry entry)
+          | .error e s => .error e (s.logEntry entry)
     match r with
     | .ok impSet s => .ok impSet.toArray s
     | .error e s => .error e s
@@ -664,7 +673,14 @@ def Module.recFetchPreSetup (mod : Module) : FetchM (Job ModulePreSetup) := ensu
   -/
   let precompileImports ← if mod.shouldPrecompileImports then
     mod.transImports.fetch else mod.precompileImports.fetch
-  let precompileImports ← precompileImports.await
+  let precompileImports ← match (← precompileImports.wait) with
+    | .ok imps {log, ..} => log.replay; pure imps
+    | .error n s =>
+      -- A failed result whose log holds no error was canceled (see `collectImportsAux`): it cancels this module and
+      -- is neither a failure nor a bad import. A bad import found next to it is still reported.
+      if !(s.log.hasEntries && s.log.maxLv ≥ .error) then
+        return .ofTask <| .pure <| .error 0 {canceled := true}
+      s.log.replay; throw n
   let impLibsJob ← Job.collectArray (traceCaption := "import dynlibs") <$>
     mod.fetchImportLibs precompileImports mod.shouldPrecompile mod.shouldPrecompileImports
 
