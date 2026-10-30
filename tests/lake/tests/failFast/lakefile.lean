@@ -42,7 +42,9 @@ target slowC pkg : Unit := do
   jobA.mapM fun _ =>
     IO.FS.writeFile (pkg.dir / "slowC.produced.out") ""
 
--- `needs` gates the module builds on `slowA`, covering cancellation of the
--- module pipeline itself rather than just of bare target continuations.
+-- `needs` gates the module builds on `slowA`. The library's module collection
+-- waits for its `needs`, so under `--fail-fast` (where `slowA` finishes only
+-- after the first failure) `Slow` makes no module jobs at all; without it,
+-- `Slow` builds after `slowA`.
 @[default_target] lean_lib Slow where
   needs := #[slowA]

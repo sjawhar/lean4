@@ -32,10 +32,19 @@ structure ModuleCollection where
 /--
 Collect the local modules of a library.
 That is, the modules from `getModuleArray` plus their local transitive imports.
+
+The walk reads the library's sources only after the library's extra dependencies (e.g., `needs`) have finished, as
+`Module.recFetchPreSetup` does for each module, so that they can write or change the sources ([1]). It does not
+fail when they fail: the builds of the library's modules await them and report the failure. A library without globs
+has no modules (`getModuleArray` expands only the globs), so its walk reads no source and does not wait.
+
+[1]: https://github.com/leanprover/lean4/issues/13598
 -/
 partial def LeanLib.recCollectLocalModules
   (self : LeanLib) : FetchM (Job (Array Module))
 := ensureJob do
+  unless self.config.globs.isEmpty do
+    discard <| (← self.extraDep.fetch).wait
   let mut col : ModuleCollection := {}
   for mod in (← self.getModuleArray) do
     col ← go mod col (viaImport := false)
