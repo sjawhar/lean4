@@ -842,6 +842,11 @@ def parallelMap (xs : Array α) (f : α → BaseIO β) : JobM (Array β) := do
     out := out ++ (← IO.wait chunk)
   return out
 
+/-- Whether the checks log which closure records they took: with `LAKE_USAGE_CUTOFF_TRACE`
+(`Lake.Env.logUsageCutoffRecords`) and `-v` only, for the usage-cutoff tests, which match these lines. -/
+public def logsUsageCutoffRecords : JobM Bool :=
+  return (← getLakeEnv).logUsageCutoffRecords && (← getIsVerbose)
+
 /-- The build's reads of closures (`BuildContext.usageFacts`) as they are now: a pass of a decision takes one snapshot
 and looks its records up in it without a lock. -/
 public def usageFactsSnapshot [Monad m] [MonadBuild m] [MonadLiftT BaseIO m] : m UsageFacts := do
@@ -941,8 +946,7 @@ def bindArts (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) : J
       for p in c.2.paths, d in c.2.digests do
         taken := taken.push (p, d)
   if took.isEmpty then return 0
-  -- With `-v` only: the records this pass took, which the usage-cutoff tests match
-  if ← getIsVerbose then
+  if ← logsUsageCutoffRecords then
     for (m, _) in took do logVerbose s!"usage cutoff: fact arts taken {m}"
   hashes.arts.modify fun all => took.foldl (fun a (m, f) => a.insert m f) all
   hashes.taken.modify fun all => taken.foldl (fun a (p, d) => a.insert p d) all
@@ -1174,8 +1178,7 @@ def bindFacts (hashes : ContentHashes) (importArts : NameMap ImportArtifacts) (m
       took := took.push c
       if let some (_, d) := c.2.olean? then taken := taken.push (c.2.olean, d)
   unless took.isEmpty do
-    -- With `-v` only: the records this pass took, which the usage-cutoff tests match
-    if ← getIsVerbose then
+    if ← logsUsageCutoffRecords then
       for (m, _) in took do logVerbose s!"usage cutoff: fact import taken {m}"
     hashes.facts.modify fun all => took.foldl (fun a (m, f) => a.insert m f) all
     hashes.taken.modify fun all => taken.foldl (fun a (p, d) => a.insert p d) all
