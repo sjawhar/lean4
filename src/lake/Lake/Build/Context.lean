@@ -87,10 +87,12 @@ public structure RemoteReadStatus where
   failures : Nat := 0
   lastError : String := ""
   /--
-  How many reads of the shared remote cache in a row failed once their transfers had waited for a
-  remote that did not answer (see `noteRemoteRead`).
+  How many reads of the shared remote cache in a row failed without an answer: their transfers
+  waited for a remote that did not answer, or could not reach it (see `noteRemoteRead`).
   -/
-  timeoutsInRow : Nat := 0
+  unansweredInRow : Nat := 0
+  /-- When that row started (`IO.monoMsNow`, see `noteRemoteRead`). -/
+  unansweredSince : Nat := 0
   /-- Why this build stopped reading the shared remote cache, once it has (see `noteRemoteRead`). -/
   stopped? : Option String := none
   deriving Inhabited
