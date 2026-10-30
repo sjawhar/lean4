@@ -310,9 +310,22 @@ def BuildContext.saveOutputs
     if isVerbose then
       log.replay
 
-def reportResult (cfg : BuildConfig) (out : IO.FS.Stream) (result : MonitorResult) : BaseIO Unit := do
+structure BuildResult (α : Type u) extends MonitorResult where
+  out : Except String α
+
+instance : CoeOut (BuildResult α) MonitorResult := ⟨BuildResult.toMonitorResult⟩
+
+@[inline] def BuildResult.isOk (self : BuildResult α) : Bool :=
+  self.out.isOk
+
+/--
+Reports how the build ended: the jobs that logged failures, or that it succeeded. A build can fail
+with no job that logged a failure (an `uncaught top-level build failure`, which the caller reports):
+then neither is printed.
+-/
+def reportResult (cfg : BuildConfig) (out : IO.FS.Stream) (result : BuildResult α) : BaseIO Unit := do
   if result.failures.isEmpty then
-    if cfg.showProgress && cfg.showSuccess then
+    if result.isOk && cfg.showProgress && cfg.showSuccess then
       let numJobs := result.numJobs
       if numJobs == 0 then
         print! out "Nothing to build.\n"
@@ -326,14 +339,6 @@ def reportResult (cfg : BuildConfig) (out : IO.FS.Stream) (result : MonitorResul
     print! out "Some required targets logged failures:\n"
     result.failures.forM (print! out s!"- {·}\n")
     flush out
-
-structure BuildResult (α : Type u) extends MonitorResult where
-  out : Except String α
-
-instance : CoeOut (BuildResult α) MonitorResult := ⟨BuildResult.toMonitorResult⟩
-
-@[inline] def BuildResult.isOk (self : BuildResult α) : Bool :=
-  self.out.isOk
 
 def monitorJob (ctx : MonitorContext) (job : Job α) : BaseIO (BuildResult α) := do
   let result ← monitorJobs' ctx #[job]

@@ -30,6 +30,17 @@ test_exp "$failures" = "- test/failingNeed"
 
 ./clean.sh
 
+echo "# TEST: a build whose only failure no job logged does not report that it completed successfully"
+if lake_out build lateNoError; then rc=0; else rc=$?; fi
+test_exp "$rc" = 1
+test_exp -n "$(grep -F 'uncaught top-level build failure' produced.out)"
+if grep -E 'Build completed successfully|All targets up-to-date' produced.out; then
+  echo "FAILURE: a failed build reported as a success"
+  exit 1
+fi
+
+./clean.sh
+
 echo "# TEST: under --fail-fast, an executable whose root imports a canceled module is canceled, not bad imports"
 test_err "Some required targets logged failures" build --fail-fast Fail slowA app Slow
 test_exp ! -f .lake/build/bin/app
