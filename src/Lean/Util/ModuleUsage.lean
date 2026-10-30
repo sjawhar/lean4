@@ -807,15 +807,18 @@ private def u8 (b : ByteArray) : DecM UInt8 := do
   set (i + 1)
   return b[i]!
 
+/-- The eight bytes of `b` from `i`, little-endian (`Enc.u64`); the caller checks that they exist. -/
+@[inline] private def u64At (b : ByteArray) (i : Nat) : UInt64 :=
+  b[i]!.toUInt64 ||| (b[i + 1]!.toUInt64 <<< 8) ||| (b[i + 2]!.toUInt64 <<< 16) ||| (b[i + 3]!.toUInt64 <<< 24) |||
+    (b[i + 4]!.toUInt64 <<< 32) ||| (b[i + 5]!.toUInt64 <<< 40) ||| (b[i + 6]!.toUInt64 <<< 48) |||
+    (b[i + 7]!.toUInt64 <<< 56)
+
 /-- `Enc.u64`: little-endian. -/
 private def u64 (b : ByteArray) : DecM UInt64 := do
   let i ← get
   unless i + 8 ≤ b.size do throw "truncated"
   set (i + 8)
-  let mut v : UInt64 := 0
-  for k in [0:8] do
-    v := v ||| (b[i + k]!.toUInt64 <<< (8 * k).toUInt64)
-  return v
+  return u64At b i
 
 private def str (b : ByteArray) : DecM String := do
   let n := (← u64 b).toNat
@@ -842,10 +845,26 @@ private def name (b : ByteArray) : DecM Name := do
     | t => throw s!"unknown name component tag {t}"
   return n
 
+/-- `count` entries of group `g` from position `i` (each `Enc.u64` `hi` and `lo`, then `Enc.u8` kinds: 17 bytes) added
+to `entries`, with `live` raised by each entry with nonzero kinds, and the position after them: one group's entries as
+`decodeM` reads them, in the same order and with the same failures, by position, without a state per entry. -/
+private def entriesAt (b : ByteArray) (g : Nat) :
+    Nat → Nat → Nat → Std.HashMap Digest (Nat × UInt8) → Except String (Std.HashMap Digest (Nat × UInt8) × Nat × Nat)
+  | 0, i, live, entries => .ok (entries, live, i)
+  | count + 1, i, live, entries =>
+    if i + 17 ≤ b.size then
+      let d : Digest := ⟨u64At b i, u64At b (i + 8)⟩
+      let k := b[i + 16]!
+      match entries.containsThenInsert d (g, k) with
+      | (true, _) => .error s!"two entries of the identity {d.hex}"
+      | (false, entries) => entriesAt b g count (i + 17) (if k != 0 then live + 1 else live) entries
+    else .error "truncated"
+
 private def decodeM (bytes : ByteArray) : DecM ResolvedTable := do
   let mut modules := #[]
   let mut provided := #[]
-  let mut entries : Std.HashMap Digest (Nat × UInt8) := {}
+  -- each entry takes 17 bytes, so this is room for every entry the bytes can hold
+  let mut entries : Std.HashMap Digest (Nat × UInt8) := Std.HashMap.emptyWithCapacity (bytes.size / 17)
   let mut seen : Std.HashSet (Option Name) := {}
   for _ in [0:(← nat bytes)] do
     let m? ← match ← u8 bytes with
@@ -855,13 +874,10 @@ private def decodeM (bytes : ByteArray) : DecM ResolvedTable := do
     if seen.contains m? then throw s!"two groups of the module {m?}"
     seen := seen.insert m?
     let g := modules.size
-    let mut live := 0
-    for _ in [0:(← nat bytes)] do
-      let d : Digest := ⟨← u64 bytes, ← u64 bytes⟩
-      let k ← u8 bytes
-      if entries.contains d then throw s!"two entries of the identity {d.hex}"
-      entries := entries.insert d (g, k)
-      if k != 0 then live := live + 1
+    let count ← nat bytes
+    let (es, live, i) ← (entriesAt bytes g count (← get) 0 entries : Except String _)
+    set i
+    entries := es
     modules := modules.push m?
     provided := provided.push live
   unless (← get) == bytes.size do throw "trailing bytes"

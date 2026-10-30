@@ -8,6 +8,8 @@ cd work
 # The kept/plain projection is pure, so this direct check isolates it from later closure checks that also reject kept
 # modules.
 test_out "ok" env lean ../project.lean
+# The reader of `.resolved` sidecars agrees with the reference reader on tables, truncations, changed and appended bytes.
+test_out "ok" env lean ../resolved.lean
 
 # Store the Lake cache in the test directory, never the system cache
 export LAKE_CACHE_DIR=
