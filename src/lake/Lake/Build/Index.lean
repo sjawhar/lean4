@@ -25,6 +25,34 @@ open System (FilePath)
 
 namespace Lake
 
+/--
+Returns the job of `key` from the build store, or makes it with `create` and stores it. Atomic across the build's
+threads (`BuildStore.reserve`): while one fetch runs `create`, another fetch of `key` waits until it returns and then
+returns the job that it stored. If `create` fails, the next waiting fetch runs `create` itself.
+
+So a fetch can block. A fetch in a `(sync := true)` continuation (`Job.mapM`, `Job.bindM`) panics if it has to wait
+(`Task.get` from a sync task); fetch in the `FetchM` code that makes the job instead.
+-/
+partial def fetchOrCreateJob
+  (key : BuildKey) [t : FamilyOut (Job <| BuildData ·) key α] (create : FetchM α)
+: FetchM α := do
+  if let some job := (← getThe BuildStore).get? key then
+    return cast t.fam_eq job
+  let promise ← IO.Promise.new
+  match ← modifyGetThe BuildStore (·.reserve key promise) with
+  | .stored job => return cast t.fam_eq job
+  | .taken other =>
+    discard <| IO.wait other.result?
+    fetchOrCreateJob key create
+  | .made =>
+    let job ← try create catch e =>
+      modifyThe BuildStore (·.release key)
+      promise.resolve ()
+      throw e
+    modifyThe BuildStore (·.finish key (cast t.fam_eq.symm job))
+    promise.resolve ()
+    return job
+
 /-- Recursive build function for anything in the Lake build index. -/
 def recBuildWithIndex (info : BuildInfo) : FetchM (Job (BuildData info.key)) :=
   match info with
@@ -32,7 +60,7 @@ def recBuildWithIndex (info : BuildInfo) : FetchM (Job (BuildData info.key)) :=
     if let some decl := pkg.findTargetDecl? target then
       if h : decl.kind.isAnonymous then
         let key := BuildKey.packageTarget pkg.keyName target
-        fetchOrCreate key do (decl.targetConfig h).fetchFn pkg
+        fetchOrCreateJob key do (decl.targetConfig h).fetchFn pkg
       else
         let kind := ⟨decl.kind, by simp [decl.target_eq_type h]⟩
         let job := Job.pure (kind := kind) <| decl.mkConfigTarget pkg
@@ -45,7 +73,7 @@ def recBuildWithIndex (info : BuildInfo) : FetchM (Job (BuildData info.key)) :=
         let recFetch := config.fetchFn <| cast (by simp [h]) data
         if config.memoize then
           let key := BuildKey.facet target facet
-          fetchOrCreate key recFetch
+          fetchOrCreateJob key recFetch
         else
           recFetch
       else
