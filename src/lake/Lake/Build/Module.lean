@@ -441,11 +441,23 @@ def fetchImportInfo
 : FetchM (Job ModuleImportInfo) := do
   let nonModule := !header.isModule
   -- The fold below reaches an import's own imports only after it awaits that import's header. Fetched here first,
-  -- the headers of all the imports are read side by side instead of one after another.
+  -- the headers of all the imports are read side by side instead of one after another. A header is fetched only
+  -- once its library's extra dependencies (`needs`, `extraDepTargets`) have finished, as `Module.recFetchPreSetup`
+  -- awaits them before it reads the source, and not at all when they failed, as then that does not read it either.
+  let mut libs : Array (Name × Name × Job Unit) := #[]
+  let mut mods : Array Module := #[]
   for imp in header.imports do
     unless modName = imp.module do
       for mod in ← findModules imp.module do
-        discard mod.header.fetch
+        mods := mods.push mod
+        unless libs.any fun (p, l, _) => p == mod.pkg.keyName && l == mod.lib.name do
+          libs := libs.push (mod.pkg.keyName, mod.lib.name, ← mod.lib.extraDep.fetch)
+  let mut ready : Array (Name × Name) := #[]
+  for (p, l, job) in libs do
+    if (← job.wait?).isSome then ready := ready.push (p, l)
+  for mod in mods do
+    if ready.contains (mod.pkg.keyName, mod.lib.name) then
+      discard mod.header.fetch
   let info := ModuleImportInfo.nil modName
   let impArtsJob : Job ModuleImportInfo := .pure info
   header.imports.foldlM (init := impArtsJob) fun s imp => do

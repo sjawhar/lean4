@@ -49,7 +49,10 @@ def MonitorWake.signal (self : MonitorWake) : BaseIO Unit := do
   self.woken.atomically (set true)
   self.condvar.notifyAll
 
-/-- Counts `job` in `pending` until it finishes. The monitor calls it once per job, when it first sees it unfinished. -/
+/--
+Counts `job` in `pending` until it finishes. The monitor calls it once per job: at its start for the initial jobs, and
+for the other jobs when it first sees them unfinished.
+-/
 def MonitorWake.watch (self : MonitorWake) (job : OpaqueJob) : BaseIO Unit := do
   self.pending.modify (· + 1)
   BaseIO.chainTask (sync := true) job.task fun _ => do
@@ -83,7 +86,7 @@ structure MonitorContext where
   useAnsi : Bool
   showProgress : Bool
   showTime : Bool
-  /-- How often to poll jobs (in milliseconds). -/
+  /-- The longest time between two polls of the jobs (in milliseconds). -/
   updateFrequency : Nat
   /-- Whether to set `cancelTk?` on the first required target failure (`--fail-fast`). -/
   failFast : Bool := false
