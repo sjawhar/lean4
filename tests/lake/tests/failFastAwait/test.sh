@@ -16,6 +16,20 @@ fi
 
 ./clean.sh
 
+# Verbose, so that a job that only ran is shown (`✔ ... Ran`). The failure is listed once, for the job that logged it.
+echo "# TEST: without --fail-fast, the jobs that depend on a job that failed are shown as failed, not as run"
+if lake_out build -v NeedsFail; then rc=0; else rc=$?; fi
+test_exp "$rc" = 1
+if grep -E '^✔ .*Ran (NeedsFail|NeedsFail:irArts|test/NeedsFail:default)$' produced.out; then
+  echo "FAILURE: a job that depends on a failed job reported as run"
+  exit 1
+fi
+test_exp -n "$(grep -E '^✖ .*Running NeedsFail$' produced.out)"
+failures=$(sed -n '/^Some required targets logged failures:$/,/^error: build failed$/p' produced.out | grep '^- ' || true)
+test_exp "$failures" = "- test/failingNeed"
+
+./clean.sh
+
 echo "# TEST: under --fail-fast, an executable whose root imports a canceled module is canceled, not bad imports"
 test_err "Some required targets logged failures" build --fail-fast Fail slowA app Slow
 test_exp ! -f .lake/build/bin/app
