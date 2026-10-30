@@ -345,12 +345,13 @@ def cellFor (snap : BuildStore) (facts : UsageFacts) (fresh : Std.HashMap Name M
   return (c, fresh.insert mod.name c)
 
 /--
-`fetchTransImportArts` of a non-`module` importer (`nonModule`), from the build's cells of the modules it reaches
-(`ModuleCell`, `BuildContext.usageFacts`), each made once per build from the jobs that walk awaits. A non-`module`
-importer imports every module its imports reach, each at the private level (`allArts`): the map starts from
-`directArts`, and a module the walk reaches gets its cell's `allArts` and its imports are walked, unless the map holds
-it already with an entry that is not a `module` file's, as in `fetchTransImportArts`. So the map has the same entries,
-and the walk waits on the same jobs the first time it meets a module. The cells it made are published in one batch.
+`fetchTransImportArts` of a non-`module` importer (`nonModule`) with the usage cutoff on (`mkModuleSetup`), from the
+build's cells of the modules it reaches (`ModuleCell`, `BuildContext.usageFacts`), each made once per build from the
+jobs that walk awaits. A non-`module` importer imports every module its imports reach, each at the private level
+(`allArts`): the map starts from `directArts`, and a module the walk reaches gets its cell's `allArts` and its imports
+are walked, unless the map holds it already with an entry that is not a `module` file's, as in `fetchTransImportArts`.
+So the map has the same entries, and the walk waits on the same jobs the first time it meets a module. The cells it
+made are published in one batch.
 -/
 def fetchNonModuleImportArts (directImports : Array ModuleImport) (directArts : NameMap ImportArtifacts) :
     FetchM (NameMap ImportArtifacts) := do
@@ -801,10 +802,11 @@ public def Module.depsFacetConfig : ModuleFacetConfig depsFacet :=
   mkFacetJobConfig fun mod => (·.toOpaque) <$> mod.presetup.fetch
 
 def mkModuleSetup (mod : Module) (presetup : ModulePreSetup) : FetchM ModuleSetup := do
-  let importArts ← if presetup.isModule then
-      fetchTransImportArts presetup.directImports presetup.directImportArts false
-    else
+  -- The cells serve the cutoff's checks only: with the cutoff off, no check reads them
+  let importArts ← if !presetup.isModule && (← usageCutoffEnabled) then
       fetchNonModuleImportArts presetup.directImports presetup.directImportArts
+    else
+      fetchTransImportArts presetup.directImports presetup.directImportArts !presetup.isModule
   return {
     name := mod.name
     isModule := presetup.isModule
