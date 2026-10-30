@@ -117,6 +117,9 @@ def reportJob (job : OpaqueJob) : MonitorM PUnit := do
   let maxLv := log.maxLv
   let failed := strictAnd log.hasEntries (maxLv ≥ failLv)
   let canceled := task.get.isCanceled && !failed
+  -- A job whose result is an error failed, even if its log holds no failure (e.g., it awaited a
+  -- registered job, whose result reaches it without its log)
+  let errored := !canceled && task.get matches .error ..
   if wantsRebuild then
     modify fun s => if s.wantsRebuild then s else {s with wantsRebuild := true}
   if failed && !optional then
@@ -126,14 +129,16 @@ def reportJob (job : OpaqueJob) : MonitorM PUnit := do
     (!optional || showOptional) &&
     (hasOutput || canceled || (showProgress && !useAnsi && action ≥ minAction))
   if showJob then
-    let verb := if canceled then "Canceled" else action.verb failed
-    let icon := if hasOutput then maxLv.icon else if canceled then '⊘' else '✔'
+    let verb := if canceled then "Canceled" else action.verb (failed || errored)
+    let icon :=
+      if hasOutput then maxLv.icon else if canceled then '⊘' else if errored then '✖' else '✔'
     let opt := if optional then " (Optional)" else ""
     let time := if showTime && buildTime > 0 then s!" ({formatTime buildTime})" else ""
     let caption := s!"{icon} [{jobNo}/{totalJobs}]{opt} {verb} {caption}{time}"
     let caption :=
       if useAnsi then
-        let color := if hasOutput then maxLv.ansiColor else if canceled then "33" else "32"
+        let color :=
+          if hasOutput then maxLv.ansiColor else if canceled then "33" else if errored then "31" else "32"
         Ansi.chalk color caption
       else
         caption
