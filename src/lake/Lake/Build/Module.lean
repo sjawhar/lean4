@@ -15,6 +15,8 @@ import Lake.Build.Job.Register
 import Lake.Build.Common
 import Lake.Build.Target
 import Init.Omega
+import Init.Data.String.Search
+import Init.Data.Iterators.Consumers
 
 /-! # Module Build Definitions -/
 
@@ -46,13 +48,102 @@ import's IR is loaded (see `Lean.importModulesCore`). When code generation is po
 Build function definitions for a module's builtin facets.
 -/
 
+/-- A source's identity as its stamp (`Module.sourceStampFile`) records it. -/
+def sourceStampIdentity (m : IO.FS.Metadata) : String :=
+  s!"{m.device} {m.inode} {m.byteSize} {m.modified.sec} {m.modified.nsec} \
+    {m.statusChanged.sec} {m.statusChanged.nsec}"
+
+/--
+A module header in a source stamp: `module` or an empty line, then one line per import, with its
+flags (`a`: `import all`, `e`: exported, `m`: `meta`, `-`: not set) and the imported module.
+-/
+def encodeStampHeader (header : ModuleHeader) : String :=
+  header.imports.foldl (init := if header.isModule then "module\n" else "\n") fun s imp =>
+    let flag (b : Bool) (c : String) := if b then c else "-"
+    s ++ s!"{flag imp.importAll "a"}{flag imp.isExported "e"}{flag imp.isMeta "m"} {imp.module}\n"
+
+/-- The header that `encodeStampHeader` encoded as `lines`. -/
+def decodeStampHeader? : List String → Option ModuleHeader
+  | kind :: imports => do
+    let isModule ← match kind with | "module" => some true | "" => some false | _ => none
+    let imports ← imports.toArray.mapM fun line => do
+      let [flags, mod] := line.split ' ' |>.toStringList | none
+      unless flags.length == 3 do none
+      let flag (i : Nat) (c : String) : Option Bool :=
+        let x := ((flags.drop i).take 1).toString
+        if x == c then some true else if x == "-" then some false else none
+      let module := mod.toName
+      if module.isAnonymous then none
+      return {module, importAll := ← flag 0 "a", isExported := ← flag 1 "e", isMeta := ← flag 2 "m"}
+    return {imports, isModule}
+  | [] => none
+
+/-- Nanoseconds since the Unix epoch. -/
+def systemTimeNanos (t : IO.FS.SystemTime) : Int :=
+  t.sec * 1000000000 + t.nsec.toNat
+
+/-- The hash and the header that the source stamp `stamp` records for the identity `ident`. -/
+def readSourceStamp? (stamp ident : String) : Option (Hash × ModuleHeader) := do
+  let first :: header := stamp.split '\n' |>.toStringList | none
+  unless stamp.endsWith "\n" && first.length == 17 + ident.length && first.endsWith s!" {ident}" do none
+  return (← Hash.ofHex? (first.take 16).toString, ← decodeStampHeader? header.dropLast)
+
+/--
+The hash and the parsed header of the source of `mod`, whose metadata `mdata` was read at the
+monotonic time `start` (`IO.monoNanosNow`).
+
+Unless `--rehash` is set, a stamp (`Module.sourceStampFile`) that records the source's current
+identity gives both, and the source is not read. Otherwise the source is read, hashed and parsed,
+and the stamp is written, unless:
+* the build is `--no-build`, which writes nothing to the build directory;
+* the header does not decode back from the stamp's encoding of it (`encodeStampHeader`);
+* the source is on another device than the build directory, or its modification or status change
+  time is less than 2 s before `start` by the clock of the build directory's filesystem (the new
+  stamp's modification time): an edit in that clock tick could keep every part of the identity.
+
+Errors while writing are ignored, as the stamp only lets a later build skip the read.
+-/
+def Module.fetchSourceInfo (mod : Module) (mdata : IO.FS.Metadata) (start : Nat) :
+    JobM (Hash × ModuleHeader) := do
+  let ident := sourceStampIdentity mdata
+  let stampFile := mod.sourceStampFile
+  if (← getTrustHash) then
+    if let .ok stamp ← (IO.FS.readFile stampFile).toBaseIO then
+      if let some info := readSourceStamp? stamp ident then
+        return info
+  let path := mod.leanFile
+  let contents ← IO.FS.readFile path
+  let hash := Hash.ofText contents
+  let header ← Lean.parseImports' contents path.toString
+  let encoded := encodeStampHeader header
+  let exact := (decodeStampHeader? (encoded.split '\n' |>.toStringList).dropLast).any fun h =>
+    h.isModule == header.isModule && h.imports == header.imports
+  if exact && !(← getNoBuild) then
+    let tmp := stampFile.addExtension s!"{← IO.Process.getPID}.tmp"
+    let write : IO Unit := do
+      createParentDirs stampFile
+      IO.FS.writeFile tmp s!"{hash} {ident}\n{encoded}"
+      let elapsed := (← IO.monoNanosNow) - start
+      let tmpData ← tmp.metadata
+      let before := systemTimeNanos tmpData.modified - elapsed
+      let racy (t : IO.FS.SystemTime) := systemTimeNanos t + 2000000000 > before
+      if tmpData.device != mdata.device || racy mdata.modified || racy mdata.statusChanged then
+        IO.FS.removeFile tmp
+      else
+        IO.FS.rename tmp stampFile
+    if let .error _ ← write.toBaseIO then
+      discard <| (removeFileIfExists tmp).toBaseIO
+  return (hash, header)
+
 /-- Parse the header of a Lean file from its source. -/
 def Module.recFetchInput (mod : Module) : FetchM (Job ModuleInput) := Job.async do
   let path := mod.leanFile
-  let contents ← IO.FS.readFile path
-  let trace := {caption := path.toString, mtime := ← getMTime path, hash := .ofText contents}
+  -- The metadata, then the contents: a stamp never pairs an identity with older contents
+  let start ← IO.monoNanosNow
+  let mdata ← path.metadata
+  let (hash, header) ← mod.fetchSourceInfo mdata start
+  let trace := {caption := path.toString, mtime := mdata.modified, hash}
   setTrace trace
-  let header ← Lean.parseImports' contents path.toString
   let imports ← header.imports.mapM fun imp => do
     return ⟨imp, (← findModule? imp.module)⟩
   return {path, header, imports, trace}

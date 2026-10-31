@@ -120,6 +120,13 @@ public abbrev pkg (self : Module) : Package :=
 @[inline] public def traceFile (self : Module) : FilePath :=
   self.leanLibPath "trace"
 
+/--
+The stamp of the module's source: the source's hash and import header, with its device, inode,
+size, and modification and status change times when Lake last read it.
+-/
+@[inline] public def sourceStampFile (self : Module) : FilePath :=
+  self.leanLibPath "lean.stamp"
+
 @[inline] public def irTraceFile (self : Module) : FilePath :=
   self.leanLibPath "ir.trace"
 
