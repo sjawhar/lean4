@@ -62,6 +62,14 @@ opaque fileMode (path : @& System.FilePath) : IO (Option UInt32)
 @[extern "lean_usage_mono_now"]
 opaque monoNow : BaseIO UInt64
 
+/--
+Gives the calling thread's empty heap pages back to the process, and the process's free pages back to the system
+(`mi_collect(true)`; nothing without mimalloc). mimalloc keeps a thread's last empty page of each size class for that
+thread's next allocation, so a thread that made many short-lived maps and arrays and then waits keeps their pages.
+-/
+@[extern "lean_usage_release_thread_memory"]
+opaque releaseThreadMemory : BaseIO Unit
+
 /-- A `monoNow` reading that only ever rises (`ObservedAt.raise`), stored with release order and read with acquire
 order (`ObservedAt.after`): Lake's record that every file of a usage-cutoff record had the recorded stamp in a stat that
 began after the reading. -/

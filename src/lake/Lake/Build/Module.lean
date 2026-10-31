@@ -1837,21 +1837,9 @@ def Module.indexUsage (mod : Module) (presetup : ModulePreSetup) (arts : ModuleO
   cache.writeUsageIndex mod.pkg.cacheScope presetup.localTrace.hash usekey.hash
     (toJson {arts.descrs with ltar? := none}) log compact?
 
-/--
-Skips compiling a module whose trace is stale if usage cutoff applies to it
-(`Module.usageCutoffApplies`), its verdict (`Module.usageVerdict`) is `upToDate`, and its outputs are still what
-the saved trace describes (`Module.keepOutputs?`): replays its saved log and rewrites its trace with `depTrace`,
-which vouches for those outputs under the new input hash. Otherwise, with a writable cache that restores artifacts
-(`cacheWith? = some true`), restores a compile of the module the usage index offers that passes the same check
-(`Module.restoreFromUsageIndex?`), if usage cutoff can apply to the module (`Module.usageIndexApplies`): its build
-directory need not hold outputs. Otherwise, builds it with `compile`, passing the verdict
-and the module setup the check computed, if the cutoff applies, and what the module's decision read
-(`ContentHashes`). With `cacheWith? = some useLocalFile`, the outputs
-it returns are in the cache: kept ones were checked while saving them (`recacheOutputArtifacts?`), as were outputs
-`compile` reports it kept and cached (a kept-module check's accept), restored ones come from it, and built ones are
-saved after the build.
--/
-def Module.skipOrBuild (mod : Module) (presetup : ModulePreSetup) (savedTrace : SavedTrace)
+/-- `Module.skipOrBuild` before it gives back the decision's memory: when it returns, nothing holds the decision's
+`ContentHashes`. -/
+def Module.skipOrBuildCore (mod : Module) (presetup : ModulePreSetup) (savedTrace : SavedTrace)
     (depTrace : BuildTrace) (cacheWith? : Option Bool := none)
     (compile : Option (UsageVerdict × ModuleSetup) → ContentHashes → JobM (ModuleOutputArtifacts × Bool) :=
       fun d? hashes => return (← mod.buildLean presetup (d?.map (·.2)) hashes, false)) :
@@ -1897,6 +1885,33 @@ def Module.skipOrBuild (mod : Module) (presetup : ModulePreSetup) (savedTrace : 
     writeBuildTrace mod.traceFile depTrace (data.outputs?.getD .null) data.log
       (some presetup.localTrace.hash)
     removeFileIfExists (mod.traceFile.addExtension "nobuild")
+  return arts
+
+/--
+Skips compiling a module whose trace is stale if usage cutoff applies to it
+(`Module.usageCutoffApplies`), its verdict (`Module.usageVerdict`) is `upToDate`, and its outputs are still what
+the saved trace describes (`Module.keepOutputs?`): replays its saved log and rewrites its trace with `depTrace`,
+which vouches for those outputs under the new input hash. Otherwise, with a writable cache that restores artifacts
+(`cacheWith? = some true`), restores a compile of the module the usage index offers that passes the same check
+(`Module.restoreFromUsageIndex?`), if usage cutoff can apply to the module (`Module.usageIndexApplies`): its build
+directory need not hold outputs. Otherwise, builds it with `compile`, passing the verdict
+and the module setup the check computed, if the cutoff applies, and what the module's decision read
+(`ContentHashes`). With `cacheWith? = some useLocalFile`, the outputs
+it returns are in the cache: kept ones were checked while saving them (`recacheOutputArtifacts?`), as were outputs
+`compile` reports it kept and cached (a kept-module check's accept), restored ones come from it, and built ones are
+saved after the build.
+
+Then, if usage cutoff can apply to the module, gives the thread's empty memory pages back
+(`Lean.ModuleUsage.releaseThreadMemory`): a decision makes many short-lived maps and arrays, and the thread that made
+them may wait long before it allocates again, while the build's task pool adds a thread for each blocking wait.
+-/
+def Module.skipOrBuild (mod : Module) (presetup : ModulePreSetup) (savedTrace : SavedTrace)
+    (depTrace : BuildTrace) (cacheWith? : Option Bool := none)
+    (compile : Option (UsageVerdict × ModuleSetup) → ContentHashes → JobM (ModuleOutputArtifacts × Bool) :=
+      fun d? hashes => return (← mod.buildLean presetup (d?.map (·.2)) hashes, false)) :
+    JobM ModuleOutputArtifacts := do
+  let arts ← mod.skipOrBuildCore presetup savedTrace depTrace cacheWith? compile
+  if ← mod.usageIndexApplies presetup then ModuleUsage.releaseThreadMemory
   return arts
 
 def  adjustMTime (arts : ModuleOutputArtifacts) (traceFile : FilePath) : JobM ModuleOutputArtifacts := do
