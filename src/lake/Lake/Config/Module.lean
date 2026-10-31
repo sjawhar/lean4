@@ -123,6 +123,13 @@ public abbrev pkg (self : Module) : Package :=
 @[inline] public def irTraceFile (self : Module) : FilePath :=
   self.leanLibPath "ir.trace"
 
+/--
+The stamp of the module's outputs: each output's artifact, with its file's device, inode, size and
+modification time when a build last found the file to be the artifact cache's entry.
+-/
+@[inline] public def outputsStampFile (self : Module) : FilePath :=
+  self.leanLibPath "outputs.stamp"
+
 @[inline] public def irPath (ext : String) (self : Module) : FilePath :=
   self.filePath self.pkg.irDir ext
 

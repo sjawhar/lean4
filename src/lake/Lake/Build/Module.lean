@@ -742,6 +742,7 @@ public def Module.setupFacetConfig : ModuleFacetConfig setupFacet :=
 /-- Remove all existing artifacts produced by a Lean build of the module. -/
 public def Module.clearOutputArtifacts (mod : Module) : IO PUnit := do
   try
+    removeFileIfExists mod.outputsStampFile
     removeFileIfExists mod.ltarFile
     removeFileIfExists mod.oleanFile
     removeFileIfExists mod.oleanServerFile
@@ -1128,6 +1129,105 @@ inductive ModuleFetchState
 | incomplete (savedTrace : SavedTrace) (ltar? : Option Artifact)
 
 /--
+The artifacts of the module's outputs that `descrs` describes, each at its file in the module's
+build directory with the modification time that `mtime` gives for its position, and the
+descriptions and files in that order.
+-/
+def Module.outputArtifacts (mod : Module) (descrs : ModuleOutputDescrs) (mtime : Nat → MTime) :
+    ModuleOutputArtifacts × Array (ArtifactDescr × FilePath) := Id.run do
+  let art (descr : ArtifactDescr) (path : FilePath) : StateM (Array (ArtifactDescr × FilePath)) Artifact :=
+    modifyGet fun files =>
+      ({descr, name := path.toString, path, mtime := mtime files.size}, files.push (descr, path))
+  StateT.run (s := #[]) do return {
+    isModule := descrs.isModule
+    olean := ← art descrs.olean mod.oleanFile
+    oleanServer? := ← descrs.oleanServer?.mapM (art · mod.oleanServerFile)
+    oleanPrivate? := ← descrs.oleanPrivate?.mapM (art · mod.oleanPrivateFile)
+    ilean := ← art descrs.ilean mod.ileanFile
+    irSig? := ← descrs.irSig?.mapM (art · mod.irSigFile)
+    ir? := ← descrs.ir?.mapM (art · mod.irFile)
+    c? := ← descrs.c?.mapM (art · mod.cFile)
+    bc? := ← descrs.bc?.mapM (art · mod.bcFile)
+    ltar? := ← descrs.ltar?.mapM (art · mod.ltarFile)
+  }
+
+/--
+The outputs stamp (`Module.outputsStampFile`) of the module's outputs that `descrs` describes, as
+their files in the build directory are now (each file's device, inode, size and modification time),
+and the files' modification times; or none if `ok` rejects a file or a file cannot be read.
+-/
+def Module.stampOutputFiles (mod : Module) (descrs : ModuleOutputDescrs)
+    (ok : ArtifactDescr → IO.FS.Metadata → JobM Bool) : JobM (Option (String × Array MTime)) := do
+  let mut stamp := ""
+  let mut mtimes := #[]
+  for (descr, path) in (mod.outputArtifacts descrs fun _ => default).2 do
+    let .ok m ← path.metadata.toBaseIO | return none
+    unless (← ok descr m) do return none
+    stamp := stamp ++ s!"{descr.relPath} {m.device} {m.inode} {m.byteSize} {m.modified.sec} {m.modified.nsec}\n"
+    mtimes := mtimes.push m.modified
+  return some (stamp, mtimes)
+
+/-- The descriptions of the module outputs that the saved trace records, if any. -/
+def SavedTrace.moduleOutputDescrs? (savedTrace : SavedTrace) : Option ModuleOutputDescrs := do
+  let .ok data := savedTrace | none
+  (fromJson? (← data.outputs?)).toOption
+
+/-- An archive of the module's outputs that an earlier build packed into its build directory. -/
+def Module.localLtar? (mod : Module) : JobM (Option Artifact) := do
+  if (← mod.ltarFile.pathExists) then
+    return some (← computeArtifact mod.ltarFile "ltar")
+  return none
+
+/--
+The module's outputs at their files in its build directory, found without a look at the artifact
+cache: its saved trace describes them for `inputHash`, and each file is unchanged since a build
+found it to be the cache's entry (it has the identity that the module's outputs stamp,
+`Module.outputsStampFile`, records, and a second link). The module's cache mapping must exist, so
+that a cache that lost it, or was removed, gets it again on the full path. Replays the trace's log
+and takes a local archive that the trace does not name, as the full path does. Not under
+`--rehash`, nor in a build that records the package's outputs (`-o`), which needs the entries.
+-/
+def Module.unchangedOutputs? (mod : Module) (savedTrace : SavedTrace) (inputHash : Hash) :
+    JobM (Option ModuleOutputArtifacts) := do
+  unless (← getTrustHash) do return none
+  if (← Internal.getOutputsRef? mod.pkg).isSome then return none
+  let .ok data := savedTrace | return none
+  unless data.depHash == inputHash do return none
+  let some descrs := savedTrace.moduleOutputDescrs? | return none
+  let .ok stamp ← (IO.FS.readFile mod.outputsStampFile).toBaseIO | return none
+  let some (now, mtimes) ← mod.stampOutputFiles descrs (fun _ m => pure (m.numLinks ≥ 2)) | return none
+  unless stamp == now do return none
+  unless (← ((← getLakeCache).outputsFile mod.pkg.cacheScope inputHash).pathExists) do return none
+  -- The trace is current (checked above), so this replays its log
+  discard <| savedTrace.replayCachedIfUpToDate inputHash
+  let arts := (mod.outputArtifacts descrs (mtimes[·]?.getD default)).1
+  if arts.ltar?.isNone then
+    if let some ltar ← mod.localLtar? then
+      return some {arts with ltar? := some ltar}
+  return some arts
+
+/--
+Records the module's outputs that its saved trace describes (those that `unchangedOutputs?`
+compares) in its outputs stamp (`Module.outputsStampFile`) when each build-directory file is the
+artifact cache's entry (the same device and inode). Otherwise, and under `--no-build`, it records
+no stamp for the module. Errors are ignored, as the stamp only lets a later build skip the cache.
+-/
+def Module.stampOutputs (mod : Module) : JobM Unit := do
+  if (← getNoBuild) then return
+  let some descrs := (← readTraceFile mod.traceFile).moduleOutputDescrs? | return
+  let cache ← getLakeCache
+  let isEntry (descr : ArtifactDescr) (m : IO.FS.Metadata) : JobM Bool := do
+    let .ok e ← (cache.artifactDir / descr.relPath).metadata.toBaseIO | return false
+    return m.device == e.device && m.inode == e.inode
+  let some (stamp, _) ← mod.stampOutputFiles descrs isEntry | return
+  let file := mod.outputsStampFile
+  if let .ok old ← (IO.FS.readFile file).toBaseIO then
+    if old == stamp then return
+  let tmp := file.addExtension s!"{← IO.Process.getPID}.tmp"
+  if let .error _ ← (IO.FS.writeFile tmp stamp *> IO.FS.rename tmp file).toBaseIO then
+    discard <| (removeFileIfExists tmp).toBaseIO
+
+/--
 Recursively build a Lean module.
 Fetch its dependencies and then elaborate the Lean source file, producing
 all possible artifacts (e.g., `.olean`, `.ilean`, `.c`, `.bc`).
@@ -1185,8 +1285,7 @@ where
           mod.restoreNeededArtifacts arts
       -- Reuse a previously packed ltar if one exists
       if arts.ltar?.isNone then
-        if (← mod.ltarFile.pathExists) then
-          let ltar ← computeArtifact mod.ltarFile "ltar"
+        if let some ltar ← mod.localLtar? then
           return .complete {arts with ltar? := some ltar}
       return .complete arts
   fetchCore (presetup : ModulePreSetup) : JobM ModuleOutputArtifacts := do
@@ -1196,8 +1295,12 @@ where
     let savedTrace ← readTraceFile mod.traceFile
     if (← mod.pkg.isArtifactCacheWritable) then
       let restore ← mod.pkg.restoreAllArtifacts
+      if restore then
+        if let some arts ← mod.unchangedOutputs? savedTrace depTrace.hash then
+          return arts
       match (← fetchFromCache? presetup savedTrace restore) with
       | .complete arts =>
+        if restore then mod.stampOutputs
         return arts
       | .incomplete savedTrace ltar? =>
         let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
