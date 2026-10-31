@@ -1,0 +1,1 @@
+export LEAN_NUM_THREADS=64
