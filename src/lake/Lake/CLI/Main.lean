@@ -1442,7 +1442,28 @@ def lakeCli : (cmd : String) → CliM PUnit
   else
     throw <| CliError.unknownCommand cmd
 
+/--
+Paces the growth of this process's task pool (`lean_task_pool_set_growth` in
+`src/runtime/object.cpp`): past `eager` workers, the pool starts a worker only once queued tasks
+have found no free worker for `spawnDelayUs` microseconds. `spawnDelayUs = 0` turns pacing off, as
+when this is never called. It does nothing before the task manager starts, e.g. in an `initialize`.
+-/
+@[extern "lean_task_pool_set_growth"]
+opaque setTaskPoolGrowth (eager spawnDelayUs : UInt32) : BaseIO Unit
+
+/--
+Paces this process's task pool past 4 workers. A build's walk queues bursts of short jobs (trace
+checks, file reads), and an unpaced pool starts about one worker for each job of a burst, each
+with its own allocator heap. A job that holds its thread (a compile) still gets a worker within a
+few delays. `LAKE_TASK_POOL_SPAWN_DELAY_US` sets the delay in microseconds, at most 1 s (default
+5 ms; `0`: no pacing; a value that is not a number keeps the default).
+-/
+def paceTaskPool : BaseIO Unit := do
+  let delay := ((← IO.getEnv "LAKE_TASK_POOL_SPAWN_DELAY_US").bind String.toNat?).getD 5000
+  setTaskPoolGrowth 4 (min delay 1000000).toUInt32
+
 def lake : CliM PUnit := do
+  paceTaskPool
   match (← getArgs) with
   | [] => IO.println usage
   | ["--version"] => IO.println uiVersionString
