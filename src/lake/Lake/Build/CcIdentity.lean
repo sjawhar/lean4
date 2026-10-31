@@ -184,22 +184,26 @@ abbrev IdentityMemo (κ : Type) [BEq κ] [Hashable κ] :=
   IO.Ref (Std.HashMap κ (Task (Except String Hash)))
 
 /--
-Returns the memoized result for `key`, or computes it. Concurrent callers of a missing key wait
-for the first one's result instead of computing it again.
+The task of the memoized result for `key`. The first caller of a missing key starts `compute` on a
+dedicated thread, and no caller waits for it: a task-pool thread that waited would make Lean's task
+manager start another worker, and every C object job of a build can ask before the first
+computation ends.
 -/
-def IdentityMemo.get [BEq κ] [Hashable κ]
+def IdentityMemo.task [BEq κ] [Hashable κ]
   (memo : IdentityMemo κ) (key : κ) (compute : ExceptT String BaseIO Hash)
-: BaseIO (Except String Hash) := do
+: BaseIO (Task (Except String Hash)) := do
+  if let some task := (← memo.get)[key]? then
+    return task
   let promise ← IO.Promise.new
+  let new := promise.resultD (.error "compiler identity was not computed")
   let task? ← memo.modifyGet fun m =>
     match m[key]? with
     | some task => (some task, m)
-    | none => (none, m.insert key (promise.resultD (.error "compiler identity was not computed")))
+    | none => (none, m.insert key new)
   if let some task := task? then
-    return (← IO.wait task)
-  let result ← compute.run
-  promise.resolve result
-  return result
+    return task
+  discard <| BaseIO.asTask (prio := .dedicated) do promise.resolve (← compute.run)
+  return new
 
 builtin_initialize compilerMemo : IdentityMemo (String × String) ← IO.mkRef {}
 
@@ -223,18 +227,31 @@ public def ccLanguage (cc srcFile : FilePath) : String :=
   else lang
 
 /--
-The identity of the C compiler `cc` run with `args` on a source of language `lang`
+The task of the identity of the C compiler `cc` run with `args` on a source of language `lang`
 (see the module docstring), computed once per Lake process.
 -/
-def computeCcIdentity
+def ccIdentityTask
   (cc : FilePath) (args : Array String) (lang : String)
-: BaseIO (Except String Hash) := ExceptT.run do
-  let compiler ← ExceptT.mk <|
-    compilerMemo.get (cc.toString, lang) (computeCompilerHash cc lang)
+: BaseIO (Task (Except String Hash)) := do
+  let compiler ← compilerMemo.task (cc.toString, lang) (computeCompilerHash cc lang)
   let args := withoutMacroArgs args
-  let macros ← ExceptT.mk <|
-    macrosMemo.get (cc.toString, lang, args) (computeMacrosHash cc lang args)
-  return compiler.mix macros
+  let macros ← macrosMemo.task (cc.toString, lang, args) (computeMacrosHash cc lang args)
+  return compiler.bind (sync := true) fun c =>
+    macros.map (sync := true) fun m => return (← c).mix (← m)
+
+/--
+**For internal use only.**
+`job`, which produces the source file of a compile by the C compiler `cc` with the arguments
+`args`, made to finish only once the identity of `cc` for that source is known, so that
+`addCcTrace` in a job that continues it does not wait. Its result, state and trace are `job`'s.
+-/
+public def withCcIdentity
+  (cc : FilePath) (args : Array String) (job : Job FilePath)
+: BaseIO (Job FilePath) := do
+  let task ← BaseIO.bindTask (sync := true) job.task fun r => do
+    let .ok srcFile _ := r | return .pure r
+    return (← ccIdentityTask cc args (ccLanguage cc srcFile)).map (sync := true) fun _ => r
+  return {job with task}
 
 /--
 Mixes the identity of the C compiler `cc` into the current job's trace, for a compile of a source
@@ -242,9 +259,11 @@ of language `lang` (see `ccLanguage`) with the arguments `args` (all of them but
 output files). The identity covers the effect of `args` on the compiler's predefined macros (other
 than those `-D` and `-U` name), not their text, so an argument kept out of the trace (e.g., a weak
 one) changes the trace only if it changes those macros, as `-march` or `-O0` do. The build fails if
-the compiler cannot report its version and predefined macros.
+the compiler cannot report its version and predefined macros. The job should continue one made by
+`withCcIdentity`: then the identity is known and this does not wait. Otherwise it waits for the
+identity on its thread.
 -/
 public def addCcTrace (cc : FilePath) (args : Array String) (lang : String) : JobM PUnit := do
-  match (← computeCcIdentity cc args lang) with
+  match (← IO.wait (← ccIdentityTask cc args lang)) with
   | .ok hash => addTrace <| .ofHash hash s!"C compiler: {cc}"
   | .error e => error s!"failed to identify the C compiler: {e}"

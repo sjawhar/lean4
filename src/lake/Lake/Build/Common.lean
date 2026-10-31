@@ -860,14 +860,15 @@ which will be computed in the resulting `Job` before building.
   (oFile : FilePath) (srcJob : Job FilePath)
   (weakArgs traceArgs : Array String := #[]) (compiler : FilePath := "cc")
   (extraDepTrace : JobM _ := pure BuildTrace.nil)
-: SpawnM (Job FilePath) :=
-  srcJob.mapM fun srcFile => do
+: SpawnM (Job FilePath) := do
+  let args := weakArgs ++ traceArgs
+  (← withCcIdentity compiler args srcJob).mapM fun srcFile => do
     addPlatformTrace -- object files are platform-dependent artifacts
     addPureTrace traceArgs "traceArgs"
-    addCcTrace compiler (weakArgs ++ traceArgs) (ccLanguage compiler srcFile)
+    addCcTrace compiler args (ccLanguage compiler srcFile)
     addTrace (← extraDepTrace)
     let art ← buildArtifactUnlessUpToDate oFile (ext := "o") do
-      compileO oFile srcFile (weakArgs ++ traceArgs) compiler
+      compileO oFile srcFile args compiler
     return art.path
 
 /--
@@ -879,8 +880,11 @@ public def Internal.buildLeanO
   (oFile : FilePath) (srcJob : Job FilePath)
   (weakArgs traceArgs : Array String := #[])
   (leanIncludeDir? : Option (FilePath × BuildTrace) := none)
-: SpawnM (Job FilePath) :=
-  srcJob.mapM fun srcFile => do
+: SpawnM (Job FilePath) := do
+  let lean ← getLeanInstall
+  let includeDir := leanIncludeDir?.elim lean.includeDir (·.1)
+  let args := #["-I", includeDir.toString] ++ lean.ccFlags ++ weakArgs ++ traceArgs
+  (← withCcIdentity lean.cc args srcJob).mapM fun srcFile => do
     addLeanTrace
     if let some (_, trace) := leanIncludeDir? then
       -- Lean-produced C files contain `#include <lean/lean.h>`.
@@ -888,11 +892,8 @@ public def Internal.buildLeanO
       addTrace trace
     addPureTrace traceArgs "traceArgs"
     addPlatformTrace -- object files are platform-dependent artifacts
-    let lean ← getLeanInstall
     -- With the toolchain's own compiler, the flags name the Lean installation's directory
     addPureTrace (lean.ccFlags.map (·.replace lean.sysroot.toString "<sysroot>")) "ccFlags"
-    let includeDir := leanIncludeDir?.elim lean.includeDir (·.1)
-    let args := #["-I", includeDir.toString] ++ lean.ccFlags ++ weakArgs ++ traceArgs
     addCcTrace lean.cc args (ccLanguage lean.cc srcFile)
     let art ← buildArtifactUnlessUpToDate oFile (ext := "o") do
       compileO oFile srcFile args lean.cc
