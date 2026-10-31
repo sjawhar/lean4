@@ -507,3 +507,8 @@ no_match_text "Built C.VM" view-kept.log
 # The reader of a `.usage` in the layout Lean writes agrees with `Json.parse` on every `.usage` this test's builds
 # wrote, on generated texts in that layout, and on each of those changed.
 test_out "ok" env lean --run ../usagelayout.lean c/.lake/build/lib/lean/C/*.usage
+
+# An importer read with its names shared (`Lake.intern`) is what a decoder that does not share names reads, on the
+# importer of every `.usekey` this test's builds wrote, on generated importers, and on each of those without one or two
+# of its fields.
+test_out "ok" env lean --run ../usekeyintern.lean $(find . -name '*.usekey' | sort)

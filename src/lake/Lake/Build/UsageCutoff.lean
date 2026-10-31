@@ -77,6 +77,24 @@ instance : FromJson SidecarName where
       | _ => throw s!"expected a name component, got {c.compress}"
     return ⟨n⟩
 
+/-- The names of one sidecar parse (`intern`), keyed by themselves. -/
+abbrev NameIntern := StateM (Std.HashMap Name Name)
+
+/-- The name of this parse that equals `n`: made from `n`'s components on top of the parse's name for `n`'s prefix the
+first time, so equal names and the prefixes they share are one object each. -/
+partial def intern : Name → NameIntern Name
+  | .anonymous => return .anonymous
+  | n@(.str p s) => do
+    if let some m := (← get)[n]? then return m
+    let m := Name.mkStr (← intern p) s
+    modify (·.insert m m)
+    return m
+  | n@(.num p k) => do
+    if let some m := (← get)[n]? then return m
+    let m := Name.mkNum (← intern p) k
+    modify (·.insert m m)
+    return m
+
 /-- Reads a JSON array of `[name, digest, digest]` triples into a map. -/
 def nameDigestPairs (j : Json) : Except String (NameMap (ModuleUsage.Digest × ModuleUsage.Digest)) := do
   (← j.getArr?).foldlM (init := {}) fun m e => do
@@ -319,26 +337,33 @@ public structure UsageImport where
   deriving TypeName
 
 /-- Reads the fields an importer checks, from a `.usekey`'s `importer` or from a module-system file's `.usage`, which
-holds them under the same names and in the same form. -/
+holds them under the same names and in the same form. Its names share their prefixes (`intern`): the build keeps the
+parse (`BuildContext.sidecarCache`), and the names of a module have long prefixes in common. -/
 instance : FromJson UsageImport where
   fromJson? j := do
     let own ← j.getObjValAs? (Array (SidecarName × ModuleUsage.Digest)) "own"
     let specKeys ← j.getObjValAs? (Array (ModuleUsage.Digest × SidecarName)) "specKeys"
-    let provides ← providesOfJson (← j.getObjVal? "provides")
+    let (kernel, exported) ← providesOfJson (← j.getObjVal? "provides")
     let indirect ← namesOfJson (← j.getObjVal? "indirect")
+    let moduleDigest ← j.getObjValAs? ModuleUsage.Digest "moduleDigest"
+    let closure ← j.getObjValAs? ModuleUsage.Digest "closure"
+    let importedClosures ← j.getObjValAs? (Array (SidecarName × ModuleUsage.Digest)) "importedClosures"
+    let providesDigest ← j.getObjValAs? ModuleUsage.Digest "providesDigest"
+    let interned : NameIntern _ := do
+      let kernel ← kernel.mapM intern
+      let exported ← exported.mapM intern
+      let own ← own.foldlM (init := ({} : NameMap ModuleUsage.Digest)) fun m (n, d) =>
+        return m.insert (← intern n.name) d
+      let indirect ← indirect.mapM intern
+      let specKeys ← specKeys.mapM fun (d, n) => return (d, ← intern n.name)
+      let importedClosures ← importedClosures.mapM fun (n, d) => return (← intern n.name, d)
+      return ((kernel, exported), own, indirect, specKeys, importedClosures)
+    let (provides, own, indirect, specKeys, importedClosures) := interned.run' {}
     return {
-      moduleDigest := ← j.getObjValAs? ModuleUsage.Digest "moduleDigest"
-      closure := ← j.getObjValAs? ModuleUsage.Digest "closure"
-      importedClosures := (← j.getObjValAs? (Array (SidecarName × ModuleUsage.Digest)) "importedClosures").map
-        fun (n, d) => (n.name, d)
-      own := own.foldl (init := {}) fun m (n, d) => m.insert n.name d
-      providesDigest := ← j.getObjValAs? ModuleUsage.Digest "providesDigest"
-      provides
-      indirect
+      moduleDigest, closure, importedClosures, own, providesDigest, provides, indirect, specKeys
       providedIds := .mk fun _ => ModuleUsage.providedIds provides
       indirectIds := .mk fun _ => indirect.map ModuleUsage.resolvedId
       kernelLows := .mk fun _ => provides.1.map (·.hash.toUInt32)
-      specKeys := specKeys.map fun (d, n) => (d, n.name)
     }
 
 /-- The `importer` object of the module's `.usekey` (`UsekeySidecar.importer`): `u`'s fields that `UsageImport`
