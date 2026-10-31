@@ -110,5 +110,13 @@ test_exp "${weak[2]}" = "${plain[2]}"
 # A compiler that cannot be run fails the build, even when the objects are up to date
 with_cc missing test_err "failed to identify the C compiler" build +Foo:c.o.export
 
+# While a slow compiler reports its identity, the C object jobs that need it (16 from `buildO`, 16
+# from `buildLeanO`) wait for it as a dependency, not on a thread of the task pool: a pool thread
+# that waited would make the task manager start one more worker for each job. Workers never exit,
+# so the threads after the build are its peak.
+(export LEAN_NUM_THREADS=4 FAKECC_SLEEP=3; with_cc plain test_run build manyFfi)
+test_cmd cat .lake/build/threads
+test_exp "$(cat .lake/build/threads)" -lt 24
+
 # Cleanup
 rm -f produced.out
