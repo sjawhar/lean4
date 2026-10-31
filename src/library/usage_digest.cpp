@@ -604,6 +604,15 @@ extern "C" LEAN_EXPORT uint8_t lean_usage_observed_after(b_obj_arg o, uint64_t t
     return observed_value(o).load(std::memory_order_acquire) > t0;
 }
 
+/* `Lean.ModuleUsage.releaseThreadMemory`: with mimalloc, `mi_collect(true)`: the calling thread's empty pages back to
+the process, and the process's free pages back to the system. */
+extern "C" LEAN_EXPORT obj_res lean_usage_release_thread_memory() {
+#ifdef LEAN_MIMALLOC
+    mi_collect(true);
+#endif
+    return box(0);
+}
+
 /* `Lean.ModuleUsage.fileStamp`: the stamp of the file at `path` (following symbolic links, as `open` does). */
 extern "C" LEAN_EXPORT obj_res lean_usage_file_stamp(b_obj_arg path) {
 #if defined(LEAN_WINDOWS)
