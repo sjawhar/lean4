@@ -1113,6 +1113,10 @@ structure Metadata where
   modified : SystemTime
   byteSize : UInt64
   type     : FileType
+  numLinks : UInt64
+  statusChanged : SystemTime
+  device   : UInt64
+  inode    : UInt64
 
 constant metadata : @& FilePath → IO IO.FS.Metadata
 */
@@ -1124,12 +1128,17 @@ static obj_res timespec_to_obj(uv_timespec_t const & ts) {
 }
 
 static obj_res metadata_core(uv_stat_t const & st) {
-    object * mdata = alloc_cnstr(0, 2, 2 * sizeof(uint64) + sizeof(uint8));
+    // The compiler's layout of `IO.FS.Metadata` (src/Init/System/IO.lean): object fields in declaration
+    // order, then scalar fields by decreasing size, each size in declaration order
+    object * mdata = alloc_cnstr(0, 3, 4 * sizeof(uint64) + sizeof(uint8));
     cnstr_set(mdata, 0, timespec_to_obj(st.st_atim));
     cnstr_set(mdata, 1, timespec_to_obj(st.st_mtim));
-    cnstr_set_uint64(mdata, 2 * sizeof(object *), st.st_size);
-    cnstr_set_uint64(mdata, 2 * sizeof(object *) + sizeof(uint64), st.st_nlink);
-    cnstr_set_uint8(mdata, 2 * sizeof(object *) + 2 * sizeof(uint64),
+    cnstr_set(mdata, 2, timespec_to_obj(st.st_ctim));
+    cnstr_set_uint64(mdata, 3 * sizeof(object *), st.st_size);
+    cnstr_set_uint64(mdata, 3 * sizeof(object *) + sizeof(uint64), st.st_nlink);
+    cnstr_set_uint64(mdata, 3 * sizeof(object *) + 2 * sizeof(uint64), st.st_dev);
+    cnstr_set_uint64(mdata, 3 * sizeof(object *) + 3 * sizeof(uint64), st.st_ino);
+    cnstr_set_uint8(mdata, 3 * sizeof(object *) + 4 * sizeof(uint64),
                     S_ISDIR(st.st_mode) ? 0 :
                     S_ISREG(st.st_mode) ? 1 :
 #ifndef LEAN_WINDOWS
