@@ -63,7 +63,12 @@ if grep -E '^✔ .*Ran (Slow:c\.o|Slow:shared|test/sharedSlow)' produced.out; th
   echo "FAILURE: a job that depends on a canceled job reported as run"
   exit 1
 fi
-test_exp -n "$(grep -E '^(⊘|ℹ) .*Canceled Slow:c\.o' produced.out)"
+# `Slow` needs `slowA`, which ends only after the cancellation. A Lake that collects a library's modules only after
+# its `needs` makes no module job here, so `Slow:c.o` may be absent; when it is shown, it must be canceled
+if grep -E '\] [A-Za-z]+ Slow:c\.o( |$)' produced.out | grep -vE '^(⊘|ℹ) .*Canceled Slow:c\.o( |$)'; then
+  echo "FAILURE: Slow:c.o reported, but not as canceled"
+  exit 1
+fi
 test_exp -n "$(grep -E '^(⊘|ℹ) .*Canceled Slow:shared$' produced.out)"
 test_exp -n "$(grep -E '^(⊘|ℹ) .*Canceled test/sharedSlow$' produced.out)"
 
