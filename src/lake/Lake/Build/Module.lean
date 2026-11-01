@@ -14,6 +14,8 @@ import Lake.Util.Proc
 import Lake.Build.Job.Register
 import Lake.Build.Common
 import Lake.Build.Target
+import Lake.Build.StampStore
+import Std.Time.DateTime.Timestamp
 import Init.Omega
 import Init.Data.String.Search
 import Init.Data.Iterators.Consumers
@@ -82,6 +84,26 @@ def decodeStampHeader? : List String → Option ModuleHeader
 def systemTimeNanos (t : IO.FS.SystemTime) : Int :=
   t.sec * 1000000000 + t.nsec.toNat
 
+/--
+A moment by the monotonic clock (`IO.monoNanosNow`) and by the wall clock, both in nanoseconds (the
+wall clock's since the Unix epoch).
+-/
+structure ClockReading where
+  mono : Nat
+  wall : Int
+
+/-- The current moment by both clocks. -/
+def ClockReading.now : IO ClockReading :=
+  return {mono := ← IO.monoNanosNow, wall := (← Std.Time.Timestamp.now).toNanosecondsSinceUnixEpoch.val}
+
+/--
+The nanoseconds since `start` by the clock that counted more: the monotonic clock stops while the
+machine sleeps, and the wall clock can step.
+-/
+def ClockReading.elapsed (start : ClockReading) : IO Int := do
+  let now ← ClockReading.now
+  return max ((now.mono - start.mono : Nat) : Int) (now.wall - start.wall)
+
 /-- The hash and the header that the source stamp `stamp` records for the identity `ident`. -/
 def readSourceStamp? (stamp ident : String) : Option (Hash × ModuleHeader) := do
   let first :: header := stamp.split '\n' |>.toStringList | none
@@ -89,57 +111,60 @@ def readSourceStamp? (stamp ident : String) : Option (Hash × ModuleHeader) := d
   return (← Hash.ofHex? (first.take 16).toString, ← decodeStampHeader? header.dropLast)
 
 /--
-The hash and the parsed header of the source of `mod`, whose metadata `mdata` was read at the
-monotonic time `start` (`IO.monoNanosNow`).
-
-Unless `--rehash` is set, a stamp (`Module.sourceStampFile`) that records the source's current
-identity gives both, and the source is not read. Otherwise the source is read, hashed and parsed,
-and the stamp is written, unless:
-* the build is `--no-build`, which writes nothing to the build directory;
-* the header does not decode back from the stamp's encoding of it (`encodeStampHeader`);
-* the source is on another device than the build directory, or its modification or status change
-  time is less than 2 s before `start` by the clock of the build directory's filesystem (the new
-  stamp's modification time): an edit in that clock tick could keep every part of the identity.
-
-Errors while writing are ignored, as the stamp only lets a later build skip the read.
+The source stamp of a source with the identity `ident` whose contents have the hash `hash` and the
+header `header`; none if the header does not decode back from the stamp's encoding of it
+(`encodeStampHeader`).
 -/
-def Module.fetchSourceInfo (mod : Module) (mdata : IO.FS.Metadata) (start : Nat) :
+def sourceStamp? (hash : Hash) (ident : String) (header : ModuleHeader) : Option String := do
+  let encoded := encodeStampHeader header
+  let decoded ← decodeStampHeader? (encoded.split '\n' |>.toStringList).dropLast
+  guard (decoded.isModule == header.isModule && decoded.imports == header.imports)
+  return s!"{hash} {ident}\n{encoded}"
+
+/--
+Whether a stamp file whose metadata is `file` (taken when it was written) may record the identity
+of a source whose metadata `mdata` was read at `start`: the source is on the file's device, and its
+modification and status change times are at least 2 s before `start` by the clock of the file's
+filesystem (the file's modification time, less the time since `start`). An edit in the same clock
+tick could keep every part of the identity.
+-/
+def maySourceStamp (mdata : IO.FS.Metadata) (start : ClockReading) (file : IO.FS.Metadata) :
+    BaseIO Bool := do
+  let .ok elapsed ← start.elapsed.toBaseIO | return false
+  let before := systemTimeNanos file.modified - elapsed
+  let racy (t : IO.FS.SystemTime) := systemTimeNanos t + 2000000000 > before
+  return file.device == mdata.device && !racy mdata.modified && !racy mdata.statusChanged
+
+/--
+The hash and the parsed header of the source of `mod`, whose metadata `mdata` was read at `start`.
+
+Unless `--rehash` is set, a source stamp (in `Module.sourceStampFile`) that records the source's
+current identity gives both, and the source is not read. Otherwise the source is read, hashed and
+parsed, and, unless the build is `--no-build` (which writes nothing to the build directory), its
+stamp is set for a later write of the stamp queue (`setStamp`, `maySourceStamp`).
+-/
+def Module.fetchSourceInfo (mod : Module) (mdata : IO.FS.Metadata) (start : ClockReading) :
     JobM (Hash × ModuleHeader) := do
   let ident := sourceStampIdentity mdata
-  let stampFile := mod.sourceStampFile
+  let key := mod.name.toString
   if (← getTrustHash) then
-    if let .ok stamp ← (IO.FS.readFile stampFile).toBaseIO then
+    if let some stamp ← findStamp? mod.sourceStampFile key then
       if let some info := readSourceStamp? stamp ident then
         return info
   let path := mod.leanFile
   let contents ← IO.FS.readFile path
   let hash := Hash.ofText contents
   let header ← Lean.parseImports' contents path.toString
-  let encoded := encodeStampHeader header
-  let exact := (decodeStampHeader? (encoded.split '\n' |>.toStringList).dropLast).any fun h =>
-    h.isModule == header.isModule && h.imports == header.imports
-  if exact && !(← getNoBuild) then
-    let tmp := stampFile.addExtension s!"{← IO.Process.getPID}.tmp"
-    let write : IO Unit := do
-      createParentDirs stampFile
-      IO.FS.writeFile tmp s!"{hash} {ident}\n{encoded}"
-      let elapsed := (← IO.monoNanosNow) - start
-      let tmpData ← tmp.metadata
-      let before := systemTimeNanos tmpData.modified - elapsed
-      let racy (t : IO.FS.SystemTime) := systemTimeNanos t + 2000000000 > before
-      if tmpData.device != mdata.device || racy mdata.modified || racy mdata.statusChanged then
-        IO.FS.removeFile tmp
-      else
-        IO.FS.rename tmp stampFile
-    if let .error _ ← write.toBaseIO then
-      discard <| (removeFileIfExists tmp).toBaseIO
+  unless (← getNoBuild) do
+    if let some stamp := sourceStamp? hash ident header then
+      setStamp mod.sourceStampFile key stamp (maySourceStamp mdata start)
   return (hash, header)
 
 /-- Parse the header of a Lean file from its source. -/
 def Module.recFetchInput (mod : Module) : FetchM (Job ModuleInput) := Job.async do
   let path := mod.leanFile
   -- The metadata, then the contents: a stamp never pairs an identity with older contents
-  let start ← IO.monoNanosNow
+  let start ← ClockReading.now
   let mdata ← path.metadata
   let (hash, header) ← mod.fetchSourceInfo mdata start
   let trace := {caption := path.toString, mtime := mdata.modified, hash}

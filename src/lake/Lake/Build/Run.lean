@@ -10,6 +10,7 @@ public import Lake.Config.Workspace
 import Lake.Config.Monad
 import Lake.Build.Job.Monad
 import Lake.Build.Index
+import Lake.Build.StampStore
 import Init.Omega
 
 /-! # Build Runner
@@ -389,6 +390,8 @@ def mkBuildContext
 def Workspace.startBuild
   (bctx : BuildContext) (build : FetchM α) (caption := "job computation")
 : BaseIO (Job α) := do
+  -- Each caller ends the build with `writeStamps`
+  startStampWrites
   let compute := Job.async build (caption := caption)
   compute.run.run'.run bctx |>.run nilTrace
 
@@ -396,6 +399,7 @@ def finalizeBuild
   (cfg : BuildConfig) (bctx : BuildContext) (mctx : MonitorContext) (result : BuildResult α)
 : IO α := do
   reportResult cfg mctx.out result
+  writeStamps
   if let some outputsFile := cfg.outputsFile? then
     bctx.saveOutputs (logger := mctx.logger) mctx.out outputsFile
   match result.out with
@@ -450,6 +454,8 @@ public def Workspace.checkNoBuild
   let bctx ← mkBuildContext ws cfg jobs
   let job ← startBuild bctx build
   let result ← monitorBuild mctx job
+  -- Ends the stamp writes that `startBuild` started (a check sets no stamps)
+  writeStamps
   return result.isOk -- `isOk` means no failures, and thus no `--no-build` failures
 
 /-- Run a build function in the Workspace's context and await the result. -/
