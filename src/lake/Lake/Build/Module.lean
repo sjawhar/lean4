@@ -14,6 +14,7 @@ import Lake.Util.Proc
 import Lake.Build.Job.Register
 import Lake.Build.Common
 import Lake.Build.Target
+import Lake.Build.StampStore
 import Init.Omega
 
 /-! # Module Build Definitions -/
@@ -742,7 +743,7 @@ public def Module.setupFacetConfig : ModuleFacetConfig setupFacet :=
 /-- Remove all existing artifacts produced by a Lean build of the module. -/
 public def Module.clearOutputArtifacts (mod : Module) : IO PUnit := do
   try
-    removeFileIfExists mod.outputsStampFile
+    removeStamp mod.outputsStampFile mod.name.toString
     removeFileIfExists mod.ltarFile
     removeFileIfExists mod.oleanFile
     removeFileIfExists mod.oleanServerFile
@@ -1181,7 +1182,7 @@ def Module.localLtar? (mod : Module) : JobM (Option Artifact) := do
 /--
 The module's outputs at their files in its build directory, found without a look at the artifact
 cache: its saved trace describes them for `inputHash`, and each file is unchanged since a build
-found it to be the cache's entry (it has the identity that the module's outputs stamp,
+found it to be the cache's entry (it has the identity that the module's outputs stamp, in
 `Module.outputsStampFile`, records, and a second link). The module's cache mapping must exist, so
 that a cache that lost it, or was removed, gets it again on the full path. Replays the trace's log
 and takes a local archive that the trace does not name, as the full path does. Not under
@@ -1194,7 +1195,7 @@ def Module.unchangedOutputs? (mod : Module) (savedTrace : SavedTrace) (inputHash
   let .ok data := savedTrace | return none
   unless data.depHash == inputHash do return none
   let some descrs := savedTrace.moduleOutputDescrs? | return none
-  let .ok stamp ← (IO.FS.readFile mod.outputsStampFile).toBaseIO | return none
+  let some stamp ← findStamp? mod.outputsStampFile mod.name.toString | return none
   let some (now, mtimes) ← mod.stampOutputFiles descrs (fun _ m => pure (m.numLinks ≥ 2)) | return none
   unless stamp == now do return none
   unless (← ((← getLakeCache).outputsFile mod.pkg.cacheScope inputHash).pathExists) do return none
@@ -1207,25 +1208,27 @@ def Module.unchangedOutputs? (mod : Module) (savedTrace : SavedTrace) (inputHash
   return some arts
 
 /--
-Records the module's outputs that its saved trace describes (those that `unchangedOutputs?`
-compares) in its outputs stamp (`Module.outputsStampFile`) when each build-directory file is the
-artifact cache's entry (the same device and inode). Otherwise, and under `--no-build`, it records
-no stamp for the module. Errors are ignored, as the stamp only lets a later build skip the cache.
+Records the module's outputs that its trace describes (those that `unchangedOutputs?` compares) in
+its outputs stamp (in `Module.outputsStampFile`, set for a later write of the stamp queue:
+`setStamp`) when each build-directory file is the artifact cache's entry (the same device and
+inode). Otherwise, and under `--no-build`, it records no stamp for the module.
+
+`savedTrace` is the trace that the build read before its cache fetch for `inputHash`. When it is
+current for `inputHash`, its descriptions are the stamp's: the fetch then writes no trace unless it
+unpacks an archive, and a stamp of other descriptions only fails to match later. Otherwise the trace
+file is read again.
 -/
-def Module.stampOutputs (mod : Module) : JobM Unit := do
+def Module.stampOutputs (mod : Module) (savedTrace : SavedTrace) (inputHash : Hash) : JobM Unit := do
   if (← getNoBuild) then return
-  let some descrs := (← readTraceFile mod.traceFile).moduleOutputDescrs? | return
+  let current := match savedTrace with | .ok data => data.depHash == inputHash | _ => false
+  let trace ← if current then pure savedTrace else readTraceFile mod.traceFile
+  let some descrs := trace.moduleOutputDescrs? | return
   let cache ← getLakeCache
   let isEntry (descr : ArtifactDescr) (m : IO.FS.Metadata) : JobM Bool := do
     let .ok e ← (cache.artifactDir / descr.relPath).metadata.toBaseIO | return false
     return m.device == e.device && m.inode == e.inode
   let some (stamp, _) ← mod.stampOutputFiles descrs isEntry | return
-  let file := mod.outputsStampFile
-  if let .ok old ← (IO.FS.readFile file).toBaseIO then
-    if old == stamp then return
-  let tmp := file.addExtension s!"{← IO.Process.getPID}.tmp"
-  if let .error _ ← (IO.FS.writeFile tmp stamp *> IO.FS.rename tmp file).toBaseIO then
-    discard <| (removeFileIfExists tmp).toBaseIO
+  setStamp mod.outputsStampFile mod.name.toString stamp
 
 /--
 Recursively build a Lean module.
@@ -1300,7 +1303,7 @@ where
           return arts
       match (← fetchFromCache? presetup savedTrace restore) with
       | .complete arts =>
-        if restore then mod.stampOutputs
+        if restore then mod.stampOutputs savedTrace depTrace.hash
         return arts
       | .incomplete savedTrace ltar? =>
         let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace

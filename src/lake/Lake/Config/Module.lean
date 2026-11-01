@@ -124,11 +124,12 @@ public abbrev pkg (self : Module) : Package :=
   self.leanLibPath "ir.trace"
 
 /--
-The stamp of the module's outputs: each output's artifact, with its file's device, inode, size and
-modification time when a build last found the file to be the artifact cache's entry.
+The stamp file (`Lake.Build.StampStore`) of the package's module outputs: for each module, under
+its name, each output's artifact, with its file's device, inode, size and modification time when a
+build last found the file to be the artifact cache's entry.
 -/
 @[inline] public def outputsStampFile (self : Module) : FilePath :=
-  self.leanLibPath "outputs.stamp"
+  self.pkg.buildDir / "outputs.stamps"
 
 @[inline] public def irPath (ext : String) (self : Module) : FilePath :=
   self.filePath self.pkg.irDir ext

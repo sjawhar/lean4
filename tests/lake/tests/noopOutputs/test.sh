@@ -4,20 +4,25 @@ source ../common.sh
 ./clean.sh
 
 # With the artifact cache on and every artifact restored, a build that finds a module's outputs to be
-# the cache's entries records their identities (device, inode, size, modification time) in
-# `<module>.outputs.stamp`. While each build-directory output keeps that identity and a second link,
-# and the module's cache mapping exists, a later build does not look at the cache for the module.
+# the cache's entries records their identities (device, inode, size, modification time) in the
+# module's record of its package's `.lake/build/outputs.stamps`. While each build-directory output
+# keeps that identity and a second link, and the module's cache mapping exists, a later build does
+# not look at the cache for the module.
 
+HELPER="$(cd .. && pwd)/stamps.lean"
 mkdir -p work/T && cd work
 export LAKE_CACHE_DIR="$PWD/cache" LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true
 printf 'name = "t"\n\n[[lean_lib]]\nname = "T"\n' > lakefile.toml
 printf 'import T.B\n' > T.lean
 printf 'import T.A\ndef b : Nat := a\n' > T/B.lean
 printf 'def a : Nat := 1\ntheorem w : True := by sorry\n' > T/A.lean
-STAMP=.lake/build/lib/lean/T/A.outputs.stamp
 OLEAN=.lake/build/lib/lean/T/A.olean
 ARTS=$LAKE_CACHE_DIR/artifacts
 entry() { echo "$ARTS/$(cat $OLEAN.hash).olean"; }
+# stamp get|del -- print or remove T.A's record (`get` fails if there is none)
+stamp() { lean --run "$HELPER" "$1" .lake/build/outputs.stamps T.A; }
+has_stamp() { test_cmd stamp get > /dev/null; }
+no_stamp() { test_cmd_fails stamp get > /dev/null; }
 # away CMD... -- run CMD with the cache's artifacts moved away; then delete what CMD put into the
 # cache and put the old artifacts back
 away() {
@@ -40,21 +45,21 @@ recached() { test_run build T; test_exp -d "$ARTS"; }
 
 # The build after the compile finds the outputs in the cache and records them
 test_run build T
-test_exp ! -f $STAMP
+no_stamp
 lake_out build T
 strip_times full.out
-test_exp -f $STAMP
+has_stamp
 away fast
 
 # A `--no-build` build records nothing
-test_cmd rm -f $STAMP
+test_cmd stamp del
 test_run build T --no-build
-test_exp ! -f $STAMP
+no_stamp
 
 # Without the stamp, the build checks the cache and records the outputs again
 away recached
 test_run build T
-test_exp -f $STAMP
+has_stamp
 
 # A missing mapping is written again
 test_cmd rm -rf "$LAKE_CACHE_DIR/outputs"
@@ -77,12 +82,12 @@ away rehash
 # again
 test_run build T
 test_cmd cp -p $OLEAN orig.olean
-test_cmd cp $STAMP before.stamp
+stamp get > before.stamp
 test_cmd chmod u+w $OLEAN
 { cat orig.olean; echo x; } > $OLEAN
 test_cmd touch -r orig.olean $OLEAN
 test_run build T
-test_cmd test "$(cksum < $STAMP)" != "$(cksum < before.stamp)"
+test_cmd test "$(stamp get | cksum)" != "$(cksum < before.stamp)"
 cat orig.olean > $OLEAN
 test_cmd touch -r orig.olean $OLEAN
 test_cmd chmod u-w $OLEAN
@@ -102,18 +107,18 @@ away recached
 test_cmd ln -f "$(entry)" $OLEAN
 # and it is recorded only as the file that is the cache's entry
 test_run build T
-test_cmd rm -f $STAMP
+test_cmd stamp del
 impostor
 test_run build T
 inode() { ls -i "$1" | awk '{ print $1 }'; }
-if [ -f "$STAMP" ]; then test_cmd test "$(inode "$OLEAN")" = "$(inode "$(entry)")"; fi
+if stamp get > /dev/null; then test_cmd test "$(inode "$OLEAN")" = "$(inode "$(entry)")"; fi
 test_cmd ln -f "$(entry)" $OLEAN
 
 # A tree restored from the cache records its outputs and skips the cache from its next build on
 mkdir -p u && cp -r lakefile.toml T.lean T u/
 cd u
 test_run build T
-test_exp -f $STAMP
+has_stamp
 lake_out build T
 strip_times full.out
 away fast
