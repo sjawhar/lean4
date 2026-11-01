@@ -121,11 +121,12 @@ public abbrev pkg (self : Module) : Package :=
   self.leanLibPath "trace"
 
 /--
-The stamp of the module's source: the source's hash and import header, with its device, inode,
-size, and modification and status change times when Lake last read it.
+The stamp file (`Lake.Build.StampStore`) of the package's sources: for each module, under its
+name, its source's hash and import header, with the source's device, inode, size, and modification
+and status change times when Lake last read it.
 -/
 @[inline] public def sourceStampFile (self : Module) : FilePath :=
-  self.leanLibPath "lean.stamp"
+  self.pkg.buildDir / "source.stamps"
 
 @[inline] public def irTraceFile (self : Module) : FilePath :=
   self.leanLibPath "ir.trace"
