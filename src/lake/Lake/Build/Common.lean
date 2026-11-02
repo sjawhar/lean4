@@ -766,9 +766,10 @@ altered artifact using `file` as the preferred path.
 
 If `file` already exists and is the cache entry (e.g., a hard link to it), it is used. Any other
 existing `file` is hashed (as text if `text := true`): if it has the artifact's hash, it is used,
-and replaced by a hard link to the entry if the entry has that hash too (otherwise the entry is
-moved into the cache's quarantine directory, with a warning); if it does not, it was changed after
-it was produced, and it is replaced by the cache entry, with a warning.
+and replaced by a hard link to the entry if the entry has that hash too (if the entry does not, it
+is moved into the cache's quarantine directory, with a warning; if the link or its rename fails,
+`file` stays as it is); if it does not, it was changed after it was produced, and it is replaced by
+the cache entry, with a warning.
 
 To restore `file`, the function attempts to create it as hard link to the artifact. If this fails
 (e.g., because the artifact and path are on differets drives and/or file systems), falls back to
@@ -793,10 +794,17 @@ public def restoreArtifact
           let tmp := file.addExtension "relink"
           removeFileIfExists tmp
           if let .ok _ ← (IO.FS.hardLink art.path tmp).toBaseIO then
-            IO.FS.rename tmp file
-            if exe then
-              let r := {read := true, write := false, execution := exe}
-              IO.setAccessRights file ⟨r, r, r⟩
+            match (← (IO.FS.rename tmp file).toBaseIO) with
+            | .ok _ =>
+              if exe then
+                let r := {read := true, write := false, execution := exe}
+                IO.setAccessRights file ⟨r, r, r⟩
+            | .error e =>
+              -- `file` has the artifact's hash, so it can stay. Linux overlayfs fails this rename
+              -- with ESTALE when `file` is a copied-up lower-layer file that is already a link to
+              -- the entry, although `isSameFile` above saw two files.
+              logVerbose s!"could not relink {file} to its cache entry, keeping the file: {e}"
+              discard <| (removeFileIfExists tmp).toBaseIO
         else
           logWarning s!"{art.path}: cached artifact does not match its content hash; \
             {← quarantineEntry art}"
