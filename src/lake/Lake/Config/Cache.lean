@@ -797,16 +797,19 @@ def parseResponseHeaders (text : String) : Array (String × String) :=
       | _ => headers
 
 /--
-How long one send of a request for an object of the shared remote cache that a build makes for a
-claim may take in all, in seconds (`curl --max-time`), so that a request that is answered but keeps
-sending stays bounded. A request is sent at most three times (see `claimRequestRetries`); a write
-that got a server error is sent once more and then read back (see `putRemoteObjectIf`).
+How long one `curl` run of a request for an object of the shared remote cache that a build makes
+for a claim may take in all, in seconds (`curl --max-time`), so that a request that is answered but
+keeps sending stays bounded.
 
-Each send carries the cache token, which `LAKE_CACHE_TOKEN_CMD` may have to print first (see
-`withCacheTokenRequest`): before the first send when this process holds no token, or one older than
-45 minutes (`cacheTokenFor?`), and again before the one second send after a refusal of the token
-(401, `CacheToken.renew`). Each run of the command is bounded by its own limit
-(`CacheToken.timeLimitMs`, 60 s).
+Each send of a request carries the cache token, which `LAKE_CACHE_TOKEN_CMD` may have to print
+first (see `withCacheTokenRequest`): when this process holds no token, or one older than 45 minutes
+(`cacheTokenFor?`), and again, with a second `curl` run, after a refusal of the token (401,
+`CacheToken.renew`). Each run of the command is bounded by its own limit
+(`CacheToken.timeLimitMs`, 60 s), so a send (two runs of the command and two `curl` runs) takes at
+most 160 s, and 20 s when it runs no command.
+A request is sent at most three times, with pauses of 1 s and 2 s (see `claimRequestRetries`): at
+most 483 s, or 63 s. A write that got a server error is a request, a pause of 1 s, a second request
+and a read (see `putRemoteObjectIf`): at most 1,450 s, or 190 s.
 -/
 def remoteObjectMaxSecs : Nat := 20
 
@@ -825,7 +828,10 @@ def claimRequestRetries (read : Bool) (code : Nat) (exitCode : UInt32) (sent : B
   exitCode == 5 || exitCode == 6 || exitCode == 7 || (exitCode == 28 && !sent) ||
     (read && (exitCode == 28 || (exitCode == 0 && code / 100 == 5)))
 
-/-- The pauses, in milliseconds, before the second and the third send of a claim request. -/
+/--
+The pauses, in milliseconds, before the second and the third send of a claim request; a write that
+got a server error waits the first before its second send (see `putRemoteObjectIf`).
+-/
 def claimRetryPausesMs : List UInt32 := [1000, 2000]
 
 /--
@@ -907,8 +913,9 @@ public def putRemoteObjectIf
   let r ← put
   unless r.code / 100 == 5 do
     return r
-  logVerbose s!"sending the write of {url} again in 1000 ms (HTTP {r.code})"
-  IO.sleep 1000
+  let pause := claimRetryPausesMs[0]!
+  logVerbose s!"sending the write of {url} again in {pause} ms (HTTP {r.code})"
+  IO.sleep pause
   let r ← put
   unless r.code == 412 do
     return r

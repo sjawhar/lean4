@@ -37,6 +37,41 @@ SOON_SECS=120
 claim_check() { "$PYTHON" "$TEST_DIR/claim_check.py" "$@"; }
 push_check() { "$PYTHON" "$TEST_DIR/../remoteCachePush/push_check.py" "$@"; }
 
+# A claim's object is `<endpoint>/claim/...`; the package's own remote scope ends in `claim` too.
+# Checks that a build recorded no claim failure in its read status (a build that recorded no
+# read failure writes no such file): `no_claim_failure <cache>`
+no_claim_failure() {
+  if [ -e "$1/remote-status-read.json" ]; then
+    no_match_text '/a0/claim/' "$1/remote-status-read.json"
+  fi
+}
+
+# A `curl` that fails the first write (`-X PUT`) and the first read of each claim (only the verbs
+# in `REFUSE_VERBS`, by default both) with the exit code `REFUSE_EXIT` and the JSON that `curl -w`
+# writes then, with `time_pretransfer` `REFUSE_PRETRANSFER` (by default 0: nothing was sent), and
+# runs the real `curl` for every other request. Each claim request is logged in `claim-calls`.
+cat > "$WORK_DIR/refuse-claim-curl.sh" << EOF
+#!/usr/bin/env bash
+url="\${@: -1}"
+verb=GET
+case " \$* " in *" -X PUT "*) verb=PUT ;; esac
+case "\$url" in
+  */a0/claim/*)
+    { printf '%s' "\$verb \$* " | tr '\n' ' '; echo; } >> "$WORK_DIR/claim-calls"
+    mark="$WORK_DIR/refused/\$verb/\$(printf '%s' "\$url" | cksum | cut -d ' ' -f 1)"
+    case " \${REFUSE_VERBS:-GET PUT} " in
+      *" \$verb "*)
+        if mkdir -p "$WORK_DIR/refused/\$verb" && mkdir "\$mark" 2> /dev/null; then
+          printf '{"response_code":0,"exitcode":%s,"time_pretransfer":%s}\n' \
+            "\$REFUSE_EXIT" "\${REFUSE_PRETRANSFER:-0.000000}" >&2
+          exit "\$REFUSE_EXIT"
+        fi ;;
+    esac ;;
+esac
+exec "$(type -P curl)" "\$@"
+EOF
+chmod +x "$WORK_DIR/refuse-claim-curl.sh"
+
 # One machine's build, in a session of its own (so that a case can kill all of it):
 # `build.sh <tree> <cache> <log> <target>...`. The other settings come from the environment.
 # It records its process ID in `<log>.pid`, and stops the build after `$BUILD_TIMEOUT` seconds
@@ -876,15 +911,6 @@ case_claim_free_slot_wake() {
   CLAIM_SLOTS=1 run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" freeSlotWake
 }
 
-# A claim's object is `<endpoint>/claim/...`; the package's own remote scope ends in `claim` too.
-# Checks that a build recorded no claim failure in its read status (a build that recorded no
-# read failure writes no such file): `no_claim_failure <cache>`
-no_claim_failure() {
-  if [ -e "$1/remote-status-read.json" ]; then
-    no_match_text '/a0/claim/' "$1/remote-status-read.json"
-  fi
-}
-
 case_claim_read_retry() {
   # A claim read that the remote cache answers with a server error (503) is sent again, 1 s
   # later: B reads another host's `failed` claim of `Claim.A` once more, takes it over and
@@ -914,11 +940,13 @@ case_claim_write_retry() {
       run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
     test_cmd_eq 1 claim_check built-by "$LOG_A"
     test_cmd_eq 1 count "^PUT /$service/a0/claim/.* -> 500 " "$SERVER_LOG"
+    # Only the second send of the write that happened finds the claim written
+    test_cmd_eq "$([ "$service" = claimputlost ] && echo 1 || echo 0)" \
+      count "^PUT /$service/a0/claim/.* -> 412 " "$SERVER_LOG"
     no_claim_failure "$CACHE_A"
     wait_push "$CACHE_A"
     claims_done 1
   done
-  test_cmd_eq 1 count '^PUT /claimputlost/a0/claim/.* -> 412 ' "$SERVER_LOG"
 }
 
 case_claim_write_race() {
@@ -1012,32 +1040,6 @@ case_claim_read_sent_timeout() {
   match_text 'taking over the claim' "$LOG_B"
   no_claim_failure "$CACHE_B"
 }
-
-# A `curl` that fails the first write (`-X PUT`) and the first read of each claim (only the verbs
-# in `REFUSE_VERBS`, by default both) with the exit code `REFUSE_EXIT` and the JSON that `curl -w`
-# writes then, with `time_pretransfer` `REFUSE_PRETRANSFER` (by default 0: nothing was sent), and
-# runs the real `curl` for every other request. Each claim request is logged in `claim-calls`.
-cat > "$WORK_DIR/refuse-claim-curl.sh" << EOF
-#!/usr/bin/env bash
-url="\${@: -1}"
-verb=GET
-case " \$* " in *" -X PUT "*) verb=PUT ;; esac
-case "\$url" in
-  */a0/claim/*)
-    { printf '%s' "\$verb \$* " | tr '\n' ' '; echo; } >> "$WORK_DIR/claim-calls"
-    mark="$WORK_DIR/refused/\$verb/\$(printf '%s' "\$url" | cksum | cut -d ' ' -f 1)"
-    case " \${REFUSE_VERBS:-GET PUT} " in
-      *" \$verb "*)
-        if mkdir -p "$WORK_DIR/refused/\$verb" && mkdir "\$mark" 2> /dev/null; then
-          printf '{"response_code":0,"exitcode":%s,"time_pretransfer":%s}\n' \
-            "\$REFUSE_EXIT" "\${REFUSE_PRETRANSFER:-0.000000}" >&2
-          exit "\$REFUSE_EXIT"
-        fi ;;
-    esac ;;
-esac
-exec "$(type -P curl)" "\$@"
-EOF
-chmod +x "$WORK_DIR/refuse-claim-curl.sh"
 
 run_cases case_claim_two_builds case_claim_one_push case_claim_order case_claim_failed \
   case_claim_takeover case_claim_dead_holder case_claim_stale case_claim_detached_push \

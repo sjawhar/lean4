@@ -318,10 +318,10 @@ case_push_many() {
 
 case_push_scale() {
   # A long queue costs a push time in proportion to its lines. The push's workers share what it
-  # did with each line's claim (2 updates per line), so a map that copied itself on each update
-  # made a queue of n lines cost n^2: 32,000 lines took about 58 s more than an empty queue.
-  # Here a queue of 32,000 lines that are not JSON (each dropped as invalid) must take less than
-  # 10 s more than an empty one.
+  # did with each line's claim (2 updates per line), so a map that copies itself on each update
+  # makes a queue of n lines cost n^2 (32,000 lines about 60 s more than an empty queue). Here a
+  # queue of 32,000 lines that are not JSON (each dropped as invalid) must take less than 10 s
+  # more than an empty one.
   push_fresh
   test_cmd mkdir -p "$PUSH_CACHE"
   local n t empty=0 extra=0
