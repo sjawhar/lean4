@@ -979,6 +979,24 @@ case_claim_write_unread() {
   match_text '/a0/claim/' "$CACHE_A/remote-status-read.json"
 }
 
+case_claim_rewrite_unread() {
+  # A compiles `Claim.Slow` (8 s), and rewrites its claim every second
+  # (`LAKE_CLAIM_TAKEOVER_SECS=4`). The first rewrite happens and gets a server error, its second
+  # send gets 412, and its read back gets 503: its outcome is unknown. The next rewrite gets 412,
+  # and a read finds the first rewrite's body, so A keeps the claim, with that generation, and its
+  # push marks it `done`.
+  claim_fresh
+  : > "$SERVER_LOG"
+  CLAIM_SERVICE=claimrewritelost LAKE_CLAIM_TAKEOVER_SECS=4 LAKE_TEST_CLAIM_SLEEP=8000 \
+    BUILD_TIMEOUT=$SOON_SECS run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.Slow
+  test_cmd_eq 1 claim_check built-by "$LOG_A"
+  test_cmd_eq 1 count '^PUT /claimrewritelost/a0/claim/.* -> 500 ' "$SERVER_LOG"
+  test_cmd_eq 3 count '^GET /claimrewritelost/a0/claim/.* -> 503 ' "$SERVER_LOG"
+  test_exp "$(count '^GET /claimrewritelost/a0/claim/.* -> 200 ' "$SERVER_LOG")" -ge 1
+  wait_push "$CACHE_A"
+  claims_done 1
+}
+
 case_claim_connect_retry() {
   # A claim request that did not reach the remote cache is sent again, a write as well as a read:
   # a connection that could not be made (`curl` exit code 7), and a time-out before `curl` began
@@ -1051,5 +1069,5 @@ run_cases case_claim_two_builds case_claim_one_push case_claim_order case_claim_
   case_claim_unreadable case_claim_local_clock case_claim_stream case_claim_off \
   case_claim_fail_open case_claim_share case_claim_free_slots case_claim_saturated \
   case_claim_free_slot_wake case_claim_read_retry case_claim_write_retry case_claim_write_race \
-  case_claim_write_unread case_claim_connect_retry case_claim_sent_timeout \
-  case_claim_read_sent_timeout
+  case_claim_write_unread case_claim_rewrite_unread case_claim_connect_retry \
+  case_claim_sent_timeout case_claim_read_sent_timeout

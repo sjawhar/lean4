@@ -212,3 +212,11 @@ name = "claimputlostread"
 type = "s3"
 artifactEndpoint = "%URL%/claimputlostread/a0"
 revisionEndpoint = "%URL%/claimputlostread/r0"
+
+# As `ok`, but the first rewrite of each claim happens and is answered 500, and the first 3 reads
+# of each claim are answered 503
+[[cache.service]]
+name = "claimrewritelost"
+type = "s3"
+artifactEndpoint = "%URL%/claimrewritelost/a0"
+revisionEndpoint = "%URL%/claimrewritelost/r0"

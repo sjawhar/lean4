@@ -175,6 +175,12 @@ def CacheService.RemoteObjectResponse.age? (r : CacheService.RemoteObjectRespons
 structure HeldState where
   /-- The generation that the last write of this process gave the claim. -/
   generation : String
+  /--
+  The bodies of this process's rewrites since its last write of known outcome whose own outcome is
+  unknown, because they failed without telling whether they happened (see `refreshClaims`): the
+  claim may hold one of them.
+  -/
+  unknownBodies : Array String := #[]
   /-- Whether this process stopped holding the claim (its build released it, or lost it). -/
   released : Bool := false
   deriving Inhabited
@@ -236,11 +242,29 @@ def unregister (url : String) (held : Held) : BaseIO Unit :=
       set {s with claims}
 
 /--
+The generation of the claim at `url` if a read finds that it holds one of `bodies`, rewrites of
+this process whose outcome is unknown (see `HeldState.unknownBodies`), whose nonces no other write
+has; `none` if it holds another body or none. A read that fails is an error.
+-/
+def unknownRewriteGeneration?
+  (service : CacheService) (url : String) (bodies : Array String)
+: LogIO (Option String) := do
+  let current ← service.getRemoteObject url
+  if current.code == 200 && bodies.contains current.body then
+    return current.header? "x-goog-generation"
+  if current.code == 200 || current.code == 404 then
+    return none
+  error s!"could not read the claim {url} (HTTP {current.code})"
+
+/--
 Rewrites each claim this process holds (state `building`), only if the claim still has the
 generation of this process's last write, and arms the timer of the next round while any claim is
 held. One round runs at a time. Each rewrite holds the claim's own lock and skips a claim that its
 build released meanwhile. A claim whose rewrite finds another generation (HTTP 412) was taken over
-by another build: this process no longer holds it.
+by another build, and this process no longer holds it, unless the claim holds a rewrite of this
+process whose outcome was unknown: this process then keeps the claim, with that rewrite's
+generation (`unknownRewriteGeneration?`). If the read that would tell fails, this process keeps
+the claim, and the next round tries again.
 -/
 partial def refreshClaims : BaseIO Unit := do
   let claims ← registry.atomically do
@@ -251,22 +275,36 @@ partial def refreshClaims : BaseIO Unit := do
       let st ← get
       if st.released then
         return false
-      let r ← tryLogIO do
-        held.service.putRemoteObjectIf url (← claimBody held.holder .building) st.generation
-      match r with
+      let .ok body ← (claimBody held.holder .building).toBaseIO
+        | held.status.modify (·.add s!"could not rewrite the claim {url}: no body could be made")
+          return false
+      match ← tryLogIO (held.service.putRemoteObjectIf url body st.generation) with
       | .ok r =>
         if r.code == 200 then
           if let some generation := r.header? "x-goog-generation" then
-            set {st with generation}
+            set {st with generation, unknownBodies := #[]}
           return false
         else if r.code == 412 then
+          unless st.unknownBodies.isEmpty do
+            match ← tryLogIO (unknownRewriteGeneration? held.service url st.unknownBodies) with
+            | .ok (some generation) =>
+              set {st with generation, unknownBodies := #[]}
+              return false
+            | .ok none => pure ()
+            | .error msg =>
+              held.status.modify
+                (·.add s!"could not tell whether this build still holds the claim {url}:\n{msg}")
+              return false
           set {st with released := true}
           return true
         else
+          -- An answer other than 200 or 412 (e.g. a second server error) leaves the outcome unknown
           held.status.modify (·.add s!"could not rewrite the claim {url} (HTTP {r.code})")
+          set {st with unknownBodies := st.unknownBodies.push body}
           return false
       | .error msg =>
         held.status.modify (·.add s!"could not rewrite the claim {url}:\n{msg}")
+        set {st with unknownBodies := st.unknownBodies.push body}
         return false
     if lost then
       unregister url held
@@ -291,8 +329,10 @@ def registerClaim (url : String) (held : Held) (periodMs : Nat) : BaseIO Unit :=
 /--
 Stops holding the claim at `url`, and returns it with the generation of this process's last write
 if this process still held it. It waits for a rewrite of the claim in flight, and no rewrite
-follows it, so that generation is the claim's. Once no claim is held, the timer of the next round
-is stopped, so nothing is left to run after the compiles end.
+follows it, so that generation is the claim's; after a rewrite whose outcome was unknown, it is the
+generation a read finds if the claim holds that rewrite (`unknownRewriteGeneration?`). Once no
+claim is held, the timer of the next round is stopped, so nothing is left to run after the compiles
+end.
 -/
 def releaseClaim (url : String) : BaseIO (Option (Held × String)) := do
   let some held ← registry.atomically do return (← get).claims[url]?
@@ -302,7 +342,15 @@ def releaseClaim (url : String) : BaseIO (Option (Held × String)) := do
     if st.released then
       return none
     set {st with released := true}
-    return some st.generation
+    if st.unknownBodies.isEmpty then
+      return some st.generation
+    match ← tryLogIO (unknownRewriteGeneration? held.service url st.unknownBodies) with
+    | .ok (some generation) => return some generation
+    | .ok none => return some st.generation
+    | .error msg =>
+      held.status.modify
+        (·.add s!"could not tell whether this build still holds the claim {url}:\n{msg}")
+      return some st.generation
   unregister url held
   return generation?.map (held, ·)
 
