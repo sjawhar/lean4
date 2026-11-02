@@ -1113,7 +1113,7 @@ v___f_363_ = lean_alloc_closure((void*)(l_Lake_buildLeanSharedLibOfStatic___lam_
 lean_closure_set(v___f_363_, 0, v_traceArgs_355_);
 lean_closure_set(v___f_363_, 1, v_weakArgs_354_);
 v___x_364_ = l_Lake_instDataKindFilePath;
-v___x_365_ = lean_unsigned_to_nat(0u);
+v___x_365_ = lean_unsigned_to_nat(8u);
 v___x_366_ = 0;
 v___x_367_ = l_Lake_Job_mapM___redArg(v___x_364_, v_staticLibJob_353_, v___f_363_, v___x_365_, v___x_366_, v_a_356_, v_a_357_, v_a_358_, v_a_359_, v_a_360_, v_a_361_);
 return v___x_367_;
@@ -1641,7 +1641,7 @@ _start:
 lean_object* v___f_583_; lean_object* v___x_584_; lean_object* v___x_585_; uint8_t v___x_586_; lean_object* v___x_587_; 
 v___f_583_ = ((lean_object*)(l___private_Lake_Build_ExternLib_0__Lake_computeDynlibOfShared___closed__0));
 v___x_584_ = l_Lake_instDataKindDynlib;
-v___x_585_ = lean_unsigned_to_nat(0u);
+v___x_585_ = lean_unsigned_to_nat(8u);
 v___x_586_ = 0;
 v___x_587_ = l_Lake_Job_mapM___redArg(v___x_584_, v_sharedLibTarget_575_, v___f_583_, v___x_585_, v___x_586_, v_a_576_, v_a_577_, v_a_578_, v_a_579_, v_a_580_, v_a_581_);
 return v___x_587_;

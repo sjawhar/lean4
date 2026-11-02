@@ -27,18 +27,15 @@ class expr_eq_fn {
             return hash((size_t)p.first >> 3, (size_t)p.second >> 3);
         }
     };
-    typedef lean::unordered_set<std::pair<lean_object *, lean_object *>, key_hasher> cache;
-    cache * m_cache = nullptr;
+    lean::lazy_table<lean::dense_set<std::pair<lean_object *, lean_object *>, key_hasher>, 16> m_cache;
     size_t m_counter = 0;
     bool check_cache(expr const & a, expr const & b) {
         if (!is_shared(a) || !is_shared(b))
             return false;
-        if (!m_cache)
-            m_cache = new cache();
         std::pair<lean_object *, lean_object *> key(a.raw(), b.raw());
-        if (m_cache->find(key) != m_cache->end())
+        if (m_cache.find(key) != m_cache.end())
             return true;
-        m_cache->insert(key);
+        m_cache.insert(key);
         return false;
     }
     bool apply(expr const & a, expr const & b, bool root = false) {
@@ -114,7 +111,6 @@ class expr_eq_fn {
 public:
     expr_eq_fn() {}
     ~expr_eq_fn() {
-        if (m_cache) delete m_cache;
         if (m_counter > 0) add_heartbeats(m_counter);
     }
     bool operator()(expr const & a, expr const & b) { return apply(a, b, true); }

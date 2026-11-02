@@ -421,6 +421,12 @@ to wall clock time.
 @[extern "lean_io_mono_nanos_now"] opaque monoNanosNow : BaseIO Nat
 
 /--
+CPU time consumed by the current thread in nanoseconds. Returns `0` where the platform has no current-thread CPU
+clock.
+-/
+@[extern "lean_io_thread_cpu_nanos_now"] opaque threadCpuNanosNow : BaseIO Nat
+
+/--
 Reads bytes from a system entropy source. It is not guaranteed to be cryptographically secure.
 
 If `nBytes` is `0`, returns immediately with an empty buffer.
@@ -813,6 +819,16 @@ works on Unix-like systems but not on Windows.
 Releases any previously-acquired lock on the handle. Succeeds even if no lock has been acquired.
 -/
 @[extern "lean_io_prim_handle_unlock"] opaque unlock (h : @& Handle) : IO Unit
+/--
+Sets whether processes spawned afterwards inherit the handle's underlying file descriptor (or
+Windows handle). Handles are not inherited by default.
+
+On Unix-like systems, where a lock belongs to the open file, a child that inherited a locked
+handle's descriptor keeps the lock after the handle is freed, until the child exits (`unlock`
+still releases it at once).
+-/
+@[extern "lean_io_prim_handle_set_inheritable"]
+opaque setInheritable (h : @& Handle) (inheritable : Bool) : IO Unit
 
 /--
 Returns `true` if a handle refers to a Windows console or a Unix terminal.
@@ -1126,6 +1142,21 @@ structure Metadata where
   type     : FileType
   /-- The number of hard links to the file. -/
   numLinks : UInt64
+  /--
+  The time of the file's last status change (`st_ctime`): a write to it, a change of its size, its
+  access rights, its owner or its number of hard links, a rename, and a change of its modification
+  time. On Unix-like systems no system call sets it to a chosen time; on Windows it is the NTFS
+  change time, which an application can set.
+  -/
+  statusChanged : SystemTime
+  /-- The device that holds the file (the volume serial number on Windows). -/
+  device   : UInt64
+  /--
+  The file's identifier on its device (the inode number on Unix-like systems). Paths with equal
+  `device` and `inode` name the same file on filesystems that give stable identifiers; some (FAT,
+  some network filesystems) do not. On Windows, `symlinkMetadata` follows symbolic links.
+  -/
+  inode    : UInt64
   deriving Repr
 
 end FS
@@ -1154,6 +1185,14 @@ does not exist or the metadata cannot be accessed.
 -/
 @[extern "lean_io_symlink_metadata"]
 opaque symlinkMetadata : @& FilePath → IO IO.FS.Metadata
+
+/--
+Returns whether the two paths name the same file: the same device and file identifier (the inode
+on Unix-like systems), following symlinks. Hard links to one file name the same file. Throws an
+exception if either file does not exist or its metadata cannot be accessed.
+-/
+@[extern "lean_io_is_same_file"]
+opaque isSameFile (p₁ p₂ : @& FilePath) : IO Bool
 
 /--
 Checks whether the indicated path can be read and is a directory. This function will traverse
