@@ -1630,13 +1630,19 @@ skipped, and so is one whose cached files cannot be read during its check (e.g.,
 after the resolve). A candidate whose check found its `.olean` is not the one its key records has that cache entry
 checked (`checkUsageIndexEntry`).
 
+Before it reads a candidate's entry, the lookup compares its record's header with what the pre-filter found current
+for earlier candidates since the last check (`headerRejects`, `UsageMemo`), and rejects there a candidate whose header
+has `noskip`, `digested` names that do not cover the closure, or other digests for a used module an earlier
+pre-filter compared. A check can bind importees, so the memo starts again after each one.
+
 A lookup that found any candidate logs one verbose line: `usage index: restored <name> (...) at rank <r>` or
 `usage index: no match (...)`, where `(...)` counts the candidates, those whose usage record the pre-filter read (its
-compact record or its `.usage`, `readCandidateUsage?`; `parsed`) and those that reached the check (`fully checked`),
-with the wall and current-thread CPU time the pre-filter took apart from reading views, the views this lookup added
-(`UsageView`) and their wall and CPU read times, and the importees the checks bound (`ContentHashes.imports`) that the
-module's same-tree check had not, with their wall and CPU check times; `<r>` is the restored candidate's position
-among the candidates, most recent first (from 1), which shows how many of them a lookup needs.
+compact record or its `.usage`, `readCandidateUsage?`, or the record's header alone; `parsed`) and those that reached
+the check (`fully checked`), with the wall and current-thread CPU time the pre-filter took apart from reading views,
+the views this lookup added (`UsageView`) and their wall and CPU read times, the importees the checks bound
+(`ContentHashes.imports`) that the module's same-tree check had not, with their wall and CPU check times, and the
+candidates rejected by their record's header; `<r>` is the restored candidate's position among the candidates, most
+recent first (from 1), which shows how many of them a lookup needs.
 -/
 def Module.lookupUsageIndex (mod : Module) (presetup : ModulePreSetup) (importArts : NameMap ImportArtifacts)
     (hashes : ContentHashes) (kept : Bool)
@@ -1646,6 +1652,8 @@ def Module.lookupUsageIndex (mod : Module) (presetup : ModulePreSetup) (importAr
   if candidates.isEmpty then return none
   -- The views this lookup added, with wall and current-thread CPU nanoseconds spent reading them
   let views ← IO.mkRef ((0, 0, 0) : Nat × Nat × Nat)
+  let memo ← IO.mkRef ({} : UsageMemo)
+  let headerRejected ← IO.mkRef 0
   let boundBefore := (← hashes.imports.get).size
   -- An importee as the module's decision bound it, if it did, else as the build's view of it
   let importee? (m : Name) : JobM (Option (Option ModuleUsage.Digest × UsageImport)) := do
@@ -1665,6 +1673,9 @@ def Module.lookupUsageIndex (mod : Module) (presetup : ModulePreSetup) (importAr
   -- and whether its usage record was read
   let prefilter (file : FilePath) :
       JobM (Option (ModuleOutputArtifacts × Log × UsageFiles × ModuleUsage.Digest) × Bool) := do
+    if ← headerRejects (Cache.usageIndexCompactFile file) (← memo.get) then
+      headerRejected.modify (· + 1)
+      return (none, true)
     let some (descrs, log) ← readUsageIndexEntry? file | return (none, false)
     if descrs.isModule || (!kept && descrs.keptFrom?.isSome) then return (none, false)
     let arts? : Option ModuleOutputArtifacts ← id do
@@ -1676,7 +1687,7 @@ def Module.lookupUsageIndex (mod : Module) (presetup : ModulePreSetup) (importAr
     let some arts := arts? | return (none, false)
     let (some usage, some usekey) := (arts.usage?, arts.usekey?) | return (none, false)
     match (← usagePrefilter presetup importArts hashes importee? usekey.path usage.path
-        (Cache.usageIndexCompactFile file)) with
+        (Cache.usageIndexCompactFile file) memo) with
     | .key => return (none, false)
     | .usage => return (none, true)
     | .passed keyOlean =>
@@ -1692,7 +1703,8 @@ def Module.lookupUsageIndex (mod : Module) (presetup : ModulePreSetup) (importAr
     return s!"{candidates.size} candidates, {parsed} parsed, {checked} fully checked; \
       prefilter {(prefilterNs - viewsNs) / 1000} µs ({(prefilterCpuNs - viewsCpuNs) / 1000} CPU µs); \
       {viewsRead} views read in {viewsNs / 1000} µs ({viewsCpuNs / 1000} CPU µs); \
-      {bound} importees bound in {checkNs / 1000} µs ({checkCpuNs / 1000} CPU µs)"
+      {bound} importees bound in {checkNs / 1000} µs ({checkCpuNs / 1000} CPU µs); \
+      {← headerRejected.get} rejected by their record's header"
   let mut parsed := 0
   let mut checked := 0
   let mut prefilterNs := 0
@@ -1723,6 +1735,7 @@ def Module.lookupUsageIndex (mod : Module) (presetup : ModulePreSetup) (importAr
         logVerbose <| log.entries.foldl (s!"{·}\n- {·.message}")
           s!"usage index: could not read the cached files of {file.fileStem.getD file.toString}:"
         return .compile "its cached files could not be read"
+    memo.set {}
     unless verdict matches .upToDate do
       if let some hash ← hashes.find? arts.olean.path then
         if hash != keyOlean then discard <| checkUsageIndexEntry arts.olean
@@ -1815,9 +1828,9 @@ Records the module's outputs, `arts`, which are in the cache, in the usage index
 lookup can read them: they name a `.usekey`, the build restores artifacts (`restore`), as a lookup requires, and usage
 cutoff can apply to the module. The entry has no archive, and holds `log`, the log of the outputs' build, which a
 lookup that restores them replays. With it goes the compact record of its `.usage` that the
-pre-filter reads (`compactUsage?`), unless the index has a usable one already (`hasCompactUsage`: it decodes and was
-made from the `.usage` the key names). The entry is named by its `.usekey`, which names the `.usage`, so a usable
-record never needs to change; one that is not usable is never read, and is written again here.
+pre-filter reads (`compactUsage?`), unless the index has a usable one already (`hasCompactUsage`: it has the current
+format, decodes and was made from the `.usage` the key names). The entry is named by its `.usekey`, which names the
+`.usage`, so a usable record never needs to change; one that is not usable is written again here.
 -/
 def Module.indexUsage (mod : Module) (presetup : ModulePreSetup) (arts : ModuleOutputArtifacts) (restore : Bool)
     (log : Log) : JobM Unit := do
