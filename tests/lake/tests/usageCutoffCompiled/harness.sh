@@ -2005,7 +2005,7 @@ hard_moduleext_s1() { nonbuiltin_y '' 'def y : List Nat := myMap k [0]'; }
 hard_moduleext_c_check() { hard_rejected hard_moduleext && grep -qE 'Built T\.M( |$)' ../hard_moduleext.1.log; }
 
 hard_speclookups_s0() {
-  nonbuiltin_files; nonbuiltin_y '' ''; hard_m $'import Lean\n' "$(hard_try 'run_meta Lean.specLookupsRef.set #[]')"
+  nonbuiltin_files; nonbuiltin_y '' ''; hard_m $'import Lean\n' "$(hard_try 'run_meta Lean.specLookupsRef.set []')"
 }
 hard_speclookups_s1() { nonbuiltin_y '' 'def y : List Nat := myMap k [0]'; }
 hard_speclookups_c_check() { hard_rejected hard_speclookups && grep -qE 'Built T\.M( |$)' ../hard_speclookups.1.log; }
