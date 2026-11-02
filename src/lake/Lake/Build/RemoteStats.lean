@@ -43,7 +43,10 @@ Counts for a build's end-of-build line: Lean module results, and separately C-ob
 plugin-link results ("other actions"). A result is `cached` (served by the service), `manifest`
 (a subset of cached, found through the manifest), `executed` (the service ran the action for this
 build, a compile that failed there included; an action run again counts once per run), or `local`
-(compiled on this machine in the fallback).
+(compiled on this machine by the fallback `local`, because the service did not answer). Each module
+counts once: one whose outputs the service made but could not deliver, and that the fallback then
+compiled, counts as `local`. `unavailableFailures` (not in the line) counts the modules that failed
+because the service did not answer, under `LAKE_REMOTE_EXEC_FALLBACK=fail`.
 -/
 public structure RemoteStats where
   state : RemoteState := .idle
@@ -54,6 +57,7 @@ public structure RemoteStats where
   otherCached : Nat := 0
   otherExecuted : Nat := 0
   otherLocal : Nat := 0
+  unavailableFailures : Nat := 0
   deriving Inhabited
 
 namespace RemoteStats
@@ -68,6 +72,10 @@ public def addLean (self : RemoteStats) (cached : Bool) (fromManifest := false) 
 /-- Records one locally compiled Lean module (the fallback). -/
 public def addLeanLocal (self : RemoteStats) : RemoteStats :=
   {self with localBuilt := self.localBuilt + 1}
+
+/-- Records one Lean module that failed because the service did not answer (fallback `fail`). -/
+public def addUnavailableFailure (self : RemoteStats) : RemoteStats :=
+  {self with unavailableFailures := self.unavailableFailures + 1}
 
 /-- The end-of-build line (contract C5.1), without a trailing newline. -/
 public def line (self : RemoteStats) : String :=

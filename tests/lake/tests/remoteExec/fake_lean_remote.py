@@ -10,9 +10,11 @@ outlives a client killed with its process group.
 
 Knobs, all through the environment:
   FAKE_CAS            directory of the content store and the action cache; persists across Lake runs
-  FAKE_LOG            file taking one JSON line per request; `<FAKE_LOG>.actions` takes each `run`'s
-                      action, which names no path of this machine, so a test can check that the
-                      action a client sends is the same on every machine
+  FAKE_LOG            file taking one JSON line per request, and after each `hello` its answer as a
+                      line `{"answer": "hello", "reachable": …, "t": <seconds since the epoch>}`;
+                      `<FAKE_LOG>.actions` takes each `run`'s action, which names no path of this
+                      machine, so a test can check that the action a client sends is the same on
+                      every machine
   FAKE_UNREACHABLE    `1`: `hello` answers `reachable: false`, as a build service that does not answer
   FAKE_UNREACHABLE_LATER  a file counting connections: `hello` answers `reachable: false` on every
                       connection after the first, as a service that stops answering mid-build
@@ -26,6 +28,13 @@ Knobs, all through the environment:
   FAKE_OOM_TARGET     a target name: its `run` answers OOM, as an action that ran out of memory
   FAKE_DISK_TARGET    a target name: its `run` answers DISK_LIMIT, as an action that filled its disk
   FAKE_UNAVAILABLE_TARGET a target name: its `run` answers UNAVAILABLE, as a service that did not answer
+  FAKE_DOWN_FILE      a path: while it exists, the service is down: `hello` answers `reachable: false`
+                      and every `run` and `materialize` answers UNAVAILABLE; a test removes it to
+                      bring the service back
+  FAKE_DOWN_AT_TARGET a target name: its first `run` creates FAKE_DOWN_FILE (once: the marker
+                      `<FAKE_DOWN_FILE>.tripped` records it), as a service that stops answering mid-build
+  FAKE_MATERIALIZE_FAIL `CODE:SUFFIX`: a `materialize` that names a path ending with SUFFIX answers
+                      CODE (UNAVAILABLE, NOT_FOUND, INTERNAL) and writes none of its files
   FAKE_SLEEP_MS       sleep this long in every `run`, standing in for the service's latency
   FAKE_CONCURRENT     `1`: answer each request after `hello` on a thread of its own, as the daemon
                       does, so requests overlap (default: one at a time, in order)
@@ -51,6 +60,7 @@ INFLIGHT_FILE = os.environ.get("FAKE_INFLIGHT")
 SLOW_WRITE = os.environ.get("FAKE_SLOW_WRITE")
 SLOW_WRITE_S = float(os.environ.get("FAKE_SLOW_WRITE_MS") or 0) / 1000.0
 CANCELLED = "cancelled, because the client closed its connection"
+DOWN_FILE = os.environ.get("FAKE_DOWN_FILE")
 
 _lock = threading.Lock()   # the in-flight counters, the log files and the CAS
 _out = threading.Lock()    # whole response lines on stdout
@@ -92,9 +102,24 @@ def append(name, obj):
         with _lock, open(name, "a") as f: f.write(json.dumps(obj, sort_keys=True) + "\n")
 
 
+def down():
+    """Whether the service is down (FAKE_DOWN_FILE exists)."""
+    return bool(DOWN_FILE) and os.path.exists(DOWN_FILE)
+
+
+def check_down():
+    if down(): raise Err("UNAVAILABLE", "fake: the service is down")
+
+
 def run(p):
     global _inflight, _max_inflight
     check_gone()
+    trip = os.environ.get("FAKE_DOWN_AT_TARGET")
+    if trip and DOWN_FILE and p.get("target") == trip:
+        with _lock:
+            if not os.path.exists(DOWN_FILE + ".tripped"):
+                open(DOWN_FILE + ".tripped", "w").close(); open(DOWN_FILE, "w").close()
+    check_down()
     for var, code, what in (("FAKE_TIMEOUT_TARGET", "TIMEOUT", "the action ran past its timeout"),
                             ("FAKE_OOM_TARGET", "OOM", "the action ran out of memory"),
                             ("FAKE_DISK_TARGET", "DISK_LIMIT", "the action filled its disk"),
@@ -165,6 +190,12 @@ def run_action(p):
 
 def materialize(p):
     written = present = nbytes = 0
+    check_down()
+    fail = os.environ.get("FAKE_MATERIALIZE_FAIL")
+    if fail:
+        code, suffix = fail.split(":", 1)
+        if any(f["path"].endswith(suffix) for f in p["files"]):
+            raise Err(code, f"fake: a materialize of *{suffix} answers {code}")
     for f in p["files"]:
         check_gone()                    # no write into the workspace starts after end of input
         h = f["digest"].split("/")[0]; src = os.path.join(CAS, h)
@@ -184,6 +215,13 @@ def materialize(p):
 
 
 def hello(p):
+    res = hello_answer(p)
+    # The answer too, with its time, so a test can tell when the service answered again
+    append(LOG, {"answer": "hello", "reachable": res["reachable"], "t": time.time()})
+    return res
+
+
+def hello_answer(p):
     if os.environ.get("FAKE_HELLO_STAMP"):
         with open(os.environ["FAKE_HELLO_STAMP"], "w") as f: f.write(repr(time.time()))
     later = os.environ.get("FAKE_UNREACHABLE_LATER") or os.environ.get("FAKE_UNVERIFIED_LATER")
@@ -191,6 +229,9 @@ def hello(p):
     if later:
         with _lock, open(later, "a+") as f:
             f.seek(0); nth = len(f.read().splitlines()) + 1; f.write("hello\n")
+    if down():
+        return {"daemonVersion": "fake", "daemonPid": os.getpid(), "reachable": False,
+                "reason": "fake: the service is down", "toolchainVerified": False}
     if os.environ.get("FAKE_UNREACHABLE") == "1" or (nth > 1 and os.environ.get("FAKE_UNREACHABLE_LATER")):
         return {"daemonVersion": "fake", "daemonPid": os.getpid(), "reachable": False,
                 "reason": "fake: unreachable", "toolchainVerified": False}

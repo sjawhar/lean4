@@ -479,6 +479,26 @@ def runQueuedPush (ws : Workspace) (logger : MonadLog BaseIO) : BaseIO Unit := d
   | .ok rc => logger.logEntry (.warning s!"`lake cache push` exited with code {rc}")
   | .error e => logger.logEntry (.warning s!"could not run `lake cache push`: {e}")
 
+/--
+Exit code of a build whose every failure is the build service's not answering, under
+`LAKE_REMOTE_EXEC_FALLBACK=fail`: 75 (`EX_TEMPFAIL`), so a caller can tell an outage from a broken
+build.
+-/
+public def remoteUnavailableCode : ExitCode := 75
+
+/--
+Whether the build failed only because the build service did not answer, under
+`LAKE_REMOTE_EXEC_FALLBACK=fail`: every job that logged a failure is a module that
+`recordUnavailableFailure` counted. A job that fails because a dependency failed logs nothing, so it
+is not among the failures (`reportJob`).
+-/
+def failedOnlyForService (bctx : BuildContext) (result : MonitorResult) : BaseIO Bool := do
+  let some rcfg := bctx.workspace.lakeEnv.remoteExec?
+    | return false
+  unless rcfg.fallback == .fail do
+    return false
+  return result.failures.size > 0 && result.failures.size == (← bctx.remoteStats.get).unavailableFailures
+
 def finalizeBuild
   (cfg : BuildConfig) (bctx : BuildContext) (mctx : MonitorContext) (result : BuildResult α)
 : IO α := do
@@ -516,6 +536,8 @@ def finalizeBuild
   | .error e =>
     if cfg.noBuild && result.wantsRebuild then
       IO.Process.exit noBuildCode.toUInt8
+    else if (← failedOnlyForService bctx result) then
+      IO.Process.exit remoteUnavailableCode.toUInt8
     else
       throw (IO.userError e)
 

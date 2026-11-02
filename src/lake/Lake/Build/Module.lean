@@ -1340,11 +1340,109 @@ def Module.remoteRunRequest (mod : Module) (presetup : ModulePreSetup) (_s : Rem
     ("mnemonic", "LeanModule"),
     ("target", mod.name.toString)]
 
-/-- Fetch a module's outputs from the build service (contract C5.1): replay an up-to-date trace
-with no request, otherwise `run` the action, materialize the outputs, and write the trace as a
-local compile does. In slice 1 every miss runs on the service; an unreachable service fails. -/
-def Module.fetchRemote (mod : Module) (presetup : ModulePreSetup) (_s : RemoteSession) :
-    JobM ModuleOutputArtifacts := do
+/--
+Leaves the build action of `fetchRemote` because the build service did not answer: a request
+answered `UNAVAILABLE`, after the daemon's own retries (contract C5.1). `epoch` is `remoteEpoch`,
+read just before that request was sent. A bridge `hello` that refused the service also rejects
+requests as `UNAVAILABLE`; it records `.refused`, which fails whatever the fallback
+(`remoteDecision?`). Under `LAKE_REMOTE_EXEC_FALLBACK=fail` an unavailable service errors with `msg`,
+counted for exit code 75 (`recordUnavailableFailure`). Otherwise it notes `msg` and `epoch` in `why`
+and fails without a log entry, from `pos`, where the action started; `fetchRemote` then drops what
+the action logged and takes the fallback (`local` or `wait`). Either way the action writes no trace.
+-/
+def remoteUnavailable (s : RemoteSession) (why : IO.Ref (Option (String × Nat))) (pos : Log.Pos)
+    (epoch : Nat) (msg : String) : JobM α := do
+  if let some (.refused refusal) ← remoteDecision? then
+    error refusal
+  if s.cfg.fallback == .fail then
+    recordUnavailableFailure
+    error msg
+  why.set (some (msg, epoch))
+  throw pos
+
+/--
+The build action of `fetchRemote`: `run` the module's action, replay Lean's output and fail on a bad
+exit, as a local compile does, then materialize the outputs and hash them. A request that answers
+`UNAVAILABLE` leaves through `remoteUnavailable`. The service's result counts once, when it is the
+module's: before Lean's output fails the module (a compile that failed on the service was executed
+there), once the outputs are here, or before `materialize` fails for another reason; not when the
+fallback is about to compile the module instead.
+-/
+def Module.buildRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSession)
+    (why : IO.Ref (Option (String × Nat))) : JobM ModuleOutputArtifacts := do
+  let pos ← getLogPos
+  let start ← IO.monoMsNow
+  let head ← mod.remoteHead presetup s
+  let params ← mod.remoteRunRequest presetup s head
+  let runEpoch ← remoteEpoch
+  let result ← match ← runAction s params with
+    | .ok r => pure r
+    | .error e =>
+      let msg := s!"the build service's run of {mod.name} failed: {e.message}"
+      if e.code == .unavailable then
+        remoteUnavailable s why pos runEpoch msg
+      -- These answers say the service ran the action and it failed there (contract C5.1).
+      if e.code == .oom || e.code == .timeout || e.code == .diskLimit then
+        recordRemoteModule (cached := false)
+      error msg
+  let locMap : List (String × String × FilePath) := [
+    (remoteLibPath mod "olean", "olean", mod.oleanFile),
+    (remoteLibPath mod "olean.server", "olean.server", mod.oleanServerFile),
+    (remoteLibPath mod "olean.private", "olean.private", mod.oleanPrivateFile),
+    (remoteLibPath mod "ilean", "ilean", mod.ileanFile),
+    (remoteLibPath mod "ir.sig", "ir.sig", mod.irSigFile),
+    (remoteLibPath mod "ir", "ir", mod.irFile),
+    (remoteIrPath mod "c", "c", mod.cFile),
+    (remoteIrPath mod "bc", "bc", mod.bcFile)]
+  let found ← result.outputs.mapM fun o =>
+    match locMap.find? (·.1 == o.rel) with
+    | some (_, ext, path) => pure (ext, o.digest, path, o.executable)
+    | none => error s!"the build service returned an unexpected output {o.rel} for {mod.name}"
+  let record : JobM Unit := do
+    recordRemoteModule result.cached
+    appendRemoteLog s "lean" mod.name.toString (if result.cached then "cached" else "executed")
+      result.action result.exitCode (found.map fun (ext, d, _, _) => (ext, d))
+      ((← IO.monoMsNow) - start)
+  mod.clearOutputArtifacts
+  mod.clearOutputHashes
+  -- Replay the compile's output and fail on a bad exit, as a local compile does.
+  let out : IO.Process.Output := {
+    exitCode := (if result.exitCode < 0 then 255 else result.exitCode.toNat).toUInt32
+    stdout := result.stdout, stderr := result.stderr}
+  try
+    withLogErrorPos <| logLeanOutput out (relPathFrom mod.pkg.dir presetup.srcFile)
+  catch e =>
+    record
+    throw e
+  let materializeEpoch ← remoteEpoch
+  match ← materializeFiles s (found.map fun (_, d, p, x) => (d, p, x)) with
+  | .ok _ => record
+  | .error e =>
+    let msg := s!"materializing {mod.name} from the build service failed: {e.message}"
+    if e.code == .unavailable then
+      -- Under `fail` the service's result stays the module's; otherwise the fallback replaces it.
+      if s.cfg.fallback == .fail then
+        record
+      remoteUnavailable s why pos materializeEpoch msg
+    record
+    error msg
+  -- Hashing the outputs takes a build slot, as the read broker's check of a download does
+  -- (`ReadBroker.lean`): after a lent wait, more jobs run than the pool has workers.
+  withBuildSlot do
+    mod.computeArtifacts presetup.isModule presetup.postponeCompile
+
+/--
+Fetch a module's outputs from the build service (contract C5.1): replay an up-to-date trace with no
+request, otherwise `run` the action, materialize the outputs, and write the trace as a local compile
+does (`buildRemote`). Returns `none` when the service did not answer and `LAKE_REMOTE_EXEC_FALLBACK`
+is `local` (`useService`, `remoteUnavailable`): the caller then compiles the module on this machine,
+where its imports' outputs are, as every result of the service is materialized here at once. Under
+`wait`, a request that answered `UNAVAILABLE` is sent again once the service answers
+(`awaitServiceAgain`). A result of the service (a nonzero exit, `OOM`, `TIMEOUT`, `DISK_LIMIT`) and
+every other error are the module's result, never a reason to fall back.
+-/
+def Module.fetchRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSession) :
+    JobM (Option ModuleOutputArtifacts) := do
   let depTrace ← getTrace
   let inputHash := depTrace.hash
   let savedTrace ← readTraceFile mod.traceFile
@@ -1352,52 +1450,23 @@ def Module.fetchRemote (mod : Module) (presetup : ModulePreSetup) (_s : RemoteSe
   -- an output went missing does not print its messages twice.
   if (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) then
     if (← savedTrace.replayCachedIfUpToDate inputHash) then
-      return ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
-  buildAction depTrace mod.traceFile do
-    let session ← activeSession
-    let start ← IO.monoMsNow
-    let head ← mod.remoteHead presetup session
-    let params ← mod.remoteRunRequest presetup session head
-    let result ← match ← runAction session params with
-      | .ok r => pure r
-      | .error e =>
-        -- These answers say the service ran the action and it failed there (contract C5.1).
-        if e.code == .oom || e.code == .timeout || e.code == .diskLimit then
-          recordRemoteModule (cached := false)
-        error s!"the build service's run of {mod.name} failed: {e.message}"
-    let locMap : List (String × String × FilePath) := [
-      (remoteLibPath mod "olean", "olean", mod.oleanFile),
-      (remoteLibPath mod "olean.server", "olean.server", mod.oleanServerFile),
-      (remoteLibPath mod "olean.private", "olean.private", mod.oleanPrivateFile),
-      (remoteLibPath mod "ilean", "ilean", mod.ileanFile),
-      (remoteLibPath mod "ir.sig", "ir.sig", mod.irSigFile),
-      (remoteLibPath mod "ir", "ir", mod.irFile),
-      (remoteIrPath mod "c", "c", mod.cFile),
-      (remoteIrPath mod "bc", "bc", mod.bcFile)]
-    let found ← result.outputs.mapM fun o =>
-      match locMap.find? (·.1 == o.rel) with
-      | some (_, ext, path) => pure (ext, o.digest, path, o.executable)
-      | none => error s!"the build service returned an unexpected output {o.rel} for {mod.name}"
-    -- Counted before Lean's output is checked: a compile that failed on the service was executed
-    -- there (contract C5.1).
-    recordRemoteModule result.cached
-    appendRemoteLog session "lean" mod.name.toString (if result.cached then "cached" else "executed")
-      result.action result.exitCode (found.map fun (ext, d, _, _) => (ext, d))
-      ((← IO.monoMsNow) - start)
-    mod.clearOutputArtifacts
-    mod.clearOutputHashes
-    -- Replay the compile's output and fail on a bad exit, as a local compile does.
-    let out : IO.Process.Output := {
-      exitCode := (if result.exitCode < 0 then 255 else result.exitCode.toNat).toUInt32
-      stdout := result.stdout, stderr := result.stderr}
-    withLogErrorPos <| logLeanOutput out (relPathFrom mod.pkg.dir presetup.srcFile)
-    match ← materializeFiles session (found.map fun (_, d, p, x) => (d, p, x)) with
-    | .ok _ => pure ()
-    | .error e => error s!"materializing {mod.name} from the build service failed: {e.message}"
-    -- Hashing the outputs takes a build slot, as the read broker's check of a download does
-    -- (`ReadBroker.lean`): after a lent wait, more jobs run than the pool has workers.
-    withBuildSlot do
-      mod.computeArtifacts presetup.isModule presetup.postponeCompile
+      return some (← mod.computeArtifacts presetup.isModule presetup.postponeCompile)
+  -- Under `--no-build` the action fails before any request (`buildAction`): no `hello`, no wait.
+  unless (← getNoBuild) do
+    unless (← useService s) do
+      return none
+  repeat
+    let why ← IO.mkRef (none : Option (String × Nat))
+    try
+      return some (← buildAction depTrace mod.traceFile (mod.buildRemote presetup s why))
+    catch pos =>
+      let some (_, epoch) ← why.get | throw pos
+      dropLogFrom pos
+      if s.cfg.fallback == .wait then
+        awaitServiceAgain s epoch
+      else
+        return none
+  return none
 
 end RemoteExec
 
@@ -2172,9 +2241,22 @@ where
       return .complete arts
   fetchCore (presetup : ModulePreSetup) (sawDone : Bool) :
       JobM (ClaimLoop ModuleOutputArtifacts) := do
-    -- Service mode bypasses the local compile and the shared-bucket machinery (contract C5.1).
-    if let some s ← remoteSession? then
-      return .done (← mod.fetchRemote presetup s)
+    -- Service mode bypasses the local compile and the shared-bucket machinery (contract C5.1), unless the
+    -- service did not answer and the fallback is `local`: then the module takes the local path, publishing
+    -- nothing (`Env.remoteCacheQueueService?`), and counts as `local` if that path compiles it.
+    let some s ← remoteSession?
+      | fetchLocal presetup sawDone
+    if let some arts ← mod.fetchRemote presetup s then
+      return .done arts
+    let compiled ← trackBuilds
+    let start ← IO.monoMsNow
+    let r ← fetchLocal presetup sawDone
+    if (← compiled) then
+      recordRemoteLocal
+      appendRemoteLog s "lean" mod.name.toString "local" "" 0 #[] ((← IO.monoMsNow) - start)
+    return r
+  fetchLocal (presetup : ModulePreSetup) (sawDone : Bool) :
+      JobM (ClaimLoop ModuleOutputArtifacts) := do
     -- Whether this call compiles the module (not an earlier action of the job it continues)
     let compiledHere ← trackBuilds
     let depTrace ← getTrace
