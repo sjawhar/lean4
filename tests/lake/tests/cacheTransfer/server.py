@@ -60,6 +60,10 @@ a test picks one by pointing an endpoint at it (e.g. `.../corrupt/a0`):
             writer's claim: the same fields with another `nonce`
   claimputlostread
             as `claimputlost`, and 503 for the first 3 `GET`s of each claim
+  claimrewritelost
+            the first rewrite of each claim (a conditional `PUT` with a
+            generation other than 0) writes it, and is answered 500; and 503
+            for the first 3 `GET`s of each claim; otherwise as `ok`
 
 A fault that does not apply to a request kind (e.g. `badcount` on a `GET`)
 behaves as `ok`. Like Cloud Storage, each object has a generation, which a new
@@ -251,6 +255,7 @@ class Mode(StrEnum):
     CLAIM_PUT_LOST = "claimputlost"
     CLAIM_PUT_RACE = "claimputrace"
     CLAIM_PUT_LOST_READ = "claimputlostread"
+    CLAIM_REWRITE_LOST = "claimrewritelost"
 
 
 def content_type(path):
@@ -469,7 +474,7 @@ class Handler(BaseHTTPRequestHandler):
         ):
             self.respond(503, b"Service Unavailable", "text/plain")
         elif (
-            mode == Mode.CLAIM_PUT_LOST_READ
+            mode in (Mode.CLAIM_PUT_LOST_READ, Mode.CLAIM_REWRITE_LOST)
             and parts[1:2] == ["claim"]
             and fault_count("get", mode, parts) <= 3
         ):
@@ -613,11 +618,15 @@ class Handler(BaseHTTPRequestHandler):
             want = self.headers.get("x-goog-if-generation-match")
             # `claimputlost`, `claimputrace` and `claimputlostread`: the first conditional write of
             # each claim happens (in `claimputrace`, as another writer's claim: the same fields,
-            # another nonce), and its answer is a 500
+            # another nonce), and its answer is a 500; `claimrewritelost`: the same for the first
+            # rewrite of each claim
             lost = (
-                mode in (Mode.CLAIM_PUT_LOST, Mode.CLAIM_PUT_RACE, Mode.CLAIM_PUT_LOST_READ)
-                and parts[1:2] == ["claim"]
+                parts[1:2] == ["claim"]
                 and want is not None
+                and (
+                    mode in (Mode.CLAIM_PUT_LOST, Mode.CLAIM_PUT_RACE, Mode.CLAIM_PUT_LOST_READ)
+                    or (mode == Mode.CLAIM_REWRITE_LOST and want != "0")
+                )
                 and first_fault("put", mode, parts)
             )
             if lost and mode == Mode.CLAIM_PUT_RACE:
