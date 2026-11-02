@@ -21,13 +21,20 @@ user-specified CLI options and the process environment.
 
 namespace Lake
 
-/-- What a build does when the build service does not answer (`LAKE_REMOTE_EXEC_FALLBACK`). -/
+/--
+What a build does when the build service does not answer (`LAKE_REMOTE_EXEC_FALLBACK`): when the
+`hello` that decides finds it unreachable, or a request still answers `UNAVAILABLE` after the
+daemon's own retries. A result of the service (a failed compile, `OOM`, `TIMEOUT`, `DISK_LIMIT`) is
+never a reason to fall back, and a service that refuses (another toolchain) fails whatever this says.
+-/
 public inductive RemoteFallback
-  /-- Compile on this machine and publish nothing (the default; design "Failure"). -/
+  /-- Compile on this machine and publish nothing (the default; design "Failure"). After the service
+  did not answer once, every later module of the build compiles locally without asking it again. -/
   | compileLocally
-  /-- Never compile on this machine: wait for the service. -/
+  /-- Never compile on this machine: wait for the service, probing it again after 1, 2, 4 … 30 s. -/
   | wait
-  /-- Fail the build at once (exit code 75). -/
+  /-- Fail each module that needs the service; the build exits with code 75 when all its failures
+  are such modules. -/
   | fail
   deriving Inhabited, DecidableEq, Repr
 
@@ -408,10 +415,12 @@ The name of the cache service whose write-back queue builds append to, if any: t
 `LAKE_REMOTE_CACHE` names, if `LAKE_REMOTE_CACHE_QUEUE` is set, and only while the githash that
 names the remote scope (`leanGithash`) is that of the `lean` Lake runs. A `LEAN_GITHASH` that
 names another Lean would publish this Lean's outputs in that Lean's scope. (Lake passes the true
-githash to the processes it starts, so a build under `lake env` still queues.)
+githash to the processes it starts, so a build under `lake env` still queues.) In build-service mode
+(`LAKE_REMOTE_EXEC`) builds queue nothing, the local fallback included: the fallback publishes
+nothing (`RemoteFallback.compileLocally`), and neither claims nor pushes follow.
 -/
 public def remoteCacheQueueService? (env : Env) : Option String :=
-  if env.remoteCacheQueue && !env.lean.githash.isEmpty &&
+  if env.remoteExec?.isNone && env.remoteCacheQueue && !env.lean.githash.isEmpty &&
       (env.githashOverride.isEmpty || env.githashOverride == env.lean.githash) then
     env.remoteCache?
   else
