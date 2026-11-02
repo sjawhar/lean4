@@ -48,7 +48,7 @@ name = "Busy"
 roots = [$(IFS=,; echo "${busy_roots[*]}")]
 EOF
 # A \`curl\` that records how many transfers each of its runs carries (the \`url =\` lines of the
-# configuration file it is given), one line per run
+# configuration file it is given), one line per run, and the arguments of each run
 cat > count-curl.sh << EOF
 #!/usr/bin/env bash
 urls=0
@@ -60,6 +60,7 @@ for arg in "\$@"; do
   prev=\$arg
 done
 echo "\$urls" >> '$WORK_DIR/curl-runs'
+{ printf '%s' "\$* " | tr '\n' ' '; echo; } >> '$WORK_DIR/curl-argv'
 exec '$(type -P curl)' "\$@"
 EOF
 chmod +x count-curl.sh
@@ -254,7 +255,8 @@ case_read_shared_runs() {
   # fewer `curl` runs than reads, and at least one run carries several of them. One `curl`
   # process per read would be 32 runs of one transfer, each with a connection of its own. The
   # remote answers each read after 2 s, so the build also shows that a run's transfers go at once
-  # and not one after another.
+  # and not one after another. The remote is plain HTTP, so each run connects its transfers at
+  # once (`--parallel-immediate`; see `Lake.parallelConnectArgs`).
   local start elapsed runs most
   LAKE_CACHE_DIR="$BUILD_CACHE_DIR" test_run build Many -o many-outputs.jsonl
   test_cmd rm -rf many-build
@@ -263,7 +265,7 @@ case_read_shared_runs() {
     --outputs many-outputs.jsonl --cache "$BUILD_CACHE_DIR" --build many-build
   fresh
   : > "$SERVER_LOG"
-  rm -f "$WORK_DIR/curl-runs"
+  rm -f "$WORK_DIR/curl-runs" "$WORK_DIR/curl-argv"
   start="$(date +%s)"
   LEAN_NUM_THREADS=16 CURL="$WORK_DIR/count-curl.sh" LAKE_REMOTE_CACHE=slow \
     test_not_out 'Built ' build Many
@@ -277,6 +279,9 @@ case_read_shared_runs() {
   test_exp "$most" -ge 2
   test_exp "$runs" -lt 32
   test_exp "$elapsed" -lt 60
+  test_exp "$(count '-Z ' "$WORK_DIR/curl-argv")" -ge 1
+  test_cmd_eq "$(count '-Z ' "$WORK_DIR/curl-argv")" \
+    count '-Z --parallel-max [0-9]* --parallel-immediate ' "$WORK_DIR/curl-argv"
 }
 
 case_read_compile_slots() {

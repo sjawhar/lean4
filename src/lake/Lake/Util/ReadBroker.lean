@@ -190,7 +190,8 @@ def runCurl
     h.flush
     let maxSecs := transferMaxSecs req.maxBytes
     let args := curlLeadArgs req.token? ++
-      #["-Z", "--parallel-max", toString runSize, "-s", "-w", writeOut] ++
+      #["-Z", "--parallel-max", toString runSize] ++ parallelConnectArgs (run.map (·.req.url)) ++
+      #["-s", "-w", writeOut] ++
       curlFollowArgs req.token? ++ transferTimeoutArgs req.limits.stallSecs ++
       #["--max-filesize", toString req.maxBytes, "--max-time", toString maxSecs,
         "--config", cfg.toString]

@@ -1225,7 +1225,8 @@ def runTransfer
     | .get => pure none
     | .put => do pure (some (transferMaxSecs (← totalFileSize (cfg.infos.map (·.path)))))
   let maxSecs? := uploadSecs?.map (transferRunMaxSecs cfg.infos.size)
-  let parallelArgs := #["-Z", "--parallel-max", toString transferParallelMax]
+  let parallelArgs := #["-Z", "--parallel-max", toString transferParallelMax] ++
+    parallelConnectArgs (cfg.infos.map (·.url))
   try
     IO.FS.withTempFile fun h path => do
       if let some token := token? then
