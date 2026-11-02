@@ -197,7 +197,8 @@ end RemoteClaimState
 /--
 The body of a claim: the build that holds it (`<host>:<pid>`), what it does, and when it wrote the
 claim (seconds since the Unix epoch, by its own clock; a build that decides whether a claim is
-stale uses the remote cache's times instead).
+stale uses the remote cache's times instead). A build also writes a random `nonce` in each body
+(see `Lake.claimBody`), which no reader parses.
 -/
 public structure RemoteClaim where
   holder : String

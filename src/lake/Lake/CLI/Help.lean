@@ -838,13 +838,15 @@ others. It takes an input that its build left unclaimed for
 leaves that build no more inputs until it sees it compiling again. A build
 that has seen no other build compiling claims every input it reaches.
 Each send of a claim request ends within 20 seconds, or fails, as does one
-whose answer is larger than 64 KiB, and claim requests are not retried. A
-request may first run `LAKE_CACHE_TOKEN_CMD` (when no token is held, or it is
+whose answer is larger than 64 KiB. A claim request that did not reach the
+remote cache is sent again after 1 and 2 seconds, as is a read that timed out
+or got a server error. A write that got a server error is sent once more; if
+that send finds the claim written, a read tells whether this build wrote it.
+A send may first run `LAKE_CACHE_TOKEN_CMD` (when no token is held, or it is
 older than 45 minutes), and one that the remote cache refuses for its token
-runs it again and is sent once more. Each run may take 60 seconds, so a claim
-request takes at most two runs and two sends: 160 seconds. After its first
-queued output, a build that claims inputs starts this command itself, once,
-detached, as
+runs it again and is sent once more. Each run may take 60 seconds. After its
+first queued output, a build that claims inputs starts this command itself,
+once, detached, as
 `lake cache push --wait --follow <file>` with a lock file that the build holds
 until it ends: the push uploads each output as the build queues it, tries an
 upload that failed again every 30 seconds while the build runs, ends after the

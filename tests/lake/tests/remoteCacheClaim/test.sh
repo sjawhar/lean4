@@ -876,6 +876,133 @@ case_claim_free_slot_wake() {
   CLAIM_SLOTS=1 run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" freeSlotWake
 }
 
+# A claim's object is `<endpoint>/claim/...`; the package's own remote scope ends in `claim` too.
+# Checks that a build recorded no claim failure in its read status (a build that recorded no
+# read failure writes no such file): `no_claim_failure <cache>`
+no_claim_failure() {
+  if [ -e "$1/remote-status-read.json" ]; then
+    no_match_text '/a0/claim/' "$1/remote-status-read.json"
+  fi
+}
+
+case_claim_read_retry() {
+  # A claim read that the remote cache answers with a server error (503) is sent again, 1 s
+  # later: B reads another host's `failed` claim of `Claim.A` once more, takes it over and
+  # compiles, and records no claim failure.
+  claim_fresh
+  LAKE_REMOTE_CACHE_CLAIMS=false run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
+  put_claim "$(inputs "$CACHE_A" Claim.A)" failed
+  : > "$SERVER_LOG"
+  CLAIM_SERVICE=claimgeterror BUILD_TIMEOUT=$SOON_SECS \
+    run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim.A
+  test_cmd_eq 1 claim_check built-by "$LOG_B"
+  test_cmd_eq 1 count '^GET /claimgeterror/a0/claim/.* -> 503 ' "$SERVER_LOG"
+  test_exp "$(count '^GET /claimgeterror/a0/claim/.* -> 200 ' "$SERVER_LOG")" -ge 1
+  no_claim_failure "$CACHE_B"
+}
+
+case_claim_write_retry() {
+  # A claim write that got a server error (500) is sent again: when the first send did not write
+  # the claim, the second one does; when it did (its answer was lost), the second one gets 412,
+  # and a read finds this build's own body (its nonce), so the build holds the claim. Either way
+  # the build compiles once, under its claim, which its push marks `done`.
+  local service
+  for service in claimputerror claimputlost; do
+    claim_fresh
+    : > "$SERVER_LOG"
+    CLAIM_SERVICE=$service BUILD_TIMEOUT=$SOON_SECS \
+      run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
+    test_cmd_eq 1 claim_check built-by "$LOG_A"
+    test_cmd_eq 1 count "^PUT /$service/a0/claim/.* -> 500 " "$SERVER_LOG"
+    no_claim_failure "$CACHE_A"
+    wait_push "$CACHE_A"
+    claims_done 1
+  done
+  test_cmd_eq 1 count '^PUT /claimputlost/a0/claim/.* -> 412 ' "$SERVER_LOG"
+}
+
+case_claim_write_race() {
+  # The first write of the claim of `Claim.A` got a server error, and what the remote cache then
+  # holds is another writer's claim: the same holder, state and time, another nonce. The second
+  # send gets 412, and the build does not take that claim for its own: it waits until the claim
+  # is stale (`LAKE_CLAIM_TAKEOVER_SECS=5`), takes it over and compiles.
+  claim_fresh
+  START=$(date +%s)
+  CLAIM_SERVICE=claimputrace LAKE_CLAIM_TAKEOVER_SECS=5 BUILD_TIMEOUT=$SOON_SECS \
+    run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
+  test_cmd_eq 1 claim_check built-by "$LOG_A"
+  test_exp $(( $(date +%s) - START )) -ge 5
+  match_text 'taking over the claim' "$LOG_A"
+}
+
+case_claim_connect_retry() {
+  # A claim request that did not reach the remote cache is sent again, a write as well as a read:
+  # a connection that could not be made (`curl` exit code 7), and a time-out before `curl` began
+  # to send the request (28, `time_pretransfer` 0). Here the first write and the first read of
+  # each claim fail so. A compiles `Claim.A` under its claim; then B finds another host's `failed`
+  # claim of `Claim.A` (its write gets 412, so it reads the claim) and takes it over. Neither
+  # records a claim failure.
+  local exit
+  for exit in 7 28; do
+    claim_fresh
+    rm -rf "$WORK_DIR/refused"
+    REFUSE_EXIT=$exit CURL="$WORK_DIR/refuse-claim-curl.sh" BUILD_TIMEOUT=$SOON_SECS \
+      run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
+    test_cmd_eq 1 claim_check built-by "$LOG_A"
+    test_exp "$(count_files "$WORK_DIR/refused/PUT")" -ge 1
+    no_claim_failure "$CACHE_A"
+    claim_fresh
+    LAKE_REMOTE_CACHE_CLAIMS=false run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
+    put_claim "$(inputs "$CACHE_A" Claim.A)" failed
+    rm -rf "$WORK_DIR/refused"
+    REFUSE_EXIT=$exit CURL="$WORK_DIR/refuse-claim-curl.sh" BUILD_TIMEOUT=$SOON_SECS \
+      run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim.A
+    test_cmd_eq 1 claim_check built-by "$LOG_B"
+    test_exp "$(count_files "$WORK_DIR/refused/GET")" -ge 1
+    no_claim_failure "$CACHE_B"
+  done
+}
+
+case_claim_sent_timeout() {
+  # A claim write that timed out after `curl` began to send it (`curl` exit code 28,
+  # `time_pretransfer` above 0) may have reached the remote cache, so it is not sent again: the
+  # claim of `Claim.A` fails, which the build records, and the build compiles all the same.
+  claim_fresh
+  rm -rf "$WORK_DIR/refused"
+  : > "$WORK_DIR/claim-calls"
+  REFUSE_EXIT=28 REFUSE_PRETRANSFER=0.5 REFUSE_VERBS=PUT CURL="$WORK_DIR/refuse-claim-curl.sh" \
+    BUILD_TIMEOUT=$SOON_SECS run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
+  test_cmd_eq 1 claim_check built-by "$LOG_A"
+  test_cmd_eq 1 count '^PUT .*x-goog-if-generation-match: 0 ' "$WORK_DIR/claim-calls"
+  match_text '/a0/claim/' "$CACHE_A/remote-status-read.json"
+}
+
+# A `curl` that fails the first write (`-X PUT`) and the first read of each claim (only the verbs
+# in `REFUSE_VERBS`, by default both) with the exit code `REFUSE_EXIT` and the JSON that `curl -w`
+# writes then, with `time_pretransfer` `REFUSE_PRETRANSFER` (by default 0: nothing was sent), and
+# runs the real `curl` for every other request. Each claim request is logged in `claim-calls`.
+cat > "$WORK_DIR/refuse-claim-curl.sh" << EOF
+#!/usr/bin/env bash
+url="\${@: -1}"
+verb=GET
+case " \$* " in *" -X PUT "*) verb=PUT ;; esac
+case "\$url" in
+  */a0/claim/*)
+    { printf '%s' "\$verb \$* " | tr '\n' ' '; echo; } >> "$WORK_DIR/claim-calls"
+    mark="$WORK_DIR/refused/\$verb/\$(printf '%s' "\$url" | cksum | cut -d ' ' -f 1)"
+    case " \${REFUSE_VERBS:-GET PUT} " in
+      *" \$verb "*)
+        if mkdir -p "$WORK_DIR/refused/\$verb" && mkdir "\$mark" 2> /dev/null; then
+          printf '{"response_code":0,"exitcode":%s,"time_pretransfer":%s}\n' \
+            "\$REFUSE_EXIT" "\${REFUSE_PRETRANSFER:-0.000000}" >&2
+          exit "\$REFUSE_EXIT"
+        fi ;;
+    esac ;;
+esac
+exec "$(type -P curl)" "\$@"
+EOF
+chmod +x "$WORK_DIR/refuse-claim-curl.sh"
+
 run_cases case_claim_two_builds case_claim_one_push case_claim_order case_claim_failed \
   case_claim_takeover case_claim_dead_holder case_claim_stale case_claim_detached_push \
   case_claim_pool_slot case_claim_fail_fast case_claim_same_pid case_claim_queued \
@@ -885,4 +1012,5 @@ run_cases case_claim_two_builds case_claim_one_push case_claim_order case_claim_
   case_claim_push_start_wfail case_claim_foreground_push case_claim_follow_reap \
   case_claim_unreadable case_claim_local_clock case_claim_stream case_claim_off \
   case_claim_fail_open case_claim_share case_claim_free_slots case_claim_saturated \
-  case_claim_free_slot_wake
+  case_claim_free_slot_wake case_claim_read_retry case_claim_write_retry case_claim_write_race \
+  case_claim_connect_retry case_claim_sent_timeout

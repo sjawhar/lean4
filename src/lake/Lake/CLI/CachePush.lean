@@ -573,9 +573,9 @@ def takeLineClaims (ctx : PushContext) (taken : TakenClaims) (lines : Array Stri
 Waits until no line of `lines` is being taken (`TakenClaim.taking`), so that each is staged with
 the generation its claim has now: a line whose claim the taker took while a pass read the queue
 would otherwise be staged with the generation of its queue line, and the `done` write after its
-upload would be refused. A request can take 160 seconds (two token runs and two sends), so this
-wait has no shorter timeout: its worker set the state to a terminal `taken`, `none`, or retried
-it before this returns.
+upload would be refused. A claim request can take minutes (token runs and its sends again; see
+`CacheService.requestRemoteObject`), so this wait has no shorter timeout: its worker set the
+state to a terminal `taken`, `none`, or retried it before this returns.
 -/
 partial def waitForLineClaims (taken : TakenClaims) (lines : Array String) : BaseIO Unit := do
   let claims ← taken.claims.get
