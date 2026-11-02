@@ -56,8 +56,11 @@ test_exp "$(stat -c %i "$X_OLEAN")" = "$(stat -c %i "$X_ENTRY")"
 test_exp "$(stat -c %i "$EXE")" = "$(stat -c %i "$EXE_ENTRY")"
 test_exp -x "$EXE"
 
-# The same with every relink rename failing: the build keeps the copies, with those modes
+# The same with every relink rename failing: the build keeps the copies, with those modes.
+# The hard links retain their identities even if the filesystem reuses a deleted inode number.
 copies "$X_OLEAN" "$EXE"
+test_cmd ln "$X_OLEAN" x.keep
+test_cmd ln "$EXE" exe.keep
 X_COPY_INODE=$(stat -c %i "$X_OLEAN") EXE_COPY_INODE=$(stat -c %i "$EXE")
 test_exp "$X_COPY_INODE" != "$(stat -c %i "$X_ENTRY")"
 test_exp "$EXE_COPY_INODE" != "$(stat -c %i "$EXE_ENTRY")"
@@ -71,6 +74,10 @@ match_pat 'could not relink .*P/X\.olean to its cache entry, keeping the file' r
 match_pat 'could not relink .*bin/hello to its cache entry, keeping the file' relink.out
 test_cmd cmp x.genuine "$X_OLEAN"
 test_cmd cmp exe.genuine "$EXE"
+test_exp "$X_OLEAN" -ef x.keep
+test_exp "$EXE" -ef exe.keep
+test_exp "$(stat -c %h "$X_OLEAN")" = 2
+test_exp "$(stat -c %h "$EXE")" = 2
 test_exp "$(stat -c %i "$X_OLEAN")" = "$X_COPY_INODE"
 test_exp "$(stat -c %i "$EXE")" = "$EXE_COPY_INODE"
 test_exp "$(mode "$X_OLEAN")" = "$X_MODE"
