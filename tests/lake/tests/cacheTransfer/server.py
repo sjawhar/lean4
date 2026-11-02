@@ -58,6 +58,8 @@ a test picks one by pointing an endpoint at it (e.g. `.../corrupt/a0`):
   claimputrace
             as `claimputlost`, but what the first write stores is another
             writer's claim: the same fields with another `nonce`
+  claimputlostread
+            as `claimputlost`, and 503 for the first 3 `GET`s of each claim
 
 A fault that does not apply to a request kind (e.g. `badcount` on a `GET`)
 behaves as `ok`. Like Cloud Storage, each object has a generation, which a new
@@ -172,18 +174,21 @@ def first_busy(parts):
         return True
 
 
-# The (kind, mode, path) triples that a `claim...` fault mode has faulted once
-FAULTED_ONCE = set()
+# How many requests of each (kind, mode, path) a `claim...` fault mode has seen
+FAULT_COUNTS = {}
+
+
+def fault_count(kind, mode, parts):
+    """Counts a request of `kind` (`get` or `put`) at `parts` in fault mode `mode`, and returns its count."""
+    key = (kind, mode, "/".join(parts))
+    with STORE_LOCK:
+        FAULT_COUNTS[key] = FAULT_COUNTS.get(key, 0) + 1
+        return FAULT_COUNTS[key]
 
 
 def first_fault(kind, mode, parts):
     """Whether this is the first request of `kind` (`get` or `put`) at `parts` in fault mode `mode`."""
-    key = (kind, mode, "/".join(parts))
-    with STORE_LOCK:
-        if key in FAULTED_ONCE:
-            return False
-        FAULTED_ONCE.add(key)
-        return True
+    return fault_count(kind, mode, parts) == 1
 
 
 def new_generation(path):
@@ -245,6 +250,7 @@ class Mode(StrEnum):
     CLAIM_PUT_ERROR = "claimputerror"
     CLAIM_PUT_LOST = "claimputlost"
     CLAIM_PUT_RACE = "claimputrace"
+    CLAIM_PUT_LOST_READ = "claimputlostread"
 
 
 def content_type(path):
@@ -462,6 +468,12 @@ class Handler(BaseHTTPRequestHandler):
             and first_fault("get", mode, parts)
         ):
             self.respond(503, b"Service Unavailable", "text/plain")
+        elif (
+            mode == Mode.CLAIM_PUT_LOST_READ
+            and parts[1:2] == ["claim"]
+            and fault_count("get", mode, parts) <= 3
+        ):
+            self.respond(503, b"Service Unavailable", "text/plain")
         elif mode == Mode.BAD_CLAIM and parts[1:2] == ["claim"]:
             # An unreadable claim with a generation and no times, which nothing rewrites
             body = b'{"invalid":"claim"}'
@@ -599,11 +611,11 @@ class Handler(BaseHTTPRequestHandler):
             path = os.path.join(STORE, *parts)
             os.makedirs(os.path.dirname(path), exist_ok=True)
             want = self.headers.get("x-goog-if-generation-match")
-            # `claimputlost` and `claimputrace`: the first conditional write of each claim happens
-            # (in `claimputrace`, as another writer's claim: the same fields, another nonce), and
-            # its answer is a 500
+            # `claimputlost`, `claimputrace` and `claimputlostread`: the first conditional write of
+            # each claim happens (in `claimputrace`, as another writer's claim: the same fields,
+            # another nonce), and its answer is a 500
             lost = (
-                mode in (Mode.CLAIM_PUT_LOST, Mode.CLAIM_PUT_RACE)
+                mode in (Mode.CLAIM_PUT_LOST, Mode.CLAIM_PUT_RACE, Mode.CLAIM_PUT_LOST_READ)
                 and parts[1:2] == ["claim"]
                 and want is not None
                 and first_fault("put", mode, parts)

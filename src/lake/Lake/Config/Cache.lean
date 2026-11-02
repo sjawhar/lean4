@@ -892,7 +892,9 @@ write happened, and code 412 if the object had another generation.
 A write that the service answered with a server error (5xx) may have happened. It is sent once
 more, and a 412 to that send is this write's own success when a read finds exactly `body` as the
 object: the answer is then that read's, with code 200 and the generation. So `body` must be unique
-to this write, as every claim body is (its nonce; see `Lake.claimBody`).
+to this write, as every claim body is (its nonce; see `Lake.claimBody`). The 412 stands when the
+read finds another body or no object; a read that fails is an error, since the write may be this
+one's.
 -/
 public def putRemoteObjectIf
   (service : CacheService) (url body : String) (generation : String)
@@ -913,7 +915,10 @@ public def putRemoteObjectIf
   let current ← service.getRemoteObject url
   if current.code == 200 && current.body == body then
     return {current with body := ""}
-  return r
+  if current.code == 200 || current.code == 404 then
+    return r
+  error s!"could not tell whether the write of {url} happened: its second send got 412, and the \
+    read of the object got HTTP {current.code}"
 
 def s3ArtifactUrl (contentHash : Hash) (service : CacheService) (scope : CacheServiceScope) : String :=
   let endpoint :=

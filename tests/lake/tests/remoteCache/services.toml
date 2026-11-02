@@ -205,3 +205,10 @@ name = "claimputrace"
 type = "s3"
 artifactEndpoint = "%URL%/claimputrace/a0"
 revisionEndpoint = "%URL%/claimputrace/r0"
+
+# As `claimputlost`, and the first 3 reads of each claim are answered 503
+[[cache.service]]
+name = "claimputlostread"
+type = "s3"
+artifactEndpoint = "%URL%/claimputlostread/a0"
+revisionEndpoint = "%URL%/claimputlostread/r0"
