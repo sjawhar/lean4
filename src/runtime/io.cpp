@@ -27,6 +27,9 @@ Authors: Leonardo de Moura, Sebastian Ullrich
 #endif
 #endif
 #ifndef LEAN_WINDOWS
+#include <time.h>
+#endif
+#ifndef LEAN_WINDOWS
 #include <csignal>
 #endif
 #include <dirent.h>
@@ -36,6 +39,7 @@ Authors: Leonardo de Moura, Sebastian Ullrich
 #include <sstream>
 #include <fstream>
 #include <iomanip>
+#include <thread>
 #include <string>
 #include <cstdlib>
 #include <cctype>
@@ -489,6 +493,16 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_unlock(b_obj_arg h) {
     }
 }
 
+/* Handle.setInheritable : (@& Handle) → (inheritable : Bool) → IO Unit */
+extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_set_inheritable(b_obj_arg h, uint8_t x) {
+    HANDLE wh = win_handle(io_get_handle(h));
+    if (SetHandleInformation(wh, HANDLE_FLAG_INHERIT, x ? HANDLE_FLAG_INHERIT : 0)) {
+        return io_result_mk_ok(box(0));
+    } else {
+        return io_result_mk_error((sstream() << GetLastError()).str());
+    }
+}
+
 #else
 
 /* Handle.lock : (@& Handle) → (exclusive : Bool) → IO Unit */
@@ -523,6 +537,16 @@ extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_unlock(b_obj_arg h) {
     } else {
         return io_result_mk_error(decode_io_error(errno, nullptr));
     }
+}
+
+/* Handle.setInheritable : (@& Handle) → (inheritable : Bool) → IO Unit */
+extern "C" LEAN_EXPORT obj_res lean_io_prim_handle_set_inheritable(b_obj_arg h, uint8_t x) {
+    int fd = fileno(io_get_handle(h));
+    int flags = fcntl(fd, F_GETFD);
+    if (flags == -1 || fcntl(fd, F_SETFD, x ? (flags & ~FD_CLOEXEC) : (flags | FD_CLOEXEC)) == -1) {
+        return io_result_mk_error(decode_io_error(errno, nullptr));
+    }
+    return io_result_mk_ok(box(0));
 }
 
 #endif
@@ -867,6 +891,28 @@ extern "C" LEAN_EXPORT obj_res lean_io_mono_nanos_now() {
     return uint64_to_nat(tm.count());
 }
 
+/* threadCpuNanosNow : BaseIO Nat */
+extern "C" LEAN_EXPORT obj_res lean_io_thread_cpu_nanos_now() {
+#if defined(LEAN_WINDOWS)
+    FILETIME created, exited, kernel, user;
+    if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) return uint64_to_nat(0);
+    ULARGE_INTEGER kernel_ticks, user_ticks;
+    kernel_ticks.LowPart = kernel.dwLowDateTime;
+    kernel_ticks.HighPart = kernel.dwHighDateTime;
+    user_ticks.LowPart = user.dwLowDateTime;
+    user_ticks.HighPart = user.dwHighDateTime;
+    return uint64_to_nat((kernel_ticks.QuadPart + user_ticks.QuadPart) * 100);
+#elif defined(CLOCK_THREAD_CPUTIME_ID)
+    timespec tm;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &tm) == 0) {
+        return uint64_to_nat(uint64_t(tm.tv_sec) * 1000000000ULL + uint64_t(tm.tv_nsec));
+    }
+    return uint64_to_nat(0);
+#else
+    return uint64_to_nat(0);
+#endif
+}
+
 /* getRandomBytes (nBytes : USize) : IO ByteArray */
 extern "C" LEAN_EXPORT obj_res lean_io_get_random_bytes (size_t nbytes) {
     // Adapted from https://github.com/rust-random/getrandom/blob/30308ae845b0bf3839e5a92120559eaf56048c28/src/
@@ -1177,6 +1223,27 @@ extern "C" LEAN_EXPORT obj_res lean_io_symlink_metadata(b_obj_arg filename) {
 #endif
 }
 
+/* System.FilePath.isSameFile : (@& FilePath) → (@& FilePath) → IO Bool */
+extern "C" LEAN_EXPORT obj_res lean_io_is_same_file(b_obj_arg p1, b_obj_arg p2) {
+    uv_stat_t st[2];
+    b_obj_arg ps[2] = {p1, p2};
+    for (int i = 0; i < 2; i++) {
+        const char* fname = string_cstr(ps[i]);
+        if (strlen(fname) != lean_string_size(ps[i]) - 1) {
+            return mk_embedded_nul_error(ps[i]);
+        }
+        uv_fs_t req;
+        int ret = uv_fs_stat(NULL, &req, fname, NULL);
+        if (ret < 0) {
+            uv_fs_req_cleanup(&req);
+            return io_result_mk_error(decode_uv_error(ret, ps[i]));
+        }
+        st[i] = req.statbuf;
+        uv_fs_req_cleanup(&req);
+    }
+    return io_result_mk_ok(box(st[0].st_dev == st[1].st_dev && st[0].st_ino == st[1].st_ino));
+}
+
 extern "C" LEAN_EXPORT obj_res lean_io_create_dir(b_obj_arg p) {
     const char* str = string_cstr(p);
     if (strlen(str) != lean_string_size(p) - 1) {
@@ -1455,9 +1522,23 @@ static inline atomic<object*> * mt_ref_val_addr(object * o) {
 */
 static inline bool ref_maybe_mt(b_obj_arg ref) { return lean_is_mt(ref) || lean_is_persistent(ref); }
 
+/*
+A multi-threaded `ST.Ref` is "locked" while its slot holds `nullptr` (another thread took the value).
+The waiters used to spin on `exchange` with no backoff: when the holder is preempted (a loaded machine
+with more runnable threads than cores), every waiter burns its whole timeslice hammering the cache line,
+and the holder gets the CPU back later rather than sooner. Spin briefly for the common nanosecond-length
+hold, then yield the processor to whoever holds the value.
+*/
+static inline void ref_spin_backoff(unsigned & spins) {
+    if (++spins > 32) {
+        std::this_thread::yield();
+    }
+}
+
 extern "C" LEAN_EXPORT obj_res lean_st_ref_get(b_obj_arg ref) {
     if (ref_maybe_mt(ref)) {
         atomic<object *> * val_addr = mt_ref_val_addr(ref);
+        unsigned spins = 0;
         while (true) {
             /*
               We cannot simply read `val` from the ref and `inc` it like in the `else` branch since someone else could
@@ -1471,6 +1552,7 @@ extern "C" LEAN_EXPORT obj_res lean_st_ref_get(b_obj_arg ref) {
                 (void)tmp;
                 return val;
             }
+            ref_spin_backoff(spins);
         }
     } else {
         object * val = lean_to_ref(ref)->m_value;
@@ -1483,10 +1565,12 @@ extern "C" LEAN_EXPORT obj_res lean_st_ref_get(b_obj_arg ref) {
 extern "C" LEAN_EXPORT obj_res lean_st_ref_take(b_obj_arg ref) {
     if (ref_maybe_mt(ref)) {
         atomic<object *> * val_addr = mt_ref_val_addr(ref);
+        unsigned spins = 0;
         while (true) {
             object * val = val_addr->exchange(nullptr);
             if (val != nullptr)
                 return val;
+            ref_spin_backoff(spins);
         }
     } else {
         object * val = lean_to_ref(ref)->m_value;
@@ -1522,10 +1606,12 @@ extern "C" LEAN_EXPORT obj_res lean_st_ref_swap(b_obj_arg ref, obj_arg a) {
         /* See io_ref_write */
         mark_mt(a);
         atomic<object *> * val_addr = mt_ref_val_addr(ref);
+        unsigned spins = 0;
         while (true) {
             object * old_a = val_addr->load();
             if (old_a != nullptr && val_addr->compare_exchange_strong(old_a, a))
                 return old_a;
+            ref_spin_backoff(spins);
         }
     } else {
         object * old_a = lean_to_ref(ref)->m_value;

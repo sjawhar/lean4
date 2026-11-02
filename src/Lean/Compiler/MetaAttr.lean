@@ -68,6 +68,17 @@ def setDeclMeta (env : Environment) (declName : Name) : Environment :=
   else
     declMetaExt.addEntry env declName
 
+/-- The declarations `setDeclMeta` marked in module `i?` (the current module if `none`). -/
+def declMetaEntries (env : Environment) (i? : Option ModuleIdx) : Array Name :=
+  match i? with
+  | some i => declMetaExt.getModuleEntries env i
+  | none => (declMetaExt.getState env).toArray
+
+/-- The current module's `setDeclMeta` marks as its `.olean` exports them at the private level: what an importer
+reads as `declMetaEntries env (some i)` for it. -/
+def declMetaExportedEntries (env : Environment) : Array Name :=
+  (PersistentEnvExtension.exportedEntries declMetaExt env).«private»
+
 /--
 Returns the IR phases of the given declaration that should be considered accessible. Does not take
 additional IR loaded for language server purposes into account.

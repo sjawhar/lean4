@@ -1,6 +1,6 @@
 // Lean compiler output
 // Module: Lake.Build
-// Imports: public import Lake.Build.Actions public import Lake.Build.Common public import Lake.Build.Context public import Lake.Build.Data public import Lake.Build.Executable public import Lake.Build.ExternLib public import Lake.Build.Facets public import Lake.Build.Fetch public import Lake.Build.Index public import Lake.Build.Info public import Lake.Build.Infos public import Lake.Build.InitFacets public import Lake.Build.InputFile public import Lake.Build.Job public import Lake.Build.Key public import Lake.Build.Library public import Lake.Build.Module public import Lake.Build.ModuleArtifacts public import Lake.Build.Package public import Lake.Build.Run public import Lake.Build.Store public import Lake.Build.Target public import Lake.Build.Targets public import Lake.Build.Topological public import Lake.Build.Trace
+// Imports: public import Lake.Build.Actions public import Lake.Build.Common public import Lake.Build.Context public import Lake.Build.Data public import Lake.Build.Executable public import Lake.Build.ExternLib public import Lake.Build.Facets public import Lake.Build.Fetch public import Lake.Build.Index public import Lake.Build.Info public import Lake.Build.Infos public import Lake.Build.InitFacets public import Lake.Build.InputFile public import Lake.Build.Job public import Lake.Build.Key public import Lake.Build.Library public import Lake.Build.Module public import Lake.Build.ModuleArtifacts public import Lake.Build.Package public import Lake.Build.Run public import Lake.Build.Store public import Lake.Build.Target public import Lake.Build.Targets public import Lake.Build.Topological public import Lake.Build.Trace public import Lake.Build.UsageCutoff
 #include <lean/lean.h>
 #if defined(__clang__)
 #pragma clang diagnostic ignored "-Wunused-parameter"
@@ -38,6 +38,7 @@ lean_object* runtime_initialize_Lake_Build_Target(uint8_t builtin);
 lean_object* runtime_initialize_Lake_Build_Targets(uint8_t builtin);
 lean_object* runtime_initialize_Lake_Build_Topological(uint8_t builtin);
 lean_object* runtime_initialize_Lake_Build_Trace(uint8_t builtin);
+lean_object* runtime_initialize_Lake_Build_UsageCutoff(uint8_t builtin);
 void lean_initialize();
 static bool _G_runtime_initialized = false;
 LEAN_EXPORT lean_object* runtime_initialize_Lake_Build(uint8_t builtin) {
@@ -120,6 +121,9 @@ lean_dec_ref(res);
 res = runtime_initialize_Lake_Build_Trace(builtin);
 if (lean_io_result_is_error(res)) return res;
 lean_dec_ref(res);
+res = runtime_initialize_Lake_Build_UsageCutoff(builtin);
+if (lean_io_result_is_error(res)) return res;
+lean_dec_ref(res);
 return lean_io_result_mk_ok(lean_box(0));
 }
 static bool _G_meta_initialized = false;
@@ -154,6 +158,7 @@ lean_object* initialize_Lake_Build_Target(uint8_t builtin);
 lean_object* initialize_Lake_Build_Targets(uint8_t builtin);
 lean_object* initialize_Lake_Build_Topological(uint8_t builtin);
 lean_object* initialize_Lake_Build_Trace(uint8_t builtin);
+lean_object* initialize_Lake_Build_UsageCutoff(uint8_t builtin);
 static bool _G_initialized = false;
 LEAN_EXPORT lean_object* initialize_Lake_Build(uint8_t builtin) {
 lean_object * res;
@@ -232,6 +237,9 @@ res = initialize_Lake_Build_Topological(builtin);
 if (lean_io_result_is_error(res)) return res;
 lean_dec_ref(res);
 res = initialize_Lake_Build_Trace(builtin);
+if (lean_io_result_is_error(res)) return res;
+lean_dec_ref(res);
+res = initialize_Lake_Build_UsageCutoff(builtin);
 if (lean_io_result_is_error(res)) return res;
 lean_dec_ref(res);
 res = runtime_initialize_Lake_Build(builtin);
