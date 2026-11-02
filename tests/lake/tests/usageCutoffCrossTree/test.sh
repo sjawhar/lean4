@@ -65,6 +65,8 @@ idxdir() {
 idxname() { local k; k=$(entryArt "$(entry "$1" "$2" "${3:-}")" k); echo "${k%.usekey}.json"; }
 # idxfiles -- every file under the cache's usage index, one per line
 idxfiles() { if [ -d "$LAKE_CACHE_DIR/usage-index" ]; then (cd "$LAKE_CACHE_DIR" && find usage-index -type f | sort); fi; }
+# idxcount DIR MOD -- how many compiles MOD's usage-index directory records
+idxcount() { find "$(idxdir "$1" "$2")" -maxdepth 1 -name '*.json' | wc -l; }
 # joblog MOD [FILE] -- what a build's output (FILE, default `produced.out`) prints for MOD's job: its caption line
 # and the log after it, up to the next job's caption
 joblog() {
@@ -258,7 +260,9 @@ case6a() {
   no_match_text "Built T.M2" race.log
 }
 
-# 6b. Concurrent writers of one module's index: 20 trees, two of them with the same sources, build B at once
+# 6b. Concurrent writers of one module's index: 20 trees, two of them with the same sources, build B at once. The
+# 19 states leave more than the files of 2 compiles and at most `usageIndexSize` (two writers that trim at once can
+# remove more than needed), each complete.
 case6b() {
   local i n f k v=
   for i in $(seq 20); do
@@ -278,8 +282,9 @@ case6b() {
   d=$(idxdir t1 B)
   test_exp -d "$d"
   n=$(find "$d" -maxdepth 1 -name '*.json' | wc -l)
-  test_exp "$n" -ge 1
-  test_exp "$n" -le 2
+  # a trim removes only files with 16 newer ones in its listing, so most of the 16 newest stay
+  test_exp "$n" -ge 3
+  test_exp "$n" -le 16
   test_exp -z "$(find "$d" -name '*.tmp-*')"
   # every file is complete (when python3 can parse it) and names only artifacts in the cache
   for f in "$d"/*.json; do
@@ -355,14 +360,14 @@ case8() {
   no_match_text "Built Test.E" produced.out
 }
 
-# 9. A module's index keeps the 2 most recently written compiles (`usageIndexSize`), and a hit rewrites the file of
-# the compile it restores, which makes it recent again. t3's compile of `a := 1` is a new file, not the first
-# compile's again: its `.usage` records the provides digest of each import (`digested`), and t3's `X` provides
-# another name. The `a := 2` compile is the older of the 2, so t2's hit restores the last candidate the lookup tries.
+# 9. A module's index keeps the 16 most recently written compiles (`usageIndexSize`), and a hit rewrites the file of
+# the compile it restores, which makes it recent again. t's compiles of `a := 1` to `17` are 17 states of B: the
+# first one's file and record go. The `a := 2` compile is then the oldest of the 16, so t2's hit restores the last
+# candidate the lookup tries, and makes it the newest: t3's compile of `a := 18` then removes `a := 3`'s file.
 case9() {
   local v names=()
   mkpkg t
-  for v in $(seq 3); do
+  for v in $(seq 17); do
     seta t $v
     test_run -d t build Test.B
     names[$v]=$(idxname t B)
@@ -370,26 +375,27 @@ case9() {
   local d
   d=$(idxdir t B)
   test_exp -d "$d"
-  test_exp "$(find "$d" -maxdepth 1 -name '*.json' | wc -l)" = 2
+  test_exp "$(idxcount t B)" = 16
   test_exp ! -e "$d/${names[1]}"
   test_exp ! -e "$d/${names[1]%.json}.pre"
-  test_exp -f "$d/${names[3]%.json}.pre"
-  test_exp -f "$d/${names[3]}"
+  test_exp -f "$d/${names[2]}"
+  test_exp -f "$d/${names[17]%.json}.pre"
+  test_exp -f "$d/${names[17]}"
   mkpkg t2 2
   edx t2
   lake_out -d t2 build -v Test.B
   jobhas Test.B "usage index: restored"
-  jobhas Test.B "(2 candidates,"
-  jobhas Test.B "at rank 2"
-  mkpkg t3 1
+  jobhas Test.B "(16 candidates,"
+  jobhas Test.B "at rank 16"
+  mkpkg t3 18
   edx t3
   lake_out -d t3 build -v Test.B
-  jobhas Test.B "usage index: no match (2 candidates"
+  jobhas Test.B "usage index: no match (16 candidates"
   jobhas Test.B "Built Test.B"
   test_exp -f "$d/${names[2]}"
   test_exp ! -e "$d/${names[3]}"
   test_exp -f "$d/$(idxname t3 B)"
-  test_exp "$(find "$d" -maxdepth 1 -name '*.json' | wc -l)" = 2
+  test_exp "$(idxcount t B)" = 16
 }
 
 # 10. No lookup and no index write without a writable cache and restored artifacts (each tree has its own value of
@@ -422,9 +428,9 @@ case10() {
 # 11. Outputs a kept-module check accepted. `P.B` uses `A.w`: compiled while `A.w := 1 - 1`, then kept while
 # `A.w := 2 - 2`, which indexes the same `.olean` again, with a kept key and lineage (`kf`). Once `A.w` is `1 - 1`
 # again, both pass the check: the compile is restored, not the kept outputs, whose key makes importers distrust the
-# module's `.usage`, and so is it for a module `LAKE_KEPT_EXCLUDE` lists. With the compile's index file gone (as the
-# trim to 8 removes it), only the kept outputs pass: they are restored and keep their lineage, in the trace, the
-# alias and `-o`.
+# module's `.usage`, and so is it for a module `LAKE_KEPT_EXCLUDE` lists. With the compile's index file gone (as a
+# trim removes it), only the kept outputs pass: they are restored and keep their lineage, in the trace, the alias and
+# `-o`.
 case11() {
   mkp() {
     mkdir -p "$1/P"
@@ -577,6 +583,117 @@ case16() {
   jobhas Test.B "Built Test.B"
 }
 
+# 17. A state that comes back after other trees wrote, as when many trees share one cache: T compiles B at `a := 1`,
+# then at `a := 2`, and ten other trees compile B at `a := 3` to `12`. Back at `a := 1`, with the unused edit (so
+# that B misses the cache by input hash), T's own check fails (its outputs are of `a := 2`), and the lookup still
+# finds the compile of `a := 1`, the oldest of the 12 files B's directory keeps: B is restored, not compiled.
+case17() {
+  local v
+  mkpkg T
+  test_run -d T build Test.B
+  seta T 2
+  test_run -d T build Test.B
+  for v in $(seq 3 12); do
+    mkpkg o$v $v
+    test_run -d o$v build Test.B
+  done
+  test_exp "$(idxcount T B)" = 12
+  seta T 1
+  edx T
+  lake_out -d T build -v Test.B
+  jobhas Test.B "usage index: restored"
+  jobhas Test.B "(12 candidates,"
+  jobhas Test.B "at rank 12"
+  no_match_text "Built Test.B" produced.out
+}
+
+# 18. A candidate is rejected from its record's header when the header shows other digests than the ones the lookup
+# already found current: the first candidate goes through the whole pre-filter, which notes the current digests of
+# each module it compares, and each later one is rejected before its entry, key or record body is read. T, whose
+# outputs are of `a := 1`, comes to `a := 9`, which no tree compiled, while B's directory holds the compiles of
+# `a := 1` to `8`: 8 candidates, the first parsed in full, 7 rejected by their header.
+case18() {
+  local v
+  mkpkg T
+  test_run -d T build Test.B
+  for v in $(seq 2 8); do
+    mkpkg o$v $v
+    test_run -d o$v build Test.B
+  done
+  seta T 9
+  lake_out -d T build -v Test.B
+  jobhas Test.B "usage index: no match (8 candidates, 8 parsed, 0 fully checked"
+  jobhas Test.B "; 7 rejected by their record's header"
+  jobhas Test.B "Built Test.B"
+}
+
+# 19. Records the header cannot serve, read as the second candidate, after the first one's pre-filter filled the memo:
+# one of format 1 (no header, as Lake wrote them before format 2) and one cut short inside its header. The lookup
+# takes each through the whole pre-filter and restores B; the hit writes the format 1 record again in format 2. A
+# format 1 record still decodes: with the cached `.usage` replaced by bytes that do not parse, it alone passes the
+# candidate to the check (`1 fully checked`, as in case 13). An index file cut short is skipped.
+case19() {
+  local d u1 p1 p3 g
+  mkpkg f
+  test_run -d f build Test.B
+  d=$(idxdir f B)
+  p1="$d/$(idxname f B | sed 's/\.json$/.pre/')"
+  u1=$(entryArt "$(entry f B)" u)
+  seta f 2
+  test_run -d f build Test.B
+  if command -v python3 > /dev/null; then
+    # format 1: the `a := 1` record without its header, its magic's version byte 1
+    test_cmd python3 - "$p1" << 'EOF'
+import struct, sys
+b = open(sys.argv[1], 'rb').read()
+assert b[:5] == b'LKUP\x02', b[:5]
+n = struct.unpack_from('<Q', b, 30)[0]
+open(sys.argv[1], 'wb').write(b'LKUP\x01' + b[5:22] + b[38 + 24 * n:])
+EOF
+    test_cmd cp "$p1" v1.pre
+    mkpkg t1
+    edx t1 1
+    lake_out -d t1 build -v Test.B
+    jobhas Test.B "usage index: restored"
+    jobhas Test.B "; 0 rejected by their record's header) at rank 2"
+    test_cmd python3 -c 'import sys; assert open(sys.argv[1], "rb").read(5) == b"LKUP\x02"' "$p1"
+    # the format 1 record decodes: the `.usage` it was made from no longer parses
+    test_cmd cp v1.pre "$p1"
+    printf 'not a usage record\n' > bad.tmp
+    mv -f bad.tmp "$LAKE_CACHE_DIR/artifacts/$u1"
+    mkpkg t2
+    edx t2 2
+    lake_out -d t2 build -v Test.B
+    jobhas Test.B "usage index: no match (2 candidates, 2 parsed, 1 fully checked"
+    jobhas Test.B "Built Test.B"
+  fi
+  # cut short inside its header, which counts more used modules than the file holds
+  seta f 3
+  test_run -d f build Test.B
+  p3="$d/$(idxname f B | sed 's/\.json$/.pre/')"
+  seta f 4
+  test_run -d f build Test.B
+  head -c 40 "$p3" > cut.tmp
+  test_cmd mv cut.tmp "$p3"
+  mkpkg t3 3
+  edx t3 3
+  lake_out -d t3 build -v Test.B
+  jobhas Test.B "usage index: restored"
+  jobhas Test.B "; 0 rejected by their record's header) at rank 2"
+  no_match_text "Built Test.B" produced.out
+  # an index file cut short, the newest: skipped, and an older one restored
+  seta f 5
+  test_run -d f build Test.B
+  g=$(idxname f B)
+  head -c 20 "$d/$g" > cut.tmp
+  test_cmd mv cut.tmp "$d/$g"
+  mkpkg t4 4
+  edx t4 4
+  lake_out -d t4 build -v Test.B
+  jobhas Test.B "usage index: restored"
+  no_match_text "Built Test.B" produced.out
+}
+
 runcase() {
   echo "=== case $1"
   mkdir -p "c$1"
@@ -587,7 +704,7 @@ runcase() {
   )
 }
 
-if [ $# = 0 ]; then set -- 1 2 3 4 5 6a 6b 7 8 9 10 11 12 13 14 15 16; fi
+if [ $# = 0 ]; then set -- 1 2 3 4 5 6a 6b 7 8 9 10 11 12 13 14 15 16 17 18 19; fi
 for c in "$@"; do runcase "$c"; done
 
 rm -f produced.out

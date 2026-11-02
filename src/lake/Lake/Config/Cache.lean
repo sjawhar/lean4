@@ -523,15 +523,12 @@ a lookup's pre-filter reads instead of parsing the `.usage` (`Lake.PrefilterUsag
 
 /--
 How many compiles of a module with one set of local inputs the usage index keeps, the most recently written: a
-lookup checks at most these. Each candidate it rejects costs a pre-filter, so the cap bounds what a lookup that
-finds no match costs: its 99th percentile times this, plus the views a lookup reads, against 1% of the build's CPU
-per compiled module. Measured on a gate build of a 33,639-module tree whose most used theorem's proof changed
-(13.00 ms and 2.73 ms), two holds against that build's own CPU and against both builds of the same workload before
-the lookups were made cheaper: 28.73 ms against budgets of 42.01, 39.47 and 38.70 ms. Three holds against the
-first alone. On an integrate round of nineteen agents' unit builds, no restored compile was older than the second
-newest, so two loses none of them either.
+lookup checks at most these. Trees that share one cache write compiles of other states in turn, so the compile a
+tree needs again can be well past the newest few. The cap bounds what a lookup that finds no match costs, which must
+stay under 1% of the build's CPU per compiled module: most rejected candidates cost a read of their record's header
+(`Module.lookupUsageIndex`), not a pre-filter.
 -/
-public def usageIndexSize : Nat := 2
+public def usageIndexSize : Nat := 16
 
 /--
 The files in a usage-index directory (`usageIndexDir`) whose names `select` takes, with their modification times, most
