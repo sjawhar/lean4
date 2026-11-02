@@ -102,9 +102,15 @@ public def claimHolder : BaseIO String := do
     | .error _ => pure "unknown"
   return s!"{host}:{← IO.Process.getPID}"
 
-/-- The body of a claim that `holder` writes now, with state `state`. -/
+/--
+The body of a claim that `holder` writes now, with state `state`, and a random `nonce`, so that no
+other write's body is the same, not even one of the same holder in the same second: after a server
+error, `CacheService.putRemoteObjectIf` tells by the body whether the write happened.
+-/
 def claimBody (holder : String) (state : RemoteClaimState) : IO String := do
-  return (toJson ({holder, state, writtenAt := ← wallClockSecs} : RemoteClaim)).compress
+  let claim := toJson ({holder, state, writtenAt := ← wallClockSecs} : RemoteClaim)
+  let nonce := (Hash.ofByteArray (← IO.getRandomBytes 8)).hex
+  return (claim.setObjVal! "nonce" (.str nonce)).compress
 
 /-- The messages of `log`, or `default` if it has none. -/
 def logMessages (log : Log) (default : String) : String :=

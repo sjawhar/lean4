@@ -47,6 +47,17 @@ a test picks one by pointing an endpoint at it (e.g. `.../corrupt/a0`):
             (an artifact or a mapping), as a busy server answers, and otherwise
             as `ok`
   silent    accepts each request, reads it, and never answers (15 minutes)
+  claimgeterror
+            503 for the first `GET` of each claim, and otherwise as `ok`
+  claimputerror
+            500 for the first conditional `PUT` of each claim, which does not
+            write it, and otherwise as `ok`
+  claimputlost
+            the first conditional `PUT` of each claim writes it, and is answered
+            500, as a write whose answer was lost; otherwise as `ok`
+  claimputrace
+            as `claimputlost`, but what the first write stores is another
+            writer's claim: the same fields with another `nonce`
 
 A fault that does not apply to a request kind (e.g. `badcount` on a `GET`)
 behaves as `ok`. Like Cloud Storage, each object has a generation, which a new
@@ -74,6 +85,7 @@ Revisit if `Std.Http` gains a way to abort a response mid-body.
 import argparse
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -160,6 +172,20 @@ def first_busy(parts):
         return True
 
 
+# The (kind, mode, path) triples that a `claim...` fault mode has faulted once
+FAULTED_ONCE = set()
+
+
+def first_fault(kind, mode, parts):
+    """Whether this is the first request of `kind` (`get` or `put`) at `parts` in fault mode `mode`."""
+    key = (kind, mode, "/".join(parts))
+    with STORE_LOCK:
+        if key in FAULTED_ONCE:
+            return False
+        FAULTED_ONCE.add(key)
+        return True
+
+
 def new_generation(path):
     """Gives the object at `path` a new generation; the caller holds `STORE_LOCK`."""
     LAST_GENERATION[0] += 1
@@ -215,6 +241,10 @@ class Mode(StrEnum):
     NO_TIMES = "notimes"
     BUSY_ONCE = "busyonce"
     SILENT = "silent"
+    CLAIM_GET_ERROR = "claimgeterror"
+    CLAIM_PUT_ERROR = "claimputerror"
+    CLAIM_PUT_LOST = "claimputlost"
+    CLAIM_PUT_RACE = "claimputrace"
 
 
 def content_type(path):
@@ -426,6 +456,12 @@ class Handler(BaseHTTPRequestHandler):
             self.silent()
         elif mode == Mode.DENY or (mode == Mode.DENY_ART and parts[-2:-1] == ["a"]):
             self.deny()
+        elif (
+            mode == Mode.CLAIM_GET_ERROR
+            and parts[1:2] == ["claim"]
+            and first_fault("get", mode, parts)
+        ):
+            self.respond(503, b"Service Unavailable", "text/plain")
         elif mode == Mode.BAD_CLAIM and parts[1:2] == ["claim"]:
             # An unreadable claim with a generation and no times, which nothing rewrites
             body = b'{"invalid":"claim"}'
@@ -525,6 +561,13 @@ class Handler(BaseHTTPRequestHandler):
             and first_reset_claim(parts)
         ):
             self.reset()
+        elif (
+            mode == Mode.CLAIM_PUT_ERROR
+            and parts[1:2] == ["claim"]
+            and self.headers.get("x-goog-if-generation-match") is not None
+            and first_fault("put", mode, parts)
+        ):
+            self.respond(500, b"Internal Server Error", "text/plain")
         elif mode == Mode.BAD_CLAIM and parts[1:2] == ["claim"]:
             # The claim exists: its create is refused
             self.respond(412, PRECONDITION_BODY, "application/xml")
@@ -556,6 +599,17 @@ class Handler(BaseHTTPRequestHandler):
             path = os.path.join(STORE, *parts)
             os.makedirs(os.path.dirname(path), exist_ok=True)
             want = self.headers.get("x-goog-if-generation-match")
+            # `claimputlost` and `claimputrace`: the first conditional write of each claim happens
+            # (in `claimputrace`, as another writer's claim: the same fields, another nonce), and
+            # its answer is a 500
+            lost = (
+                mode in (Mode.CLAIM_PUT_LOST, Mode.CLAIM_PUT_RACE)
+                and parts[1:2] == ["claim"]
+                and want is not None
+                and first_fault("put", mode, parts)
+            )
+            if lost and mode == Mode.CLAIM_PUT_RACE:
+                body = re.sub(rb'"nonce":"[^"]*"', b'"nonce":"another-writer"', body)
             # The precondition and the replacement are one atomic step, as Cloud Storage makes
             # them. In particular, a GET never sees a partially written claim body: it sees the
             # old object, no object, or the new complete object. The test used to write `path`
@@ -580,7 +634,10 @@ class Handler(BaseHTTPRequestHandler):
                     except FileNotFoundError:
                         pass
                 gen = new_generation(path)
-            self.respond(200, b"", "application/xml", {"x-goog-generation": str(gen)})
+            if lost:
+                self.respond(500, b"Internal Server Error", "text/plain")
+            else:
+                self.respond(200, b"", "application/xml", {"x-goog-generation": str(gen)})
 
 
 class Server(ThreadingHTTPServer):

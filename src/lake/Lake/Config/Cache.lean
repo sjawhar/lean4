@@ -797,22 +797,36 @@ def parseResponseHeaders (text : String) : Array (String × String) :=
       | _ => headers
 
 /--
-How long one request for an object of the shared remote cache that a build makes for a claim may
-take in all, in seconds (`curl --max-time`), so that a request that is answered but keeps sending
-stays bounded. Claim requests are not retried (a claim that fails is a cache miss), so each
-request ends within this time.
+How long one send of a request for an object of the shared remote cache that a build makes for a
+claim may take in all, in seconds (`curl --max-time`), so that a request that is answered but keeps
+sending stays bounded. A request is sent at most three times (see `claimRequestRetries`); a write
+that got a server error is sent once more and then read back (see `putRemoteObjectIf`).
 
 Each send carries the cache token, which `LAKE_CACHE_TOKEN_CMD` may have to print first (see
 `withCacheTokenRequest`): before the first send when this process holds no token, or one older than
 45 minutes (`cacheTokenFor?`), and again before the one second send after a refusal of the token
 (401, `CacheToken.renew`). Each run of the command is bounded by its own limit
-(`CacheToken.timeLimitMs`, 60 s). So a claim request takes at most two runs of the command and two
-sends: 60 + 20 + 60 + 20 = 160 seconds with the limits as they are.
+(`CacheToken.timeLimitMs`, 60 s).
 -/
 def remoteObjectMaxSecs : Nat := 20
 
 /-- The most bytes that the body of an answer to a claim request may have: a claim is far smaller. -/
 def remoteObjectMaxBytes : Nat := 65536
+
+/--
+Whether a claim request that ended with the HTTP status `code` and the `curl` exit code `exitCode`
+is sent again (see `requestRemoteObject`): any request that did not reach the service (`curl` exit
+code 5, 6 or 7, or 28 before `curl` began to send it: `sent` is false), and a read (`read`) that
+timed out (28) or that the service answered with a server error (5xx). A write that got a 5xx may
+have happened, and its next send would then find its own generation: `putRemoteObjectIf` sends it
+again itself.
+-/
+def claimRequestRetries (read : Bool) (code : Nat) (exitCode : UInt32) (sent : Bool) : Bool :=
+  exitCode == 5 || exitCode == 6 || exitCode == 7 || (exitCode == 28 && !sent) ||
+    (read && (exitCode == 28 || (exitCode == 0 && code / 100 == 5)))
+
+/-- The pauses, in milliseconds, before the second and the third send of a claim request. -/
+def claimRetryPausesMs : List UInt32 := [1000, 2000]
 
 /--
 Sends one request for the object at `url` with the cache token (see `withCacheTokenRequest`),
@@ -821,17 +835,17 @@ request's own `curl` arguments. Errors if the request cannot carry the token: th
 for the service that `LAKE_REMOTE_CACHE` names, which accepts no other credential. A transfer
 that `curl` could not finish (e.g., a connection that failed) is an error, as is a stall (see
 `transferTimeoutArgs`), a request that has not ended after `remoteObjectMaxSecs`, and a body larger
-than `remoteObjectMaxBytes`. A request is not retried, except once with a renewed token after a
-401 (see `withCacheTokenRequest`). The body goes to a temporary file, never to memory, while it
-arrives.
+than `remoteObjectMaxBytes`. The request is sent again after a pause when `claimRequestRetries`
+says so (at most three sends), and once with a renewed token after a 401 (see
+`withCacheTokenRequest`). The body goes to a temporary file, never to memory, while it arrives.
 -/
 def requestRemoteObject
-  (service : CacheService) (url : String) (args : Array String)
+  (service : CacheService) (url : String) (args : Array String) (read : Bool)
 : LogIO RemoteObjectResponse := do
   unless service.sendsCacheToken url do
     error s!"a request for {url} needs the token of `{CacheToken.cmdVar}` for its host"
   IO.FS.withTempFile fun _ headerFile => IO.FS.withTempFile fun _ bodyFile => do
-    let (code, exitCode, _) ← withCacheTokenRequest url true (follow := false) fun _ lead => do
+    let send := withCacheTokenRequest url true (follow := false) fun _ lead => do
       let out ← rawProc (quiet := true) {
         cmd := ← Internal.getCurl
         args := lead ++ #["-s", "-w", "%{stderr}%{json}\n", "-D", headerFile.toString,
@@ -840,7 +854,17 @@ def requestRemoteObject
           "--max-filesize", toString remoteObjectMaxBytes] ++
           transferTimeoutArgs ++ args ++ #[url]
       }
-      return (← curlResponseCode out.stderr, out.exitCode)
+      return (← curlResponseCode out.stderr, (out.exitCode, curlSentRequest out.stderr))
+    let mut answer ← send
+    for pause in claimRetryPausesMs do
+      let (code, (exitCode, sent), _) := answer
+      unless claimRequestRetries read code exitCode sent do
+        break
+      logVerbose s!"sending the request for {url} again in {pause} ms \
+        (HTTP {code}, curl exit code {exitCode})"
+      IO.sleep pause
+      answer ← send
+    let (code, (exitCode, _), _) := answer
     -- `curl` reports the status of an answer that it then did not receive whole
     unless exitCode == 0 do
       error s!"the request for {url} did not finish (curl exit code {exitCode}; a request may \
@@ -854,27 +878,42 @@ def requestRemoteObject
 
 /--
 Reads the object at `url` (with the cache token; see `requestRemoteObject`). A missing object is
-an answer with code 404. The read is not retried: a claim that cannot be read is a cache miss.
+an answer with code 404. A read that still fails after its retries is a cache miss.
 -/
 public def getRemoteObject (service : CacheService) (url : String) : LogIO RemoteObjectResponse :=
-  service.requestRemoteObject url #[]
+  service.requestRemoteObject url #[] (read := true)
 
 /--
 Writes `body` as the object at `url` (with the cache token; see `requestRemoteObject`) only if the
 object has the generation `generation` (`x-goog-if-generation-match`; `0` names an object that does
 not exist). The answer has code 200 and the object's new generation in `x-goog-generation` if the
-write happened, and code 412 if the object had another generation. The request is sent once: a
-retry of a write that happened but whose answer was lost would find the new generation and report
-412.
+write happened, and code 412 if the object had another generation.
+
+A write that the service answered with a server error (5xx) may have happened. It is sent once
+more, and a 412 to that send is this write's own success when a read finds exactly `body` as the
+object: the answer is then that read's, with code 200 and the generation. So `body` must be unique
+to this write, as every claim body is (its nonce; see `Lake.claimBody`).
 -/
 public def putRemoteObjectIf
   (service : CacheService) (url body : String) (generation : String)
-: LogIO RemoteObjectResponse :=
-  service.requestRemoteObject url #[
+: LogIO RemoteObjectResponse := do
+  let put := service.requestRemoteObject url (read := false) #[
     "-X", "PUT", "--data-binary", body,
     "-H", "Content-Type: application/json",
     "-H", s!"x-goog-if-generation-match: {generation}"
   ]
+  let r ← put
+  unless r.code / 100 == 5 do
+    return r
+  logVerbose s!"sending the write of {url} again in 1000 ms (HTTP {r.code})"
+  IO.sleep 1000
+  let r ← put
+  unless r.code == 412 do
+    return r
+  let current ← service.getRemoteObject url
+  if current.code == 200 && current.body == body then
+    return {current with body := ""}
+  return r
 
 def s3ArtifactUrl (contentHash : Hash) (service : CacheService) (scope : CacheServiceScope) : String :=
   let endpoint :=

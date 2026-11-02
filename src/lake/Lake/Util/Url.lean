@@ -334,6 +334,19 @@ public def curlResponseCode (stderr : String) : LogIO Nat := do
     error s!"curl produced invalid JSON output: {e}; received:\n{stderr}"
 
 /--
+Whether `curl` began to send its request, by the JSON that `curl -w "%{json}"` wrote to `stderr`:
+its `time_pretransfer` is `0` until the connection is made and the request is about to go out.
+JSON without that field counts as a request that was sent.
+-/
+public def curlSentRequest (stderr : String) : Bool :=
+  match Json.parse stderr >>= JsonObject.fromJson? with
+  | .ok data =>
+    match (data.get? "time_pretransfer" : Except String (Option Float)) with
+    | .ok (some secs) => secs > 0
+    | _ => true
+  | .error _ => true
+
+/--
 Performs a HTTP `GET` request of a URL (using `curl` with JSON output) and, if successful,
 return the body.  Otherwise, returns `none` on a 404 and errors on anything else.
 
