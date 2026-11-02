@@ -8,6 +8,7 @@ prelude
 public import Lake.Build.Job.Monad
 public import Lake.Build.Infos
 public import Lean.Util.ModuleUsage.Basic
+public import Std.Data.HashSet
 import Lean.Util.ModuleUsage
 import Lake.Config.Monad
 
@@ -2095,8 +2096,41 @@ def PrefilterUsage.coversClosure (usage : PrefilterUsage) (importArts : NameMap 
 
 namespace PrefilterUsage
 
-/-- The first bytes of a compact usage record (`encode`), with its format version. -/
-def magic : ByteArray := "LKUP\x01".toUTF8
+/-- The first bytes of a compact usage record (`encode`): `LKUP` and its format version, 2. `decode?` also reads
+format 1, which has no header (`Header`). -/
+def magic : ByteArray := "LKUP\x02".toUTF8
+
+/-- The hash of the names of a record's `digested` modules, in its order (`Header`). -/
+def digestedHash (ns : Array Name) : UInt64 := ns.foldl (init := 7) fun h n => mixHash h (hash n)
+
+/-- The hash of a used module's name and of its constants' names, in the record's order (`Header`). -/
+def usedKey (m : Name) (cs : Array (Name × ModuleUsage.Digest)) : UInt64 × UInt64 :=
+  (hash m, cs.foldl (init := 11) fun h (c, _) => mixHash h (hash c))
+
+/-- `digestsHash` of a used module's constants, one constant further: its digest, or `none` if the module does not
+have the constant. -/
+@[inline] def mixDigest (h : UInt64) : Option ModuleUsage.Digest → UInt64
+  | some d => mixHash (mixHash h d.hi) d.lo
+  | none => mixHash h 0x9e3779b97f4a7c15
+
+/-- Where `digestsHash` starts. -/
+def digestsSeed : UInt64 := 13
+
+/-- The hash of the digests a record holds for a used module's constants, in its order (`Header`). -/
+def digestsHash (cs : Array (Name × ModuleUsage.Digest)) : UInt64 :=
+  cs.foldl (init := digestsSeed) fun h (_, d) => mixDigest h (some d)
+
+/--
+The header of a compact record of format 2 (`encode`): `noskip`, the hash of the `digested` names (`digestedHash`), and
+per used module the hash of its name and constant names (`usedKey`) and of the constants' digests (`digestsHash`). A
+lookup compares it with what its pre-filter found current for earlier candidates (`UsageMemo`, `headerRejects`)
+before it reads anything else of the candidate. Equal values hash equal, so a header that differs from them shows a
+record the pre-filter would reject.
+-/
+structure Header where
+  noskip : Bool
+  digested : UInt64
+  used : Array (UInt64 × UInt64 × UInt64)
 
 @[inline] def putU64 (b : ByteArray) (v : UInt64) : ByteArray :=
   b.push v.toUInt8 |>.push (v >>> 8).toUInt8 |>.push (v >>> 16).toUInt8 |>.push (v >>> 24).toUInt8
@@ -2133,7 +2167,8 @@ partial def NameTable.intern (s : NameTable) : Name → Option (Nat × NameTable
 
 /--
 The compact record of `u`, a `.usage` whose bytes have the digest `usage` (`ModuleUsage.Digest.ofBytes`), which
-`decode?` reads back: `magic`, `usage`, `noskip`, the name table (`NameTable`), then `digested`, `used`, `extra` and
+`decode?` reads back: `magic`, `usage`, `noskip`, the header's other fields (`Header`: the `digested` hash, then a
+count and per used module its three hashes), the name table (`NameTable`), then `digested`, `used`, `extra` and
 `specLookups`, each a count and its elements, names by their index. Every number is 64 bits, least significant byte
 first. `none` if a name has a number component that does not fit 64 bits.
 -/
@@ -2146,6 +2181,10 @@ def encode (u : PrefilterUsage) (usage : ModuleUsage.Digest) : Option ByteArray 
   for n in u.extra do s := (← s.intern n).2
   let id (n : Name) : Nat := s.ids.getD n 0
   let mut b := putDigest magic usage |>.push (if u.noskip then 1 else 0)
+  b := putNat (putU64 b (digestedHash u.digested)) u.used.size
+  for (m, cs) in u.used do
+    let (moduleHash, namesHash) := usedKey m cs
+    b := putU64 (putU64 (putU64 b moduleHash) namesHash) (digestsHash cs)
   b := putNat b s.count |>.append s.table
   b := putNat b u.digested.size
   for n in u.digested do b := putNat b (id n)
@@ -2185,14 +2224,38 @@ def count (width : Nat) : Dec Nat := do
   unless n * width ≤ (← read).size - (← get) do throw ()
   return n
 
-def decoder : Dec (ModuleUsage.Digest × PrefilterUsage) := do
-  for b in magic do
-    unless (← byte) == b do throw ()
+/-- A record's first fields: whether it has a header (format 2, `magic`; format 1 has none), the digest of the
+`.usage` it was made from, and `noskip`. -/
+def start : Dec (Bool × ModuleUsage.Digest × Bool) := do
+  for i in [0:magic.size - 1] do
+    unless (← byte) == magic.get! i do throw ()
+  let version ← byte
+  let v2 := version == magic.get! (magic.size - 1)
+  unless v2 || version == 1 do throw ()
   let usage ← digest
   let noskip ← match ← byte with
     | 0 => pure false
     | 1 => pure true
     | _ => throw ()
+  return (v2, usage, noskip)
+
+/-- The header's fields after `noskip` (`Header`). -/
+def header (noskip : Bool) : Dec Header := do
+  let digested ← u64
+  let mut used : Array (UInt64 × UInt64 × UInt64) := #[]
+  for _ in [0:← count 24] do used := used.push (← u64, ← u64, ← u64)
+  return { noskip, digested, used }
+
+/-- Whether `bytes` start with `magic`, as a record of the current format does. -/
+def isCurrent (bytes : ByteArray) : Bool :=
+  decide (magic.size ≤ bytes.size) && (List.range magic.size).all fun i => bytes.get! i == magic.get! i
+
+def decoder : Dec (ModuleUsage.Digest × PrefilterUsage) := do
+  let (v2, usage, noskip) ← start
+  if v2 then
+    discard u64
+    let n ← count 24
+    set ((← get) + 24 * n)
   let mut names : Array Name := #[.anonymous]
   for _ in [0:← count 10] do
     let p ← nat
@@ -2231,6 +2294,28 @@ def decode? (bytes : ByteArray) : Option (ModuleUsage.Digest × PrefilterUsage) 
   | .ok r => some r
   | .error _ => none
 
+/-- The header (`Header`) of the record of format 2 at `file`, read without the rest of the file; `none` for a record
+of format 1, or a file that cannot be read or does not start with a whole header. -/
+def readHeader? (file : FilePath) : BaseIO (Option Header) := do
+  let read : IO (Option Header) := do
+    let h ← IO.FS.Handle.mk file .read
+    let fixed ← h.read (magic.size + 16 + 1 + 16).toUSize
+    let lead : Dec Nat := do
+      let (v2, _, _) ← start
+      unless v2 do throw ()
+      discard u64
+      nat
+    let .ok n := (lead.run fixed).run' 0 | return none
+    unless fixed.size + 24 * n ≤ (← file.metadata).byteSize.toNat do return none
+    let whole : Dec Header := do
+      let (_, _, noskip) ← start
+      header noskip
+    let .ok hdr := (whole.run (fixed ++ (← h.read (24 * n).toUSize))).run' 0 | return none
+    return some hdr
+  match ← read.toBaseIO with
+  | .ok header? => return header?
+  | .error _ => return none
+
 end PrefilterUsage
 
 /--
@@ -2250,17 +2335,21 @@ public def takeCompactUsage? (art : Hash) : BaseIO (Option (Option ByteArray)) :
 
 /--
 The compact record at `compactFile` (`compactUsage?`) if it decodes and was made from a `.usage` with the digest
-`usage`, the one the compile's key records: the only record any reader takes. `none` otherwise.
+`usage`, the one the compile's key records: the only record any reader takes. With `current`, only a record of the
+current format (`PrefilterUsage.isCurrent`). `none` otherwise.
 -/
-def readCompactUsage? (compactFile : FilePath) (usage : ModuleUsage.Digest) : BaseIO (Option PrefilterUsage) := do
+def readCompactUsage? (compactFile : FilePath) (usage : ModuleUsage.Digest) (current := false) :
+    BaseIO (Option PrefilterUsage) := do
   let .ok bytes ← (IO.FS.readBinFile compactFile).toBaseIO | return none
+  if current && !PrefilterUsage.isCurrent bytes then return none
   let some (from_, record) := PrefilterUsage.decode? bytes | return none
   return if from_ == usage then some record else none
 
 /--
 Whether the usage index has a compact record a reader takes (`readCompactUsage?`) at `compactFile` for the compile
-whose `.usekey` is at `usekeyFile`: one that decodes and was made from the `.usage` that key names. An unusable one
-(e.g., a file a crash left empty after its rename, or one damaged since) is never read, so the index writes it again
+whose `.usekey` is at `usekeyFile`, in the current format: one that decodes and was made from the `.usage` that key
+names. An unusable one (e.g., a file a crash left empty after its rename, or one damaged since) is never read, and
+one of format 1 has no header for a lookup to compare (`headerRejects`), so the index writes either again
 (`Module.indexUsage`). Every compile and every hit asks, and a fresh compile has no record, so it answers that
 before it reads the key, and it reads the key without the build's shared sidecar cache (`readUsageSidecar`), whose
 insert under one mutex the question would otherwise add to each of them.
@@ -2269,7 +2358,7 @@ public def hasCompactUsage (compactFile usekeyFile : FilePath) : BaseIO Bool := 
   unless (← compactFile.pathExists) do return false
   let .ok bytes ← (IO.FS.readBinFile usekeyFile).toBaseIO | return false
   let .ok (some key) := parseUsageSidecar.parse UsekeySidecar usekeyVersion bytes | return false
-  return (← readCompactUsage? compactFile key.usage).isSome
+  return (← readCompactUsage? compactFile key.usage (current := true)).isSome
 
 /--
 Reads what the usage index's pre-filter (`usagePrefilter`) reads of a cached compile's `.usage`: from the compile's
@@ -2296,6 +2385,32 @@ public inductive UsagePrefilter
   | passed (olean : ModuleUsage.Digest)
 
 /--
+What one usage-index lookup's pre-filter (`usagePrefilter`) found of the module's current imports, to which the
+lookup compares later candidates' record headers (`PrefilterUsage.Header`, `headerRejects`): the hashes of the
+records' `digested` names that do not cover the closure, and per hash of a used workspace module's name and constant
+names (`PrefilterUsage.usedKey`), the hash of those constants' current digests (`PrefilterUsage.digestsHash`), for
+the modules the pre-filter compared before it rejected or passed a candidate. It holds nothing for a module outside
+the workspace or one `importee?` gives nothing for, so a header that names them is compared on its other modules
+only.
+-/
+public structure UsageMemo where
+  uncovered : Std.HashSet UInt64 := {}
+  digests : Std.HashMap (UInt64 × UInt64) UInt64 := {}
+
+/--
+Whether the header of the compact record at `compactFile` (`PrefilterUsage.Header`) shows a record the pre-filter
+(`usagePrefilter`) rejects, by `memo`, what it found current for earlier candidates: one with `noskip`, one whose
+`digested` names do not cover the closure, or one that records other digests for a used module's constants. It only
+rejects: `false` for a record of format 1, one whose header cannot be read, and one whose modules `memo` does not
+hold; with an empty `memo` it reads nothing. A false header can cost a candidate, never pass one.
+-/
+public def headerRejects (compactFile : FilePath) (memo : UsageMemo) : BaseIO Bool := do
+  if memo.uncovered.isEmpty && memo.digests.isEmpty then return false
+  let some h ← PrefilterUsage.readHeader? compactFile | return false
+  if h.noskip || memo.uncovered.contains h.digested then return true
+  return h.used.any fun (m, names, digests) => (memo.digests[(m, names)]?).any (· != digests)
+
+/--
 The usage index's pre-filter of a cached compile of the module, whose `.usekey` and `.usage` are `usekeyFile` and
 `usageFile` and whose compact record of that `.usage` is `compactFile` (`readCandidateUsage?`): whether it may pass
 the cutoff's check (`Module.usageVerdict`) against the module's current imports (`importArts`). It only rejects, and
@@ -2312,11 +2427,13 @@ records, for each workspace `extra` module the `moduleDigest` and, unless it is 
 closure; last, the key's `modsys` against the closure's (`modsysHash`). That hash costs a stamp of every file of the
 closure's module-system modules, most of the pre-filter's own time, and a module whose lookup finds no match computes
 it for its compile anyway (`usekeyBefore`), into the same `hashes`: compared last, it costs a candidate rejected on
-its `.usage` nothing.
+its `.usage` nothing. It notes in `memo` whether the `.usage`'s `digested` names cover the closure and the current
+digests of each used workspace module's constants it compares (`UsageMemo`).
 -/
 public def usagePrefilter (presetup : ModulePreSetup) (importArts : NameMap ImportArtifacts) (hashes : ContentHashes)
     (importee? : Name → JobM (Option (Option ModuleUsage.Digest × UsageImport)))
-    (usekeyFile usageFile compactFile : FilePath) : JobM UsagePrefilter := do
+    (usekeyFile usageFile compactFile : FilePath) (memo : IO.Ref UsageMemo) :
+    JobM UsagePrefilter := do
   let some key ← readUsageSidecar UsekeySidecar usekeyVersion usekeyFile | return .key
   if key.localHash != presetup.localTrace.hash then return .key
   -- A direct import whose closure the decision found changed rejects a candidate that imported another closure of it,
@@ -2329,13 +2446,19 @@ public def usagePrefilter (presetup : ModulePreSetup) (importArts : NameMap Impo
     | none => foldClosureHash presetup fun m => return (← importee? m).map (·.2.closure)
   unless closure == some key.closure do return .key
   let some usage ← readCandidateUsage? compactFile usageFile key.usage | return .usage
-  if usage.noskip || !usage.coversClosure importArts then return .usage
+  if usage.noskip then return .usage
+  unless usage.coversClosure importArts do
+    memo.modify fun s => { s with uncovered := s.uncovered.insert (PrefilterUsage.digestedHash usage.digested) }
+    return .usage
   -- A module outside the workspace is a toolchain module, pinned by the Lean githash in `localTrace`.
   for (m, consts) in usage.used do
     if (← findModule? m).isNone then continue
     let some (_, imp) ← importee? m | return .usage
-    for (c, d) in consts do
-      unless imp.own.find? c == some d do return .usage
+    let (current, same) := consts.foldl (init := (PrefilterUsage.digestsSeed, true)) fun (h, same) (c, d) =>
+      let d? := imp.own.find? c
+      (PrefilterUsage.mixDigest h d?, same && d? == some d)
+    memo.modify fun s => { s with digests := s.digests.insert (PrefilterUsage.usedKey m consts) current }
+    unless same do return .usage
   for m in usage.extra do
     if (← findModule? m).isNone then continue
     let some (oleanHash, digest) := key.extra.find? m | return .usage
