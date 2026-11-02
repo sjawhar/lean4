@@ -806,8 +806,8 @@ public def restoreArtifact
               -- would have given it: read-only, executable if `exe`.
               logVerbose s!"could not relink {file} to its cache entry, keeping the file: {e}"
               discard <| (removeFileIfExists tmp).toBaseIO
-              let r := {read := true, write := false, execution := exe}
-              IO.setAccessRights file ⟨r, r, r⟩
+              removeFileIfExists file
+              copyFile art.path file
         else
           logWarning s!"{art.path}: cached artifact does not match its content hash; \
             {← quarantineEntry art}"
