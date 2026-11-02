@@ -184,7 +184,7 @@ class instantiate_direct_fn {
        is encountered. Pass 2 is needed to resolve or write back such MVars. */
     bool m_has_updateable_delayed;
 
-    lean::unordered_map<lean_object *, expr> m_cache;
+    lean::lazy_table<lean::dense_map<lean_object *, expr>, 16> m_cache;
     std::vector<expr> m_saved;
 
     level visit_level(level const & l) {
