@@ -60,9 +60,16 @@ entry() { echo "$LAKE_CACHE_DIR/outputs/${PKG:-test}/$(depHash "$1/${3:-$OUT}/$2
 idxdir() {
   echo "$LAKE_CACHE_DIR/usage-index/${PKG:-test}/$(sed -n 's/.*"local":"\([0-9a-f]*\)".*/\1/p' "$1/${3:-$OUT}/$2.usekey")"
 }
-# idxname DIR MOD -- the name of the usage-index file of the compile whose outputs DIR's entry for MOD names: the
-# hash of its `.usekey`
-idxname() { local k; k=$(entryArt "$(entry "$1" "$2" "${3:-}")" k); echo "${k%.usekey}.json"; }
+# idxname DIR MOD [OUTDIR] -- the name of the usage-index file of the compile whose outputs DIR's entry for MOD names:
+# the file of its directory that names the same `.usekey` (a file is named by the dependency state its key records)
+idxname() {
+  local k f
+  k=$(entryArt "$(entry "$1" "$2" "${3:-}")" k)
+  for f in "$(idxdir "$1" "$2" "${3:-}")"/*.json; do
+    if grep -qF "\"$k\"" "$f"; then basename "$f"; return; fi
+  done
+  return 1
+}
 # idxfiles -- every file under the cache's usage index, one per line
 idxfiles() { if [ -d "$LAKE_CACHE_DIR/usage-index" ]; then (cd "$LAKE_CACHE_DIR" && find usage-index -type f | sort); fi; }
 # joblog MOD [FILE] -- what a build's output (FILE, default `produced.out`) prints for MOD's job: its caption line
@@ -557,6 +564,80 @@ case15() {
   test_cmd cmp pre-first "$pre"
 }
 
+# 20. One file per dependency state, and only for the module's own local inputs. Two compiles of B that differ only
+# in their input hash (the unused edit of X, which B's usage does not record), so only in their key's `input`, record
+# one file, named by the hash of their `.usekey` without its `input`. A compile with other local inputs never takes
+# that file: the directory is per local-input hash (`Cache.usageIndexDir`), and both the pre-filter (`usagePrefilter`)
+# and the check (`Module.usageVerdict`) compare the key's `local`. B with another source (a comment) and B with other
+# options get other directories, and with the first file in such a B's directory, the pre-filter rejects it on its
+# key.
+case20() {
+  local d f d3
+  mkpkg t1
+  edx t1 1
+  test_run -d t1 build Test.B
+  d=$(idxdir t1 B)
+  f=$(idxname t1 B)
+  # t2 compiles B again (t1's file is held aside, so no lookup finds it), at the same state, for another input hash
+  test_cmd mv "$d/$f" held.json
+  test_cmd mv "$d/${f%.json}.pre" held.pre
+  mkpkg t2
+  edx t2 2
+  lake_out -d t2 build -v Test.B
+  jobhas Test.B "Built Test.B"
+  test_cmd_fails cmp -s "t1/$OUT/B.usekey" "t2/$OUT/B.usekey"
+  test_exp "$(idxname t2 B)" = "$f"
+  test_cmd mv held.json "$d/$f"
+  test_cmd mv held.pre "$d/${f%.json}.pre"
+  test_exp "$(find "$d" -maxdepth 1 -name '*.json' | wc -l)" = 1
+  # another source of B: another directory, no candidate
+  mkpkg t3
+  printf -- '-- another source\n' >> t3/Test/B.lean
+  edx t3 3
+  lake_out -d t3 build -v Test.B
+  jobhas Test.B "Built Test.B"
+  jobnot Test.B "usage index:"
+  d3=$(idxdir t3 B)
+  test_exp "$d3" != "$d"
+  # other options of B's library: another directory too
+  mkpkg t5
+  printf 'leanOptions = { maxRecDepth = 600 }\n' >> t5/lakefile.toml
+  edx t5 5
+  lake_out -d t5 build -v Test.B
+  jobhas Test.B "Built Test.B"
+  jobnot Test.B "usage index:"
+  test_exp "$(idxdir t5 B)" != "$d"
+  # t1's file in the directory of B's other source, alone: rejected on its key, unparsed and unchecked
+  test_cmd rm -f "$d3"/*
+  test_cmd cp "$d/$f" "$d/${f%.json}.pre" "$d3/"
+  mkpkg t4
+  printf -- '-- another source\n' >> t4/Test/B.lean
+  edx t4 4
+  lake_out -d t4 build -v Test.B
+  jobhas Test.B "usage index: no match (1 candidates, 0 parsed, 0 fully checked"
+  jobhas Test.B "Built Test.B"
+}
+
+# 16. A restored `.resolved` must have the bytes its entry records, as each other restored file must (with the other
+# sidecars it counts as an output, `Module.outputMismatches`): one replaced in the cache by other bytes is quarantined,
+# and B builds. The edit changes the value of `x`, not what `X` provides, so B's check does not read the `.resolved`.
+case16() {
+  local art
+  mkpkg f
+  test_run -d f build Test.B
+  art="$(cat f/$OUT/B.resolved.hash).resolved"
+  cat "$LAKE_CACHE_DIR/artifacts/$art" > good.tmp
+  { cat good.tmp; printf 'replaced'; } > bad.tmp
+  mv -f bad.tmp "$LAKE_CACHE_DIR/artifacts/$art"
+  mkpkg t
+  printf 'def x := 5\n' > t/Test/X.lean
+  lake_out -d t build -v Test.B
+  jobhas Test.B "warning: usage index: $LAKE_CACHE_DIR/artifacts/$art"
+  test_exp -f "$LAKE_CACHE_DIR/quarantine/$art.0"
+  jobhas Test.B "usage index: no match (1 candidates, 1 parsed, 1 fully checked"
+  jobhas Test.B "Built Test.B"
+}
+
 runcase() {
   echo "=== case $1"
   mkdir -p "c$1"
@@ -567,7 +648,7 @@ runcase() {
   )
 }
 
-if [ $# = 0 ]; then set -- 1 2 3 4 5 6a 6b 7 8 9 10 11 12 13 14 15; fi
+if [ $# = 0 ]; then set -- 1 2 3 4 5 6a 6b 7 8 9 10 11 12 13 14 15 16 20; fi
 for c in "$@"; do runcase "$c"; done
 
 rm -f produced.out

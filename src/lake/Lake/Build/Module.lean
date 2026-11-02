@@ -1564,7 +1564,7 @@ Looks in the usage index (`Cache.usageCandidates`) for a compile of the module, 
 (`importArts`). Each candidate, most recently written first, is resolved against the local cache only (no artifact is
 downloaded), pre-filtered (`usagePrefilter`), and decided by the cutoff's own check (`Module.usageVerdict`) on its
 cache files, which reads them in `hashes`, the module's decision. A candidate that passes goes to `accept`, with its
-name (the hash of its `.usekey`), its outputs in the cache and the log of its compile; the first one `accept` takes
+name (`usageIndexName`), its outputs in the cache and the log of its compile; the first one `accept` takes
 ends the lookup. A candidate whose outputs a kept-module check accepted (`ModuleOutputDescrs.keptFrom?`) is offered
 only if no compile passes: a compile of the same `.olean` passes whenever the kept outputs do, and a kept key makes
 the module's importers distrust its digests (`importUsage?`). A candidate that cannot be read or resolved, that is a
@@ -1754,6 +1754,18 @@ def Module.usageCutoffApplies (mod : Module) (presetup : ModulePreSetup) : JobM 
   mod.checkArtifactsExist presetup.isModule presetup.postponeCompile
 
 /--
+The name of the usage-index file (`Cache.usageIndexFile`) of the compile whose `.usekey` is at `path` and has the
+content hash `hash`: the hash of the key without its `input`. Compiles of one dependency state under other input
+hashes (after an edit that no constant the module uses sees) differ only there, so they share one file, and the index
+keeps more states. `hash` if the key cannot be read or records no `input`.
+-/
+def usageIndexName (path : FilePath) (hash : Hash) : BaseIO Hash := do
+  let .ok s ← (IO.FS.readFile path).toBaseIO | return hash
+  let .ok (.obj kvs) := Json.parse s | return hash
+  unless kvs.contains "input" do return hash
+  return Hash.ofString (Json.obj (kvs.erase "input")).compress
+
+/--
 Records the module's outputs, `arts`, which are in the cache, in the usage index (`Cache.writeUsageIndex`) if a
 lookup can read them: they name a `.usekey`, the build restores artifacts (`restore`), as a lookup requires, and usage
 cutoff can apply to the module. The entry has no archive, and holds `log`, the log of the outputs' build, which a
@@ -1768,13 +1780,14 @@ def Module.indexUsage (mod : Module) (presetup : ModulePreSetup) (arts : ModuleO
   let some usekey := arts.usekey? | return
   unless (← mod.usageIndexApplies presetup) do return
   let cache ← getLakeCache
+  let name ← usageIndexName usekey.path usekey.hash
   let compact := Cache.usageIndexCompactFile <|
-    cache.usageIndexFile mod.pkg.cacheScope presetup.localTrace.hash usekey.hash
+    cache.usageIndexFile mod.pkg.cacheScope presetup.localTrace.hash name
   let compact? ← id do
     if (← hasCompactUsage compact usekey.path) then return none
     let some usage := arts.usage? | return none
     compactUsage? usage.path
-  cache.writeUsageIndex mod.pkg.cacheScope presetup.localTrace.hash usekey.hash
+  cache.writeUsageIndex mod.pkg.cacheScope presetup.localTrace.hash name
     (toJson {arts.descrs with ltar? := none}) log compact?
 
 /--

@@ -503,16 +503,16 @@ public def readOutputs? (cache : Cache) (scope : String) (inputHash : Hash) : Lo
 
 /--
 The directory of the usage index for a package's modules (`scope`) whose local inputs (`ModulePreSetup.localTrace`)
-have the hash `localHash`: one file per compile of such a module, named by the content hash of its `.usekey`
-(`writeUsageIndex`). A build that misses the cache by input hash reads them for an earlier compile whose outputs pass
-the usage cutoff's check against its current imports.
+have the hash `localHash`: one file per dependency state of such a module that a compile recorded, named by the hash
+of its `.usekey` without the key's `input` (`Module.indexUsage`, `writeUsageIndex`). A build that misses the cache by
+input hash reads them for an earlier compile whose outputs pass the usage cutoff's check against its current imports.
 -/
 @[inline] public def usageIndexDir (cache : Cache) (scope : String) (localHash : Hash) : FilePath :=
   cache.dir / "usage-index" / scope / localHash.toString
 
-/-- The usage-index file (`usageIndexDir`) of the compile whose `.usekey` has the content hash `usekey`. -/
-@[inline] public def usageIndexFile (cache : Cache) (scope : String) (localHash usekey : Hash) : FilePath :=
-  cache.usageIndexDir scope localHash / s!"{usekey}.json"
+/-- The usage-index file (`usageIndexDir`) named `name`, the hash of a compile's dependency state. -/
+@[inline] public def usageIndexFile (cache : Cache) (scope : String) (localHash name : Hash) : FilePath :=
+  cache.usageIndexDir scope localHash / s!"{name}.json"
 
 /--
 The compact record of the `.usage` of the compile that the usage-index file `file` records (`writeUsageIndex`), which
@@ -557,24 +557,24 @@ def usageIndexFiles (dir : FilePath) (select : String → Bool) : IO (Array (Fil
 
 /--
 Records a compile in the usage index (`usageIndexDir`): `out`, its outputs entry, with `log`, the log of the compile
-as the cache keeps it (`cachedLog?`), which a lookup that restores the compile replays, as the file named by the
-content hash of its `.usekey` (`usekey`), with no cache service, so that it resolves only against this cache, and
+as the cache keeps it (`cachedLog?`), which a lookup that restores the compile replays, as the file `name`, the hash
+of its dependency state (`Module.indexUsage`), with no cache service, so that it resolves only against this cache, and
 `compact?`, if given, as its compact usage record (`usageIndexCompactFile`), written first, so that a lookup that
 finds the entry finds the record too. Each file is written whole under a temporary name and renamed onto its own: a
-reader sees the old complete file or the new one, and two writers of one name write the outputs of compiles with
-the same `.usekey`, either of which is valid. A rewrite makes the file recent again. Then removes the files beyond
+reader sees the old complete file or the new one, and two writers of one name write the outputs of compiles of the
+same dependency state, either of which is valid. A rewrite makes the file recent again. Then removes the files beyond
 the `usageIndexSize` most recently written with their records, temporary files an hour older than this one (left by
 a writer that stopped), and records as old whose file is gone. Two writers that trim at once can remove more than
 needed, which loses a candidate or its record (the lookup then reads the `.usage`) and never adds one. Nothing else
 removes them: a file whose artifacts were pruned from the cache no longer resolves and ages out.
 -/
-public def writeUsageIndex (cache : Cache) (scope : String) (localHash usekey : Hash) (out : Json)
+public def writeUsageIndex (cache : Cache) (scope : String) (localHash name : Hash) (out : Json)
     (log : Log := {}) (compact? : Option ByteArray := none) : IO Unit := do
   let dir := cache.usageIndexDir scope localHash
   IO.FS.createDirAll dir
-  let file := cache.usageIndexFile scope localHash usekey
+  let file := cache.usageIndexFile scope localHash name
   let tmp (ext : String) : IO FilePath :=
-    return dir / s!"{usekey}.{ext}.tmp-{← IO.Process.getPID}-{← IO.monoNanosNow}"
+    return dir / s!"{name}.{ext}.tmp-{← IO.Process.getPID}-{← IO.monoNanosNow}"
   if let some compact := compact? then
     let t ← tmp "pre"
     IO.FS.writeBinFile t compact
