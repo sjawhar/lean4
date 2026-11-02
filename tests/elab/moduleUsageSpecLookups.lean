@@ -1,12 +1,13 @@
 import Lean
-open Lean
 
 /-!
 `recordSpecLookup` records a specialization-cache lookup in time that does not grow with the lookups already
-recorded. The keys are kept in a `builtin_initialize` reference, whose value is never exclusive, so a structure that
-copies itself on update (an `Array` push) made each lookup copy every key recorded before it. `lookedUpSpecKeys` still
-returns every key, in the order recorded.
+recorded, and `lookedUpSpecKeys` returns every key in the order recorded. The keys are in a `builtin_initialize`
+reference, whose value is never exclusive, so a structure that copies itself on update would copy every key recorded
+before at each lookup.
 -/
+
+open Lean
 
 /-- Records the keys `start`, ..., `start + n - 1`, in batches of 500, and returns the fewest nanoseconds per lookup
 that a batch took (the least disturbed batch). -/
@@ -35,6 +36,6 @@ def recordKeys (start n : Nat) : IO Float := do
     throw <| IO.userError s!"recorded {keys.size - before} keys, expected 64000"
   unless keys.extract before keys.size == (Array.range 64000).map mkRawNatLit do
     throw <| IO.userError "the keys are not returned in the order recorded"
-  -- A copy per lookup makes a lookup after 62,000 about 30 times slower than one among the first 2,000.
+  -- A copy per lookup makes a lookup after 62,000 keys over 100 times slower than one among the first 2,000.
   unless late < 5 * early do
     throw <| IO.userError s!"a lookup took {early} ns among the first 2,000 keys and {late} ns after 62,000"
