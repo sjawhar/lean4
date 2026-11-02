@@ -200,6 +200,21 @@ public def urlOrigin? (url : String) : Option String := do
   return s!"{scheme}://{authority}"
 
 /--
+The `curl` arguments that make a parallel run (`curl -Z`) of transfers to `urls` connect each
+transfer at once when every URL is plain HTTP (in any case), and none otherwise. `curl -Z` holds a
+transfer until the first connection to its host shows whether it multiplexes, and the hold counts
+against `--connect-timeout` (see `transferTimeoutArgs`). Over HTTPS the TLS handshake shows it at
+once. A plain HTTP connection never multiplexes, and curl 8.18 holds the other transfers until its
+first answer, so they would all time out on a server that takes longer than `transferConnectSecs`
+to answer.
+-/
+public def parallelConnectArgs (urls : Array String) : Array String :=
+  if urls.all fun url => (urlOrigin? url).any (·.startsWith "http://") then
+    #["--parallel-immediate"]
+  else
+    #[]
+
+/--
 Whether a request to `url` may carry a credential: it uses HTTPS, or HTTP to a loopback host
 (`localhost`, `127.x.x.x` or `[::1]`), whose traffic does not leave the machine.
 -/

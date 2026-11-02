@@ -170,3 +170,10 @@ name = "notimes"
 type = "s3"
 artifactEndpoint = "%URL%/notimes/a0"
 revisionEndpoint = "%URL%/notimes/r0"
+
+# Encrypted HTTP to a host name that does not resolve
+[[cache.service]]
+name = "tls"
+type = "s3"
+artifactEndpoint = "https://cache.invalid/a0"
+revisionEndpoint = "https://cache.invalid/r0"
