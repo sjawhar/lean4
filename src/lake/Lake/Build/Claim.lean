@@ -14,6 +14,7 @@ import Lake.Util.IO
 import Std.Internal.UV.Timer
 import Std.Internal.UV.System
 import Std.Sync.Mutex
+import Std.Data.TreeMap.Basic
 import Std.Time
 import Init.Data.String.Legacy
 
@@ -331,18 +332,20 @@ def HeldClaim.abandon (claim : HeldClaim) : JobM Unit := do
 /--
 The waits of the jobs that wait for another build's claim, or leave an input to another build,
 and have not looked again yet (`ClaimWait.after`), by a number that counts them: a compile that
-ends wakes one of them, so a job that could compile at once on the freed worker does not wait
-out its timer (`wakeClaimWait`). A wait is woken once, by its timer or by a compile, whichever
-is first.
+ends wakes the oldest of them, so a job that could compile at once on the freed worker does not
+wait out its timer (`wakeClaimWait`). A wait is woken once, by its timer or by a compile,
+whichever is first. This map, `deferrals` and `claimSightings` can hold an entry per input of
+the build, so they are persistent: the value of a global that several threads reach is never
+exclusive, so each update of a hash map there would copy all of it.
 -/
-builtin_initialize claimWaits : Std.Mutex (Nat × Std.HashMap Nat (IO.Promise Unit)) ←
+builtin_initialize claimWaits : Std.Mutex (Nat × Std.TreeMap Nat (IO.Promise Unit)) ←
   Std.Mutex.new (0, {})
 
-/-- Wakes one wait of `claimWaits`, if any: its job looks for its input again at once. -/
+/-- Wakes the oldest wait of `claimWaits`, if any: its job looks for its input again at once. -/
 def wakeClaimWait : BaseIO Unit := do
   let some promise ← claimWaits.atomically do
       let (next, waits) ← get
-      let some (id, promise) := waits.toArray[0]?
+      let some (id, promise) := waits.minEntry?
         | return none
       set (next, waits.erase id)
       return some promise
@@ -422,7 +425,7 @@ def inputOwner? (inputHash : Hash) : BaseIO (Option String) := do
 To which build this build last left each input, and since when, by its own monotonic clock
 (milliseconds), by claim URL (see `observeDeferral`).
 -/
-builtin_initialize deferrals : Std.Mutex (Std.HashMap String (String × Nat)) ← Std.Mutex.new {}
+builtin_initialize deferrals : Std.Mutex (Std.TreeMap String (String × Nat)) ← Std.Mutex.new {}
 
 /--
 Records that this build leaves the input at `url` to the build `owner`, and returns for how many
@@ -449,7 +452,7 @@ def observeDeferral (url owner : String) : BaseIO Nat := do
 When this process first saw each claim with the generation it last saw, by its own monotonic clock
 (milliseconds), by URL: the claims it waits for (see `observeClaim`).
 -/
-builtin_initialize claimSightings : Std.Mutex (Std.HashMap String (String × Nat)) ←
+builtin_initialize claimSightings : Std.Mutex (Std.TreeMap String (String × Nat)) ←
   Std.Mutex.new {}
 
 /--

@@ -20,6 +20,7 @@ import Lake.Util.Proc
 import Lake.Util.Sha256
 import Init.While
 import Std.Sync.Mutex
+import Std.Data.TreeMap.Basic
 import Std.Internal.UV.System
 
 /-! # `lake cache push`
@@ -528,10 +529,14 @@ inductive TakenClaim
 /--
 What a push has done with the claim of each queue line it has read (see `takeLineClaims`),
 shared by the push's passes and its claim taker (`claimTaker`), with the messages of the
-requests that failed, which the passes log.
+requests that failed, which the passes log. The claims are a persistent map: the value of a
+reference that several threads reach is never exclusive, so each update of a hash map there
+would copy the whole map, two updates per distinct queue line. The lines that leave the queue are
+erased by key: a filter of the whole map at each flush (after each chunk, for a short queue) would
+make a long queue cost n^2 again.
 -/
 structure TakenClaims where
-  claims : IO.Ref (Std.HashMap String TakenClaim)
+  claims : IO.Ref (Std.TreeMap String TakenClaim)
   messages : IO.Ref (Array String)
 
 /--
@@ -588,7 +593,7 @@ each staged line with the log of its staging, in order.
 -/
 def stageLines
   (ctx : PushContext) (dir : FilePath) (lines : Array String)
-  (taken : Std.HashMap String TakenClaim)
+  (taken : Std.TreeMap String TakenClaim)
 : BaseIO (Array (StagedEntry × Log)) := do
   -- The index of the next line to take, and the bytes staged so far
   let progress ← IO.mkRef ((0 : Nat), (0 : Nat))
@@ -681,7 +686,7 @@ push took).
 -/
 def stageChunk
   (ctx : PushContext) (dir : FilePath) (lines : Array String)
-  (taken : Std.HashMap String TakenClaim)
+  (taken : Std.TreeMap String TakenClaim)
 : LoggerIO StagedChunk := do
   removeDirAllIfExists dir
   IO.FS.createDirAll dir
@@ -904,7 +909,7 @@ partial def pushLoop
   let todo := lines.filter (!failed.contains ·)
   -- The lines that left the queue need no generation any more
   unless done.isEmpty do
-    taken.claims.modify (·.filter fun line _ => !done.contains line)
+    taken.claims.modify fun claims => done.fold (fun claims line _ => claims.erase line) claims
   for msg in ← taken.messages.modifyGet (·, #[]) do
     logVerbose msg
   if todo.isEmpty then
@@ -914,12 +919,8 @@ partial def pushLoop
         -- The retry states protected this pass's staging. A failed entry stays queued, so its
         -- next pass may try its claim again.
         taken.claims.modify fun claims =>
-          claims.filter fun line state =>
-            if failed.contains line then
-              match state with
-              | .retry => false
-              | _ => true
-            else true
+          failed.fold (init := claims) fun claims line =>
+            if claims[line]? matches some .retry then claims.erase line else claims
         logInfo s!"trying {failed.size} failed queue entries again"
         let stats := {stats with failed := stats.failed - failed.size}
         return ← pushLoop ctx pushLock queueLock taken taker stats {} {} follow? retryAt firstChunk
@@ -983,7 +984,7 @@ partial def pushLoop
       match ← (removeFromQueue cache queueLock done).toBaseIO with
       | .ok invalid =>
         stats := {stats with dropped := stats.dropped + invalid}
-        taken.claims.modify (·.filter fun line _ => !done.contains line)
+        taken.claims.modify fun claims => done.fold (fun claims line _ => claims.erase line) claims
         done := {}
         flushAt := now + pushFlushFactor * ((← IO.monoMsNow) - now)
       | .error e =>
