@@ -24,8 +24,8 @@ private builtin_initialize usageRecordingRef : IO.Ref Bool ← IO.mkRef false
 environment that is then discarded (`example`, `#eval`, `#guard`), and the names `recordUsedName` adds. -/
 private builtin_initialize usedByChecksRef : IO.Ref NameSet ← IO.mkRef {}
 /-- The keys looked up in the specialization cache while recording is on (`recordSpecLookup`), the latest first.
-A `List`: the reference's value is never exclusive (the reference is persistent, and several threads reach it), so an
-`Array` push would copy every key recorded before it. -/
+A `List`: the value of a persistent reference is never exclusive, so an `Array` push would copy every key recorded
+before it. -/
 private builtin_initialize specLookupsRef : IO.Ref (List Expr) ← IO.mkRef []
 
 /-- Switches on the recording of resolved names (`noteResolved`), in `src/library/usage_digest.cpp`. -/
