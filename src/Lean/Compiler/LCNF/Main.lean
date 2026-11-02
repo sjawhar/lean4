@@ -13,6 +13,8 @@ import Lean.Compiler.LCNF.ToImpureType
 import Lean.Compiler.LCNF.Check
 import Lean.Meta.Match.MatcherInfo
 import Lean.Compiler.LCNF.SplitSCC
+import Lean.Compiler.LCNF.Simp.ConstantFold
+import Lean.Util.UsedByChecks
 public import Lean.Compiler.IR.Basic
 public import Lean.Compiler.LCNF.CompilerM
 
@@ -120,7 +122,19 @@ def resumeCompilation (declName : Name) (baseOpts : Options) : CoreM Unit := do
   -- we did to get here.
   withOptions (fun _ => opts) do
   Core.prependError m!"Failed to compile `{declName}`" do
-    (← compileDeclsRef.get) decls.declNames baseOpts
+    runCompileDecls decls.declNames baseOpts
+
+/-- Whether `manager` and `folders` are the built-in pass manager and constant folders, unchanged by any
+installer or folder from any module, whether added by an extension entry or written into the extension state
+directly. Both extension states start as these objects and change only by copying (`runImportedDecls`,
+`SMap.insert`), so pointer identity decides. -/
+private unsafe def isBuiltinCompilerUnsafe (manager : PassManager)
+    (folders : SMap Name Simp.ConstantFold.Folder) : Bool :=
+  ptrAddrUnsafe manager == ptrAddrUnsafe builtinPassManager &&
+    ptrAddrUnsafe folders.map₁ == ptrAddrUnsafe Simp.ConstantFold.builtinFolders.map₁ && folders.map₂.isEmpty
+
+@[implemented_by isBuiltinCompilerUnsafe]
+private opaque isBuiltinCompiler (manager : PassManager) (folders : SMap Name Simp.ConstantFold.Folder) : Bool
 
 namespace PassManager
 
@@ -146,7 +160,7 @@ partial def run (declNames : Array Name) (baseOpts : Options) : CompilerM Unit :
     if let some fnName := Compiler.getImplementedBy? (← getEnv) declName then
       if (← getEnv).header.isModule && (← compiler.postponeCompile.getM) then
         -- must postpone here as well so that visibility marking happens in the correct process
-        modifyEnv (postponedCompileDeclsExt.addEntry · { declNames := #[declName], options := ← getOptions })
+        modifyEnv (postponedCompileDeclsExt.addEntry · { declNames := #[declName], options := (← getOptions).erase inCompileOption })
       else
         -- Ensure the impl target is compiled first so `getLocalDeclAt?` succeeds
         resumeCompilation fnName baseOpts
@@ -172,7 +186,7 @@ partial def run (declNames : Array Name) (baseOpts : Options) : CompilerM Unit :
 
   -- Now that we have done all input checks, check for postponement
   if (← getEnv).header.isModule && (← compiler.postponeCompile.getM) then
-    modifyEnv (postponedCompileDeclsExt.addEntry · { declNames := decls.map (·.name), options := ← getOptions })
+    modifyEnv (postponedCompileDeclsExt.addEntry · { declNames := decls.map (·.name), options := (← getOptions).erase inCompileOption })
     -- meta defs are compiled locally so they are available for execution/compilation without
     -- importing `.ir` but still marked for `leanir` compilation so that we do not have to persist
     -- module-local compilation information between the two processes
@@ -195,6 +209,7 @@ partial def run (declNames : Array Name) (baseOpts : Options) : CompilerM Unit :
 
   let decls := markRecDecls decls
   let manager ← getPassManager
+  unless isBuiltinCompiler manager (← Simp.ConstantFold.getFolders) do recordCompilerCode
   let isCheckEnabled := compiler.check.get (← getOptions)
   let decls ← runPassManagerPart .pure .pure "compilation (LCNF base)" manager.basePasses decls isCheckEnabled
   let decls ← runPassManagerPart .pure .pure "compilation (LCNF mono)" manager.monoPasses decls isCheckEnabled
@@ -234,12 +249,15 @@ where
 
 end PassManager
 
+/-- Compiles `declNames`. The compile's options carry `inCompileOption`, so that `Meta` queries it makes record the
+elaboration state they read (`recordIfCompiling`). -/
 def main (declNames : Array Name) (baseOpts : Options) : CoreM Unit := do
   withTraceNode `Compiler (fun _ => return m!"compiling: {declNames}") do
-    CompilerM.run <| PassManager.run declNames baseOpts
+    withOptions (·.setBool inCompileOption true) do
+      CompilerM.run <| PassManager.run declNames baseOpts
 
 builtin_initialize
-  compileDeclsRef.set main
+  setBuiltinCompileDecls main
 
 builtin_initialize
   registerTraceClass `Compiler.init (inherited := true)

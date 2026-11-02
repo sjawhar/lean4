@@ -396,7 +396,18 @@ optional<expr> type_checker::reduce_recursor(expr const & e, bool cheap_rec, boo
                                                 [&](expr const & e) { return cheap_rec ? whnf_core(e, cheap_rec, cheap_proj) : whnf(e); },
                                                 [&](expr const & e) { return infer(e); },
                                                 [&](expr const & e1, expr const & e2) { return is_def_eq(e1, e2); },
-                                                [&](expr const & e) { return is_prop(e); })) {
+                                                [&](expr const & e) { return is_prop(e); },
+                                                [&](recursor_rule const & rule, constant_info const & rec_info, expr const & rec_fn) {
+                                                    if (is_nil(const_levels(rec_fn)))
+                                                        return rule.get_rhs();
+                                                    expr_pair key(rec_fn, rule.get_rhs());
+                                                    auto it = m_st->m_rec_rhs.find(key);
+                                                    if (it != m_st->m_rec_rhs.end())
+                                                        return it->second;
+                                                    expr rhs = instantiate_lparams(rule.get_rhs(), rec_info.get_lparams(), const_levels(rec_fn));
+                                                    m_st->m_rec_rhs.insert(mk_pair(key, rhs));
+                                                    return rhs;
+                                                })) {
         return r;
     }
     return none_expr();
