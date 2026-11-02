@@ -253,6 +253,26 @@ case_push_githash() {
   test_cmd_eq $PUSH_COMPILES queued
 }
 
+case_push_service_mode() {
+  # In build-service mode (`LAKE_REMOTE_EXEC`), a build queues nothing for the bucket and starts no
+  # push, its local fallback included: here the service does not answer, so every module compiles on
+  # this machine, with the queue and the claims on.
+  local fake="$TEST_DIR/../remoteExec/fake_lean_remote.py"
+  push_fresh
+  FAKE_UNREACHABLE=1 FAKE_CAS="$WORK_DIR/fake-cas" LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_REMOTE_EXEC_CLIENT="$fake" \
+    LAKE_REMOTE_EXEC_TOOLCHAIN=sha256:0000000000000000000000000000000000000000000000000000000000000001 \
+    on_a test_out "lake: remote: unreachable; 0 cached (0 from manifest), 0 executed, 6 local;" \
+    --dir "$PUSH_A" build $PUSH_TARGETS
+  test_cmd_eq 0 queued
+  push_fresh
+  FAKE_UNREACHABLE=1 FAKE_CAS="$WORK_DIR/fake-cas" LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_REMOTE_EXEC_CLIENT="$fake" \
+    LAKE_REMOTE_EXEC_TOOLCHAIN=sha256:0000000000000000000000000000000000000000000000000000000000000001 \
+    LAKE_CACHE_DIR="$PUSH_CACHE" LAKE_REMOTE_CACHE="${PUSH_SERVICE:-bearer}" LAKE_CACHE_TOKEN_CMD="$TOKEN_CMD" \
+    LAKE_REMOTE_CACHE_QUEUE=true LAKE_REMOTE_CACHE_CLAIMS=true test_run --dir "$PUSH_A" build $PUSH_TARGETS
+  test_cmd_eq 0 queued
+  test_exp ! -e "$PUSH_CACHE/push.log"
+}
+
 case_push_deny() {
   # A push that the service refuses fails and keeps the queue, and it sends no
   # mapping whose artifacts it could not upload. A later push that the service
@@ -961,7 +981,7 @@ case_push_unpack_readonly() {
 }
 
 run_cases case_push_queue case_push_upload case_push_tree_changed case_push_mismatch \
-  case_push_missing case_push_custom_target case_push_githash case_push_deny case_push_invalid \
+  case_push_missing case_push_custom_target case_push_githash case_push_service_mode case_push_deny case_push_invalid \
   case_push_many case_push_staging case_push_concurrent case_push_stall case_push_dead \
   case_push_dead_follow case_push_busy \
   case_push_curl_hang case_push_resume case_push_pack_failure \

@@ -10,7 +10,8 @@ WORK="$TEST_DIR/work"; mkdir -p "$WORK"
 # The fake itself first, so that the cases below test Lake and not the fake.
 test_cmd bash "$TEST_DIR/fake_selftest.sh"
 
-for d in local remote remote2 failed timeout unreach later later2 wrongtc killed termed termed-write stuck late late-ref; do
+for d in local remote remote2 failed timeout unreach later later-local later2 wrongtc killed termed termed-write stuck \
+    late late-ref fb-local fb-mixed fb-unavail fb-mat fb-mat-nf fb-seed fb-restore fb-wait fb-wait-mid; do
   mkdir -p "$WORK/$d"; cp -r lakefile.toml Rx.lean Rx "$WORK/$d/"
 done
 export LAKE_REMOTE_EXEC_CLIENT="$TEST_DIR/fake_lean_remote.py" FAKE_CAS="$WORK/cas" FAKE_LOG="$WORK/fake.log"
@@ -67,6 +68,34 @@ seconds_since() { "$PYTHON" -c 'import sys, time; print(round(time.time() - floa
 in_range() { "$PYTHON" -c 'import sys; x, lo, hi = map(float, sys.argv[1:]); sys.exit(0 if lo <= x < hi else 1)' "$@"; }
 # dead PID: PID is no longer running
 dead() { ! kill -0 "$1" 2> /dev/null; }
+# results FILE: the `result` of each line of a LAKE_REMOTE_EXEC_LOG file, counted, e.g. `cached 2 local 3`
+results() {
+  "$PYTHON" -c 'import collections,json,sys
+c=collections.Counter(json.loads(l)["result"] for l in open(sys.argv[1]) if l.strip())
+print(" ".join(f"{k} {c[k]}" for k in sorted(c)))' "$1"
+}
+# local_targets FILE: the sorted targets of the `local` lines of a LAKE_REMOTE_EXEC_LOG file; each line names
+# no action and no output, and has the compile's own wall time
+local_targets() {
+  "$PYTHON" -c 'import json,sys
+ls=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+ls=[l for l in ls if l["result"]=="local"]
+assert all(l["kind"]=="lean" and l["action"]=="" and l["outputs"]=={} and l["exitCode"]==0 and l["wallMs"]>0 for l in ls), ls
+print(" ".join(sorted(l["target"] for l in ls)))' "$1"
+}
+# log_lines: how many lines the fake's log has
+log_lines() { if [ -f "$FAKE_LOG" ]; then wc -l < "$FAKE_LOG"; else echo 0; fi; }
+# wait_down SKIP N: wait up to 30 s until N hello answers after line SKIP of the fake's log said unreachable
+wait_down() {
+  for _ in $(seq 1 300); do
+    [ "$("$PYTHON" -c 'import json,sys
+ls=open(sys.argv[1]).read().splitlines()[int(sys.argv[2]):]
+print(sum(1 for l in ls if l.strip() and json.loads(l).get("answer")=="hello" and not json.loads(l)["reachable"]))' \
+      "$FAKE_LOG" "$1")" -ge "$2" ] && return 0
+    sleep 0.1
+  done
+  return 1
+}
 
 (cd "$WORK/local" && test_run build Rx)
 
@@ -132,17 +161,24 @@ for var in FAKE_TIMEOUT_TARGET FAKE_OOM_TARGET FAKE_DISK_TARGET; do
 done
 
 # The bridge that carries a build's actions says its own `hello`, after the decision and the wait for
-# the workspace build lock; when the service no longer answers by then, no request is sent, nothing is
-# recorded, and the end-of-build line says `unreachable`.
+# the workspace build lock; when the service no longer answers by then, no request is sent and nothing
+# is recorded. With `LAKE_REMOTE_EXEC_FALLBACK=fail` every module fails, the end-of-build line says
+# `unreachable`, and Lake exits with code 75, as every failure is the service's.
 runs=$(count_method run)
-(cd "$WORK/later" && FAKE_UNREACHABLE_LATER="$WORK/later.state" LAKE_REMOTE_EXEC=grpc://fake:1 \
-  test_err "build service at grpc://fake:1 did not answer: fake: unreachable" build Rx)
-match_text "lake: remote: unreachable;" "$WORK/later/produced.out"
+(cd "$WORK/later" && FAKE_UNREACHABLE_LATER="$WORK/later.state" LAKE_REMOTE_EXEC_FALLBACK=fail LAKE_REMOTE_EXEC=grpc://fake:1 \
+  test_status_out 75 "build service at grpc://fake:1 did not answer: fake: unreachable" build Rx)
+match_text "lake: remote: unreachable; 0 cached (0 from manifest), 0 executed, 0 local;" "$WORK/later/produced.out"
 test_cmd_eq 2 grep -c hello "$WORK/later.state"
 test_cmd_eq "$runs" count_method run
 test_exp ! -e "$WORK/later/.lake/build/lib/lean/Rx/A.olean"
+# With the default fallback (`local`), the same build compiles every module on this machine.
+(cd "$WORK/later-local" && FAKE_UNREACHABLE_LATER="$WORK/later-local.state" LAKE_REMOTE_EXEC=grpc://fake:1 \
+  test_out "lake: remote: unreachable; 0 cached (0 from manifest), 0 executed, 5 local;" build Rx)
+test_cmd_eq "$runs" count_method run
+test_cmd same_outputs "$WORK/later-local"
 
 # A later hello that answers but did not verify the toolchain refuses every request too, and the line says why.
+# This is not a service that does not answer: no fallback runs, the default one (`local`) included.
 runs=$(count_method run)
 (cd "$WORK/later2" && FAKE_UNVERIFIED_LATER="$WORK/later2.state" LAKE_REMOTE_EXEC=grpc://fake:1 \
   test_err "runs Lean 0000000000000000000000000000000000000000, but this Lake uses Lean" build Rx)
@@ -151,26 +187,117 @@ test_cmd_eq "$runs" count_method run
 test_exp ! -e "$WORK/later2/.lake/build/lib/lean/Rx/A.olean"
 
 # An UNAVAILABLE answer to a request means the service did not answer: the line says `unreachable`.
+# With `fail`, the module fails, and Lake exits with code 75.
 rm -rf "$WORK/timeout/.lake"
-(cd "$WORK/timeout" && FAKE_UNAVAILABLE_TARGET=Rx.B LAKE_REMOTE_EXEC=grpc://fake:1 \
-  test_err "the build service's run of Rx.B failed" build Rx)
+(cd "$WORK/timeout" && FAKE_UNAVAILABLE_TARGET=Rx.B LAKE_REMOTE_EXEC_FALLBACK=fail LAKE_REMOTE_EXEC=grpc://fake:1 \
+  test_status_out 75 "the build service's run of Rx.B failed" build Rx)
 match_text "lake: remote: unreachable; 2 cached (0 from manifest), 0 executed, 0 local;" "$WORK/timeout/produced.out"
 
 # After an UNAVAILABLE answer, a module whose job starts later (Rq.N waits 2 s for a local target) sends
-# no request and fails at once, and its error names the service. Rx.A and Rx.B are the only runs:
-# Rx.M, which Rq.N imports, starts after `slow` too.
+# no request and, with `fail`, fails at once, and its error names the service. Rx.A and Rx.B are the only
+# runs: Rx.M, which Rq.N imports, starts after `slow` too.
 mkdir -p "$WORK/unavail-later/Rq"; cp -r Rx.lean Rx "$WORK/unavail-later/"
 printf 'import Lake\nopen Lake DSL\npackage rz\ntarget slow : Unit := Job.async do\n  IO.sleep 2000\nlean_lib Rx\nlean_lib Rq where\n  extraDepTargets := #[`slow]\n' > "$WORK/unavail-later/lakefile.lean"
 printf 'import Rx.M\n\n/-! A module whose build starts after a slow local target. -/\n\ndef n := m + 1\n' > "$WORK/unavail-later/Rq/N.lean"
 runs=$(count_method run)
-(cd "$WORK/unavail-later" && FAKE_UNAVAILABLE_TARGET=Rx.B LAKE_REMOTE_EXEC=grpc://fake:1 \
-  test_err "error: build service at grpc://fake:1 did not answer: Rx.B: the service did not answer" build Rx.B Rq.N)
+(cd "$WORK/unavail-later" && FAKE_UNAVAILABLE_TARGET=Rx.B LAKE_REMOTE_EXEC_FALLBACK=fail LAKE_REMOTE_EXEC=grpc://fake:1 \
+  test_status_out 75 "error: build service at grpc://fake:1 did not answer: Rx.B: the service did not answer" build Rx.B Rq.N)
 test_cmd_eq "$((runs + 2))" count_method run
 
-# A service that does not answer fails the build (slice 1), and the end-of-build line says so.
-(cd "$WORK/unreach" && FAKE_UNREACHABLE=1 LAKE_REMOTE_EXEC=grpc://fake:1 \
-  test_err "build service at grpc://fake:1 did not answer" build Rx)
-match_text "lake: remote: unreachable;" "$WORK/unreach/produced.out"
+# With `fail`, a service that does not answer fails the build with exit code 75, and the line says so.
+(cd "$WORK/unreach" && FAKE_UNREACHABLE=1 LAKE_REMOTE_EXEC_FALLBACK=fail LAKE_REMOTE_EXEC=grpc://fake:1 \
+  test_status_out 75 "build service at grpc://fake:1 did not answer: fake: unreachable" build Rx)
+match_text "lake: remote: unreachable; 0 cached (0 from manifest), 0 executed, 0 local;" "$WORK/unreach/produced.out"
+
+# The default fallback (`local`): a service that does not answer fails no build. Every module compiles on
+# this machine and counts as `local`, no `run` is sent, the outputs are those of a local build, and the
+# per-target log has one `local` line for each. The same tree again is up to date: nothing compiles.
+runs=$(count_method run)
+(cd "$WORK/fb-local" && FAKE_UNREACHABLE=1 LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_REMOTE_EXEC_LOG="$WORK/fb-local.jsonl" \
+  test_out "lake: remote: unreachable; 0 cached (0 from manifest), 0 executed, 5 local;" build Rx)
+match_text "c says hi" "$WORK/fb-local/produced.out"
+test_cmd_eq "$runs" count_method run
+test_cmd same_outputs "$WORK/fb-local"
+test_cmd_eq "local 5" results "$WORK/fb-local.jsonl"
+test_cmd_eq "Rx Rx.A Rx.B Rx.C Rx.M" local_targets "$WORK/fb-local.jsonl"
+(cd "$WORK/fb-local" && FAKE_UNREACHABLE=1 LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_REMOTE_EXEC_LOG="$WORK/fb-local.jsonl" \
+  test_out "lake: remote: unreachable; 0 cached (0 from manifest), 0 executed, 0 local;" build Rx)
+test_cmd_eq "local 5" results "$WORK/fb-local.jsonl"
+
+# With `fail`, a build whose failures are not all the service's exits with code 1, not 75: Rx.M does not
+# compile (a result, sent before the service stopped answering), and Rx.B's run answers UNAVAILABLE.
+printf 'module\n\n/-! A module that does not compile. -/\n\npublic def m : Nat := undefinedIdentXyz\n' > "$WORK/fb-mixed/Rx/M.lean"
+(cd "$WORK/fb-mixed" && FAKE_UNAVAILABLE_TARGET=Rx.B LAKE_REMOTE_EXEC_FALLBACK=fail LAKE_REMOTE_EXEC=grpc://fake:1 \
+  test_status_out 1 "undefinedIdentXyz" build Rx)
+match_text "the build service's run of Rx.B failed" "$WORK/fb-mixed/produced.out"
+
+# A request that answers UNAVAILABLE mid-build (after the daemon's own retries): with the default fallback,
+# Rx.B compiles locally, and so do the modules after it, without a request: the service is not asked again
+# in this build. Rx.A and Rx.M came from the service's cache before.
+runs=$(count_method run)
+(cd "$WORK/fb-unavail" && FAKE_UNAVAILABLE_TARGET=Rx.B LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_REMOTE_EXEC_LOG="$WORK/fb-unavail.jsonl" \
+  test_out "lake: remote: unreachable; 2 cached (0 from manifest), 0 executed, 3 local;" build Rx)
+test_cmd_eq "$((runs + 3))" count_method run
+test_cmd same_outputs "$WORK/fb-unavail"
+test_cmd_eq "cached 2 local 3" results "$WORK/fb-unavail.jsonl"
+test_cmd_eq "Rx Rx.B Rx.C" local_targets "$WORK/fb-unavail.jsonl"
+
+# A materialize that answers UNAVAILABLE after a good run: the module compiles locally and counts once, as
+# `local`; the remote run's messages, already replayed, are dropped, so Rx.C's message shows once.
+(cd "$WORK/fb-mat" && FAKE_MATERIALIZE_FAIL=UNAVAILABLE:/Rx/C.olean LAKE_REMOTE_EXEC=grpc://fake:1 \
+  LAKE_REMOTE_EXEC_LOG="$WORK/fb-mat.jsonl" \
+  test_out "lake: remote: unreachable; 3 cached (0 from manifest), 0 executed, 2 local;" build Rx)
+test_cmd_eq 1 grep -c "c says hi" "$WORK/fb-mat/produced.out"
+test_cmd same_outputs "$WORK/fb-mat"
+test_cmd_eq "Rx Rx.C" local_targets "$WORK/fb-mat.jsonl"
+
+# Any other materialize failure is not a fallback: the build fails, and the run still counts as cached.
+(cd "$WORK/fb-mat-nf" && FAKE_MATERIALIZE_FAIL=NOT_FOUND:/Rx/B.olean LAKE_REMOTE_EXEC=grpc://fake:1 \
+  test_status_out 1 "materializing Rx.B from the build service failed" build Rx)
+match_text "lake: remote: ok; 3 cached (0 from manifest), 0 executed, 0 local;" "$WORK/fb-mat-nf/produced.out"
+
+# `local` counts compiles only: a fresh tree whose fallback restores a Lake-cache trace replays it
+# (here Rx.C) and records `0 local`. The default materialization setting does not put its `.olean` in
+# the tree until a local reader needs it, so that absence is not a restore failure.
+(cd "$WORK/fb-seed" && LAKE_CACHE_DIR="$WORK/fb-cache" LAKE_ARTIFACT_CACHE=true test_run build Rx)
+(cd "$WORK/fb-restore" && LAKE_CACHE_DIR="$WORK/fb-cache" LAKE_ARTIFACT_CACHE=true FAKE_UNREACHABLE=1 \
+  LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_REMOTE_EXEC_LOG="$WORK/fb-restore.jsonl" \
+  test_out "lake: remote: unreachable; 0 cached (0 from manifest), 0 executed, 0 local;" build Rx)
+match_text "Replayed Rx.C" "$WORK/fb-restore/produced.out"
+test_exp ! -s "$WORK/fb-restore.jsonl"
+
+# `wait`, with the service down when the build starts: no module compiles locally; Lake probes the service
+# again on a new connection after 1, 2, 4 … s, one job at a time, prints the waiting line, and builds on the
+# service once it answers.
+rm -f "$WORK/down" "$WORK/down.tripped"; touch "$WORK/down"
+skip=$(log_lines)
+(cd "$WORK/fb-wait" && FAKE_DOWN_FILE="$WORK/down" LAKE_REMOTE_EXEC_FALLBACK=wait LAKE_REMOTE_EXEC=grpc://fake:1 \
+  "$LAKE" build Rx > "$WORK/fb-wait.out" 2>&1) & wait_pid=$!
+wait_down "$skip" 4 || { kill "$wait_pid" 2> /dev/null; cat "$WORK/fb-wait.out"; exit 1; }
+rm -f "$WORK/down"
+rc=0; wait "$wait_pid" || rc=$?
+cat "$WORK/fb-wait.out"
+test_exp "$rc" = 0
+match_text "waiting for the build service at grpc://fake:1 since" "$WORK/fb-wait.out"
+match_text "lake: remote: ok; 5 cached (0 from manifest), 0 executed, 0 local;" "$WORK/fb-wait.out"
+test_cmd "$PYTHON" "$TEST_DIR/fallback_check.py" probes "$FAKE_LOG" "$skip"
+test_cmd same_outputs "$WORK/fb-wait"
+
+# `wait`, with the service gone in the middle of the build: Rx.B's run answers UNAVAILABLE, and Lake sends
+# it again only after a hello on a new connection found the service answering again.
+rm -f "$WORK/down" "$WORK/down.tripped"
+skip=$(log_lines)
+(cd "$WORK/fb-wait-mid" && FAKE_DOWN_FILE="$WORK/down" FAKE_DOWN_AT_TARGET=Rx.B LAKE_REMOTE_EXEC_FALLBACK=wait \
+  LAKE_REMOTE_EXEC=grpc://fake:1 "$LAKE" build Rx > "$WORK/fb-wait-mid.out" 2>&1) & wait_pid=$!
+wait_down "$skip" 2 || { kill "$wait_pid" 2> /dev/null; cat "$WORK/fb-wait-mid.out"; exit 1; }
+rm -f "$WORK/down"
+rc=0; wait "$wait_pid" || rc=$?
+cat "$WORK/fb-wait-mid.out"
+test_exp "$rc" = 0
+match_text "waiting for the build service at grpc://fake:1 since" "$WORK/fb-wait-mid.out"
+match_text "lake: remote: ok; 5 cached (0 from manifest), 0 executed, 0 local;" "$WORK/fb-wait-mid.out"
+test_cmd "$PYTHON" "$TEST_DIR/fallback_check.py" retry "$FAKE_LOG" "$skip" Rx.B
+test_cmd same_outputs "$WORK/fb-wait-mid"
 
 # A service whose toolchain runs another Lean fails the build before any action, and records nothing.
 runs=$(count_method run)
@@ -342,5 +469,5 @@ test_cmd cmp "$WORK/pc-local/.lake/build/ir/Pc.c" "$WORK/pc-remote/.lake/build/i
 # starting a bridge (`lake lean` decides in its jobs; Rx.A and Rx.M start together).
 printf '#!/bin/sh\necho start >> "$DEAD_LOG"\nsleep 1\nexit 75\n' > "$WORK/dead-bridge"; chmod +x "$WORK/dead-bridge"
 (cd "$WORK/unreach" && rm -rf .lake && DEAD_LOG="$WORK/dead.log" LAKE_REMOTE_EXEC_CLIENT="$WORK/dead-bridge" \
-  LAKE_REMOTE_EXEC=grpc://fake:1 test_err "did not answer" lean Rx.lean)
+  LAKE_REMOTE_EXEC_FALLBACK=fail LAKE_REMOTE_EXEC=grpc://fake:1 test_status_out 75 "did not answer" lean Rx.lean)
 test_cmd_eq 1 grep -c start "$WORK/dead.log"
