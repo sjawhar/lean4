@@ -44,14 +44,23 @@ copies() {
 mode() { stat -c %a "$1"; }
 
 # The modes a relink gives: a build without the preload links both copies to their entries
+X_ENTRY="$LAKE_CACHE_DIR/artifacts/$(cat "$X_OLEAN.hash").olean"
+EXE_ENTRY="$LAKE_CACHE_DIR/artifacts/$(cat "$EXE.hash")"
+X_ENTRY_MODE=$(mode "$X_ENTRY") EXE_ENTRY_MODE=$(mode "$EXE_ENTRY")
 copies "$X_OLEAN" "$EXE"
 test_run -d t build P.D hello
 X_MODE=$(mode "$X_OLEAN") EXE_MODE=$(mode "$EXE")
-test_exp "$(stat -c %i "$X_OLEAN")" = "$(stat -c %i "$LAKE_CACHE_DIR/artifacts/$(cat "$X_OLEAN.hash").olean")"
+test_exp "$X_MODE" = "$X_ENTRY_MODE"
+test_exp "$EXE_MODE" = "$EXE_ENTRY_MODE"
+test_exp "$(stat -c %i "$X_OLEAN")" = "$(stat -c %i "$X_ENTRY")"
+test_exp "$(stat -c %i "$EXE")" = "$(stat -c %i "$EXE_ENTRY")"
 test_exp -x "$EXE"
 
 # The same with every relink rename failing: the build keeps the copies, with those modes
 copies "$X_OLEAN" "$EXE"
+X_COPY_INODE=$(stat -c %i "$X_OLEAN") EXE_COPY_INODE=$(stat -c %i "$EXE")
+test_exp "$X_COPY_INODE" != "$(stat -c %i "$X_ENTRY")"
+test_exp "$EXE_COPY_INODE" != "$(stat -c %i "$EXE_ENTRY")"
 echo "\$ (preload: a rename from a .relink path fails with ESTALE; lake -v -d t build P.D hello)"
 rc=0
 out=$(env LD_PRELOAD="$PWD/fail-relink.so" "$LAKE" -v -d t build P.D hello 2>&1) || rc=$?
@@ -62,13 +71,19 @@ match_pat 'could not relink .*P/X\.olean to its cache entry, keeping the file' r
 match_pat 'could not relink .*bin/hello to its cache entry, keeping the file' relink.out
 test_cmd cmp x.genuine "$X_OLEAN"
 test_cmd cmp exe.genuine "$EXE"
+test_exp "$(stat -c %i "$X_OLEAN")" = "$X_COPY_INODE"
+test_exp "$(stat -c %i "$EXE")" = "$EXE_COPY_INODE"
 test_exp "$(mode "$X_OLEAN")" = "$X_MODE"
 test_exp "$(mode "$EXE")" = "$EXE_MODE"
+test_exp "$(mode "$X_ENTRY")" = "$X_ENTRY_MODE"
+test_exp "$(mode "$EXE_ENTRY")" = "$EXE_ENTRY_MODE"
 test_cmd_out hello "$EXE"
 test_exp -z "$(find t/.lake -name '*.relink')"
 
-# Without the preload, the next build links the output to the entry
-test_run -d t build P.D
+# Without the preload, the next build links both outputs to their entries
+test_run -d t build P.D hello
 test_cmd cmp x.genuine "$X_OLEAN"
-ENTRY="$LAKE_CACHE_DIR/artifacts/$(cat "$X_OLEAN.hash").olean"
-test_exp "$(stat -c %i "$X_OLEAN")" = "$(stat -c %i "$ENTRY")"
+test_cmd cmp exe.genuine "$EXE"
+test_exp "$(stat -c %i "$X_OLEAN")" = "$(stat -c %i "$X_ENTRY")"
+test_exp "$(stat -c %i "$EXE")" = "$(stat -c %i "$EXE_ENTRY")"
+test_cmd_out hello "$EXE"
