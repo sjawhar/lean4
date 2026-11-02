@@ -977,6 +977,26 @@ case_claim_sent_timeout() {
   match_text '/a0/claim/' "$CACHE_A/remote-status-read.json"
 }
 
+case_claim_read_sent_timeout() {
+  # A claim read that timed out after `curl` began to send it (`curl` exit code 28,
+  # `time_pretransfer` above 0) is sent again: a read changes nothing. B finds another host's
+  # `failed` claim of `Claim.A` (its write gets 412, so it reads the claim), its first read times
+  # out so, and its second reads the claim: B takes it over, compiles, and records no claim
+  # failure.
+  claim_fresh
+  LAKE_REMOTE_CACHE_CLAIMS=false run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
+  put_claim "$(inputs "$CACHE_A" Claim.A)" failed
+  rm -rf "$WORK_DIR/refused"
+  : > "$WORK_DIR/claim-calls"
+  REFUSE_EXIT=28 REFUSE_PRETRANSFER=0.5 REFUSE_VERBS=GET CURL="$WORK_DIR/refuse-claim-curl.sh" \
+    BUILD_TIMEOUT=$SOON_SECS run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim.A
+  test_cmd_eq 1 claim_check built-by "$LOG_B"
+  test_cmd_eq 1 count_files "$WORK_DIR/refused/GET"
+  test_exp "$(count '^GET ' "$WORK_DIR/claim-calls")" -ge 2
+  match_text 'taking over the claim' "$LOG_B"
+  no_claim_failure "$CACHE_B"
+}
+
 # A `curl` that fails the first write (`-X PUT`) and the first read of each claim (only the verbs
 # in `REFUSE_VERBS`, by default both) with the exit code `REFUSE_EXIT` and the JSON that `curl -w`
 # writes then, with `time_pretransfer` `REFUSE_PRETRANSFER` (by default 0: nothing was sent), and
@@ -1013,4 +1033,4 @@ run_cases case_claim_two_builds case_claim_one_push case_claim_order case_claim_
   case_claim_unreadable case_claim_local_clock case_claim_stream case_claim_off \
   case_claim_fail_open case_claim_share case_claim_free_slots case_claim_saturated \
   case_claim_free_slot_wake case_claim_read_retry case_claim_write_retry case_claim_write_race \
-  case_claim_connect_retry case_claim_sent_timeout
+  case_claim_connect_retry case_claim_sent_timeout case_claim_read_sent_timeout
