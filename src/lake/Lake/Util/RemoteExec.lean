@@ -225,6 +225,31 @@ def getConn (cfg : ClientConfig) : BaseIO (Except Error Conn) :=
 public def hello (cfg : ClientConfig) : BaseIO (Except Error Json) :=
   return (← getConn cfg).map (·.hello)
 
+/--
+Asks whether the service answers now, on a bridge of its own: it says `hello` and is killed at once,
+so it carries no request and no write into the workspace, and this process's connection (and the
+requests in flight on it) stays as it is.
+-/
+public def probe (cfg : ClientConfig) : BaseIO (Except Error Json) := do
+  match ← connect cfg with
+  | .error e => return .error e
+  | .ok conn =>
+    conn.writeLock.atomically (m := BaseIO) do conn.stdin.set none
+    reap conn.child
+    return .ok conn.hello
+
+/--
+Stops this process's bridge (`stopBridge`) if its `hello` does not pass `admits`, in one section of
+the connection lock, so a newer connection that another job started meanwhile is never the one
+stopped. A connection whose `hello` passes stays, with its requests in flight.
+-/
+public def dropUnless (admits : Json → Bool) : BaseIO Unit :=
+  connRef.atomically do
+    if let some conn ← getThe (Option Conn) then
+      unless admits conn.hello do
+        stopBridge conn
+        set (none : Option Conn)
+
 /-- Stops this process's bridge, if any (`stopBridge`), so Lake can exit: the bridge's read task
 would otherwise keep the process alive. Called at a build's end and however a Lake command ends. -/
 public def shutdown : BaseIO Unit :=

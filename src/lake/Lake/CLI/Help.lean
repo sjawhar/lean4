@@ -181,16 +181,26 @@ BUILD SERVICE:          compile Lean modules on a shared service instead of loca
   LAKE_REMOTE_EXEC_INSTANCE   service instance name (default: lean)
   LAKE_REMOTE_EXEC_CLIENT     the `lean-remote` executable (default: lean-remote)
   LAKE_REMOTE_EXEC_SOCKET     daemon socket passed to the bridge
-  LAKE_REMOTE_EXEC_LOG        append one JSON line per module resolved through the service
+  LAKE_REMOTE_EXEC_FALLBACK   local (default), wait or fail: what to do when the service does not
+                              answer
+  LAKE_REMOTE_EXEC_LOG        append one JSON line per module resolved through the service or
+                              compiled by the fallback (`result`: cached, executed or local)
   LEAN_REMOTE_CLIENT_LABEL    overrides the client label reported to the service
 
-A service whose toolchain does not run this Lake's Lean fails the build, and a module that needs
-the service fails when the service does not answer. C files and plugins still compile locally, and
-outputs are downloaded as soon as they are built.
+A service whose toolchain does not run this Lake's Lean fails the build. When the service does not
+answer (its `hello` finds it unreachable, or a request still answers UNAVAILABLE after the daemon's
+own retries), LAKE_REMOTE_EXEC_FALLBACK decides: `local` compiles the module on this machine and
+publishes nothing, and so does every later module of the build without asking the service again;
+`wait` compiles nothing locally and asks again after 1, 2, 4 … 30 s, saying so on standard error;
+`fail` fails the module, and the build exits with code 75 when all its failures are such modules.
+A compile that failed on the service, OOM, TIMEOUT or DISK_LIMIT is the module's result, never a
+reason to fall back. In service mode nothing is queued for LAKE_REMOTE_CACHE. C files and plugins
+still compile locally, and outputs are downloaded as soon as they are built.
 
 The build ends with `lake: remote: <state>; <c> cached (<m> from manifest), <e> executed, <l> local;
 other actions: …`. `executed` counts every action the service ran for this build, compiles that
-failed there included; `<state>` is ok, unreachable, off: <reason>, or idle."
+failed there included; `local` counts the modules the fallback compiled; `<state>` is ok,
+unreachable, off: <reason>, or idle."
 
 def helpQuery :=
 "Build targets and output results

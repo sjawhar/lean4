@@ -60,6 +60,7 @@ with open(src, "w") as f:
     f.write("the fake daemon runs the action locally\n")
 want = digest_of(src)
 
+before_first = time.time()
 b = Bridge()
 h = result(b.call("hello", {"protocol": 1, "endpoint": "grpc://fake:1", "instance": "lean",
                             "toolchain": "sha256:" + "0" * 63 + "1", "sysroot": "/nonexistent",
@@ -108,9 +109,14 @@ check("the bridge exits 0 on EOF", b.close() == 0)
 
 # --- the log: every request, and every action without this machine's paths
 log = [json.loads(l) for l in open(os.path.join(work, "fake.log"))]
-check("FAKE_LOG holds one line per request", [x["method"] for x in log] ==
+requests = [x for x in log if "method" in x]
+check("FAKE_LOG holds one line per request", [x["method"] for x in requests] ==
       ["hello", "digest", "run", "run", "materialize", "materialize", "materialize", "frobnicate"],
-      json.dumps([x["method"] for x in log]))
+      json.dumps([x["method"] for x in requests]))
+answers = [x for x in log if "method" not in x]
+check("and one line for the hello's answer, right after it, with its time",
+      [x.get("answer") for x in answers] == ["hello"] and log[1] is answers[0] and answers[0]["reachable"] is True
+      and before_first <= answers[0]["t"] <= time.time(), json.dumps(answers))
 actions = [json.loads(l) for l in open(os.path.join(work, "fake.log.actions"))]
 check("FAKE_LOG.actions holds one line per run", len(actions) == 2, str(len(actions)))
 check("an action names no local path", work not in json.dumps(actions), json.dumps(actions))
@@ -293,6 +299,52 @@ still = b15.p.poll() is None
 rc15 = b15.p.wait(timeout=10); dt15 = time.time() - t0
 check("FAKE_IGNORE_EOF_S keeps the fake after end of input", still and rc15 == 0 and 1 <= dt15 < 3,
       f"alive at 0.5 s: {still}, exit {rc15} after {dt15:.2f} s")
+
+# --- FAKE_DOWN_FILE: while the file exists, hello is unreachable and run and materialize are UNAVAILABLE
+downfile = os.path.join(work, "down")
+open(downfile, "w").close()
+bd = Bridge(FAKE_DOWN_FILE=downfile)
+hd = result(bd.call("hello", {"protocol": 1, "leanGithash": "a" * 40}))
+check("FAKE_DOWN_FILE makes hello unreachable, with a reason",
+      hd.get("reachable") is False and "down" in hd.get("reason", ""), json.dumps(hd))
+rd = bd.call("run", req)
+check("and run UNAVAILABLE", rd.get("error", {}).get("code") == "UNAVAILABLE", json.dumps(rd))
+md = bd.call("materialize", {"files": [{"digest": want, "path": os.path.join(work, "down-out")}]})
+check("and materialize UNAVAILABLE, writing nothing",
+      md.get("error", {}).get("code") == "UNAVAILABLE" and not os.path.exists(os.path.join(work, "down-out")), json.dumps(md))
+os.remove(downfile)
+rd2 = bd.call("run", req)
+check("a run after the file is gone runs", rd2.get("result", {}).get("exitCode") == 0, json.dumps(rd2))
+bd.close()
+
+# --- FAKE_DOWN_AT_TARGET: that target's first run takes the service down, once
+downfile2 = os.path.join(work, "down2")
+bt = Bridge(FAKE_DOWN_FILE=downfile2, FAKE_DOWN_AT_TARGET="selftest-trip")
+result(bt.call("hello", {"protocol": 1}))
+t0r = bt.call("run", req)
+check("another target's run does not take the service down",
+      t0r.get("result", {}).get("exitCode") == 0 and not os.path.exists(downfile2), json.dumps(t0r))
+t1r = bt.call("run", dict(req, target="selftest-trip"))
+check("FAKE_DOWN_AT_TARGET's run creates the file and answers UNAVAILABLE",
+      os.path.exists(downfile2) and t1r.get("error", {}).get("code") == "UNAVAILABLE", json.dumps(t1r))
+os.remove(downfile2)
+t2r = bt.call("run", dict(req, target="selftest-trip"))
+check("and only its first run does", not os.path.exists(downfile2) and t2r.get("result", {}).get("exitCode") == 0,
+      json.dumps(t2r))
+bt.close()
+
+# --- FAKE_MATERIALIZE_FAIL: a materialize naming a path with that suffix answers that code, writing nothing
+for code in ("UNAVAILABLE", "NOT_FOUND"):
+    bm = Bridge(FAKE_MATERIALIZE_FAIL=f"{code}:/mat/B.olean")
+    result(bm.call("hello", {"protocol": 1}))
+    other = os.path.join(work, code, "mat", "A.olean")
+    mf = bm.call("materialize", {"files": [{"digest": want, "path": other},
+                                           {"digest": want, "path": os.path.join(work, code, "mat", "B.olean")}]})
+    check(f"FAKE_MATERIALIZE_FAIL answers {code} for that suffix, writing none of the files",
+          mf.get("error", {}).get("code") == code and not os.path.exists(other), json.dumps(mf))
+    mo = bm.call("materialize", {"files": [{"digest": want, "path": other}]})
+    check("and another materialize writes", mo.get("result", {}).get("written") == 1, json.dumps(mo))
+    bm.close()
 
 print(f"\n{len(failures)} failed")
 sys.exit(1 if failures else 0)
