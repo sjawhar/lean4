@@ -340,9 +340,8 @@ The waits of the jobs that wait for another build's claim, or leave an input to 
 and have not looked again yet (`ClaimWait.after`), by a number that counts them: a compile that
 ends wakes the oldest of them, so a job that could compile at once on the freed worker does not
 wait out its timer (`wakeClaimWait`). A wait is woken once, by its timer or by a compile,
-whichever is first. This map, `deferrals` and `claimSightings` can hold an entry per input of
-the build, so they are persistent: the value of a global that several threads reach is never
-exclusive, so each update of a hash map there would copy all of it.
+whichever is first. The map is persistent: the value of a global that several threads reach is
+never exclusive, so each update of a hash map there would copy all of it.
 -/
 builtin_initialize claimWaits : Std.Mutex (Nat × Std.TreeMap Nat (IO.Promise Unit)) ←
   Std.Mutex.new (0, {})
@@ -429,7 +428,8 @@ def inputOwner? (inputHash : Hash) : BaseIO (Option String) := do
 
 /--
 To which build this build last left each input, and since when, by its own monotonic clock
-(milliseconds), by claim URL (see `observeDeferral`).
+(milliseconds), by claim URL (see `observeDeferral`). It can hold an entry per input of the build,
+so it is persistent, as `claimWaits` is.
 -/
 builtin_initialize deferrals : Std.Mutex (Std.TreeMap String (String × Nat)) ← Std.Mutex.new {}
 
@@ -456,7 +456,8 @@ def observeDeferral (url owner : String) : BaseIO Nat := do
 
 /--
 When this process first saw each claim with the generation it last saw, by its own monotonic clock
-(milliseconds), by URL: the claims it waits for (see `observeClaim`).
+(milliseconds), by URL: the claims it waits for (see `observeClaim`). It can hold an entry per input
+of the build, so it is persistent, as `claimWaits` is.
 -/
 builtin_initialize claimSightings : Std.Mutex (Std.TreeMap String (String × Nat)) ←
   Std.Mutex.new {}

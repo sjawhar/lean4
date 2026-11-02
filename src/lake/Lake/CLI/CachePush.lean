@@ -532,12 +532,18 @@ shared by the push's passes and its claim taker (`claimTaker`), with the message
 requests that failed, which the passes log. The claims are a persistent map: the value of a
 reference that several threads reach is never exclusive, so each update of a hash map there
 would copy the whole map, two updates per distinct queue line. The lines that leave the queue are
-erased by key: a filter of the whole map at each flush (after each chunk, for a short queue) would
-make a long queue cost n^2 again.
+erased by key (`eraseLines`): a filter of the whole map at each flush (after each chunk, for a
+short queue) would take time in proportion to the map at each flush.
 -/
 structure TakenClaims where
   claims : IO.Ref (Std.TreeMap String TakenClaim)
   messages : IO.Ref (Array String)
+
+/-- Erases the claims of the lines `done` from `claims`, each by its key. -/
+def eraseLines
+  (claims : Std.TreeMap String TakenClaim) (done : Std.HashMap String Nat)
+: Std.TreeMap String TakenClaim :=
+  done.fold (init := claims) fun claims line _ => claims.erase line
 
 /--
 Takes the claims that the queue lines `lines` name (see `takeLineClaim`), with `ctx.workers`
@@ -909,7 +915,7 @@ partial def pushLoop
   let todo := lines.filter (!failed.contains ·)
   -- The lines that left the queue need no generation any more
   unless done.isEmpty do
-    taken.claims.modify fun claims => done.fold (fun claims line _ => claims.erase line) claims
+    taken.claims.modify (eraseLines · done)
   for msg in ← taken.messages.modifyGet (·, #[]) do
     logVerbose msg
   if todo.isEmpty then
@@ -984,7 +990,7 @@ partial def pushLoop
       match ← (removeFromQueue cache queueLock done).toBaseIO with
       | .ok invalid =>
         stats := {stats with dropped := stats.dropped + invalid}
-        taken.claims.modify fun claims => done.fold (fun claims line _ => claims.erase line) claims
+        taken.claims.modify (eraseLines · done)
         done := {}
         flushAt := now + pushFlushFactor * ((← IO.monoMsNow) - now)
       | .error e =>

@@ -844,9 +844,11 @@ or got a server error. A write that got a server error is sent once more; if
 that send finds the claim written, a read tells whether this build wrote it.
 A send may first run `LAKE_CACHE_TOKEN_CMD` (when no token is held, or it is
 older than 45 minutes), and one that the remote cache refuses for its token
-runs it again and is sent once more. Each run may take 60 seconds. After its
-first queued output, a build that claims inputs starts this command itself,
-once, detached, as
+runs it again and is sent once more. Each run may take 60 seconds. So a claim
+request takes at most 483 seconds (63 when the command does not run), and a
+write that got a server error at most 1,450 (190). After its first queued
+output, a build that claims inputs starts this command itself, once, detached,
+as
 `lake cache push --wait --follow <file>` with a lock file that the build holds
 until it ends: the push uploads each output as the build queues it, tries an
 upload that failed again every 30 seconds while the build runs, ends after the

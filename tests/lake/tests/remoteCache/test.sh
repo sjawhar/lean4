@@ -404,6 +404,7 @@ case_parallel_immediate() {
   # and a scheme in upper case (`case_read_shared_runs` of `remoteCacheRead` checks the read
   # broker's runs). A run to an `https://` service keeps curl's default, which waits for the first
   # handshake and then multiplexes the transfers on it.
+  # An upload
   : > "$ARGV_LOG"
   LAKE_CACHE_DIR="$BUILD_CACHE_DIR" record_argv with_token \
     test_run cache put outputs.jsonl --scope=parallel --service=bearer
@@ -413,11 +414,13 @@ case_parallel_immediate() {
   : > "$ARGV_LOG"
   record_argv with_token test_run cache get --scope=parallel --service=bearer
   match_text '-Z --parallel-max 50 --parallel-immediate -X GET ' "$ARGV_LOG"
+  # An upload to the service with its scheme in upper case
   sed -e 's|"http://|"HTTP://|' "$LAKE_CONFIG" > "$WORK_DIR/services-upper.toml"
   : > "$ARGV_LOG"
   LAKE_CONFIG="$WORK_DIR/services-upper.toml" LAKE_CACHE_DIR="$BUILD_CACHE_DIR" \
     record_argv with_token test_run cache put outputs.jsonl --scope=parallel-upper --service=bearer
   match_text '-Z --parallel-max 50 --parallel-immediate -X PUT ' "$ARGV_LOG"
+  # An upload to an `https://` service (whose name does not resolve, so the upload fails)
   : > "$ARGV_LOG"
   LAKE_CACHE_DIR="$BUILD_CACHE_DIR" LAKE_CACHE_KEY=mock:key record_argv \
     test_fails cache put outputs.jsonl --scope=parallel --service=tls
