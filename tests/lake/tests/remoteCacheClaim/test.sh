@@ -935,6 +935,22 @@ case_claim_write_race() {
   match_text 'taking over the claim' "$LOG_A"
 }
 
+case_claim_write_unread() {
+  # The first write of the claim of `Claim.A` happened and got a server error, the second send
+  # gets 412, and every send of the read that would tell whose claim it is gets 503. The build
+  # cannot know, so the claim fails: it compiles at once and records the failure. It does not
+  # take the claim for another build's, whose wait would last the takeover time (600 s).
+  claim_fresh
+  : > "$SERVER_LOG"
+  CLAIM_SERVICE=claimputlostread BUILD_TIMEOUT=$SOON_SECS \
+    run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
+  test_cmd_eq 1 claim_check built-by "$LOG_A"
+  test_cmd_eq 1 count '^PUT /claimputlostread/a0/claim/.* -> 412 ' "$SERVER_LOG"
+  test_cmd_eq 3 count '^GET /claimputlostread/a0/claim/.* -> 503 ' "$SERVER_LOG"
+  no_match_text 'waiting for the claim' "$LOG_A"
+  match_text '/a0/claim/' "$CACHE_A/remote-status-read.json"
+}
+
 case_claim_connect_retry() {
   # A claim request that did not reach the remote cache is sent again, a write as well as a read:
   # a connection that could not be made (`curl` exit code 7), and a time-out before `curl` began
@@ -1033,4 +1049,5 @@ run_cases case_claim_two_builds case_claim_one_push case_claim_order case_claim_
   case_claim_unreadable case_claim_local_clock case_claim_stream case_claim_off \
   case_claim_fail_open case_claim_share case_claim_free_slots case_claim_saturated \
   case_claim_free_slot_wake case_claim_read_retry case_claim_write_retry case_claim_write_race \
-  case_claim_connect_retry case_claim_sent_timeout case_claim_read_sent_timeout
+  case_claim_write_unread case_claim_connect_retry case_claim_sent_timeout \
+  case_claim_read_sent_timeout
