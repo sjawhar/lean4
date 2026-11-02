@@ -167,18 +167,39 @@ def owner(args):
     print(holders[int(args.hash, 16) % len(holders)])
 
 
+def temp_roots(pid):
+    """The directories in which a process makes its temporary files: `/tmp`, and the first of
+    `TMPDIR`, `TMP`, `TEMP` and `TEMPDIR` that its environment sets to a non-empty value, which
+    libuv's `uv_os_tmpdir` (behind Lean's `IO.FS.createTempFile`) takes instead of `/tmp`. A
+    descriptor names its file by its real path, so the directory counts by its real path as well."""
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            env = dict(var.split(b"=", 1) for var in f.read().split(b"\0") if b"=" in var)
+    except OSError:
+        env = {}
+    roots = ["/tmp/"]
+    for name in (b"TMPDIR", b"TMP", b"TEMP", b"TEMPDIR"):
+        if env.get(name):
+            dir = os.fsdecode(env[name])
+            roots += [os.path.join(dir, ""), os.path.join(os.path.realpath(dir), "")]
+            break
+    return roots
+
+
 def fds(args):
     """Prints the open descriptors above 2 of a process that are files it did not open itself.
 
     Left out: the descriptors that the Lean runtime opens for itself (its event
-    loop's `anon_inode` and `io_uring` handles, its pipes and sockets) and the
-    files under an `--allow` prefix (the push's own cache and temporary files).
-    What matters is that no file of the build, such as a lock that a wrapper
-    holds, passed to the process.
+    loop's `anon_inode` and `io_uring` handles, its pipes and sockets), the
+    files under an `--allow` prefix (the push's own cache) and those in the
+    process's temporary directory (see `temp_roots`), such as `curl`'s
+    configuration. What matters is that no file of the build, such as a lock
+    that a wrapper holds, passed to the process.
     """
     dir = f"/proc/{args.pid}/fd"
     if not os.path.isdir(dir):
         sys.exit(f"{dir} does not exist; the process is gone")
+    allow = args.allow + temp_roots(args.pid)
     for name in sorted(os.listdir(dir), key=int):
         if int(name) <= 2:
             continue
@@ -189,7 +210,7 @@ def fds(args):
             continue
         if not target.startswith("/") or target.startswith(("/dev/", "/proc/")):
             continue
-        if any(target.startswith(prefix) for prefix in args.allow):
+        if any(target.startswith(prefix) for prefix in allow):
             continue
         print(name, target)
 
@@ -262,7 +283,7 @@ def main():
 
     p = sub.add_parser("fds", help=fds.__doc__)
     p.add_argument("pid", type=int)
-    p.add_argument("--allow", action="append", default=["/tmp/"])
+    p.add_argument("--allow", action="append", default=[])
     p.set_defaults(run=fds)
 
     args = parser.parse_args()
