@@ -74,7 +74,7 @@ builtin_initialize buildSlots : Std.Mutex (Option BuildSlotState) ← Std.Mutex.
 
 /--
 How many jobs wait for a slot with their worker lent to the task pool at once (see
-`takeBuildSlot`): as many as the read broker lends for reads (`Lake.ReadBroker.send`).
+`takeBuildSlot`), so that the jobs that wait for slots cannot take an unbounded number of threads.
 -/
 def maxLentSlotWaits : Nat := 1024
 
