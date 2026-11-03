@@ -170,3 +170,53 @@ name = "notimes"
 type = "s3"
 artifactEndpoint = "%URL%/notimes/a0"
 revisionEndpoint = "%URL%/notimes/r0"
+
+# Encrypted HTTP to a host name that does not resolve
+[[cache.service]]
+name = "tls"
+type = "s3"
+artifactEndpoint = "https://cache.invalid/a0"
+revisionEndpoint = "https://cache.invalid/r0"
+
+# As `ok`, but the first read of each claim is answered 503
+[[cache.service]]
+name = "claimgeterror"
+type = "s3"
+artifactEndpoint = "%URL%/claimgeterror/a0"
+revisionEndpoint = "%URL%/claimgeterror/r0"
+
+# As `ok`, but the first write of each claim is answered 500 and does not happen
+[[cache.service]]
+name = "claimputerror"
+type = "s3"
+artifactEndpoint = "%URL%/claimputerror/a0"
+revisionEndpoint = "%URL%/claimputerror/r0"
+
+# As `ok`, but the first write of each claim happens and is answered 500
+[[cache.service]]
+name = "claimputlost"
+type = "s3"
+artifactEndpoint = "%URL%/claimputlost/a0"
+revisionEndpoint = "%URL%/claimputlost/r0"
+
+# As `claimputlost`, but the first write of each claim stores another writer's claim
+[[cache.service]]
+name = "claimputrace"
+type = "s3"
+artifactEndpoint = "%URL%/claimputrace/a0"
+revisionEndpoint = "%URL%/claimputrace/r0"
+
+# As `claimputlost`, and the first 3 reads of each claim are answered 503
+[[cache.service]]
+name = "claimputlostread"
+type = "s3"
+artifactEndpoint = "%URL%/claimputlostread/a0"
+revisionEndpoint = "%URL%/claimputlostread/r0"
+
+# As `ok`, but the first rewrite of each claim happens and is answered 500, and the first 3 reads
+# of each claim are answered 503
+[[cache.service]]
+name = "claimrewritelost"
+type = "s3"
+artifactEndpoint = "%URL%/claimrewritelost/a0"
+revisionEndpoint = "%URL%/claimrewritelost/r0"

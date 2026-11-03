@@ -869,13 +869,17 @@ others. It takes an input that its build left unclaimed for
 leaves that build no more inputs until it sees it compiling again. A build
 that has seen no other build compiling claims every input it reaches.
 Each send of a claim request ends within 20 seconds, or fails, as does one
-whose answer is larger than 64 KiB, and claim requests are not retried. A
-request may first run `LAKE_CACHE_TOKEN_CMD` (when no token is held, or it is
+whose answer is larger than 64 KiB. A claim request that did not reach the
+remote cache is sent again after 1 and 2 seconds, as is a read that timed out
+or got a server error. A write that got a server error is sent once more; if
+that send finds the claim written, a read tells whether this build wrote it.
+A send may first run `LAKE_CACHE_TOKEN_CMD` (when no token is held, or it is
 older than 45 minutes), and one that the remote cache refuses for its token
-runs it again and is sent once more. Each run may take 60 seconds, so a claim
-request takes at most two runs and two sends: 160 seconds. After its first
-queued output, a build that claims inputs starts this command itself, once,
-detached, as
+runs it again and is sent once more. Each run may take 60 seconds. So a claim
+request takes at most 483 seconds (63 when the command does not run), and a
+write that got a server error at most 1,450 (190). After its first queued
+output, a build that claims inputs starts this command itself, once, detached,
+as
 `lake cache push --wait --follow <file>` with a lock file that the build holds
 until it ends: the push uploads each output as the build queues it, tries an
 upload that failed again every 30 seconds while the build runs, ends after the
@@ -988,9 +992,13 @@ tried once more). After 3 reads in a row fail in any of these ways (a read
 that failed once its transfers took 3 seconds or more, or that got no answer
 because it could not reach the remote; what a read waits before its transfer,
 e.g. behind other reads, does not count) and such reads have gone on for 3
-seconds, the build reads no more mappings or artifacts of the remote cache and
-compiles its other targets (claims, if they are on, are still requested);
-`remote-status-read.json` in the cache directory says so (`stopped`). An
+seconds, the build stops reading mappings and artifacts of the remote cache
+and compiles its targets (claims, if they are on, are still requested). While
+the reads are stopped, at most one probe read every 2 seconds, in place of a
+mapping read the build skips and in the background, checks the remote again;
+the first that gets an answer resumes the reads. `remote-status-read.json` in
+the cache directory says how many times the build stopped, probed and resumed
+(`stops`, `probes`, `resumes`), and `stopped` if the build ended stopped. An
 upload of `lake cache push` gives up after 30 seconds without progress, or
 after 60 seconds and one more for each MiB that its `curl` run uploads, and one
 that failed transiently (a timeout, a host that could not be resolved, or HTTP

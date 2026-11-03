@@ -397,6 +397,37 @@ case_put_timeouts() {
   test_cmd_eq 2 count '--connect-timeout 3 --speed-limit 1024 --speed-time 30' "$ARGV_LOG"
 }
 
+case_parallel_immediate() {
+  # A parallel `curl` run (`-Z`) to a plain HTTP service connects each transfer at once
+  # (`--parallel-immediate`): there curl 8.18 holds the transfers until the host's first answer,
+  # and the hold counts against `--connect-timeout`. This case checks an upload, a bulk download
+  # and a scheme in upper case (`case_read_shared_runs` of `remoteCacheRead` checks the read
+  # broker's runs). A run to an `https://` service keeps curl's default, which waits for the first
+  # handshake and then multiplexes the transfers on it.
+  # An upload
+  : > "$ARGV_LOG"
+  LAKE_CACHE_DIR="$BUILD_CACHE_DIR" record_argv with_token \
+    test_run cache put outputs.jsonl --scope=parallel --service=bearer
+  match_text '-Z --parallel-max 50 --parallel-immediate -X PUT ' "$ARGV_LOG"
+  # A bulk download
+  fresh
+  : > "$ARGV_LOG"
+  record_argv with_token test_run cache get --scope=parallel --service=bearer
+  match_text '-Z --parallel-max 50 --parallel-immediate -X GET ' "$ARGV_LOG"
+  # An upload to the service with its scheme in upper case
+  sed -e 's|"http://|"HTTP://|' "$LAKE_CONFIG" > "$WORK_DIR/services-upper.toml"
+  : > "$ARGV_LOG"
+  LAKE_CONFIG="$WORK_DIR/services-upper.toml" LAKE_CACHE_DIR="$BUILD_CACHE_DIR" \
+    record_argv with_token test_run cache put outputs.jsonl --scope=parallel-upper --service=bearer
+  match_text '-Z --parallel-max 50 --parallel-immediate -X PUT ' "$ARGV_LOG"
+  # An upload to an `https://` service (whose name does not resolve, so the upload fails)
+  : > "$ARGV_LOG"
+  LAKE_CACHE_DIR="$BUILD_CACHE_DIR" LAKE_CACHE_KEY=mock:key record_argv \
+    test_fails cache put outputs.jsonl --scope=parallel --service=tls
+  match_text '-Z --parallel-max 50 -X PUT ' "$ARGV_LOG"
+  no_match_text '--parallel-immediate' "$ARGV_LOG"
+}
+
 case_failing_cmd() {
   # A token command that fails is not run again for each download that needs the token:
   # the two modules of `Two` are fetched independently, and the command runs once
@@ -482,4 +513,5 @@ case_cleartext() {
 run_cases case_roundtrip case_no_token case_second_put case_no_leak case_rotation \
   case_token_cmd_fails case_token_cmd_time_limit case_token_cmd_time_limit_cache case_other_host \
   case_no_request case_download \
-  case_put_timeouts case_failing_cmd case_refused_token case_redirect case_cleartext
+  case_put_timeouts case_parallel_immediate case_failing_cmd case_refused_token case_redirect \
+  case_cleartext

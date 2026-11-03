@@ -318,6 +318,34 @@ case_push_many() {
   test_cmd push_check order "$SERVER_LOG" "$STORE_DIR"
 }
 
+case_push_scale() {
+  # A long queue costs a push time in proportion to its lines. The push's workers share what it
+  # did with each line's claim (2 updates per line), so a map that copies itself on each update
+  # makes a queue of n lines cost n^2 (32,000 lines about 60 s more than an empty queue). Here a
+  # queue of 32,000 lines that are not JSON (each dropped as invalid) must take less than 10 s
+  # more than an empty one.
+  push_fresh
+  test_cmd mkdir -p "$PUSH_CACHE"
+  local n t empty=0 extra=0
+  for n in 0 32000; do
+    rm -f "$PUSH_QUEUE" "$PUSH_DROPPED"
+    : > "$PUSH_QUEUE"
+    [ "$n" = 0 ] || seq -f 'not json %.0f' 1 "$n" > "$PUSH_QUEUE"
+    t=$(date +%s%N)
+    on_a test_run cache push
+    t=$(( $(date +%s%N) - t ))
+    test_cmd_eq 0 queued
+    if [ "$n" = 0 ]; then
+      empty=$t
+    else
+      test_cmd_eq "$n" push_check dropped "$PUSH_DROPPED" invalid
+      extra=$(( (t - empty) / 1000000 ))
+    fi
+  done
+  echo "32,000 lines took $extra ms more than an empty queue"
+  test_exp "$extra" -lt 10000
+}
+
 case_push_staging() {
   # A push first removes the staging directories that dead pushes left, even
   # with nothing to push, and each push stages in a directory of its own, so a
@@ -964,8 +992,8 @@ case_push_unpack_readonly() {
 
 run_cases case_push_queue case_push_upload case_push_tree_changed case_push_mismatch \
   case_push_missing case_push_custom_target case_push_githash case_push_deny case_push_invalid \
-  case_push_many case_push_staging case_push_concurrent case_push_stall case_push_dead \
-  case_push_dead_follow case_push_busy \
+  case_push_many case_push_scale case_push_staging case_push_concurrent case_push_stall \
+  case_push_dead case_push_dead_follow case_push_busy \
   case_push_curl_hang case_push_resume case_push_pack_failure \
   case_push_repair_race case_push_mapping_overwrite case_push_unset case_push_unset_caption \
   case_push_local_pruned case_push_bad_archive case_push_bad_archive_race \

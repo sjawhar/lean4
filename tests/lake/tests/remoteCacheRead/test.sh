@@ -12,11 +12,12 @@ source ../common.sh
 
 source ../remoteCache/lib.sh
 
-# A library of 16 modules, none of which imports another, so that a build of it reads all their
-# mappings (and then their artifacts) at once
+# A library of 48 modules, none of which imports another, so that a build of it reads all their
+# mappings (and then their artifacts) at once: more than the read broker runs `curl` processes at
+# once, so that some reads wait for a run
 mkdir -p Many
 many_roots=()
-for i in $(seq 1 16); do
+for i in $(seq 1 48); do
   echo "def m$i := $i" > "Many/M$i.lean"
   many_roots+=("\"Many.M$i\"")
 done
@@ -48,7 +49,7 @@ name = "Busy"
 roots = [$(IFS=,; echo "${busy_roots[*]}")]
 EOF
 # A \`curl\` that records how many transfers each of its runs carries (the \`url =\` lines of the
-# configuration file it is given), one line per run
+# configuration file it is given), one line per run, and the arguments of each run
 cat > count-curl.sh << EOF
 #!/usr/bin/env bash
 urls=0
@@ -60,9 +61,20 @@ for arg in "\$@"; do
   prev=\$arg
 done
 echo "\$urls" >> '$WORK_DIR/curl-runs'
+{ printf '%s' "\$* " | tr '\n' ' '; echo; } >> '$WORK_DIR/curl-argv'
 exec '$(type -P curl)' "\$@"
 EOF
 chmod +x count-curl.sh
+# A \`curl\` that records when each of its runs starts (a \`+\` line) and ends (a \`-\` line)
+cat > span-curl.sh << EOF
+#!/usr/bin/env bash
+echo + >> '$WORK_DIR/curl-spans'
+'$(type -P curl)' "\$@"
+rc=\$?
+echo - >> '$WORK_DIR/curl-spans'
+exit \$rc
+EOF
+chmod +x span-curl.sh
 
 # Build the package once, into the cache of the machine that uploads
 LAKE_CACHE_DIR="$BUILD_CACHE_DIR" test_run build Test native -o remote-outputs.jsonl
@@ -83,6 +95,18 @@ seed_remote() {
 remote_targets() {
   "$PYTHON" -c 'import json, sys; print(sum(bool(line.strip()) for line in open(sys.argv[1])) - 1)' \
     remote-outputs.jsonl
+}
+
+# Builds `Many` into the cache of the machine that uploads, and stores its mappings and artifacts
+# in the remote. The build runs once: after a case restores `Many`, its traces in `.lake/build` are
+# synthetic ones, which `seed_remote.py` cannot use, so a later call seeds from the first build.
+seed_many() {
+  if [ ! -d many-build ]; then
+    LAKE_CACHE_DIR="$BUILD_CACHE_DIR" test_run build Many -o many-outputs.jsonl
+    test_cmd cp -r .lake/build many-build
+  fi
+  "$PYTHON" "$TEST_DIR/seed_remote.py" --store "$STORE_DIR/a0" --scope "$(remote_scope)" \
+    --outputs many-outputs.jsonl --cache "$BUILD_CACHE_DIR" --build many-build
 }
 
 case_read_through() {
@@ -223,8 +247,9 @@ case_read_status_persistence() {
 case_read_silent() {
   # A remote cache that accepts each request and never answers costs a build seconds, not
   # minutes: a read gives up after 3 s without progress and is tried once more, and after 3
-  # such reads in a row the build reads the remote cache no more. Every target compiles, the
-  # verbose log says once why the build stopped reading, and so does the read status.
+  # such reads in a row the build stops reading the remote cache (but for a probe read at most
+  # every 2 s, in the background). Every target compiles, the verbose log says once why the
+  # build stopped reading, and so does the read status.
   local start local_secs elapsed
   fresh
   start="$(date +%s)"
@@ -249,34 +274,61 @@ assert status["failures"] >= 3, status
 }
 
 case_read_shared_runs() {
-  # The reads of the jobs that run at the same time go in shared `curl` runs: the 16 modules of
-  # `Many`, which import nothing, restore with their 32 reads (a mapping and an artifact each) in
+  # The reads of the jobs that run at the same time go in shared `curl` runs: the 48 modules of
+  # `Many`, which import nothing, restore with their 96 reads (a mapping and an artifact each) in
   # fewer `curl` runs than reads, and at least one run carries several of them. One `curl`
-  # process per read would be 32 runs of one transfer, each with a connection of its own. The
+  # process per read would be 96 runs of one transfer, each with a connection of its own. The
   # remote answers each read after 2 s, so the build also shows that a run's transfers go at once
-  # and not one after another.
+  # and not one after another. The remote is plain HTTP, so each run connects its transfers at
+  # once (`--parallel-immediate`; see `Lake.parallelConnectArgs`).
   local start elapsed runs most
-  LAKE_CACHE_DIR="$BUILD_CACHE_DIR" test_run build Many -o many-outputs.jsonl
-  test_cmd rm -rf many-build
-  test_cmd cp -r .lake/build many-build
-  "$PYTHON" "$TEST_DIR/seed_remote.py" --store "$STORE_DIR/a0" --scope "$(remote_scope)" \
-    --outputs many-outputs.jsonl --cache "$BUILD_CACHE_DIR" --build many-build
+  seed_many
   fresh
   : > "$SERVER_LOG"
-  rm -f "$WORK_DIR/curl-runs"
+  rm -f "$WORK_DIR/curl-runs" "$WORK_DIR/curl-argv"
   start="$(date +%s)"
   LEAN_NUM_THREADS=16 CURL="$WORK_DIR/count-curl.sh" LAKE_REMOTE_CACHE=slow \
     test_not_out 'Built ' build Many
   elapsed=$(($(date +%s) - start))
   runs="$(grep -c . "$WORK_DIR/curl-runs")"
   most="$(sort -n "$WORK_DIR/curl-runs" | tail -1)"
-  echo "the restore took $elapsed seconds in $runs curl runs for 32 reads;" \
+  echo "the restore took $elapsed seconds in $runs curl runs for 96 reads;" \
     "the largest run carried $most"
-  test_cmd_eq 16 count_path /in/ "$SERVER_LOG"
-  test_cmd_eq 16 count_path /a/ "$SERVER_LOG"
+  test_cmd_eq 48 count_path /in/ "$SERVER_LOG"
+  test_cmd_eq 48 count_path /a/ "$SERVER_LOG"
   test_exp "$most" -ge 2
-  test_exp "$runs" -lt 32
+  test_exp "$runs" -lt 96
   test_exp "$elapsed" -lt 60
+  test_exp "$(count '-Z ' "$WORK_DIR/curl-argv")" -ge 1
+  test_cmd_eq "$(count '-Z ' "$WORK_DIR/curl-argv")" \
+    count '-Z --parallel-max [0-9]* --parallel-immediate ' "$WORK_DIR/curl-argv"
+}
+
+case_read_runs_at_once() {
+  # A read that comes while every run of the read broker waits for the remote starts a run of its
+  # own, up to 16 at once. The 48 modules of `Many`, which import nothing, restore from a remote
+  # that answers each read after 2 s, and `span-curl.sh` shows how many runs went at once: more
+  # than half of the 16, and never more.
+  local most
+  seed_many
+  fresh
+  : > "$SERVER_LOG"
+  rm -f "$WORK_DIR/curl-spans"
+  LEAN_NUM_THREADS=16 CURL="$WORK_DIR/span-curl.sh" LAKE_REMOTE_CACHE=slow \
+    test_not_out 'Built ' build Many
+  test_cmd_eq 48 count_path /in/ "$SERVER_LOG"
+  test_cmd_eq 48 count_path /a/ "$SERVER_LOG"
+  most=$("$PYTHON" -c '
+import sys
+now = most = 0
+for line in open(sys.argv[1]):
+    now += 1 if line.strip() == "+" else -1
+    most = max(most, now)
+print(most)
+' "$WORK_DIR/curl-spans")
+  echo "at most $most curl runs went at once"
+  test_exp "$most" -gt 8
+  test_exp "$most" -le 16
 }
 
 case_read_compile_slots() {
@@ -349,16 +401,16 @@ case_read_fast_refusals() {
   test_cmd cp produced.out refusals.out
   test_cmd_eq 0 count 'stopped reading the remote cache' refusals.out
   # Every module's mapping was read, and refused
-  test_cmd_eq 16 count '^GET .*/in/.* -> 403 ' "$SERVER_LOG"
+  test_cmd_eq 48 count '^GET .*/in/.* -> 403 ' "$SERVER_LOG"
   "$PYTHON" -c '
 import json, sys
 status = json.load(open(sys.argv[1]))
 assert "stopped" not in status, status
-assert status["failures"] >= 16, status
+assert status["failures"] >= 48, status
 ' "$CACHE_DIR/remote-status-read.json"
 }
 
 run_cases case_read_through case_read_404 case_read_invalid_mapping case_read_bad_artifact \
   case_read_bad_descriptor case_read_transport case_read_status case_read_artifact_status \
-  case_read_status_persistence case_read_silent case_read_shared_runs case_read_compile_slots \
-  case_read_slot_wait_time case_read_fast_refusals
+  case_read_status_persistence case_read_silent case_read_shared_runs case_read_runs_at_once \
+  case_read_compile_slots case_read_slot_wait_time case_read_fast_refusals
