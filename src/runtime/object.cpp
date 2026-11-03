@@ -11,6 +11,7 @@ Author: Leonardo de Moura
 #include <deque>
 #include <cmath>
 #include <climits>
+#include <cstring>
 #include <lean/lean.h>
 #include "runtime/object.h"
 #include "runtime/thread.h"
@@ -857,6 +858,13 @@ class task_manager {
     std::unique_ptr<lthread>                      m_pacer;
     condition_variable                            m_pacer_cv;
     bool                                          m_pacer_waiting{false};
+    // Scratch (measurement only): the pacer's growth rule, from LEAN_TASK_POOL_RULE at `set_growth`. D (default):
+    // the batch doubles after each starved delay. C4: as D, with the batch at most 4. P: as D, but a delay in which
+    // fewer tasks arrived than finished starts no worker. PC4: P and C4.
+    unsigned                                      m_batch_cap{UINT_MAX};
+    bool                                          m_progress_rule{false};
+    uint64_t                                      m_enqueued{0};
+    uint64_t                                      m_finished{0};
 
     bool paced() const {
         return m_eager_std_workers != UINT_MAX;
@@ -904,14 +912,17 @@ class task_manager {
                     continue;
                 }
                 auto deadline = std::chrono::steady_clock::now() + m_spawn_delay;
+                uint64_t enqueued = m_enqueued, finished = m_finished;
                 while (!m_shutting_down && std::chrono::steady_clock::now() < deadline)
                     m_pacer_cv.wait_until(lock, deadline);
                 if (m_shutting_down || !paced() || !starved()) {
                     batch = 1;
                     continue;
                 }
+                if (m_progress_rule && m_enqueued - enqueued < m_finished - finished)
+                    continue;
                 spawn_workers(batch);
-                batch = std::min(2 * batch, m_max_std_workers);
+                batch = std::min({2 * batch, m_max_std_workers, m_batch_cap});
             }
         }));
 #endif
@@ -950,6 +961,7 @@ class task_manager {
             m_max_prio = prio;
         m_queues[prio].push_back(t);
         m_queues_size++;
+        m_enqueued++;
         if (!m_idle_std_workers && m_std_workers.size() < m_max_std_workers)
             grow();
         else
@@ -1012,6 +1024,7 @@ class task_manager {
                 m_idle_std_workers--;
                 run_task(lock, t);
                 m_idle_std_workers++;
+                m_finished++;
                 reset_heartbeat();
             }
             m_idle_std_workers--;
@@ -1254,6 +1267,10 @@ public:
         unique_lock<mutex> lock(m_mutex);
         m_eager_std_workers = spawn_delay_us == 0 ? UINT_MAX : eager_std_workers;
         m_spawn_delay = std::chrono::microseconds(spawn_delay_us);
+        char const * rule = std::getenv("LEAN_TASK_POOL_RULE");
+        auto is = [&](char const * r) { return rule != nullptr && std::strcmp(rule, r) == 0; };
+        m_batch_cap = is("C4") || is("PC4") ? 4 : UINT_MAX;
+        m_progress_rule = is("P") || is("PC4");
     }
 };
 
