@@ -256,15 +256,33 @@ test_cmd_eq "Rx Rx.C" local_targets "$WORK/fb-mat.jsonl"
   test_status_out 1 "materializing Rx.B from the build service failed" build Rx)
 match_text "lake: remote: ok; 3 cached (0 from manifest), 0 executed, 0 local;" "$WORK/fb-mat-nf/produced.out"
 
-# `local` counts compiles only: a fresh tree whose fallback restores a Lake-cache trace replays it
-# (here Rx.C) and records `0 local`. The default materialization setting does not put its `.olean` in
-# the tree until a local reader needs it, so that absence is not a restore failure.
+# `local` counts compiles only: a fresh tree whose fallback finds its modules in the Lake cache restores them,
+# replays the saved log of each (here Rx.C's message), and records `0 local`. With `LAKE_RESTORE_ARTIFACTS=false`
+# (Lake's default), a restore leaves each `.olean` in the cache, and Lake gives a reader the cache's file.
 (cd "$WORK/fb-seed" && LAKE_CACHE_DIR="$WORK/fb-cache" LAKE_ARTIFACT_CACHE=true test_run build Rx)
-(cd "$WORK/fb-restore" && LAKE_CACHE_DIR="$WORK/fb-cache" LAKE_ARTIFACT_CACHE=true FAKE_UNREACHABLE=1 \
-  LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_REMOTE_EXEC_LOG="$WORK/fb-restore.jsonl" \
+(cd "$WORK/fb-restore" && LAKE_CACHE_DIR="$WORK/fb-cache" LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=false \
+  FAKE_UNREACHABLE=1 LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_REMOTE_EXEC_LOG="$WORK/fb-restore.jsonl" \
   test_out "lake: remote: unreachable; 0 cached (0 from manifest), 0 executed, 0 local;" build Rx)
 match_text "Replayed Rx.C" "$WORK/fb-restore/produced.out"
 test_exp ! -s "$WORK/fb-restore.jsonl"
+# Rx.D, which the cache does not hold, imports Rx, so its compile needs `Rx.olean`. With the service still down,
+# Rx is restored (`Reused`: taken from the cache again, through the trace the restore wrote), not compiled: Rx.D
+# is the one local compile, and the per-target log has its line only, none for Rx.
+printf 'import Rx\n\n/-! A module that imports the library root, so its compile needs `Rx.olean`. -/\n\ndef d := c + m\n' \
+  > "$WORK/fb-restore/Rx/D.lean"
+(cd "$WORK/fb-restore" && LAKE_CACHE_DIR="$WORK/fb-cache" LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=false \
+  FAKE_UNREACHABLE=1 LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_REMOTE_EXEC_LOG="$WORK/fb-consume.jsonl" \
+  test_out_pat "Reused Rx( |$)" -v build Rx.D)
+match_text "lake: remote: unreachable; 0 cached (0 from manifest), 0 executed, 1 local;" "$WORK/fb-restore/produced.out"
+test_cmd_eq "local 1" results "$WORK/fb-consume.jsonl"
+test_cmd_eq "Rx.D" local_targets "$WORK/fb-consume.jsonl"
+# The `Rx.olean` that Lake gives Rx's readers has the bytes of the one a local build makes, and it is the cache's
+# file: the tree has none.
+rx_olean=$(cd "$WORK/fb-restore" && LAKE_CACHE_DIR="$WORK/fb-cache" LAKE_ARTIFACT_CACHE=true \
+  LAKE_RESTORE_ARTIFACTS=false FAKE_UNREACHABLE=1 LAKE_REMOTE_EXEC=grpc://fake:1 "$LAKE" query +Rx:olean)
+test_cmd cmp "$WORK/local/.lake/build/lib/lean/Rx.olean" "$rx_olean"
+test_exp "${rx_olean#"$WORK/fb-cache/artifacts/"}" != "$rx_olean"
+test_exp ! -e "$WORK/fb-restore/.lake/build/lib/lean/Rx.olean"
 
 # `wait`, with the service down when the build starts: no module compiles locally; Lake probes the service
 # again on a new connection after 1, 2, 4 … s, one job at a time, prints the waiting line, and builds on the
