@@ -7,8 +7,9 @@ Growth pacing of the task pool (`lean_task_pool_set_growth`), with `LEAN_NUM_THR
 * unpaced (the default, in a child process, as workers never exit), 32 tasks that each spin until
   all 32 have started do start, so the pool has at least 32 threads;
 * with a 5 ms delay, in a child process, a burst of 600 tasks that each hold their thread for 1 ms,
-  queued at once, ends with fewer than 48 threads: the pacer starts at most 4 workers per delay, and
-  none after a delay in which tasks finished faster than they were queued;
+  queued at once, ends with fewer than 24 threads: the pacer starts no worker after a delay in
+  which tasks finished faster than they were queued (doubling batches reach the limit of 64, and
+  batches of at most 4 per delay alone reach about 33);
 * with no eager workers and a 5 ms delay, in a child process, 4 tasks that wait for a task queued
   behind them finish: the pacer starts at least one worker per starved delay (a watchdog on a
   dedicated thread ends the child with an error after 20 s without that, and stops once they finish).
@@ -57,7 +58,7 @@ def main (args : List String) : IO Unit := do
     setTaskPoolGrowth 4 5000
     let tasks ← (List.range 600).mapM fun _ => BaseIO.asTask (IO.sleep 1)
     for t in tasks do discard <| IO.wait t
-    report "paced short burst" (· < 48)
+    report "paced short burst" (· < 24)
     return
   if args == ["noeager"] then
     setTaskPoolGrowth 0 5000
