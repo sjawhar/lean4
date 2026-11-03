@@ -849,14 +849,18 @@ class task_manager {
     condition_variable                            m_dedicated_finished_cv;
     bool                                          m_shutting_down{false};
     // Growth pacing (`lean_task_pool_set_growth`, off by default): past `m_eager_std_workers` standard workers, a worker
-    // starts only once queued tasks have found no free worker for `m_spawn_delay`, then twice as many after each further
-    // delay while that lasts, up to one per queued task (`m_pacer`). Unpaced, a burst of short tasks starts about one
-    // worker per task, as a new worker counts as free only once it runs.
+    // starts only once queued tasks have found no free worker for `m_spawn_delay` (`m_pacer`). After each further such
+    // delay the pacer starts twice as many as before, at most `m_eager_std_workers` (and at least one) at once and one
+    // per queued task, but none after a delay in which fewer tasks were queued than finished: then the workers already
+    // there drain the queue, and more would only wait idle once they have. Unpaced, a burst of short tasks starts about
+    // one worker per task, as a new worker counts as free only once it runs.
     unsigned                                      m_eager_std_workers{UINT_MAX};
     std::chrono::microseconds                     m_spawn_delay{0};
     std::unique_ptr<lthread>                      m_pacer;
     condition_variable                            m_pacer_cv;
     bool                                          m_pacer_waiting{false};
+    uint64_t                                      m_queued_tasks{0};
+    uint64_t                                      m_finished_tasks{0};
 
     bool paced() const {
         return m_eager_std_workers != UINT_MAX;
@@ -904,14 +908,17 @@ class task_manager {
                     continue;
                 }
                 auto deadline = std::chrono::steady_clock::now() + m_spawn_delay;
+                uint64_t queued = m_queued_tasks, finished = m_finished_tasks;
                 while (!m_shutting_down && std::chrono::steady_clock::now() < deadline)
                     m_pacer_cv.wait_until(lock, deadline);
                 if (m_shutting_down || !paced() || !starved()) {
                     batch = 1;
                     continue;
                 }
+                if (m_queued_tasks - queued < m_finished_tasks - finished)
+                    continue;
                 spawn_workers(batch);
-                batch = std::min(2 * batch, m_max_std_workers);
+                batch = std::min({2 * batch, std::max(m_eager_std_workers, 1u), m_max_std_workers});
             }
         }));
 #endif
@@ -950,6 +957,7 @@ class task_manager {
             m_max_prio = prio;
         m_queues[prio].push_back(t);
         m_queues_size++;
+        m_queued_tasks++;
         if (!m_idle_std_workers && m_std_workers.size() < m_max_std_workers)
             grow();
         else
@@ -1012,6 +1020,7 @@ class task_manager {
                 m_idle_std_workers--;
                 run_task(lock, t);
                 m_idle_std_workers++;
+                m_finished_tasks++;
                 reset_heartbeat();
             }
             m_idle_std_workers--;
