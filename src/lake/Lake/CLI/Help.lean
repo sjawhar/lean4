@@ -961,9 +961,13 @@ tried once more). After 3 reads in a row fail in any of these ways (a read
 that failed once its transfers took 3 seconds or more, or that got no answer
 because it could not reach the remote; what a read waits before its transfer,
 e.g. behind other reads, does not count) and such reads have gone on for 3
-seconds, the build reads no more mappings or artifacts of the remote cache and
-compiles its other targets (claims, if they are on, are still requested);
-`remote-status-read.json` in the cache directory says so (`stopped`). An
+seconds, the build stops reading mappings and artifacts of the remote cache
+and compiles its targets (claims, if they are on, are still requested). While
+the reads are stopped, at most one probe read every 2 seconds, in place of a
+mapping read the build skips and in the background, checks the remote again;
+the first that gets an answer resumes the reads. `remote-status-read.json` in
+the cache directory says how many times the build stopped, probed and resumed
+(`stops`, `probes`, `resumes`), and `stopped` if the build ended stopped. An
 upload of `lake cache push` gives up after 30 seconds without progress, or
 after 60 seconds and one more for each MiB that its `curl` run uploads, and one
 that failed transiently (a timeout, a host that could not be resolved, or HTTP

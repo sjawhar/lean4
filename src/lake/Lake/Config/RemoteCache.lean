@@ -56,14 +56,33 @@ public def remoteReadLimits : TransferLimits := {stallSecs := 3, retries := 1, r
 
 /--
 After how many reads of the shared remote cache in a row that failed without an answer a build
-stops reading the remote cache for the rest of the build, once they have also gone on for the stall
-time of `remoteReadLimits` (see `RemoteReadStatus`): 3. Such a read either failed once its
-transfers took at least the stall time (3 s; a remote that does not answer), or got no HTTP answer
-and could not reach the remote (a refused connection, which fails at once, or a name that did not
-resolve, which fails after one retry). A read that failed sooner with an HTTP answer (e.g., a 403)
-does not count, however long it waited before its transfers, and any other read resets the count.
+stops reading the remote cache, once they have also gone on for the stall time of
+`remoteReadLimits` (see `RemoteReadStatus`): 3. Such a read either failed once its transfers took
+at least the stall time (3 s; a remote that does not answer), or got no HTTP answer and could not
+reach the remote (a refused connection, which fails at once, or a name that did not resolve, which
+fails after one retry). A read that failed sooner with an HTTP answer (e.g., a 403) does not count,
+however long it waited before its transfers, and any other read resets the count. The reads stay
+stopped until a probe read gets an answer (see `remoteReadProbeSecs`).
 -/
 public def remoteReadTimeoutLimit : Nat := 3
+
+/--
+How often a build that has stopped reading the shared remote cache (see `remoteReadTimeoutLimit`)
+probes it: a probe read starts at most every 2 s, in the background, so that no target waits for
+it, and the first that gets an answer ends the stop. A probe goes only in place of a mapping read
+that the stop skipped, and one at a time; it is tried once, so one of a remote that does not answer
+ends after 3 s (the stall time of `remoteReadLimits`). So once the remote answers again, the reads
+resume at the first skipped mapping read 2 s after the last probe started (3 s for a remote that
+did not answer), and a remote that is gone for the whole build costs at most one failed read every
+2 s (3 s for a remote that does not answer), not one per target.
+
+Measured on 2026-11-03 in a pod of the build pool: a probe of a remote that refuses connections
+took 8 ms, 6 ms of it CPU time (one `curl` run), and one that got a 404 took 9 ms, 7 ms of it CPU
+time. A MachCSL build that compiled 38,379 modules in 2,347 s used 1.2 CPU-seconds on each, about
+19 CPU-seconds for each second of the build. So each second that the reads stay stopped after the
+remote is back costs more than all the probes of such a build (about 1,200, 7 CPU-seconds).
+-/
+public def remoteReadProbeSecs : Nat := 2
 
 /-- The namespace of a package's input-hash mappings in the shared remote cache. -/
 public def remoteCacheScope (githash packageScope : String) : String :=

@@ -21,8 +21,10 @@ compiled for `lake cache push` (`queueRemotePush`).
 
 Each read is bounded (`remoteReadLimits`). A build stops reading the remote cache once
 `remoteReadTimeoutLimit` reads in a row got no answer from it for the stall time: they waited for a
-remote that did not answer, or could not reach it (see `noteRemoteRead`). Its other targets then
-compile.
+remote that did not answer, or could not reach it (see `noteRemoteRead`). Its targets then compile,
+and while the reads are stopped, one probe read at most every `remoteReadProbeSecs` (see
+`probeRemoteRead`) checks whether the remote answers again: a probe that gets an answer resumes the
+reads.
 -/
 
 open System Lean
@@ -61,9 +63,20 @@ public def recordRemoteReadFailure (log : Log) (default : String) : JobM String 
   liftM (m := BaseIO) <| status.modify (·.add msg)
   return msg
 
-/-- Whether this build has stopped reading the shared remote cache (see `noteRemoteRead`). -/
+/--
+Whether this build has stopped reading the shared remote cache (see `noteRemoteRead`). Also logs,
+at verbose level, each resumption of the reads that no job has logged yet: a probe read ends in no
+job (see `probeRemoteRead`), so the next read of the build, or the end of the build, logs what it
+did.
+-/
 public def remoteReadsStopped : JobM Bool := do
-  return (← (← getBuildContext).remoteReadStatus.get).stopped?.isSome
+  let status := (← getBuildContext).remoteReadStatus
+  let s ← status.get
+  unless s.notices.isEmpty do
+    let notices ← liftM (m := BaseIO) <| status.modifyGet fun s =>
+      (s.notices, {s with notices := #[]})
+    notices.forM logVerbose
+  return s.stopped?.isSome
 
 /--
 Fails the current job as canceled if the build was canceled (`--fail-fast` after a failure).
@@ -77,18 +90,56 @@ public def cancelIfBuildCanceled : JobM Unit := do
       Job.cancelJob
 
 /--
-Records how a read of the shared remote cache ended, from what its sends saw (`meter`, see
-`ReadBroker.Meter`). A read that failed adds one to the build's reads in a row that got no answer
-if its transfers took at least the stall time of `remoteReadLimits` (the remote did not answer),
-or if no try of it got an HTTP answer and its last try could not reach the remote (a name that did
-not resolve, or a refused connection). Any other read resets them: a read that got an HTTP answer
-at once, of any status (a 404 miss, a 403), was answered. The time a read waited before a transfer
-(for the token command, for a run of the read broker, or for a retry) is not in its transfers'
-time: a read can wait long behind others without waiting for the remote.
+The read status after a read of the shared remote cache that was sent at `sentAt` and ended at
+`now` (both `IO.monoMsNow`), from what its sends saw (`meter`, see `ReadBroker.Meter`) and whether
+it `failed`, and what to log if the read stopped or resumed the reads (see `noteRemoteRead`). A
+read sent before the build last stopped or resumed its reads changes nothing, and only a `probe`
+(see `probeRemoteRead`) resumes them.
+-/
+public def RemoteReadStatus.noteRead
+  (s : RemoteReadStatus) (meter : ReadBroker.Meter) (failed : Bool) (sentAt now : Nat)
+  (probe := false)
+: RemoteReadStatus × Option String :=
+  let stallMs := remoteReadLimits.stallSecs * 1000
+  let timedOut := failed && meter.transferMs ≥ stallMs
+  let unreachable := failed && meter.unreachable && !meter.answered
+  if sentAt < s.changedAt then
+    (s, none)
+  else if !(timedOut || unreachable) then
+    let s := {s with unansweredInRow := 0}
+    if probe && meter.answered && s.stopped?.isSome then
+      let msg := s!"resumed reading the remote cache: a probe read got an answer \
+        {now - s.changedAt} ms after the stop"
+      ({s with stopped? := none, changedAt := now, resumes := s.resumes + 1}, some msg)
+    else
+      (s, none)
+  else
+    let n := s.unansweredInRow + 1
+    let start := now - min meter.transferMs stallMs
+    let since := if s.unansweredInRow == 0 then start else min s.unansweredSince start
+    let s := {s with unansweredInRow := n, unansweredSince := since}
+    if s.stopped?.isNone && n ≥ remoteReadTimeoutLimit && now - since ≥ stallMs then
+      let msg := s!"stopped reading the remote cache: {n} reads in a row waited for it and \
+        failed (the transfers of the last one took {meter.transferMs} ms); a probe read goes at \
+        most every {remoteReadProbeSecs} s, and the reads resume once one gets an answer"
+      ({s with stopped? := some msg, changedAt := now, stops := s.stops + 1,
+               probeAt := now + remoteReadProbeSecs * 1000}, some msg)
+    else
+      (s, none)
+
+/--
+Records how a read of the shared remote cache that was sent at `sentAt` (`IO.monoMsNow`) ended,
+from what its sends saw (`meter`, see `ReadBroker.Meter`). A read that failed adds one to the
+build's reads in a row that got no answer if its transfers took at least the stall time of
+`remoteReadLimits` (the remote did not answer), or if no try of it got an HTTP answer and its last
+try could not reach the remote (a name that did not resolve, or a refused connection). Any other
+read resets them: a read that got an HTTP answer at once, of any status (a 404 miss, a 403), was
+answered. The time a read waited before a transfer (for the token command, for a run of the read
+broker, or for a retry) is not in its transfers' time: a read can wait long behind others without
+waiting for the remote.
 
 The build stops reading the remote cache (`remoteReadsStopped`) at the first read that makes the
-row both `remoteReadTimeoutLimit` reads long and the stall time long; that is logged once, at
-verbose level, and kept in the read status (`Cache.readStatusFile`). A read starts the row its
+row both `remoteReadTimeoutLimit` reads long and the stall time long. A read starts the row its
 transfers' time before it was recorded (the wait before a retry is not in it), but at most the stall
 time, so a row of reads that each waited the stall time is always that long. A read that could not
 reach the remote fails within about a second (a refused connection at once, a name that did not
@@ -96,42 +147,73 @@ resolve after one retry), so a remote that is unreachable for the whole build wo
 such a read for each target. But many reads go at once, and an outage of a moment (e.g., while a
 proxy restarts) can fail many of them together: such reads stop the reads only once they have gone
 on for the stall time with no answered read between them.
+
+While the reads are stopped, the build probes the remote (see `probeRemoteRead`): the first probe
+that gets an HTTP answer without waiting the stall time resumes them. A read sent before the stop,
+or before the last resumption, counts for nothing: the reads that end after a stop or a resumption
+but were sent before it (such as retries of reads of a remote that does not answer) say nothing
+about the remote since. Each stop is logged at verbose level by the read that caused it, and each
+resumption by the next read of the build (or at the end of the build); both are counted in the
+read status (`Cache.readStatusFile`), but for a probe still in flight when the build ends.
 -/
-public def noteRemoteRead (meter : ReadBroker.Meter) (failed : Bool) : JobM Unit := do
-  let stallMs := remoteReadLimits.stallSecs * 1000
-  let timedOut := failed && meter.transferMs ≥ stallMs
-  let unreachable := failed && meter.unreachable && !meter.answered
+public def noteRemoteRead
+  (meter : ReadBroker.Meter) (failed : Bool) (sentAt : Nat)
+: JobM Unit := do
   let now ← IO.monoMsNow
-  let start := now - min meter.transferMs stallMs
   let status := (← getBuildContext).remoteReadStatus
-  let stopped? ← liftM (m := BaseIO) <| status.modifyGet fun s =>
-    if !(timedOut || unreachable) then
-      (none, {s with unansweredInRow := 0})
-    else
-      let n := s.unansweredInRow + 1
-      let since := if s.unansweredInRow == 0 then start else min s.unansweredSince start
-      let s := {s with unansweredInRow := n, unansweredSince := since}
-      if s.stopped?.isNone && n ≥ remoteReadTimeoutLimit && now - since ≥ stallMs then
-        let msg := s!"stopped reading the remote cache for the rest of this build: {n} reads in \
-          a row waited for it and failed (the transfers of the last one took {meter.transferMs} ms)"
-        (some msg, {s with stopped? := some msg})
-      else
-        (none, s)
-  if let some msg := stopped? then
+  let notice? ← liftM (m := BaseIO) <| status.modifyGet fun s =>
+    let (s, notice?) := s.noteRead meter failed sentAt now
+    (notice?, s)
+  if let some msg := notice? then
     logVerbose msg
+
+/--
+While this build has stopped reading the shared remote cache, sends a probe read of `url` (the
+mapping of a read that the stop skipped) if no probe is in flight and `remoteReadProbeSecs` have
+passed since the stop or since the last probe started. The probe goes on in the background: the
+job that skipped its read compiles its target and does not wait for it, so a remote that does not
+answer costs no target any time; only a probe still in flight when the build ends holds Lake's
+exit, for at most one try (a probe is not tried again: the next probe is its retry). Its body is
+not used. It counts toward the stop as any read does (see `noteRemoteRead`), so a probe that gets
+an answer resumes the reads; the next read of the build, or the end of the build, logs what it
+did (see `remoteReadsStopped`).
+-/
+def probeRemoteRead (url : String) (tmpDir : FilePath) (cacheToken : Bool) : JobM Unit := do
+  let status := (← getBuildContext).remoteReadStatus
+  let sentAt ← IO.monoMsNow
+  let due ← liftM (m := BaseIO) <| status.modifyGet fun s =>
+    if s.stopped?.isSome && !s.probing && sentAt ≥ s.probeAt then
+      (true, {s with probing := true, probes := s.probes + 1,
+                     probeAt := sentAt + remoteReadProbeSecs * 1000})
+    else
+      (false, s)
+  unless due do
+    return
+  let probe : BaseIO Unit := do
+    let meter ← IO.mkRef ({} : ReadBroker.Meter)
+    let body? ← (ReadBroker.getUrl? url tmpDir (cacheToken := cacheToken) remoteMappingMaxFileSize
+      {remoteReadLimits with retries := 0} meter).run?'
+    let m ← meter.get
+    let now ← IO.monoMsNow
+    status.modify fun s =>
+      let (s, notice?) := s.noteRead m body?.isNone sentAt now (probe := true)
+      let s := {s with probing := false}
+      notice?.elim s fun msg => {s with notices := s.notices.push msg}
+  discard <| liftM (m := BaseIO) <| BaseIO.asTask probe (prio := .dedicated)
 
 /--
 Runs `read`, a read of the shared remote cache, with a `ReadBroker.Meter` of its sends, which it
 adds to, and records how the read ended (see `noteRemoteRead`).
 -/
 @[inline] public def timeRemoteRead (read : IO.Ref ReadBroker.Meter → JobM α) : JobM α := do
+  let sentAt ← IO.monoMsNow
   let meter ← IO.mkRef ({} : ReadBroker.Meter)
   try
     let a ← read meter
-    noteRemoteRead (← meter.get) false
+    noteRemoteRead (← meter.get) false sentAt
     return a
   catch e =>
-    noteRemoteRead (← meter.get) true
+    noteRemoteRead (← meter.get) true sentAt
     throw e
 
 /--
@@ -142,8 +224,8 @@ mapping only with `replace` (one that could not be used, e.g., because its artif
 A mapping that does not name this input, target and source hash (`srcHash?`, for a module), or
 whose artifacts could not be cache files, is refused. Every failure but a missing mapping is
 recorded (see `recordRemoteReadFailure`), and each is a miss. The read is bounded
-(`remoteReadLimits`), and none is sent once the build has stopped reading the remote cache
-(`remoteReadsStopped`).
+(`remoteReadLimits`). While the build has stopped reading the remote cache (`remoteReadsStopped`),
+the read is not sent, and is a miss; its URL may go as a probe (see `probeRemoteRead`).
 -/
 public def readRemoteOutputs?
   (inputHash : Hash) (pkg : Package) (target : String) (srcHash? : Option Hash)
@@ -152,8 +234,7 @@ public def readRemoteOutputs?
   let ws ← getWorkspace
   let some serviceName := ws.lakeEnv.remoteCache?
     | return none
-  if ← remoteReadsStopped then
-    return none
+  let stopped ← remoteReadsStopped
   try
     let service ← match ws.lakeConfig.findRemoteCacheService? serviceName with
       | .ok service => pure service
@@ -161,8 +242,12 @@ public def readRemoteOutputs?
     let scope := remoteCacheScope ws.lakeEnv.leanGithash pkg.cacheScope
     let url := service.remoteMappingUrl scope inputHash
     let tmpDir := (← getLakeCache).dir
+    let cacheToken := service.sendsCacheToken url
+    if stopped then
+      probeRemoteRead url tmpDir cacheToken
+      return none
     let contents? ← timeRemoteRead fun meter => liftM <|
-      ReadBroker.getUrl? url tmpDir (cacheToken := service.sendsCacheToken url)
+      ReadBroker.getUrl? url tmpDir (cacheToken := cacheToken)
         remoteMappingMaxFileSize remoteReadLimits meter
     let some contents := contents?
       | logVerbose s!"remote cache mapping miss for input `{inputHash}` at {url}"
