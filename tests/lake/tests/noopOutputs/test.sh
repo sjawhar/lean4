@@ -142,3 +142,104 @@ test_run build T
 lake_out build T
 strip_times full.out
 away fast
+
+# A local archive that is not the one packed for the module (its bytes no longer match the `.hash`
+# recorded when it was packed) is treated alike by a build that skips the cache and by one that
+# checks it: the same output, and the same archive (or none) left in the build directory
+LTAR=.lake/build/ir/T/A.ltar
+test_exp -f $LTAR.hash
+test_cmd cp $LTAR orig.ltar
+test_cmd cp $LTAR.hash orig.ltar.hash
+stale() {
+  test_cmd rm -f $LTAR $LTAR.hash
+  { cat orig.ltar; echo x; } > $LTAR
+  test_cmd cp orig.ltar.hash $LTAR.hash
+}
+ltar_state() { if [ -e $LTAR ]; then cksum < $LTAR; else echo none; fi; }
+test_cmd stamp del
+stale
+lake_out build T
+strip_times full.out
+ltar_state > full.ltar
+has_stamp
+stale
+away fast
+test_exp "$(ltar_state)" = "$(cat full.ltar)"
+
+# The cases below need the usage cutoff and kept-module checks. A Lake that has the usage cutoff
+# records it among a module's inputs in its trace when `LAKE_USAGE_CUTOFF` is set; with one that does
+# not, they are skipped.
+export LAKE_USAGE_CUTOFF=1
+# mstamp get|del MOD -- print or remove MOD's record in the package's outputs stamp
+mstamp() { lean --run "$HELPER" "$1" .lake/build/outputs.stamps "$2"; }
+mkdir -p v && cp -r lakefile.toml T.lean T v/
+cd v
+export LAKE_CACHE_DIR="$PWD/cache"
+test_run build T
+if ! grep -qF '"usage cutoff: true"' .lake/build/lib/lean/T/A.trace; then
+  echo "SKIPPED: this Lake has no usage cutoff (kept outputs, .usage/.resolved/.usekey)"
+  exit 0
+fi
+test_exp -f .lake/build/lib/lean/T/A.usage
+
+# With the usage cutoff, a module's outputs also have a `.usage`, a `.resolved` and a `.usekey`, which
+# the cache's mapping describes (the trace does not). When one of them is removed from the build
+# directory, a build gives the output and leaves the build directory that a build that checks the
+# cache gives
+test_run build T
+has_stamp
+for ext in usage resolved usekey; do
+  f=.lake/build/lib/lean/T/A.$ext
+  entry="$LAKE_CACHE_DIR/artifacts/$(cat $f.hash).$ext"
+  test_exp -f "$entry"
+  sidecar_state() { if [ -e $f ]; then cksum < $f; else echo none; fi; }
+  # the build that checks the cache: without the module's stamp record
+  test_cmd rm -f $f
+  test_cmd stamp del
+  lake_out build T
+  strip_times full.out
+  sidecar_state > full.state
+  has_stamp
+  # the same removal, now with the module's stamp record
+  test_cmd rm -f $f
+  lake_out build T
+  strip_times now.out
+  check_diff full.out now.out
+  test_exp "$(sidecar_state)" = "$(cat full.state)"
+  test_cmd ln -f "$entry" $f
+done
+cd ..
+
+# Outputs that a kept-module check accepted (their trace marks them `"kf"`) are never recorded in the
+# stamp, so every build takes them on the full path, which applies the supersede rule to them, and
+# keeps their lineage. `checker.sh` accepts every module.
+mkdir -p k/K
+(
+  cd k
+  export LAKE_CACHE_DIR="$PWD/cache"
+  printf 'name = "k"\n\n[[lean_lib]]\nname = "K"\n' > lakefile.toml
+  printf 'import K.B\n' > K.lean
+  printf 'import K.A\ntheorem B.ok : A.w = 0 := rfl\n' > K/B.lean
+  # seta V -- `K/A.lean` (a new file) with `A.v := V` and `A.w := V - V`: `A.w` changes meaning
+  # but stays `0`, so `K.B` is a kept candidate and its proof holds
+  seta() { rm -f K/A.lean; printf 'def A.v : Nat := %s\ndef A.w : Nat := %s - %s\n' "$1" "$1" "$1" > K/A.lean; }
+  cat > checker.sh << 'EOF'
+#!/usr/bin/env bash
+while IFS= read -r line; do
+  [[ $line =~ \"id\":([0-9]+) ]] && id=${BASH_REMATCH[1]}
+  [[ $line =~ \"olean\":\"([^\"]*)\" ]] && olean=${BASH_REMATCH[1]}
+  printf '{"id":%s,"ok":true,"oleanHash":"%s"}\n' "$id" "$(cat "$olean.hash")"
+done
+EOF
+  chmod +x checker.sh
+  seta 1
+  test_run build K
+  seta 2
+  LAKE_KEPT_CHECKER="$PWD/checker.sh" test_out 'Checked K.B' build K
+  test_cmd grep -q '"kf"' .lake/build/lib/lean/K/B.trace
+  test_run build K
+  test_run build K
+  test_cmd mstamp get K.A
+  test_cmd_fails mstamp get K.B
+  test_cmd grep -q '"kf"' .lake/build/lib/lean/K/B.trace
+)
