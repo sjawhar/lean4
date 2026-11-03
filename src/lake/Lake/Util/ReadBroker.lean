@@ -49,8 +49,12 @@ well within a 1,024 limit.
 -/
 def runSize : Nat := 128
 
-/-- How many `curl` runs go at once. -/
-def maxRuns : Nat := 8
+/--
+How many `curl` runs go at once: 16. Each run is a `curl` process with its own connections, and
+`send` lends the workers of up to `maxRuns * runSize` waiting reads. A restore of 51,308 targets
+from Cloud Storage measured fastest with 16 (2026-11-03, two machine types of the build pool).
+-/
+def maxRuns : Nat := 16
 
 /-- One read of the broker: a `GET` of `url` whose body goes to `out`. -/
 public structure Request where
