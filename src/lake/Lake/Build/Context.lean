@@ -93,8 +93,31 @@ public structure RemoteReadStatus where
   unansweredInRow : Nat := 0
   /-- When that row started (`IO.monoMsNow`, see `noteRemoteRead`). -/
   unansweredSince : Nat := 0
-  /-- Why this build stopped reading the shared remote cache, once it has (see `noteRemoteRead`). -/
+  /--
+  Why this build stopped reading the shared remote cache, while it has (see `noteRemoteRead`). A
+  probe read that gets an answer (see `probeRemoteRead`) resumes the reads.
+  -/
   stopped? : Option String := none
+  /--
+  When (`IO.monoMsNow`) the build last stopped or resumed its reads of the remote cache: a read
+  sent before then counts for nothing (see `noteRemoteRead`).
+  -/
+  changedAt : Nat := 0
+  /-- How many times the build stopped reading the remote cache. -/
+  stops : Nat := 0
+  /-- How many times a probe read that got an answer resumed the reads. -/
+  resumes : Nat := 0
+  /-- How many probe reads the build sent (see `probeRemoteRead`). -/
+  probes : Nat := 0
+  /-- Whether a probe read is in flight. -/
+  probing : Bool := false
+  /-- From when (`IO.monoMsNow`) the next probe read may go, while the reads are stopped. -/
+  probeAt : Nat := 0
+  /--
+  The resumptions of the reads that no job has logged yet: a probe ends in no job, so the next read
+  of the build, or the end of the build, logs what it did (see `remoteReadsStopped`).
+  -/
+  notices : Array String := #[]
   deriving Inhabited
 
 /-- Add one read-through failure to a build's remote status. -/

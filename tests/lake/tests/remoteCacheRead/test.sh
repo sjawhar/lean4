@@ -224,8 +224,9 @@ case_read_status_persistence() {
 case_read_silent() {
   # A remote cache that accepts each request and never answers costs a build seconds, not
   # minutes: a read gives up after 3 s without progress and is tried once more, and after 3
-  # such reads in a row the build reads the remote cache no more. Every target compiles, the
-  # verbose log says once why the build stopped reading, and so does the read status.
+  # such reads in a row the build stops reading the remote cache (but for a probe read at most
+  # every 2 s, in the background). Every target compiles, the verbose log says once why the
+  # build stopped reading, and so does the read status.
   local start local_secs elapsed
   fresh
   start="$(date +%s)"

@@ -399,7 +399,8 @@ def Workspace.startBuild
 
 /--
 Atomically replace the status left by remote mapping reads in one build, with `stopped` if the
-build stopped reading the remote cache (see `noteRemoteRead`).
+build ended with its reads of the remote cache stopped, and how many times it stopped, resumed and
+probed them if it ever stopped (see `noteRemoteRead`).
 -/
 def writeRemoteReadStatus (cache : Cache) (status : RemoteReadStatus) : IO Unit := do
   let obj := JsonObject.empty
@@ -407,6 +408,10 @@ def writeRemoteReadStatus (cache : Cache) (status : RemoteReadStatus) : IO Unit 
     |>.insert "failures" status.failures
     |>.insert "lastError" status.lastError
   let obj := status.stopped?.elim obj (obj.insert "stopped" ·)
+  let obj := if status.stops == 0 then obj else
+    let obj := obj.insert "stops" status.stops
+    let obj := obj.insert "resumes" status.resumes
+    obj.insert "probes" status.probes
   writeFileAtomic cache.readStatusFile (obj : Json).pretty
 
 /--
@@ -438,6 +443,9 @@ def finalizeBuild
 : IO α := do
   reportResult cfg mctx.out result
   let remoteStatus ← bctx.remoteReadStatus.get
+  -- What a probe did after the last read of the build, which no job logged
+  for msg in remoteStatus.notices do
+    mctx.logger.logEntry (.trace msg)
   if remoteStatus.failures > 0 then
     if let .error e ← (writeRemoteReadStatus bctx.workspace.lakeCache remoteStatus).toBaseIO then
       mctx.logger.logEntry (.trace s!"could not write remote cache read status: {e}")
