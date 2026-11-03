@@ -5,7 +5,13 @@ Growth pacing of the task pool (`lean_task_pool_set_growth`), with `LEAN_NUM_THR
 * with a 5 ms delay, 16 tasks that wait for a task queued behind them finish, and 32 tasks that each
   hold their thread for 200 ms run side by side;
 * unpaced (the default, in a child process, as workers never exit), 32 tasks that each spin until
-  all 32 have started do start, so the pool has at least 32 threads.
+  all 32 have started do start, so the pool has at least 32 threads;
+* with a 5 ms delay, in a child process, a burst of 600 tasks that each hold their thread for 1 ms,
+  queued at once, ends with fewer than 48 threads: the pacer starts at most 4 workers per delay, and
+  none after a delay in which tasks finished faster than they were queued;
+* with no eager workers and a 5 ms delay, in a child process, 4 tasks that wait for a task queued
+  behind them finish: the pacer starts at least one worker per starved delay (a watchdog on a
+  dedicated thread ends the child with an error after 20 s without that, and stops once they finish).
 The thread counts come from `/proc/self/status`; without it they are not checked.
 -/
 
@@ -47,6 +53,31 @@ def main (args : List String) : IO Unit := do
     barrier 32
     report "unpaced barrier" (· ≥ 32)
     return
+  if args == ["burst"] then
+    setTaskPoolGrowth 4 5000
+    let tasks ← (List.range 600).mapM fun _ => BaseIO.asTask (IO.sleep 1)
+    for t in tasks do discard <| IO.wait t
+    report "paced short burst" (· < 48)
+    return
+  if args == ["noeager"] then
+    setTaskPoolGrowth 0 5000
+    let done ← IO.mkRef false
+    let watchdog ← IO.asTask (prio := .dedicated) (α := Unit) do
+      let t0 ← IO.monoMsNow
+      while !(← done.get) do
+        if (← IO.monoMsNow) - t0 > 20000 then
+          IO.println "paced without eager workers: no progress in 20 s"
+          IO.Process.exit 1
+        IO.sleep 100
+    let gate ← IO.Promise.new
+    let waiters ← (List.range 4).mapM fun _ => IO.asTask (discard <| IO.wait gate.result?)
+    let opener ← BaseIO.asTask (gate.resolve ())
+    discard <| IO.wait opener
+    for t in waiters do discard <| IO.wait t
+    done.set true
+    discard <| IO.wait watchdog
+    IO.println "paced without eager workers: ok"
+    return
   setTaskPoolGrowth 4 2000000
   let tasks ← (List.range 64).mapM fun _ => BaseIO.asTask (spin 200000)
   for t in tasks do discard <| IO.wait t
@@ -64,4 +95,8 @@ def main (args : List String) : IO Unit := do
   let ms := (← IO.monoMsNow) - t0
   IO.println (if ms < 600 then "paced sleepers: ok" else s!"paced sleepers: {ms} ms")
   let out ← IO.Process.output { cmd := (← IO.appPath).toString, args := #["unpaced"] }
+  IO.print out.stdout
+  let out ← IO.Process.output { cmd := (← IO.appPath).toString, args := #["burst"] }
+  IO.print out.stdout
+  let out ← IO.Process.output { cmd := (← IO.appPath).toString, args := #["noeager"] }
   IO.print out.stdout

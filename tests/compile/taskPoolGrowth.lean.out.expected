@@ -2,3 +2,5 @@ paced burst: ok
 paced waits: ok
 paced sleepers: ok
 unpaced barrier: ok
+paced short burst: ok
+paced without eager workers: ok
