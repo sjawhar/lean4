@@ -36,6 +36,7 @@ Knobs, all through the environment:
   FAKE_MATERIALIZE_FAIL `CODE:SUFFIX`: a `materialize` that names a path ending with SUFFIX answers
                       CODE (UNAVAILABLE, NOT_FOUND, INTERNAL) and writes none of its files
   FAKE_SLEEP_MS       sleep this long in every `run`, standing in for the service's latency
+  FAKE_INPUT_BARRIER  file prefix: mark <prefix>.ready before reading inputs, wait for <prefix>.go
   FAKE_CONCURRENT     `1`: answer each request after `hello` on a thread of its own, as the daemon
                       does, so requests overlap (default: one at a time, in order)
   FAKE_INFLIGHT       file taking the most `run` requests that were in progress at once
@@ -135,6 +136,14 @@ def run(p):
                 with open(INFLIGHT_FILE, "w") as f: f.write(str(_max_inflight))
     try:
         if SLEEP and _gone.wait(SLEEP): check_gone()
+        barrier = os.environ.get("FAKE_INPUT_BARRIER")
+        if barrier:
+            open(barrier + ".ready", "w").close()
+            deadline = time.monotonic() + 30
+            while not os.path.exists(barrier + ".go"):
+                if time.monotonic() >= deadline:
+                    raise Err("TIMEOUT", "test input barrier was not released")
+                if _gone.wait(0.01): check_gone()
         return run_action(p)
     finally:
         with _lock:

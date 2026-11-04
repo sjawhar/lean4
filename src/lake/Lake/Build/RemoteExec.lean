@@ -57,13 +57,13 @@ public structure RemoteHead where
 
 /-! ## Per-process invocation id and `hello` params -/
 
-private def hexChars : Array Char :=
+def hexChars : Array Char :=
   #['0','1','2','3','4','5','6','7','8','9','a','b','c','d','e','f']
 
-private def byteHex (b : UInt8) : String :=
+def byteHex (b : UInt8) : String :=
   String.ofList [hexChars[(b.toNat / 16)]!, hexChars[(b.toNat % 16)]!]
 
-private def mkRemoteInvocationId : IO String := do
+def mkRemoteInvocationId : IO String := do
   let bytes ← IO.getRandomBytes 16
   let mut s := ""
   let mut i := 0

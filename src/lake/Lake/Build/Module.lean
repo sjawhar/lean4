@@ -15,6 +15,7 @@ import Lake.Util.BuildSlots
 import Lake.Util.Proc
 import Lake.Build.Job.Register
 import Lake.Build.Common
+import Lake.Build.RemoteExec
 import Lake.Build.RemoteCache
 import Lake.Build.Target
 import Init.Omega
@@ -1318,6 +1319,280 @@ def SavedTrace.moduleOutputDescrs? (self : SavedTrace) : Option ModuleOutputDesc
   let some outputs := data.outputs? | none
   (ModuleOutputDescrs.fromJson? outputs).toOption
 
+/-- The `keptFrom?` recorded with a saved trace's module outputs. -/
+def SavedTrace.keptFrom? (self : SavedTrace) : Option Hash :=
+  self.moduleOutputDescrs?.bind (·.keptFrom?)
+
+/--
+Fails, discarding the module's outputs, if its source changed since `recFetchInput` read it: the input
+hash covers the source as read then, while `lean` reads it again and a usage skip keeps old outputs.
+-/
+def Module.checkSourceUnchanged (mod : Module) (presetup : ModulePreSetup) : JobM Unit := do
+  -- A rewrite can keep the modification time (`cp -p`, `rsync -a`, or a read part-way through one
+  -- in-place `write`), so compare the contents too.
+  if (← getMTime presetup.srcFile) != presetup.srcMTime ||
+      Hash.ofText (← IO.FS.readFile presetup.srcFile) != presetup.srcHash then
+    mod.clearOutputArtifacts
+    let relSrcFile := relPathFrom mod.pkg.dir presetup.srcFile
+    error s!"{relSrcFile}: source file was modified during the build; \
+      its outputs were discarded (build again to compile the current version)"
+
+section RemoteExec
+/-! ## Build service (contract C2.1, C5.1)
+
+The parts of service mode that need this file's private helpers (`mkModuleSetup`,
+`computeArtifacts`): the per-module action's head, its `run` request, and the fetch that replaces
+a local compile. The session, path rewriting and typed calls are in `Lake.Build.RemoteExec`.
+-/
+
+/-- The platform/path part of a module's action (contract C2.1): plugins, dynlibs, `LEAN_PATH`
+and platform, rewritten to input-root-relative form. -/
+def remoteHead (presetup : ModulePreSetup) (s : RemoteSession) : JobM RemoteHead := do
+  let ws ← getWorkspace
+  let sysrootStr := s.sysroot.toString
+  -- A toolchain plugin is found under the LOCAL sysroot and named under the remote one (C2.1).
+  let localSysroot := (← getLeanInstall).sysroot
+  let localSysrootReal ← (IO.FS.realPath localSysroot).catchExceptions fun _ => pure localSysroot
+  let dirRel (dir p : FilePath) : Option String :=
+    match p.toString.dropPrefix? (dir.toString ++ "/") with
+    | some rest => some rest.toString
+    | none => none
+  let classify (p : FilePath) : JobM ((String × Option RemoteExec.Digest) × Option (FilePath × String)) := do
+    for pkg in ws.packages do
+      if let some rel := dirRel pkg.leanLibDir p then
+        let r := s!"lib/{pkg.keyName}/{rel}"
+        return ((r, none), some (p, r))
+      if let some rel := dirRel pkg.buildDir p then
+        let r := s!"native/{pkg.keyName}/{rel}"
+        return ((r, none), some (p, r))
+    if let some rel := (dirRel localSysroot p).orElse fun _ => dirRel localSysrootReal p then
+      return ((s!"{sysrootStr}/{rel}", none), none)
+    error s!"plugin {p} is outside the workspace"
+  let mut plugins := #[]
+  let mut dynlibs := #[]
+  let mut inputFiles := #[]
+  for pl in presetup.plugins do
+    let ((r, d), f?) ← classify pl.path
+    plugins := plugins.push (r, d)
+    if let some f := f? then inputFiles := inputFiles.push f
+  for dl in presetup.dynlibs do
+    let ((r, d), f?) ← classify dl.path
+    dynlibs := dynlibs.push (r, d)
+    if let some f := f? then inputFiles := inputFiles.push f
+  -- In `Workspace.leanPath` order (`Config/Workspace.lean:356-357`), each package's dir rewritten.
+  let leanPath := String.intercalate ":" <|
+    ws.packages.foldl (fun dirs pkg => s!"lib/{pkg.keyName}" :: dirs) []
+  let platform := #[("arch", "x86_64"), ("memory", "std"), ("os", "linux"), ("toolchain", s.toolchain)]
+  return {platform, sysroot := sysrootStr, leanPath, plugins, dynlibs, inputFiles}
+
+/-- The exact module-compile `run` request (contract C2.1): relative paths, `setup.json` inline,
+the toolchain as a platform property. -/
+def Module.remoteRunRequest (mod : Module) (presetup : ModulePreSetup) (head : RemoteHead) : JobM Json := do
+  let setup ← mkModuleSetup mod presetup
+  let (importArts, importFiles) ← rewriteImportArts setup.importArts
+  let newSetup : ModuleSetup := {setup with
+    importArts
+    dynlibs := head.dynlibs.map (fun d => FilePath.mk d.1)
+    plugins := head.plugins.map (fun p => Lean.Plugin.ofFilePath (FilePath.mk p.1))}
+  let setupJson := (toJson newSetup).compress
+  let srcRel := remoteSrcPath mod
+  let oleanRel := remoteLibPath mod "olean"
+  let ileanRel := remoteLibPath mod "ilean"
+  let cRel := remoteIrPath mod "c"
+  let bcRel := remoteIrPath mod "bc"
+  let hasLLVM := Lean.Internal.hasLLVMBackend ()
+  -- As `compileLeanModule` (`Build/Actions.lean`): code generation is postponed only for a module.
+  let postpone := presetup.isModule && presetup.postponeCompile
+  let mut argv := #[s!"{head.sysroot}/bin/lean"]
+  argv := argv ++ mod.weakLeanArgs ++ mod.leanArgs
+  argv := argv.push srcRel
+  argv := argv ++ #["-o", oleanRel, "-i", ileanRel]
+  unless postpone do
+    argv := argv ++ #["-c", cRel]
+  if hasLLVM then
+    argv := argv ++ #["-b", bcRel]
+  argv := argv ++ #["--setup", "setup.json", "--json"]
+  let mut outs := #[oleanRel, ileanRel]
+  if presetup.isModule then
+    outs := outs ++ #[remoteLibPath mod "olean.server", remoteLibPath mod "olean.private"]
+    unless postpone do
+      outs := outs ++ #[remoteLibPath mod "ir.sig", remoteLibPath mod "ir"]
+  unless postpone do
+    outs := outs.push cRel
+  if hasLLVM then
+    outs := outs.push bcRel
+  outs := outs.qsort (fun a b => compare a b == .lt)
+  let inputs := #[(presetup.srcFile, srcRel)] ++ importFiles ++ head.inputFiles
+  let inputsJson := inputs.map fun (path, rel) => Json.mkObj [("rel", rel), ("path", path.toString)]
+  let platformJson := Json.mkObj (head.platform.map (fun (k, v) => (k, (toJson v : Json)))).toList
+  return Json.mkObj [
+    ("argv", (toJson argv : Json)),
+    ("env", Json.mkObj [("LEAN_PATH", head.leanPath)]),
+    ("workingDirectory", ""),
+    ("inputs", Json.arr inputsJson),
+    ("inputDirs", Json.arr #[]),
+    ("files", Json.arr #[Json.mkObj [("rel", "setup.json"), ("contents", setupJson)]]),
+    ("outputs", (toJson outs : Json)),
+    ("platform", platformJson),
+    ("timeoutSecs", (toJson (3600 : Nat) : Json)),
+    ("mnemonic", "LeanModule"),
+    ("target", mod.name.toString)]
+
+/--
+Leaves the build action of `fetchRemote` because the build service did not answer: a request
+answered `UNAVAILABLE`, after the daemon's own retries (contract C5.1). `epoch` is `remoteEpoch`,
+read just before that request was sent. A bridge `hello` that refused the service also rejects
+requests as `UNAVAILABLE`; it records `.refused`, which fails whatever the fallback
+(`remoteDecision?`). Under `LAKE_REMOTE_EXEC_FALLBACK=fail` an unavailable service errors with `msg`,
+counted for exit code 75 (`recordUnavailableFailure`). Otherwise it notes `msg` and `epoch` in `why`
+and fails without a log entry, from `pos`, where the action started; `fetchRemote` then drops what
+the action logged and takes the fallback (`local` or `wait`). Either way the action writes no trace.
+-/
+def remoteUnavailable (s : RemoteSession) (why : IO.Ref (Option (String × Nat))) (pos : Log.Pos)
+    (epoch : Nat) (msg : String) : JobM α := do
+  if let some (.refused refusal) ← remoteDecision? then
+    error refusal
+  if s.cfg.fallback == .fail then
+    recordUnavailableFailure
+    error msg
+  why.set (some (msg, epoch))
+  throw pos
+
+/--
+The build action of `fetchRemote`: `run` the module's action, replay Lean's output and fail on a bad
+exit, as a local compile does, then materialize the outputs and hash them. A request that answers
+`UNAVAILABLE` leaves through `remoteUnavailable`. The service's result counts once, when it is the
+module's: before Lean's output fails the module (a compile that failed on the service was executed
+there), once the outputs are here, or before `materialize` fails for another reason; not when the
+fallback is about to compile the module instead.
+-/
+def Module.buildRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSession)
+    (why : IO.Ref (Option (String × Nat))) : JobM ModuleOutputArtifacts := do
+  let pos ← getLogPos
+  let start ← IO.monoMsNow
+  let head ← remoteHead presetup s
+  let params ← mod.remoteRunRequest presetup head
+  let runEpoch ← remoteEpoch
+  let result ← match ← runAction s params with
+    | .ok r => pure r
+    | .error e =>
+      let msg := s!"the build service's run of {mod.name} failed: {e.message}"
+      if e.code == .unavailable then
+        remoteUnavailable s why pos runEpoch msg
+      -- These answers say the service ran the action and it failed there (contract C5.1).
+      if e.code == .oom || e.code == .timeout || e.code == .diskLimit then
+        recordRemoteModule (cached := false)
+      error msg
+  let locMap : List (String × String × FilePath) := [
+    (remoteLibPath mod "olean", "olean", mod.oleanFile),
+    (remoteLibPath mod "olean.server", "olean.server", mod.oleanServerFile),
+    (remoteLibPath mod "olean.private", "olean.private", mod.oleanPrivateFile),
+    (remoteLibPath mod "ilean", "ilean", mod.ileanFile),
+    (remoteLibPath mod "ir.sig", "ir.sig", mod.irSigFile),
+    (remoteLibPath mod "ir", "ir", mod.irFile),
+    (remoteIrPath mod "c", "c", mod.cFile),
+    (remoteIrPath mod "bc", "bc", mod.bcFile)]
+  let found ← result.outputs.mapM fun o =>
+    match locMap.find? (·.1 == o.rel) with
+    | some (_, ext, path) => pure (ext, o.digest, path, o.executable)
+    | none => error s!"the build service returned an unexpected output {o.rel} for {mod.name}"
+  let record : JobM Unit := do
+    recordRemoteModule result.cached
+    appendRemoteLog s "lean" mod.name.toString (if result.cached then "cached" else "executed")
+      result.action result.exitCode (found.map fun (ext, d, _, _) => (ext, d))
+      ((← IO.monoMsNow) - start)
+  mod.clearOutputArtifacts
+  mod.clearOutputHashes
+  -- Replay the compile's output and fail on a bad exit, as a local compile does.
+  let out : IO.Process.Output := {
+    exitCode := (if result.exitCode < 0 then 255 else result.exitCode.toNat).toUInt32
+    stdout := result.stdout, stderr := result.stderr}
+  try
+    withLogErrorPos <| logLeanOutput out (relPathFrom mod.pkg.dir presetup.srcFile)
+  catch e =>
+    record
+    throw e
+  let materializeEpoch ← remoteEpoch
+  match ← materializeFiles s (found.map fun (_, d, p, x) => (d, p, x)) with
+  | .ok _ => record
+  | .error e =>
+    let msg := s!"materializing {mod.name} from the build service failed: {e.message}"
+    if e.code == .unavailable then
+      -- Under `fail` the service's result stays the module's; otherwise the fallback replaces it.
+      if s.cfg.fallback == .fail then
+        record
+      remoteUnavailable s why pos materializeEpoch msg
+    record
+    error msg
+  mod.checkSourceUnchanged presetup
+  -- Hashing the outputs takes a build slot, as the read broker's check of a download does
+  -- (`ReadBroker.lean`): after a lent wait, more jobs run than the pool has workers.
+  withBuildSlot do
+    mod.computeArtifacts presetup.isModule presetup.postponeCompile
+
+def Module.cacheRemoteOutputs (mod : Module) (presetup : ModulePreSetup) (inputHash : Hash)
+    (arts : ModuleOutputArtifacts) : JobM ModuleOutputArtifacts := do
+  unless (← mod.pkg.isArtifactCacheWritable) do return arts
+  try
+    let restore ← mod.pkg.restoreAllArtifacts
+    let cached ← withBuildSlot do
+      mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile
+    (← getLakeCache).writeOutputs mod.pkg.cacheScope inputHash cached.descrs
+      (log := (← readTraceFile mod.traceFile).log)
+    return cached
+  catch e =>
+    let log ← takeLogFrom e
+    let details := log.entries.foldl (fun msg entry => s!"{msg}\n- {entry.message}") ""
+    logWarning s!"{mod.name}: could not save build-service outputs to the local cache; \
+      keeping the build outputs:{details}"
+    return arts
+
+/--
+Fetch a module's outputs from the build service (contract C5.1): replay an up-to-date trace with no
+request, else restore them from the local Lake cache with no request (`fromCache`, as `fetchLocal`
+restores before a compile), otherwise `run` the action, materialize the outputs, write the trace as a
+local compile does (`buildRemote`), and save them to the local Lake cache (`cacheRemoteOutputs`).
+Returns `none` when the service did not answer and `LAKE_REMOTE_EXEC_FALLBACK`
+is `local` (`useService`, `remoteUnavailable`): the caller then compiles the module on this machine,
+where its imports' outputs are, as every result of the service is materialized here at once. Under
+`wait`, a request that answered `UNAVAILABLE` is sent again once the service answers
+(`awaitServiceAgain`). A result of the service (a nonzero exit, `OOM`, `TIMEOUT`, `DISK_LIMIT`) and
+every other error are the module's result, never a reason to fall back.
+-/
+def Module.fetchRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSession)
+    (savedTrace : SavedTrace) (fromCache : SavedTrace → JobM (Option ModuleOutputArtifacts)) :
+    JobM (Option ModuleOutputArtifacts) := do
+  let depTrace ← getTrace
+  let inputHash := depTrace.hash
+  -- The outputs are checked before the saved log is replayed, so a module that is rebuilt because
+  -- an output went missing does not print its messages twice.
+  if (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) then
+    if (← savedTrace.replayCachedIfUpToDate inputHash) then
+      return some {(← mod.computeArtifacts presetup.isModule presetup.postponeCompile) with
+        keptFrom? := savedTrace.keptFrom?}
+  if let some arts ← fromCache savedTrace then
+    return some arts
+  -- Under `--no-build` the action fails before any request (`buildAction`): no `hello`, no wait.
+  unless (← getNoBuild) do
+    unless (← useService s) do
+      return none
+  repeat
+    let why ← IO.mkRef (none : Option (String × Nat))
+    try
+      let arts ← buildAction depTrace mod.traceFile (mod.buildRemote presetup s why)
+      return some (← mod.cacheRemoteOutputs presetup inputHash arts)
+    catch pos =>
+      let some (_, epoch) ← why.get | throw pos
+      dropLogFrom pos
+      if s.cfg.fallback == .wait then
+        awaitServiceAgain s epoch
+      else
+        return none
+  return none
+
+end RemoteExec
+
+
 /--
 The outputs the saved trace describes (`descrs`) that are not in the build directory with the bytes recorded for
 them, hashed as the cache hashes a module output (`computeBinFileHash`), each with the description recorded for it
@@ -1369,9 +1644,6 @@ def Module.keepOutputs? (mod : Module) (isModule postponesCompile : Bool) (descr
     unless (← mod.outputMismatches isModule postponesCompile descrs).isEmpty do return none
     return some {(← mod.computeArtifacts isModule postponesCompile) with keptFrom? := descrs.keptFrom?}
 
-/-- The `keptFrom?` recorded with a saved trace's module outputs. -/
-def SavedTrace.keptFrom? (self : SavedTrace) : Option Hash :=
-  self.moduleOutputDescrs?.bind (·.keptFrom?)
 
 /--
 Gives `arts` the `keptFrom?` that the module's trace file records: outputs described again from the
@@ -1585,19 +1857,6 @@ public def Module.ltarFacetConfig : ModuleFacetConfig ltarFacet :=
   mkFacetJobConfig recBuildLtar
 
 
-/--
-Fails, discarding the module's outputs, if its source changed since `recFetchInput` read it: the input
-hash covers the source as read then, while `lean` reads it again and a usage skip keeps old outputs.
--/
-def Module.checkSourceUnchanged (mod : Module) (presetup : ModulePreSetup) : JobM Unit := do
-  -- A rewrite can keep the modification time (`cp -p`, `rsync -a`, or a read part-way through one
-  -- in-place `write`), so compare the contents too.
-  if (← getMTime presetup.srcFile) != presetup.srcMTime ||
-      Hash.ofText (← IO.FS.readFile presetup.srcFile) != presetup.srcHash then
-    mod.clearOutputArtifacts
-    let relSrcFile := relPathFrom mod.pkg.dir presetup.srcFile
-    error s!"{relSrcFile}: source file was modified during the build; \
-      its outputs were discarded (build again to compile the current version)"
 
 /--
 Compiles the module. `setup?` is its `ModuleSetup` if the caller already computed it
@@ -2008,7 +2267,7 @@ def Module.recBuildElabArts (mod : Module) : FetchM (Job ModuleOutputArtifacts) 
       | .done arts => return .done (← adjustMTime arts mod.traceFile)
       | .wait wait => return .wait wait
 where
-  fetchFromCache? presetup savedTrace restoreAll : JobM ModuleFetchState := do
+  fetchFromCache? presetup savedTrace restoreAll (remoteRead := true) : JobM ModuleFetchState := do
     let inputHash := (← getTrace).hash
     -- An archive of this input that this process could not unpack is not tried again.
     if (← rejectedArchives.atomically (return (← get).contains (mod.archiveKey inputHash)) : Bool) then
@@ -2020,7 +2279,7 @@ where
         if (out.getObjVal? "kf").isOk || ((← getNoBuild) && !(out.getObjVal? "o").isOk) then
           return .incomplete savedTrace none
     let some ((ltarOrArts : ModuleOutputs), log) ←
-      getArtifacts? inputHash savedTrace mod.pkg mod.name.toString (some presetup.srcHash)
+      getArtifacts? inputHash savedTrace mod.pkg mod.name.toString (some presetup.srcHash) remoteRead
       | return .incomplete savedTrace none
     match ltarOrArts with
     | .ltar ltar usage? resolved? usekey? =>
@@ -2111,7 +2370,51 @@ where
         if let some ltar ← mod.verifiedLocalLtar? then
           return .complete {arts with ltar? := some ltar}
       return .complete arts
+  fromLocalCache (presetup : ModulePreSetup) (savedTrace : SavedTrace) :
+      JobM (Option ModuleOutputArtifacts) := do
+    let restore? : Option Bool ←
+      if (← mod.pkg.isArtifactCacheWritable) then some <$> mod.pkg.restoreAllArtifacts
+      else if (← mod.pkg.isArtifactCacheReadable) then pure (some true)
+      else pure none
+    let some restore := restore? | return none
+    match ← fetchFromCache? presetup savedTrace restore (remoteRead := false) with
+    | .complete arts => return some arts
+    | .incomplete savedTrace (some ltar) =>
+      -- An archive can contain every output without separate cache entries. Its trace and bytes
+      -- must still verify before those unpacked outputs can be reused.
+      let .ok data := savedTrace | return none
+      let inputHash := (← getTrace).hash
+      unless data.depHash == inputHash do return none
+      let writable ← mod.pkg.isArtifactCacheWritable
+      let cacheWith? := if writable then some restore else none
+      let some arts ← mod.keepOutputs? presetup.isModule presetup.postponeCompile
+          savedTrace.moduleOutputDescrs? cacheWith?
+        | return none
+      mod.checkSourceUnchanged presetup
+      data.log.replay
+      let arts := {arts with ltar? := some ltar}
+      if writable then
+        (← getLakeCache).writeOutputs mod.pkg.cacheScope inputHash arts.descrs (log := data.log)
+        mod.indexUsage presetup arts restore data.log
+      return some arts
+    | .incomplete _ none => return none
   fetchCore (presetup : ModulePreSetup) (sawDone : Bool) :
+      JobM (ClaimLoop ModuleOutputArtifacts) := do
+    let some s ← remoteSession?
+      | fetchLocal presetup sawDone
+    let (savedTrace, setAside) ← reviewKept (← readTraceFile mod.traceFile)
+    if setAside && (← getNoBuild) then
+      return .done (← mod.buildLean presetup)
+    if let some arts ← mod.fetchRemote presetup s savedTrace (fromLocalCache presetup) then
+      return .done arts
+    let compiled ← trackBuilds
+    let start ← IO.monoMsNow
+    let r ← fetchLocal presetup sawDone
+    if (← compiled) then
+      recordRemoteLocal
+      appendRemoteLog s "lean" mod.name.toString "local" "" 0 #[] ((← IO.monoMsNow) - start)
+    return r
+  fetchLocal (presetup : ModulePreSetup) (sawDone : Bool) :
       JobM (ClaimLoop ModuleOutputArtifacts) := do
     -- Whether this call compiles the module (not an earlier action of the job it continues)
     let compiledHere ← trackBuilds
