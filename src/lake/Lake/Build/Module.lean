@@ -1252,6 +1252,19 @@ def Module.checkSourceUnchanged (mod : Module) (presetup : ModulePreSetup) : Job
     error s!"{relSrcFile}: source file was modified during the build; \
       its outputs were discarded (build again to compile the current version)"
 
+/--
+Decodes a module's output descriptors (as recorded by `buildAction`/`writeFetchTrace`, see
+`ToOutputJson ModuleOutputArtifacts`) from a saved trace, if present and well-formed.
+-/
+def SavedTrace.moduleOutputDescrs? (self : SavedTrace) : Option ModuleOutputDescrs := do
+  let .ok data := self | none
+  let some outputs := data.outputs? | none
+  (ModuleOutputDescrs.fromJson? outputs).toOption
+
+/-- The `keptFrom?` recorded with a saved trace's module outputs. -/
+def SavedTrace.keptFrom? (self : SavedTrace) : Option Hash :=
+  self.moduleOutputDescrs?.bind (·.keptFrom?)
+
 section RemoteExec
 /-! ## Build service (contract C2.1, C5.1)
 
@@ -1481,16 +1494,16 @@ where its imports' outputs are, as every result of the service is materialized h
 every other error are the module's result, never a reason to fall back.
 -/
 def Module.fetchRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSession)
-    (fromCache : SavedTrace → JobM (Option ModuleOutputArtifacts)) :
+    (savedTrace : SavedTrace) (fromCache : SavedTrace → JobM (Option ModuleOutputArtifacts)) :
     JobM (Option ModuleOutputArtifacts) := do
   let depTrace ← getTrace
   let inputHash := depTrace.hash
-  let savedTrace ← readTraceFile mod.traceFile
   -- The outputs are checked before the saved log is replayed, so a module that is rebuilt because
   -- an output went missing does not print its messages twice.
   if (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) then
     if (← savedTrace.replayCachedIfUpToDate inputHash) then
-      return some (← mod.computeArtifacts presetup.isModule presetup.postponeCompile)
+      return some {(← mod.computeArtifacts presetup.isModule presetup.postponeCompile) with
+        keptFrom? := savedTrace.keptFrom?}
   if let some arts ← fromCache savedTrace then
     return some arts
   -- Under `--no-build` the action fails before any request (`buildAction`): no `hello`, no wait.
@@ -1513,14 +1526,6 @@ def Module.fetchRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSes
 
 end RemoteExec
 
-/--
-Decodes a module's output descriptors (as recorded by `buildAction`/`writeFetchTrace`, see
-`ToOutputJson ModuleOutputArtifacts`) from a saved trace, if present and well-formed.
--/
-def SavedTrace.moduleOutputDescrs? (self : SavedTrace) : Option ModuleOutputDescrs := do
-  let .ok data := self | none
-  let some outputs := data.outputs? | none
-  (ModuleOutputDescrs.fromJson? outputs).toOption
 
 /--
 The outputs the saved trace describes (`descrs`) that are not in the build directory with the bytes recorded for
@@ -1573,9 +1578,6 @@ def Module.keepOutputs? (mod : Module) (isModule postponesCompile : Bool) (descr
     unless (← mod.outputMismatches isModule postponesCompile descrs).isEmpty do return none
     return some {(← mod.computeArtifacts isModule postponesCompile) with keptFrom? := descrs.keptFrom?}
 
-/-- The `keptFrom?` recorded with a saved trace's module outputs. -/
-def SavedTrace.keptFrom? (self : SavedTrace) : Option Hash :=
-  self.moduleOutputDescrs?.bind (·.keptFrom?)
 
 /--
 Gives `arts` the `keptFrom?` that the module's trace file records: outputs described again from the
@@ -2276,7 +2278,10 @@ where
     -- Lake cache still comes before any request (`fromLocalCache`).
     let some s ← remoteSession?
       | fetchLocal presetup sawDone
-    if let some arts ← mod.fetchRemote presetup s (fromLocalCache presetup) then
+    let (savedTrace, setAside) ← reviewKept (← readTraceFile mod.traceFile)
+    if setAside && (← getNoBuild) then
+      return .done (← mod.buildLean presetup)
+    if let some arts ← mod.fetchRemote presetup s savedTrace (fromLocalCache presetup) then
       return .done arts
     let compiled ← trackBuilds
     let start ← IO.monoMsNow

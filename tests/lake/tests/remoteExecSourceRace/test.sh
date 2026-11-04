@@ -33,6 +33,8 @@ assert not list((w / 'cache' / 'outputs').rglob('*.json')), 'stale cache mapping
 out = w / 'outputs.jsonl'
 if out.exists():
     rows = [json.loads(x) for x in out.read_text().splitlines() if x.strip()]
-    assert len(rows) <= 1, f'stale -o export survived: {rows}'
+    assert not rows or isinstance(rows[0], str), f'missing export schema header: {rows}'
+    entries = rows[1:] if rows else []
+    assert len(entries) == 0, f'stale -o export entries survived: {entries}'
 print('source race: no stale trace, local mapping or -o export')
 PY
