@@ -359,31 +359,37 @@ assert status["failures"] >= 16, status
 }
 
 case_service_cached_mapping() {
-  # Keep metadata written by a real remote read, but prune every cached blob. Service mode
-  # must treat that mapping as a local miss, not fetch its missing archive from the bucket.
-  # A writable restore replaces remote metadata with its own per-file mapping. A read-only
-  # restore retains the mapping actually read from the bucket.
-  sed_i '/^enableArtifactCache = true$/d' lakefile.toml
-  seed_remote
-  fresh
-  LAKE_REMOTE_CACHE=ok test_not_out 'Built ' build Test
-  test_exp "$(count 'GET ' "$SERVER_LOG")" -gt 0
-  "$PYTHON" - "$CACHE_DIR/outputs" <<'PY'
+  # A writable restore rewrites the remote metadata; a read-only restore retains it.
+  # Both keep the mapping while pruning its blobs, and neither may fetch them in service mode.
+  local mode
+  for mode in writable readonly; do
+    if [ "$mode" = readonly ]; then sed_i '/^enableArtifactCache = true$/d' lakefile.toml; fi
+    seed_remote
+    fresh
+    : > "$SERVER_LOG"
+    LAKE_REMOTE_CACHE=ok test_not_out 'Built ' build Test
+    test_exp "$(count 'GET ' "$SERVER_LOG")" -gt 0
+    "$PYTHON" - "$CACHE_DIR/outputs" "$mode" <<'PY'
 import json, pathlib, sys
 maps = [json.loads(p.read_text()) for p in pathlib.Path(sys.argv[1]).rglob('*.json')]
-assert maps and all(m.get('service') == 'ok' and m.get('sha256') for m in maps), maps
+assert maps, 'no mappings from the prior remote read'
+if sys.argv[2] == 'readonly':
+    assert all(m.get('service') == 'ok' and m.get('sha256') for m in maps), maps
+else:
+    assert all(not m.get('service') and not m.get('sha256') for m in maps), maps
 PY
-  test_cmd rm -rf .lake/build
-  find "$CACHE_DIR/artifacts" -type f -delete
-  : > "$SERVER_LOG"
-  LAKE_REMOTE_CACHE=ok LAKE_REMOTE_EXEC=grpc://fake:1 \
-    LAKE_REMOTE_EXEC_CLIENT="$LIB_DIR/../remoteExec/fake_lean_remote.py" \
-    LAKE_REMOTE_EXEC_TOOLCHAIN=sha256:0000000000000000000000000000000000000000000000000000000000000001 \
-    LAKE_REMOTE_EXEC_SYSROOT="$(lean --print-prefix)" \
-    FAKE_CAS="$WORK_DIR/service-cas" FAKE_LOG="$WORK_DIR/service.log" \
-    test_run build Test
-  test_cmd_eq 0 count 'GET ' "$SERVER_LOG"
-  test_exp -s "$WORK_DIR/service.log"
+    test_cmd rm -rf .lake/build
+    find "$CACHE_DIR/artifacts" -type f -delete
+    : > "$SERVER_LOG"
+    LAKE_REMOTE_CACHE=ok LAKE_REMOTE_EXEC=grpc://fake:1 \
+      LAKE_REMOTE_EXEC_CLIENT="$LIB_DIR/../remoteExec/fake_lean_remote.py" \
+      LAKE_REMOTE_EXEC_TOOLCHAIN=sha256:0000000000000000000000000000000000000000000000000000000000000001 \
+      LAKE_REMOTE_EXEC_SYSROOT="$(lean --print-prefix)" \
+      FAKE_CAS="$WORK_DIR/service-$mode-cas" FAKE_LOG="$WORK_DIR/service-$mode.log" \
+      test_run build Test
+    test_cmd_eq 0 count 'GET ' "$SERVER_LOG"
+    test_exp -s "$WORK_DIR/service-$mode.log"
+  done
 }
 
 run_cases case_read_through case_read_404 case_read_invalid_mapping case_read_bad_artifact \

@@ -779,8 +779,8 @@ stored in the cached input-to-content mapping, along with the build log stored w
 A local mapping that cannot be used (e.g., its artifacts were pruned from the cache) does not hide
 the shared remote cache: the remote mapping is then read (see `readRemoteOutputs?`, which reads
 nothing unless `LAKE_REMOTE_CACHE` names a service) and replaces the local one. With
-`remoteRead := false` (service mode, which bypasses the shared remote cache), it reads only the
-local mapping.
+`remoteRead := false` (service mode, which bypasses the shared remote cache), it resolves only
+local mappings and artifacts, ignoring any remote service metadata in a saved mapping.
 
 **For internal use only.**
 -/
@@ -798,7 +798,8 @@ local mapping.
     logVerbose msg
   let resolve (out : CacheOutput) : JobM (Option (α × Log)) := do
     try
-      return some (← resolveOutputs out, out.log?.getD {})
+      let localOut := if remoteRead || out.service?.isNone then out else CacheOutput.ofData out.data
+      return some (← resolveOutputs localOut, out.log?.getD {})
     catch e =>
       reportIssue e
       return none
