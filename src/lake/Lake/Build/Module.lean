@@ -1432,16 +1432,34 @@ def Module.buildRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSes
     mod.computeArtifacts presetup.isModule presetup.postponeCompile
 
 /--
+Saves the outputs that the build service gave a module to the local Lake cache, with the mapping from
+its input hash, as a local compile's are saved (`fetchLocal`): a later build on this machine then
+restores them with no request. Does nothing for a package that does not write the cache.
+-/
+def Module.cacheRemoteOutputs (mod : Module) (presetup : ModulePreSetup) (inputHash : Hash)
+    (arts : ModuleOutputArtifacts) : JobM ModuleOutputArtifacts := do
+  unless (← mod.pkg.isArtifactCacheWritable) do return arts
+  let restore ← mod.pkg.restoreAllArtifacts
+  let arts ← mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile
+  unless arts.cacheSkipped do
+    (← getLakeCache).writeOutputs mod.pkg.cacheScope inputHash arts.descrs
+      (log := (← readTraceFile mod.traceFile).log)
+  return arts
+
+/--
 Fetch a module's outputs from the build service (contract C5.1): replay an up-to-date trace with no
-request, otherwise `run` the action, materialize the outputs, and write the trace as a local compile
-does (`buildRemote`). Returns `none` when the service did not answer and `LAKE_REMOTE_EXEC_FALLBACK`
+request, else restore them from the local Lake cache with no request (`fromCache`, as `fetchLocal`
+restores before a compile), otherwise `run` the action, materialize the outputs, write the trace as a
+local compile does (`buildRemote`), and save them to the local Lake cache (`cacheRemoteOutputs`).
+Returns `none` when the service did not answer and `LAKE_REMOTE_EXEC_FALLBACK`
 is `local` (`useService`, `remoteUnavailable`): the caller then compiles the module on this machine,
 where its imports' outputs are, as every result of the service is materialized here at once. Under
 `wait`, a request that answered `UNAVAILABLE` is sent again once the service answers
 (`awaitServiceAgain`). A result of the service (a nonzero exit, `OOM`, `TIMEOUT`, `DISK_LIMIT`) and
 every other error are the module's result, never a reason to fall back.
 -/
-def Module.fetchRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSession) :
+def Module.fetchRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSession)
+    (fromCache : SavedTrace → JobM (Option ModuleOutputArtifacts)) :
     JobM (Option ModuleOutputArtifacts) := do
   let depTrace ← getTrace
   let inputHash := depTrace.hash
@@ -1451,6 +1469,8 @@ def Module.fetchRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSes
   if (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) then
     if (← savedTrace.replayCachedIfUpToDate inputHash) then
       return some (← mod.computeArtifacts presetup.isModule presetup.postponeCompile)
+  if let some arts ← fromCache savedTrace then
+    return some arts
   -- Under `--no-build` the action fails before any request (`buildAction`): no `hello`, no wait.
   unless (← getNoBuild) do
     unless (← useService s) do
@@ -1458,7 +1478,8 @@ def Module.fetchRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSes
   repeat
     let why ← IO.mkRef (none : Option (String × Nat))
     try
-      return some (← buildAction depTrace mod.traceFile (mod.buildRemote presetup s why))
+      let arts ← buildAction depTrace mod.traceFile (mod.buildRemote presetup s why)
+      return some (← mod.cacheRemoteOutputs presetup inputHash arts)
     catch pos =>
       let some (_, epoch) ← why.get | throw pos
       dropLogFrom pos
@@ -2135,7 +2156,7 @@ def Module.recBuildElabArts (mod : Module) : FetchM (Job ModuleOutputArtifacts) 
         return .done (← adjustMTime arts mod.traceFile)
       | .wait wait => return .wait wait
 where
-  fetchFromCache? presetup savedTrace restoreAll : JobM ModuleFetchState := do
+  fetchFromCache? presetup savedTrace restoreAll (remoteRead := true) : JobM ModuleFetchState := do
     let inputHash := (← getTrace).hash
     -- An archive of this input that this process could not unpack is not tried again.
     if (← rejectedArchives.atomically (return (← get).contains (mod.archiveKey inputHash)) : Bool) then
@@ -2148,6 +2169,7 @@ where
           return .incomplete savedTrace none
     let some ((ltarOrArts : ModuleOutputs), log) ←
       getArtifacts? inputHash savedTrace mod.pkg mod.name.toString (some presetup.srcHash)
+        (remoteRead := remoteRead)
       | return .incomplete savedTrace none
     match ltarOrArts with
     | .ltar ltar usage? resolved? usekey? =>
@@ -2243,10 +2265,11 @@ where
       JobM (ClaimLoop ModuleOutputArtifacts) := do
     -- Service mode bypasses the local compile and the shared-bucket machinery (contract C5.1), unless the
     -- service did not answer and the fallback is `local`: then the module takes the local path, publishing
-    -- nothing (`Env.remoteCacheQueueService?`), and counts as `local` if that path compiles it.
+    -- nothing (`Env.remoteCacheQueueService?`), and counts as `local` if that path compiles it. The local
+    -- Lake cache still comes before any request (`fromLocalCache`).
     let some s ← remoteSession?
       | fetchLocal presetup sawDone
-    if let some arts ← mod.fetchRemote presetup s then
+    if let some arts ← mod.fetchRemote presetup s (fromLocalCache presetup) then
       return .done arts
     let compiled ← trackBuilds
     let start ← IO.monoMsNow
@@ -2255,6 +2278,21 @@ where
       recordRemoteLocal
       appendRemoteLog s "lean" mod.name.toString "local" "" 0 #[] ((← IO.monoMsNow) - start)
     return r
+  /-
+  In service mode, the outputs the local Lake cache holds for the module's input, restored as `fetchLocal`
+  restores them before a compile: from a cache this package writes, or one it only reads (then always
+  into the build directory). The shared remote cache is not read: service mode bypasses it.
+  -/
+  fromLocalCache (presetup : ModulePreSetup) (savedTrace : SavedTrace) :
+      JobM (Option ModuleOutputArtifacts) := do
+    let restore? : Option Bool ←
+      if (← mod.pkg.isArtifactCacheWritable) then some <$> mod.pkg.restoreAllArtifacts
+      else if (← mod.pkg.isArtifactCacheReadable) then pure (some true)
+      else pure none
+    let some restore := restore? | return none
+    match ← fetchFromCache? presetup savedTrace restore (remoteRead := false) with
+    | .complete arts => return some arts
+    | .incomplete .. => return none
   fetchLocal (presetup : ModulePreSetup) (sawDone : Bool) :
       JobM (ClaimLoop ModuleOutputArtifacts) := do
     -- Whether this call compiles the module (not an earlier action of the job it continues)
