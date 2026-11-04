@@ -15,6 +15,8 @@ import Lake.Util.JsonObject
 import Lake.Util.IO
 import Lake.Config.PushQueue
 import Lake.Build.Claim
+import Lake.Util.RemoteExec
+import Lake.Build.RemoteExec
 
 /-! # Build Runner
 
@@ -446,6 +448,7 @@ def mkBuildContext
   usageViews := ← Shards.new 1024 {}
   usageFacts := ← Std.Mutex.new {}
   usageCutoffInFlight := ← IO.mkRef 0
+  remoteStats := ← IO.mkRef {}
   leanTrace := .ofHash (pureHash ws.lakeEnv.leanGithash)
     s!"Lean {Lean.versionStringCore}, commit {ws.lakeEnv.leanGithash}"
   cancelTk?
@@ -511,10 +514,30 @@ def runQueuedPush (ws : Workspace) (logger : MonadLog BaseIO) : BaseIO Unit := d
   | .ok rc => logger.logEntry (.warning s!"`lake cache push` exited with code {rc}")
   | .error e => logger.logEntry (.warning s!"could not run `lake cache push`: {e}")
 
+/--
+Exit code of a build whose every failure is an unavailable service under `fail`, or a confirmed
+toolchain mismatch under `wait` or `fail`: 75 (`EX_TEMPFAIL`), distinct from a broken build.
+-/
+public def remoteUnavailableCode : ExitCode := 75
+
+def failedOnlyForService (bctx : BuildContext) (result : MonitorResult) : BaseIO Bool := do
+  let some rcfg := bctx.workspace.lakeEnv.remoteExec?
+    | return false
+  if rcfg.fallback == .compileLocally then return false
+  return result.failures.size > 0 && result.failures.size == (← bctx.remoteStats.get).unavailableFailures
+
 def finalizeBuild
   (cfg : BuildConfig) (bctx : BuildContext) (mctx : MonitorContext) (result : BuildResult α)
 : IO α := do
   reportResult cfg mctx.out result
+  if bctx.workspace.lakeEnv.remoteExec?.isSome && cfg.verbosity != .quiet then
+    let stats ← bctx.remoteStats.get
+    -- `ok`, `unreachable` or `off: <reason>` from this process's decision; `idle` when no `hello`.
+    let state ← remoteDecisionState
+    print! mctx.out s!"{({stats with state}).line}\n"
+    flush mctx.out
+  -- The build is done with the service; stop the bridge before Lake goes on (e.g. `lake exe` runs).
+  RemoteExec.shutdown
   let remoteStatus ← bctx.remoteReadStatus.get
   if remoteStatus.failures > 0 then
     if let .error e ← (writeRemoteReadStatus bctx.workspace.lakeCache remoteStatus).toBaseIO then
@@ -539,6 +562,8 @@ def finalizeBuild
   | .error e =>
     if cfg.noBuild && result.wantsRebuild then
       IO.Process.exit noBuildCode.toUInt8
+    else if (← failedOnlyForService bctx result) then
+      IO.Process.exit remoteUnavailableCode.toUInt8
     else
       throw (IO.userError e)
 

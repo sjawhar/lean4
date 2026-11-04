@@ -581,6 +581,8 @@ With `LAKE_REMOTE_EXEC` set, Lake restores matching outputs from its local artif
 
 If the package writes the artifact cache, Lake also saves successful service outputs there. A cache write failure warns and keeps the build outputs. Service mode never uses a retained cache mapping to download artifacts from a shared cache service. Kept-output checks and lineage apply to these restores just as they do to a local build.
 
+When the service reports a different Lean githash, only `LAKE_REMOTE_EXEC_FALLBACK=local` permits local compilation. Lake warns with both githashes and logs each fallback compile with result `toolchain-mismatch`. The `wait` and `fail` policies fail with exit code 75 instead of retrying a confirmed mismatch. A missing or failed toolchain verification without a different githash remains an error under every policy.
+
 ## Building and Running Lake from the Source
 
 If you already have a Lean installation with `lake` packaged with it, you can build a new `lake` by just running `lake build`.
