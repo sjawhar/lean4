@@ -178,11 +178,11 @@ test_exp ! -e "$WORK/later/.lake/build/lib/lean/Rx/A.olean"
 test_cmd_eq "$runs" count_method run
 test_cmd same_outputs "$WORK/later-local"
 
-# A later hello that answers but did not verify the toolchain refuses every request too, and the line says why.
-# This is not a service that does not answer: no fallback runs, the default one (`local`) included.
+# A later hello with a confirmed toolchain mismatch refuses requests under `fail` and exits 75.
+# The dedicated mismatch test also covers the local and wait policies on this second connection.
 runs=$(count_method run)
-(cd "$WORK/later2" && FAKE_UNVERIFIED_LATER="$WORK/later2.state" LAKE_REMOTE_EXEC=grpc://fake:1 \
-  test_err "runs Lean 0000000000000000000000000000000000000000, but this Lake uses Lean" build Rx)
+(cd "$WORK/later2" && FAKE_UNVERIFIED_LATER="$WORK/later2.state" LAKE_REMOTE_EXEC_FALLBACK=fail LAKE_REMOTE_EXEC=grpc://fake:1 \
+  test_status_out 75 "runs Lean 0000000000000000000000000000000000000000, but this Lake uses Lean" build Rx)
 match_text "lake: remote: off: build service at grpc://fake:1 runs Lean 0000000000000000000000000000000000000000" "$WORK/later2/produced.out"
 test_cmd_eq "$runs" count_method run
 test_exp ! -e "$WORK/later2/.lake/build/lib/lean/Rx/A.olean"
@@ -346,14 +346,14 @@ match_text "lake: remote: ok; 5 cached (0 from manifest), 0 executed, 0 local;" 
 test_cmd "$PYTHON" "$TEST_DIR/fallback_check.py" retry "$FAKE_LOG" "$skip" Rx.B
 test_cmd same_outputs "$WORK/fb-wait-mid"
 
-# A service whose toolchain runs another Lean fails the build before any action, and records nothing.
+# Under `fail`, a service whose toolchain runs another Lean exits 75 before any action and records nothing.
 runs=$(count_method run)
-(cd "$WORK/wrongtc" && FAKE_GITHASH=0000000000000000000000000000000000000000 LAKE_REMOTE_EXEC=grpc://fake:1 \
-  test_err "runs Lean 0000000000000000000000000000000000000000" build Rx)
+(cd "$WORK/wrongtc" && FAKE_GITHASH=0000000000000000000000000000000000000000 LAKE_REMOTE_EXEC_FALLBACK=fail LAKE_REMOTE_EXEC=grpc://fake:1 \
+  test_status_out 75 "runs Lean 0000000000000000000000000000000000000000" build Rx)
 # The refusal also holds where no hello is said at the start (`lake lean`, the editor's `setup-file`),
 # and a hello without `toolchainVerified` counts as false.
-(cd "$WORK/wrongtc" && FAKE_GITHASH=0000000000000000000000000000000000000000 LAKE_REMOTE_EXEC=grpc://fake:1 \
-  test_err "runs Lean 0000000000000000000000000000000000000000" lean Rx/C.lean)
+(cd "$WORK/wrongtc" && FAKE_GITHASH=0000000000000000000000000000000000000000 LAKE_REMOTE_EXEC_FALLBACK=fail LAKE_REMOTE_EXEC=grpc://fake:1 \
+  test_status_out 75 "runs Lean 0000000000000000000000000000000000000000" lean Rx/C.lean)
 (cd "$WORK/wrongtc" && FAKE_OMIT_VERIFIED=1 LAKE_REMOTE_EXEC=grpc://fake:1 \
   test_err "did not verify its toolchain" lean Rx/C.lean)
 test_cmd_eq "$runs" count_method run
