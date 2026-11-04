@@ -84,6 +84,14 @@ builtin_facet imports : Module => Array Module
 public structure ModulePreSetup where
   trace : BuildTrace
   irSigTrace : BuildTrace
+  /--
+  The trace of every input of the module except its imports: the library's extra dependencies
+  (`needs`, `extraDepTargets`), the shared libraries it loads, the platform, the toolchain, the
+  source's contents, the options, the module's name, package and arguments, and the usage-cutoff
+  setting. Outputs produced for the same local trace differ only in the imports they were produced
+  against.
+  -/
+  localTrace : BuildTrace
   srcMTime : MTime
   /-- The hash of the source's contents as Lake read them (see `Module.recFetchInput`). -/
   srcHash : Hash

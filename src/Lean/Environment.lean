@@ -26,6 +26,8 @@ import Init.Data.Slice
 import Init.Data.String.TakeDrop
 import Init.Data.Range.Polymorphic.Iterators
 import Init.While
+-- public: `getModuleIdxFor?` may be inlined at its callers
+public import Lean.Util.UsedByChecks
 
 public section
 
@@ -240,7 +242,7 @@ structure Environment where
   the field `constants`. These auxiliary constants are invisible to the Lean kernel and elaborator.
   Only the code generator uses them.
   -/
-  const2ModIdx            : Std.HashMap Name ModuleIdx
+  private const2ModIdx    : Std.HashMap Name ModuleIdx
   /--
   Environment extensions. It also includes user-defined extensions.
   -/
@@ -875,9 +877,10 @@ def addDeclCore (env : Environment) (maxHeartbeats : USize) (maxRecDepth : USize
 def constants (env : Environment) : ConstMap :=
   env.toKernelEnv.constants
 
-@[inherit_doc Kernel.Environment.const2ModIdx]
+/-- The whole of `Kernel.Environment.const2ModIdx`. A read records that the defining module of every imported name
+was read (`noteAllResolved`); single lookups go through `getModuleIdxFor?`. -/
 def const2ModIdx (env : Environment) : Std.HashMap Name ModuleIdx :=
-  env.toKernelEnv.const2ModIdx
+  noteAllResolved env.toKernelEnv.const2ModIdx
 
 -- only needed for the lakefile.lean cache
 @[export lake_environment_add]
@@ -991,9 +994,11 @@ system, this is any definition. -/
 def hasExposedBody (env : Environment) (n : Name) : Bool :=
   env.setExporting true |>.find? n |>.any (·.hasValue)
 
+/-- The module that defines `declName`, a kernel constant or a compiled name of the module, or `none` for the
+current module or no module. Every answer is recorded for the usage data (`noteResolved`). -/
 def getModuleIdxFor? (env : Environment) (declName : Name) : Option ModuleIdx :=
   -- async constants are always from the current module
-  env.base.get env |>.const2ModIdx[declName]?
+  noteResolved declName (env.base.get env |>.const2ModIdx[declName]?)
 
 def isImportedConst (env : Environment) (declName : Name) : Bool :=
   env.getModuleIdxFor? declName |>.isSome
@@ -1845,6 +1850,29 @@ def registerEnvExtension {σ : Type} (mkInitial : IO σ)
 
 private def mkInitialExtensionStates : IO (Array EnvExtensionState) := EnvExtension.mkInitialExtStates
 
+/-- For each imported kernel constant whose declarers are not just the module `const2ModIdx` maps it to, the modules
+that declare it, in import order: several modules declare it and the import keeps a copy chosen from all of theirs
+(`subsumesInfo`), or an earlier module provides the name as a compiled declaration only. Set once by
+`finalizeImport`. -/
+private builtin_initialize kernelDeclarersExt : EnvExtension (Std.HashMap Name (Array ModuleIdx)) ←
+  registerEnvExtension (pure {}) (asyncMode := .local)
+
+/-- The modules that declare the imported kernel constant `declName`, in import order, when that is not just
+`resolved`, the caller's `getModuleIdxFor? declName`: the `ConstantInfo` that `find?` and the kernel read is one of
+their copies, chosen from all of them. -/
+def Environment.getKernelDeclarersIfOther? (env : Environment) (declName : Name) (_resolved : Option ModuleIdx) :
+    Option (Array ModuleIdx) :=
+  -- safety: `kernelDeclarersExt` is private and its state is of type `σ`; it is fixed at import, so its reads need no
+  -- dependency recording
+  (unsafe kernelDeclarersExt.getStateImpl env.base.private.extensions)[declName]?
+
+/-- The imported kernel constants that several modules declare, each with those modules in import order: the import
+keeps a copy chosen from all of theirs. -/
+def Environment.getImportedKernelDuplicates (env : Environment) : Array (Name × Array ModuleIdx) :=
+  -- safety: as in `getKernelDeclarersIfOther?`
+  (unsafe kernelDeclarersExt.getStateImpl env.base.private.extensions).fold (init := #[]) fun ds n ks =>
+    if ks.size ≥ 2 then ds.push (n, ks) else ds
+
 def mkEmptyEnvironment (trustLevel : UInt32 := 0) : IO Environment := do
   let initializing ← IO.initializing
   if initializing then throw (IO.userError "environment objects cannot be created during initialization")
@@ -2173,6 +2201,14 @@ set_option compiler.ignoreBorrowAnnotation true in
 @[extern "lean_get_ir_extra_const_names"]
 private opaque getIRExtraConstNames (env : Environment) (level : OLeanLevel) (includeDecls := false) : Array Name
 
+/-- The entries of `ext` that the current module's `.olean` files export at each level (`writeModule`). -/
+def PersistentEnvExtension.exportedEntries {α β σ : Type} [Inhabited σ] (ext : PersistentEnvExtension α β σ)
+    (env : Environment) : OLeanEntries (Array α) :=
+  let asyncMode := match ext.toEnvExtension.asyncMode with
+    | .async _ => .sync
+    | m => m
+  ext.exportEntriesFn env (ext.getState (asyncMode := asyncMode) env)
+
 /--
 Compute extension entries for all levels at once by calling `exportEntriesFn` once per extension.
 Returns an `OLeanEntries` of arrays mapping extension names to their exported data.
@@ -2180,13 +2216,7 @@ Returns an `OLeanEntries` of arrays mapping extension names to their exported da
 private def computeExtEntries (env : Environment) :
     IO (OLeanEntries (Array (Name × Array EnvExtensionEntry))) := do
   let pExts ← persistentEnvExtensionsRef.get
-  let allEntries := pExts.map fun pExt =>
-    let asyncMode := match pExt.toEnvExtension.asyncMode with
-      | .async _ => .sync
-      | m => m
-    let state := pExt.getState (asyncMode := asyncMode) env
-    let oe := pExt.exportEntriesFn env state
-    (pExt.name, oe)
+  let allEntries := pExts.map fun pExt => (pExt.name, pExt.exportedEntries env)
   let filterNonEmpty (level : OLeanLevel) :=
     allEntries.filterMap fun (name, oe) => do
       let ents := oe.get level
@@ -2440,10 +2470,11 @@ abbrev ImportStateM := StateRefT ImportState IO
 @[inline] nonrec def ImportStateM.run (x : ImportStateM α) (s : ImportState := default) : IO (α × ImportState) :=
   x.run s
 
-private def readModuleDataPartsOfMod (mod : Name) : IO (Array (ModuleData × CompactedRegion)) := do
-  let mFile ← findOLean mod
-  unless (← mFile.pathExists) do
-    throw <| IO.userError s!"object file '{mFile}' of module {mod} does not exist"
+/--
+Loads every `.olean` part of the module whose `.olean` is `mFile`, as an import does: for a `module` file, also its
+`.olean.server` and `.olean.private`.
+-/
+def readModuleDataPartsOfFile (mFile : System.FilePath) : IO (Array (ModuleData × CompactedRegion)) := do
   let main ← unsafe CompactedRegion.read (α := ModuleData) mFile #[]
   if !main.1.isModule then
     return #[main]
@@ -2454,6 +2485,12 @@ private def readModuleDataPartsOfMod (mod : Name) : IO (Array (ModuleData × Com
   let pFile := OLeanLevel.private.adjustFileName mFile
   let priv ← unsafe CompactedRegion.read (α := ModuleData) pFile #[main.2, server.2]
   return #[main, server, priv]
+
+private def readModuleDataPartsOfMod (mod : Name) : IO (Array (ModuleData × CompactedRegion)) := do
+  let mFile ← findOLean mod
+  unless (← mFile.pathExists) do
+    throw <| IO.userError s!"object file '{mFile}' of module {mod} does not exist"
+  readModuleDataPartsOfFile mFile
 
 private def readIRPartsOfMod (mod : Name) : IO (Array (ModuleData × CompactedRegion)) := do
   let mFile ← findOLean mod
@@ -2694,9 +2731,12 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
   let mut const2ModIdx : Std.HashMap Name ModuleIdx := Std.HashMap.emptyWithCapacity (capacity := numPrivateConsts + numExtraConsts)
   let mut privateConstantMap : Std.HashMap Name ConstantInfo := Std.HashMap.emptyWithCapacity (capacity := numPrivateConsts)
   let mut publicConstantMap : Std.HashMap Name ConstantInfo := Std.HashMap.emptyWithCapacity (capacity := numPublicConsts)
+  let mut kernelDeclarers : Std.HashMap Name (Array ModuleIdx) := {}
   for h : modIdx in *...moduleData.size do
     let data := moduleData[modIdx]
     for cname in data.constNames, cinfo in data.constants do
+      let (claimed, const2ModIdx') := const2ModIdx.containsThenInsertIfNew cname modIdx
+      const2ModIdx := const2ModIdx'
       match privateConstantMap.getThenInsertIfNew? cname cinfo with
       | (cinfoPrev?, constantMap') =>
         privateConstantMap := constantMap'
@@ -2706,7 +2746,13 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
             privateConstantMap := privateConstantMap.insert cname cinfo
           else if !subsumesInfo privateConstantMap cinfoPrev cinfo then
             throwAlreadyImported s const2ModIdx modIdx cname
-      const2ModIdx := const2ModIdx.insertIfNew cname modIdx
+          -- without an entry, the first provider is the first declarer
+          kernelDeclarers := kernelDeclarers.alter cname fun
+            | some ks => some (ks.push modIdx)
+            | none => some #[const2ModIdx[cname]!, modIdx]
+        else if claimed then
+          -- an earlier module provides the name as a compiled declaration only
+          kernelDeclarers := kernelDeclarers.insert cname #[modIdx]
     if let some data := irData[modIdx]? then
       for cname in data.extraConstNames do
         const2ModIdx := const2ModIdx.insertIfNew cname modIdx
@@ -2724,6 +2770,8 @@ def finalizeImport (s : ImportState) (imports : Array Import) (opts : Options) (
             -- no need to check for duplicates again, `privateConstMap` should be a superset
 
   let exts ← mkInitialExtensionStates
+  -- safety: as in `modifyState`
+  let exts := unsafe kernelDeclarersExt.setStateImpl exts kernelDeclarers
   let privateConstants : ConstMap := SMap.fromHashMap privateConstantMap false
   let privateBase : Kernel.Environment := {
     const2ModIdx, constants := privateConstants

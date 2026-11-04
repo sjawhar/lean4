@@ -33,6 +33,10 @@ Requires `compileDecls` to have been run for inductive `declName`.
 def hasTrivialStructure? (declName : Name) : CoreM (Option TrivialStructureInfo) :=
   Irrelevant.hasTrivialStructure? trivialStructureInfoExt declName
 
+/-- The trivial-structure info persisted for `declName`, if the cache holds an entry for it. -/
+def findTrivialStructureInfo? (env : Environment) (declName : Name) : Option (Option TrivialStructureInfo) :=
+  trivialStructureInfoExt.find? env declName
+
 def getParamTypes (type : Expr) : Array Expr :=
   go type #[]
 where
@@ -116,7 +120,8 @@ def getOtherDeclMonoType (declName : Name) : CoreM Expr := do
   if (← getEnv).find? declName matches some (.inductInfo _) | some (.ctorInfo _) then
     throwError "`{declName}` was not compiled; `compileDecls` must run on inductive types first"
   let type ← toMonoType (← getOtherDeclBaseType declName [])
-  -- avoid `addEntry` for local-only caching
+  -- `modifyState` logs no entry. The state is exported for every name the environment contains, but importers look
+  -- a name up only in its defining module's entries, so a type cached here for an imported name stays local.
   modifyEnv (monoTypeExt.modifyState · (monoTypeExt.addEntryFn · (declName, type)))
   return type
 
