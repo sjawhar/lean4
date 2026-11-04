@@ -1120,6 +1120,47 @@ def Module.restoreAllArtifacts (mod : Module) (cached : ModuleOutputArtifacts) :
 where
   @[inline] restoreSome file art? := art?.mapM (restoreArtifact file ·)
 
+/--
+Restores into the build directory each usage-cutoff sidecar of the module (`.usage`, `.resolved`, `.usekey`) that the
+build directory lacks, if the cache's mapping of the input `inputHash` names it, describes the same `.olean` (`olean`,
+the hash of the module's), and the local cache holds an entry whose bytes have the hash the mapping names. A module's
+trace usually names no sidecar (`fetchFromCache?` and a compile write it without them; a kept-module check's accept
+names them), so a restore through the trace brings none back, while the mapping, written when the outputs were cached,
+names those they had.
+
+A sidecar that stays missing (the mapping names none or describes another compile, or the cache lost its entry or holds
+other bytes) is no error: the usage cutoff never skips the module on a record it cannot read (`Module.usageVerdict`),
+and an importer's check takes the module to have no usage record (`importUsage?`). A restored one is checked as any
+other: the `.usekey` binds the `.usage` and the `.olean`, and the `.usage` binds the `.resolved`.
+-/
+def Module.restoreMissingSidecars (mod : Module) (inputHash olean : Hash) : JobM Unit := do
+  if (← mod.usageFile.pathExists) && (← mod.resolvedFile.pathExists) && (← mod.usekeyFile.pathExists) then
+    return
+  let descrs? ← try
+      pure <| (← (← getLakeCache).readOutputs? mod.pkg.cacheScope inputHash).bind fun out =>
+        (fromJson? out.data : Except String ModuleOutputDescrs).toOption
+    catch e =>
+      dropLogFrom e
+      pure none
+  let some descrs := descrs? | return
+  -- Sidecars of another compile would only be rejected where they are read
+  unless descrs.olean.hash == olean do return
+  restore mod.usageFile descrs.usage?
+  restore mod.resolvedFile descrs.resolved?
+  restore mod.usekeyFile descrs.usekey?
+where
+  restore (file : FilePath) (descr? : Option ArtifactDescr) : JobM Unit := do
+    let some descr := descr? | return
+    if (← file.pathExists) then return
+    -- Only the local cache (`resolveArtifact` downloads nothing without a cache service), and only an entry with the
+    -- bytes the mapping names: the file is then the record of the compile the mapping describes, and readable
+    try
+      let art ← resolveArtifact descr none none
+      unless Hash.ofByteArray (← IO.FS.readBinFile art.path) == descr.hash do return
+      discard <| restoreArtifact file art
+    catch e =>
+      dropLogFrom e
+
 public def Module.checkArtifactsExist
   (self : Module) (isModule : Bool) (skipIR := isModule && self.postponeCompile)
 : BaseIO Bool := do
@@ -1876,6 +1917,11 @@ def Module.skipOrBuildCore (mod : Module) (presetup : ModulePreSetup) (savedTrac
     if indexed then lookupOrBuild (.compile reason, ← mkModuleSetup mod presetup) else build none
   let .ok data := savedTrace | noVerdict "it has no trace"
   unless (← mod.usageCutoffApplies presetup) do return ← noVerdict "its outputs are missing"
+  -- A trace usually names no sidecar, so a restore through it brought back none that the build directory lost: those
+  -- come from the mapping of the input the trace records, before the decision reads them
+  if cacheWith? == some true then
+    if let some descrs := savedTrace.moduleOutputDescrs? then
+      mod.restoreMissingSidecars data.depHash descrs.olean.hash
   let setup ← mkModuleSetup mod presetup
   let verdict ← mod.usageVerdict presetup setup.importArts hashes
   -- The decision, and the importees whose records it took
