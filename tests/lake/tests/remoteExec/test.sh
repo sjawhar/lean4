@@ -11,7 +11,8 @@ WORK="$TEST_DIR/work"; mkdir -p "$WORK"
 test_cmd bash "$TEST_DIR/fake_selftest.sh"
 
 for d in local remote remote2 failed timeout unreach later later-local later2 wrongtc killed termed termed-write stuck \
-    late late-ref fb-local fb-mixed fb-unavail fb-mat fb-mat-nf fb-seed fb-restore fb-wait fb-wait-mid; do
+    late late-ref fb-local fb-mixed fb-unavail fb-mat fb-mat-nf fb-seed fb-restore fb-wait fb-wait-mid \
+    cf-seed cf-restore cf-svc cf-svc2; do
   mkdir -p "$WORK/$d"; cp -r lakefile.toml Rx.lean Rx "$WORK/$d/"
 done
 export LAKE_REMOTE_EXEC_CLIENT="$TEST_DIR/fake_lean_remote.py" FAKE_CAS="$WORK/cas" FAKE_LOG="$WORK/fake.log"
@@ -283,6 +284,34 @@ rx_olean=$(cd "$WORK/fb-restore" && LAKE_CACHE_DIR="$WORK/fb-cache" LAKE_ARTIFAC
 test_cmd cmp "$WORK/local/.lake/build/lib/lean/Rx.olean" "$rx_olean"
 test_exp "${rx_olean#"$WORK/fb-cache/artifacts/"}" != "$rx_olean"
 test_exp ! -e "$WORK/fb-restore/.lake/build/lib/lean/Rx.olean"
+
+# The Lake cache comes first in service mode too, as in a local build: a fresh tree whose modules the cache holds
+# restores each of them with no request, replays its saved log (Rx.C's message), counts nothing, writes no line to
+# LAKE_REMOTE_EXEC_LOG, and has the outputs of a local build.
+(cd "$WORK/cf-seed" && LAKE_CACHE_DIR="$WORK/cf-cache" LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true \
+  test_run build Rx)
+runs=$(count_method run)
+(cd "$WORK/cf-restore" && LAKE_CACHE_DIR="$WORK/cf-cache" LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true \
+  LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_REMOTE_EXEC_LOG="$WORK/cf-restore.jsonl" \
+  test_out "lake: remote: ok; 0 cached (0 from manifest), 0 executed, 0 local;" build Rx)
+match_text "c says hi" "$WORK/cf-restore/produced.out"
+test_cmd_eq "$runs" count_method run
+test_cmd same_outputs "$WORK/cf-restore"
+test_exp ! -s "$WORK/cf-restore.jsonl"
+# The outputs that the service gives a build go to the Lake cache, as a local compile's do: another fresh tree on
+# that cache restores every module with no request, and so does the first tree for an output it lost.
+(cd "$WORK/cf-svc" && LAKE_CACHE_DIR="$WORK/cf-cache2" LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true \
+  LAKE_REMOTE_EXEC=grpc://fake:1 test_out "lake: remote: ok; 5 cached (0 from manifest), 0 executed, 0 local;" build Rx)
+runs=$(count_method run)
+(cd "$WORK/cf-svc2" && LAKE_CACHE_DIR="$WORK/cf-cache2" LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true \
+  LAKE_REMOTE_EXEC=grpc://fake:1 test_out "lake: remote: ok; 0 cached (0 from manifest), 0 executed, 0 local;" build Rx)
+match_text "c says hi" "$WORK/cf-svc2/produced.out"
+test_cmd same_outputs "$WORK/cf-svc2"
+rm -f "$WORK/cf-svc/.lake/build/lib/lean/Rx/C.olean"
+(cd "$WORK/cf-svc" && LAKE_CACHE_DIR="$WORK/cf-cache2" LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true \
+  LAKE_REMOTE_EXEC=grpc://fake:1 test_out "lake: remote: ok; 0 cached (0 from manifest), 0 executed, 0 local;" build Rx)
+test_cmd same_outputs "$WORK/cf-svc"
+test_cmd_eq "$runs" count_method run
 
 # `wait`, with the service down when the build starts: no module compiles locally; Lake probes the service
 # again on a new connection after 1, 2, 4 … s, one job at a time, prints the waiting line, and builds on the

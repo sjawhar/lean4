@@ -710,6 +710,7 @@ nothing unless `LAKE_REMOTE_CACHE` names a service) and replaces the local one.
 -/
 @[specialize] def getArtifactsUsingCache?
   [ResolveOutputs α] (inputHash : Hash) (pkg : Package) (target : String) (srcHash? : Option Hash)
+  (remoteRead := true)
 : JobM (Option (α × Log)) := do
   let reportIssue (e : Log.Pos) : JobM Unit := do
     let log ← takeLogFrom e
@@ -721,7 +722,8 @@ nothing unless `LAKE_REMOTE_CACHE` names a service) and replaces the local one.
     logVerbose msg
   let resolve (out : CacheOutput) : JobM (Option (α × Log)) := do
     try
-      return some (← resolveOutputs out, out.log?.getD {})
+      let localOut := if remoteRead || out.service?.isNone then out else CacheOutput.ofData out.data
+      return some (← resolveOutputs localOut, out.log?.getD {})
     catch e =>
       reportIssue e
       return none
@@ -732,6 +734,7 @@ nothing unless `LAKE_REMOTE_CACHE` names a service) and replaces the local one.
   if let some out := local? then
     if let some a ← resolve out then
       return some a
+  unless remoteRead do return none
   -- A local mapping file that exists but cannot be used (it does not parse, or its artifacts are
   -- gone) is replaced by the remote one, so that it does not hide the remote cache again
   let hadLocal ← (cache.outputsFile pkg.cacheScope inputHash).pathExists
@@ -777,17 +780,18 @@ open ResolveOutputs in
 /--
 Retrieve artifacts from the Lake cache using the outputs stored in either
 the saved trace file or in the cached input-to-content mapping,
-along with the build log stored with them.
+along with the build log stored with them. With `remoteRead := false`, the shared remote cache is
+not read (see `getArtifactsUsingCache?`).
 
 **For internal use only.**
 -/
 @[inline] public nonrec def getArtifacts?
   [ResolveOutputs α] (inputHash : Hash) (savedTrace : SavedTrace) (pkg : Package)
-  (target : String) (srcHash? : Option Hash)
+  (target : String) (srcHash? : Option Hash) (remoteRead := true)
 : JobM (Option (α × Log)) := do
   if let some a ← getArtifactsUsingTrace? inputHash savedTrace pkg then
     return some (a, savedTrace.log)
-  if let some a ← getArtifactsUsingCache? inputHash pkg target srcHash? then
+  if let some a ← getArtifactsUsingCache? inputHash pkg target srcHash? remoteRead then
     return some a
   return none
 
