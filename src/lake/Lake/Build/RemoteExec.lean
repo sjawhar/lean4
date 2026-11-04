@@ -105,12 +105,23 @@ public inductive SessionDecision
   /-- The service did not answer; `LAKE_REMOTE_EXEC_FALLBACK` decides what a module that needs it does
   (see `useService`). -/
   | unreachable (message : String)
+  /-- The service answered with a different Lean githash. Only `local` may fall back. -/
+  | toolchainMismatch (message : String)
   /-- The service must not be used, whatever the fallback: the client cannot run, the daemon refuses
   the protocol, or it did not verify that its toolchain runs this Lake's Lean. -/
   | refused (message : String)
 
 /-- This process's decision: `none` until the first `hello`. -/
 builtin_initialize remoteDecisionRef : Std.Mutex (Option SessionDecision) ← Std.Mutex.new none
+
+builtin_initialize remoteMismatchWarned : Std.Mutex Bool ← Std.Mutex.new false
+
+def warnToolchainMismatch (message : String) : BaseIO Unit :=
+  remoteMismatchWarned.atomically do
+    unless (← getThe Bool) do
+      set true
+      (IO.eprintln s!"warning: {message}; falling back to local compilation").catchExceptions
+        fun _ => pure ()
 
 /--
 How many times this process found the build service answering again after it had not (fallback
@@ -123,8 +134,8 @@ builtin_initialize remoteEpochRef : IO.Ref Nat ← IO.mkRef 0
 /--
 The verdict of one `hello` answer (contract C5.1). No output is recorded unless the daemon answers
 `toolchainVerified = true`, which it sets only when the toolchain image's `lean --githash` equals
-`leanGithash` (fails closed: a missing field is false), so a wrong toolchain fails the build instead
-of recording another Lean's outputs.
+`leanGithash` (fails closed: a missing field is false). A confirmed different hash may select the
+local fallback, but the service's outputs are never recorded under this Lean's input hash.
 -/
 def helloVerdict (endpoint leanGithash : String) (j : Json) : SessionDecision := Id.run do
   let str? (k : String) : Option String :=
@@ -132,16 +143,15 @@ def helloVerdict (endpoint leanGithash : String) (j : Json) : SessionDecision :=
   unless (j.getObjValAs? Bool "reachable").toOption.getD false do
     return .unreachable s!"build service at {endpoint} did not answer: \
       {(str? "reason").getD "no reason given"}"
+  if let some g := str? "toolchainGithash" then
+    if g != leanGithash then
+      return .toolchainMismatch s!"build service at {endpoint} runs Lean {g}, but this Lake uses Lean \
+        {leanGithash}; refusing to record its outputs (check LAKE_REMOTE_EXEC_TOOLCHAIN and \
+        LAKE_REMOTE_EXEC_SYSROOT)"
   if (j.getObjValAs? Bool "toolchainVerified").toOption.getD false then
     return .active
-  match str? "toolchainGithash" with
-  | some g =>
-    return .refused s!"build service at {endpoint} runs Lean {g}, but this Lake uses Lean \
-      {leanGithash}; refusing to record its outputs (check LAKE_REMOTE_EXEC_TOOLCHAIN and \
-      LAKE_REMOTE_EXEC_SYSROOT)"
-  | none =>
-    return .refused s!"build service at {endpoint} did not verify its toolchain: \
-      {(str? "reason").getD "no reason given"}; refusing to record its outputs"
+  return .refused s!"build service at {endpoint} did not verify its toolchain: \
+    {(str? "reason").getD "no reason given"}; refusing to record its outputs"
 
 /-- Records that a service in use can no longer be used, so that the end-of-build line says so
 (`remoteDecisionState`). A decision that did not put the service in use is kept. -/
@@ -166,6 +176,10 @@ def admitHello (endpoint leanGithash : String) (fallback : RemoteFallback) (j : 
   | .unreachable msg =>
     unless fallback == .wait do
       noteUnusable (.unreachable msg)
+    return some msg
+  | .toolchainMismatch msg =>
+    noteUnusable (.toolchainMismatch msg)
+    if fallback == .compileLocally then warnToolchainMismatch msg
     return some msg
   | .refused msg =>
     noteUnusable (.refused msg)
@@ -263,6 +277,7 @@ def awaitService (client : RemoteExec.ClientConfig) (endpoint leanGithash : Stri
     | none =>
       if let some .active := cur then return .ok ()
     if let some (.refused msg) := cur then return .error msg
+    if let some (.toolchainMismatch msg) := cur then return .error msg
     let mut delay := remoteProbeFirstDelayMs
     let mut waiting : Option (String × Nat) := none
     repeat
@@ -274,6 +289,9 @@ def awaitService (client : RemoteExec.ClientConfig) (endpoint leanGithash : Stri
         set (some SessionDecision.active)
         remoteEpochRef.modify (· + 1)
         return .ok ()
+      | .toolchainMismatch msg =>
+        set (some (SessionDecision.toolchainMismatch msg))
+        return .error msg
       | .refused msg =>
         set (some (SessionDecision.refused msg))
         return .error msg
@@ -299,6 +317,11 @@ public def remoteEpoch : BaseIO Nat :=
 public def remoteDecision? : BaseIO (Option SessionDecision) :=
   remoteDecisionRef.atomically (getThe (Option SessionDecision))
 
+/-- Records one Lean module that failed because the service was unavailable under `fail`, or its
+toolchain mismatched under `wait` or `fail` (for exit code 75, `Lake.finalizeBuild`). -/
+public def recordUnavailableFailure : JobM Unit := do
+  (← (·.remoteStats) <$> getBuildContext).modify (·.addUnavailableFailure)
+
 /--
 The fallback `wait` for a job whose request answered `UNAVAILABLE` (see `awaitService`): returns once
 the service answers again, so the job sends the request again. `epoch` is `remoteEpoch` read before
@@ -306,12 +329,8 @@ the request was sent.
 -/
 public def awaitServiceAgain (s : RemoteSession) (epoch : Nat) : JobM Unit := do
   if let .error msg ← awaitService s.client s.cfg.endpoint s.leanGithash (some epoch) then
+    if let some (.toolchainMismatch _) ← remoteDecision? then recordUnavailableFailure
     error msg
-
-/-- Records one Lean module that failed because the build service did not answer, under
-`LAKE_REMOTE_EXEC_FALLBACK=fail` (for exit code 75, `Lake.finalizeBuild`). -/
-public def recordUnavailableFailure : JobM Unit := do
-  (← (·.remoteStats) <$> getBuildContext).modify (·.addUnavailableFailure)
 
 /--
 Whether a module that needs the build service sends its request (contract C5.1): says `hello` once
@@ -320,11 +339,18 @@ answer. `true`: send it. `false`: the fallback is `local` (the default), and the
 this machine; once the service did not answer, every later module of this process does so without a
 request, and the next build asks again. Under `fail` it errors with the decision's message, counted
 (`recordUnavailableFailure`); under `wait` it returns `true` once the service answers
-(`awaitService`). A refused service fails the module whatever the fallback.
+(`awaitService`). A refused service fails the module whatever the fallback. A confirmed toolchain
+mismatch falls back only under `local`; `wait` and `fail` fail with exit code 75.
 -/
 public def useService (s : RemoteSession) : JobM Bool := do
   match ← ensureDecision s.client s.cfg.endpoint s.leanGithash with
   | .active => return true
+  | .toolchainMismatch msg =>
+    if s.cfg.fallback == .compileLocally then
+      warnToolchainMismatch msg
+      return false
+    recordUnavailableFailure
+    error msg
   | .refused msg => error msg
   | .unreachable msg =>
     match s.cfg.fallback with
@@ -334,17 +360,19 @@ public def useService (s : RemoteSession) : JobM Bool := do
       error msg
     | .wait =>
       if let .error msg ← awaitService s.client s.cfg.endpoint s.leanGithash none then
+        if let some (.toolchainMismatch _) ← remoteDecision? then recordUnavailableFailure
         error msg
       return true
 
 /--
 The `hello` that `lake build` sends at its start (with `command := build`), so that every build's
-GetCapabilities carries the build's invocation id; it makes this process's decision. A refused
-service (a client that cannot run, or an unverified toolchain) fails the build here.
+GetCapabilities carries the build's invocation id; it makes this process's decision. An unverified
+service fails here. A confirmed mismatch warns and returns `none` under `local`, or returns the
+error message for the caller to fail with exit code 75 under `wait` and `fail`.
 -/
-public def startRemoteSession (ws : Workspace) : IO Unit := do
+public def startRemoteSession (ws : Workspace) : IO (Option String) := do
   let some cfg := ws.lakeEnv.remoteExec?
-    | return
+    | return none
   let some _ := cfg.toolchain?
     | throw (IO.userError "LAKE_REMOTE_EXEC is set but LAKE_REMOTE_EXEC_TOOLCHAIN is not")
   let sysroot ← match cfg.sysroot? with
@@ -361,6 +389,10 @@ public def startRemoteSession (ws : Workspace) : IO Unit := do
   RemoteExec.killBridge
   if let .refused msg := decision then
     throw (IO.userError msg)
+  if let .toolchainMismatch msg := decision then
+    if cfg.fallback != .compileLocally then return some msg
+    warnToolchainMismatch msg
+  return none
 
 /-- The service's state for the end-of-build line (contract C5.1): `idle` when no `hello` was sent. -/
 public def remoteDecisionState : BaseIO RemoteState := do
@@ -368,6 +400,7 @@ public def remoteDecisionState : BaseIO RemoteState := do
   | none => return .idle
   | some .active => return .ok
   | some (.unreachable _) => return .unreachable
+  | some (.toolchainMismatch msg) => return .off msg
   | some (.refused msg) => return .off msg
 
 /-! ## Statistics and the per-target log -/
@@ -386,7 +419,8 @@ public def recordRemoteLocal : JobM Unit := do
 
 /-- Appends one line to `LAKE_REMOTE_EXEC_LOG`, if set (contract C5.1: `kind`, `target`, `result`,
 `action`, `outputs` by extension, `exitCode`, `wallMs`). `result` is `cached` or `executed` for a
-result of the service, and `local` for a module the fallback compiled (no action, no outputs). -/
+result of the service, `local` for an unavailable-service fallback compile, or `toolchain-mismatch`
+for a confirmed-mismatch fallback compile (both have no action or outputs). -/
 public def appendRemoteLog (s : RemoteSession) (kind target result action : String) (exitCode : Int)
     (outputs : Array (String × RemoteExec.Digest)) (wallMs : Nat) : JobM Unit := do
   let some path := s.cfg.log?

@@ -1439,19 +1439,24 @@ def Module.remoteRunRequest (mod : Module) (presetup : ModulePreSetup) (head : R
     ("target", mod.name.toString)]
 
 /--
-Leaves the build action of `fetchRemote` because the build service did not answer: a request
-answered `UNAVAILABLE`, after the daemon's own retries (contract C5.1). `epoch` is `remoteEpoch`,
-read just before that request was sent. A bridge `hello` that refused the service also rejects
-requests as `UNAVAILABLE`; it records `.refused`, which fails whatever the fallback
-(`remoteDecision?`). Under `LAKE_REMOTE_EXEC_FALLBACK=fail` an unavailable service errors with `msg`,
-counted for exit code 75 (`recordUnavailableFailure`). Otherwise it notes `msg` and `epoch` in `why`
-and fails without a log entry, from `pos`, where the action started; `fetchRemote` then drops what
-the action logged and takes the fallback (`local` or `wait`). Either way the action writes no trace.
+Leaves the build action of `fetchRemote` after a request answers `UNAVAILABLE`, either after the
+daemon's retries (contract C5.1) or because the bridge rejected its `hello`. `epoch` is `remoteEpoch`,
+read just before that request was sent. A failed bridge `hello` also rejects requests as
+`UNAVAILABLE`; its saved verdict distinguishes an unverified service (always fatal) from a confirmed
+toolchain mismatch (local fallback only under `local`, otherwise exit 75). An unavailable service
+under `fail` also errors with `msg`, counted for exit 75 (`recordUnavailableFailure`). Otherwise it
+notes `msg` and `epoch` in `why` and fails without a log entry, from `pos`, where the action started;
+`fetchRemote` drops what the action logged and takes the fallback. Either way the action writes no trace.
 -/
 def remoteUnavailable (s : RemoteSession) (why : IO.Ref (Option (String × Nat))) (pos : Log.Pos)
     (epoch : Nat) (msg : String) : JobM α := do
-  if let some (.refused refusal) ← remoteDecision? then
-    error refusal
+  match ← remoteDecision? with
+  | some (.refused refusal) => error refusal
+  | some (.toolchainMismatch mismatch) =>
+    if s.cfg.fallback != .compileLocally then
+      recordUnavailableFailure
+      error mismatch
+  | _ => pure ()
   if s.cfg.fallback == .fail then
     recordUnavailableFailure
     error msg
@@ -1552,11 +1557,11 @@ Fetch a module's outputs from the build service (contract C5.1): replay an up-to
 request, else restore them from the local Lake cache with no request (`fromCache`, as `fetchLocal`
 restores before a compile), otherwise `run` the action, materialize the outputs, write the trace as a
 local compile does (`buildRemote`), and save them to the local Lake cache (`cacheRemoteOutputs`).
-Returns `none` when the service did not answer and `LAKE_REMOTE_EXEC_FALLBACK`
-is `local` (`useService`, `remoteUnavailable`): the caller then compiles the module on this machine,
-where its imports' outputs are, as every result of the service is materialized here at once. Under
-`wait`, a request that answered `UNAVAILABLE` is sent again once the service answers
-(`awaitServiceAgain`). A result of the service (a nonzero exit, `OOM`, `TIMEOUT`, `DISK_LIMIT`) and
+Returns `none` when the service is unavailable or has a confirmed toolchain mismatch and
+`LAKE_REMOTE_EXEC_FALLBACK` is `local` (`useService`, `remoteUnavailable`): the caller then compiles
+on this machine, where imports' outputs were materialized. Under `wait`, an unavailable request
+is retried once the service answers (`awaitServiceAgain`); a confirmed mismatch fails with exit 75.
+A result of the service (a nonzero exit, `OOM`, `TIMEOUT`, `DISK_LIMIT`) and
 every other error are the module's result, never a reason to fall back.
 -/
 def Module.fetchRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSession)
@@ -2407,12 +2412,14 @@ where
       return .done (← mod.buildLean presetup)
     if let some arts ← mod.fetchRemote presetup s savedTrace (fromLocalCache presetup) then
       return .done arts
+    let result := if (← remoteDecision?) matches some (.toolchainMismatch _) then
+      "toolchain-mismatch" else "local"
     let compiled ← trackBuilds
     let start ← IO.monoMsNow
     let r ← fetchLocal presetup sawDone
     if (← compiled) then
       recordRemoteLocal
-      appendRemoteLog s "lean" mod.name.toString "local" "" 0 #[] ((← IO.monoMsNow) - start)
+      appendRemoteLog s "lean" mod.name.toString result "" 0 #[] ((← IO.monoMsNow) - start)
     return r
   fetchLocal (presetup : ModulePreSetup) (sawDone : Bool) :
       JobM (ClaimLoop ModuleOutputArtifacts) := do

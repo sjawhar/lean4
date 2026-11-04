@@ -1040,7 +1040,9 @@ protected def build : CliM PUnit := do
   let buildConfig := mkBuildConfig opts (out := .stdout) (showSuccess := true) outputsPackage?
   -- Say `hello` to the build service at the build's start, so its GetCapabilities carries the
   -- build's invocation id (contract C5.1). A no-op when service mode is off.
-  startRemoteSession ws
+  if let some mismatch ← startRemoteSession ws then
+    logError mismatch
+    exit remoteUnavailableCode
   ws.runBuild (buildSpecs specs) {buildConfig with forgetContext := opts.oneShot}
 
 protected def checkBuild : CliM PUnit := do

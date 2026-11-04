@@ -24,6 +24,9 @@ Knobs, all through the environment:
                       `leanGithash`); `toolchainVerified` is true only when it is the client's, as the
                       daemon's toolchain probe decides
   FAKE_OMIT_VERIFIED  `1`: `hello` answers without `toolchainVerified` and `toolchainGithash`
+  FAKE_UNVERIFIED    `1`: `hello` reports the client's githash but toolchainVerified is false
+  FAKE_HELLO_SEQUENCE `refused-later` or `mismatch-after-outage`: capabilities across connections
+  FAKE_HELLO_STATE    the counter file for FAKE_HELLO_SEQUENCE
   FAKE_TIMEOUT_TARGET a target name: its `run` answers TIMEOUT, as an action that ran past its timeout
   FAKE_OOM_TARGET     a target name: its `run` answers OOM, as an action that ran out of memory
   FAKE_DISK_TARGET    a target name: its `run` answers DISK_LIMIT, as an action that filled its disk
@@ -233,7 +236,9 @@ def hello(p):
 def hello_answer(p):
     if os.environ.get("FAKE_HELLO_STAMP"):
         with open(os.environ["FAKE_HELLO_STAMP"], "w") as f: f.write(repr(time.time()))
-    later = os.environ.get("FAKE_UNREACHABLE_LATER") or os.environ.get("FAKE_UNVERIFIED_LATER")
+    sequence = os.environ.get("FAKE_HELLO_SEQUENCE")
+    later = (os.environ.get("FAKE_UNREACHABLE_LATER") or os.environ.get("FAKE_UNVERIFIED_LATER")
+             or os.environ.get("FAKE_HELLO_STATE"))
     nth = 1
     if later:
         with _lock, open(later, "a+") as f:
@@ -241,11 +246,13 @@ def hello_answer(p):
     if down():
         return {"daemonVersion": "fake", "daemonPid": os.getpid(), "reachable": False,
                 "reason": "fake: the service is down", "toolchainVerified": False}
-    if os.environ.get("FAKE_UNREACHABLE") == "1" or (nth > 1 and os.environ.get("FAKE_UNREACHABLE_LATER")):
+    if (os.environ.get("FAKE_UNREACHABLE") == "1" or (nth > 1 and os.environ.get("FAKE_UNREACHABLE_LATER"))
+            or (sequence == "mismatch-after-outage" and nth == 1)):
         return {"daemonVersion": "fake", "daemonPid": os.getpid(), "reachable": False,
                 "reason": "fake: unreachable", "toolchainVerified": False}
     client = p.get("leanGithash") or ""
-    githash = "0" * 40 if nth > 1 else (os.environ.get("FAKE_GITHASH") or client)
+    mismatch = nth > 1 and (os.environ.get("FAKE_UNVERIFIED_LATER") or sequence == "mismatch-after-outage")
+    githash = "0" * 40 if mismatch else (os.environ.get("FAKE_GITHASH") or client)
     res = {"daemonVersion": "fake", "daemonPid": os.getpid(), "reachable": True,
            "toolchainVerified": bool(githash) and githash == client}
     if githash:
@@ -254,6 +261,8 @@ def hello_answer(p):
         res["reason"] = "fake: no githash to verify the toolchain against"
     if os.environ.get("FAKE_OMIT_VERIFIED") == "1":
         res.pop("toolchainVerified", None); res.pop("toolchainGithash", None)
+    if os.environ.get("FAKE_UNVERIFIED") == "1" or (sequence == "refused-later" and nth > 1):
+        res["toolchainVerified"] = False
     return res
 
 
