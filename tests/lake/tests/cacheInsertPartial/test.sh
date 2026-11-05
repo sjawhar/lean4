@@ -2,6 +2,7 @@
 source ../common.sh
 
 ./clean.sh
+HERE=$(pwd)
 
 # A write of an artifact cache entry that fails or stops part way must leave nothing under the
 # entry's name. A partial file under the name would be kept by the next build that caches the
@@ -304,6 +305,73 @@ if [ "$UNAME" = Linux ]; then
     [ "$(basename "$f")" = outputs.jsonl ] && continue
     test_cmd cmp "$f" "cache10/artifacts/$(basename "$f")"
   done
+  # Service outputs must not publish a mapping when their local cache insertion was skipped.
+  mkdir service-build archive-seed archive-reader
+  for dir in service-build archive-seed archive-reader; do
+    printf 'name = "partial-service"\n[[lean_lib]]\nname = "Big"\n' > "$dir/lakefile.toml"
+    cp Big.lean "$dir/"
+  done
+  REMOTE_CLIENT="$HERE/../remoteExec/fake_lean_remote.py"
+  REMOTE_TOOLCHAIN=sha256:0000000000000000000000000000000000000000000000000000000000000001
+  REMOTE_SYSROOT="$(lean --print-prefix)"
+  SERVICE_CACHE="$PWD/cache-service"
+  echo '\$ (preload: service-output cache insertion fails; lake build Big)'
+  rc=0
+  env LD_PRELOAD="$PRELOAD" LAKE_TEST_FAIL_LINK="$SERVICE_CACHE/artifacts/" \
+    LAKE_TEST_LINK_LOG="$PWD/service-link.log" LAKE_CACHE_DIR="$SERVICE_CACHE" \
+    LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_REMOTE_EXEC_FALLBACK=fail \
+    LAKE_REMOTE_EXEC_CLIENT="$REMOTE_CLIENT" LAKE_REMOTE_EXEC_TOOLCHAIN="$REMOTE_TOOLCHAIN" \
+    LAKE_REMOTE_EXEC_SYSROOT="$REMOTE_SYSROOT" FAKE_CAS="$PWD/service-cas" \
+    FAKE_LOG="$PWD/service-fake.log" \
+    "$LAKE" -v -d service-build build Big > service-build.out 2>&1 || rc=$?
+  cat service-build.out
+  test_exp $rc = 0
+  match_text ': not cached' service-build.out
+  test_exp -s service-build/.lake/build/lib/lean/Big.olean
+  test_exp "$(wc -l < service-link.log)" = 1
+  test_exp "$(find "$SERVICE_CACHE/artifacts" -type f | wc -l)" = 0
+
+  # An archive-only hit stays usable when recaching its unpacked outputs is skipped.
+  ARCHIVE_CACHE="$PWD/cache-service-archive"
+  LAKE_CACHE_DIR="$ARCHIVE_CACHE" test_run -d archive-seed build Big -o "$PWD/archive-outputs.jsonl"
+  LAKE_CACHE_DIR="$ARCHIVE_CACHE" test_run -d archive-seed cache add "$PWD/archive-outputs.jsonl"
+  find "$ARCHIVE_CACHE/artifacts" -type f ! -name '*.ltar' -delete
+  ARCHIVE_MAPPING="$(find "$ARCHIVE_CACHE/outputs" -name '*.json')"
+  test_exp "$(find "$ARCHIVE_CACHE/outputs" -name '*.json' | wc -l)" = 1
+  test_exp "$(find "$ARCHIVE_CACHE/artifacts" -name '*.ltar' | wc -l)" = 1
+  cp "$ARCHIVE_MAPPING" archive-mapping-before.json
+  echo '\$ (preload: archive-output cache insertion fails; lake build Big)'
+  rc=0
+  env LD_PRELOAD="$PRELOAD" LAKE_TEST_FAIL_LINK="$ARCHIVE_CACHE/artifacts/" \
+    LAKE_TEST_LINK_LOG="$PWD/archive-service-link.log" LAKE_CACHE_DIR="$ARCHIVE_CACHE" \
+    LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_REMOTE_EXEC_FALLBACK=fail \
+    LAKE_REMOTE_EXEC_CLIENT="$REMOTE_CLIENT" LAKE_REMOTE_EXEC_TOOLCHAIN="$REMOTE_TOOLCHAIN" \
+    LAKE_REMOTE_EXEC_SYSROOT="$REMOTE_SYSROOT" FAKE_CAS="$PWD/archive-service-cas" \
+    FAKE_LOG="$PWD/archive-service-fake.log" FAKE_UNREACHABLE=1 \
+    "$LAKE" -v -d archive-reader build Big > archive-service.out 2>&1 || rc=$?
+  cat archive-service.out
+  test_exp $rc = 0
+  match_text ': not cached' archive-service.out
+  test_cmd cmp archive-seed/.lake/build/lib/lean/Big.olean archive-reader/.lake/build/lib/lean/Big.olean
+  test_exp "$(wc -l < archive-service-link.log)" = 1
+  test_exp "$(find "$ARCHIVE_CACHE/artifacts" -type f | wc -l)" = 1
+  python3 - "$SERVICE_CACHE" "$ARCHIVE_MAPPING" <<'PY'
+import json, pathlib, sys
+service_mappings = list(pathlib.Path(sys.argv[1]).rglob('*.json'))
+before = pathlib.Path('archive-mapping-before.json').read_bytes()
+after = pathlib.Path(sys.argv[2]).read_bytes()
+service = [row['method'] for row in map(json.loads, open('service-fake.log')) if 'method' in row]
+archive = [row['method'] for row in map(json.loads, open('archive-service-fake.log')) if 'method' in row]
+assert 'run' in service and 'materialize' in service, service
+assert archive == ['hello'], archive
+failures = []
+if service_mappings:
+    failures.append(f'service outputs not cached, but mappings were published: {service_mappings}')
+if before != after:
+    failures.append('archive-only mapping was replaced after its output cache insertion was skipped')
+assert not failures, '\n'.join(failures)
+print('skipped service outputs: no new mapping; archive-only mapping preserved')
+PY
 else
   echo "SKIPPED: the cases with failing hard links need a Linux preload"
 fi

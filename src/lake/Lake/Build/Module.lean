@@ -1542,8 +1542,9 @@ def Module.cacheRemoteOutputs (mod : Module) (presetup : ModulePreSetup) (inputH
     let restore ← mod.pkg.restoreAllArtifacts
     let cached ← withBuildSlot do
       mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile
-    (← getLakeCache).writeOutputs mod.pkg.cacheScope inputHash cached.descrs
-      (log := (← readTraceFile mod.traceFile).log)
+    unless cached.cacheSkipped do
+      (← getLakeCache).writeOutputs mod.pkg.cacheScope inputHash cached.descrs
+        (log := (← readTraceFile mod.traceFile).log)
     return cached
   catch e =>
     let log ← takeLogFrom e
@@ -2400,7 +2401,8 @@ where
       data.log.replay
       let arts := {arts with ltar? := some ltar}
       if writable then
-        (← getLakeCache).writeOutputs mod.pkg.cacheScope inputHash arts.descrs (log := data.log)
+        unless arts.cacheSkipped do
+          (← getLakeCache).writeOutputs mod.pkg.cacheScope inputHash arts.descrs (log := data.log)
         mod.indexUsage presetup arts restore data.log
       return some arts
     | .incomplete _ none => return none
