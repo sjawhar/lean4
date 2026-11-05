@@ -3,6 +3,7 @@ import Init.System.IO
 import Init.Data.List.Control
 import Init.Data.ToString
 
+/-! Tests of the file system operations of `IO`: files, handles, directories, links and metadata. -/
 
 open IO.FS
 
@@ -180,6 +181,46 @@ def testHardLink : IO Unit := do
 
 #guard_msgs in
 #eval testHardLink
+
+/-! `metadata` gives a file's identity: hard links share the device and inode, a copy does not,
+and a change of the file's status (here its access rights) moves the status change time but not
+the modification time. -/
+
+def testIdentity : IO Unit := do
+  let fn : System.FilePath := "IO_test.lean.dir/identity.txt"
+  let linkFn : System.FilePath := "IO_test.lean.dir/identity-link.txt"
+  let copyFn : System.FilePath := "IO_test.lean.dir/identity-copy.txt"
+  for f in [fn, linkFn, copyFn] do
+    if (← f.pathExists) then removeFile f
+  writeFile fn "foo"
+  hardLink fn linkFn
+  writeFile copyFn "foo"
+  let m ← fn.metadata
+  let l ← linkFn.metadata
+  let c ← copyFn.metadata
+  check_eq "1" m.device l.device
+  check_eq "2" m.inode l.inode
+  check_eq "3" m.device c.device
+  assert! m.inode != c.inode
+  assert! m.statusChanged ≥ m.modified
+  -- change the access rights until the status change time moves (filesystems differ in its
+  -- resolution), for at most about 3 s
+  let mut m' := m
+  for i in List.range 9 do
+    IO.sleep (UInt32.ofNat (10 * 2 ^ i |>.min 1000))
+    let r := {read := true, write := i % 2 == 1}
+    IO.setAccessRights fn ⟨r, r, r⟩
+    m' ← fn.metadata
+    if m'.statusChanged > m.statusChanged then break
+  check_eq "6" m.modified m'.modified
+  assert! m'.statusChanged > m.statusChanged
+  check_eq "8" m.inode m'.inode
+  check_eq "9" m'.statusChanged (← linkFn.metadata).statusChanged
+  IO.setAccessRights fn ⟨{read := true, write := true}, {read := true}, {read := true}⟩
+  for f in [fn, linkFn, copyFn] do removeFile f
+
+#guard_msgs in
+#eval testIdentity
 
 def testRemoveFile : IO Unit := do
   -- `removeFile` should remove read-only files
