@@ -857,23 +857,45 @@ protected def unstage : CliM PUnit := do
   let ok ← descrs.foldlM (init := true) fun ok descr => do
     let cachePath := artDir/ descr.relPath
     let stagingPath := stagingDir / descr.relPath
-    if (← cachePath.pathExists) then
-      if overwrite then
-        -- Cache artifacts are read-only, so the old artifact must be deleted first.
-        IO.FS.removeFile cachePath
-      else
-        return ok
-    match (← copyFile stagingPath cachePath |>.toBaseIO) with
-    | .ok _ =>
+    if !overwrite && (← cachePath.pathExists) then
       return ok
+    match (← IO.FS.readBinFile stagingPath |>.toBaseIO) with
     | .error (.noFileOrDirectory ..) =>
       logError s!"output artifact not found in staging directory: {stagingPath}"
       return false
     | .error e =>
-      logError s!"failed to copy artifact: {e}"
+      logError s!"failed to read staged artifact: {e}"
       return false
+    | .ok bytes =>
+      -- The name's hash is that of the entry's bytes, also for text: a text artifact's hash is the
+      -- hash of its normalized text, and a text entry holds that text's UTF-8 bytes. A staged file
+      -- without those bytes (e.g., one that a `stage` that stopped part way left) is not cached.
+      unless Hash.ofByteArray bytes == descr.hash do
+        logError s!"{stagingPath}: staged artifact does not match its content hash"
+        return false
+      let write : IO (Except IO.Error Unit) := do
+        -- With `overwrite`, a rename replaces the old artifact with the whole staged file at once
+        -- (without a hard link); otherwise `writeBinFileIfNew` publishes the new artifact.
+        let written : Except IO.Error Unit ← id do
+          if overwrite then
+            writeBinFileReplacing cachePath bytes
+            return .ok ()
+          writeBinFileIfNew cachePath bytes
+        if written matches .ok _ then
+          let r : IO.AccessRight := {read := true, write := false, execution := false}
+          IO.setAccessRights cachePath ⟨r, r, r⟩
+        return written
+      match (← write.toBaseIO) with
+      | .ok (.ok _) =>
+        return ok
+      | .ok (.error e) =>
+        logError s!"{cachePath}: not cached: the cache's file system did not hard-link the entry: {e}"
+        return false
+      | .error e =>
+        logError s!"failed to copy artifact: {e}"
+        return false
   unless ok do
-    logError "failed to copy all outputs to the staging directory"
+    logError "failed to copy all outputs from the staging directory"
     exit 1
   ws.lakeCache.writeMap localScope map service? opts.scope? overwrite
 

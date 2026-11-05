@@ -2348,8 +2348,9 @@ where
           let arts := {arts with keptFrom?}
           -- Note: Cache service metadata is not preserved on an output update because it would
           -- result in downloading module outputs that are not available on the remote.
-          (← getLakeCache).writeOutputs mod.pkg.cacheScope inputHash arts.descrs
-            (log := savedTrace.log) (overwrite := true)
+          unless arts.cacheSkipped do
+            (← getLakeCache).writeOutputs mod.pkg.cacheScope inputHash arts.descrs
+              (log := savedTrace.log) (overwrite := true)
           mod.indexUsage presetup arts restoreAll savedTrace.log
           return .complete arts
         else
@@ -2485,11 +2486,12 @@ where
             -- compiles (or queues) this input. After a crash between the two, the next build
             -- restores the outputs through the trace without queueing them, so they stay queued once.
             -- The supersede rule (`Cache.writeOutputsCore`): accepted outputs never replace a mapping.
-            if (← compiledHere) then
-              -- `lake cache push` packs the per-file outputs into the archive it uploads
-              queueCompiledOutputs claim? mod.pkg depTrace.hash mod.name.toString
-                (some presetup.srcHash) (toJson {arts.descrs with ltar? := none}) log
-            (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs (log := log)
+            unless arts.cacheSkipped do
+              if (← compiledHere) then
+                -- `lake cache push` packs the per-file outputs into the archive it uploads
+                queueCompiledOutputs claim? mod.pkg depTrace.hash mod.name.toString
+                  (some presetup.srcHash) (toJson {arts.descrs with ltar? := none}) log
+              (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs (log := log)
             mod.indexUsage presetup arts restore log
             return .done arts
           else

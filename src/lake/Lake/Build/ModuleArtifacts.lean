@@ -130,3 +130,15 @@ public def ModuleOutputArtifacts.descrs (arts : ModuleOutputArtifacts) : ModuleO
   resolved? := arts.resolved?.map (·.descr)
   usekey? := arts.usekey?.map (·.descr)
   keptFrom? := arts.keptFrom?
+
+/--
+Whether Lake was to save any of the artifacts in its local cache but did not (see
+`Artifact.cacheSkipped`). Lake then writes no input-to-output mapping for the module.
+-/
+public def ModuleOutputArtifacts.cacheSkipped (arts : ModuleOutputArtifacts) : Bool :=
+  arts.olean.cacheSkipped || arts.oleanServer?.any (·.cacheSkipped) ||
+  arts.oleanPrivate?.any (·.cacheSkipped) || arts.ilean.cacheSkipped ||
+  arts.irSig?.any (·.cacheSkipped) || arts.ir?.any (·.cacheSkipped) ||
+  arts.c?.any (·.cacheSkipped) || arts.bc?.any (·.cacheSkipped) ||
+  arts.ltar?.any (·.cacheSkipped) || arts.usage?.any (·.cacheSkipped) ||
+  arts.resolved?.any (·.cacheSkipped) || arts.usekey?.any (·.cacheSkipped)

@@ -776,7 +776,12 @@ Reads the mappings file located at `outputs.jsonl` within the staging
 directory and writes the mappings to the Lake cache. Then, it copies the
 described artifacts from the staging directory into the cache. Mappings and
 artifacts already in the cache are not overwritten unless `--force-overwrite`
-is specified."
+is specified. An artifact whose bytes do not have the content hash in its file
+name is not copied, and the command fails without writing the mappings. The
+same holds where the cache's file system cannot hard-link a new artifact to its
+name: a new artifact is published only by a hard link, which never leaves part
+of a file under its name or replaces a file. With `--force-overwrite`, an
+artifact is renamed into place instead."
 
 def helpCachePutStaged :=
 "Upload build outputs from a staging directory to a remote service
