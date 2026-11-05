@@ -144,7 +144,7 @@ def helloVerdict (endpoint leanGithash : String) (j : Json) : SessionDecision :=
     return .unreachable s!"build service at {endpoint} did not answer: \
       {(str? "reason").getD "no reason given"}"
   if let some g := str? "toolchainGithash" then
-    if g != leanGithash then
+    if !leanGithash.isEmpty && g != leanGithash then
       return .toolchainMismatch s!"build service at {endpoint} runs Lean {g}, but this Lake uses Lean \
         {leanGithash}; refusing to record its outputs (check LAKE_REMOTE_EXEC_TOOLCHAIN and \
         LAKE_REMOTE_EXEC_SYSROOT)"
