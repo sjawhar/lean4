@@ -124,3 +124,42 @@ for refusal in missing same; do
     )
   done
 done
+
+# A failed local githash probe leaves no known hash to compare with the service's.
+export TEST_REAL_LEAN="$(command -v lean)"
+UNKNOWN_SYSROOT="$W/unknown-sysroot"
+mkdir -p "$UNKNOWN_SYSROOT/bin"
+ln -s "$LAKE_REMOTE_EXEC_SYSROOT/lib" "$UNKNOWN_SYSROOT/lib"
+cat > "$UNKNOWN_SYSROOT/bin/lean" <<'EOF'
+#!/usr/bin/env bash
+if [ "$#" = 1 ] && [ "$1" = --githash ]; then
+  printf '%s\n' --githash >> "$TEST_GITHASH_PROBE_LOG"
+  exit 1
+fi
+exec "$TEST_REAL_LEAN" "$@"
+EOF
+chmod +x "$UNKNOWN_SYSROOT/bin/lean"
+for mode in fail wait local; do
+  name="unknown-local-$mode"
+  make_case "$name"
+  (
+    cd "$W/$name"
+    export LAKE_OVERRIDE_LEAN=1 LEAN_SYSROOT="$UNKNOWN_SYSROOT"
+    export TEST_GITHASH_PROBE_LOG="$W/$name.probe.log"
+    export LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_REMOTE_EXEC_FALLBACK="$mode"
+    export LAKE_REMOTE_EXEC_LOG="$W/$name.jsonl" FAKE_GITHASH="$REMOTE_GITHASH"
+    export FAKE_LOG="$W/$name.fake.log" FAKE_CAS="$W/$name.cas"
+    test_status_out 1 'did not verify its toolchain' build P
+    no_match_text 'falling back to local compilation' produced.out
+    test_exp -s "$TEST_GITHASH_PROBE_LOG"
+    test_exp ! -e .lake/build/lib/lean/A.olean
+    test_exp ! -e .lake/build/lib/lean/P.trace
+    test_exp ! -s "$LAKE_REMOTE_EXEC_LOG"
+    "$PYTHON" - "$FAKE_LOG" <<'PY'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
+assert [row['method'] for row in rows if 'method' in row] == ['hello'], rows
+assert rows[0]['params']['leanGithash'] == '', rows
+PY
+  )
+done
