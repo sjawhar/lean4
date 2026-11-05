@@ -57,10 +57,15 @@ for path in sys.argv[1:]:
     assert [row['method'] for row in rows if 'method' in row] == ['hello'], (path, rows)
 PY
 
+# The writable restore above deliberately left ordinary outputs in the cache.
+unset LAKE_REMOTE_EXEC
+LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true \
+  test_not_out 'Built T.D' -d "$W/seed" build T.D
+test_exp -f "$B/D.olean"
+
 # The preserved mapping must still recover missing sidecars for the usage-cutoff decision.
 rm -f "$B/D.usage" "$B/D.resolved" "$B/D.usekey"
 printf '/-! A dependency for service-cache sidecar tests. -/\ndef m : Nat := 1\ndef unused : Nat := 2\n' > "$W/seed/T/M.lean"
-unset LAKE_REMOTE_EXEC
 LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true lake_out -d "$W/seed" build -v T.D
 match_text 'Built T.M' produced.out
 match_text 'Replayed T.D' produced.out
