@@ -23,7 +23,7 @@ test_exp -f "$MAP"
 cp "$MAP" "$W/mapping-before.json"
 python3 - "$MAP" <<'PY'
 import json, sys
-mapping = json.load(open(sys.argv[1]))
+mapping = json.load(open(sys.argv[1]))['data']
 assert all(mapping.get(key) for key in ('u', 'v', 'k')), mapping
 PY
 export LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_REMOTE_EXEC_FALLBACK=fail
@@ -34,10 +34,10 @@ export LAKE_REMOTE_EXEC_SYSROOT="$(lean --print-prefix)" FAKE_CAS="$W/cas"
 # Force the trace-based cache path, whose trace omits the usage sidecar descriptors.
 rm "$B/D.olean"
 LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=false FAKE_LOG="$W/writable.log" \
-  test_out '0 remote, 0 deduped, 0 reused; 0 local;' -d "$W/seed" build T.D
+  test_out '0 cached (0 from manifest), 0 executed, 0 local;' -d "$W/seed" build T.D
 python3 - "$W/mapping-before.json" "$MAP" <<'PY'
 import json, sys
-before, after = [json.load(open(path)) for path in sys.argv[1:]]
+before, after = [json.load(open(path))['data'] for path in sys.argv[1:]]
 assert {key: after.get(key) for key in ('u', 'v', 'k')} == {key: before[key] for key in ('u', 'v', 'k')}, (before, after)
 PY
 
@@ -45,7 +45,7 @@ PY
 env -u LAKE_ARTIFACT_CACHE LAKE_RESTORE_ARTIFACTS=false FAKE_LOG="$W/readonly.log" \
   "$LAKE" -d "$W/readonly" build T.D > "$W/readonly.out" 2>&1
 cat "$W/readonly.out"
-match_text '0 remote, 0 deduped, 0 reused; 0 local;' "$W/readonly.out"
+match_text '0 cached (0 from manifest), 0 executed, 0 local;' "$W/readonly.out"
 for f in M.olean D.olean D.ilean; do
   test_exp -f "$W/readonly/.lake/build/lib/lean/T/$f"
 done
