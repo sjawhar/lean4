@@ -25,10 +25,28 @@ lean_lib Order where
 
 /--
 Three modules that import nothing, whose compiles wait 1, 2 and 3 times `LAKE_TEST_CLAIM_SLEEP`
-milliseconds, built only when named: a build with fewer workers than three runs out of them.
+milliseconds, built only when named.
 -/
 lean_lib Wide where
   roots := #[`Wide.One, `Wide.Two, `Wide.Three]
+
+/-- Checks both sides of the claim threshold with one explicitly counted operation. -/
+target claimSaturated pkg : Unit := Job.async do
+  match ← claimInput pkg (Hash.ofHex "0000000000000002") with
+  | .compile none => pure ()
+  | .compile (some claim) => withClaim (some claim) do
+    error "claimed an input below the compile threshold"
+  | .wait _ => error "waited for a claim below the compile threshold"
+  withClaim none do
+    match ← claimInput pkg (Hash.ofHex "0000000000000003") with
+    | .compile (some claim) => withClaim (some claim) (pure ())
+    | .compile none => error "did not claim an input at the compile threshold"
+    | .wait _ => error "waited for an unclaimed input at the compile threshold"
+  match ← claimInput pkg (Hash.ofHex "0000000000000004") with
+  | .compile none => pure ()
+  | .compile (some claim) => withClaim (some claim) do
+    error "claimed an input after the counted operation ended"
+  | .wait _ => error "waited for a claim after the counted operation ended"
 
 
 /--
