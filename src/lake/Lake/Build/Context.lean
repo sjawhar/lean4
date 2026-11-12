@@ -12,6 +12,7 @@ public import Lake.Build.Job.Basic
 public import Std.Sync.Mutex
 public import Lean.Data.PersistentHashMap
 public import Lean.Util.ModuleUsage
+public import Lake.Build.KeptChecker
 
 open System
 namespace Lake
@@ -125,11 +126,31 @@ public structure KernelProviders where
   read. -/
   toolchain : Lean.PHashMap Lean.Name (Option (Array UInt64 × Array Lean.Name)) := {}
 
+/-- Non-404 failures observed while reading input-hash mappings in one Lake build. -/
+public structure RemoteReadStatus where
+  failures : Nat := 0
+  lastError : String := ""
+  /--
+  How many reads of the shared remote cache in a row failed once their transfers had waited for a
+  remote that did not answer (see `noteRemoteRead`).
+  -/
+  timeoutsInRow : Nat := 0
+  /-- Why this build stopped reading the shared remote cache, once it has (see `noteRemoteRead`). -/
+  stopped? : Option String := none
+  deriving Inhabited
+
+/-- Add one read-through failure to a build's remote status. -/
+public def RemoteReadStatus.add (message : String) (status : RemoteReadStatus) : RemoteReadStatus :=
+  {status with failures := status.failures + 1, lastError := message}
+
+
 /-- A Lake context with a build configuration and additional build data. -/
 public structure BuildContext extends BuildConfig, Context where
   leanTrace : BuildTrace
   leanIncludeDirs : Array (Option (FilePath × BuildTrace))
   registeredJobs : JobQueue
+  /-- Read-through failures that `finalizeBuild` writes to `remote-status-read.json`. -/
+  remoteReadStatus : IO.Ref RemoteReadStatus
   /--
   Input-to-output(s) map for hashes of the tracked package's artifacts.
   If `none`, tracking outputs is disabled for this build.
@@ -168,9 +189,32 @@ public structure BuildContext extends BuildConfig, Context where
   /-- The kernel constants usage-cutoff checks read from `.olean` files in this build. -/
   kernelProviders : Std.Mutex KernelProviders
   /--
-  How many usage-cutoff checks (`Lake.Module.usageUpToDate`) and key writes (`Lake.Module.writeUsekey`) run now: each
-  reads its closure with more tasks the fewer run (`Lake.usageCutoffReadTasks`). An `IO.Ref` of a scalar: an update
-  is an atomic exchange held for a few nanoseconds, with no mutex, and a build makes two per check or key write.
+  What this build first read of each imported module's usage-cutoff sidecars, keyed by the module's `.usage`, as a
+  `Lake.UsageView` (`Lake.freezeUsageView`): an entry is added once and never replaced, so a view can be older
+  than the files when another process rewrote them since. Only the usage index's pre-filter reads views, and it only
+  rejects: a check that accepts reads the files again. Concurrent jobs share it, so the maps are persistent, as
+  `KernelProviders`' are: a shared hash map is never updated in place, so each view added would copy its shard's
+  whole bucket array. Sharded by the path's hash: each read or fill of a view (`usageView?`, `freezeUsageView`) takes
+  only the mutex of its path's shard.
+  -/
+  usageViews : Shards 1024 (Lean.PHashMap FilePath Dynamic)
+  /--
+  The kept-module checker (`LAKE_KEPT_CHECKER`): a module whose own source and options did not
+  change since its outputs were built, but whose imports did, keeps those outputs if the usage
+  cutoff's records show the machinery it used unchanged and the checker accepts them. If `none`,
+  every such module is compiled.
+  -/
+  keptChecker? : Option KeptChecker := none
+  /--
+  Modules to decide as if no outputs had been kept for them (`LAKE_KEPT_EXCLUDE`): their kept
+  outputs, local or cached, are not used, and the checker is not asked about them.
+  -/
+  keptExclude : Lean.NameSet := {}
+  /--
+  How many usage-cutoff checks (`Lake.Module.usageVerdict`), key writes (`Lake.Module.writeUsekey`) and closure reads
+  before a compile (`Lake.usekeyBefore`) run now: each reads its closure with more tasks the fewer run
+  (`Lake.usageCutoffReadTasks`). An `IO.Ref` of a scalar: an update is an atomic exchange held for a few nanoseconds,
+  with no mutex, and a build makes two per counted run.
   -/
   usageCutoffInFlight : IO.Ref Nat
 
@@ -186,6 +230,7 @@ public instance [Pure m] : MonadLift LakeM (BuildT m) where
 
 @[inline] public def getBuildContext [MonadBuild m] : m BuildContext :=
   readThe BuildContext
+
 
 @[inline] public def getLeanTrace [Functor m] [MonadBuild m] : m BuildTrace :=
   (·.leanTrace) <$> getBuildContext

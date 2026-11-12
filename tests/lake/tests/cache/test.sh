@@ -493,5 +493,36 @@ log_msgs .lake/log/rebuild.out
 test_cmd_eq 1 grep -c 'declaration uses' .lake/log/rebuild.out
 test_cmd_eq 1 grep -c 'a warning logged by its build' .lake/log/rebuild.out
 
+
+# With usage cutoff, a change to an import that `Log.Lint` does not use lets
+# Lake keep its outputs instead of building it, if they are still the ones its
+# trace records. Here one was changed after the build, so Lake warns about it
+# and builds the module, and the cache keeps the log of that build alone:
+# a copy that restores it prints the module's warning once and not Lake's.
+# Usage cutoff needs the imports' `.usekey` next to their `.olean`, so the
+# artifacts are restored to the build directory.
+CUTOFF_CACHE="$(norm_path "$TEST_DIR")/.lake/cutoff-cache"
+test_cmd cp -r log .lake/log/tree5
+test_cmd cp -r log .lake/log/tree6
+test_cmd chmod -R u+w .lake/log/tree5 .lake/log/tree6
+LAKE_RESTORE_ARTIFACTS=true LAKE_USAGE_CUTOFF=true cache_build "$CUTOFF_CACHE" tree5 Log.Lint
+test_exp -f .lake/log/tree5/.lake/build/lib/lean/Log/Lint.usekey
+for tree in tree5 tree6; do
+  echo 'theorem notUsedByLint : True := trivial' >> ".lake/log/$tree/Log/Sorry.lean"
+done
+# Change a copy of the output, not the hard link to its cache entry
+f=.lake/log/tree5/.lake/build/lib/lean/Log/Lint.ilean
+test_cmd cp "$f" "$f.new"
+test_cmd chmod u+w "$f.new"
+echo changed >> "$f.new"
+test_cmd mv -f "$f.new" "$f"
+test_cmd rm -f "$f.hash"
+LAKE_RESTORE_ARTIFACTS=true LAKE_USAGE_CUTOFF=true cache_build "$CUTOFF_CACHE" tree5 Log.Lint
+match_text 'does not match its trace' produced.out
+LAKE_RESTORE_ARTIFACTS=true LAKE_USAGE_CUTOFF=true cache_build "$CUTOFF_CACHE" tree6 Log.Lint --no-build
+log_msgs .lake/log/cutoff.out
+test_cmd_eq 1 grep -c 'not explicitly referenced' .lake/log/cutoff.out
+no_match_text 'does not match its trace' .lake/log/cutoff.out
+
 # Cleanup
 rm -f produced.* Ignored.lean
