@@ -10,6 +10,7 @@ Author: Leonardo de Moura
 #include <vector>
 #include <deque>
 #include <cmath>
+#include <climits>
 #include <lean/lean.h>
 #include "runtime/object.h"
 #include "runtime/thread.h"
@@ -564,6 +565,90 @@ static obj_res mark_persistent_fn(obj_arg o) {
 #endif
 #endif
 
+extern "C" void lean_mark_persistent_unshared(object * o);
+
+static obj_res mark_persistent_unshared_fn(obj_arg o) {
+    lean_mark_persistent_unshared(o);
+    return lean_box(0);
+}
+
+/*
+Like `lean_mark_persistent`, but skips multi-threaded objects and their subgraphs, which contain
+no single-threaded objects by the `lean_mark_mt` closure invariant. Safe on graphs whose
+single-threaded part is owned by the calling thread even while the multi-threaded fringe is
+concurrently accessed, since only thread-owned reference counts are written; the skipped fringe
+stays alive below persistent parents because `dec` never traverses persistent objects. Unlike
+`lean_mark_persistent`, already-shared parts keep their atomic reference counting.
+*/
+extern "C" LEAN_EXPORT void lean_mark_persistent_unshared(object * o) {
+    buffer<object*> todo;
+    todo.push_back(o);
+    while (!todo.empty()) {
+        object * o = todo.back();
+        todo.pop_back();
+        if (!lean_is_scalar(o) && lean_is_st(o)) {
+            o->m_rc = 0;
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+            // do not report as leak
+            // NOTE: Most persistent objects are actually reachable from global
+            // variables up to the end of the process. However, this is *not*
+            // true for closures inside of persistent thunks, which are
+            // "orphaned" after being evaluated.
+            __lsan_ignore_object(o);
+#endif
+#endif
+            uint8_t tag = lean_ptr_tag(o);
+            if (tag <= LeanMaxCtorTag) {
+                object ** it  = lean_ctor_obj_cptr(o);
+                object ** end = it + lean_ctor_num_objs(o);
+                for (; it != end; ++it) todo.push_back(*it);
+            } else {
+                switch (tag) {
+                case LeanScalarArray:
+                case LeanString:
+                case LeanMPZ:
+                    break;
+                case LeanExternal: {
+                    object * fn = lean_alloc_closure((void*)mark_persistent_unshared_fn, 1, 0);
+                    lean_to_external(o)->m_class->m_foreach(lean_to_external(o)->m_data, fn);
+                    lean_dec(fn);
+                    break;
+                }
+                case LeanTask:
+                    todo.push_back(lean_task_get(o));
+                    break;
+                case LeanPromise:
+                    todo.push_back((lean_object *)lean_to_promise(o)->m_result);
+                    break;
+                case LeanClosure: {
+                    object ** it  = lean_closure_arg_cptr(o);
+                    object ** end = it + lean_closure_num_fixed(o);
+                    for (; it != end; ++it) todo.push_back(*it);
+                    break;
+                }
+                case LeanArray: {
+                    object ** it  = lean_array_cptr(o);
+                    object ** end = it + lean_array_size(o);
+                    for (; it != end; ++it) todo.push_back(*it);
+                    break;
+                }
+                case LeanThunk:
+                    if (object * c = lean_to_thunk(o)->m_closure) todo.push_back(c);
+                    if (object * v = lean_to_thunk(o)->m_value) todo.push_back(v);
+                    break;
+                case LeanRef:
+                    if (object * v = lean_to_ref(o)->m_value) todo.push_back(v);
+                    break;
+                default:
+                    lean_unreachable();
+                    break;
+                }
+            }
+        }
+    }
+}
+
 extern "C" LEAN_EXPORT void lean_mark_persistent(object * o) {
     buffer<object*> todo;
     todo.push_back(o);
@@ -763,6 +848,81 @@ class task_manager {
     condition_variable                            m_task_finished_cv;
     condition_variable                            m_dedicated_finished_cv;
     bool                                          m_shutting_down{false};
+    // Growth pacing (`lean_task_pool_set_growth`, off by default): past `m_eager_std_workers` standard workers, a worker
+    // starts only once queued tasks have found no free worker for `m_spawn_delay` (`m_pacer`). After each further such
+    // delay the pacer starts twice as many as before, at most `m_eager_std_workers` (and at least one) at once and one
+    // per queued task, but none after a delay in which fewer tasks were queued than finished: then the workers already
+    // there drain the queue, and more would only wait idle once they have. Unpaced, a burst of short tasks starts about
+    // one worker per task, as a new worker counts as free only once it runs.
+    unsigned                                      m_eager_std_workers{UINT_MAX};
+    std::chrono::microseconds                     m_spawn_delay{0};
+    std::unique_ptr<lthread>                      m_pacer;
+    condition_variable                            m_pacer_cv;
+    bool                                          m_pacer_waiting{false};
+    uint64_t                                      m_queued_tasks{0};
+    uint64_t                                      m_finished_tasks{0};
+
+    bool paced() const {
+        return m_eager_std_workers != UINT_MAX;
+    }
+
+    bool starved() const {
+        return m_queues_size > 0 && m_idle_std_workers == 0 && m_std_workers.size() < m_max_std_workers;
+    }
+
+    // Starts `n` workers, at most one per queued task and within the pool's limit.
+    void spawn_workers(unsigned n) {
+        unsigned size = m_std_workers.size();
+        if (size >= m_max_std_workers)
+            return;
+        n = std::min({n, m_queues_size, m_max_std_workers - size});
+        for (unsigned i = 0; i < n; i++)
+            spawn_worker();
+    }
+
+    // A queued task finds no free worker: start one now, or leave it to the pacer.
+    void grow() {
+        if (m_std_workers.size() < m_eager_std_workers) {
+            spawn_worker();
+            return;
+        }
+        // The single-threaded stubs have no timed wait, and run an `lthread`'s function at once; there the task manager
+        // is never created.
+#if defined(LEAN_MULTI_THREAD)
+        if (m_shutting_down)
+            return;
+        if (m_pacer) {
+            if (m_pacer_waiting)
+                m_pacer_cv.notify_one();
+            return;
+        }
+        m_pacer.reset(new lthread([this]() {
+            unique_lock<mutex> lock(m_mutex);
+            unsigned batch = 1;
+            while (!m_shutting_down) {
+                if (!paced() || !starved()) {
+                    batch = 1;
+                    m_pacer_waiting = true;
+                    m_pacer_cv.wait(lock);
+                    m_pacer_waiting = false;
+                    continue;
+                }
+                auto deadline = std::chrono::steady_clock::now() + m_spawn_delay;
+                uint64_t queued = m_queued_tasks, finished = m_finished_tasks;
+                while (!m_shutting_down && std::chrono::steady_clock::now() < deadline)
+                    m_pacer_cv.wait_until(lock, deadline);
+                if (m_shutting_down || !paced() || !starved()) {
+                    batch = 1;
+                    continue;
+                }
+                if (m_queued_tasks - queued < m_finished_tasks - finished)
+                    continue;
+                spawn_workers(batch);
+                batch = std::min({2 * batch, std::max(m_eager_std_workers, 1u), m_max_std_workers});
+            }
+        }));
+#endif
+    }
 
     lean_task_object * dequeue() {
         lean_assert(m_queues_size != 0);
@@ -797,8 +957,9 @@ class task_manager {
             m_max_prio = prio;
         m_queues[prio].push_back(t);
         m_queues_size++;
+        m_queued_tasks++;
         if (!m_idle_std_workers && m_std_workers.size() < m_max_std_workers)
-            spawn_worker();
+            grow();
         else
             m_queue_cv.notify_one();
     }
@@ -859,6 +1020,7 @@ class task_manager {
                 m_idle_std_workers--;
                 run_task(lock, t);
                 m_idle_std_workers++;
+                m_finished_tasks++;
                 reset_heartbeat();
             }
             m_idle_std_workers--;
@@ -967,11 +1129,17 @@ public:
     ~task_manager() {
         {
             unique_lock<mutex> lock(m_mutex);
+            // Tasks still queued with no free worker would wait for the pacer, which stops now: start their workers.
+            if (m_pacer && starved())
+                spawn_workers(m_queues_size);
             m_shutting_down = true;
             // we can assume that `m_std_workers` will not be changed after this line
         }
         m_queue_cv.notify_all();
+        m_pacer_cv.notify_all();
 #ifndef LEAN_EMSCRIPTEN
+        if (m_pacer)
+            m_pacer->join();
         // wait for all workers to finish
         for (auto & t : m_std_workers)
             t->join();
@@ -1031,7 +1199,7 @@ public:
         if (in_pool) {
             m_max_std_workers++;
             if (m_idle_std_workers == 0)
-                spawn_worker();
+                grow();
             else
                 m_queue_cv.notify_one();
         }
@@ -1090,6 +1258,12 @@ public:
             return 2; // finished
         }
     }
+
+    void set_growth(unsigned eager_std_workers, unsigned spawn_delay_us) {
+        unique_lock<mutex> lock(m_mutex);
+        m_eager_std_workers = spawn_delay_us == 0 ? UINT_MAX : eager_std_workers;
+        m_spawn_delay = std::chrono::microseconds(spawn_delay_us);
+    }
 };
 
 static task_manager * g_task_manager = nullptr;
@@ -1119,6 +1293,13 @@ extern "C" LEAN_EXPORT uint32 lean_internal_get_hardware_concurrency(obj_arg) {
 
 extern "C" LEAN_EXPORT void lean_init_task_manager() {
     lean_init_task_manager_using(get_lean_num_threads());
+}
+
+/* setTaskPoolGrowth (eager spawnDelayUs : UInt32) : BaseIO Unit */
+extern "C" LEAN_EXPORT obj_res lean_task_pool_set_growth(uint32 eager_std_workers, uint32 spawn_delay_us) {
+    if (g_task_manager)
+        g_task_manager->set_growth(eager_std_workers, spawn_delay_us);
+    return box(0);
 }
 
 extern "C" LEAN_EXPORT void lean_finalize_task_manager() {
