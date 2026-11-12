@@ -168,31 +168,39 @@ compiled_by() {
 }
 
 case_5() {
-  # Four processes, two root targets, opposite orders: t1 and t2 build `r1` (which builds `A`,
-  # and only then `B`), t3 and t4 build `r2` (`B`, then `A`), with 2 threads each. A process that
-  # waits for one input holds no other input's lock, so no two processes wait for each other.
+  # Four processes, two root targets, opposite orders: t1 and t2 build `r1` (which starts `A`,
+  # then, past a gate, `B`), t3 and t4 build `r2` (`B`, then `A`), with 2 threads each. t1 holds
+  # `A`'s lock and waits for `B`'s while t3 holds `B`'s and waits for `A`'s. A process releases an
+  # input's lock once its outputs are in the cache, not at its exit, so the two waits end.
   case_dir 5
   probe mkab A B
   local lock_a lock_b start t left
   lock_a="$(lock_path "$HASH_A")"
   lock_b="$(lock_path "$HASH_B")"
   for t in t1 t2 t3 t4; do mkab "$t"; done
+  export CROSS_GATE="$CASE_DIR/cross-gate"
   start=$SECONDS
   LEAN_NUM_THREADS=2 start_lake t1 t1 build r1
   LEAN_NUM_THREADS=2 start_lake t3 t3 build r2
   wait_until 60 "t1 compiles A" compiled_by "$COUNTER_A" "$PID_t1"
   wait_until 60 "t3 compiles B" compiled_by "$COUNTER_B" "$PID_t3"
-  LEAN_NUM_THREADS=2 start_lake t2 t2 build r1
-  LEAN_NUM_THREADS=2 start_lake t4 t4 build r2
   wait_until 60 "t1 (pid $PID_t1) holds A's lock" is_held_by "$lock_a" "$PID_t1"
   wait_until 60 "t3 (pid $PID_t3) holds B's lock" is_held_by "$lock_b" "$PID_t3"
-  wait_until 60 "t2 is blocked on A's lock" is_blocked "$lock_a"
-  wait_until 60 "t4 is blocked on B's lock" is_blocked "$lock_b"
+  # Past the gate, t1 requests `B` and t3 requests `A`, while their first compiles still run
+  test_cmd touch "$CROSS_GATE"
+  wait_until 60 "t1 (pid $PID_t1) is blocked on B's lock" is_blocked_by "$lock_b" "$PID_t1"
+  wait_until 60 "t3 (pid $PID_t3) is blocked on A's lock" is_blocked_by "$lock_a" "$PID_t3"
+  LEAN_NUM_THREADS=2 start_lake t2 t2 build r1
+  LEAN_NUM_THREADS=2 start_lake t4 t4 build r2
+  wait_until 60 "t2 (pid $PID_t2) is blocked on A's lock" is_blocked_by "$lock_a" "$PID_t2"
+  wait_until 60 "t4 (pid $PID_t4) is blocked on B's lock" is_blocked_by "$lock_b" "$PID_t4"
   show_locks "$lock_a"
   show_locks "$lock_b"
-  # No process has reached its second module, and only t1 and t3 compile
-  expect_eq "compiles of A before the gate opens" 1 "$(lines "$COUNTER_A")"
-  expect_eq "compiles of B before the gate opens" 1 "$(lines "$COUNTER_B")"
+  expect_held "$lock_a" "$PID_t1"
+  expect_held "$lock_b" "$PID_t3"
+  # Only t1 and t3 compile
+  expect_eq "compiles of A before \$GO" 1 "$(lines "$COUNTER_A")"
+  expect_eq "compiles of B before \$GO" 1 "$(lines "$COUNTER_B")"
   test_cmd touch "$GO"
   for t in t1 t2 t3 t4; do
     left=$((120 - (SECONDS - start)))
@@ -201,6 +209,13 @@ case_5() {
   done
   expect_eq "compiles of A" 1 "$(lines "$COUNTER_A")"
   expect_eq "compiles of B" 1 "$(lines "$COUNTER_B")"
+  # t1 waited for `B` and t3 for `A`, and each restored it
+  match_text 'for another Lake process to build this input' t1.log
+  match_text 'for another Lake process to build this input' t3.log
+  match_pat 'Built A( |$)' t1.log
+  match_pat 'Built B( |$)' t3.log
+  no_match_pat 'Built B( |$)' t1.log
+  no_match_pat 'Built A( |$)' t3.log
   test_exp -f "$lock_a"
   test_exp -f "$lock_b"
 }
