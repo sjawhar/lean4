@@ -98,5 +98,5 @@ Lean.Elab.runFrontend (input : String) (opts : Lean.Options) (fileName : String)
   (trustLevel : UInt32 := 0) (oleanFileName? ileanFileName? : Option System.FilePath := none)
   (jsonOutput : Bool := false) (errorOnKinds : Array Lean.Name := #[]) (plugins : Array Lean.Plugin := #[])
   (printStats : Bool := false) (setup? : Option Lean.ModuleSetup := none)
-  (incrSaveFileName? incrLoadFileName? incrHeaderSaveFileName? : Option System.FilePath := none) :
-  IO (Option Lean.Environment)
+  (incrSaveFileName? incrLoadFileName? incrHeaderSaveFileName? usageFileName? : Option System.FilePath := none)
+  (codegen : Lean.Environment → IO Unit := fun x => pure ()) : IO (Option Lean.Environment)

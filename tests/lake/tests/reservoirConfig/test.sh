@@ -17,11 +17,11 @@ git config user.name test
 git config user.email test@example.com
 git add --all
 git commit -m "commit 1"
-git tag v1
+git -c tag.gpgSign=false tag v1
 git commit --allow-empty -m "commit 2"
-git tag v2
+git -c tag.gpgSign=false tag v2
 git commit --allow-empty -m "commit 3"
-git tag etc
+git -c tag.gpgSign=false tag etc
 set +x
 
 # Test that Lake produces the expected Reservoir configuration.
