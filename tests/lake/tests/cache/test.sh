@@ -282,17 +282,24 @@ test_run cache stage .lake/outputs.jsonl .lake/staging
 test_exp ! -s $staging_art
 test_run cache stage .lake/outputs.jsonl .lake/staging --force-overwrite
 test_exp -s $staging_art
-# Verify unstage overwritting
+# Verify unstage overwritting (of a cache artifact without its hash's bytes, here an empty file)
 test_cmd rm -rf "$CACHE_DIR"
 test_run cache unstage .lake/staging --no-overwrite
 test_exp -f $cache_art # verify copy can occur with `--no-overwrite`
+test_cmd rm -f $cache_art
+test_cmd touch $cache_art
+test_exp ! -s $cache_art
+test_run cache unstage .lake/staging
+test_exp ! -s $cache_art
+test_run cache unstage .lake/staging --force-overwrite
+test_exp -s $cache_art
+# Verify that `cache unstage` does not copy a staged artifact without its hash's bytes, also with
+# `--force-overwrite`, and keeps the cache's artifact
 test_cmd rm $staging_art
 test_cmd touch $staging_art
-test_exp ! -s $staging_art
-test_run cache unstage .lake/staging
+test_err 'staged artifact does not match its content hash' \
+  cache unstage .lake/staging --force-overwrite
 test_exp -s $cache_art
-test_run cache unstage .lake/staging --force-overwrite
-test_exp ! -s $cache_art
 
 # Verify that `lake cache clean` deletes the cache directory
 test_exp -d "$CACHE_DIR"
@@ -380,6 +387,149 @@ if command -v jq > /dev/null; then # skip if no jq found
   test_out 'some output(s) have issues' build Test:static -v --iofail
   test_exp -f $libPath
 fi
+
+# Verify that targets restored from the cache replay the log of their build:
+# a copy of a package at another path that shares the cache prints the same
+# messages as the tree that built it, without building anything itself.
+LOG_CACHE="$(norm_path "$TEST_DIR")/.lake/log-cache"
+test_cmd mkdir -p .lake/log
+test_cmd cp -r log .lake/log/tree1
+test_cmd cp -r log .lake/log/tree2
+test_cmd chmod -R u+w .lake/log
+# with_cache CACHE CMD...: run CMD with the artifact cache on and stored in CACHE
+with_cache() {
+  cache="$1"; shift
+  LAKE_CACHE_DIR="$cache" LAKE_ARTIFACT_CACHE=true "$@"
+}
+# cache_build CACHE TREE ARGS...: `lake build ARGS...` in the copy TREE with the cache in CACHE
+cache_build() {
+  cache="$1"; tree="$2"; shift 2
+  with_cache "$cache" lake_out -d ".lake/log/$tree" build "$@"
+}
+# log_msgs FILE: save the messages that the jobs of the last build printed
+# (what follows the first job line, without the job lines and the summary)
+log_msgs() {
+  awk '/^[^ ]+ \[[0-9]+\/[0-9]+\] /{jobs=1; next} /^(Build completed|All targets up-to-date)/{next} jobs' \
+    produced.out > "$1"
+}
+# Modules: the `sorry` warning and the linter warning
+cache_build "$LOG_CACHE" tree1 Log
+log_msgs .lake/log/mods.expected
+match_text 'declaration uses' .lake/log/mods.expected
+match_text 'linter.unusedVariables' .lake/log/mods.expected
+# The cached logs name no path of the tree that built them (the trace's
+# verbose entry with the command line of `lean` does)
+log_maps() { cat "$LOG_CACHE"/outputs/log/*.json > .lake/log/maps.json; }
+log_maps
+no_match_text tree1 .lake/log/maps.json
+cache_build "$LOG_CACHE" tree2 Log --no-build
+log_msgs .lake/log/mods.out
+check_diff .lake/log/mods.expected .lake/log/mods.out
+# A second build replays them from the tree's own traces
+cache_build "$LOG_CACHE" tree2 Log --no-build
+log_msgs .lake/log/mods.out
+check_diff .lake/log/mods.expected .lake/log/mods.out
+# `--wfail` fails on the restored warnings as it does on the built ones
+test_cmd rm -rf .lake/log/tree2/.lake
+with_cache "$LOG_CACHE" test_status 1 -d .lake/log/tree2 build Log --no-build --wfail
+# A mapping written from a trace (the cache lost the mapping, and the trace
+# still names outputs in the cache) keeps the trace's log
+test_cmd rm -rf "$LOG_CACHE/outputs"
+cache_build "$LOG_CACHE" tree1 Log --no-build
+log_maps
+match_text 'declaration uses' .lake/log/maps.json
+test_cmd rm -rf .lake/log/tree2/.lake
+cache_build "$LOG_CACHE" tree2 Log --no-build
+log_msgs .lake/log/mods.out
+check_diff .lake/log/mods.expected .lake/log/mods.out
+# Other artifacts (`buildArtifactUnlessUpToDate`)
+cache_build "$LOG_CACHE" tree1 warnArt
+log_msgs .lake/log/art.expected
+match_text 'a warning logged by its build' .lake/log/art.expected
+match_text 'an info message logged by its build' .lake/log/art.expected
+cache_build "$LOG_CACHE" tree2 warnArt --no-build
+log_msgs .lake/log/art.out
+check_diff .lake/log/art.expected .lake/log/art.out
+# Modules unpacked from an archive in the cache
+cache_build "$LOG_CACHE" tree1 Log -o "$TEST_DIR/.lake/log/outputs.jsonl"
+with_cache "$LOG_CACHE" test_run -d .lake/log/tree1 cache add "$TEST_DIR/.lake/log/outputs.jsonl"
+log_maps
+match_text ltar .lake/log/maps.json
+# `cache add` wrote the module mappings without a log
+no_match_text 'declaration uses' .lake/log/maps.json
+test_cmd rm -rf .lake/log/tree2/.lake
+cache_build "$LOG_CACHE" tree2 Log --no-build
+match_text 'Unpacked Log.Sorry' produced.out
+log_msgs .lake/log/mods.out
+check_diff .lake/log/mods.expected .lake/log/mods.out
+# The unpack rewrote the mapping with the log of the archive's trace
+log_maps
+match_text 'declaration uses' .lake/log/maps.json
+# Mappings without a log (as written by older versions of Lake) still restore
+if command -v jq > /dev/null; then # skip if no jq found
+  for f in "$LOG_CACHE"/outputs/log/*.json; do
+    jq 'del(.log)' "$f" > "$f.new"
+    test_cmd mv "$f.new" "$f"
+  done
+  log_maps
+  no_match_text '"log"' .lake/log/maps.json
+  test_cmd rm -rf .lake/log/tree2/.lake
+  cache_build "$LOG_CACHE" tree2 Log warnArt --no-build
+  log_msgs .lake/log/old.out
+  check_diff /dev/null .lake/log/old.out
+fi
+
+# A replay stores the log it replayed. Where Lake rechecks the outputs a replay
+# keeps against the hashes their trace records, changing them after the build
+# (below) makes it rebuild them, and the cache must then keep the log of that
+# rebuild alone. Either way, a copy that restores them prints each message once.
+REBUILD_CACHE="$(norm_path "$TEST_DIR")/.lake/rebuild-cache"
+test_cmd cp -r log .lake/log/tree3
+test_cmd cp -r log .lake/log/tree4
+test_cmd chmod -R u+w .lake/log/tree3 .lake/log/tree4
+cache_build "$REBUILD_CACHE" tree3 Log.Sorry warnArt
+for f in .lake/log/tree3/.lake/build/lib/lean/Log/Sorry.olean .lake/log/tree3/.lake/build/warn.txt; do
+  test_cmd chmod u+w "$f"
+  echo changed >> "$f"
+  test_cmd rm -f "$f.hash"
+done
+test_cmd rm -rf "$REBUILD_CACHE"
+cache_build "$REBUILD_CACHE" tree3 Log.Sorry warnArt
+cache_build "$REBUILD_CACHE" tree4 Log.Sorry warnArt --no-build
+log_msgs .lake/log/rebuild.out
+test_cmd_eq 1 grep -c 'declaration uses' .lake/log/rebuild.out
+test_cmd_eq 1 grep -c 'a warning logged by its build' .lake/log/rebuild.out
+
+
+# With usage cutoff, a change to an import that `Log.Lint` does not use lets
+# Lake keep its outputs instead of building it, if they are still the ones its
+# trace records. Here one was changed after the build, so Lake warns about it
+# and builds the module, and the cache keeps the log of that build alone:
+# a copy that restores it prints the module's warning once and not Lake's.
+# Usage cutoff needs the imports' `.usekey` next to their `.olean`, so the
+# artifacts are restored to the build directory.
+CUTOFF_CACHE="$(norm_path "$TEST_DIR")/.lake/cutoff-cache"
+test_cmd cp -r log .lake/log/tree5
+test_cmd cp -r log .lake/log/tree6
+test_cmd chmod -R u+w .lake/log/tree5 .lake/log/tree6
+LAKE_RESTORE_ARTIFACTS=true LAKE_USAGE_CUTOFF=true cache_build "$CUTOFF_CACHE" tree5 Log.Lint
+test_exp -f .lake/log/tree5/.lake/build/lib/lean/Log/Lint.usekey
+for tree in tree5 tree6; do
+  echo 'theorem notUsedByLint : True := trivial' >> ".lake/log/$tree/Log/Sorry.lean"
+done
+# Change a copy of the output, not the hard link to its cache entry
+f=.lake/log/tree5/.lake/build/lib/lean/Log/Lint.ilean
+test_cmd cp "$f" "$f.new"
+test_cmd chmod u+w "$f.new"
+echo changed >> "$f.new"
+test_cmd mv -f "$f.new" "$f"
+test_cmd rm -f "$f.hash"
+LAKE_RESTORE_ARTIFACTS=true LAKE_USAGE_CUTOFF=true cache_build "$CUTOFF_CACHE" tree5 Log.Lint
+match_text 'does not match its trace' produced.out
+LAKE_RESTORE_ARTIFACTS=true LAKE_USAGE_CUTOFF=true cache_build "$CUTOFF_CACHE" tree6 Log.Lint --no-build
+log_msgs .lake/log/cutoff.out
+test_cmd_eq 1 grep -c 'not explicitly referenced' .lake/log/cutoff.out
+no_match_text 'does not match its trace' .lake/log/cutoff.out
 
 # Cleanup
 rm -f produced.* Ignored.lean

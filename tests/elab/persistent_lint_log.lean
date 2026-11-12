@@ -85,3 +85,21 @@ def testRecordLintsMultiple : CoreM (Array Name) := do
 /-- info: #[`linter.a, `linter.b, `linter.a] -/
 #guard_msgs in
 #eval testRecordLintsMultiple
+
+/-- The recorded entry holds no source path, so the `.olean` does not depend on where the
+source file was. Consumers resolve the file from the module that owns the entry. -/
+def testRecordLintsDropsFileName : CoreM (Array String) := do
+  let env ← getEnv
+  let msg : Message := {
+    fileName := "/some/checkout/Test.lean"
+    pos := ⟨3, 5⟩
+    severity := .warning
+    data := mkLinterMsg `linter.dummy m!"unused variable 'x'"
+  }
+  let log : MessageLog := MessageLog.empty.add msg
+  let env ← Linter.recordLints default env #[(none, log)]
+  return (Linter.lintLogExt.getState env).map (·.message.fileName)
+
+/-- info: #[""] -/
+#guard_msgs in
+#eval testRecordLintsDropsFileName
