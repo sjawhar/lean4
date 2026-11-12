@@ -8,6 +8,7 @@ module
 prelude
 public import Lake.Util.Log
 import Lake.Util.IO
+import Lake.Util.Proc
 import Std.Sync.Mutex
 import Init.Data.String.TakeDrop
 
@@ -90,7 +91,9 @@ Runs the token command `cmd` with `sh -c` and returns the token it printed
 and it reads no standard input, so a command that asks a question fails instead of waiting.
 The command runs in a session of its own: if it has not ended after 60 seconds (`timeLimitMs`),
 Lake kills it and every process it started, and the run fails. (Because of its own session, a
-Ctrl-C that stops Lake does not reach the command.)
+Ctrl-C that stops Lake does not reach the command.) It is spawned without the workspace build lock
+(`spawnProc` with `inheritBuildLock := false`): it writes nothing into the workspace, and in its own
+session it can outlive a Lake that is killed, which would leave the lock held.
 Errors name `cmdVar`, but never include what the command printed.
 
 The run gives up on a process that left the command's process group and still holds its standard
@@ -98,7 +101,7 @@ output: the thread that reads that output then stays blocked until the process c
 -/
 def run (cmd : String) : BaseIO (Except RunError String) := do
   let act : IO (Option (String × UInt32)) := do
-    let child ← IO.Process.spawn {
+    let child ← spawnProc (inheritBuildLock := false) {
       cmd := "sh", args := #["-c", cmd]
       stdin := .null, stdout := .piped, stderr := .inherit
       setsid := true

@@ -190,7 +190,7 @@ def runCurl
       curlFollowArgs req.token? ++ transferTimeoutArgs req.limits.stallSecs ++
       #["--max-filesize", toString req.maxBytes, "--max-time", toString maxSecs,
         "--config", cfg.toString]
-    let child ← IO.Process.spawn {
+    let child ← spawnProc {
       cmd := ← Internal.getCurl, args
       stdin := .null, stdout := .null, stderr := .piped
     }
