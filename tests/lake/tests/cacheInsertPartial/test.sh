@@ -289,7 +289,8 @@ if [ "$UNAME" = Linux ]; then
     "$LAKE" -d t10 build out || rc=$?
   test_exp $rc = 0
   test_exp "$(find cache9 -name '*.json' | wc -l)" = 0
-  test_exp "$(find cache9 -type f | wc -l)" = 0
+  # (The input lock's file of `Big`, which no build deletes, is not an output.)
+  test_exp "$(find cache9 -type f ! -path 'cache9/locks/*' | wc -l)" = 0
   # Without failing links, a fresh tree builds the outputs, and caches them
   LAKE_CACHE_DIR="$PWD/cache9" test_out 'Built Big' -d t11 build Big
   test_cmd cmp "t11/$BIG" "cache9/artifacts/$(cat "t11/$BIG.hash").olean"
