@@ -111,6 +111,15 @@ def readSourceStamp? (stamp ident : String) : Option (Hash × ModuleHeader) := d
   return (← Hash.ofHex? (first.take 16).toString, ← decodeStampHeader? header.dropLast)
 
 /--
+The header that the source stamp `stamp` records for contents with the hash `hash`, whatever
+identity it records, and the stamp's encoding of that header (`encodeStampHeader`).
+-/
+def sourceStampHeader? (stamp : String) (hash : Hash) : Option (ModuleHeader × String) := do
+  let first :: header := stamp.split '\n' |>.toStringList | none
+  unless stamp.endsWith "\n" && first.startsWith s!"{hash} " do none
+  return (← decodeStampHeader? header.dropLast, (stamp.drop (first.length + 1)).toString)
+
+/--
 The source stamp of a source with the identity `ident` whose contents have the hash `hash` and the
 header `header`; none if the header does not decode back from the stamp's encoding of it
 (`encodeStampHeader`).
@@ -139,21 +148,29 @@ def maySourceStamp (mdata : IO.FS.Metadata) (start : ClockReading) (file : IO.FS
 The hash and the parsed header of the source of `mod`, whose metadata `mdata` was read at `start`.
 
 Unless `--rehash` is set, a source stamp (in `Module.sourceStampFile`) that records the source's
-current identity gives both, and the source is not read. Otherwise the source is read, hashed and
-parsed, and, unless the build is `--no-build` (which writes nothing to the build directory), its
-stamp is set for a later write of the stamp queue (`setStamp`, `maySourceStamp`).
+current identity gives both, and the source is not read. Otherwise the source is read and hashed.
+A stamp of the same contents under another identity (as in a copy of the tree) then gives the
+header, which it recorded when it was parsed from those contents; else the source is parsed. Unless
+the build is `--no-build` (which writes nothing to the build directory), the stamp of the current
+identity is set for a later write of the stamp queue (`setStamp`, `maySourceStamp`).
 -/
 def Module.fetchSourceInfo (mod : Module) (mdata : IO.FS.Metadata) (start : ClockReading) :
     JobM (Hash × ModuleHeader) := do
   let ident := sourceStampIdentity mdata
   let key := mod.name.toString
-  if (← getTrustHash) then
-    if let some stamp ← findStamp? mod.sourceStampFile key then
-      if let some info := readSourceStamp? stamp ident then
-        return info
+  let stamp? ← if (← getTrustHash) then findStamp? mod.sourceStampFile key else pure none
+  if let some stamp := stamp? then
+    if let some info := readSourceStamp? stamp ident then
+      return info
   let path := mod.leanFile
   let contents ← IO.FS.readFile path
   let hash := Hash.ofText contents
+  -- A record of another identity is reused only for contents of an equal hash (the source was just
+  -- read and hashed), whose header it recorded; any other record falls through to the parse
+  if let some (header, encoded) := stamp?.bind (sourceStampHeader? · hash) then
+    unless (← getNoBuild) do
+      setStamp mod.sourceStampFile key s!"{hash} {ident}\n{encoded}" (maySourceStamp mdata start)
+    return (hash, header)
   let header ← Lean.parseImports' contents path.toString
   unless (← getNoBuild) do
     if let some stamp := sourceStamp? hash ident header then
