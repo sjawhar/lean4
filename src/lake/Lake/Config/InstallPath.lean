@@ -13,6 +13,7 @@ public import Lake.Util.NativeLib
 import Init.Data.UInt.Lemmas
 import Init.Data.String.Modify
 import Init.System.Platform
+import Lake.Util.Proc
 
 open System Lean.Compiler.FFI
 
@@ -230,7 +231,7 @@ Defaults to trying the `lean` in `PATH`.
 -/
 public def findLeanSysroot? (lean := "lean") : BaseIO (Option FilePath) := do
   let act : IO _ := do
-    let out ← IO.Process.output {
+    let out ← outputProc {
       cmd := lean,
       args := #["--print-prefix"]
     }
@@ -281,7 +282,7 @@ public def LeanInstall.get (sysroot : FilePath) (collocated : Bool := false) : B
 where
   getGithash := do
     EIO.catchExceptions (h := fun _ => pure "") do
-      let out ← IO.Process.output {
+      let out ← outputProc {
         cmd := leanExe sysroot |>.toString,
         args := #["--githash"]
       }

@@ -19,7 +19,7 @@ class replace_rec_fn {
             return hash((size_t)p.first >> 3, p.second);
         }
     };
-    lean::unordered_map<std::pair<lean_object *, unsigned>, expr, key_hasher> m_cache;
+    lean::lazy_table<lean::dense_map<std::pair<lean_object *, unsigned>, expr, key_hasher>, 16> m_cache;
     std::function<optional<expr>(expr const &, unsigned)> m_f;
     bool                                                  m_use_cache;
 
@@ -85,7 +85,7 @@ expr replace(expr const & e, std::function<optional<expr>(expr const &, unsigned
 }
 
 class replace_fn {
-    lean::unordered_map<lean_object *, expr> m_cache;
+    lean::lazy_table<lean::dense_map<lean_object *, expr>, 16> m_cache;
     lean_object * m_f;
 
     expr save_result(expr const & e, expr const & r, bool shared) {

@@ -11,6 +11,7 @@ public import Lean.ResolveName
 public import Lean.Language.Basic
 import Init.While
 import Lean.Compiler.NoncomputableAttr
+import Lean.Util.UsedByChecks
 
 public section
 
@@ -904,8 +905,42 @@ actual implementation of compileDeclsRef.
 builtin_initialize compileDeclsRef : IO.Ref (Array Name → Options → CoreM Unit) ←
   IO.mkRef (fun _ _ => throwError m!"call to compileDecls with uninitialized compileDeclsRef")
 
-private def compileDeclsImpl (declNames : Array Name) : CoreM Unit := do
-  (← compileDeclsRef.get) declNames {}
+/-- The implementation the compiler installs at startup (`setBuiltinCompileDecls`). -/
+private builtin_initialize builtinCompileDeclsRef : IO.Ref (Option (Array Name → Options → CoreM Unit)) ←
+  IO.mkRef none
+
+/-- Installs the compiler's own implementation of `compileDecls` in `compileDeclsRef`. Only the first call, from
+the compiler's `builtin_initialize`, succeeds; `runCompileDecls` compares the ref with that value. -/
+def setBuiltinCompileDecls (f : Array Name → Options → CoreM Unit) : IO Unit := do
+  if (← builtinCompileDeclsRef.get).isSome then
+    throw <| IO.userError "the compiler's implementation of `compileDecls` is already installed"
+  builtinCompileDeclsRef.set (some f)
+  compileDeclsRef.set f
+
+/-- Whether the compile is about to run only the toolchain's own code around and inside `Environment.find?`:
+`f`, what `compileDeclsRef` holds, is the compiler's own implementation (`setBuiltinCompileDecls`), and the
+environment's reserved-name predicates are the array `reservedNamePredicatesRef` holds, which is what an environment
+starts with. Pointer identity decides: a ref or an extension state holds the same object until something replaces it. -/
+private unsafe def isBuiltinCompileUnsafe (f : Array Name → Options → CoreM Unit) (env : Environment) :
+    BaseIO Bool := do
+  let some b ← builtinCompileDeclsRef.get | return false
+  unless ptrAddrUnsafe f == ptrAddrUnsafe b do return false
+  return ptrAddrUnsafe (reservedNamePredicatesExt.getState env) == ptrAddrUnsafe (← reservedNamePredicatesRef.get)
+
+@[implemented_by isBuiltinCompileUnsafe]
+private opaque isBuiltinCompile (f : Array Name → Options → CoreM Unit) (env : Environment) : BaseIO Bool
+
+/-- Calls the implementation of `compileDecls` that `compileDeclsRef` holds. Code other than the toolchain's own
+around the compile (a wrapper an imported `initialize` installs in `compileDeclsRef`) or inside it (a reserved-name
+predicate a module adds to its environment, which `Environment.find?` calls) can read any environment state or change
+the options, so the module's usage data then depends on every import (`recordCompilerCode`). -/
+def runCompileDecls (declNames : Array Name) (baseOpts : Options) : CoreM Unit := do
+  let f ← compileDeclsRef.get
+  unless (← isBuiltinCompile f (← getEnv)) do recordCompilerCode
+  f declNames baseOpts
+
+private def compileDeclsImpl (declNames : Array Name) : CoreM Unit :=
+  runCompileDecls declNames {}
 
 -- `ref?` is used for error reporting if available
 def compileDecls (decls : Array Name) (logErrors := true) : CoreM Unit := do
