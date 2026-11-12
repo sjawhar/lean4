@@ -6,12 +6,11 @@ Authors: Markus Himmel
 module
 
 prelude
-public import Init.Data.String.Pattern.Memcmp
-import all Init.Data.String.Pattern.Memcmp
+public import Init.Data.String.Pattern.Basic
+import all Init.Data.String.Pattern.Basic
 import Init.Data.ByteArray.Lemmas
 import Init.ByCases
 import Init.Data.Nat.MinMax
-import Init.Data.String.OrderInstances
 
 public section
 
