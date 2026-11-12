@@ -68,12 +68,14 @@ EOF
 }
 
 # mkab ROOT -- package `p` in ROOT, with libraries `LA` (module `A`) and `LB` (module `B`). `A` and
-# `B` record their compiles in `$COUNTER_A` and `$COUNTER_B` and wait for `$GO`. The targets
-# `r1` and `r2` reach the modules in opposite orders: `r1` builds `A`, waits until it is built,
-# and only then fetches `B`; `r2` does the same with `B` first. So a process that builds `r1` does
-# not reach `B` while its compile of `A` runs. The order comes from the targets: Lake awaits a
-# library's `extraDepTargets` while it computes the library's jobs, so a gate there would stop the
-# other module too. Every root has the same input hashes.
+# `B` record their compiles in `$COUNTER_A` and `$COUNTER_B` and wait for `$GO` (at most 120 s).
+# The targets `r1` and `r2` reach the modules in opposite orders: `r1` starts the build of `A`,
+# then, while that build runs, waits while the environment variable `CROSS_GATE` names a file that
+# does not exist (at most 120 s; no environment variable is part of a trace), and only then starts
+# the build of `B`; `r2` does the same with `B` first. So a process that builds `r1` requests `B`
+# while its compile of `A` still runs. The order comes from the targets: Lake awaits a library's
+# `extraDepTargets` while it computes the library's jobs, so a gate there would stop the other
+# module too. Every root has the same input hashes.
 mkab() {
   mkdir -p "$1"
   cat > "$1/lakefile.lean" << 'EOF'
@@ -82,15 +84,24 @@ open Lake DSL
 
 package p
 
-/-- Builds `first`, waits until it is built, and only then fetches `second`. -/
-def inOrder (first second : Lean.Name) : FetchM (Job Unit) := do
+/-- Waits while `CROSS_GATE` names a file that does not exist (at most 120 s). -/
+def crossGate : FetchM (Job Unit) := Job.async (prio := .dedicated) do
+  if let some file := ← IO.getEnv "CROSS_GATE" then
+    for _ in [0:2400] do
+      if ← System.FilePath.pathExists file then break
+      IO.sleep 50
+
+/-- Starts the build of `first`, waits for the gate, then starts the build of `second`. -/
+def crossed (first second : Lean.Name) : FetchM (Job Unit) := do
   let some m1 ← findModule? first | error s!"no module {first}"
   let some m2 ← findModule? second | error s!"no module {second}"
-  discard <| (← m1.olean.fetch).await
-  (← m2.olean.fetch).mapM (sync := true) fun _ => pure ()
+  let job1 ← m1.olean.fetch
+  discard <| (← crossGate).await
+  let job2 ← m2.olean.fetch
+  return job1.mix job2
 
-target r1 : Unit := inOrder `A `B
-target r2 : Unit := inOrder `B `A
+target r1 : Unit := crossed `A `B
+target r2 : Unit := crossed `B `A
 
 lean_lib LA where
   roots := #[`A]
@@ -98,8 +109,8 @@ lean_lib LA where
 lean_lib LB where
   roots := #[`B]
 EOF
-  { gate_eval "$COUNTER_A" "$GO" 60; echo 'def A.v : Nat := 1'; } > "$1/A.lean"
-  { gate_eval "$COUNTER_B" "$GO" 60; echo 'def B.v : Nat := 2'; } > "$1/B.lean"
+  { gate_eval "$COUNTER_A" "$GO" 120; echo 'def A.v : Nat := 1'; } > "$1/A.lean"
+  { gate_eval "$COUNTER_B" "$GO" 120; echo 'def B.v : Nat := 2'; } > "$1/B.lean"
 }
 
 # case_dir NAME -- makes a fresh directory for the case NAME, `cd`s into it, and sets its cache,
@@ -110,7 +121,7 @@ case_dir() {
   mkdir -p "$CASE_DIR"
   cd "$CASE_DIR"
   export LAKE_CACHE_DIR="$CASE_DIR/cache" LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true
-  unset LAKE_NO_BUILD_LOCK
+  unset LAKE_NO_BUILD_LOCK CROSS_GATE
   GO="$CASE_DIR/go"
   HOLD="$CASE_DIR/hold"
   X_FAILS="$CASE_DIR/x-fails"
@@ -168,6 +179,8 @@ lock_lines() {
 }
 # is_blocked FILE -- a process is blocked on the lock of FILE
 is_blocked() { lock_lines "$1" | awk '$2 == "->" { f = 1 } END { exit !f }'; }
+# is_blocked_by FILE PID -- process PID is blocked on the lock of FILE
+is_blocked_by() { lock_lines "$1" | awk -v pid="$2" '$2 == "->" && $6 == pid { f = 1 } END { exit !f }'; }
 # is_held_by FILE PID -- process PID holds the lock of FILE
 is_held_by() { lock_lines "$1" | awk -v pid="$2" '$2 != "->" && $5 == pid { f = 1 } END { exit !f }'; }
 # has_holder FILE -- some process holds the lock of FILE
