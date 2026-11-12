@@ -197,6 +197,13 @@ option_ref<decl> find_ir_decl_boxed(elab_environment const & env, name const & n
     return option_ref<decl>(lean_ir_find_env_decl_boxed(env.to_obj_arg(), n.to_obj_arg()));
 }
 
+// `BaseIO Unit`: the compiled function takes no world token and returns a boxed unit.
+extern "C" object * lean_usage_record_used(obj_arg n);
+/** \brief Record `n` as used by the module being elaborated, for its usage data (`Lean.recordUsedName`). */
+static void record_used(name const & n) {
+    lean_dec(lean_usage_record_used(n.to_obj_arg()));
+}
+
 extern "C" double lean_float_of_nat(lean_obj_arg a);
 extern "C" float lean_float32_of_nat(lean_obj_arg a);
 
@@ -871,6 +878,11 @@ private:
             }
         }
         g_native_symbol_cache->insert({ fn, e_new.m_native });
+        unique_lock.unlock();
+        // The first resolution of `fn` in this process (later interpreter instances find it in the global cache
+        // above): every declaration the interpreter runs, and through its digest everything that one calls,
+        // counts as used by the module being elaborated.
+        record_used(fn);
         return m_symbol_cache.emplace(fn, std::move(e_new)).first->second;
     }
 
