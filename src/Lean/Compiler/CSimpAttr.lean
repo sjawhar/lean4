@@ -85,6 +85,8 @@ def replaceConstant? (env : Environment) (e : Expr) : CoreM (Option Expr) := do
   let .const declName _ := e | return none
   if let some ent := s.map.find? declName then
     withoutExporting <| recordExtraModUseFromDecl (isMeta := false) ent.thmName
+    -- The code may later inline the replacement, so that no name in the compiled code shows it was used.
+    recordUsedName ent.toDeclName
     return some (mkConst ent.toDeclName e.constLevels!)
   else
     return none

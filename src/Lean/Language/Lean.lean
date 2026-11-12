@@ -13,6 +13,7 @@ module
 prelude
 public import Lean.Language.Util
 public import Lean.Language.Lean.Types
+public import Lean.Language.Lean.PosShift
 public import Lean.Language.Lean.Util
 public import Lean.Elab.Import
 
@@ -241,6 +242,17 @@ open Lean.Parser
 structure LeanProcessingContext extends ProcessingContext where
   /-- Position of the first file difference if there was a previous invocation. -/
   firstDiffPos? : Option String.Pos.Raw
+  /--
+  The first file difference, if the change against the previous invocation keeps the byte length
+  but moves text after it that keeps its bytes to another line or column (see
+  `sameLengthLineShift?`).
+  -/
+  lineShiftPos? : Thunk (Option String.Pos.Raw) := .pure none
+  /--
+  The changed region against the input of the previous invocation, if any; computed only when
+  `server.reuseMovedPositions` asks for it.
+  -/
+  shift? : Option (Thunk PosShift)
 
 /-- Monad transformer holding all relevant data for Lean processing. -/
 abbrev LeanProcessingT m := ReaderT LeanProcessingContext m
@@ -254,6 +266,47 @@ instance : MonadLift (ProcessingT m) (LeanProcessingT m) where
   monadLift := fun act ctx => act ctx.toProcessingContext
 
 /--
+Returns `start`, the first difference of the inputs `old` and `new`, if the change keeps the byte
+length but moves text after `start` that has the same bytes at the same byte offset in both inputs
+to another line or column, as when a comment `-- a\n-- b` becomes `-- a -- b`. Syntax comparisons
+(`Syntax.eqWithInfo`) accept old elaboration results for such text, but the lines and columns of
+their messages are those of the old input, and so are the editor ranges that the language server
+keeps for their message logs.
+
+The text from the end of the change on, and each byte inside the change that is equal in both
+inputs and starts a character, is checked. Columns count code points (`Position`) and UTF-16 units
+(editor positions).
+-/
+def sameLengthLineShift? (old new : String) (start : String.Pos.Raw) :
+    Option String.Pos.Raw := Id.run do
+  if old.utf8ByteSize != new.utf8ByteSize then
+    return none
+  let byte (s : String) (i : Nat) : UInt8 :=
+    if h : (⟨i⟩ : String.Pos.Raw) < s.rawEndPos then s.getUTF8Byte ⟨i⟩ h else 0
+  -- the end of the change, the same byte position in both inputs
+  let mut stop := old.utf8ByteSize
+  while stop > start.byteIdx && byte old (stop - 1) == byte new (stop - 1) do
+    stop := stop - 1
+  -- move to a character boundary inside the common suffix
+  while stop < old.utf8ByteSize && byte old stop &&& 0xC0 == 0x80 do
+    stop := stop + 1
+  -- lines, code-point columns and UTF-16 columns since `start`, where both inputs agree
+  let step (pos : Nat × Nat × Nat) (b : UInt8) : Nat × Nat × Nat :=
+    let (line, col, col16) := pos
+    if b == 10 then (line + 1, 0, 0)
+    else if b &&& 0xC0 == 0x80 then pos
+    else (line, col + 1, col16 + if b ≥ 0xF0 then 2 else 1)
+  let mut posOld := (0, 0, 0)
+  let mut posNew := (0, 0, 0)
+  for i in [start.byteIdx:stop + 1] do
+    let b := byte old i
+    if (i == stop || (b == byte new i && b &&& 0xC0 != 0x80)) && posOld != posNew then
+      return some start
+    posOld := step posOld b
+    posNew := step posNew (byte new i)
+  return none
+
+/--
 Embeds a `LeanProcessingM` action into `ProcessingM`, optionally using the old input string to speed
 up reuse analysis and supplying a cancellation token that should be triggered as soon as reuse is
 ruled out.
@@ -261,8 +314,12 @@ ruled out.
 def LeanProcessingM.run (act : LeanProcessingM α) (oldInputCtx? : Option InputContext) :
     ProcessingM α := do
   -- compute position of syntactic change once
-  let firstDiffPos? := oldInputCtx?.map (·.inputString.firstDiffPos (← read).inputString)
-  ReaderT.adapt ({ · with firstDiffPos? }) act
+  let ctx ← read
+  let firstDiffPos? := oldInputCtx?.map (·.inputString.firstDiffPos ctx.inputString)
+  let lineShiftPos? := Thunk.mk fun _ => do
+    sameLengthLineShift? (← oldInputCtx?).inputString ctx.inputString (← firstDiffPos?)
+  let shift? := oldInputCtx?.map fun old => Thunk.mk fun _ => PosShift.compute old.fileMap ctx.fileMap
+  ReaderT.adapt ({ · with firstDiffPos?, lineShiftPos?, shift? }) act
 
 /--
 Returns true if there was a previous run and the given position is before any textual change
@@ -365,6 +422,31 @@ register_builtin_option experimental.module : Bool := {
 }
 
 /--
+Whether the whitespace of a header token holds a `deprecated_module` directive, which
+`Elab.checkDeprecatedImports` reads.
+-/
+private partial def mentionsHeaderDirective : Syntax → Bool
+  | .node _ _ args => args.any mentionsHeaderDirective
+  | .atom (.original leading _ trailing _) _ | .ident (.original leading _ trailing _) .. =>
+    leading.toString.contains "deprecated_module" || trailing.toString.contains "deprecated_module"
+  | _ => false
+
+/-- A command whose old elaboration is reused with moved positions. -/
+structure MovedCmd where
+  /-- The old command snapshot. -/
+  old         : CommandParsedSnapshot
+  /-- The new command syntax. -/
+  stx         : Syntax
+  /-- The parser state after the new command. -/
+  parserState : Parser.ModuleParserState
+  /-- The parse messages of the new command. -/
+  msgLog      : MessageLog
+  /-- The old elaboration snapshots with moved positions. -/
+  elabSnap    : CommandElaboratingSnapshot
+  /-- Whether the moved state holds positions that moving does not update (`holdsUnmovedPositions`). -/
+  holdsUnmovedPositions : Bool
+
+/--
 Entry point of the Lean language processor.
 
 The `setupImports` function is called after the header has been parsed and before the first command
@@ -407,9 +489,8 @@ where
           ictx
           stx := newStx
           diagnostics := .empty
-          metaSnap := .finished newStx {
-            diagnostics := old.diagnostics
-          }
+          -- the header's parse messages are in the old `metaSnap`, which is always finished
+          metaSnap := .finished newStx old.metaSnap.get
           result? := some {
             parserState := newParserState
             processedSnap := (← oldSuccess.processedSnap.bindIO
@@ -425,9 +506,8 @@ where
                     cancelTk [] ctx
                   return .finished none {
                     diagnostics := .empty
-                    metaSnap := .finished newStx {
-                      diagnostics := oldProcessed.diagnostics
-                    }
+                    -- the import messages and the header info tree are in the old `metaSnap`
+                    metaSnap := .finished newStx oldProcessed.metaSnap.get
                     result? := some {
                       cmdState := oldProcSuccess.cmdState
                       firstCmdSnap := { stx? := none, task := prom.result!, cancelTk? := cancelTk } } }
@@ -468,10 +548,25 @@ where
       -- to uphold the invariant that concatenating all top-level snapshots' syntax trees results in
       -- the original file.
       if let some old := old? then
-        if trimmedStx.eqWithInfo old.stx.unsetTrailing then
+        if trimmedStx.eqWithInfo old.stx.unsetTrailing &&
+            -- `Elab.checkDeprecatedImports` reads a directive in the comment after the last import
+            stx.raw.getTrailing?.map (·.toString.contains "deprecated_module: ignore") ==
+              old.stx.getTrailing?.map (·.toString.contains "deprecated_module: ignore") then
           -- Here we must make sure to pass the *new* syntax and parser state; see NOTE in
           -- `unchanged`
           return (← unchanged old stx parserState)
+        -- After an edit of whitespace and comments above the imports, keep the imports if their
+        -- processing has finished (see `unchangedMoved`).
+        if let some shift := ctx.shift? then
+          if let some oldSuccess := old.result? then
+            if let some oldProcessed ← oldSuccess.processedSnap.get? then
+              if let some oldProcSuccess := oldProcessed.result? then
+                if server.reuseMovedPositions.get oldProcSuccess.cmdState.scopes.head!.opts &&
+                    !mentionsHeaderDirective old.stx && !mentionsHeaderDirective stx.raw &&
+                    shift.get.syntaxMoved old.stx stx.raw then
+                  if let .ok metaSnap ← ((shift.get.mapSnapshot? (shift.get.moveScope old.stx)
+                      oldProcessed.metaSnap.get.toSnapshot).run' {}).run then
+                    return (← unchangedMoved oldProcSuccess metaSnap stx parserState msgLog)
         -- on first change, make sure to cancel old invocation
         old.result?.forM (·.processedSnap.cancelRec)
       return {
@@ -485,6 +580,39 @@ where
           processedSnap := (← processHeader ⟨trimmedStx⟩ stx parserState)
         }
       }
+
+  /-
+  Reuses the finished old import processing when the header has the same tokens at moved positions,
+  as after an edit of a comment above the imports, with `metaSnap` holding the header's moved
+  messages and info tree. The commands then take the same path as after any other edit that moves
+  their positions. The header state passed on holds no positions that a later command reads: each
+  command starts with an empty message log and info tree.
+  -/
+  unchangedMoved (oldProcSuccess : HeaderProcessedState) (metaSnap : Snapshot) (stx : HeaderSyntax)
+      (parserState : Parser.ModuleParserState) (msgLog : MessageLog) :
+      LeanProcessingM HeaderParsedSnapshot := do
+    let ctx ← read
+    let progressRange? := .some ⟨parserState.pos, ctx.endPos⟩
+    return {
+      ictx := ctx.toInputContext
+      stx
+      diagnostics := .empty
+      metaSnap := .finished stx { diagnostics := (← Snapshot.Diagnostics.ofMessageLog msgLog) }
+      result? := some {
+        parserState
+        processedSnap := (← oldProcSuccess.firstCmdSnap.bindIO (sync := true) (cancelTk? := none)
+            (reportingRange := progressRange?) fun oldCmd => do
+          let prom ← IO.Promise.new
+          let cancelTk ← IO.CancelToken.new
+          parseCmd oldCmd parserState oldProcSuccess.cmdState prom (sync := true) cancelTk [] ctx
+          return .finished none {
+            diagnostics := .empty
+            metaSnap := .finished stx { toSnapshot := metaSnap }
+            result? := some {
+              cmdState := oldProcSuccess.cmdState
+              firstCmdSnap := { stx? := none, task := prom.result!, cancelTk? := cancelTk } } })
+      }
+    }
 
   processHeader (stx : HeaderSyntax) (origStx : HeaderSyntax) (parserState : Parser.ModuleParserState) :
       LeanProcessingM (SnapshotTask HeaderProcessedSnapshot) := do
@@ -583,12 +711,19 @@ where
         } }
       else prom.resolve old  -- terminal command, we're done!
 
+    -- The state of a command reused with moved positions can hold positions of an earlier input that
+    -- moving does not update (`holdsUnmovedPositions`). Such a command is reused again only together
+    -- with all later commands, see `collectMoved`, so that no command is elaborated from such a state.
+    let stateValid (old : CommandParsedSnapshot) : Bool :=
+      elabSourceMatches old.elabSource? ctx.inputString old.parserState.pos
+
     -- fast path, do not even start new task for this snapshot (see [Incremental Parsing])
     if let some old := old? then
-      if let some nextCom ← old.nextCmdSnap?.bindM (·.get?) then
-        if let some nextNextCom ← nextCom.nextCmdSnap?.bindM (·.get?) then
-          if (← isBeforeEditPos nextNextCom.parserState.pos) then
-            return (← unchanged old old.parserState)
+      if stateValid old then
+        if let some nextCom ← old.nextCmdSnap?.bindM (·.get?) then
+          if let some nextNextCom ← nextCom.nextCmdSnap?.bindM (·.get?) then
+            if (← isBeforeEditPos nextNextCom.parserState.pos) then
+              return (← unchanged old old.parserState)
 
     let beginPos := parserState.pos
     let scope := cmdState.scopes.head!
@@ -600,21 +735,43 @@ where
       profileit "parsing" scope.opts fun _ =>
         Parser.parseCommand ctx.toInputContext pmctx parserState .empty
 
+    -- After a change that keeps the byte length but moves the text after it to another line or
+    -- column, the old results of a command that ends after the first changed byte can have the
+    -- same bytes and positions as the new ones and still hold the old lines and columns in their
+    -- messages. (The fast path above reuses only commands that end before the change.)
+    let resultsValid (old : CommandParsedSnapshot) : Bool :=
+      ctx.lineShiftPos?.get.all (old.parserState.pos ≤ ·)
+
     -- semi-fast path
     if let some old := old? then
       -- NOTE: as `parserState.pos` includes trailing whitespace, this forces reprocessing even if
       -- only that whitespace changes, which is wasteful but still necessary because it may
       -- influence the range of error messages such as from a trailing `exact`
-      if stx.eqWithInfo old.stx then
+      if stx.eqWithInfo old.stx && stateValid old && resultsValid old then
         -- Here we must make sure to pass the *new* parser state; see NOTE in `unchanged`
         return (← unchanged old parserState)
+      -- After an edit of whitespace and comments only, this and all later commands have the same
+      -- tokens at moved positions, and their old elaboration can be reused.
+      if let some shift := ctx.shift? then
+        if server.reuseMovedPositions.get scope.opts && shift.get.syntaxMoved old.stx stx then
+          match (← collectMoved shift.get cmdState cmdState old stx parserState msgLog {} #[]) with
+          | .ok cmds =>
+            resolveMoved shift.get cmds prom
+            return
+          | .error (reason, pos) =>
+            if scope.opts.getBool `trace.Elab.reuse then
+              let p := ctx.fileMap.toPosition pos
+              let _ ← IO.eprintln s!"{ctx.fileName}:{p.line}:{p.column}: no reuse with moved \
+                positions: {reason}" |>.toBaseIO
       -- On first change, immediately cancel old invocation for all subsequent commands. This
       -- includes setting the global parse cancellation token, which is stored in
       -- `next?` below. Thus we can be sure that no further commands will start to elaborate in the
       -- old invocation from this point on.
       old.nextCmdSnap?.forM (·.cancelRec)
       -- For the current command, we depend on the elaborator to either reuse parts of `old` or
-      -- cancel them as soon as reuse can be ruled out.
+      -- cancel them as soon as reuse can be ruled out, unless no part of it may be reused.
+      unless resultsValid old do
+        old.elabSnap.elabSnap.cancelRec
 
     -- check for cancellation, most likely during elaboration of previous command, before starting
     -- processing of next command
@@ -680,7 +837,8 @@ where
         }
       }
       let cmdState ← doElab stx revCmds cmdState beginPos
-        { old? := old?.map fun old => ⟨old.stx, old.elabSnap.elabSnap⟩, new := elabPromise }
+        { old? := old?.filter resultsValid |>.map fun old => ⟨old.stx, old.elabSnap.elabSnap⟩
+          new := elabPromise }
         elabCmdCancelTk ctx
 
       let mut reportedCmdState := cmdState
@@ -751,6 +909,94 @@ where
       if let some next := next? then
         -- We're definitely off the fast-forwarding path now
         parseCmd none parserState cmdState next (sync := false) elabCmdCancelTk (stx :: revCmds) ctx
+
+  /-
+  Collects the moved results of `old` and each later old command while the new input has the same
+  tokens at moved positions, or names why a command cannot be reused and where it starts in the new
+  input. `prevOld` and `prevNew` are the state after the previous command before and after its move,
+  and `cache` holds the moves of the objects that the earlier commands' results hold.
+  All or nothing: when one command cannot be reused, the caller takes the path of any other edit at
+  the first changed command. This never waits: it fails if old elaboration has not finished, so that
+  the caller cancels the old run at once as in a normal edit.
+  -/
+  collectMoved (shift : PosShift) (prevOld prevNew : Command.State) (old : CommandParsedSnapshot)
+      (stx : Syntax) (parserState : Parser.ModuleParserState) (msgLog : MessageLog)
+      (cache : PosShift.MoveCache) (acc : Array MovedCmd) :
+      LeanProcessingM (Except (String × String.Pos.Raw) (Array MovedCmd)) := do
+    let ctx ← read
+    let scope := shift.moveScope old.stx
+    let fail (reason : String) := Except.error (reason, stx.getPos?.getD 0)
+    if !shift.syntaxMoved old.stx stx then
+      return fail "tokens differ"
+    if scope.moves && hasPositionSensitiveSyntax stx then
+      return fail "position-sensitive command"
+    if msgLog.hasErrors != old.diagnostics.msgLog.hasErrors then
+      return fail "parse errors differ"
+    let oldTree := toSnapshotTree old.elabSnap
+    unless (← snapshotTreeFinished oldTree) do
+      return fail "old elaboration has not finished"
+    let res := old.elabSnap.resultSnap.get
+    let opts := res.cmdState.scopes.head!.opts
+    if scope.moves && (opts.getBool `pp.sorrySource || opts.getBool `doc.verso) then
+      return fail "position-sensitive option"
+    -- also when the command does not move: its trailing whitespace, which its scope syntax (a
+    -- `variable` binder) holds, may contain the change
+    let names := Thunk.mk fun _ => PosShift.declaredNames oldTree
+    let cmdState := shift.mapCmdState names prevOld prevNew res.cmdState
+    let lineShift := ctx.lineShiftPos?.get.isSome
+    let (elabSnap, cache) ←
+      match (← ((shift.mapElabSnap? scope lineShift stx cmdState old.elabSnap).run cache).run) with
+      | .ok r => pure r
+      | .error reason => return fail reason
+    let unmoved := scope.moves &&
+      holdsUnmovedPositions old.stx oldTree old.diagnostics.msgLog res.cmdState
+    let acc := acc.push
+      { old, stx, parserState, msgLog, elabSnap, holdsUnmovedPositions := unmoved }
+    match old.nextCmdSnap?, Parser.isTerminalCommand stx with
+    | none, true => return .ok acc
+    | some oldNext, false =>
+      let some oldNext ← oldNext.get? | return fail "old parse has not finished"
+      let scope := cmdState.scopes.head!
+      let pmctx := {
+        env := cmdState.env, options := scope.opts, currNamespace := scope.currNamespace
+        openDecls := scope.openDecls
+      }
+      let (stx, parserState', msgLog) :=
+        profileit "parsing" scope.opts fun _ =>
+          Parser.parseCommand ctx.toInputContext pmctx parserState .empty
+      collectMoved shift res.cmdState cmdState oldNext stx parserState' msgLog cache acc
+    | _, _ => return fail "end of input differs"
+
+  /--
+  Resolves `prom` to the chain of commands whose old elaboration is reused with moved positions. From
+  the first command whose state holds unmoved positions on, each command records the input of those
+  positions (`CommandParsedSnapshot.elabSource?`).
+  -/
+  resolveMoved (shift : PosShift) (cmds : Array MovedCmd) (prom : IO.Promise CommandParsedSnapshot) :
+      LeanProcessingM Unit := do
+    let ctx ← read
+    let mut marked := false
+    let mut sources := #[]
+    for cmd in cmds do
+      let mut src? := none
+      if marked || cmd.holdsUnmovedPositions || cmd.old.elabSource?.isSome then
+        let src := cmd.old.elabSource?.getD (shift.oldMap.source, cmd.old.parserState.pos)
+        unless elabSourceMatches (some src) ctx.inputString cmd.parserState.pos do
+          src? := some src
+      marked := src?.isSome
+      sources := sources.push src?
+    let mut next? : Option CommandParsedSnapshot := none
+    for cmd in cmds.reverse, elabSource? in sources.reverse do
+      next? := some {
+        diagnostics := (← Snapshot.Diagnostics.ofMessageLog cmd.msgLog)
+        stx := cmd.stx
+        parserState := cmd.parserState
+        elabSnap := cmd.elabSnap
+        nextCmdSnap? := next?.map (.finished none ·)
+        elabSource?
+      }
+    if let some first := next? then
+      prom.resolve first
 
   doElab (stx : Syntax) (revCmds : List Syntax) (cmdState : Command.State) (beginPos : String.Pos.Raw)
       (snap : SnapshotBundle DynamicSnapshot) (cancelTk : IO.CancelToken) :
@@ -838,11 +1084,21 @@ def truncateToHeader (snap : InitialSnapshot) : InitialSnapshot := Id.run do
   let some parsed := snap.result? | return snap
   let processed := parsed.processedSnap.get
   let some hps := processed.result? | return snap
+  -- Pre-force lazily merged import views: the compactor would force the thunks anyway, and doing
+  -- it eagerly instead allows substituting plain merged nodes for the lazy wrappers, keeping
+  -- thunks, their closures, and the captured candidate lists out of the compacted region.
+  let env := hps.cmdState.env.forceLazyImportedViews
+  -- The env is also captured by the header info tree's command context; substitute it there and
+  -- in `metaSnap` below as well so the unforced env does not additionally end up in the region.
+  let trees := hps.cmdState.infoState.trees.map fun
+    | .context (.commandCtx ci) t => .context (.commandCtx { ci with env }) t
+    | t                           => t
+  let cmdState := { hps.cmdState with env, infoState.trees := trees }
   -- Construct a synthetic terminal CommandParsedSnapshot whose cmdState is the
   -- initial post-import state, effectively representing "no commands elaborated".
   let resultSnap : CommandResultSnapshot := {
     diagnostics := .empty
-    cmdState := hps.cmdState
+    cmdState
   }
   let elabSnap : CommandElaboratingSnapshot := {
     diagnostics := .empty
@@ -859,7 +1115,10 @@ def truncateToHeader (snap : InitialSnapshot) : InitialSnapshot := Id.run do
     nextCmdSnap? := none
   }
   let newProcessed : HeaderProcessedSnapshot := { processed with
+    metaSnap := { processed.metaSnap with
+      task := .pure { processed.metaSnap.get with infoTree? := trees[0]? } }
     result? := some { hps with
+      cmdState
       firstCmdSnap := .finished none termCmd } }
   { snap with
     result? := some { parsed with
