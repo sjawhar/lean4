@@ -1155,18 +1155,24 @@ def Module.outputArtifacts (mod : Module) (descrs : ModuleOutputDescrs) (mtime :
 /--
 The outputs stamp (`Module.outputsStampFile`) of the module's outputs that `descrs` describes, as
 their files in the build directory are now (each file's device, inode, size and modification time),
-and the files' modification times; or none if `ok` rejects a file or a file cannot be read.
+and each file's description and metadata; or none if `ok` rejects a file or a file cannot be read.
 -/
 def Module.stampOutputFiles (mod : Module) (descrs : ModuleOutputDescrs)
-    (ok : ArtifactDescr → IO.FS.Metadata → JobM Bool) : JobM (Option (String × Array MTime)) := do
+    (ok : ArtifactDescr → IO.FS.Metadata → JobM Bool) :
+    JobM (Option (String × Array (ArtifactDescr × IO.FS.Metadata))) := do
   let mut stamp := ""
-  let mut mtimes := #[]
+  let mut files := #[]
   for (descr, path) in (mod.outputArtifacts descrs fun _ => default).2 do
     let .ok m ← path.metadata.toBaseIO | return none
     unless (← ok descr m) do return none
     stamp := stamp ++ s!"{descr.relPath} {m.device} {m.inode} {m.byteSize} {m.modified.sec} {m.modified.nsec}\n"
-    mtimes := mtimes.push m.modified
-  return some (stamp, mtimes)
+    files := files.push (descr, m)
+  return some (stamp, files)
+
+/-- Whether the file whose metadata is `m` is the artifact cache's entry of `descr` (the same device and inode). -/
+def isCacheEntry (cache : Cache) (descr : ArtifactDescr) (m : IO.FS.Metadata) : BaseIO Bool := do
+  let .ok e ← (cache.artifactDir / descr.relPath).metadata.toBaseIO | return false
+  return m.device == e.device && m.inode == e.inode
 
 /-- The descriptions of the module outputs that the saved trace records, if any. -/
 def SavedTrace.moduleOutputDescrs? (savedTrace : SavedTrace) : Option ModuleOutputDescrs := do
@@ -1180,13 +1186,15 @@ def Module.localLtar? (mod : Module) : JobM (Option Artifact) := do
   return none
 
 /--
-The module's outputs at their files in its build directory, found without a look at the artifact
-cache: its saved trace describes them for `inputHash`, and each file is unchanged since a build
-found it to be the cache's entry (it has the identity that the module's outputs stamp, in
-`Module.outputsStampFile`, records, and a second link). The module's cache mapping must exist, so
-that a cache that lost it, or was removed, gets it again on the full path. Replays the trace's log
-and takes a local archive that the trace does not name, as the full path does. Not under
-`--rehash`, nor in a build that records the package's outputs (`-o`), which needs the entries.
+The module's outputs at their files in its build directory, found without the full path's restore
+from the artifact cache: its saved trace describes them for `inputHash`, each file has a second link,
+and each is unchanged since a build found it to be the cache's entry (it has the identity that the
+module's outputs stamp, in `Module.outputsStampFile`, records) or, where the stamp records other
+identities or none (as in a copy of the tree and its cache), is the cache's entry now; its stamp is
+then set again, unless under `--no-build`. The module's cache mapping must exist, so that a cache
+that lost it, or was removed, gets it again on the full path. Replays the trace's log and takes a
+local archive that the trace does not name, as the full path does. Not under `--rehash`, nor in a
+build that records the package's outputs (`-o`), which needs the entries.
 -/
 def Module.unchangedOutputs? (mod : Module) (savedTrace : SavedTrace) (inputHash : Hash) :
     JobM (Option ModuleOutputArtifacts) := do
@@ -1195,13 +1203,19 @@ def Module.unchangedOutputs? (mod : Module) (savedTrace : SavedTrace) (inputHash
   let .ok data := savedTrace | return none
   unless data.depHash == inputHash do return none
   let some descrs := savedTrace.moduleOutputDescrs? | return none
-  let some stamp ← findStamp? mod.outputsStampFile mod.name.toString | return none
-  let some (now, mtimes) ← mod.stampOutputFiles descrs (fun _ m => pure (m.numLinks ≥ 2)) | return none
-  unless stamp == now do return none
-  unless (← ((← getLakeCache).outputsFile mod.pkg.cacheScope inputHash).pathExists) do return none
+  let stamp? ← findStamp? mod.outputsStampFile mod.name.toString
+  let some (now, files) ← mod.stampOutputFiles descrs (fun _ m => pure (m.numLinks ≥ 2)) | return none
+  let cache ← getLakeCache
+  unless (← (cache.outputsFile mod.pkg.cacheScope inputHash).pathExists) do return none
+  if stamp? != some now then
+    -- Without a matching stamp, a file is reused only if it is the cache entry its trace names itself
+    -- (the same device and inode), which is what a stamp records; any other file takes the full path
+    unless (← files.allM fun (descr, m) => isCacheEntry cache descr m) do return none
+    unless (← getNoBuild) do
+      setStamp mod.outputsStampFile mod.name.toString now
   -- The trace is current (checked above), so this replays its log
   discard <| savedTrace.replayCachedIfUpToDate inputHash
-  let arts := (mod.outputArtifacts descrs (mtimes[·]?.getD default)).1
+  let arts := (mod.outputArtifacts descrs fun i => files[i]?.map (·.2.modified) |>.getD default).1
   if arts.ltar?.isNone then
     if let some ltar ← mod.localLtar? then
       return some {arts with ltar? := some ltar}
@@ -1224,10 +1238,7 @@ def Module.stampOutputs (mod : Module) (savedTrace : SavedTrace) (inputHash : Ha
   let trace ← if current then pure savedTrace else readTraceFile mod.traceFile
   let some descrs := trace.moduleOutputDescrs? | return
   let cache ← getLakeCache
-  let isEntry (descr : ArtifactDescr) (m : IO.FS.Metadata) : JobM Bool := do
-    let .ok e ← (cache.artifactDir / descr.relPath).metadata.toBaseIO | return false
-    return m.device == e.device && m.inode == e.inode
-  let some (stamp, _) ← mod.stampOutputFiles descrs isEntry | return
+  let some (stamp, _) ← mod.stampOutputFiles descrs (fun descr m => isCacheEntry cache descr m) | return
   setStamp mod.outputsStampFile mod.name.toString stamp
 
 /--

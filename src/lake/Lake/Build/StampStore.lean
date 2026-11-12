@@ -22,10 +22,11 @@ A stamp file holds small records, one per module of a package and keyed by the m
 that let a later build skip work (such as reading a source again). A process reads each stamp file
 once, when it first looks up one of its records, and keeps that view for its lookups until it
 writes the file. The records a build changes are written after it reports its result
-(`writeStamps`), and before that in the background each time no record has changed for a second,
-so that the stamps it sets before it compiles are written while it compiles. A write reads the file
-again while it holds a lock on `<file>.lock`, merges the changes into it and replaces it, so that
-records other processes wrote are kept.
+(`writeStamps`), and before that in the background each time no record has changed for a tenth of
+a second or a change has waited a second, so that the stamps it sets before it compiles are written
+while it compiles, and most of those of a build that changes records all along are written while
+it runs. A write reads the file again while it holds a lock on `<file>.lock`, merges the changes
+into it and replaces it, so that records other processes wrote are kept.
 
 Format (integers are little-endian `UInt64`s): the magic `LKSTAMP1`; the count `n` of records; the
 file's size; `n` index entries, each the key's hash and the record's offset, in the order of the
@@ -216,6 +217,8 @@ structure StampQueue where
   changes : List (FilePath × String × StampChange) := []
   /-- When the newest change was made (`IO.monoNanosNow`). -/
   newest : Nat := 0
+  /-- When the oldest change on the queue was made (`IO.monoNanosNow`). -/
+  oldest : Nat := 0
   /-- The moment before which the background writer (`writeWhenQuiet`) does not write again. -/
   notBefore : Nat := 0
   /-- Whether a build runs that writes the queue when it ends (`startStampWrites`, `writeStamps`). -/
@@ -255,9 +258,18 @@ public def findStamp? (file : FilePath) (key : String) : BaseIO (Option String) 
 
 /--
 How long the queue must go without a change before the background writer writes it: the stamps
-that a build sets before it compiles (its sources') are then written while it compiles.
+that a build sets before it compiles (its sources', and its outputs' where it stamps them again) are
+then written while it compiles, and those of a build that ends soon after are written before it
+ends, not after it reports its result.
 -/
-def stampQuietNanos : Nat := 1000000000
+def stampQuietNanos : Nat := 100000000
+
+/--
+How long a change may wait on the queue while others keep coming before the background writer
+writes it: a build that changes records all along (one that stamps every module again, as in a copy
+of the tree) then writes most of them while it runs, not after it reports its result.
+-/
+def stampMaxWaitNanos : Nat := 1000000000
 
 /--
 How often the background writer looks at the queue, which also bounds how long `writeStamps` waits
@@ -338,16 +350,18 @@ def writeQueued : BaseIO Unit :=
     writeStampFiles changes.reverse
 
 /--
-The background writer: writes the queue once no change has come for `stampQuietNanos`, and ends
-when the queue is empty or the build ends (`writeStamps`). After a write it waits nine times as long
-as the write took before the next, so that background writes take at most a tenth of the time.
+The background writer: writes the queue once no change has come for `stampQuietNanos`, or once its
+oldest change has waited `stampMaxWaitNanos`, and ends when the queue is empty or the build ends
+(`writeStamps`). After a write it waits nine times as long as the write took before the next, so
+that background writes take at most a tenth of the time.
 -/
 partial def writeWhenQuiet : BaseIO Unit := do
   IO.sleep stampWriterSliceMs
   let now ← IO.monoNanosNow
   let quiet? ← stampQueue.atomically <| modifyGet fun q =>
     if !q.building || q.changes.isEmpty then (none, {q with writer := none})
-    else (some (now ≥ q.notBefore && now - q.newest ≥ stampQuietNanos), q)
+    else (some (now ≥ q.notBefore &&
+      (now - q.newest ≥ stampQuietNanos || now - q.oldest ≥ stampMaxWaitNanos)), q)
   match quiet? with
   | none => return
   | some false => writeWhenQuiet
@@ -362,7 +376,8 @@ def queueChange (change : FilePath × String × StampChange) : BaseIO Unit := do
   let now ← IO.monoNanosNow
   stampQueue.atomically do
     let q ← get
-    let q := {q with changes := change :: q.changes, newest := now}
+    let oldest := if q.changes.isEmpty then now else q.oldest
+    let q := {q with changes := change :: q.changes, newest := now, oldest}
     if q.building && q.writer.isNone then
       set {q with writer := some (← BaseIO.asTask (prio := .dedicated) writeWhenQuiet)}
     else
