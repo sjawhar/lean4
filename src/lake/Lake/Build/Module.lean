@@ -1203,7 +1203,7 @@ def Module.unchangedOutputs? (mod : Module) (savedTrace : SavedTrace) (inputHash
   let .ok data := savedTrace | return none
   unless data.depHash == inputHash do return none
   let some descrs := savedTrace.moduleOutputDescrs? | return none
-  let stamp? ← findStamp? mod.outputsStampFile mod.name.toString
+  let stamp? ← (← getStamps).find? mod.outputsStampFile mod.name.toString
   let some (now, files) ← mod.stampOutputFiles descrs (fun _ m => pure (m.numLinks ≥ 2)) | return none
   let cache ← getLakeCache
   unless (← (cache.outputsFile mod.pkg.cacheScope inputHash).pathExists) do return none
