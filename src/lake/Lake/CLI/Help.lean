@@ -174,6 +174,18 @@ different one. These mappings can then be used to upload the build artifacts
 to a remote cache with `lake cache put`. This will only include the artifacts
 from the covered targets. Other targets in the package will not be tracked.
 
+ENVIRONMENT:
+  LAKE_NO_BUILD_LOCK    if true (e.g., `1`), take neither the workspace's
+                        `.lake/build.lock` nor the input lock
+
+  The artifact cache is writable for a package that sets
+  `enableArtifactCache = true`, or that leaves it unset in a workspace that
+  enables the cache (e.g., `LAKE_ARTIFACT_CACHE=true`). Then two Lake
+  processes that must build the same module input build it only once: one
+  builds it, holding a lock file in the cache's `locks` directory, and the
+  other waits for it and then restores the outputs from the cache. A package
+  with `enableArtifactCache = false` takes no lock.
+
 BUILD SERVICE:          compile Lean modules on a shared service instead of locally
   LAKE_REMOTE_EXEC            service endpoint (grpc://host:port or grpcs://host:port); the switch
   LAKE_REMOTE_EXEC_TOOLCHAIN  sha256:<hex> of the toolchain image (required with the switch)

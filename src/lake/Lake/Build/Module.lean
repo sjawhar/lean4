@@ -15,6 +15,7 @@ import Lake.Util.BuildSlots
 import Lake.Util.Proc
 import Lake.Build.Job.Register
 import Lake.Build.Common
+import Lake.Build.InputLock
 import Lake.Build.RemoteExec
 import Lake.Build.RemoteCache
 import Lake.Build.Target
@@ -2824,14 +2825,95 @@ where
         return .done arts
       | .incomplete savedTrace ltar? =>
         let (savedTrace, ltar?, alias?) ← aliasedPrevious? presetup savedTrace ltar? restore depTrace
+        let logPos ← getLogPos
         let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
-        -- Whether the build directory holds the outputs the saved trace describes
-        let mut replayed := false
-        let mut claim? : Option HeldClaim := none
-        if status.isUpToDate then
-          if (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) then
-            replayed := true
-          else
+        /-
+        Runs `build`, which may compile or unpack the outputs, with the trace and archive to go on
+        with, holding the input lock unless it is off (`acquireInputLock?`). Under the lock the local
+        cache is read again: another Lake process may have cached the outputs meanwhile, and their
+        restore replaces the replay above (the lock's own messages stay).
+        -/
+        let withLock (build : SavedTrace → Option Artifact → JobM (ClaimLoop ModuleOutputArtifacts)) :
+            JobM (ClaimLoop ModuleOutputArtifacts) := do
+          let lockPos ← getLogPos
+          let some lock ← acquireInputLock? mod.pkg.cacheScope depTrace.hash
+            | build savedTrace ltar?
+          try
+            match (← fetchFromCache? presetup savedTrace restore (remoteRead := false)) with
+            | .complete arts =>
+              modifyThe Log fun log => log.dropFrom logPos ++ log.takeFrom lockPos
+              if restore then mod.stampOutputs savedTrace depTrace.hash
+              return .done arts
+            | .incomplete savedTrace ltar? => build savedTrace ltar?
+          finally
+            lock.release
+        -- Maps the input to the cached outputs `arts`; `skippedOrBuilt` if a usage skip or build gave them
+        let cacheOutputs (arts : ModuleOutputArtifacts) (ltar? : Option Artifact)
+            (claim? : Option HeldClaim) (skippedOrBuilt : Bool) :
+            JobM (ClaimLoop ModuleOutputArtifacts) := do
+          let arts ← mod.withSavedKeptFrom arts
+          -- An archive from the cache describes the mapping's outputs, which accepted ones are not.
+          let arts := if arts.keptFrom?.isSome then arts else {arts with ltar? := arts.ltar? <|> ltar?}
+          -- The trace holds the log of the action that produced the outputs: their replay, restore
+          -- (by input hash or from the usage index), unpack, kept-module check's accept or build
+          let log := (← readTraceFile mod.traceFile).log
+          -- Queued before the local mapping is written: a build that finds the mapping never
+          -- compiles (or queues) this input. After a crash between the two, the next build
+          -- restores the outputs through the trace without queueing them, so they stay queued once.
+          -- A queue line or a mapping would name artifacts that the cache does not hold. The supersede
+          -- rule (`Cache.writeOutputsCore`) keeps accepted outputs until a source compile replaces them.
+          unless arts.cacheSkipped do
+            if (← compiledHere) then
+              -- `lake cache push` packs the per-file outputs into the archive it uploads
+              queueCompiledOutputs claim? mod.pkg depTrace.hash mod.name.toString
+                (some presetup.srcHash) (toJson {arts.descrs with ltar? := none}) log
+            else if skippedOrBuilt && alias?.isNone then
+              queueKeptAlias presetup arts depTrace.hash
+            (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs (log := log)
+          mod.indexUsage presetup arts restore log
+          return .done arts
+        let uncacheable (ltar? : Option Artifact) : JobM (ClaimLoop ModuleOutputArtifacts) := do
+          let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
+          return .done (← mod.withSavedKeptFrom {arts with ltar? := arts.ltar? <|> ltar?})
+        if !status.isUpToDate then
+          -- Before it compiles, a build that writes the shared remote cache claims the input.
+          -- While another build holds the claim, the job waits, then fetches again. `withLock`
+          -- releases the input lock before the wait: the run after it takes the lock again.
+          withLock fun savedTrace ltar? => do
+            match ← claimInput mod.pkg depTrace.hash sawDone with
+            | .wait wait => return .wait wait
+            | .compile claim? =>
+              withClaim claim? do
+                -- The outputs of a usage skip or build, already in the cache.
+                let arts ← mod.skipOrBuild presetup savedTrace depTrace (cacheWith? := some restore)
+                  (compile := checkOrBuild presetup savedTrace (some restore))
+                if let some compiledFor := alias? then
+                  -- The outputs are the alias's compile only if no other decision gave them: not a compile,
+                  -- not the kept-module checker's accept, and not another compile from the usage index (each
+                  -- compile's `.usekey` records its own input hash)
+                  let usekeyInput? ← match arts.usekey? with
+                    | some usekey => usekeyInputHash? usekey.path
+                    | none => pure none
+                  if !(← compiledHere) && arts.keptFrom?.isNone && usekeyInput? == some compiledFor then
+                    logVerbose s!"remote cache alias: restored the compile of input {compiledFor} \
+                      for input {depTrace.hash}"
+                  else
+                    logVerbose s!"remote cache alias: the compile of input {compiledFor} does not pass \
+                      for input {depTrace.hash}"
+                cacheOutputs arts ltar? claim? true
+        else if (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) then
+          -- The build directory holds the outputs the saved trace describes
+          withClaim none do
+            unless status.isCacheable do return ← uncacheable ltar?
+            if let some arts ← mod.keepOutputs? presetup.isModule presetup.postponeCompile
+                savedTrace.moduleOutputDescrs? (cacheWith? := some restore) then
+              return ← cacheOutputs arts ltar? none false
+            withLock fun _ ltar? => do
+              discard <| mod.buildLean presetup
+              cacheOutputs (← mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile)
+                ltar? none false
+        else
+          withLock fun _ ltar? => do
             -- Restoring from the archive stamps the trace with the current input
             -- hash, so only do it on a verified hash match. An mtime-only match
             -- leaves the hash unconfirmed, so rebuild instead.
@@ -2840,63 +2922,12 @@ where
                 discard <| mod.buildLean presetup
             else
               discard <| mod.buildLean presetup
-        else
-          -- Before it compiles, a build that writes the shared remote cache claims the input.
-          -- While another build holds the claim, the job waits, then fetches again.
-          match ← claimInput mod.pkg depTrace.hash sawDone with
-          | .wait wait => return .wait wait
-          | .compile c? => claim? := c?
-        withClaim claim? do
-          -- The outputs of a usage skip or build, already in the cache.
-          let cached? ← if status.isUpToDate then pure none else
-            some <$> mod.skipOrBuild presetup savedTrace depTrace (cacheWith? := some restore)
-              (compile := checkOrBuild presetup savedTrace (some restore))
-          if let (some compiledFor, some arts) := (alias?, cached?) then
-            -- The outputs are the alias's compile only if no other decision gave them: not a compile,
-            -- not the kept-module checker's accept, and not another compile from the usage index (each
-            -- compile's `.usekey` records its own input hash)
-            let usekeyInput? ← match arts.usekey? with
-              | some usekey => usekeyInputHash? usekey.path
-              | none => pure none
-            if !(← compiledHere) && arts.keptFrom?.isNone && usekeyInput? == some compiledFor then
-              logVerbose s!"remote cache alias: restored the compile of input {compiledFor} \
-                for input {depTrace.hash}"
-            else
-              logVerbose s!"remote cache alias: the compile of input {compiledFor} does not pass \
-                for input {depTrace.hash}"
-          if status.isCacheable then
-            let arts ← id do
-              if let some arts := cached? then return arts
-              if replayed then
-                if let some arts ← mod.keepOutputs? presetup.isModule presetup.postponeCompile
-                    savedTrace.moduleOutputDescrs? (cacheWith? := some restore) then
-                  return arts
-                discard <| mod.buildLean presetup
-              mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile
-            let arts ← mod.withSavedKeptFrom arts
-            -- An archive from the cache describes the mapping's outputs, which accepted ones are not.
-            let arts := if arts.keptFrom?.isSome then arts else {arts with ltar? := arts.ltar? <|> ltar?}
-            -- The trace holds the log of the action that produced the outputs: their replay, restore
-            -- (by input hash or from the usage index), unpack, kept-module check's accept or build
-            let log := (← readTraceFile mod.traceFile).log
-            -- Queued before the local mapping is written: a build that finds the mapping never
-            -- compiles (or queues) this input. After a crash between the two, the next build
-            -- restores the outputs through the trace without queueing them, so they stay queued once.
-            -- A queue line or a mapping would name artifacts that the cache does not hold. The supersede
-            -- rule (`Cache.writeOutputsCore`) keeps accepted outputs until a source compile replaces them.
-            unless arts.cacheSkipped do
-              if (← compiledHere) then
-                -- `lake cache push` packs the per-file outputs into the archive it uploads
-                queueCompiledOutputs claim? mod.pkg depTrace.hash mod.name.toString
-                  (some presetup.srcHash) (toJson {arts.descrs with ltar? := none}) log
-              else if cached?.isSome && alias?.isNone then
-                queueKeptAlias presetup arts depTrace.hash
-              (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs (log := log)
-            mod.indexUsage presetup arts restore log
-            return .done arts
-          else
-            let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
-            return .done (← mod.withSavedKeptFrom {arts with ltar? := arts.ltar? <|> ltar?})
+            withClaim none do
+              if status.isCacheable then
+                cacheOutputs (← mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile)
+                  ltar? none false
+              else
+                uncacheable ltar?
     else .done <$> do
       let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
       if status.isUpToDate then

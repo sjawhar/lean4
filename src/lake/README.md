@@ -30,6 +30,7 @@ A Lake configuration file defines the package's basic configuration. It also typ
   + [Supported Sources](#supported-sources)
   + [TOML `require`](#toml-require)
 * [GitHub Release Builds](#github-release-builds)
+* [Artifact Cache: One Build per Input](#artifact-cache-one-build-per-input)
 * [Writing and Running Scripts](#writing-and-running-scripts)
 * [Building and Running Lake from the Source](#building-and-running-lake-from-the-source)
   + [Building with Nix Flakes](#building-with-nix-flakes)
@@ -527,6 +528,14 @@ Lake internally uses `curl` to download the release and `tar` to unpack it, so t
 ### Uploading
 
 To upload a built package as an artifact to a GitHub release, Lake provides the `lake upload <tag>` command as a convenient shorthand. This command uses `tar` to pack the package's build directory into an archive and uses `gh release upload` to attach it to a pre-existing GitHub release for `tag`. Thus, in order to use it, the package uploader (but not the downloader) needs to have `gh`, the [GitHub CLI](https://cli.github.com/), installed and in `PATH`.
+
+## Artifact Cache: One Build per Input
+
+When the artifact cache is writable for a package, Lake processes on one machine that share a cache directory (`LAKE_CACHE_DIR`) build each of its module inputs once. The cache is writable for a package that sets `enableArtifactCache = true`, or that leaves `enableArtifactCache` unset in a workspace that enables the cache (e.g., with `LAKE_ARTIFACT_CACHE=true`, or with `enableArtifactCache = true` in the root package when the package is a dependency). Before Lake builds a module whose outputs are not in the cache, it takes an exclusive lock on the file `locks/<scope>/<input hash>` in the cache directory, where the input hash is the one that names the module's outputs in the cache. If another Lake process holds that lock, this one waits for it to finish, and then restores that process's outputs from the cache instead of building the module again. The lock is held until the outputs are in the cache, or until the build of the module fails, and the operating system releases it if the process dies.
+
+A package with `enableArtifactCache = false` takes no lock, nor does one whose cache is only read (the default, when neither the package nor the workspace enables the cache). The lock is also off when `LAKE_NO_BUILD_LOCK` is true (e.g., `LAKE_NO_BUILD_LOCK=1`), and under `lake build --no-build`. If Lake cannot open or lock the file (e.g., the directory is not writable), it builds the module without the lock and prints one warning for the process to standard error.
+
+A build never deletes a lock file. Lock files are deleted only together with the whole cache, by `lake cache clean`.
 
 ## Writing and Running Scripts
 

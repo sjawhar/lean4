@@ -69,6 +69,11 @@ holder and what the holder does.
   with times in the future, only leaves the second bound. A module waits with no thread at all
   (`runWithClaimWaits`); another target waits on its job's thread, which gives its slot in the
   pool to another job meanwhile (`waitForClaim`).
+* A module's build with a writable artifact cache takes the input lock (`acquireInputLock?`)
+  before it claims the input, and holds it until the outputs are in the cache, so that only one
+  Lake process of a machine claims and compiles the input. It releases the lock before it waits
+  for another build's claim, and the run after the wait takes it again: a second lock of the same
+  file in one process would block on the first.
 * Builds share the inputs out instead of racing for them. A build that has read a live claim
   that says `building` knows the build that holds it (a push holds `queued` and `done` claims
   with its own process ID, and compiles nothing), and gives each input it is about to compile to

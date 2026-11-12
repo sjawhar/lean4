@@ -18,6 +18,7 @@ import Lake.Util.JsonObject
 import Lake.Util.IO
 import Lake.Config.PushQueue
 import Lake.Build.Claim
+import Lake.Build.InputLock
 import Lake.Util.RemoteExec
 import Lake.Build.RemoteExec
 
@@ -665,10 +666,10 @@ which registers it as `buildLockHandle`), so if Lake is killed, the lock is held
 too: the compiler of a killed Lake cannot write into the workspace while another Lake builds it.
 A process that runs in a session of its own (the kept-module checker, the detached `lake cache push`,
 the cache token command) does not inherit it. (Windows releases the lock with the process.)
-Setting `LAKE_NO_BUILD_LOCK=1` disables it.
+Setting `LAKE_NO_BUILD_LOCK=1` disables it and the input lock of each module build (`acquireInputLock?`).
 -/
 public def Workspace.withBuildLock (ws : Workspace) (act : IO α) : IO α := do
-  if (← IO.getEnv "LAKE_NO_BUILD_LOCK").bind envToBool? |>.getD false then
+  if (← isBuildLockDisabled) then
     return ← act
   let lockFile := ws.root.lakeDir / "build.lock"
   let h? ← try
