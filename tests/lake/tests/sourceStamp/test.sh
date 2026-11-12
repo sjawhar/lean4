@@ -5,12 +5,13 @@ source ../common.sh
 
 # Lake keeps the hash and the parsed header of each module's source with the source's identity
 # (device, inode, size, modification and status change times) in a record of its package's
-# `.lake/build/source.stamps`, and reads the source again only when that identity changed. It records
-# no identity that changed within 2 s before it looked at the file, so an edit in the same clock tick
-# as the stored hash is seen. A record's first line holds the hash and the identity; the header
-# follows. A process reads the file once for its lookups; each write of a build's changed records
-# (after it reports its result, and before in the background when no record changed for a second)
-# reads it again while it holds `source.stamps.lock`.
+# `.lake/build/source.stamps`, and reads the source again only when that identity changed. Then it
+# hashes the source, and takes the header from the record only if the record holds that hash. It
+# records no identity that changed within 2 s before it looked at the file, so an edit in the same
+# clock tick as the stored hash is seen. A record's first line holds the hash and the identity; the
+# header follows. A process reads the file once for its lookups; each write of a build's changed
+# records (after it reports its result, and before in the background when no record changed for a
+# tenth of a second or a change waited a second) reads it again while it holds `source.stamps.lock`.
 
 NO_BUILD_CODE=3
 mkdir -p work/T work/U && cd work
@@ -70,8 +71,8 @@ test_run build T --no-build --rehash
 test_run build T --rehash
 ignores_stamp
 
-# A record is used only for the identity it records: each of its parts is compared (on Unix-like
-# systems, any change of the others also moves the status change time)
+# A record's hash is used only for the identity it records: each of its parts is compared (on
+# Unix-like systems, any change of the others also moves the status change time)
 for n in 2 3 4 5 6 7 8; do
   plant
   set_field T.A $n 1
@@ -136,8 +137,8 @@ if command -v flock > /dev/null; then
   fi
 fi
 
-# A build writes its records in the background once none has changed for a second, so a build
-# that compiles for long keeps them before it ends
+# A build writes its records in the background once none has changed for a tenth of a second, so a
+# build that compiles for long keeps them before it ends
 sleep 3
 test_run build T
 stamp del T.B
@@ -175,3 +176,41 @@ ignores_stamp
 test_run build T
 plant
 uses_stamp
+
+# A copy of the tree (new inodes and status change times, the same modification times, as `cp -a`
+# makes) matches no record's identity, so each source is read and hashed again. A record of another
+# identity is reused only where it holds the source's hash: its header is taken, and the source is
+# recorded again under the copy's identity. The copy builds nothing, and its next build reads no
+# source.
+printf 'def a : Nat := 1\n' > T/A.lean
+sleep 3
+test_run build T
+test_cmd rm -rf ../copy ../copy2 ../copy3
+test_cmd cp -a . ../copy
+test_cmd cp -a . ../copy2
+test_cmd cp -a . ../copy3
+inode_field() { stamp get "$1" | head -n 1 | cut -d ' ' -f 3; }
+cd ../copy
+sleep 3
+test_cmd test "$(inode_field T.A)" != "$(stat -c %i T/A.lean)"
+test_not_out 'Built' build T
+test_cmd test "$(inode_field T.A)" = "$(stat -c %i T/A.lean)"
+plant
+uses_stamp
+
+# The header comes from the record: in a copy, B's record (of the other tree's identity, with the
+# hash of B's source) with an import that B's source does not have is used
+cd ../copy2
+edit T.B 's/ T\.A$/ T.Nope/'
+test_err 'T.Nope' build T --no-build
+
+# An edit that keeps the size and the modification time (restored with `touch -d`) changes the
+# hash: in a copy, where no identity matches, the record is not reused and the module is built
+cd ../copy3
+mtime=$(stat -c %y T/A.lean)
+printf 'def a : Nat := 2\n' > T/A.lean
+test_cmd touch -d "$mtime" T/A.lean
+test_cmd test "$(stat -c %y T/A.lean)" = "$mtime"
+test_out 'Built T.A' build T
+test_run build T --no-build
+cd ../work
