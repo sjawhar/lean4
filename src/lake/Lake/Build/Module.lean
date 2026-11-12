@@ -116,9 +116,21 @@ def ClockReading.elapsed (start : ClockReading) : IO Int := do
 
 /-- The hash and the header that the source stamp `stamp` records for the identity `ident`. -/
 def readSourceStamp? (stamp ident : String) : Option (Hash × ModuleHeader) := do
+  -- Checked before the split, so that a record of another identity costs no split of its header
+  unless (stamp.drop 16).startsWith s!" {ident}\n" do none
   let first :: header := stamp.split '\n' |>.toStringList | none
   unless stamp.endsWith "\n" && first.length == 17 + ident.length && first.endsWith s!" {ident}" do none
   return (← Hash.ofHex? (first.take 16).toString, ← decodeStampHeader? header.dropLast)
+
+/--
+The header that the source stamp `stamp` records for contents with the hash `hash`, whatever
+identity it records, and the stamp's encoding of that header (`encodeStampHeader`).
+-/
+def sourceStampHeader? (stamp : String) (hash : Hash) : Option (ModuleHeader × String) := do
+  unless stamp.startsWith s!"{hash} " do none
+  let first :: header := stamp.split '\n' |>.toStringList | none
+  unless stamp.endsWith "\n" && first.startsWith s!"{hash} " do none
+  return (← decodeStampHeader? header.dropLast, (stamp.drop (first.length + 1)).toString)
 
 /--
 The source stamp of a source with the identity `ident` whose contents have the hash `hash` and the
@@ -149,21 +161,29 @@ def maySourceStamp (mdata : IO.FS.Metadata) (start : ClockReading) (file : IO.FS
 The hash and the parsed header of the source of `mod`, whose metadata `mdata` was read at `start`.
 
 Unless `--rehash` is set, a source stamp (in `Module.sourceStampFile`) that records the source's
-current identity gives both, and the source is not read. Otherwise the source is read, hashed and
-parsed, and, unless the build is `--no-build` (which writes nothing to the build directory), its
-stamp is set for a later write of the stamp queue (`setStamp`, `maySourceStamp`).
+current identity gives both, and the source is not read. Otherwise the source is read and hashed.
+A stamp of the same contents under another identity (as in a copy of the tree) then gives the
+header, which it recorded when it was parsed from those contents; else the source is parsed. Unless
+the build is `--no-build` (which writes nothing to the build directory), the stamp of the current
+identity is set for a later write of the stamp queue (`setStamp`, `maySourceStamp`).
 -/
 def Module.fetchSourceInfo (mod : Module) (mdata : IO.FS.Metadata) (start : ClockReading) :
     JobM (Hash × ModuleHeader) := do
   let ident := sourceStampIdentity mdata
   let key := mod.name.toString
-  if (← getTrustHash) then
-    if let some stamp ← findStamp? mod.sourceStampFile key then
-      if let some info := readSourceStamp? stamp ident then
-        return info
+  let stamp? ← if (← getTrustHash) then (← getStamps).find? mod.sourceStampFile key else pure none
+  if let some stamp := stamp? then
+    if let some info := readSourceStamp? stamp ident then
+      return info
   let path := mod.leanFile
   let contents ← IO.FS.readFile path
   let hash := Hash.ofText contents
+  -- A record of another identity is reused only for contents of an equal hash (the source was just
+  -- read and hashed), whose header it recorded; any other record falls through to the parse
+  if let some (header, encoded) := stamp?.bind (sourceStampHeader? · hash) then
+    unless (← getNoBuild) do
+      setStamp mod.sourceStampFile key s!"{hash} {ident}\n{encoded}" (maySourceStamp mdata start)
+    return (hash, header)
   let header ← Lean.parseImports' contents path.toString
   unless (← getNoBuild) do
     if let some stamp := sourceStamp? hash ident header then
@@ -2472,27 +2492,35 @@ def Module.outputArtifacts (mod : Module) (descrs : ModuleOutputDescrs) (mtime :
 /--
 The outputs stamp (`Module.outputsStampFile`) of the module's outputs that `descrs` describes, as
 their files in the build directory are now (each file's device, inode, size and modification time),
-and the files' modification times; or none if `ok` rejects a file or a file cannot be read.
+and each file's description and metadata; or none if `ok` rejects a file or a file cannot be read.
 -/
 def Module.stampOutputFiles (mod : Module) (descrs : ModuleOutputDescrs)
-    (ok : ArtifactDescr → IO.FS.Metadata → JobM Bool) : JobM (Option (String × Array MTime)) := do
+    (ok : ArtifactDescr → IO.FS.Metadata → JobM Bool) :
+    JobM (Option (String × Array (ArtifactDescr × IO.FS.Metadata))) := do
   let mut stamp := ""
-  let mut mtimes := #[]
+  let mut files := #[]
   for (descr, path) in (mod.outputArtifacts descrs fun _ => default).2 do
     let .ok m ← path.metadata.toBaseIO | return none
     unless (← ok descr m) do return none
     stamp := stamp ++ s!"{descr.relPath} {m.device} {m.inode} {m.byteSize} {m.modified.sec} {m.modified.nsec}\n"
-    mtimes := mtimes.push m.modified
-  return some (stamp, mtimes)
+    files := files.push (descr, m)
+  return some (stamp, files)
+
+/-- Whether the file whose metadata is `m` is the artifact cache's entry of `descr` (the same device and inode). -/
+def isCacheEntry (cache : Cache) (descr : ArtifactDescr) (m : IO.FS.Metadata) : BaseIO Bool := do
+  let .ok e ← (cache.artifactDir / descr.relPath).metadata.toBaseIO | return false
+  return m.device == e.device && m.inode == e.inode
 
 /--
-The module's outputs at their files in its build directory, found without a look at the artifact
-cache: its saved trace describes them for `inputHash`, and each file is unchanged since a build
-found it to be the cache's entry (it has the identity that the module's outputs stamp, in
-`Module.outputsStampFile`, records, and a second link). The module's cache mapping must exist, so
-that a cache that lost it, or was removed, gets it again on the full path. Replays the trace's log
-and takes a local archive that the trace does not name, as the full path does. Not under
-`--rehash`, nor in a build that records the package's outputs (`-o`), which needs the entries.
+The module's outputs at their files in its build directory, found without the full path's restore
+from the artifact cache: its saved trace describes them for `inputHash`, each file has a second link,
+and each is unchanged since a build found it to be the cache's entry (it has the identity that the
+module's outputs stamp, in `Module.outputsStampFile`, records) or, where the stamp records other
+identities or none (as in a copy of the tree and its cache), is the cache's entry now; its stamp is
+then set again, unless under `--no-build`. The module's cache mapping must exist, so that a cache
+that lost it, or was removed, gets it again on the full path. Replays the trace's log and takes a
+local archive that the trace does not name, as the full path does. Not under `--rehash`, nor in a
+build that records the package's outputs (`-o`), which needs the entries.
 -/
 def Module.unchangedOutputs? (mod : Module) (savedTrace : SavedTrace) (inputHash : Hash) :
     JobM (Option ModuleOutputArtifacts) := do
@@ -2503,13 +2531,19 @@ def Module.unchangedOutputs? (mod : Module) (savedTrace : SavedTrace) (inputHash
   let some descrs := savedTrace.moduleOutputDescrs? | return none
   -- Outputs that a kept-module check accepted take the full path, which applies the supersede rule to them
   if descrs.keptFrom?.isSome then return none
-  let some stamp ← findStamp? mod.outputsStampFile mod.name.toString | return none
-  let some (now, mtimes) ← mod.stampOutputFiles descrs (fun _ m => pure (m.numLinks ≥ 2)) | return none
-  unless stamp == now do return none
-  unless (← ((← getLakeCache).outputsFile mod.pkg.cacheScope inputHash).pathExists) do return none
+  let stamp? ← (← getStamps).find? mod.outputsStampFile mod.name.toString
+  let some (now, files) ← mod.stampOutputFiles descrs (fun _ m => pure (m.numLinks ≥ 2)) | return none
+  let cache ← getLakeCache
+  unless (← (cache.outputsFile mod.pkg.cacheScope inputHash).pathExists) do return none
+  if stamp? != some now then
+    -- Without a matching stamp, a file is reused only if it is the cache entry its trace names itself
+    -- (the same device and inode), which is what a stamp records; any other file takes the full path
+    unless (← files.allM fun (descr, m) => isCacheEntry cache descr m) do return none
+    unless (← getNoBuild) do
+      setStamp mod.outputsStampFile mod.name.toString now
   -- The trace is current (checked above), so this replays its log
   discard <| savedTrace.replayCachedIfUpToDate inputHash
-  let arts := (mod.outputArtifacts descrs (mtimes[·]?.getD default)).1
+  let arts := (mod.outputArtifacts descrs fun i => files[i]?.map (·.2.modified) |>.getD default).1
   if arts.ltar?.isNone then
     if let some ltar ← mod.verifiedLocalLtar? then
       return some {arts with ltar? := some ltar}
@@ -2533,10 +2567,7 @@ def Module.stampOutputs (mod : Module) (savedTrace : SavedTrace) (inputHash : Ha
   let some descrs := trace.moduleOutputDescrs? | return
   if descrs.keptFrom?.isSome then return
   let cache ← getLakeCache
-  let isEntry (descr : ArtifactDescr) (m : IO.FS.Metadata) : JobM Bool := do
-    let .ok e ← (cache.artifactDir / descr.relPath).metadata.toBaseIO | return false
-    return m.device == e.device && m.inode == e.inode
-  let some (stamp, _) ← mod.stampOutputFiles descrs isEntry | return
+  let some (stamp, _) ← mod.stampOutputFiles descrs (fun descr m => isCacheEntry cache descr m) | return
   setStamp mod.outputsStampFile mod.name.toString stamp
 
 /--

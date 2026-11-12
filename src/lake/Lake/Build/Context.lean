@@ -15,6 +15,7 @@ public import Lean.Data.PersistentHashMap
 public import Lean.Util.ModuleUsage
 public import Lake.Build.KeptChecker
 public import Lake.Build.RemoteStats
+public import Lake.Build.StampStore
 
 open System
 namespace Lake
@@ -291,6 +292,8 @@ public structure BuildContext extends BuildConfig, Context where
    Only the build monitor should set this token: reporting assumes that a counted failure exists when the token is set.
   -/
   cancelTk? : Option IO.CancelToken := none
+  /-- The stamp files of the workspace's packages as the build found them (`openStamps`). -/
+  stamps : StampView := {}
   /--
   The workspace's module-times record: compile priorities read at the start of the build, and the
   compile times recorded during it. `none` when the build does not compile (`checkNoBuild`).
@@ -384,6 +387,9 @@ public instance [Pure m] : MonadLift LakeM (BuildT m) where
 
 @[inline] public def getModuleTimes? [Functor m] [MonadBuild m] : m (Option ModuleTimes) :=
   (·.moduleTimes?) <$> getBuildContext
+
+@[inline] public def getStamps [Functor m] [MonadBuild m] : m StampView :=
+  (·.stamps) <$> getBuildContext
 
 @[inline, inherit_doc BuildConfig.oldMode]
 public def getIsOldMode [Functor m] [MonadBuild m] : m Bool :=

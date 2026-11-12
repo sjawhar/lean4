@@ -12,7 +12,7 @@ import Init.Data.Hashable
 import Init.Data.ToString.Macro
 import Init.While
 import Lake.Util.IO
-import Std.Data.HashMap
+public import Std.Data.HashMap
 import Std.Data.HashSet
 import Std.Sync.Mutex
 
@@ -20,12 +20,14 @@ import Std.Sync.Mutex
 
 A stamp file holds small records, one per module of a package and keyed by the module's name,
 that let a later build skip work (such as reading a source again). A process reads each stamp file
-once, when it first looks up one of its records, and keeps that view for its lookups until it
-writes the file. The records a build changes are written after it reports its result
-(`writeStamps`), and before that in the background each time no record has changed for a second,
-so that the stamps it sets before it compiles are written while it compiles. A write reads the file
-again while it holds a lock on `<file>.lock`, merges the changes into it and replaces it, so that
-records other processes wrote are kept.
+once, in the background when its first build starts (`openStamps`), and keeps that view, or the
+file as it last wrote it, for its builds' lookups; a lookup takes no lock (`StampView`). The
+records a build changes are written after it reports its result (`writeStamps`), and before that
+in the background each time no record has changed for a tenth of a second or a change has waited a
+second, so that the stamps it sets before it compiles are written while it compiles, and most of
+those of a build that changes records all along are written while it runs. Adding a change takes
+no lock either. A write reads the file again while it holds a lock on `<file>.lock`, merges the
+changes into it and replaces it, so that records other processes wrote are kept.
 
 Format (integers are little-endian `UInt64`s): the magic `LKSTAMP1`; the count `n` of records; the
 file's size; `n` index entries, each the key's hash and the record's offset, in the order of the
@@ -57,7 +59,7 @@ def pushU64 (bs : ByteArray) (v : UInt64) : ByteArray :=
 The contents of a stamp file with `count` records, whose form is checked: the index's hashes in
 order, and the records whole and back to back in the index's order, up to the file's end.
 -/
-structure StampData where
+public structure StampData where
   bytes : ByteArray := .empty
   count : Nat := 0
 
@@ -198,8 +200,12 @@ public def writeStampFile (file : FilePath) (records : Array (String × String))
   IO.FS.writeBinFile tmp (encodeStamps .empty pieces)
   IO.FS.rename tmp file
 
-/-- Each stamp file as this process last read or wrote it. -/
-builtin_initialize stampFiles : Std.Mutex (Std.HashMap FilePath StampData) ← Std.Mutex.new {}
+/--
+Each stamp file as this process last read or wrote it, as the task that reads it (`openStamps`) or
+the value a write left. Only the start of a build and the end of a write take its lock, not a lookup.
+-/
+builtin_initialize stampFiles : Std.Mutex (Std.HashMap FilePath (Task StampData)) ←
+  Std.Mutex.new {}
 
 /-- A change to a record, made by the next write of the queue. -/
 inductive StampChange
@@ -207,27 +213,37 @@ inductive StampChange
   | set (value : String) (keep : IO.FS.Metadata → BaseIO Bool)
   | remove
 
-/-- The changes to stamp files not written yet, and the state of their background writer. -/
-structure StampQueue where
-  /--
-  The changes (`setStamp`, `removeStamp`), the newest first. Build jobs on many threads share the
-  queue, so its value is never exclusive and an array would be copied by each push.
-  -/
+/--
+The changes to stamp files not written yet (`setStamp`, `removeStamp`), the newest first, with when
+the newest and the oldest of them were made (`IO.monoNanosNow`).
+-/
+structure StampPending where
   changes : List (FilePath × String × StampChange) := []
-  /-- When the newest change was made (`IO.monoNanosNow`). -/
   newest : Nat := 0
-  /-- The moment before which the background writer (`writeWhenQuiet`) does not write again. -/
-  notBefore : Nat := 0
-  /-- Whether a build runs that writes the queue when it ends (`startStampWrites`, `writeStamps`). -/
+  oldest : Nat := 0
+  deriving Inhabited
+
+/--
+The pending changes. Build jobs on many threads add to them, so a change is put on with one update
+of a reference (no lock, and no wait but for another update), and the list is never exclusive, so
+an array would be copied by each push.
+-/
+builtin_initialize stampPending : IO.Ref StampPending ← IO.mkRef {}
+
+/-- The state of the background writer (`writeWhenQuiet`), which only its start and end change. -/
+structure StampWriter where
+  /-- Whether a build runs that writes the changes when it ends (`startStampWrites`, `writeStamps`). -/
   building : Bool := false
-  /-- The background writer, while it runs. -/
+  /-- The number of the build's writer: a writer of an earlier build that sees another ends. -/
+  generation : Nat := 0
+  /-- The background writer, while the build runs. -/
   writer : Option (Task Unit) := none
   deriving Inhabited
 
-builtin_initialize stampQueue : Std.Mutex StampQueue ← Std.Mutex.new {}
+builtin_initialize stampWriter : Std.Mutex StampWriter ← Std.Mutex.new {}
 
 /--
-Held from taking changes off the queue to the end of their write, so that writes keep the order of
+Held from taking the pending changes to the end of their write, so that writes keep the order of
 the changes.
 -/
 builtin_initialize stampWriting : Std.Mutex Unit ← Std.Mutex.new ()
@@ -238,26 +254,67 @@ def readStamps (file : FilePath) : BaseIO StampData := do
   | .ok bs => return StampData.ofBytes bs
   | .error _ => return {}
 
-/-- The stamp file `file` as this process last read or wrote it (reading it the first time). -/
-def loadStamps (file : FilePath) : BaseIO StampData :=
+/--
+The task that reads the stamp file `file` for this process (started the first time, on a thread of
+its own, so that the read and the check of its form hold neither the lock of `stampFiles` nor a
+worker of the task pool).
+-/
+def stampLoad (file : FilePath) : BaseIO (Task StampData) :=
   stampFiles.atomically do
-    if let some d := (← get)[file]? then return d
-    let d ← readStamps file
-    modify (·.insert file d)
-    return d
+    if let some t := (← get)[file]? then return t
+    let t ← BaseIO.asTask (prio := .dedicated) (readStamps file)
+    modify (·.insert file t)
+    return t
 
 /--
-The value of the record of `key` in the stamp file `file`, as the file was when this process first
-read it or last wrote it: the changes since then (`setStamp`, `removeStamp`) are not seen.
+The stamp files of a build as it found them when it started (`openStamps`): each file, by its
+path, with the task that reads it. A build's jobs look records up in it (`StampView.find?`), which
+takes no lock and changes no shared state, so that lookups on many threads never wait for each
+other; only a lookup that comes before its file's read ends waits, for that read.
 -/
-public def findStamp? (file : FilePath) (key : String) : BaseIO (Option String) :=
-  return (← loadStamps file).find? key
+public structure StampView where
+  files : Std.HashMap FilePath (Task StampData) := {}
+
+/--
+The view of the stamp files of a build whose packages' build directories are `dirs` (each
+directory's files named `*.stamps`), as this process last read or wrote each one. The reads of
+those it has not read run on threads of their own and the call returns before they end, so that
+they overlap the start of the build. A file that is not there when the build starts has no records
+for it.
+-/
+public def openStamps (dirs : Array FilePath) : BaseIO StampView := do
+  let mut files : Std.HashMap FilePath (Task StampData) := {}
+  for dir in dirs do
+    let .ok entries ← dir.readDir.toBaseIO | continue
+    for e in entries do
+      if e.path.extension == some "stamps" then
+        files := files.insert e.path (← stampLoad e.path)
+  return {files}
+
+/--
+The value of the record of `key` in the stamp file `file`, as the file was when the build that
+opened `view` started (`openStamps`): the changes since then (`setStamp`, `removeStamp`) are not
+seen.
+-/
+public def StampView.find? (view : StampView) (file : FilePath) (key : String) :
+    BaseIO (Option String) := do
+  let some t := view.files[file]? | return none
+  return (← IO.wait t).find? key
 
 /--
 How long the queue must go without a change before the background writer writes it: the stamps
-that a build sets before it compiles (its sources') are then written while it compiles.
+that a build sets before it compiles (its sources', and its outputs' where it stamps them again) are
+then written while it compiles, and those of a build that ends soon after are written before it
+ends, not after it reports its result.
 -/
-def stampQuietNanos : Nat := 1000000000
+def stampQuietNanos : Nat := 100000000
+
+/--
+How long a change may wait on the queue while others keep coming before the background writer
+writes it: a build that changes records all along (one that stamps every module again, as in a copy
+of the tree) then writes most of them while it runs, not after it reports its result.
+-/
+def stampMaxWaitNanos : Nat := 1000000000
 
 /--
 How often the background writer looks at the queue, which also bounds how long `writeStamps` waits
@@ -314,7 +371,7 @@ def writeStampChanges (file : FilePath) (changes : Std.HashMap String StampChang
       let bytes := encodeStamps old.bytes pieces
       IO.FS.writeBinFile tmp bytes
       IO.FS.rename tmp file
-      stampFiles.atomically <| modify (·.insert file {bytes, count := pieces.size})
+      stampFiles.atomically <| modify (·.insert file (.pure {bytes, count := pieces.size}))
     finally
       if let some lock := lock? then lock.unlock
   if let .error _ ← write.toBaseIO then
@@ -331,61 +388,61 @@ def writeStampFiles (changes : List (FilePath × String × StampChange)) : BaseI
       if f == file then m.insert key change else m
   for w in writes do IO.wait w
 
-/-- Writes the changes on the queue: each stamp file once, and where a key has several, the last. -/
+/-- Writes the pending changes: each stamp file once, and where a key has several, the last. -/
 def writeQueued : BaseIO Unit :=
   stampWriting.atomically do
-    let changes ← stampQueue.atomically <| modifyGet fun q => (q.changes, {q with changes := []})
+    let changes ← stampPending.modifyGet fun p => (p.changes, {p with changes := []})
     writeStampFiles changes.reverse
 
 /--
-The background writer: writes the queue once no change has come for `stampQuietNanos`, and ends
-when the queue is empty or the build ends (`writeStamps`). After a write it waits nine times as long
-as the write took before the next, so that background writes take at most a tenth of the time.
+The background writer of the build numbered `generation`: writes the pending changes once no change
+has come for `stampQuietNanos`, or once the oldest has waited `stampMaxWaitNanos`, and ends when
+the build ends (`writeStamps`) or another starts. After a write it waits nine times as long as the
+write took before the next (until `notBefore`), so that background writes take at most a tenth of
+the time.
 -/
-partial def writeWhenQuiet : BaseIO Unit := do
+partial def writeWhenQuiet (generation : Nat) (notBefore : Nat := 0) : BaseIO Unit := do
   IO.sleep stampWriterSliceMs
+  let w ← stampWriter.atomically get
+  unless w.building && w.generation == generation do return
   let now ← IO.monoNanosNow
-  let quiet? ← stampQueue.atomically <| modifyGet fun q =>
-    if !q.building || q.changes.isEmpty then (none, {q with writer := none})
-    else (some (now ≥ q.notBefore && now - q.newest ≥ stampQuietNanos), q)
-  match quiet? with
-  | none => return
-  | some false => writeWhenQuiet
-  | some true =>
-    writeQueued
-    let done ← IO.monoNanosNow
-    stampQueue.atomically <| modify fun q => {q with notBefore := done + 9 * (done - now)}
-    writeWhenQuiet
+  let p ← stampPending.get
+  if p.changes.isEmpty || now < notBefore ||
+      (now - p.newest < stampQuietNanos && now - p.oldest < stampMaxWaitNanos) then
+    return ← writeWhenQuiet generation notBefore
+  writeQueued
+  let done ← IO.monoNanosNow
+  writeWhenQuiet generation (done + 9 * (done - now))
 
-/-- Puts `change` on the queue, and starts the background writer if a build runs and none does. -/
+/-- Adds `change` to the pending changes. -/
 def queueChange (change : FilePath × String × StampChange) : BaseIO Unit := do
   let now ← IO.monoNanosNow
-  stampQueue.atomically do
-    let q ← get
-    let q := {q with changes := change :: q.changes, newest := now}
-    if q.building && q.writer.isNone then
-      set {q with writer := some (← BaseIO.asTask (prio := .dedicated) writeWhenQuiet)}
-    else
-      set q
+  stampPending.modify fun p =>
+    {changes := change :: p.changes, newest := now,
+     oldest := if p.changes.isEmpty then now else p.oldest}
 
 /--
-Sets the record of `key` in the stamp file `file` to `value` at the next write of the queue, if
-`keep` holds then for the metadata of the new file (taken before its records are chosen).
+Sets the record of `key` in the stamp file `file` to `value` at the next write of the pending
+changes, if `keep` holds then for the metadata of the new file (taken before its records are
+chosen).
 -/
 public def setStamp (file : FilePath) (key value : String)
     (keep : IO.FS.Metadata → BaseIO Bool := fun _ => pure true) : BaseIO Unit :=
   queueChange (file, key, .set value keep)
 
-/-- Removes the record of `key` from the stamp file `file` at the next write of the queue. -/
+/-- Removes the record of `key` from the stamp file `file` at the next write of the pending changes. -/
 public def removeStamp (file : FilePath) (key : String) : BaseIO Unit :=
   queueChange (file, key, .remove)
 
 /--
-Starts a build's writes of its stamp changes in the background (`writeWhenQuiet`); the build ends
-them with `writeStamps`.
+Starts a build's writes of its stamp changes in the background (`writeWhenQuiet`), on a thread of
+its own for the whole build; the build ends them with `writeStamps`.
 -/
 public def startStampWrites : BaseIO Unit :=
-  stampQueue.atomically <| modify fun q => {q with building := true, notBefore := 0}
+  stampWriter.atomically do
+    let generation := (← get).generation + 1
+    let writer ← BaseIO.asTask (prio := .dedicated) (writeWhenQuiet generation)
+    set ({building := true, generation, writer := some writer} : StampWriter)
 
 /--
 Ends a build's writes of its stamp changes: stops the background writer, then writes the changes
@@ -393,6 +450,7 @@ not written yet (`setStamp`, `removeStamp`), each stamp file once, by a temporar
 it, and where a key has several changes, the last.
 -/
 public def writeStamps : BaseIO Unit := do
-  let writer? ← stampQueue.atomically <| modifyGet fun q => (q.writer, {q with building := false})
+  let writer? ← stampWriter.atomically <| modifyGet fun w =>
+    (w.writer, {w with building := false, writer := none})
   if let some w := writer? then IO.wait w
   writeQueued

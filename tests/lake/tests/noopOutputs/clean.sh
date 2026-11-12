@@ -1,1 +1,1 @@
-rm -rf work produced.out
+rm -rf work copy produced.out
