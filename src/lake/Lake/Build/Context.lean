@@ -9,6 +9,7 @@ prelude
 public import Lake.Config.Cache
 public import Lake.Config.Context
 public import Lake.Build.Job.Basic
+public import Lake.Build.StampStore
 
 open System
 namespace Lake
@@ -99,6 +100,8 @@ public structure BuildContext extends BuildConfig, Context where
    Only the build monitor should set this token: reporting assumes that a counted failure exists when the token is set.
   -/
   cancelTk? : Option IO.CancelToken := none
+  /-- The stamp files of the workspace's packages as the build found them (`openStamps`). -/
+  stamps : StampView := {}
 
 /-- A transformer to equip a monad with a `BuildContext`. -/
 public abbrev BuildT := ReaderT BuildContext
@@ -118,6 +121,9 @@ public instance [Pure m] : MonadLift LakeM (BuildT m) where
 
 @[inline] public def getBuildConfig [Functor m] [MonadBuild m] : m BuildConfig :=
   (·.toBuildConfig) <$> getBuildContext
+
+@[inline] public def getStamps [Functor m] [MonadBuild m] : m StampView :=
+  (·.stamps) <$> getBuildContext
 
 @[inline, inherit_doc BuildConfig.oldMode]
 public def getIsOldMode [Functor m] [MonadBuild m] : m Bool :=

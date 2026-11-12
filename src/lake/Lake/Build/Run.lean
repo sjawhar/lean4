@@ -392,6 +392,7 @@ def Workspace.startBuild
 : BaseIO (Job α) := do
   -- Each caller ends the build with `writeStamps`
   startStampWrites
+  let bctx := {bctx with stamps := ← openStamps (bctx.workspace.packages.map (·.buildDir))}
   let compute := Job.async build (caption := caption)
   compute.run.run'.run bctx |>.run nilTrace
 

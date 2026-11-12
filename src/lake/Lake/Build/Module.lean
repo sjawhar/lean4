@@ -106,6 +106,8 @@ def ClockReading.elapsed (start : ClockReading) : IO Int := do
 
 /-- The hash and the header that the source stamp `stamp` records for the identity `ident`. -/
 def readSourceStamp? (stamp ident : String) : Option (Hash × ModuleHeader) := do
+  -- Checked before the split, so that a record of another identity costs no split of its header
+  unless (stamp.drop 16).startsWith s!" {ident}\n" do none
   let first :: header := stamp.split '\n' |>.toStringList | none
   unless stamp.endsWith "\n" && first.length == 17 + ident.length && first.endsWith s!" {ident}" do none
   return (← Hash.ofHex? (first.take 16).toString, ← decodeStampHeader? header.dropLast)
@@ -115,6 +117,7 @@ The header that the source stamp `stamp` records for contents with the hash `has
 identity it records, and the stamp's encoding of that header (`encodeStampHeader`).
 -/
 def sourceStampHeader? (stamp : String) (hash : Hash) : Option (ModuleHeader × String) := do
+  unless stamp.startsWith s!"{hash} " do none
   let first :: header := stamp.split '\n' |>.toStringList | none
   unless stamp.endsWith "\n" && first.startsWith s!"{hash} " do none
   return (← decodeStampHeader? header.dropLast, (stamp.drop (first.length + 1)).toString)
@@ -158,7 +161,7 @@ def Module.fetchSourceInfo (mod : Module) (mdata : IO.FS.Metadata) (start : Cloc
     JobM (Hash × ModuleHeader) := do
   let ident := sourceStampIdentity mdata
   let key := mod.name.toString
-  let stamp? ← if (← getTrustHash) then findStamp? mod.sourceStampFile key else pure none
+  let stamp? ← if (← getTrustHash) then (← getStamps).find? mod.sourceStampFile key else pure none
   if let some stamp := stamp? then
     if let some info := readSourceStamp? stamp ident then
       return info
