@@ -7,7 +7,9 @@ source ../common.sh
 # the cache's entries records their identities (device, inode, size, modification time) in the
 # module's record of its package's `.lake/build/outputs.stamps`. While each build-directory output
 # keeps that identity and a second link, and the module's cache mapping exists, a later build does
-# not look at the cache for the module.
+# not look at the cache for the module. Where the record does not match, a build-directory output
+# that is the cache's entry itself (the same device and inode) is taken too, and recorded again;
+# any other file takes the full path.
 
 HELPER="$(cd .. && pwd)/stamps.lean"
 mkdir -p work/T && cd work
@@ -165,6 +167,69 @@ has_stamp
 stale
 away fast
 test_exp "$(ltar_state)" = "$(cat full.ltar)"
+
+# A record is reused only for the identities it records. Without one that matches, a build file is
+# reused only if it is the cache entry its trace names itself (the same device and inode), which is
+# what a record vouches for; any other file takes the full path, which checks it against the cache.
+# record_inode -- the inode that T.A's record holds for its `.olean` (its first line)
+record_inode() { stamp get | head -n 1 | cut -d ' ' -f 3; }
+
+# A copy of the tree and its cache (new inodes, the same modification times and the same links, as
+# `cp -a` makes) matches no record. Its build files are the copied cache's entries: they are reused,
+# and recorded again under their new identities, so the copy's next build skips the cache
+# (without the stale local archive of the case above)
+test_cmd rm -f $LTAR $LTAR.hash
+test_run build T
+test_run build T
+test_cmd rm -rf ../copy
+test_cmd cp -a . ../copy
+(
+  cd ../copy
+  export LAKE_CACHE_DIR="$PWD/cache"
+  ARTS=$LAKE_CACHE_DIR/artifacts
+  test_cmd test "$(record_inode)" != "$(inode $OLEAN)"
+  test_cmd test "$(inode $OLEAN)" = "$(inode "$(entry)")"
+  test_not_out 'Built' build T
+  test_cmd test "$(record_inode)" = "$(inode $OLEAN)"
+  test_cmd mv "$ARTS" "$ARTS.away"
+  test_run build T
+  test_exp ! -d "$ARTS"
+  test_cmd mv "$ARTS.away" "$ARTS"
+)
+
+# A build file hard-linked to a stale entry of the cache (the `.olean` of an earlier source of the
+# module, not the entry its trace names) is not reused, with or without a record: the full path puts
+# the named entry back, and only that entry is recorded
+test_cmd cp T/A.lean A.orig
+stale_link() {
+  test_cmd ln -f "$old" $OLEAN
+  test_run build T
+  test_cmd test "$(inode $OLEAN)" = "$(inode "$(entry)")"
+  test_cmd cmp $OLEAN "$(entry)"
+  test_cmd test "$(record_inode)" = "$(inode "$(entry)")"
+}
+test_run build T
+old=$(entry)
+printf 'def a : Nat := 3\ntheorem w : True := by sorry\n' > T/A.lean
+test_run build T
+test_cmd test "$(entry)" != "$old"
+test_exp -f "$old"
+stale_link
+test_cmd stamp del
+stale_link
+
+# A build file with other bytes and a second link (it is no cache entry; its modification time is
+# the entry's) is not reused either: the full path puts the entry back
+test_cmd rm -f x.olean x2.olean
+{ cat $OLEAN; echo x; } > x.olean
+test_cmd touch -r $OLEAN x.olean
+test_cmd ln x.olean x2.olean
+test_cmd mv -f x.olean $OLEAN
+test_run build T
+test_cmd test "$(inode $OLEAN)" = "$(inode "$(entry)")"
+test_cmd cmp $OLEAN "$(entry)"
+test_cmd cp A.orig T/A.lean
+test_run build T
 
 # The cases below need the usage cutoff and kept-module checks. A Lake that has the usage cutoff
 # records it among a module's inputs in its trace when `LAKE_USAGE_CUTOFF` is set; with one that does
