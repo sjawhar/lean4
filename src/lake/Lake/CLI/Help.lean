@@ -183,8 +183,11 @@ ENVIRONMENT:
   enables the cache (e.g., `LAKE_ARTIFACT_CACHE=true`). Then two Lake
   processes that must build the same module input build it only once: one
   builds it, holding a lock file in the cache's `locks` directory, and the
-  other waits for it and then restores the outputs from the cache. A package
-  with `enableArtifactCache = false` takes no lock.
+  other waits for it and then restores the outputs from the cache. The lock
+  is held until the outputs are in the cache, except while the kept-module
+  checker checks the module: then the lock is released, and another process
+  may compile that module during the check. A package with
+  `enableArtifactCache = false` takes no lock.
 
 BUILD SERVICE:          compile Lean modules on a shared service instead of locally
   LAKE_REMOTE_EXEC            service endpoint (grpc://host:port or grpcs://host:port); the switch

@@ -2571,6 +2571,17 @@ def Module.stampOutputs (mod : Module) (savedTrace : SavedTrace) (inputHash : Ha
   setStamp mod.outputsStampFile mod.name.toString stamp
 
 /--
+A kept-module check that runs without its compile's input lock (`withLock` in `fetchLocal`).
+-/
+structure KeptCheckRelock where
+  /-- Runs the checker with the input lock released, and takes the lock again after it. -/
+  unlocked : JobM KeptVerdict → JobM KeptVerdict
+  /-- Under the lock, the outputs of the input that another Lake process cached, if any. -/
+  reread : JobM (Option ModuleOutputArtifacts)
+  /-- Whether `reread` gave the outputs, in place of a compile. -/
+  restored : IO.Ref Bool
+
+/--
 Recursively build a Lean module.
 Fetch its dependencies and then elaborate the Lean source file, producing
 all possible artifacts (e.g., `.olean`, `.ilean`, `.c`, `.bc`).
@@ -2858,43 +2869,29 @@ where
         let (savedTrace, ltar?, alias?) ← aliasedPrevious? presetup savedTrace ltar? restore depTrace
         let logPos ← getLogPos
         let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
+        let replayEnd ← getLogPos
+        -- The input lock while `withLock` holds it
+        let held ← IO.mkRef (none : Option InputLock)
         /-
         Runs `build`, which may compile or unpack the outputs, with the trace and archive to go on
         with, holding the input lock unless it is off (`acquireInputLock?`). Under the lock the local
         cache is read again: another Lake process may have cached the outputs meanwhile, and their
-        restore replaces the replay above (the lock's own messages stay). `build` also gets what a
-        kept-module check runs with (`checkOrBuild`): the check runs without the lock, which is taken
-        again after it, so that the checker's wait does not hold up another process's compile; a
-        compile after the check first reads the local cache again (its outputs, if it has them).
+        restore replaces the replay above (what was logged after the replay stays).
         -/
-        let withLock (build : (JobM KeptVerdict → JobM KeptVerdict) →
-            JobM (Option ModuleOutputArtifacts) → SavedTrace → Option Artifact →
-            JobM (ClaimLoop ModuleOutputArtifacts)) :
+        let withLock (build : SavedTrace → Option Artifact → JobM (ClaimLoop ModuleOutputArtifacts)) :
             JobM (ClaimLoop ModuleOutputArtifacts) := do
-          let lockPos ← getLogPos
           let some lock ← acquireInputLock? mod.pkg.cacheScope depTrace.hash
-            | build id (pure none) savedTrace ltar?
-          let held ← IO.mkRef (some lock)
-          let unlocked (check : JobM KeptVerdict) : JobM KeptVerdict := do
-            if let some lock ← held.swap none then lock.release
-            let verdict ← check
-            held.set (← acquireInputLock? mod.pkg.cacheScope depTrace.hash)
-            return verdict
+            | build savedTrace ltar?
+          held.set (some lock)
           try
             match (← fetchFromCache? presetup savedTrace restore (remoteRead := false)) with
             | .complete arts =>
-              modifyThe Log fun log => log.dropFrom logPos ++ log.takeFrom lockPos
+              modifyThe Log fun log => log.dropFrom logPos ++ log.takeFrom replayEnd
               if restore then mod.stampOutputs savedTrace depTrace.hash
               return .done arts
-            | .incomplete savedTrace ltar? =>
-              let reread : JobM (Option ModuleOutputArtifacts) := do
-                unless (← held.get).isSome do return none
-                match (← fetchFromCache? presetup savedTrace restore (remoteRead := false)) with
-                | .complete arts => return some arts
-                | .incomplete .. => return none
-              build unlocked reread savedTrace ltar?
+            | .incomplete savedTrace ltar? => build savedTrace ltar?
           finally
-            if let some lock ← held.get then lock.release
+            if let some lock ← held.swap none then lock.release
         -- Maps the input to the cached outputs `arts`; `skippedOrBuilt` if a usage skip or build gave them
         let cacheOutputs (arts : ModuleOutputArtifacts) (ltar? : Option Artifact)
             (claim? : Option HeldClaim) (skippedOrBuilt : Bool) :
@@ -2927,21 +2924,31 @@ where
           -- Before it compiles, a build that writes the shared remote cache claims the input.
           -- While another build holds the claim, the job waits, then fetches again. `withLock`
           -- releases the input lock before the wait: the run after it takes the lock again.
-          withLock fun unlocked reread savedTrace ltar? => do
+          withLock fun savedTrace ltar? => do
             match ← claimInput mod.pkg depTrace.hash sawDone with
             | .wait wait => return .wait wait
             | .compile claim? =>
               withClaim claim? do
-                -- Outputs another Lake process cached while the kept-module checker ran
-                let restored ← IO.mkRef false
-                let reread := do
-                  let arts? ← reread
-                  restored.set arts?.isSome
-                  return arts?
+                -- The checker's wait does not hold up another process's compile of the input; a
+                -- compile after the check first reads the local cache again
+                let relock : KeptCheckRelock := {
+                  unlocked := fun check => do
+                    let some lock ← held.swap none | check
+                    lock.release
+                    let verdict ← check
+                    held.set (← acquireInputLock? mod.pkg.cacheScope depTrace.hash)
+                    return verdict
+                  reread := do
+                    unless (← held.get).isSome do return none
+                    match (← fetchFromCache? presetup savedTrace restore (remoteRead := false)) with
+                    | .complete arts => return some arts
+                    | .incomplete .. => return none
+                  restored := ← IO.mkRef false
+                }
                 -- The outputs of a usage skip or build, already in the cache.
                 let arts ← mod.skipOrBuild presetup savedTrace depTrace (cacheWith? := some restore)
-                  (compile := checkOrBuild presetup savedTrace (some restore) unlocked reread)
-                if (← restored.get) then
+                  (compile := checkOrBuild presetup savedTrace (some restore) (relock? := some relock))
+                if (← relock.restored.get) then
                   if restore then mod.stampOutputs savedTrace depTrace.hash
                   return .done arts
                 if let some compiledFor := alias? then
@@ -2958,23 +2965,22 @@ where
                     logVerbose s!"remote cache alias: the compile of input {compiledFor} does not pass \
                       for input {depTrace.hash}"
                 cacheOutputs arts ltar? claim? true
-        else if (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) then
-          -- The build directory holds the outputs the saved trace describes
-          withClaim none do
-            unless status.isCacheable do return ← uncacheable ltar?
-            if let some arts ← mod.keepOutputs? presetup.isModule presetup.postponeCompile
-                savedTrace.moduleOutputDescrs? (cacheWith? := some restore) then
-              return ← cacheOutputs arts ltar? none false
-            withLock fun _ _ _ ltar? => do
-              discard <| mod.buildLean presetup
-              cacheOutputs (← mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile)
-                ltar? none false
         else
-          withLock fun _ _ _ ltar? => do
+          -- Whether the build directory holds the outputs the saved trace describes
+          let exist ← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile
+          if exist then
+            let kept? ← withClaim none do
+              unless status.isCacheable do return some (← uncacheable ltar?)
+              let some arts ← mod.keepOutputs? presetup.isModule presetup.postponeCompile
+                  savedTrace.moduleOutputDescrs? (cacheWith? := some restore)
+                | return none
+              some <$> cacheOutputs arts ltar? none false
+            if let some r := kept? then return r
+          withLock fun _ ltar? => do
             -- Restoring from the archive stamps the trace with the current input
             -- hash, so only do it on a verified hash match. An mtime-only match
             -- leaves the hash unconfirmed, so rebuild instead.
-            if status == .hashUpToDate then
+            if !exist && status == .hashUpToDate then
               unless (← unpackLocalLtar depTrace.hash) do
                 discard <| mod.buildLean presetup
             else
@@ -3008,11 +3014,9 @@ where
               let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
               mod.withSavedKeptFrom {arts with ltar? := arts.ltar? <|> ltar?}
             else
-              mod.skipOrBuild presetup savedTrace depTrace
-                (compile := checkOrBuild presetup savedTrace none id (pure none))
+              mod.skipOrBuild presetup savedTrace depTrace (compile := checkOrBuild presetup savedTrace none)
         else
-          mod.skipOrBuild presetup savedTrace depTrace
-            (compile := checkOrBuild presetup savedTrace none id (pure none))
+          mod.skipOrBuild presetup savedTrace depTrace (compile := checkOrBuild presetup savedTrace none)
   isKeptExcluded : JobM Bool :=
     return (← getBuildContext).keptExclude.contains mod.name
   /-
@@ -3052,20 +3056,22 @@ where
   with the module's verdict when the cutoff applies, and what the module's decision read (`hashes`), which the
   compile takes its `modsysHash` from. With `cacheWith?`, accepted outputs are saved to
   the cache as a skip saves its outputs (`Module.keepOutputs?`). Returns the outputs and whether
-  they were kept and cached. The checker runs within `unlocked`, which releases the input lock
-  meanwhile (see `withLock`); after the check, a compile is replaced by the outputs `reread` gives,
-  if any (which are in the cache).
+  they were kept and cached. With `relock?`, the checker runs without the input lock, and a compile
+  after the check is replaced by the outputs its `reread` gives, if any (which are in the cache).
   -/
   checkOrBuild (presetup : ModulePreSetup) (savedTrace : SavedTrace) (cacheWith? : Option Bool)
-    (unlocked : JobM KeptVerdict → JobM KeptVerdict) (reread : JobM (Option ModuleOutputArtifacts))
+    (relock? : Option KeptCheckRelock := none)
     (decided? : Option (UsageVerdict × ModuleSetup)) (hashes : ContentHashes)
   : JobM (ModuleOutputArtifacts × Bool) := do
     if let some checker := (← getBuildContext).keptChecker? then
       if let some (data, descrs, setup) ← keptCandidate? presetup savedTrace decided? then
         let cwd ← IO.currentDir
         let abs (f : FilePath) := if f.isAbsolute then f else cwd / f
-        let verdict ← unlocked do
+        let check : JobM KeptVerdict :=
           checker.check mod.name (abs mod.oleanFile) (abs presetup.srcFile) (toJson setup)
+        let verdict ← match relock? with
+          | some relock => relock.unlocked check
+          | none => check
         let mut why := ""
         match verdict with
         | .accepted hash =>
@@ -3078,8 +3084,10 @@ where
             why := "the module's outputs changed while the checker checked them"
         | .rejected reason =>
           why := reason
-        if let some arts ← reread then
-          return (arts, true)
+        if let some relock := relock? then
+          if let some arts ← relock.reread then
+            relock.restored.set true
+            return (arts, true)
         logInfo s!"kept-module check: {why}; compiling"
     return (← mod.buildLean presetup (decided?.map (·.2)) hashes, false)
   /-
