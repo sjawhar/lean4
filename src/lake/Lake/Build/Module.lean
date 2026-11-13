@@ -2977,6 +2977,7 @@ where
               some <$> cacheOutputs arts ltar? none false
             if let some r := kept? then return r
           withLock fun _ ltar? => do
+            -- Outputs that exist were rejected by `keepOutputs?`, so rebuild them.
             -- Restoring from the archive stamps the trace with the current input
             -- hash, so only do it on a verified hash match. An mtime-only match
             -- leaves the hash unconfirmed, so rebuild instead.

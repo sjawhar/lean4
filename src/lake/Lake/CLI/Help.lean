@@ -185,8 +185,9 @@ ENVIRONMENT:
   builds it, holding a lock file in the cache's `locks` directory, and the
   other waits for it and then restores the outputs from the cache. The lock
   is held until the outputs are in the cache, except while the kept-module
-  checker checks the module: then the lock is released, and another process
-  may compile that module during the check. A package with
+  checker checks the module (then another process may compile that module
+  during the check) and while the build waits for another build's claim of
+  the input in the remote cache. A package with
   `enableArtifactCache = false` takes no lock.
 
 BUILD SERVICE:          compile Lean modules on a shared service instead of locally
