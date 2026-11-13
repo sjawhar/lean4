@@ -50,7 +50,6 @@ public def isBuildLockDisabled : BaseIO Bool := do
 
 /-- A held input lock (see `acquireInputLock?`). -/
 public structure InputLock where
-  file : FilePath
   handle : IO.FS.Handle
 
 /-- Releases the input lock. Never deletes its file. -/
@@ -90,7 +89,7 @@ public def acquireInputLock? (scope : String) (inputHash : Hash) : JobM (Option 
       discard <| (processStderr.putStrLn s!"warning: {msg}" *> processStderr.flush).toBaseIO
     return none
   | .ok (handle, waited?) =>
-    let lock : InputLock := {file, handle}
+    let lock : InputLock := {handle}
     if let some ms := waited? then
       logVerbose s!"waited {ms / 1000}.{ms % 1000 / 100} s for another Lake process \
         to build this input ({file})"
@@ -99,9 +98,3 @@ public def acquireInputLock? (scope : String) (inputHash : Hash) : JobM (Option 
           lock.release
           Job.cancelJob
     return some lock
-
-/-- Runs `act` holding the input lock of `inputHash` in `scope` (see `acquireInputLock?`). -/
-public def withInputLock (scope : String) (inputHash : Hash) (act : JobM α) : JobM α := do
-  let some lock ← acquireInputLock? scope inputHash
-    | act
-  try act finally lock.release
