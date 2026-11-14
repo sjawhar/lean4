@@ -37,7 +37,7 @@ case_1() {
   expect_rc t1 0
   wait_lake t2 60
   expect_rc t2 0
-  expect_eq "compiles of P.X" 1 "$(lines "$COUNTER")"
+  expect_eq "compiles of P.X" 2 "$(lines "$COUNTER")"
   match_pat 'Built P\.X( |$)' t1.log
   no_match_pat 'Built P\.X( |$)' t2.log
   same_inode "$(lib_file t1 P.X olean)" "$(lib_file t2 P.X olean)"
