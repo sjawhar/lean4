@@ -172,7 +172,18 @@ mappings of each to a file specified by the `-o` option. By default, with `-o`,
 Lake will track the targets of the root package, use `--package` to select a
 different one. These mappings can then be used to upload the build artifacts
 to a remote cache with `lake cache put`. This will only include the artifacts
-from the covered targets. Other targets in the package will not be tracked."
+from the covered targets. Other targets in the package will not be tracked.
+
+ENVIRONMENT:
+  LAKE_NO_BUILD_LOCK    if true (e.g., `1`), do not take the input lock
+
+  The artifact cache is writable for a package that sets
+  `enableArtifactCache = true`, or that leaves it unset in a workspace that
+  enables the cache (e.g., `LAKE_ARTIFACT_CACHE=true`). Then two Lake
+  processes that must build the same module input build it only once: one
+  builds it, holding a lock file in the cache's `locks` directory, and the
+  other waits for it and then restores the outputs from the cache. A package
+  with `enableArtifactCache = false` takes no lock."
 
 def helpQuery :=
 "Build targets and output results
