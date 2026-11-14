@@ -33,7 +33,9 @@ away() {
   rm -rf "$ARTS"
   test_cmd mv "$ARTS.away" "$ARTS"
 }
-strip_times() { sed -E 's/ \([0-9.]+m?s\)//' produced.out > "$1"; }
+# strip_times FILE -- `produced.out` without job times and job numbers, which depend on the order in
+# which parallel jobs finish
+strip_times() { sed -E 's/ \([0-9.]+m?s\)//; s/\[[0-9]+\//[_\//' produced.out > "$1"; }
 # fast -- a build that does not look at the cache's entries: with them gone, it prints what the
 # build that recorded the outputs printed (`full.out`), and puts none of them back
 fast() {
