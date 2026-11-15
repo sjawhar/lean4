@@ -825,9 +825,10 @@ With `LAKE_REMOTE_CACHE_QUEUE` set to true and `LAKE_REMOTE_CACHE` naming an
 compiled (not one it replayed or restored) to the queue `push.jsonl` in the
 Lake cache directory. It uploads nothing itself. It queues nothing while
 `LEAN_GITHASH` names a Lean other than the one it runs. With
-`LAKE_USAGE_CUTOFF` true, a module's entry also names its usage-cutoff files
-(`.usage`, `.resolved`, `.usekey`), and with `LAKE_REMOTE_CACHE_ALIASES` true
-as well, the build also queues an alias for each module that the cutoff keeps
+`LAKE_USAGE_CUTOFF` true, a module's entry also names its usage-cutoff records
+(one file, `.usepack`, that holds its `.usekey`, `.usage` and `.resolved`), and
+with `LAKE_REMOTE_CACHE_ALIASES` true as well, the build also queues an alias
+for each module that the cutoff keeps
 for a new input: `kept/<inputHash>.json`, the input hash of the compile whose
 outputs it kept. An alias names no outputs: a build that reads one restores
 that compile and keeps it only if the cutoff's check passes for its own

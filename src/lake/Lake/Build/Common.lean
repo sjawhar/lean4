@@ -705,7 +705,7 @@ for text that is not valid UTF-8, which has no hash).
 -/
 public def Cache.saveArtifactIfMatches
   (cache : Cache) (file : FilePath) (expected? : Option Hash)
-  (ext := "art") (text exe useLocalFile := false)
+  (ext := "art") (text exe useLocalFile := false) (writeHash := true)
 : LogIO (Except (Option Hash) Artifact) := do
   let some (bytes, hash) ← cacheIO <| readEntryBytes? file text
     | if expected?.isSome then return .error none else
@@ -721,7 +721,7 @@ public def Cache.saveArtifactIfMatches
   let cached ← cache.insertEntry descr file bytes text
   cacheIO do
     if cached then setAccessRightsIfChanged cacheFile ⟨r, r, r⟩
-    writeFileHash file hash
+    if writeHash then writeFileHash file hash
   let mtime ← cacheIO <| getMTime (if cached then cacheFile else file)
   let path := if useLocalFile || !cached then file else cacheFile
   return .ok {descr, name := file.toString, path, mtime, cacheSkipped := !cached}
@@ -738,19 +738,21 @@ and its `cacheSkipped` is set.
 * `exe`: the cached file will be executable.
 * `useLocalFile`: the resulting artifact will use `file`'s path instead of path to
 the file in the cache.
+* `writeHash`: with `false`, no `.hash` file is written for `file` (a module's usage-cutoff pack,
+`Lake.UsagePack`, whose readers check its bytes themselves and never read a `.hash` file).
 -/
 public def Cache.saveArtifact
-  (cache : Cache) (file : FilePath) (ext := "art") (text exe useLocalFile := false)
+  (cache : Cache) (file : FilePath) (ext := "art") (text exe useLocalFile := false) (writeHash := true)
 : LogIO Artifact := do
-  match (← cache.saveArtifactIfMatches file none ext text exe useLocalFile) with
+  match (← cache.saveArtifactIfMatches file none ext text exe useLocalFile writeHash) with
   | .ok art => return art
   | .error _ => unreachable!
 
 @[inline, inherit_doc Cache.saveArtifact]
 public def cacheArtifact
   [MonadWorkspace m] [MonadLiftT LogIO m] [Monad m]
-  (file : FilePath) (ext := "art") (text exe useLocalFile := false)
-: m Artifact := do (← getLakeCache).saveArtifact file ext text exe useLocalFile
+  (file : FilePath) (ext := "art") (text exe useLocalFile := false) (writeHash := true)
+: m Artifact := do (← getLakeCache).saveArtifact file ext text exe useLocalFile writeHash
 
 /--
 Caches `file` like `cacheArtifact`, unless its contents no longer hash to `expected`, the hash
@@ -1006,10 +1008,12 @@ To restore `file`, the function attempts to create it as hard link to the artifa
 (e.g., because the artifact and path are on differets drives and/or file systems), falls back to
 copying the artifact to the new path.
 
+With `writeHash := false`, no `.hash` file is written for `file` (as for `Cache.saveArtifact`).
+
 **For internal use.**
 -/
 public def restoreArtifact
-  (file : FilePath) (art : Artifact) (exe text := false)
+  (file : FilePath) (art : Artifact) (exe text := false) (writeHash := true)
 : JobM Artifact := do
   let isEntry ← if art.path == file then file.pathExists else
     (· matches .ok true) <$> (file.isSameFile art.path).toBaseIO
@@ -1046,7 +1050,7 @@ public def restoreArtifact
       | .error e =>
         logWarning s!"{art.path}: could not read the cache entry to link {file} to it; \
           keeping the file: {e}"
-      writeFileHash file art.hash
+      if writeHash then writeFileHash file art.hash
       return art.useLocalFile file
     logWarning s!"{file}: does not match the cache entry its trace names; restoring the entry\
       \n  cache entry: {art.path}"
@@ -1067,7 +1071,7 @@ public def restoreArtifact
     let r := {read := true, write := false, execution := exe}
     setAccessRightsIfChanged file ⟨r, r, r⟩
   logVerbose s!"restored artifact from cache to: {file}"
-  writeFileHash file art.hash
+  if writeHash then writeFileHash file art.hash
   return art.useLocalFile file
 
 /-- **For internal use only.** -/
