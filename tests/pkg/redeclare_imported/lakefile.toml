@@ -1,0 +1,4 @@
+name = "redeclare_imported"
+
+[[lean_lib]]
+name = "Redecl"

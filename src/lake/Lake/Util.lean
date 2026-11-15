@@ -7,6 +7,7 @@ module
 
 prelude
 public import Lake.Util.Binder
+public import Lake.Util.CacheToken
 public import Lake.Util.Casing
 public import Lake.Util.Cli
 public import Lake.Util.Cycle
@@ -33,6 +34,7 @@ public import Lake.Util.OrdHashSet
 public import Lake.Util.Proc
 public import Lake.Util.RBArray
 public import Lake.Util.Reservoir
+public import Lake.Util.Sha256
 public import Lake.Util.Store
 public import Lake.Util.StoreInsts
 public import Lake.Util.String

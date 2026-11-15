@@ -78,6 +78,14 @@ structure CommandParsedSnapshot extends Snapshot where
   elabSnap : CommandElaboratingSnapshot
   /-- Next command, unless this is a terminal command. -/
   nextCmdSnap? : Option (SnapshotTask CommandParsedSnapshot)
+  /--
+  The input, and the end of this command in it, whose positions this command's elaboration state
+  holds, if that is not this snapshot's own input. It is set when the command, or an earlier one,
+  reused the elaboration of an earlier input and its state holds positions that moving does not
+  update (`Lean.Language.Lean.holdsUnmovedPositions`); then the state must not be the start of a new
+  elaboration of a later command (see `Lean.Language.Lean.process`).
+  -/
+  elabSource? : Option (String × String.Pos.Raw) := none
 deriving Nonempty
 partial instance : ToSnapshotTree CommandParsedSnapshot where
   toSnapshotTreeM := go where

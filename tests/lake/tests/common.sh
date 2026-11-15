@@ -366,3 +366,70 @@ test_eq() {
     return 1
   fi
 }
+
+# Usage-cutoff packs (`X.usepack`, `Lake.UsagePack`): the header line `lake-usepack 1 k=<n>:<d> u=<n>:<d> v=<n>:<d>`,
+# then the parts `k` (the `.usekey`), `u` (the `.usage`) and `v` (the `.resolved`), in that order. `<n>` is the
+# part's size in bytes and `<d>` the first 32 hex digits of its SHA-256; a part the pack does not hold is `k=-` (etc.).
+
+# usepack_part PACK PART: the bytes of part PART (k, u or v) of PACK on stdout; fails if PACK does not hold it.
+usepack_part() {
+  local pack=$1 want=$2 header off w tag n
+  header=$(head -n 1 -- "$pack") || return 1
+  off=$(( ${#header} + 1 ))
+  for w in $header; do
+    case $w in
+      [kuv]=*)
+        tag=${w%%=*} n=${w#*=} n=${n%%:*}
+        if [ "$tag" = "$want" ]; then
+          [ "$n" != - ] || return 1
+          tail -c +$((off + 1)) -- "$pack" | head -c "$n"
+          return
+        fi
+        [ "$n" = - ] || off=$((off + n)) ;;
+    esac
+  done
+  return 1
+}
+
+# usepack_has PACK PART: whether PACK exists and holds part PART.
+usepack_has() {
+  [ -f "$1" ] && usepack_part "$1" "$2" > /dev/null
+}
+
+# usepack_write PACK K U V: writes PACK of the parts in the files K, U and V (`-` for a part it does not hold), as a new
+# file renamed over PACK, never through it (it can be a read-only link to a cache entry).
+usepack_write() {
+  local pack=$1 header="lake-usepack 1" tag f
+  local -a parts=("$2" "$3" "$4")
+  local i=0
+  for tag in k u v; do
+    f=${parts[$i]}
+    if [ "$f" = - ]; then
+      header="$header $tag=-"
+    else
+      header="$header $tag=$(( $(wc -c < "$f") )):$(sha256sum < "$f" | cut -c1-32)"
+    fi
+    i=$((i + 1))
+  done
+  { printf '%s\n' "$header"; for f in "${parts[@]}"; do [ "$f" = - ] || cat -- "$f"; done; } > "$pack.tmp"
+  mv -f -- "$pack.tmp" "$pack"
+}
+
+# usepack_set PACK PART FILE: rewrites PACK with part PART replaced by the bytes of FILE, or without it if FILE is `-`.
+# A PACK that does not exist is made of that part alone.
+usepack_set() {
+  local pack=$1 part=$2 src=$3 t tag
+  local -a files=()
+  t=$(mktemp -d)
+  for tag in k u v; do
+    if [ "$tag" = "$part" ]; then
+      if [ "$src" = - ]; then files+=(-); else cat -- "$src" > "$t/$tag"; files+=("$t/$tag"); fi
+    elif [ -f "$pack" ] && usepack_part "$pack" "$tag" > "$t/$tag"; then
+      files+=("$t/$tag")
+    else
+      files+=(-)
+    fi
+  done
+  usepack_write "$pack" "${files[@]}"
+  rm -rf -- "$t"
+}
