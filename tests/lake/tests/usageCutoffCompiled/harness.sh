@@ -2485,9 +2485,9 @@ dn_never_extract_s0() {
 dn_never_extract_s1() { dn_never_extract_a '@[never_extract] '; }
 
 # A closure provider's provides change after the dependent module was restored from the shared cache: `A` gains a
-# declaration `M` does not use, so `M`'s check reads the `.resolved` sidecar it restored with its `.usage`
+# declaration `M` does not use, so `M`'s check reads the `.resolved` it restored with its `.usage` in its pack
 # (`provides_restore:cache`, whose state 0 is built again from the cache into an empty build directory), finds every
-# recorded name resolved as before, and replays `M`. Without the sidecar `M` would build.
+# recorded name resolved as before, and replays `M`. Without the restored `.resolved` `M` would build.
 provides_restore_s0() {
   printf 'name = "test"\ndefaultTargets = ["T"]\n[[lean_lib]]\nname = "T"\n' > lakefile.toml
   mkdir_t

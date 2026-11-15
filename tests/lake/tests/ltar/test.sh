@@ -34,9 +34,9 @@ rm -rf .lake/build
 test_not_out "leantar" build +Test --no-build -v
 test_exp -f .lake/build/ir/Test.ltar
 
-# Test unpacking the archive from the cache (the usage-cutoff sidecars `.usage`, `.resolved` and `.usekey`
-# stay: the archive does not include them, and an entry whose `.usage` is missing is a miss)
-rm -rf .lake/build .lake/cache/artifacts/*.[!lur]*
+# Test unpacking the archive from the cache (the usage-cutoff pack `.usepack`, which holds the module's `.usekey`,
+# `.usage` and `.resolved`, stays: the archive does not include it, and an entry whose pack is missing is a miss)
+rm -rf .lake/build .lake/cache/artifacts/*.[!lu]*
 test_out "leantar" build +Test --no-build -v
 
 # Test caching an `ltar` through `-o` (with `restoreAllArtifacts = true`)
