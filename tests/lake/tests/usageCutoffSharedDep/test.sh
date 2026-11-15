@@ -57,7 +57,8 @@ race() {
     sleep 0.1
   done
   test_exp -f ready
-  test_exp -f a/.lake/build/lib/lean/T/E.usekey
+  test_cmd usepack_has a/.lake/build/lib/lean/T/E.usepack k
+  usepack_alone a/.lake/build/lib/lean/T/E
   printf "$1" > dep/D.lean
   (cd b && test_run build D)
   touch release
@@ -153,16 +154,16 @@ no_match_text "Replayed T.M" after.log
 match_text "T/M.lean" after.log
 
 # An importer reads a dependency's `.usekey`, never its `.usage`. `b` rebuilds `D`, and `D.usage` from before the
-# rebuild is put back next to the new `D.usekey` and `D.olean`: `M` is not replayed against the old `sharedValue`.
+# rebuild is put back into `D`'s new pack, beside the new `D.usekey` and next to the new `D.olean`: `M` is not replayed
+# against the old `sharedValue`.
 printf 'def sharedValue : Nat := 1\n' > dep/D.lean
 printf 'import D\ntheorem kept : sharedValue = 1 := rfl\n' > a/T/M.lean
 (cd a && test_run build T.M)
 (cd b && test_run build D)
-cp dep/.lake/build/lib/lean/D.usage old-D.usage
+usepack_part dep/.lake/build/lib/lean/D.usepack u > old-D.usage
 printf 'def sharedValue : Nat := 2\n' > dep/D.lean
 (cd b && test_run build D)
-rm -f dep/.lake/build/lib/lean/D.usage
-cp old-D.usage dep/.lake/build/lib/lean/D.usage
+test_cmd usepack_set dep/.lake/build/lib/lean/D.usepack u old-D.usage
 (cd a && "$LAKE" build -v T.M) > after.log 2>&1 && rc=0 || rc=$?
 cat after.log
 test_exp $rc != 0

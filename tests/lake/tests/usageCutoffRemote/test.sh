@@ -4,8 +4,8 @@ source ../common.sh
 ./clean.sh
 
 # A build with the usage cutoff on (`LAKE_USAGE_CUTOFF=1`) and the shared remote cache. A writer publishes its fresh
-# compiles as `in/` mappings, each naming one `.ltar` archive that holds the module's usage sidecars (`.usage`,
-# `.resolved`, `.usekey`) beside its outputs, and, with
+# compiles as `in/` mappings, each naming one `.ltar` archive that holds the module's usage-cutoff pack (`.usepack`,
+# which holds its `.usekey`, `.usage` and `.resolved`) beside its outputs, and, with
 # `LAKE_REMOTE_CACHE_ALIASES`, a `kept/<inputHash>.json` alias for each module its cutoff kept under a new input
 # hash, naming the compile it kept (`compiledFor`). A reader that misses by input hash reads the alias, restores the
 # named compile and runs the cutoff's same-tree check on it: a pass keeps the module, a fail compiles it.
@@ -106,8 +106,8 @@ unpack() {
 
 case_publish() {
   # 1. A cutoff-on writer publishes each fresh compile: one `in/` mapping whose data is an archive, with a SHA-256
-  # entry for it alone, and the archive in the store. The archive holds every sidecar the build wrote, with the
-  # build's bytes; B's `.usekey` records the input hash of the compile that wrote it.
+  # entry for it alone, and the archive in the store. The archive holds the pack the build wrote, with the build's
+  # bytes, and no loose usage-cutoff record; B's `.usekey` records the input hash of the compile that wrote it.
   mkpkg "$W"
   on_w test_run -d "$W" build $MODS
   on_w test_run -d "$W" cache push --wait
@@ -121,17 +121,17 @@ case_publish() {
     dir="$WORK_DIR/unpacked/$f"
     test_cmd rm -rf "$dir"
     eval "test_cmd unpack \"\$(store art \"\$SCOPE_DIR\" \"\$m\" \"\$H1_$f\")\" \"\$H1_$f\" \"\$dir\""
-    for ext in usage resolved usekey; do
-      [ -f "$W/$OUT/$f.$ext" ] || continue
-      n="$(find "$dir" -name "$f.$ext" | grep -c . || true)"
+    if [ -f "$W/$OUT/$f.usepack" ]; then
+      n="$(find "$dir" -name "$f.usepack" | grep -c . || true)"
       test_cmd_eq 1 echo "$n"
-      test_cmd cmp "$W/$OUT/$f.$ext" "$(find "$dir" -name "$f.$ext")"
-    done
+      test_cmd cmp "$W/$OUT/$f.usepack" "$(find "$dir" -name "$f.usepack")"
+    fi
+    test_exp -z "$(find "$dir" -name "$f.usage" -o -name "$f.resolved" -o -name "$f.usekey" -o -name "$f.usepack.hash")"
   done
-  # (premise) B's compile wrote the sidecars that the checks above compare
-  test_exp -f "$W/$OUT/B.usage"
-  test_exp -f "$W/$OUT/B.usekey"
-  test_cmd_out "\"input\":\"$H1_B\"" cat "$W/$OUT/B.usekey"
+  # (premise) B's compile wrote the pack that the checks above compare
+  for part in k u v; do test_cmd usepack_has "$W/$OUT/B.usepack" $part; done
+  usepack_alone "$W/$OUT/B"
+  test_cmd_out "\"input\":\"$H1_B\"" usepack_part "$W/$OUT/B.usepack" k
   # The first compile's outputs, which later cases compare against
   test_cmd rm -rf "$WORK_DIR/w1" && cp -r "$W/$OUT" "$WORK_DIR/w1"
 }
@@ -157,7 +157,7 @@ case_aliases() {
 
 case_reader() {
   # 3. A fresh reader at W's state compiles nothing: X and A hit by input hash, and B, C and D through their
-  # aliases, with the first compile's outputs and the sidecars its archives hold.
+  # aliases, with the first compile's outputs and the pack its archives hold.
   R="$TREES/r"
   R_CACHE="$WORK_DIR/r-cache"
   test_cmd rm -rf "$R_CACHE"
@@ -168,14 +168,12 @@ case_reader() {
   # One alias read for each of B, C and D, which miss by input hash (this also shows `kept_reqs` counts them)
   test_cmd_eq 3 kept_reqs
   for f in A X B C D; do test_cmd cmp "$W/$OUT/$f.olean" "$R/$OUT/$f.olean"; done
-  for ext in usage resolved usekey; do
-    [ -f "$WORK_DIR/w1/B.$ext" ] || continue
-    test_cmd cmp "$WORK_DIR/w1/B.$ext" "$R/$OUT/B.$ext"
-  done
-  test_exp -f "$R/$OUT/B.usage"
-  test_exp -f "$R/$OUT/B.usekey"
-  # 4. The restored sidecars serve R's own cutoff: after another unused edit, R keeps B and compiles X. (A guard of
-  # the restore's sidecars: the cutoff's same-tree keep is older than aliases.)
+  test_cmd cmp "$WORK_DIR/w1/B.usepack" "$R/$OUT/B.usepack"
+  test_cmd usepack_has "$R/$OUT/B.usepack" u
+  test_cmd usepack_has "$R/$OUT/B.usepack" k
+  usepack_alone "$R/$OUT/B"
+  # 4. The restored pack serves R's own cutoff: after another unused edit, R keeps B and compiles X. (A guard of
+  # the restore's pack: the cutoff's same-tree keep is older than aliases.)
   edx "$R" 3
   on_r "$R_CACHE" lake_out -d "$R" build -v $MODS
   match_text "Built Test.X" produced.out
@@ -229,7 +227,9 @@ case_forged() {
   jobhas Test.C "remote cache alias: restored the compile of input $H1_C for input $hc"
   no_match_text "Built Test.X" produced.out
   # B's `.usage` is R2's own compile's, not the forged one's (the `.olean`s can have the same bytes)
-  test_cmd_fails cmp -s "$WORK_DIR/w1/B.usage" "$R2/$OUT/B.usage"
+  usepack_part "$WORK_DIR/w1/B.usepack" u > w1-B.usage
+  usepack_part "$R2/$OUT/B.usepack" u > r2-B.usage
+  test_cmd_fails cmp -s w1-B.usage r2-B.usage
 }
 
 case_dangling() {
@@ -445,9 +445,11 @@ case_foreign_usekey() {
   dir="$WORK_DIR/foreign"
   test_cmd rm -rf "$dir"
   test_cmd unpack "$(store art "$scope" Test.B "$hb")" "$hb" "$dir"
-  test_cmd_out "\"input\":\"$hb\"" cat "$dir/lib/B.usekey"
-  sed_i -e "s/\"input\":\"$hb\"/\"input\":\"$fake\"/" "$dir/lib/B.usekey"
-  test_cmd_out "\"input\":\"$fake\"" cat "$dir/lib/B.usekey"
+  usepack_part "$dir/lib/B.usepack" k > "$dir/B.usekey"
+  test_cmd grep -qF "\"input\":\"$hb\"" "$dir/B.usekey"
+  sed_i -e "s/\"input\":\"$hb\"/\"input\":\"$fake\"/" "$dir/B.usekey"
+  test_cmd usepack_set "$dir/lib/B.usepack" k "$dir/B.usekey"
+  test_cmd_out "\"input\":\"$fake\"" usepack_part "$dir/lib/B.usepack" k
   files=()
   for f in "$dir"/lib/*; do [ "$(basename "$f")" = B.trace ] || files+=(-i 0 "$(basename "$f")"); done
   for f in "$dir"/ir/*; do if [ -e "$f" ]; then files+=(-i 1 "$(basename "$f")"); fi; done
@@ -461,6 +463,7 @@ case_foreign_usekey() {
   on_wc "$cache" lake_out -d "$rh" build -v $MODS
   no_match_text "Built Test.B" produced.out
   jobhas Test.B "records input $fake, not $hb; dropping it"
+  test_exp ! -e "$rh/$OUT/B.usepack"
   test_exp ! -e "$rh/$OUT/B.usekey"
   edx "$rh"
   on_wc "$cache" lake_out -d "$rh" build -v $MODS
