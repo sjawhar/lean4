@@ -25,7 +25,11 @@ public structure ModuleOutputDescrs where
   c? : Option ArtifactDescr := none
   bc? : Option ArtifactDescr := none
   ltar? : Option ArtifactDescr := none
-  /-- Usage-cutoff sidecars (`.usage`, `.resolved`, `.usekey`), when the build wrote them. -/
+  /-- The usage-cutoff records (`.usekey`, `.usage`, `.resolved`) in one file, the module's pack (`Lake.UsagePack`),
+  when the build wrote them. -/
+  usepack? : Option ArtifactDescr := none
+  /-- The usage-cutoff records as three files (`.usage`, `.resolved`, `.usekey`): the layout before packs, which
+  this Lake reads from an entry written then, as it was read then, and never writes for a compile of its own. -/
   usage? : Option ArtifactDescr := none
   resolved? : Option ArtifactDescr := none
   usekey? : Option ArtifactDescr := none
@@ -59,6 +63,8 @@ public protected def ModuleOutputDescrs.toJson (self : ModuleOutputDescrs) : Jso
     obj := obj.insert "b" bc
   if let some ltar := self.ltar? then
     obj := obj.insert "l" ltar
+  if let some usepack := self.usepack? then
+    obj := obj.insert "p" usepack
   if let some usage := self.usage? then
     obj := obj.insert "u" usage
   if let some resolved := self.resolved? then
@@ -87,6 +93,7 @@ public protected def ModuleOutputDescrs.fromJson? (val : Json) : Except String M
     c? := ← obj.get? "c"
     bc? := ← obj.get? "b"
     ltar? := ← obj.get? "l"
+    usepack? := ← obj.get? "p"
     usage? := ← obj.get? "u"
     resolved? := ← obj.get? "v"
     usekey? := ← obj.get? "k"
@@ -94,6 +101,11 @@ public protected def ModuleOutputDescrs.fromJson? (val : Json) : Except String M
   }
 
 public instance : FromJson ModuleOutputDescrs := ⟨ModuleOutputDescrs.fromJson?⟩
+
+/-- The descriptions without the usage-cutoff records (pack or files), as a trace records outputs: the records are
+files of the build directory that a kept module's check rewrites, and an archive of `lake build -o` holds outputs only. -/
+public def ModuleOutputDescrs.withoutRecords (self : ModuleOutputDescrs) : ModuleOutputDescrs :=
+  {self with usepack? := none, usage? := none, resolved? := none, usekey? := none}
 
 /-- The output artifacts of a module build. -/
 public structure ModuleOutputArtifacts where
@@ -107,7 +119,9 @@ public structure ModuleOutputArtifacts where
   c? : Option Artifact := none
   bc? : Option Artifact := none
   ltar? : Option Artifact := none
-  /-- Usage-cutoff sidecars (`.usage`, `.resolved`, `.usekey`), when the build wrote them. -/
+  /-- The module's pack of usage-cutoff records (`ModuleOutputDescrs.usepack?`), when the build wrote it. -/
+  usepack? : Option Artifact := none
+  /-- Its records as three files (`ModuleOutputDescrs.usage?`), in the layout before packs. -/
   usage? : Option Artifact := none
   resolved? : Option Artifact := none
   usekey? : Option Artifact := none
@@ -126,7 +140,29 @@ public def ModuleOutputArtifacts.descrs (arts : ModuleOutputArtifacts) : ModuleO
   c? := arts.c?.map (·.descr)
   bc? := arts.bc?.map (·.descr)
   ltar? := arts.ltar?.map (·.descr)
+  usepack? := arts.usepack?.map (·.descr)
   usage? := arts.usage?.map (·.descr)
   resolved? := arts.resolved?.map (·.descr)
   usekey? := arts.usekey?.map (·.descr)
   keptFrom? := arts.keptFrom?
+
+/--
+The path that names the module's `.usekey` record (`Lake.UsagePack`) for a reader, if the outputs have records: in
+their pack (the pack's path with the extension `usekey`), or, in the layout before packs, its own file.
+-/
+public def ModuleOutputArtifacts.usekeyPath? (arts : ModuleOutputArtifacts) : Option System.FilePath :=
+  match arts.usepack? with
+  | some pack => some (pack.path.withExtension "usekey")
+  | none => arts.usekey?.map (·.path)
+
+/-- The path that names the module's `.usage` record, as `usekeyPath?` names its `.usekey`. -/
+public def ModuleOutputArtifacts.usagePath? (arts : ModuleOutputArtifacts) : Option System.FilePath :=
+  match arts.usepack? with
+  | some pack => some (pack.path.withExtension "usage")
+  | none => arts.usage?.map (·.path)
+
+/-- The path that names the module's `.resolved` record, as `usekeyPath?` names its `.usekey`. -/
+public def ModuleOutputArtifacts.resolvedPath? (arts : ModuleOutputArtifacts) : Option System.FilePath :=
+  match arts.usepack? with
+  | some pack => some (pack.path.withExtension "resolved")
+  | none => arts.resolved?.map (·.path)
