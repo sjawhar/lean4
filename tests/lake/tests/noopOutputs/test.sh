@@ -177,37 +177,39 @@ cd v
 export LAKE_CACHE_DIR="$PWD/cache"
 test_run build T
 if ! grep -qF '"usage cutoff: true"' .lake/build/lib/lean/T/A.trace; then
-  echo "SKIPPED: this Lake has no usage cutoff (kept outputs, .usage/.resolved/.usekey)"
+  echo "SKIPPED: this Lake has no usage cutoff (kept outputs, .usepack)"
   exit 0
 fi
-test_exp -f .lake/build/lib/lean/T/A.usage
+test_exp -f .lake/build/lib/lean/T/A.usepack
+usepack_alone .lake/build/lib/lean/T/A .lake/build/lib/lean/T/B
 
-# With the usage cutoff, a module's outputs also have a `.usage`, a `.resolved` and a `.usekey`, which
-# the cache's mapping describes (the trace does not). When one of them is removed from the build
-# directory, a build gives the output and leaves the build directory that a build that checks the
+# With the usage cutoff, a module's outputs also have its pack of usage-cutoff records (`.usepack`, which holds its
+# `.usekey`, `.usage` and `.resolved`), which the cache's mapping describes (the trace does not). When it is removed
+# from the build directory, a build gives the output and leaves the build directory that a build that checks the
 # cache gives
 test_run build T
 has_stamp
-for ext in usage resolved usekey; do
-  f=.lake/build/lib/lean/T/A.$ext
-  entry="$LAKE_CACHE_DIR/artifacts/$(cat $f.hash).$ext"
-  test_exp -f "$entry"
-  sidecar_state() { if [ -e $f ]; then cksum < $f; else echo none; fi; }
-  # the build that checks the cache: without the module's stamp record
-  test_cmd rm -f $f
-  test_cmd stamp del
-  lake_out build T
-  strip_times full.out
-  sidecar_state > full.state
-  has_stamp
-  # the same removal, now with the module's stamp record
-  test_cmd rm -f $f
-  lake_out build T
-  strip_times now.out
-  check_diff full.out now.out
-  test_exp "$(sidecar_state)" = "$(cat full.state)"
-  test_cmd ln -f "$entry" $f
-done
+f=.lake/build/lib/lean/T/A.usepack
+# the pack's entry, which the cache's mapping of `T.A`'s input names (a pack has no `.hash` file)
+map="$LAKE_CACHE_DIR/outputs/t/$(sed -nE 's/.*"depHash": *"([0-9a-f]+)".*/\1/p' .lake/build/lib/lean/T/A.trace).json"
+entry="$LAKE_CACHE_DIR/artifacts/$(sed -nE 's/.*"p": *"([^"]+)".*/\1/p' "$map")"
+test_exp -f "$entry"
+test_cmd cmp "$f" "$entry"
+sidecar_state() { if [ -e $f ]; then cksum < $f; else echo none; fi; }
+# the build that checks the cache: without the module's stamp record
+test_cmd rm -f $f
+test_cmd stamp del
+lake_out build T
+strip_times full.out
+sidecar_state > full.state
+has_stamp
+# the same removal, now with the module's stamp record
+test_cmd rm -f $f
+lake_out build T
+strip_times now.out
+check_diff full.out now.out
+test_exp "$(sidecar_state)" = "$(cat full.state)"
+test_cmd ln -f "$entry" $f
 cd ..
 
 # Outputs that a kept-module check accepted (their trace marks them `"kf"`) are never recorded in the

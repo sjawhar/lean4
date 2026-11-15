@@ -141,8 +141,11 @@ write_late 0
 printf 'import T.Late\nimport D\ntheorem k : sharedValue = 1 := rfl\n' > a/T/K.lean
 touch "$facts_ready"
 (cd a && test_run build T.J T.K)
-sed -i 's/"local":/"kept":true,"local":/' dep/.lake/build/lib/lean/D.usekey
-test_cmd grep -q '"kept":true' dep/.lake/build/lib/lean/D.usekey
+# (`D`'s key is rewritten in its pack, by a rename, with its other parts as they were)
+usepack_part dep/.lake/build/lib/lean/D.usepack k | sed 's/"local":/"kept":true,"local":/' > D.usekey.tmp
+test_cmd usepack_set dep/.lake/build/lib/lean/D.usepack k D.usekey.tmp
+usepack_part dep/.lake/build/lib/lean/D.usepack k > D.usekey.tmp
+test_cmd grep -q '"kept":true' D.usekey.tmp
 rm -f "$facts_ready"
 write_j 1
 write_late 1
@@ -300,8 +303,8 @@ make_t12 t12-view marker
     '    IO.sleep 100' \
     '  throw <| IO.userError "the test did not release the index pre-filter"' \
     'def gate : Nat := 0' > t12-view/C/Gate.lean
-  { cat t12-view/.lake/build/lib/lean/C/J.usage; printf ' '; } > t12-view/J.usage.tmp
-  mv -f t12-view/J.usage.tmp t12-view/.lake/build/lib/lean/C/J.usage
+  { usepack_part t12-view/.lake/build/lib/lean/C/J.usepack u; printf ' '; } > t12-view/J.usage.tmp
+  test_cmd usepack_set t12-view/.lake/build/lib/lean/C/J.usepack u t12-view/J.usage.tmp
   sleep 3
   touch t12-started
   (cd t12-view && "$LAKE" build -v C.J C.N) > t12.log 2>&1 &
@@ -315,10 +318,11 @@ make_t12 t12-view marker
   printf 'def a : Nat := 2\n' > t12-view/C/A.lean
   (cd t12-view && "$LAKE" env lean C/A.lean -o ../A.rewrite.olean)
   mv -f A.rewrite.olean t12-view/.lake/build/lib/lean/C/A.olean
-  sed -E 's/("own":\[\[\["a"\],")[0-9a-f]+/\1deadbeefdeadbeefdeadbeefdeadbeef/' \
-    t12-view/.lake/build/lib/lean/C/A.usekey > A.usekey.tmp
-  mv -f A.usekey.tmp t12-view/.lake/build/lib/lean/C/A.usekey
-  test_cmd grep -q deadbeef t12-view/.lake/build/lib/lean/C/A.usekey
+  usepack_part t12-view/.lake/build/lib/lean/C/A.usepack k | \
+    sed -E 's/("own":\[\[\["a"\],")[0-9a-f]+/\1deadbeefdeadbeefdeadbeefdeadbeef/' > A.usekey.tmp
+  test_cmd usepack_set t12-view/.lake/build/lib/lean/C/A.usepack k A.usekey.tmp
+  usepack_part t12-view/.lake/build/lib/lean/C/A.usepack k > A.usekey.tmp
+  test_cmd grep -q deadbeef A.usekey.tmp
   printf 'def a : Nat := 1\n' > t12-view/C/A.lean
   touch "$t12_release"
   wait $t12_pid && rc=0 || rc=$?
@@ -410,7 +414,10 @@ printf 'def slow2 : Nat := 0\n' > c/C/Slow2.lean
 printf 'import C.PM\nimport C.OU\ntheorem t : (mkv : Nat) = 1 := rfl\n' > c/C/X1.lean
 printf 'import C.PM\nimport C.OU\nimport C.Slow2\ntheorem t : (mkv : Nat) = 1 := rfl\n' > c/C/X2.lean
 (cd c && test_run build C.X1 C.X2)
-test_cmd grep -q '"extra":\[\[\["C","PM"\]' c/.lake/build/lib/lean/C/X1.usage
+# each module keeps its usage-cutoff records in one file, its pack, with no `.hash` file
+usepack_alone c/.lake/build/lib/lean/C/X1 c/.lake/build/lib/lean/C/X2 c/.lake/build/lib/lean/C/OU
+usepack_part c/.lake/build/lib/lean/C/X1.usepack u > X1.usage.tmp
+test_cmd grep -q '"extra":\[\[\["C","PM"\]' X1.usage.tmp
 printf 'def ou : Nat := 0\ndef ou2 : Nat := 0\n' > c/C/OU.lean
 { pm_waiter; printf 'def slow2 : Nat := 1\n'; } > c/C/Slow2.lean
 rm -f "$pm_ready" "$pm_release"
@@ -457,14 +464,15 @@ match_text "Replayed C.Z" seeds.log
 match_text "environment already contains 'Std.HashMap.insertMany'" seeds.log
 no_match_text "Replayed C.DN2" seeds.log
 
-# A closure module's `.usekey` that exists but cannot be read fails the check that binds it, with the read's error,
-# once, as before the checks shared closure records: no record of it is made or taken.
+# A closure module's `.usekey` that exists but cannot be read (here its pack has no read permission) fails the check
+# that binds it, with the read's error, which names the `.usekey`, once, as before the checks shared closure records: no
+# record of it is made or taken.
 if [ "$(id -u)" != 0 ]; then
   printf 'def ou : Nat := 0\ndef ou3 : Nat := 0\n' > c/C/OU.lean
   (cd c && test_run build C.OU)
-  chmod 000 c/.lake/build/lib/lean/C/OU.usekey
+  chmod 000 c/.lake/build/lib/lean/C/OU.usepack
   (cd c && "$LAKE" build -v C.X1) > unread.log 2>&1 && rc=0 || rc=$?
-  chmod 644 c/.lake/build/lib/lean/C/OU.usekey
+  chmod 644 c/.lake/build/lib/lean/C/OU.usepack
   cat unread.log
   test_exp $rc != 0
   test_exp "$(grep -c 'OU.usekey: read failed' unread.log)" = 1
@@ -492,8 +500,10 @@ sleep 3
 cat view.log
 match_text "Built C.VA" view.log
 match_text "Replayed C.VM" view.log
-sed -i 's/"local":/"kept":true,"local":/' c/.lake/build/lib/lean/C/VK.usekey
-test_cmd grep -q '"kept":true' c/.lake/build/lib/lean/C/VK.usekey
+usepack_part c/.lake/build/lib/lean/C/VK.usepack k | sed 's/"local":/"kept":true,"local":/' > VK.usekey.tmp
+test_cmd usepack_set c/.lake/build/lib/lean/C/VK.usepack k VK.usekey.tmp
+usepack_part c/.lake/build/lib/lean/C/VK.usepack k > VK.usekey.tmp
+test_cmd grep -q '"kept":true' VK.usekey.tmp
 printf 'def va1 : Nat := 1\ndef va2 : Nat := 2\ndef vaUnused2 : Nat := 0\n' > c/C/VA.lean
 sleep 3
 (cd c && STUB_LOG="$PWD/../view-stub.log" LAKE_KEPT_CHECKER="$STUB" "$LAKE" build -v C.VM) > view-kept.log 2>&1 \
@@ -505,10 +515,20 @@ no_match_text "Replayed C.VM" view-kept.log
 no_match_text "Built C.VM" view-kept.log
 
 # The reader of a `.usage` in the layout Lean writes agrees with `Json.parse` on every `.usage` this test's builds
-# wrote, on generated texts in that layout, and on each of those changed.
-test_out "ok" env lean --run ../usagelayout.lean c/.lake/build/lib/lean/C/*.usage
+# wrote (each taken out of its module's pack), on generated texts in that layout, and on each of those changed.
+mkdir -p records
+for p in c/.lake/build/lib/lean/C/*.usepack; do
+  if usepack_has "$p" u; then usepack_part "$p" u > "records/$(basename "$p" .usepack).usage"; fi
+done
+test_out "ok" env lean --run ../usagelayout.lean records/*.usage
 
 # An importer read with its names shared (`Lake.intern`) is what a decoder that does not share names reads, on the
-# importer of every `.usekey` this test's builds wrote, on generated importers, and on each of those without one or two
-# of its fields.
-test_out "ok" env lean --run ../usekeyintern.lean $(find . -name '*.usekey' | sort)
+# importer of every `.usekey` this test's builds wrote (each taken out of its module's pack), on generated importers,
+# and on each of those without one or two of its fields.
+mkdir -p keys
+i=0
+for p in $(find . -name '*.usepack' -not -path './keys/*' | sort); do
+  i=$((i + 1))
+  if usepack_has "$p" k; then usepack_part "$p" k > "keys/$i.usekey"; fi
+done
+test_out "ok" env lean --run ../usekeyintern.lean $(find keys -name '*.usekey' | sort)

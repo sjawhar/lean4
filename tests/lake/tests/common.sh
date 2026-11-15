@@ -371,7 +371,8 @@ test_eq() {
 # then the parts `k` (the `.usekey`), `u` (the `.usage`) and `v` (the `.resolved`), in that order. `<n>` is the
 # part's size in bytes and `<d>` the first 32 hex digits of its SHA-256; a part the pack does not hold is `k=-` (etc.).
 
-# usepack_part PACK PART: the bytes of part PART (k, u or v) of PACK on stdout; fails if PACK does not hold it.
+# usepack_part PACK PART: the bytes of part PART (k, u or v) of PACK on stdout; fails if PACK does not hold it. (`tail`
+# reads all that `head` writes, so a large part after PART never ends the pipe early with SIGPIPE under `pipefail`.)
 usepack_part() {
   local pack=$1 want=$2 header off w tag n
   header=$(head -n 1 -- "$pack") || return 1
@@ -382,7 +383,7 @@ usepack_part() {
         tag=${w%%=*} n=${w#*=} n=${n%%:*}
         if [ "$tag" = "$want" ]; then
           [ "$n" != - ] || return 1
-          tail -c +$((off + 1)) -- "$pack" | head -c "$n"
+          head -c $((off + n)) -- "$pack" | tail -c "$n"
           return
         fi
         [ "$n" = - ] || off=$((off + n)) ;;
@@ -394,6 +395,19 @@ usepack_part() {
 # usepack_has PACK PART: whether PACK exists and holds part PART.
 usepack_has() {
   [ -f "$1" ] && usepack_part "$1" "$2" > /dev/null
+}
+
+# usepack_alone STEM...: each STEM.usepack exists, and no loose record (STEM.usage, STEM.resolved, STEM.usekey) and no
+# STEM.usepack.hash is beside it.
+usepack_alone() {
+  local stem ext
+  for stem in "$@"; do
+    echo "? usepack_alone $stem"
+    if [ ! -f "$stem.usepack" ]; then echo "FAILURE: $stem.usepack does not exist"; return 1; fi
+    for ext in usage resolved usekey usepack.hash; do
+      if [ -e "$stem.$ext" ]; then echo "FAILURE: $stem.$ext exists beside $stem.usepack"; return 1; fi
+    done
+  done
 }
 
 # usepack_write PACK K U V: writes PACK of the parts in the files K, U and V (`-` for a part it does not hold), as a new
