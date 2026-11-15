@@ -154,36 +154,50 @@ CLOSURE_REASON="its import closure changed, so a name it looked up, used or refe
 # 3. A wide module whose direct import's closure changed is compiled without its own `.usage` being read: `P.M` gains a
 # `@[csimp]` lemma (`CSIMP`), which changes its closure digest but nothing `P.R` uses. `P.R` compiles for that reason
 # (the kept-module check says why it does not ask), before it reads its `.usage`, and its `.usage` and `.usekey` are
-# the ones a build from scratch writes. An edit to `P.M` that keeps its closure, though `P/M.usekey` is then newer than
-# `P/R.usekey`, still replays `P.R`.
+# the ones a build from scratch writes. An edit to `P.M` that keeps its closure, though `P/M.usepack` (which holds its
+# key) is then newer than `P/R.usepack`, still replays `P.R`. `P.R`'s `.usage` and `.usekey` are parts of one file, its
+# pack, so the trace of opened files cannot tell a read of its `.usage` from a read of its key: before the build, one
+# byte of the `.usage` part is flipped, which a read of the `.usage` reports (the part does not have the digest the
+# pack's header records), and a read of the key, which reads the start of the pack, does not.
 case3() {
+  local p header k
   mkpkg t
   test_run -d t build P.R
   printf 'def mPlain : Nat := 0\n' >> t/P/M.lean
   test_out "Replayed P.R" -d t build -v P.R
   match_text "Built P.M" produced.out
   printf "$CSIMP" >> t/P/M.lean
+  p=t/$OUT/R.usepack
+  header=$(head -n 1 "$p")
+  k=$(usepack_part "$p" k | wc -c)
+  cat "$p" > bad.tmp
+  printf '\377' | dd of=bad.tmp bs=1 seek=$(( ${#header} + k + 1 )) conv=notrunc status=none
+  test_cmd mv -f bad.tmp "$p"
   if command -v strace > /dev/null; then
     echo '$' strace lake build -v P.R
     LAKE_KEPT_CHECKER="$STUB" strace -f -s 4096 -e trace=open,openat,execve -o open.trace "$LAKE" -d t build -v P.R \
       > produced.out 2>&1
     cat produced.out
     before_exec open.trace "P/R.lean" > before.trace
-    # (premise) the trace holds the compile of `P.R`, and the decision's read of the key of `P.M`
+    # (premise) the trace holds the compile of `P.R`, and the decision's read of the key of `P.M` (in its pack)
     test_exp "$(wc -l < before.trace)" -lt "$(wc -l < open.trace)"
-    test_exp -n "$(opened before.trace "$OUT/M.usekey")"
-    test_exp -z "$(opened before.trace "$OUT/R.usage")"
+    test_exp -n "$(opened before.trace "$OUT/M.usepack")"
   else
     LAKE_KEPT_CHECKER="$STUB" lake_out -d t build -v P.R
   fi
   match_text "Built P.M" produced.out
   match_text "Built P.R" produced.out
   match_text "kept-module check: not asked: $CLOSURE_REASON" produced.out
+  no_match_text "R.usepack: not a usage-cutoff pack" produced.out
   mkpkg fresh
   cp t/P/M.lean fresh/P/M.lean
   test_run -d fresh build P.R
-  test_cmd cmp fresh/$OUT/R.usage t/$OUT/R.usage
-  test_cmd cmp fresh/$OUT/R.usekey t/$OUT/R.usekey
+  for part in u k; do
+    usepack_part fresh/$OUT/R.usepack $part > fresh-R.$part
+    usepack_part t/$OUT/R.usepack $part > t-R.$part
+    test_cmd cmp fresh-R.$part t-R.$part
+  done
+  usepack_alone t/$OUT/R fresh/$OUT/R
 }
 
 # 3b. The early exit looks only at the direct imports whose key is newer than the module's: `P/L1.olean` gets other bytes

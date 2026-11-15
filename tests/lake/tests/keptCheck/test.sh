@@ -469,7 +469,9 @@ printf 'macro "triv!" : tactic => `(tactic| trivial)\n' > t40/P/M.lean
 printf 'import P.A\nimport P.M\ntheorem B.ok : A.w = 0 := rfl\ndef B.u : Nat := A.w\ntheorem B.t : True := by triv!\n' \
   > t40/P/B.lean
 test_run -d t40 build P
-test_cmd_out '[["P","M"],' cat "t40/$OUT/B.usage"
+test_cmd_out '[["P","M"],' usepack_part "t40/$OUT/B.usepack" u
+# each module keeps its usage-cutoff records in one file, its pack, with no `.hash` file
+usepack_alone "t40/$OUT/A" "t40/$OUT/B"
 export STUB_LOG="$PWD/t40.log"
 # The machinery `P.B` used changed: it compiles, and the checker is not asked
 rm -f t40/P/M.lean; printf 'macro "triv!" : tactic => `(tactic| exact True.intro)\n' > t40/P/M.lean
@@ -484,7 +486,8 @@ test_cmd_fails grep -qx P.B t40.log
 seta t40 2
 LAKE_KEPT_CHECKER="$STUB" test_out 'Checked P.B' -d t40 build P
 test_cmd grep -qx P.B t40.log
-test_cmd grep -q '"kept":true' "t40/$OUT/B.usekey"
+usepack_part "t40/$OUT/B.usepack" k > bkey.tmp
+test_cmd grep -q '"kept":true' bkey.tmp
 # ... and `P.C`, which uses `B.u`, is not skipped on `P.B`'s old digests: after the accept they may
 # be stale (here `B.u` now unfolds to another term), so it is re-checked too
 no_match_text 'Replayed P.C' produced.out
@@ -520,7 +523,8 @@ t59D() {
   export STUB_LOG="$PWD/$1.log"
   LAKE_KEPT_CHECKER="$STUB" test_out 'Checked P.K' -d "$1" build P
   match_text 'Built P.I' produced.out
-  test_exp ! -e "$1/$OUT/I.usekey"
+  test_exp -f "$1/$OUT/I.usepack"
+  test_cmd_fails usepack_has "$1/$OUT/I.usepack" k
   rm -f "$1/P/A.lean"; printf 'def A.w : Nat := 0\n' > "$1/P/A.lean"
   printf -- '-- touched\n' >> "$1/P/K.lean"
   LAKE_KEPT_CHECKER="$STUB" test_err 'Type mismatch' -d "$1" build P
@@ -562,7 +566,8 @@ rm -f t61/P/Y.lean; printf 'import P.K\ndef Y.g (n : Nat) : Nat := n * 2 + 3\n' 
 export STUB_LOG="$PWD/t61.log"
 LAKE_KEPT_CHECKER="$STUB" test_out 'Checked P.K' -d t61 build P
 match_text 'Built P.Y' produced.out
-test_exp ! -e "t61/$OUT/Y.usekey"
+test_exp -f "t61/$OUT/Y.usepack"
+test_cmd_fails usepack_has "t61/$OUT/Y.usepack" k
 seta t61 3
 LAKE_KEPT_CHECKER="$STUB" test_out 'not asked: it has no usage key' -d t61 build P
 match_text 'Built P.Y' produced.out
@@ -586,13 +591,13 @@ mkrace() { # mkrace DIR -- `shared` (lib Sh: `A.w := 0`, `K.u := A.w`) required 
   printf 'import W.X\n' > "$1/w/W.lean"
   printf 'import Sh.K\ntheorem X.t : K.u = 0 := rfl\n' > "$1/w/W/X.lean"
 }
-XKEY=t62/w/.lake/build/lib/lean/W/X.usekey
-KKEY=t62/shared/.lake/build/lib/lean/Sh/K.usekey
+XPACK=t62/w/.lake/build/lib/lean/W/X.usepack
+KPACK=t62/shared/.lake/build/lib/lean/Sh/K.usepack
 gate="$PWD/t62/w"
 mkrace t62
 # round 0: every module compiles under the cutoff, so each gets a key
 test_run -d t62/w build W
-test_exp -f "$XKEY"
+test_cmd usepack_has "$XPACK" k
 # round 1: `A.w` changes meaning, and `W.X` waits at a gate after it has loaded `Sh.K`'s `.olean`
 rm -f t62/shared/Sh/A.lean; printf 'def A.w : Nat := 5\n' > t62/shared/Sh/A.lean
 rm -f t62/w/W/X.lean
@@ -611,16 +616,20 @@ r1pid=$!
 for _ in $(seq 600); do [ -e "$gate/started" ] && break; sleep 0.1; done
 test_exp -e "$gate/started"
 # `Sh.K` is kept right now; the `shared` tree rebuilds it normally, giving it an ordinary key
-test_cmd grep -q '"kept":true' "$KKEY"
+usepack_part "$KPACK" k > kkey.tmp
+test_cmd grep -q '"kept":true' kkey.tmp
 rm -f t62/shared/Sh/K.lean; printf 'import Sh.A\nnoncomputable def K.u : Nat := A.w\n-- edited in round 1\n' > t62/shared/Sh/K.lean
 test_run -d t62/shared build Sh.K
-test_cmd_fails grep -q '"kept":true' "$KKEY"
+test_cmd usepack_has "$KPACK" k
+usepack_part "$KPACK" k > kkey.tmp
+test_cmd_fails grep -q '"kept":true' kkey.tmp
 touch "$gate/go"
 wait $r1pid
 test_cmd cat t62.r1
 test_exp "$(cat t62.r1.rc)" = 0
 # `W.X` compiled against the kept `Sh.K`, so it has no usage key although `Sh.K` now has an ordinary one
-test_exp ! -e "$XKEY"
+test_exp -f "$XPACK"
+test_cmd_fails usepack_has "$XPACK" k
 # round 2 (no checker): `A.w` back to `0` and `Sh.K` touched; with no key `W.X` recompiles and its
 # false `X.t : K.u = 5` fails
 rm -f t62/shared/Sh/A.lean; printf 'def A.w : Nat := 0\n' > t62/shared/Sh/A.lean
