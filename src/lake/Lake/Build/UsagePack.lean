@@ -152,12 +152,34 @@ public inductive Read
   | invalid (pack : FilePath) (reason : String)
 
 /--
-Part `p` of the pack whose first bytes are `bytes`, if they reach that far, for a pack of `size` bytes: `absent` if
-the pack does not hold `p`, `invalid` if the bytes are not a pack of this format and size or the part does not have
-the digest the header records. The stamp `stamp?` goes with the part's bytes.
+The largest pack Lake reads: the bound of `Lean.ModuleUsage.readFileStamped`, which reads a pack whole and refuses a
+larger file (`max_stamped_read`, `src/library/usage_digest.cpp`), so that a damaged record cannot make Lake allocate
+without bound. The `.usage` of a module whose closure has about 4,900 workspace modules is about 3 MB.
 -/
-def partOf (pack : FilePath) (bytes : ByteArray) (size : Nat) (p : Part) (stamp? : Option ModuleUsage.FileStamp) :
-    Read := Id.run do
+public def maxWhole : Nat := 256 * 1024 * 1024
+
+/-- What a read finds of a pack larger than `maxWhole`. -/
+def tooLarge (pack : FilePath) : Read :=
+  .invalid pack s!"it is larger than the {maxWhole} bytes that Lake reads of a record file"
+
+/--
+Whether `e` is the refusal of `Lean.ModuleUsage.readFileStamped` to read a file larger than its bound: the error
+that `too_large_error` of `src/library/usage_digest.cpp` makes, and no other (an error of the file system is never
+taken for it).
+-/
+def refusedAsTooLarge : IO.Error → Bool
+  | .userError msg => msg == s!"larger than {maxWhole} bytes"
+  | _ => false
+
+/--
+Part `p` of the pack whose first bytes are `bytes`, if they reach that far, for a pack of `size` bytes: `absent` if
+the pack does not hold `p`, `invalid` if the pack is larger than `maxWhole`, if the bytes are not a pack of this
+format and size, or if the part does not have the digest the header records. The stamp `stamp?` goes with the part's
+bytes. Every read of a pack decides through this function, whether it read the start of the pack or all of it.
+-/
+public def partOf (pack : FilePath) (bytes : ByteArray) (size : Nat) (p : Part)
+    (stamp? : Option ModuleUsage.FileStamp) : Read := Id.run do
+  if size > maxWhole then return tooLarge pack
   let some h := Header.parse? bytes | return .invalid pack "not a pack of this format"
   unless h.total == size do return .invalid pack s!"its header records {h.total} bytes, the file has {size}"
   let some (start, e) := h.span? p | return .absent
@@ -177,17 +199,6 @@ partial def readUpTo (h : IO.FS.Handle) (n : Nat) (acc : ByteArray := .empty) : 
 /-- How long before a read began the status-change time of the file read must lie for the stamp taken around the read
 to stand for its bytes: the general bound of `Lean.ModuleUsage.stampSettled`, which holds on every file system. -/
 def settleNs : Int := 2000000000
-
-/--
-The largest pack Lake reads: the bound of `Lean.ModuleUsage.readFileStamped`, which reads a pack whole and fails for a
-larger file (`max_stamped_read`, `src/library/usage_digest.cpp`), so that a damaged record cannot make Lake allocate
-without bound. The `.usage` of a module whose closure has about 4,900 workspace modules is about 3 MB.
--/
-def maxWhole : Nat := 256 * 1024 * 1024
-
-/-- What a read finds of a pack of `size` bytes, more than `maxWhole`. -/
-def tooLarge (pack : FilePath) (size : Nat) : Read :=
-  .invalid pack s!"it has {size} bytes, more than the {maxWhole} that Lake reads of a record file"
 
 /--
 The first bytes of the pack at `pack`, its header and its `.usekey`, with the pack's size and with its stamp if that
@@ -224,26 +235,22 @@ def readPrefixStamped (pack : FilePath) : IO (ByteArray × Nat × Option ModuleU
 Reads the record that the sidecar path `sidecar` names (`Part.ofSidecar?`): from its pack (`packOf`) if that exists,
 otherwise from the file at `sidecar`, the layout before packs. A `.usekey` is read with the start of its pack only
 (`readPrefixStamped`), the other parts with the whole pack (`Lean.ModuleUsage.readFileStamped`). A pack larger than
-`maxWhole` is `invalid` for every part, as any other pack this Lake cannot read: the key read has its size, and for
-a whole read that fails the size is looked up after the failure. Throws if a file exists but cannot be read for
-another reason.
+`maxWhole` is `invalid` for every part, as any other pack this Lake cannot read: by its size (`partOf`: the key read
+has the file's size, a whole read the size of what it read), or because the whole read refused it for its size
+(`refusedAsTooLarge`: that error alone, with no second look at the path). Throws if a file exists but cannot be read
+for any other reason.
 -/
 public def readSidecar (sidecar : FilePath) : IO Read := do
   let pack := packOf sidecar
   let some p := Part.ofSidecar? sidecar | return ← own
   let read? : Except IO.Error Read ← if p == .usekey then
-      (do let (bytes, size, stamp?) ← readPrefixStamped pack
-          return if size > maxWhole then tooLarge pack size else partOf pack bytes size p stamp?).toBaseIO
+      (do let (bytes, size, stamp?) ← readPrefixStamped pack; return partOf pack bytes size p stamp?).toBaseIO
     else
       (do let (bytes, stamp?) ← ModuleUsage.readFileStamped pack; return partOf pack bytes bytes.size p stamp?).toBaseIO
   match read? with
   | .ok r => return r
   | .error (.noFileOrDirectory ..) => own
-  | .error e =>
-    if p == .usekey then throw e
-    match (← pack.metadata.toBaseIO) with
-    | .ok md => if md.byteSize.toNat > maxWhole then return tooLarge pack md.byteSize.toNat else throw e
-    | .error _ => throw e
+  | .error e => if refusedAsTooLarge e then return tooLarge pack else throw e
 where
   own : IO Read := do
     match (← (ModuleUsage.readFileStamped sidecar).toBaseIO) with

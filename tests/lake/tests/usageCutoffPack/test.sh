@@ -177,4 +177,35 @@ rebuilds_c stale
 no_match_text "warning" produced.out
 usepack_alone "stale/$OUT/C"
 
+# (e) The reader itself (`../reader.lean`, which says what it checks), on packs at and above the 256 MiB that Lake
+# reads of a record file. Each is the header, the `.usekey` of `P.C`, and a `.usage` of zeros up to its size, whose
+# length (9 digits) and digest its header records, with no `.resolved`: a file with a hole. `big` is one byte larger
+# than the bound, `edge` has the bound's size exactly. The two `locked` packs are ones this user may not read (as
+# root every file can be read, so they are not made).
+mkdir reader
+usepack_part "stale/$OUT/C.usepack" k > reader/key
+k=$(( $(wc -c < reader/key) ))
+kd=$(sha256sum < reader/key | cut -c1-32)
+max=$((256 * 1024 * 1024))
+# mkbig FILE SIZE -- such a pack of SIZE bytes
+mkbig() {
+  local f=$1 size=$2 hl u ud
+  hl=$(( $(printf 'lake-usepack 1 k=%s:%s u=123456789:%s v=-' "$k" "$kd" "$kd" | wc -c) + 1 ))
+  u=$((size - hl - k))
+  test_exp ${#u} = 9
+  ud=$(head -c "$u" /dev/zero | sha256sum | cut -c1-32)
+  { printf 'lake-usepack 1 k=%s:%s u=%s:%s v=-\n' "$k" "$kd" "$u" "$ud"; cat reader/key; } > "$f"
+  dd if=/dev/null of="$f" bs=1 seek="$size" status=none
+  test_exp "$(( $(wc -c < "$f") ))" = "$size"
+}
+mkbig reader/big.usepack $((max + 1))
+mkbig reader/edge.usepack $max
+if [ "$(id -u)" != 0 ]; then
+  test_cmd cp --sparse=always reader/big.usepack reader/locked-big.usepack
+  test_cmd usepack_write reader/locked-small.usepack reader/key - -
+  test_cmd chmod 000 reader/locked-big.usepack reader/locked-small.usepack
+fi
+test_out "ok" env lean ../reader.lean
+rm -rf reader
+
 rm -f produced.out
