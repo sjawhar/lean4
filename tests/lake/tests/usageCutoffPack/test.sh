@@ -120,10 +120,12 @@ packart() {
 # flipped (the part then does not have the digest the header records), then the pack cut short by one byte (it then
 # does not have the size the header records), then a header whose `.usekey` length is 2^63 - 1 (a reader that took
 # that length before the file's size would allocate it and fail the build: Lake reads such a pack as invalid without
-# reading past its header). Each time, after the proof edit, `P.C` compiles rather than being skipped, the build warns
-# that it cannot read `P.C`'s pack, and the build succeeds. (The artifact cache is off: its usage index would restore
-# the earlier compile of `P.C`, whose cache entries are intact.)
-for damage in flip cut huge; do
+# reading past its header), then a pack one byte larger than the 256 MiB that Lake reads of a record file, with its
+# `.usekey` intact and a header whose lengths add up to its size (Lake reads a pack of that size as invalid, whichever
+# record is asked for, rather than failing the build or reading it). Each time, after the proof edit, `P.C` compiles
+# rather than being skipped, the build warns that it cannot read `P.C`'s pack, and the build succeeds. (The artifact
+# cache is off: its usage index would restore the earlier compile of `P.C`, whose cache entries are intact.)
+for damage in flip cut huge big; do
   t=bad-$damage
   mkpkg $t
   test_run -d $t build P.C
@@ -143,6 +145,18 @@ for damage in flip cut huge; do
     cut) head -c $((size - 1)) "$p" > bad.tmp;;
     huge) sed '1s/ k=[0-9]*:/ k=9223372036854775807:/' "$p" > bad.tmp
       test_cmd_out ' k=9223372036854775807:' head -n 1 bad.tmp;;
+    big)
+      # the header line and the `.usekey` part, then a hole up to the size, under a header whose `.usage` length (9
+      # digits) makes its lengths add up to that size
+      u=${header#* u=} u=${u%%:*}
+      v=$(usepack_part "$p" v | wc -c)
+      bigsize=$((256 * 1024 * 1024 + 1))
+      bigu=$((bigsize - (${#header} - ${#u} + 9 + 1) - k - v))
+      test_exp ${#bigu} = 9
+      { printf '%s\n' "${header/ u=$u:/ u=$bigu:}"; usepack_part "$p" k; } > bad.tmp
+      dd if=/dev/null of=bad.tmp bs=1 seek=$bigsize status=none
+      test_exp "$(wc -c < bad.tmp)" = "$bigsize"
+      ;;
   esac
   test_cmd mv -f bad.tmp "$p"
   test_cmd_fails cmp -s good.tmp "$p"
