@@ -123,10 +123,9 @@ def readSourceStamp? (stamp ident : String) : Option (Hash × ModuleHeader) := d
   return (← Hash.ofHex? (first.take 16).toString, ← decodeStampHeader? header.dropLast)
 
 /--
-Whether `decodeStampHeader?` reads the module name `n` back from what `encodeStampHeader` writes:
-every component is a string of ASCII characters that `Name.escapePart` leaves as it is, so the name
-is written as its components joined by dots (`Name.toString`) and read back as the same components
-(`String.toName`).
+Whether every component of a module name is a string of ASCII characters that `Name.escapePart`
+leaves as it is; then `encodeStampHeader` writes the name as its components joined by dots
+(`Name.toString`) and `decodeStampHeader?` reads back the same components (`String.toName`).
 -/
 def plainStampName : Name → Bool
   | .str p s => (p.isAnonymous || plainStampName p) && s.utf8ByteSize == s.length &&
@@ -173,10 +172,10 @@ def Module.fetchSourceInfo (mod : Module) (mdata : IO.FS.Metadata) (start : Cloc
     JobM (Hash × ModuleHeader) := do
   let ident := sourceStampIdentity mdata
   let key := mod.name.toString
-  let stamp? ← if (← getTrustHash) then (← getStamps).find? mod.sourceStampFile key else pure none
-  if let some stamp := stamp? then
-    if let some info := readSourceStamp? stamp ident then
-      return info
+  if (← getTrustHash) then
+    if let some stamp ← (← getStamps).find? mod.sourceStampFile key then
+      if let some info := readSourceStamp? stamp ident then
+        return info
   let path := mod.leanFile
   let contents ← IO.FS.readFile path
   let hash := Hash.ofText contents
