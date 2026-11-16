@@ -27,9 +27,9 @@ The rest of Lake names a record by the path it had as a file of its own (`X.usek
 sidecar path, from which `packOf` finds the pack and `Part.ofSidecar?` the part. `readSidecar` reads a part from the
 pack if the pack exists, and otherwise the file at the sidecar path itself, the layout Lake wrote before packs, so that
 a tree built then is read as it was. A pack that is not one of this format, whose size is not the one its header
-records, whose part does not have the digest its header records, or whose `.usage` or `.resolved` is asked for and
-which is larger than Lake reads of a record file (`maxWhole`), is read as `invalid`: the module's records are then
-absent, so the cutoff never skips the module on them and its importers take it to have no usage record.
+records, whose part does not have the digest its header records, or which is larger than Lake reads of a record file
+(`maxWhole`), is read as `invalid`, whichever record is asked for: the module's records are then absent, so the
+cutoff never skips the module on them and its importers take it to have no usage record.
 -/
 
 open System Lean
@@ -165,7 +165,9 @@ def tooLarge (pack : FilePath) : Read :=
 /--
 Whether `e` is the refusal of `Lean.ModuleUsage.readFileStamped` to read a file larger than its bound: the error
 that `too_large_error` of `src/library/usage_digest.cpp` makes, and no other (an error of the file system is never
-taken for it).
+taken for it). The text names Lean's bound, which `maxWhole` restates by value: if the two ever differ, a refusal is
+not taken for this one and fails the build, which is seen, where a pack read by one bound and refused by the other
+would not be.
 -/
 def refusedAsTooLarge : IO.Error → Bool
   | .userError msg => msg == s!"larger than {maxWhole} bytes"
@@ -278,7 +280,7 @@ public def sidecarStamp (sidecar : FilePath) : IO (Option ModuleUsage.FileStamp)
 /--
 `sidecarStamp` of the `.usekey` record path `usekey`, but `none` when its pack holds no `.usekey` or is not a pack of
 this format: a module whose compile made no key had no `.usekey` file before packs either, and a reader that compares
-the times of keys (`Lake.changedDirectImport?`) reads such a module's records instead.
+the times of keys (in the trees that have it, `Lake.changedDirectImport?`) reads such a module's records instead.
 -/
 public def usekeyStamp (usekey : FilePath) : IO (Option ModuleUsage.FileStamp) := do
   let pack := packOf usekey
