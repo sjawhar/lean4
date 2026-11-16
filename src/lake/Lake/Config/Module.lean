@@ -111,11 +111,17 @@ public abbrev pkg (self : Module) : Package :=
 @[inline] public def oleanFile (self : Module) : FilePath :=
   self.leanLibPath "olean"
 
-/-- The path of the module's `.usage` record (`Lake.UsagePack`): a file of its own in the layout before packs. -/
+/--
+The path of the module's `.usage` record (`Lake.UsagePack`): the file Lean writes there in a compile (`--usage`), until
+Lake packs it, and a file of its own in the layout before packs.
+-/
 @[inline] public def usageFile (self : Module) : FilePath :=
   self.leanLibPath "usage"
 
-/-- The path of the module's `.resolved` record (`Lake.UsagePack`): a file of its own in the layout before packs. -/
+/--
+The path of the module's `.resolved` record (`Lake.UsagePack`): the file Lean writes there in a compile (beside the
+`.usage`), until Lake packs it, and a file of its own in the layout before packs.
+-/
 @[inline] public def resolvedFile (self : Module) : FilePath :=
   self.leanLibPath "resolved"
 

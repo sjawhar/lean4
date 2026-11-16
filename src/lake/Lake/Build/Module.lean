@@ -1008,7 +1008,7 @@ def removeOutputFile (file : FilePath) : IO PUnit := do
 Remove all existing artifacts produced by a Lean build of the module, and their `.hash` files. Lake owns the
 usage-cutoff record paths (the pack `.usepack`, and the `.usage`, `.resolved` and `.usekey` of the layout before packs,
 `Lake.UsagePack`) and removes them also with the cutoff off, so that a rebuild never leaves an earlier build's records
-beside its outputs, or saves them to the cache with them (`cacheUsagePack`).
+beside its outputs, or saves them to the cache with them (`cacheUsageRecords`).
 -/
 public def Module.clearOutputArtifacts (mod : Module) : IO PUnit := do
   try
@@ -2363,7 +2363,7 @@ def Module.usageCutoffApplies (mod : Module) (presetup : ModulePreSetup) : JobM 
 
 /--
 The name of the usage-index file (`Cache.usageIndexFile`) of the compile whose `.usekey` record is at `path`
-(`Lake.UsagePack`) and whose key artifact (its pack, or its `.usekey` file before packs) has the
+(`Lake.UsagePack`) and whose key's own bytes (packed or, before packs, a file) have the
 content hash `hash`: the hash of the key without its `input`. Compiles of one dependency state under other input
 hashes (after an edit that no constant the module uses sees) differ only there, so they share one file, and the index
 keeps more states. `hash` if the key cannot be read or records no `input`.

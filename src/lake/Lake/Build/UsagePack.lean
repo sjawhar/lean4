@@ -181,22 +181,27 @@ def settleNs : Int := 2000000000
 The first bytes of the pack at `pack`, its header and its `.usekey`, with the pack's size and with its stamp if that
 stands for the bytes: the stamp is the same before the read and after it, and its status-change time lay more than
 `settleNs` before the read began (as `Lean.ModuleUsage.readFileStamped` judges a whole read, by the bound it uses on a
-file system whose clock it cannot read). Throws if the pack cannot be opened or read (`noFileOrDirectory` if it does
-not exist).
+file system whose clock it cannot read). The stamps are the path's, taken around an open of it, not the opened
+file's: they stand for the bytes where the file at the path is only replaced by a rename over it (as Lake and Lean
+write records), which gives it a new status-change time; a switch of the path to another file and back between the
+two stats, such as of a symlinked parent directory, is not seen. The size is the stamp's from before the read (a stat
+it takes anyway; only where no stamp can be read, as on Windows, the file's metadata): a header whose sizes do not add
+up to it is not read past its first bytes, so no length a header claims is ever allocated, and `partOf` reads such a
+pack as `invalid`. Throws if the pack cannot be opened or read (`noFileOrDirectory` if it does not exist).
 -/
 def readPrefixStamped (pack : FilePath) : IO (ByteArray × Nat × Option ModuleUsage.FileStamp) := do
   let start := (← Std.Time.Timestamp.now).toNanosecondsSinceUnixEpoch.val
   let before? ← ModuleUsage.fileStamp pack
   let h ← IO.FS.Handle.mk pack .read
-  let head ← readUpTo h maxHeader
+  let size ← match before? with
+    | some s => pure s.size.toNat
+    | none => pure (← pack.metadata).byteSize.toNat
+  let head ← readUpTo h (min maxHeader size)
   let want := match Header.parse? head with
-    | some hdr => hdr.length + (hdr.usekey?.map (·.size)).getD 0
+    | some hdr => if hdr.total == size then hdr.length + (hdr.usekey?.map (·.size)).getD 0 else 0
     | none => 0
   let bytes ← if want ≤ head.size then pure head else readUpTo h want head
   let after? ← ModuleUsage.fileStamp pack
-  let size ← match before? with
-    | some s => pure s.size.toNat
-    | none => return (bytes, (← pack.metadata).byteSize.toNat, none)
   let stamp? := before?.filter fun s =>
     after? == some s && start - (s.ctimeSec.toNat * 1000000000 + s.ctimeNsec.toNat : Int) > settleNs
   return (bytes, size, stamp?)
