@@ -98,11 +98,20 @@ def printWarnings (results : Std.HashMap Name MessageData) (filePath : System.Fi
       printWarning declName warning (useErrorFormat := useErrorFormat) (filePath := filePath)
 
 /--
-Formats a map of linter warnings grouped by filename with `-- filename` comments.
+Finds the source file of `mod` through `getSrcSearchPath`, by the module's root: the default file
+lookup of `groupedByFilename` and `formatLinterResults`.
 -/
-def groupedByFilename (results : Std.HashMap Name MessageData) (useErrorFormat : Bool := false) :
+def findSrcFileOnSrcSearchPath (mod : Name) : IO (Option System.FilePath) := do
+  (← getSrcSearchPath).findWithExt "lean" mod
+
+/--
+Formats a map of linter warnings grouped by filename with `-- filename` comments.
+
+With `useErrorFormat`, each module's file is found by `findSrcFile`.
+-/
+def groupedByFilename (results : Std.HashMap Name MessageData) (useErrorFormat : Bool := false)
+    (findSrcFile : Name → IO (Option System.FilePath) := findSrcFileOnSrcSearchPath) :
     CoreM MessageData := do
-  let sp ← if useErrorFormat then getSrcSearchPath else pure {}
   let grouped : Std.HashMap Name (System.FilePath × Std.HashMap Name MessageData) ←
     results.foldM (init := {}) fun grouped declName msg => do
       let mod ← findModuleOf? declName
@@ -112,7 +121,7 @@ def groupedByFilename (results : Std.HashMap Name MessageData) (useErrorFormat :
         | some (fp, msgs) => pure (fp, msgs.insert declName msg)
         | none => do
           let fp ← if useErrorFormat then
-            pure <| (← sp.findWithExt "lean" mod).getD (modToFilePath "." mod "lean")
+            pure <| (← findSrcFile mod).getD (modToFilePath "." mod "lean")
           else pure default
           pure (fp, .insert {} declName msg)
   let grouped' := grouped.toArray.qsort fun (a, _) (b, _) => toString a < toString b
@@ -122,19 +131,24 @@ def groupedByFilename (results : Std.HashMap Name MessageData) (useErrorFormat :
 
 /--
 Formats the linter results as Lean code with comments and `#check` commands.
+
+`findSrcFile` finds each module's file when grouping by filename in the error format (see
+`groupedByFilename`).
 -/
 def formatLinterResults
     (results : Array (NamedEnvLinter × Std.HashMap Name MessageData))
     (decls : Array Name)
     (groupByFilename : Bool)
     (whereDesc : String)
-    (numLinters : Nat) (useErrorFormat : Bool := false) :
+    (numLinters : Nat) (useErrorFormat : Bool := false)
+    (findSrcFile : Name → IO (Option System.FilePath) := findSrcFileOnSrcSearchPath) :
     CoreM MessageData := do
   let formattedResults ← results.filterMapM fun (linter, results) => do
     if !results.isEmpty then
       let warnings ←
         if groupByFilename || useErrorFormat then
           groupedByFilename results (useErrorFormat := useErrorFormat)
+            (findSrcFile := findSrcFile)
         else
           printWarnings results
       pure $ some m!"/- The `{linter.optName}` linter reports:\n{linter.errorsFound} -/\n{warnings}\n"
@@ -155,15 +169,15 @@ def getDeclsInCurrModule : CoreM (Array Name) := do
 
 /-- Get the list of all declarations in the environment. -/
 def getAllDecls : CoreM (Array Name) := do
-  pure $ (← getEnv).constants.map₁.fold (init := ← getDeclsInCurrModule) fun r k _ => r.push k
+  pure $ (← getEnv).constants.map₁.foldl (init := ← getDeclsInCurrModule) (fun r k _ => r.push k)
 
 /-- Get the list of all declarations in the specified package. -/
 def getDeclsInPackage (pkg : Name) : CoreM (Array Name) := do
   let env ← getEnv
   let mut decls ← getDeclsInCurrModule
   let modules := env.header.moduleNames.map (pkg.isPrefixOf ·)
-  return env.constants.map₁.fold (init := decls) fun decls declName _ =>
-    if modules[env.const2ModIdx[declName]?.get!]! then
+  return env.constants.map₁.foldl (init := decls) fun decls declName _ =>
+    if modules[(env.getModuleIdxFor? declName).get!]! then
       decls.push declName
     else decls
 

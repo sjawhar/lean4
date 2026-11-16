@@ -31,9 +31,9 @@ protected:
     We use `m_cache` to ensure we do **not** traverse a DAG as a tree.
     We use pointer equality for this collection.
     */
-    lean::unordered_map<lean_object *, lean_object *> m_cache;
+    lean::lazy_table<lean::dense_map<lean_object *, lean_object *>, 1024> m_cache;
     /* Set of maximally shared terms. AKA hash-consing table. */
-    lean::unordered_set<lean_object *, set_hash, set_eq> m_set;
+    lean::lazy_table<lean::dense_set<lean_object *, set_hash, set_eq>, 1024> m_set;
     /*
     If `true`, `check_cache` will also check `m_set`.
     This is useful when the input term may contain terms that have already

@@ -30,7 +30,9 @@ Author: Leonardo de Moura
 #endif
 
 #define LEAN_COMPACTOR_INIT_SZ 1024*1024
-#define LEAN_MAX_SHARING_TABLE_INITIAL_SIZE 1024*1024
+// The max-sharing table grows with the module; reserving more only adds memset and page faults to
+// each `.olean` write, since a dense table zeroes all of its buckets.
+#define LEAN_MAX_SHARING_TABLE_INITIAL_SIZE 4096
 
 // uncomment to track the number of each kind of object in an .olean file
 // #define LEAN_TAG_COUNTERS
@@ -62,7 +64,7 @@ struct max_sharing_eq {
 
 
 struct object_compactor::max_sharing_table {
-    lean::unordered_set<max_sharing_key, max_sharing_hash, max_sharing_eq> m_table;
+    lean::dense_set<max_sharing_key, max_sharing_hash, max_sharing_eq> m_table;
     max_sharing_table(object_compactor * manager):
         m_table(LEAN_MAX_SHARING_TABLE_INITIAL_SIZE, max_sharing_hash(manager), max_sharing_eq(manager)) {
     }

@@ -192,6 +192,12 @@ def getStructuralRecArgPosImp? (declName : Name) : CoreM (Option Nat) := do
   let some info := eqnInfoExt.find? (← getEnv) declName | return none
   return some info.recArgPos
 
+set_option compiler.ignoreBorrowAnnotation true in
+/-- `getStructuralRecArgPosImp?` for a given environment, for the usage digests
+(`Lean.ModuleUsage.getStructuralRecArgPosOfEnv?`). -/
+@[export lean_get_structural_rec_arg_pos_of_env]
+def getStructuralRecArgPosOfEnv? (env : Environment) (declName : Name) : Option Nat :=
+  (eqnInfoExt.find? env declName).map (·.recArgPos)
 
 builtin_initialize
   registerGetUnfoldEqnFn getUnfoldFor?
