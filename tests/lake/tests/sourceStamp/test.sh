@@ -5,17 +5,17 @@ source ../common.sh
 
 # Lake keeps the hash and the parsed header of each module's source with the source's identity
 # (device, inode, size, modification and status change times) in a record of its package's
-# `.lake/build/source.stamps`, and reads the source again only when that identity changed. Then it
-# hashes the source, and takes the header from the record only if the record holds that hash. It
-# records no identity that changed within 2 s before it looked at the file, so an edit in the same
-# clock tick as the stored hash is seen. A record's first line holds the hash and the identity; the
+# `.lake/build/source.stamps`, and reads the source again only when that identity changed: then it
+# hashes and parses the source, whatever header a record of another identity holds. It records no
+# identity that changed within 2 s before it looked at the file, so an edit in the same clock tick
+# as the stored hash is seen. A record's first line holds the hash and the identity; the
 # header follows. A process reads the file once for its lookups; each write of a build's changed
 # records (after it reports its result, and before in the background when no record changed for a
 # tenth of a second or a change waited a second) reads it again while it holds `source.stamps.lock`.
 
 NO_BUILD_CODE=3
-mkdir -p work/T work/U && cd work
-printf 'name = "t"\n\n[[lean_lib]]\nname = "T"\n\n[[lean_lib]]\nname = "U"\n\n[[lean_lib]]\nname = "V"\n' > lakefile.toml
+mkdir -p work/T work/U work/W && cd work
+printf 'name = "t"\n\n[[lean_lib]]\nname = "T"\n\n[[lean_lib]]\nname = "U"\n\n[[lean_lib]]\nname = "V"\n\n[[lean_lib]]\nname = "W"\n' > lakefile.toml
 printf 'import T.B\n' > T.lean
 printf 'import T.A\ndef b : Nat := a\n' > T/B.lean
 printf 'def a : Nat := 1\n' > T/A.lean
@@ -27,6 +27,15 @@ printf 'module\n\npublic def d : Nat := 3\n' > U/D.lean
 printf 'module\n\npublic import U.A\nimport all U.C\npublic meta import U.D\n\npublic def b : Nat := a\n' > U/B.lean
 # V takes 8 s to build
 printf '#eval IO.sleep 8000\n' > V.lean
+# Each module of W that W.I<n> imports is named after a component that Lean's escaper leaves as it
+# is (`fun`, `α`) or escapes (`123`, `9a`, `a b`)
+parts=(fun 123 9a α 'a b')
+: > W.lean
+for i in "${!parts[@]}"; do
+  printf 'def x%s : Nat := %s\n' "$i" "$i" > "W/${parts[$i]}.lean"
+  printf 'import W.«%s»\ndef y%s : Nat := x%s\n' "${parts[$i]}" "$i" "$i" > "W/I$i.lean"
+  printf 'import W.I%s\n' "$i" >> W.lean
+done
 STAMPS=.lake/build/source.stamps
 
 # stamp OP KEY -- `get` (to standard output; fails if the module has no record), `put` (from
@@ -94,6 +103,38 @@ ignores_stamp
 test_run build U --no-build
 plant U.B
 uses_stamp U
+
+# An import whose name Lean's escaper changes (`W.«123»`, `W.«9a»`) or whose name holds a character
+# outside ASCII (`W.α`) takes the encode-decode check of the record's header; a keyword component
+# (`W.fun`) takes none. Each record holds the name as the encoding writes it, and the next build
+# reads it back: it builds nothing, and with a planted hash it takes the record
+test_run build W
+test_cmd test "$(stamp get W.I0 | tail -n 1)" = '-e- W.fun'
+test_cmd test "$(stamp get W.I1 | tail -n 1)" = '-e- W.«123»'
+test_cmd test "$(stamp get W.I2 | tail -n 1)" = '-e- W.«9a»'
+test_cmd test "$(stamp get W.I3 | tail -n 1)" = '-e- W.α'
+test_not_out 'Built' build W
+for i in 0 1 2 3; do
+  plant W.I$i
+  uses_stamp W
+  test_run build W --rehash
+done
+
+# A name the encoding cannot write is no record: the space in `W.«a b»` separates an import's flags
+# from its name, so the check fails and every build reads W.I4's source again
+no_stamp W.I4
+ignores_stamp W
+
+# A header line that drops the escaping holds another name: `W.123` is a numeric component, which
+# the build does not find
+edit W.I1 '3s/.*/-e- W.123/'
+test_err 'W.123' build W --no-build
+test_run build W --rehash
+# `W.9a` is no name at all, so that record is not read
+plant W.I2
+edit W.I2 '3s/.*/-e- W.9a/'
+ignores_stamp W
+test_run build W --rehash
 
 # An edit that keeps the size and the modification time (as `cp -p` or `touch -r` can) changes the
 # status change time, so the source is hashed again
@@ -178,10 +219,8 @@ plant
 uses_stamp
 
 # A copy of the tree (new inodes and status change times, the same modification times, as `cp -a`
-# makes) matches no record's identity, so each source is read and hashed again. A record of another
-# identity is reused only where it holds the source's hash: its header is taken, and the source is
-# recorded again under the copy's identity. The copy builds nothing, and its next build reads no
-# source.
+# makes) matches no record's identity, so each source is read, hashed and parsed again, and recorded
+# again under the copy's identity. The copy builds nothing, and its next build reads no source.
 printf 'def a : Nat := 1\n' > T/A.lean
 sleep 3
 test_run build T
@@ -198,11 +237,15 @@ test_cmd test "$(inode_field T.A)" = "$(stat -c %i T/A.lean)"
 plant
 uses_stamp
 
-# The header comes from the record: in a copy, B's record (of the other tree's identity, with the
-# hash of B's source) with an import that B's source does not have is used
+# A record of another identity gives no header: in a copy, B's record (of the other tree's identity,
+# with the hash of B's source) with an import that B's source does not have is not used; B's source
+# is parsed, and recorded again under the copy's identity with the parsed header
 cd ../copy2
 edit T.B 's/ T\.A$/ T.Nope/'
-test_err 'T.Nope' build T --no-build
+test_run build T --no-build
+test_run build T
+test_cmd test "$(inode_field T.B)" = "$(stat -c %i T/B.lean)"
+test_cmd test "$(stamp get T.B | tail -n 1 | cut -d ' ' -f 2)" = T.A
 
 # An edit that keeps the size and the modification time (restored with `touch -d`) changes the
 # hash: in a copy, where no identity matches, the record is not reused and the module is built
