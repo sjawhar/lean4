@@ -360,3 +360,21 @@ info: Entries: [import Init.Data.Nat.Basic]
 Is rev mod use: false
 -/
 #guard_msgs in #eval showExtraModUses
+
+/-!
+Uses recorded inside a `realizeConst` survive the realization's replay into the main environment.
+-/
+
+def realizeTarget : Nat := 0
+
+run_meta
+  Lean.Meta.realizeConst ``realizeTarget `realizeTarget.extra do
+    Lean.recordExtraModUse `Realized.Module (isMeta := false)
+    Lean.addDecl <| .thmDecl {
+      name := `realizeTarget.extra, levelParams := [], type := Lean.mkConst ``True,
+      value := Lean.mkConst ``True.intro }
+
+/-- info: true -/
+#guard_msgs in
+#eval show Lean.CoreM Bool from
+  return (Lean.extraModUses.getEntries (← Lean.getEnv)).any (·.module == `Realized.Module)

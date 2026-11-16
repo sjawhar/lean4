@@ -531,7 +531,7 @@ v_resetjp_105_:
 {
 lean_object* v___f_108_; lean_object* v___x_109_; uint8_t v___x_110_; lean_object* v___x_111_; lean_object* v___x_113_; 
 v___f_108_ = ((lean_object*)(l_Lake_Job_renew___redArg___closed__0));
-v___x_109_ = lean_unsigned_to_nat(0u);
+v___x_109_ = lean_unsigned_to_nat(8u);
 v___x_110_ = 1;
 v___x_111_ = lean_task_map(v___f_108_, v_task_101_, v___x_109_, v___x_110_);
 if (v_isShared_107_ == 0)
@@ -1085,7 +1085,7 @@ v___x_302_ = l_Array_extract___redArg(v_a_289_, v_iniPos_270_, v___x_290_);
 lean_dec(v_a_289_);
 v___f_303_ = lean_alloc_closure((void*)(l_Lake_ensureJob___redArg___lam__0), 2, 1);
 lean_closure_set(v___f_303_, 0, v___x_302_);
-v___x_304_ = lean_unsigned_to_nat(0u);
+v___x_304_ = lean_unsigned_to_nat(8u);
 v___x_305_ = lean_task_map(v___f_303_, v_task_295_, v___x_304_, v___x_291_);
 if (v_isShared_300_ == 0)
 {

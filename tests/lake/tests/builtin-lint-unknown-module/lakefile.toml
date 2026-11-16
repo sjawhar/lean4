@@ -1,0 +1,8 @@
+name = "lint-unknown-module"
+defaultTargets = ["FooMain"]
+
+# Claims only `Foo.Main`, so Lake does not know `Foo.Old`, which `Foo.Main`
+# imports; `old.toml` builds it.
+[[lean_lib]]
+name = "FooMain"
+roots = ["Foo.Main"]
