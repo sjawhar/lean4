@@ -27,8 +27,9 @@ The rest of Lake names a record by the path it had as a file of its own (`X.usek
 sidecar path, from which `packOf` finds the pack and `Part.ofSidecar?` the part. `readSidecar` reads a part from the
 pack if the pack exists, and otherwise the file at the sidecar path itself, the layout Lake wrote before packs, so that
 a tree built then is read as it was. A pack that is not one of this format, whose size is not the one its header
-records, or whose part does not have the digest its header records, is read as `invalid`: the module's records are
-then absent, so the cutoff never skips the module on them and its importers take it to have no usage record.
+records, whose part does not have the digest its header records, or whose `.usage` or `.resolved` is asked for and
+which is larger than Lake reads of a record file (`maxWhole`), is read as `invalid`: the module's records are then
+absent, so the cutoff never skips the module on them and its importers take it to have no usage record.
 -/
 
 open System Lean
@@ -178,6 +179,17 @@ to stand for its bytes: the general bound of `Lean.ModuleUsage.stampSettled`, wh
 def settleNs : Int := 2000000000
 
 /--
+The largest pack Lake reads: the bound of `Lean.ModuleUsage.readFileStamped`, which reads a pack whole and fails for a
+larger file (`max_stamped_read`, `src/library/usage_digest.cpp`), so that a damaged record cannot make Lake allocate
+without bound. The `.usage` of a module whose closure has about 4,900 workspace modules is about 3 MB.
+-/
+def maxWhole : Nat := 256 * 1024 * 1024
+
+/-- What a read finds of a pack of `size` bytes, more than `maxWhole`. -/
+def tooLarge (pack : FilePath) (size : Nat) : Read :=
+  .invalid pack s!"it has {size} bytes, more than the {maxWhole} that Lake reads of a record file"
+
+/--
 The first bytes of the pack at `pack`, its header and its `.usekey`, with the pack's size and with its stamp if that
 stands for the bytes: the stamp is the same before the read and after it, and its status-change time lay more than
 `settleNs` before the read began (as `Lean.ModuleUsage.readFileStamped` judges a whole read, by the bound it uses on a
@@ -185,9 +197,11 @@ file system whose clock it cannot read). The stamps are the path's, taken around
 file's: they stand for the bytes where the file at the path is only replaced by a rename over it (as Lake and Lean
 write records), which gives it a new status-change time; a switch of the path to another file and back between the
 two stats, such as of a symlinked parent directory, is not seen. The size is the stamp's from before the read (a stat
-it takes anyway; only where no stamp can be read, as on Windows, the file's metadata): a header whose sizes do not add
-up to it is not read past its first bytes, so no length a header claims is ever allocated, and `partOf` reads such a
-pack as `invalid`. Throws if the pack cannot be opened or read (`noFileOrDirectory` if it does not exist).
+it takes anyway; only where no stamp can be read, as on Windows, the file's metadata). The `.usekey` is read only if
+it ends within that size and the pack is no larger than `maxWhole`: otherwise the header does not describe a pack
+Lake reads, nothing past the first bytes is read, so no length a header claims is ever allocated that the pack's size
+and `maxWhole` do not bound, and `readSidecar` reads the pack as `invalid`. Throws if the pack cannot be opened or
+read (`noFileOrDirectory` if it does not exist).
 -/
 def readPrefixStamped (pack : FilePath) : IO (ByteArray × Nat × Option ModuleUsage.FileStamp) := do
   let start := (← Std.Time.Timestamp.now).toNanosecondsSinceUnixEpoch.val
@@ -196,11 +210,11 @@ def readPrefixStamped (pack : FilePath) : IO (ByteArray × Nat × Option ModuleU
   let size ← match before? with
     | some s => pure s.size.toNat
     | none => pure (← pack.metadata).byteSize.toNat
-  let head ← readUpTo h (min maxHeader size)
+  let head ← readUpTo h maxHeader
   let want := match Header.parse? head with
-    | some hdr => if hdr.total == size then hdr.length + (hdr.usekey?.map (·.size)).getD 0 else 0
+    | some hdr => hdr.length + (hdr.usekey?.map (·.size)).getD 0
     | none => 0
-  let bytes ← if want ≤ head.size then pure head else readUpTo h want head
+  let bytes ← if want ≤ head.size || want > size || size > maxWhole then pure head else readUpTo h want head
   let after? ← ModuleUsage.fileStamp pack
   let stamp? := before?.filter fun s =>
     after? == some s && start - (s.ctimeSec.toNat * 1000000000 + s.ctimeNsec.toNat : Int) > settleNs
@@ -209,20 +223,27 @@ def readPrefixStamped (pack : FilePath) : IO (ByteArray × Nat × Option ModuleU
 /--
 Reads the record that the sidecar path `sidecar` names (`Part.ofSidecar?`): from its pack (`packOf`) if that exists,
 otherwise from the file at `sidecar`, the layout before packs. A `.usekey` is read with the start of its pack only
-(`readPrefixStamped`), the other parts with the whole pack (`Lean.ModuleUsage.readFileStamped`). Throws if a file
-exists but cannot be read.
+(`readPrefixStamped`), the other parts with the whole pack (`Lean.ModuleUsage.readFileStamped`). A pack larger than
+`maxWhole` is `invalid` for every part, as any other pack this Lake cannot read: the key read has its size, and for
+a whole read that fails the size is looked up after the failure. Throws if a file exists but cannot be read for
+another reason.
 -/
 public def readSidecar (sidecar : FilePath) : IO Read := do
   let pack := packOf sidecar
   let some p := Part.ofSidecar? sidecar | return ← own
   let read? : Except IO.Error Read ← if p == .usekey then
-      (do let (bytes, size, stamp?) ← readPrefixStamped pack; return partOf pack bytes size p stamp?).toBaseIO
+      (do let (bytes, size, stamp?) ← readPrefixStamped pack
+          return if size > maxWhole then tooLarge pack size else partOf pack bytes size p stamp?).toBaseIO
     else
       (do let (bytes, stamp?) ← ModuleUsage.readFileStamped pack; return partOf pack bytes bytes.size p stamp?).toBaseIO
   match read? with
   | .ok r => return r
   | .error (.noFileOrDirectory ..) => own
-  | .error e => throw e
+  | .error e =>
+    if p == .usekey then throw e
+    match (← pack.metadata.toBaseIO) with
+    | .ok md => if md.byteSize.toNat > maxWhole then return tooLarge pack md.byteSize.toNat else throw e
+    | .error _ => throw e
 where
   own : IO Read := do
     match (← (ModuleUsage.readFileStamped sidecar).toBaseIO) with

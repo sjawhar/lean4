@@ -440,10 +440,11 @@ def UsekeySidecar.importedClosure? (key : UsekeySidecar) (m : Name) : Option Mod
 /--
 The bytes of the usage-cutoff record that the sidecar path `path` names (`Lake.UsagePack.readSidecar`: from the
 module's pack, or from the file of the layout before packs) with their digest and the stamp of the file they were
-read from, if it stands for them (`Lean.ModuleUsage.readFileStamped`), or `none` if it does not exist or its bytes do
-not have the digest `expected?` (the `.usage` a `.usekey` was written from). A pack that cannot be read as one
-(`UsagePack.Read.invalid`) gives `none`, with a warning, so that the module builds normally. Fails if a file exists but
-cannot be read.
+read from, if it stands for them (a `.usekey` in a pack: `UsagePack.readPrefixStamped`'s stamp of the pack's path;
+otherwise `Lean.ModuleUsage.readFileStamped`'s of the file read), or `none` if it does not exist or its bytes do not
+have the digest `expected?` (the `.usage` a `.usekey` was written from). A pack that cannot be read as one
+(`UsagePack.Read.invalid`, which a pack larger than `UsagePack.maxWhole` is too) gives `none`, with a warning, so that
+the module builds normally. Fails if a file exists but cannot be read for another reason.
 -/
 def readSidecarBytes? (path : FilePath) (expected? : Option ModuleUsage.Digest) :
     JobM (Option (ByteArray × ModuleUsage.Digest × Option ModuleUsage.FileStamp)) := do
