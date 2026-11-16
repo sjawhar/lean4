@@ -6,12 +6,12 @@ source ../common.sh
 # Lake keeps the hash and the parsed header of each module's source with the source's identity
 # (device, inode, size, modification and status change times) in a record of its package's
 # `.lake/build/source.stamps`, and reads the source again only when that identity changed: then it
-# hashes and parses the source, whatever header a record of another identity holds. It records no
-# identity that changed within 2 s before it looked at the file, so an edit in the same clock tick
-# as the stored hash is seen. A record's first line holds the hash and the identity; the
-# header follows. A process reads the file once for its lookups; each write of a build's changed
-# records (after it reports its result, and before in the background when no record changed for a
-# tenth of a second or a change waited a second) reads it again while it holds `source.stamps.lock`.
+# hashes and parses the source. It records no identity that changed within 2 s before it looked at
+# the file, so an edit in the same clock tick as the stored hash is seen. A record's first line
+# holds the hash and the identity; the header follows. A process reads the file once for its
+# lookups; each write of a build's changed records (after it reports its result, and before in the
+# background when no record changed for a tenth of a second or a change waited a second) reads it
+# again while it holds `source.stamps.lock`.
 
 NO_BUILD_CODE=3
 mkdir -p work/T work/U work/W && cd work
@@ -104,10 +104,9 @@ test_run build U --no-build
 plant U.B
 uses_stamp U
 
-# An import whose name Lean's escaper changes (`W.«123»`, `W.«9a»`) or whose name holds a character
-# outside ASCII (`W.α`) takes the encode-decode check of the record's header; a keyword component
-# (`W.fun`) takes none. Each record holds the name as the encoding writes it, and the next build
-# reads it back: it builds nothing, and with a planted hash it takes the record
+# An import name, plain (`W.fun`) or not (`W.«123»`, `W.«9a»`, `W.α`), is recorded as the encoding
+# writes it, and the next build reads it back: it builds nothing, and with a planted hash it takes
+# the record
 test_run build W
 test_cmd test "$(stamp get W.I0 | tail -n 1)" = '-e- W.fun'
 test_cmd test "$(stamp get W.I1 | tail -n 1)" = '-e- W.«123»'
@@ -120,8 +119,8 @@ for i in 0 1 2 3; do
   test_run build W --rehash
 done
 
-# A name the encoding cannot write is no record: the space in `W.«a b»` separates an import's flags
-# from its name, so the check fails and every build reads W.I4's source again
+# A name the encoding cannot write is not recorded: the space in `W.«a b»` separates an import's
+# flags from its name, so the check fails and W.I4 has no record; W stays up to date
 no_stamp W.I4
 ignores_stamp W
 
@@ -247,8 +246,8 @@ test_run build T
 test_cmd test "$(inode_field T.B)" = "$(stat -c %i T/B.lean)"
 test_cmd test "$(stamp get T.B | tail -n 1 | cut -d ' ' -f 2)" = T.A
 
-# An edit that keeps the size and the modification time (restored with `touch -d`) changes the
-# hash: in a copy, where no identity matches, the record is not reused and the module is built
+# In a copy, where no identity matches, an edit that keeps the size and the modification time
+# (restored with `touch -d`) is read and built; then T is up to date
 cd ../copy3
 mtime=$(stat -c %y T/A.lean)
 printf 'def a : Nat := 2\n' > T/A.lean
