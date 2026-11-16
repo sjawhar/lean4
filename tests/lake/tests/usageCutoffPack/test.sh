@@ -117,11 +117,13 @@ packart() {
 )
 
 # (c) A pack this Lake cannot read: in a fresh tree built with the cutoff on, one byte of `P.C`'s `.usage` part
-# flipped (the part then does not have the digest the header records), and then the pack cut short by one byte (it
-# then does not have the size the header records). Each time, after the proof edit, `P.C` compiles rather than being
-# skipped, the build warns that it cannot read `P.C`'s pack, and the build succeeds. (The artifact cache is off: its
-# usage index would restore the earlier compile of `P.C`, whose cache entries are intact.)
-for damage in flip cut; do
+# flipped (the part then does not have the digest the header records), then the pack cut short by one byte (it then
+# does not have the size the header records), then a header whose `.usekey` length is 2^63 - 1 (a reader that took
+# that length before the file's size would allocate it and fail the build: Lake reads such a pack as invalid without
+# reading past its header). Each time, after the proof edit, `P.C` compiles rather than being skipped, the build warns
+# that it cannot read `P.C`'s pack, and the build succeeds. (The artifact cache is off: its usage index would restore
+# the earlier compile of `P.C`, whose cache entries are intact.)
+for damage in flip cut huge; do
   t=bad-$damage
   mkpkg $t
   test_run -d $t build P.C
@@ -139,6 +141,8 @@ for damage in flip cut; do
       test_exp "$(wc -c < bad.tmp)" = "$size"
       ;;
     cut) head -c $((size - 1)) "$p" > bad.tmp;;
+    huge) sed '1s/ k=[0-9]*:/ k=9223372036854775807:/' "$p" > bad.tmp
+      test_cmd_out ' k=9223372036854775807:' head -n 1 bad.tmp;;
   esac
   test_cmd mv -f bad.tmp "$p"
   test_cmd_fails cmp -s good.tmp "$p"
