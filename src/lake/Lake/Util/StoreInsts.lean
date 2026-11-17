@@ -9,6 +9,7 @@ prelude
 public import Init.Data.Order
 public import Lean.Data.NameMap.Basic
 public import Lake.Util.RBArray
+public import Lake.Util.DPHashMap
 public import Lake.Util.Family
 public import Lake.Util.Store
 
@@ -22,6 +23,11 @@ public instance {cmp : κ → κ → Ordering} [Monad m] [Std.LawfulEqCmp cmp] :
 public instance {cmp : κ → κ → Ordering} [MonadLiftT (ST ω) m] [Monad m] [Std.LawfulEqCmp cmp] : MonadDStore κ β (StateRefT' ω (Std.DTreeMap κ β cmp) m) where
   -- A lookup reads a snapshot of the (persistent) map: `ST.Ref.get` holds the cell only to bump a reference count,
   -- whereas `modifyGet` would hold it across the whole tree search, serializing every fetch of every build thread.
+  fetch? k := (·.get? k) <$> get
+  store k a := modify (·.insert k a)
+
+public instance [BEq κ] [Hashable κ] [LawfulBEq κ] [MonadLiftT (ST ω) m] [Monad m] : MonadDStore κ β (StateRefT' ω (DPHashMap κ β) m) where
+  -- As for `Std.DTreeMap` above, a lookup reads a snapshot of the persistent map.
   fetch? k := (·.get? k) <$> get
   store k a := modify (·.insert k a)
 
