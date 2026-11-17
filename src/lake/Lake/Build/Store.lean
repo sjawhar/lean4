@@ -7,7 +7,9 @@ module
 
 prelude
 public import Lake.Util.Store
+public import Lake.Util.DPHashMap
 public import Lake.Build.Job.Basic
+import Init.Data.Array.QSort
 
 /-!
 # The Lake Build Store
@@ -23,13 +25,25 @@ open Lean (Name NameMap)
 /-- A monad equipped with a Lake build store. -/
 public abbrev MonadBuildStore (m) := MonadDStore BuildKey (Job <| BuildData ·) m
 
-/-- The type of the Lake build store. -/
-public  abbrev BuildStore :=
-  Std.DTreeMap BuildKey (Job <| BuildData ·) BuildKey.quickCmp
+/-- The type of the Lake build store. Persistent, because the build's threads share it. -/
+public abbrev BuildStore := DPHashMap BuildKey (Job <| BuildData ·)
 
-@[inline] public def BuildStore.empty : BuildStore := Std.DTreeMap.empty
+@[inline] public def BuildStore.empty : BuildStore := DPHashMap.empty
 
 namespace BuildStore
+
+/-- The entries of the store, ordered by `BuildKey.quickCmp`. -/
+public def toArray (self : BuildStore) : Array ((k : BuildKey) × Job (BuildData k)) :=
+  DPHashMap.foldl (fun es k v => es.push ⟨k, v⟩) #[] self |>.qsort (·.1.quickCmp ·.1 == .lt)
+
+/-- Folds `f` over the entries of the store in the order of `BuildKey.quickCmp`. -/
+@[inline] public def foldl (f : σ → (k : BuildKey) → Job (BuildData k) → σ) (init : σ)
+    (self : BuildStore) : σ :=
+  self.toArray.foldl (fun s e => f s e.1 e.2) init
+
+/-- Iterates over the entries of the store in the order of `BuildKey.quickCmp`. -/
+public instance [Monad m] : ForIn m BuildStore ((k : BuildKey) × Job (BuildData k)) where
+  forIn self init f := ForIn.forIn self.toArray init f
 
 set_option linter.deprecated false in
 def getModuleFacetJob? (facet : Name) [FamilyOut FacetOut facet α]
