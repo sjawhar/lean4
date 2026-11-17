@@ -11,6 +11,7 @@ public import Lake.Util.Casing
 public import Lake.Util.Cli
 public import Lake.Util.Cycle
 public import Lake.Util.Date
+public import Lake.Util.DPHashMap
 public import Lake.Util.EquipT
 public import Lake.Util.Error
 public import Lake.Util.EStateT
