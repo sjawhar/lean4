@@ -142,30 +142,28 @@ printf 'def a : Nat := 2\n' > T/A.lean
 test_cmd touch -r ref T/A.lean
 test_out 'Built T.A' build T
 
-# An edit in the same second as the stored hash: the build right after the edit (within 2 s of it)
-# keeps no identity for it, so an edit in the same clock tick (which can keep every part of the
-# identity) is seen. A build that ends at most 1 s (by `date +%s`) after the edit looked at the
-# source less than 2 s after it; a slower build is tried again.
-fast=
-for i in 1 2 3; do
-  t0=$(date +%s)
-  printf 'def a : Nat := %s\n' $((2 + i)) > T/A.lean
-  test_out 'Built T.A' build T
-  if [ $(($(date +%s) - t0)) -le 1 ]; then fast=1; break; fi
-done
-test_exp -n "$fast"
+# An edit in the same second as the stored hash: a build that reads the source less than 2 s after
+# it changed keeps no identity for it, so an edit in the same clock tick (which can keep every part
+# of the identity) is seen. The modification time is set 30 s ahead, so that a read in the next 30 s
+# is less than 2 s after it, however slow the build; then it is set to now, as an edit leaves it.
+printf 'def a : Nat := 3\n' > T/A.lean
+test_cmd touch -d "@$(($(date +%s) + 30))" T/A.lean
+test_out 'Built T.A' build T
 no_stamp T.A
+test_cmd touch T/A.lean
 
 # The rule is checked against the moment Lake read the source, however late the write comes. The
-# source's modification time is set up to 3 s ahead of the edit, so a read up to 4 s after the edit
-# is less than 2 s after it; every write of `source.stamps` waits for its lock, which another
-# process holds until 6 s after the edit, so the write comes more than 2 s after that time. Skipped
-# without `flock`, or where it cannot take the lock.
+# source's modification time is set to 3 s after the edit, so a read up to 5 s after the edit is
+# less than 2 s after it. Another process then holds the lock of `source.stamps` for 6 s, and a
+# write waits for it at most 5 s, so the write comes more than 2 s after that time; a later time
+# cannot work, as a fast build could then write less than 2 s after it. Skipped without `flock`, or
+# where it cannot take the lock.
 if command -v flock > /dev/null; then
   sleep 3
   test_run build T
   printf 'def a : Nat := 9\n' > T/A.lean
-  test_cmd touch -d "@$(($(date +%s) + 3))" T/A.lean
+  t=$(date +%s%N)
+  test_cmd touch -d "@$((t / 1000000000 + 3)).$(printf '%09d' $((t % 1000000000)))" T/A.lean
   rm -f held
   flock "$STAMPS.lock" sh -c 'touch held; sleep 6' &
   holder=$!
