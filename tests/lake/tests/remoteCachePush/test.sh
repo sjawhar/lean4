@@ -339,31 +339,41 @@ case_push_many() {
 }
 
 case_push_scale() {
-  # A long queue costs a push time in proportion to its lines. The push's workers share what it
+  # A long queue costs a push work in proportion to its lines. The push's workers share what it
   # did with each line's claim (2 updates per line), so a map that copies itself on each update
-  # makes a queue of n lines cost n^2 (32,000 lines about 60 s more than an empty queue). Here a
-  # queue of 32,000 lines that are not JSON (each dropped as invalid) must take less than 10 s
-  # more than an empty one.
+  # makes a queue of n lines cost n^2 (32,000 lines about 60 s more than an empty queue). Here
+  # pushes of 0, 16,000 and 32,000 lines that are not JSON (each dropped as invalid) are timed in
+  # CPU (user and system, of Lake and its children): what 32,000 lines add to the empty queue's
+  # must be less than 3 times what 16,000 lines add (linear work gives 2, the copying map 4). Load
+  # on the machine stretches a push's wall time, not the CPU time it uses. If 16,000 lines add
+  # under 50 ms, the ratio is noise, and 32,000 lines must instead add less than 10 s.
   push_fresh
   test_cmd mkdir -p "$PUSH_CACHE"
-  local n t empty=0 extra=0
-  for n in 0 32000; do
+  local n cpu="$WORK_DIR/push-cpu" TIMEFORMAT='%3U %3S'
+  : > "$cpu"
+  for n in 0 16000 32000; do
     rm -f "$PUSH_QUEUE" "$PUSH_DROPPED"
     : > "$PUSH_QUEUE"
     [ "$n" = 0 ] || seq -f 'not json %.0f' 1 "$n" > "$PUSH_QUEUE"
-    t=$(date +%s%N)
-    on_a test_run cache push
-    t=$(( $(date +%s%N) - t ))
+    { time on_a test_run cache push; } 2>> "$cpu"
     test_cmd_eq 0 queued
-    if [ "$n" = 0 ]; then
-      empty=$t
-    else
-      test_cmd_eq "$n" push_check dropped "$PUSH_DROPPED" invalid
-      extra=$(( (t - empty) / 1000000 ))
-    fi
+    [ "$n" = 0 ] || test_cmd_eq "$n" push_check dropped "$PUSH_DROPPED" invalid
   done
-  echo "32,000 lines took $extra ms more than an empty queue"
-  test_exp "$extra" -lt 10000
+  "$PYTHON" -c '
+import sys
+# `time` prints the decimal point of the locale
+cpu = [sum(float(t.replace(",", ".")) for t in line.split()) for line in open(sys.argv[1])]
+assert len(cpu) == 3, cpu
+empty, half, full = cpu
+print("push CPU seconds: %.3f (empty), %.3f (16,000 lines), %.3f (32,000 lines)" % tuple(cpu))
+if half - empty < 0.05:
+    print("16,000 lines add under 50 ms of CPU; 32,000 lines must add under 10 s")
+    assert full - empty < 10, cpu
+else:
+    ratio = (full - empty) / (half - empty)
+    print("32,000 lines add %.2f times the CPU that 16,000 lines add" % ratio)
+    assert ratio < 3, (ratio, cpu)
+' "$cpu"
 }
 
 case_push_staging() {

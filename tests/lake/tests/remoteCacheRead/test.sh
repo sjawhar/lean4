@@ -27,16 +27,19 @@ name = "Many"
 roots = [$(IFS=,; echo "${many_roots[*]}")]
 EOF
 # A library of 8 modules, none of which imports another, whose compile records when it starts and
-# ends in `$LAKE_TEST_BUSY_LOG`: a `+` line, a second of work, and a `-` line
+# ends in `$LAKE_TEST_BUSY_LOG`: a `+ <ns>` line, a second of work, and a `- <ns>` line, with times
+# from `IO.monoNanosNow`, a clock that all processes share
 mkdir -p Busy
 busy_roots=()
 for i in $(seq 1 8); do
   cat > "Busy/B$i.lean" << 'EOF'
 #eval show IO Unit from do
   if let some log ← IO.getEnv "LAKE_TEST_BUSY_LOG" then
-    IO.FS.withFile log .append fun h => h.putStrLn "+"
+    let t0 ← IO.monoNanosNow
+    IO.FS.withFile log .append fun h => h.putStrLn s!"+ {t0}"
     IO.sleep 1000
-    IO.FS.withFile log .append fun h => h.putStrLn "-"
+    let t1 ← IO.monoNanosNow
+    IO.FS.withFile log .append fun h => h.putStrLn s!"- {t1}"
 EOF
   echo "def b$i := $i" >> "Busy/B$i.lean"
   busy_roots+=("\"Busy.B$i\"")
@@ -296,12 +299,12 @@ case_read_compile_slots() {
   : > "$busy"
   LEAN_NUM_THREADS=2 LAKE_TEST_BUSY_LOG="$busy" LAKE_REMOTE_CACHE=slow \
     test_out 'Built Busy' build Busy
-  test_cmd_eq 8 count '^+$' "$busy"
+  test_cmd_eq 8 count '^+ ' "$busy"
   "$PYTHON" -c '
 import sys
 now = most = 0
 for line in open(sys.argv[1]):
-    now += 1 if line.strip() == "+" else -1
+    now += 1 if line.startswith("+ ") else -1
     most = max(most, now)
 print("at most", most, "compiles ran at once")
 assert most <= int(sys.argv[2]), most
@@ -312,8 +315,10 @@ case_read_slot_wait_time() {
   # A job's build time (the time its `Built` line shows) does not count the time its compile waited
   # for a build slot. With one worker and the eight modules of `Busy`, whose mappings are all
   # missing (each miss waits 2 s for the remote) and each of whose compiles takes a second, the
-  # compiles run one at a time after their reads, so the last one waits about 7 s for its slot; each
-  # line still shows about the second of its own compile.
+  # compiles run one at a time after their reads, so the last one waits for its slot about as long
+  # as the span from the first compile's start to the last one's (seven compiles). Each line must
+  # show less than three quarters of that span: a correct line shows about a seventh of it, even
+  # when one compile runs several times slower than the others, and one that counted the wait more.
   local busy
   busy="$WORK_DIR/busy-log"
   fresh
@@ -321,13 +326,17 @@ case_read_slot_wait_time() {
   LEAN_NUM_THREADS=1 LAKE_TEST_BUSY_LOG="$busy" LAKE_REMOTE_CACHE=slow \
     test_out 'Built Busy' build Busy
   test_cmd cp produced.out slotwait.out
-  test_cmd_eq 8 count '^+$' "$busy"
+  test_cmd_eq 8 count '^+ ' "$busy"
   "$PYTHON" -c '
 import re, sys
 now = most = 0
+starts = []
 for line in open(sys.argv[1]):
-    now += 1 if line.strip() == "+" else -1
+    sign, ns = line.split()
+    now += 1 if sign == "+" else -1
     most = max(most, now)
+    if sign == "+":
+        starts.append(int(ns))
 assert most == 1, most
 times = {}
 for line in open(sys.argv[2]):
@@ -336,7 +345,11 @@ for line in open(sys.argv[2]):
         times[m.group(1)] = float(m.group(2)) * (1 if m.group(3) == "ms" else 1000)
 print("build times (ms):", sorted(times.values()))
 assert len(times) == 8, times
-assert max(times.values()) < 3000, times
+span = max(starts) - min(starts)
+assert span > 0, starts
+ratio = max(times.values()) * 10**6 / span
+print("largest build time / span of the compile starts (%d ms): %.3f" % (span // 10**6, ratio))
+assert ratio < 0.75, (ratio, span, times)
 ' "$busy" slotwait.out
 }
 

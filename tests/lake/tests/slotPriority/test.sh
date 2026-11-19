@@ -15,7 +15,8 @@ source ../common.sh
 source ../remoteCache/lib.sh
 
 # The library `Prio`: a chain C0 <- C1 <- C2 and ten modules L1..L10 that import nothing. Each compile
-# writes its name to `$LAKE_TEST_ORDER_LOG` when it starts and then takes a second.
+# takes a second, and appends `+ <name> <ns>` to `$LAKE_TEST_ORDER_LOG` when it starts and
+# `- <name> <ns>` when it ends, with times from `IO.monoNanosNow`, a clock that all processes share.
 mkdir -p Prio
 prio_mod() {
   local name=$1 dep=${2:-}
@@ -24,8 +25,11 @@ prio_mod() {
     cat << EOF
 #eval show IO Unit from do
   if let some log ← IO.getEnv "LAKE_TEST_ORDER_LOG" then
-    IO.FS.withFile log .append fun h => h.putStrLn "$name"
+    let t0 ← IO.monoNanosNow
+    IO.FS.withFile log .append fun h => h.putStrLn s!"+ $name {t0}"
     IO.sleep 1000
+    let t1 ← IO.monoNanosNow
+    IO.FS.withFile log .append fun h => h.putStrLn s!"- $name {t1}"
 def x$name := 0
 EOF
   } > "Prio/$name.lean"
@@ -52,8 +56,10 @@ case_slot_priority() {
   # modules that import nothing read at once and then wait for the slot. C0 compiles first or
   # second; when C0 is done, C1 reads for 2 s while the L modules take turns, and then C1 is next,
   # before the L modules that have waited since the start, and so is C2 after it. In arrival order
-  # C1 and C2 would compile after all ten. Each compile time in the record is the second of the
-  # compile, not the up to 13 s that an L module waits for its slot.
+  # C1 and C2 would compile after all ten. Each compile time in the record is the compile's own,
+  # not the wait for its slot: the last L module to compile waits about as long as the span from
+  # the first compile's start to the last one's (twelve compiles), so each recorded time must stay
+  # below half that span. A load that slows the compiles lengthens the span with them.
   fresh
   mkdir -p .lake
   # The record's rows are sorted by module name, byte by byte, or Lake ignores the record
@@ -69,10 +75,11 @@ case_slot_priority() {
   # The build read the record (a record it cannot read only warns, and every priority is 0)
   test_cmd_eq 0 count 'module-times.tsv' prio-build.out
   cat "$ORDER"
-  test_cmd_eq 13 count '' "$ORDER"
+  test_cmd_eq 13 count '^+ ' "$ORDER"
   "$PYTHON" -c '
 import sys
-order = [line.strip() for line in open(sys.argv[1])]
+starts = [line.split()[1:] for line in open(sys.argv[1]) if line.startswith("+ ")]
+order = [name for name, ns in starts]
 last_l = max(i for i, m in enumerate(order) if m.startswith("L"))
 print("order:", order)
 assert order.index("C0") <= 1, order
@@ -87,7 +94,12 @@ with open(sys.argv[2]) as f:
 times = {n: rows[n] for n in rows if n.startswith("Prio.")}
 print("recorded ms:", times)
 assert len(times) == 13, times
-assert max(times.values()) < 3000, times
+start_ns = [int(ns) for name, ns in starts]
+span = max(start_ns) - min(start_ns)
+assert span > 0, starts
+ratio = max(times.values()) * 10**6 / span
+print("largest recorded time / span of the compile starts (%d ms): %.3f" % (span // 10**6, ratio))
+assert ratio < 0.5, (ratio, span, times)
 ' "$ORDER" "$REC"
 }
 
