@@ -43,13 +43,13 @@ Knobs, all through the environment:
   FAKE_CONCURRENT     `1`: answer each request after `hello` on a thread of its own, as the daemon
                       does, so requests overlap (default: one at a time, in order)
   FAKE_INFLIGHT       file taking the most `run` requests that were in progress at once
-  FAKE_SLOW_WRITE     a path suffix: a `materialize` write of a file whose path ends with it takes
-  FAKE_SLOW_WRITE_MS  this long; its temporary file exists for that time
+  FAKE_SLOW_WRITE     a path suffix: a `materialize` write of a file whose path ends with it creates its
+  FAKE_SLOW_WRITE_GO  temporary file and finishes only once the input has ended and this file exists
+                      (at most 10 min later), as a write in progress when the client goes
   FAKE_PIDFILE        file taking this process's id
   FAKE_DAEMON_S       start a detached child that lives this many seconds and closes every descriptor
                       it inherited, as the daemon `lean-remote bridge` starts; its id goes to
                       `<FAKE_PIDFILE>.daemon`
-  FAKE_HELLO_STAMP    file taking the time (seconds since the epoch) at which `hello` arrived
   FAKE_EXIT_LOG       file taking a line `end of input` when the fake exits after its input ended
                       (a fake that is killed writes none)
   FAKE_IGNORE_EOF_S   stay this many seconds after end of input before exiting, as a bridge whose
@@ -62,7 +62,7 @@ LOG = os.environ.get("FAKE_LOG")
 SLEEP = float(os.environ.get("FAKE_SLEEP_MS") or 0) / 1000.0
 INFLIGHT_FILE = os.environ.get("FAKE_INFLIGHT")
 SLOW_WRITE = os.environ.get("FAKE_SLOW_WRITE")
-SLOW_WRITE_S = float(os.environ.get("FAKE_SLOW_WRITE_MS") or 0) / 1000.0
+SLOW_WRITE_GO = os.environ.get("FAKE_SLOW_WRITE_GO")
 CANCELLED = "cancelled, because the client closed its connection"
 DOWN_FILE = os.environ.get("FAKE_DOWN_FILE")
 
@@ -218,7 +218,9 @@ def materialize(p):
         tmp = tmp_name(f["path"])
         if SLOW_WRITE and f["path"].endswith(SLOW_WRITE):
             open(tmp, "wb").close()     # the write has started, and it finishes
-            time.sleep(SLOW_WRITE_S)
+            deadline = time.monotonic() + 600
+            while not (_gone.is_set() and os.path.exists(SLOW_WRITE_GO)) and time.monotonic() < deadline:
+                time.sleep(0.01)
         shutil.copyfile(src, tmp)
         if file_digest(tmp) != f["digest"]: os.remove(tmp); raise Err("INTERNAL", "digest mismatch")
         os.chmod(tmp, 0o555 if f.get("executable") else 0o444); os.replace(tmp, f["path"])
@@ -234,8 +236,6 @@ def hello(p):
 
 
 def hello_answer(p):
-    if os.environ.get("FAKE_HELLO_STAMP"):
-        with open(os.environ["FAKE_HELLO_STAMP"], "w") as f: f.write(repr(time.time()))
     sequence = os.environ.get("FAKE_HELLO_SEQUENCE")
     later = (os.environ.get("FAKE_UNREACHABLE_LATER") or os.environ.get("FAKE_UNVERIFIED_LATER")
              or os.environ.get("FAKE_HELLO_STATE"))
