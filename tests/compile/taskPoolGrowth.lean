@@ -6,10 +6,10 @@ Growth pacing of the task pool (`lean_task_pool_set_growth`), with `LEAN_NUM_THR
   hold their thread for 200 ms run side by side;
 * unpaced (the default, in a child process, as workers never exit), 32 tasks that each spin until
   all 32 have started do start, so the pool has at least 32 threads;
-* with a 5 ms delay, in a child process, a burst of 600 tasks that each hold their thread for 1 ms,
-  queued at once, ends with fewer than 24 threads: the pacer starts no worker after a delay in
-  which tasks finished faster than they were queued (doubling batches reach the limit of 64, and
-  batches of at most 4 per delay alone reach about 33);
+* with a 200 ms delay, in a child process, a burst of 2250 tasks that each hold their thread for
+  20 ms, queued at once, ends with at most 20 threads: the pacer starts no worker after a delay in
+  which fewer tasks were queued than finished (batches of at most 4 per delay alone reach about 46
+  threads, and doubling batches the limit of 64 workers);
 * with no eager workers and a 5 ms delay, in a child process, 4 tasks that wait for a task queued
   behind them finish: the pacer starts at least one worker per starved delay (a watchdog on a
   dedicated thread ends the child with an error after 20 s without that, and stops once they finish).
@@ -55,10 +55,14 @@ def main (args : List String) : IO Unit := do
     report "unpaced barrier" (· ≥ 32)
     return
   if args == ["burst"] then
-    setTaskPoolGrowth 4 5000
-    let tasks ← (List.range 600).mapM fun _ => BaseIO.asTask (IO.sleep 1)
+    -- All 2250 tasks are queued within the pacer's first delay, after which it starts at most one
+    -- worker; every later delay sees tasks finish and none queued, so starts none. Only a stall of
+    -- every worker for a whole delay, or of the queueing thread past the first, can start more: 20
+    -- threads (main, libuv's event loop, pacer, 17 workers) leave room for three, starting 2, 4, 4.
+    setTaskPoolGrowth 4 200000
+    let tasks ← (List.range 2250).mapM fun _ => BaseIO.asTask (IO.sleep 20)
     for t in tasks do discard <| IO.wait t
-    report "paced short burst" (· < 24)
+    report "paced short burst" (· ≤ 20)
     return
   if args == ["noeager"] then
     setTaskPoolGrowth 0 5000
