@@ -174,7 +174,7 @@ check("concurrent requests are all answered", ids == [101, 102], str(ids))
 check("and they overlap", elapsed < 0.95 and most == "2", f"{elapsed:.2f} s, most in flight {most}")
 b7.close()
 
-# --- FAKE_PIDFILE, FAKE_HELLO_STAMP, FAKE_DAEMON_S
+# --- FAKE_PIDFILE, FAKE_DAEMON_S
 def holds(pid, path):
     """Whether process `pid` has a descriptor open on `path`."""
     d = f"/proc/{pid}/fd"
@@ -185,14 +185,12 @@ def holds(pid, path):
             pass
     return False
 
-pidfile = os.path.join(work, "bridge.pid"); stamp = os.path.join(work, "hello.stamp")
+pidfile = os.path.join(work, "bridge.pid")
 lockfile = os.path.join(work, "inherited.lock"); lockfd = os.open(lockfile, os.O_RDWR | os.O_CREAT)
-before = time.time()
-b8 = Bridge(pass_fds=(lockfd,), FAKE_DAEMON_S="30", FAKE_PIDFILE=pidfile, FAKE_HELLO_STAMP=stamp)
+b8 = Bridge(pass_fds=(lockfd,), FAKE_DAEMON_S="30", FAKE_PIDFILE=pidfile)
 result(b8.call("hello", {"protocol": 1}))
 dpid = int(open(pidfile + ".daemon").read())
 check("FAKE_PIDFILE names the bridge", int(open(pidfile).read()) == b8.p.pid)
-check("FAKE_HELLO_STAMP holds the time of hello", before <= float(open(stamp).read()) <= time.time())
 check("the bridge keeps a descriptor it inherited", holds(b8.p.pid, lockfile))
 check("the FAKE_DAEMON_S child closes every descriptor it inherited", not holds(dpid, lockfile))
 b8.close()
@@ -258,15 +256,17 @@ check("and the bridge exits at once", rc11 == 0 and dt11 < 2, f"exit {rc11} afte
 
 # --- a write in progress at end of input finishes; no write starts after it
 slowdir = os.path.join(work, "slow"); os.makedirs(slowdir)
-b12 = Bridge(FAKE_SLOW_WRITE="slow.out", FAKE_SLOW_WRITE_MS="1000")
+slowgo = os.path.join(work, "slow.go")
+b12 = Bridge(FAKE_SLOW_WRITE="slow.out", FAKE_SLOW_WRITE_GO=slowgo)
 result(b12.call("hello", {"protocol": 1}))
 mat = {"files": [{"digest": want, "path": os.path.join(slowdir, "slow.out")},
                  {"digest": want, "path": os.path.join(slowdir, "after.out")}]}
 b12.p.stdin.write(json.dumps({"id": 301, "method": "materialize", "params": mat}) + "\n"); b12.p.stdin.flush()
-for _ in range(250):
+for _ in range(3000):
     if any(n.startswith("slow.out.fake-") for n in os.listdir(slowdir)): break
     time.sleep(0.02)
 b12.p.stdin.close()
+open(slowgo, "w").close()
 r12 = json.loads(b12.p.stdout.readline() or "{}")
 b12.p.wait(timeout=10)
 slow_out = os.path.join(slowdir, "slow.out")
