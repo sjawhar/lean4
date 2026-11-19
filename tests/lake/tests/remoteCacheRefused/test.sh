@@ -232,12 +232,13 @@ case_one_refused() {
 }
 
 case_outage_recovers() {
-  # A remote that refuses every connection until 8 modules of the chain have compiled, and then
-  # answers: the build stops reading it once its refused reads have gone on for 3 s, and compiles; a
-  # probe read after the outage gets an answer, so the build reads the remote again and restores the
-  # rest of the chain. The outage costs the modules compiled during it and until the probe, not the
-  # rest of the build. Each of the 8 sleeps half a second as it compiles, so their refused reads go on
-  # for at least 3.5 s however fast or loaded the machine is, and the reads stop.
+  # A remote that refuses every connection until 8 modules of the chain have started compiling, and
+  # then answers: the build stops reading it once its refused reads have gone on for 3 s, and
+  # compiles; a probe read after the outage gets an answer, so the build reads the remote again and
+  # restores the rest of the chain. The outage costs the modules compiled during it and until the
+  # probe, not the rest of the build. A module appends its line to `compiles` as its compile starts
+  # and then sleeps half a second, so the read of the 8th, which is refused, goes at least 3.5 s after
+  # that of the first however fast or loaded the machine is, and the reads stop.
   local compiled
   REFUSE="until:$WORK_DIR/compiles:8" seeded_build Long.L40
   compiled="$(count '^Long\.' "$WORK_DIR/compiles")"
