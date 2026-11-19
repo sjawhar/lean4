@@ -135,16 +135,18 @@ test_cmd same_outputs "$WORK/remote"
 no_match_text "$WORK" "$FAKE_LOG.actions"
 
 # The same modules from another directory are the same actions, and the service's cache serves them.
-# Lake ends the bridge that carried the build's requests by closing its input, not by killing it; the
-# bridge that only made the decision (before the build lock) carried no write and is killed at once.
+# Lake ends the bridge that carried the build's requests by closing its input, not by killing it, so
+# that bridge logs its exit; it starts after the bridge that only made the decision (before the build
+# lock), so the pid file names it. The decision bridge carried no write and is killed at once, right
+# after Lake closes its input, so it can log its exit too: only the build bridge's line is counted.
 hellos=$(count_method hello)
-(cd "$WORK/remote2" && FAKE_EXIT_LOG="$WORK/exits.log" LAKE_REMOTE_EXEC=grpc://fake:1 \
+(cd "$WORK/remote2" && FAKE_EXIT_LOG="$WORK/exits.log" FAKE_PIDFILE="$WORK/remote2.pid" LAKE_REMOTE_EXEC=grpc://fake:1 \
   test_out "lake: remote: ok; 5 cached (0 from manifest), 0 executed, 0 local;" build Rx)
 match_text "c says hi" "$WORK/remote2/produced.out"
 test_cmd same_actions
 test_cmd same_outputs "$WORK/remote2"
 test_cmd_eq 2 echo "$(($(count_method hello) - hellos))"
-test_cmd_eq 1 grep -c "end of input" "$WORK/exits.log"
+test_cmd_eq 1 grep -cxF "\"end of input $(cat "$WORK/remote2.pid")\"" "$WORK/exits.log"
 
 # A client that runs the bridge as its child (a wrapper script without `exec`, as `timeout` or
 # `strace -f` also do): when Lake kills the decision bridge, that child keeps Lake's pipes and exits
@@ -486,9 +488,11 @@ test_exp ! -e "$WORK/wrongtc/.lake/build/lib/lean/Rx/A.olean"
   test_cmd write_started
   test_cmd_fails lock_free .lake/build.lock
   touch "$WORK/termedw.go"
-  test_cmd wait_dead "$(cat "$WORK/termedw.pid")"
+  bridge=$(cat "$WORK/termedw.pid")
+  test_cmd wait_dead "$bridge"
   test_cmd lock_free .lake/build.lock
-  test_cmd_eq 1 grep -c "end of input" "$WORK/termedw.exits"
+  # The build's bridge, which the pid file names, not the decision's (see `remote2`)
+  test_cmd_eq 1 grep -cxF "\"end of input $bridge\"" "$WORK/termedw.exits"
   test_cmd cmp .lake/build/lib/lean/Rx/A.olean "$WORK/local/.lake/build/lib/lean/Rx/A.olean"
 )
 

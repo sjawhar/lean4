@@ -158,20 +158,31 @@ check("a client that names no Lean is not verified, with a reason",
       h6.get("toolchainVerified") is False and bool(h6.get("reason")), json.dumps(h6))
 b6.close()
 
-# --- FAKE_CONCURRENT, FAKE_SLEEP_MS, FAKE_INFLIGHT: requests after hello overlap
-inflight = os.path.join(work, "inflight")
-b7 = Bridge(FAKE_CONCURRENT="1", FAKE_SLEEP_MS="500", FAKE_INFLIGHT=inflight)
+# --- FAKE_CONCURRENT, FAKE_SLEEP_MS, FAKE_INFLIGHT: requests after hello overlap. Each run sleeps and
+# then waits at FAKE_INPUT_BARRIER, which the test opens only once both runs are in flight: a fake that
+# answers one request at a time never has both in flight.
+inflight = os.path.join(work, "inflight"); barrier = os.path.join(work, "barrier")
+b7 = Bridge(FAKE_CONCURRENT="1", FAKE_SLEEP_MS="500", FAKE_INFLIGHT=inflight, FAKE_INPUT_BARRIER=barrier)
 result(b7.call("hello", {"protocol": 1}))
 slow = dict(req, argv=["/bin/sh", "-c", "true"], outputs=[], inputs=[], mnemonic="SelfTestSlow")
-t0 = time.time()
+t0 = time.monotonic()
 for i in (101, 102):
     b7.p.stdin.write(json.dumps({"id": i, "method": "run", "params": slow}) + "\n")
 b7.p.stdin.flush()
-ids = sorted(json.loads(b7.p.stdout.readline())["id"] for _ in range(2))
-elapsed = time.time() - t0
+ready_at = None
+for _ in range(1200):
+    if ready_at is None and os.path.exists(barrier + ".ready"): ready_at = time.monotonic()
+    if ready_at is not None and os.path.exists(inflight) and open(inflight).read() == "2": break
+    time.sleep(0.1)
+open(barrier + ".go", "w").close()
+answers = sorted((json.loads(b7.p.stdout.readline() or "{}") for _ in range(2)), key=lambda a: a.get("id", 0))
 most = open(inflight).read() if os.path.exists(inflight) else None
-check("concurrent requests are all answered", ids == [101, 102], str(ids))
-check("and they overlap", elapsed < 0.95 and most == "2", f"{elapsed:.2f} s, most in flight {most}")
+check("concurrent requests are all answered",
+      [a.get("id") for a in answers] == [101, 102] and all(a.get("result", {}).get("exitCode") == 0 for a in answers),
+      json.dumps(answers))
+check("and they overlap", most == "2", f"most in flight {most}")
+# The barrier marks `.ready` after the sleep, so the test sees it no earlier
+check("FAKE_SLEEP_MS holds a run that long", ready_at is not None and ready_at - t0 >= 0.5, f"ready after {ready_at and ready_at - t0}")
 b7.close()
 
 # --- FAKE_PIDFILE, FAKE_DAEMON_S
@@ -243,16 +254,25 @@ check("FAKE_UNVERIFIED_LATER makes every later connection verify another Lean",
       answers == [(True, True, "a" * 40), (True, False, "0" * 40)], str(answers))
 
 # --- end of input means the client is gone: the request in flight is cancelled and the bridge exits
-b11 = Bridge(FAKE_SLEEP_MS="30000")
+# at once, without waiting out the run's 600 s sleep
+inflight11 = os.path.join(work, "inflight11")
+b11 = Bridge(FAKE_SLEEP_MS="600000", FAKE_INFLIGHT=inflight11)
 result(b11.call("hello", {"protocol": 1}))
 b11.p.stdin.write(json.dumps({"id": 201, "method": "run", "params": slow}) + "\n"); b11.p.stdin.flush()
-time.sleep(0.3)
-t0 = time.time(); b11.p.stdin.close()
+for _ in range(1200):
+    in_flight = os.path.exists(inflight11) and open(inflight11).read() == "1"
+    if in_flight: break
+    time.sleep(0.1)
+b11.p.stdin.close()
+try:
+    rc11 = b11.p.wait(timeout=10)
+except subprocess.TimeoutExpired:
+    b11.p.kill(); b11.p.wait(); rc11 = None
 r11 = json.loads(b11.p.stdout.readline() or "{}")
-rc11 = b11.p.wait(timeout=10); dt11 = time.time() - t0
 check("end of input cancels the run in flight",
-      r11.get("error", {}).get("code") == "UNAVAILABLE" and "cancelled" in r11["error"].get("message", ""), json.dumps(r11))
-check("and the bridge exits at once", rc11 == 0 and dt11 < 2, f"exit {rc11} after {dt11:.2f} s")
+      in_flight and r11.get("error", {}).get("code") == "UNAVAILABLE" and "cancelled" in r11["error"].get("message", ""),
+      f"in flight: {in_flight}, {json.dumps(r11)}")
+check("and the bridge exits at once", rc11 == 0, f"exit {rc11}")
 
 # --- a write in progress at end of input finishes; no write starts after it
 slowdir = os.path.join(work, "slow"); os.makedirs(slowdir)
@@ -284,21 +304,19 @@ for s in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM): b13.p.send_signal(s)
 time.sleep(0.2)
 check("the bridge ignores SIGINT, SIGHUP and SIGTERM", b13.p.poll() is None)
 check("and exits on end of input", b13.close() == 0)
-check("FAKE_EXIT_LOG records the exit on end of input", open(exitlog).read().count("end of input") == 1)
+check("FAKE_EXIT_LOG records the exit on end of input, with the fake's id",
+      open(exitlog).read().splitlines() == [json.dumps(f"end of input {b13.p.pid}")], open(exitlog).read())
 b14 = Bridge(FAKE_EXIT_LOG=exitlog)
 result(b14.call("hello", {"protocol": 1}))
 b14.p.kill(); b14.p.wait()
 check("and records nothing for a killed fake", open(exitlog).read().count("end of input") == 1)
 
-# --- FAKE_IGNORE_EOF_S: the fake stays that long after end of input
+# --- FAKE_IGNORE_EOF_S: the fake stays that long after end of input, then exits
 b15 = Bridge(FAKE_IGNORE_EOF_S="1")
 result(b15.call("hello", {"protocol": 1}))
-t0 = time.time(); b15.p.stdin.close()
-time.sleep(0.5)
-still = b15.p.poll() is None
-rc15 = b15.p.wait(timeout=10); dt15 = time.time() - t0
-check("FAKE_IGNORE_EOF_S keeps the fake after end of input", still and rc15 == 0 and 1 <= dt15 < 3,
-      f"alive at 0.5 s: {still}, exit {rc15} after {dt15:.2f} s")
+t0 = time.monotonic(); b15.p.stdin.close()
+rc15 = b15.p.wait(timeout=10); dt15 = time.monotonic() - t0
+check("FAKE_IGNORE_EOF_S keeps the fake after end of input", rc15 == 0 and dt15 >= 1, f"exit {rc15} after {dt15:.2f} s")
 
 # --- FAKE_DOWN_FILE: while the file exists, hello is unreachable and run and materialize are UNAVAILABLE
 downfile = os.path.join(work, "down")

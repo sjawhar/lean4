@@ -50,8 +50,8 @@ Knobs, all through the environment:
   FAKE_DAEMON_S       start a detached child that lives this many seconds and closes every descriptor
                       it inherited, as the daemon `lean-remote bridge` starts; its id goes to
                       `<FAKE_PIDFILE>.daemon`
-  FAKE_EXIT_LOG       file taking a line `end of input` when the fake exits after its input ended
-                      (a fake that is killed writes none)
+  FAKE_EXIT_LOG       file taking a line `"end of input <pid>"` (a JSON string, with this process's id)
+                      when the fake exits after its input ended (a fake that is killed writes none)
   FAKE_IGNORE_EOF_S   stay this many seconds after end of input before exiting, as a bridge whose
                       daemon does not close the connection
 """
@@ -341,7 +341,7 @@ def main():
     work.put(None)
     for t in threads: t.join()
     time.sleep(float(os.environ.get("FAKE_IGNORE_EOF_S") or 0))
-    append(os.environ.get("FAKE_EXIT_LOG"), "end of input")
+    append(os.environ.get("FAKE_EXIT_LOG"), f"end of input {os.getpid()}")
     return 0
 
 
