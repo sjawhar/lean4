@@ -3,4 +3,5 @@ paced waits: ok
 paced sleepers: ok
 unpaced barrier: ok
 paced short burst: ok
+measurement: short_burst_threads ...
 paced without eager workers: ok
