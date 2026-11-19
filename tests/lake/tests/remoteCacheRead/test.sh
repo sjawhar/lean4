@@ -315,10 +315,12 @@ case_read_slot_wait_time() {
   # A job's build time (the time its `Built` line shows) does not count the time its compile waited
   # for a build slot. With one worker and the eight modules of `Busy`, whose mappings are all
   # missing (each miss waits 2 s for the remote) and each of whose compiles takes a second, the
-  # compiles run one at a time after their reads, so the last one waits for its slot about as long
-  # as the span from the first compile's start to the last one's (seven compiles). Each line must
-  # show less than three quarters of that span: a correct line shows about a seventh of it, even
-  # when one compile runs several times slower than the others, and one that counted the wait more.
+  # compiles run one at a time after their reads. The last one waits for its slot about as long as
+  # the seven compiles before it, so a line that counted the wait shows about the span from the
+  # first compile's start to the last one's end (eight compiles); each line must show less than
+  # three quarters of that span. A correct line, about an eighth of the span, reaches three
+  # quarters only if one compile takes about three times as long as all the others together, and a
+  # load that slows the compiles lengthens the span with them.
   local busy
   busy="$WORK_DIR/busy-log"
   fresh
@@ -330,13 +332,12 @@ case_read_slot_wait_time() {
   "$PYTHON" -c '
 import re, sys
 now = most = 0
-starts = []
+starts, ends = [], []
 for line in open(sys.argv[1]):
     sign, ns = line.split()
     now += 1 if sign == "+" else -1
     most = max(most, now)
-    if sign == "+":
-        starts.append(int(ns))
+    (starts if sign == "+" else ends).append(int(ns))
 assert most == 1, most
 times = {}
 for line in open(sys.argv[2]):
@@ -345,10 +346,12 @@ for line in open(sys.argv[2]):
         times[m.group(1)] = float(m.group(2)) * (1 if m.group(3) == "ms" else 1000)
 print("build times (ms):", sorted(times.values()))
 assert len(times) == 8, times
-span = max(starts) - min(starts)
-assert span > 0, starts
+assert len(ends) == 8, ends
+span = max(ends) - min(starts)
+assert span > 0, (starts, ends)
 ratio = max(times.values()) * 10**6 / span
-print("largest build time / span of the compile starts (%d ms): %.3f" % (span // 10**6, ratio))
+print("span of the compiles, first start to last end: %d ms" % (span // 10**6))
+print("largest build time / span: %.3f" % ratio)
 assert ratio < 0.75, (ratio, span, times)
 ' "$busy" slotwait.out
 }

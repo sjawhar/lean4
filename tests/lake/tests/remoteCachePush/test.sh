@@ -345,8 +345,10 @@ case_push_scale() {
   # pushes of 0, 16,000 and 32,000 lines that are not JSON (each dropped as invalid) are timed in
   # CPU (user and system, of Lake and its children): what 32,000 lines add to the empty queue's
   # must be less than 3 times what 16,000 lines add (linear work gives 2, the copying map 4). Load
-  # on the machine stretches a push's wall time, not the CPU time it uses. If 16,000 lines add
-  # under 50 ms, the ratio is noise, and 32,000 lines must instead add less than 10 s.
+  # on the machine stretches a push's CPU time far less than its wall time: only the claim taker,
+  # which reads the whole queue again every second (`followPollMs`), and threads that spin for a
+  # contended `IO.Ref` use CPU in step with the wall time. If 16,000 lines add under 50 ms, the
+  # ratio is noise, and 32,000 lines must instead add less than 10 s.
   push_fresh
   test_cmd mkdir -p "$PUSH_CACHE"
   local n cpu="$WORK_DIR/push-cpu" TIMEFORMAT='%3U %3S'
