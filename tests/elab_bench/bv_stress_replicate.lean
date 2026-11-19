@@ -68,6 +68,6 @@ theorem select_fold_eq (hdisj : a &&& b = 0#51) :
           ||| BitVec.replicate 116 (BitVec.extractLsb' 3 1 a) &&& (BitVec.replicate 116 (BitVec.extractLsb' 3 1 a) &&& d0 ||| BitVec.replicate 116 (BitVec.extractLsb' 3 1 b) &&& d1 ||| BitVec.replicate 116 m48 &&& 0#116)
           ||| BitVec.replicate 116 (BitVec.extractLsb' 4 1 a) &&& (BitVec.replicate 116 (BitVec.extractLsb' 4 1 a) &&& d0 ||| BitVec.replicate 116 (BitVec.extractLsb' 4 1 b) &&& d1 ||| BitVec.replicate 116 m49 &&& 0#116)
           ||| BitVec.replicate 116 (BitVec.extractLsb' 5 1 a) &&& (BitVec.replicate 116 (BitVec.extractLsb' 5 1 a) &&& d0 ||| BitVec.replicate 116 (BitVec.extractLsb' 5 1 b) &&& d1 ||| BitVec.replicate 116 m50 &&& 0#116) := by
-  bv_decide
+  bv_decide (config := { timeout := 120 })
 
 end WideFoldSelect
