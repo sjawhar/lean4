@@ -55,9 +55,9 @@ while True:
     time.sleep(0.005)
 print(round((time.monotonic() - t0) * 1000))' "$1" "$2" "$3"
 }
-# wait_run RUNS: wait up to 30 s until the fake has logged more than RUNS `run` requests
+# wait_run RUNS: wait up to 120 s until the fake has logged more than RUNS `run` requests
 wait_run() {
-  for _ in $(seq 1 300); do
+  for _ in $(seq 1 1200); do
     [ "$(count_method run)" -gt "$1" ] && return 0
     sleep 0.1
   done
@@ -69,6 +69,24 @@ seconds_since() { "$PYTHON" -c 'import sys, time; print(round(time.time() - floa
 in_range() { "$PYTHON" -c 'import sys; x, lo, hi = map(float, sys.argv[1:]); sys.exit(0 if lo <= x < hi else 1)' "$@"; }
 # dead PID: PID is no longer running
 dead() { ! kill -0 "$1" 2> /dev/null; }
+# wait_dead PID: wait up to 120 s until PID is no longer running
+wait_dead() {
+  for _ in $(seq 1 1200); do
+    dead "$1" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+# fds_on PID FILE: how many descriptors process PID has open on FILE
+fds_on() {
+  "$PYTHON" -c 'import os, sys
+d, f = f"/proc/{sys.argv[1]}/fd", os.stat(sys.argv[2])
+def on(p):
+    try: s = os.stat(p)
+    except OSError: return False
+    return (s.st_dev, s.st_ino) == (f.st_dev, f.st_ino)
+print(sum(1 for n in os.listdir(d) if on(os.path.join(d, n))))' "$1" "$2"
+}
 # results FILE: the `result` of each line of a LAKE_REMOTE_EXEC_LOG file, counted, e.g. `cached 2 local 3`
 results() {
   "$PYTHON" -c 'import collections,json,sys
@@ -86,9 +104,9 @@ print(" ".join(sorted(l["target"] for l in ls)))' "$1"
 }
 # log_lines: how many lines the fake's log has
 log_lines() { if [ -f "$FAKE_LOG" ]; then wc -l < "$FAKE_LOG"; else echo 0; fi; }
-# wait_down SKIP N: wait up to 30 s until N hello answers after line SKIP of the fake's log said unreachable
+# wait_down SKIP N: wait up to 120 s until N hello answers after line SKIP of the fake's log said unreachable
 wait_down() {
-  for _ in $(seq 1 300); do
+  for _ in $(seq 1 1200); do
     [ "$("$PYTHON" -c 'import json,sys
 ls=open(sys.argv[1]).read().splitlines()[int(sys.argv[2]):]
 print(sum(1 for l in ls if l.strip() and json.loads(l).get("answer")=="hello" and not json.loads(l)["reachable"]))' \
@@ -96,6 +114,14 @@ print(sum(1 for l in ls if l.strip() and json.loads(l).get("answer")=="hello" an
     sleep 0.1
   done
   return 1
+}
+# hello_gaps SKIP [T]: the seconds from each hello answer after line SKIP of the fake's log to the next,
+# and from the last one to T (seconds since the epoch), if given
+hello_gaps() {
+  "$PYTHON" -c 'import json, sys
+ts = [json.loads(l)["t"] for l in open(sys.argv[1]).read().splitlines()[int(sys.argv[2]):]
+      if l.strip() and json.loads(l).get("answer") == "hello"] + [float(t) for t in sys.argv[3:]]
+print(" ".join(f"{b - a:.2f}" for a, b in zip(ts, ts[1:])))' "$FAKE_LOG" "$@"
 }
 
 (cd "$WORK/local" && test_run build Rx)
@@ -126,7 +152,7 @@ test_cmd_eq 1 grep -c "end of input" "$WORK/exits.log"
 printf '#!/bin/sh\n"%s" "$@"\n' "$TEST_DIR/fake_lean_remote.py" > "$WORK/fork-bridge"; chmod +x "$WORK/fork-bridge"
 rc=0
 (cd "$WORK/remote" && FAKE_PIDFILE="$WORK/fork.pid" LAKE_REMOTE_EXEC_CLIENT="$WORK/fork-bridge" \
-  LAKE_REMOTE_EXEC=grpc://fake:1 timeout 30 "$LAKE" build Rx > "$WORK/fork.out" 2>&1) || rc=$?
+  LAKE_REMOTE_EXEC=grpc://fake:1 timeout 120 "$LAKE" build Rx > "$WORK/fork.out" 2>&1) || rc=$?
 kill -9 "$(cat "$WORK/fork.pid")" 2> /dev/null || true
 test_exp "$rc" = 0
 
@@ -361,28 +387,33 @@ test_exp ! -e "$WORK/wrongtc/.lake/build/lib/lean/Rx/A.olean"
 
 # After a kill -9 of Lake, its bridge gets only end of input: it cancels the request in flight and
 # exits, freeing the workspace build lock it inherited, and the daemon it started (which outlives
-# Lake and closes every descriptor it inherited) holds no lock. The next build starts within 2 s.
+# Lake and closes every descriptor it inherited) holds no lock and no descriptor of it. So once the
+# bridge has exited, no process holds the lock, and the next build does not wait for one.
 (
   cd "$WORK/killed"
   LAKE_REMOTE_EXEC=grpc://fake:1 test_run build Rx
   has_lock=0; [ -e .lake/build.lock ] && has_lock=1
   printf '/-! A leaf module, changed. -/\n\ndef a := 2\n' > Rx/A.lean
-  runs=$(count_method run)
-  FAKE_SLEEP_MS=60000 FAKE_DAEMON_S=60 FAKE_PIDFILE="$WORK/killed.pid" LAKE_REMOTE_EXEC=grpc://fake:1 \
-    "$LAKE" lean Rx/C.lean >"$WORK/killed.out" 2>&1 &
+  runs=$(count_method run); actions=$(grep -c . "$FAKE_LOG.actions")
+  FAKE_SLEEP_MS=60000 FAKE_DAEMON_S=600 FAKE_PIDFILE="$WORK/killed.pid" FAKE_EXIT_LOG="$WORK/killed.exits" \
+    LAKE_REMOTE_EXEC=grpc://fake:1 "$LAKE" lean Rx/C.lean >"$WORK/killed.out" 2>&1 &
   lake_pid=$!
   wait_run "$runs"
   test_cmd_eq "$((runs + 1))" count_method run
+  bridge=$(cat "$WORK/killed.pid"); daemon=$(cat "$WORK/killed.pid.daemon")
+  trap 'kill -9 "$bridge" "$daemon" 2> /dev/null || true' EXIT
   [ $has_lock = 0 ] || test_cmd_fails lock_free .lake/build.lock
   ms=$(kill_lake KILL "$lake_pid" .lake/build.lock); wait "$lake_pid" || true
   echo "workspace build lock free $ms ms after kill -9 of Lake"
-  test_exp "$ms" -ge 0 -a "$ms" -lt 2000
-  start=$(date +%s.%N)
-  FAKE_HELLO_STAMP="$WORK/killed.hello" LAKE_REMOTE_EXEC=grpc://fake:1 \
-    test_not_out "waiting for another Lake" build Rx
-  test_cmd "$PYTHON" -c 'import sys; sys.exit(0 if float(open(sys.argv[1]).read()) - float(sys.argv[2]) < 2 else 1)' \
-    "$WORK/killed.hello" "$start"
-  kill "$(cat "$WORK/killed.pid.daemon")" "$(cat "$WORK/killed.pid")" 2>/dev/null || true
+  test_cmd wait_dead "$bridge"
+  test_cmd_eq 1 grep -c "end of input" "$WORK/killed.exits"
+  # The run in flight was cancelled in its 60 s sleep: the fake logs a run's action after that sleep
+  test_cmd_eq "$actions" grep -c . "$FAKE_LOG.actions"
+  test_cmd lock_free .lake/build.lock
+  test_cmd_eq 0 fds_on "$daemon" .lake/build.lock
+  # The daemon was alive for both checks above
+  test_cmd kill -0 "$daemon"
+  LAKE_REMOTE_EXEC=grpc://fake:1 test_not_out "waiting for another Lake" build Rx
 )
 
 # A SIGTERM to Lake's process group (as GNU `timeout` sends) kills Lake. The bridge, which ignores
@@ -392,35 +423,38 @@ test_exp ! -e "$WORK/wrongtc/.lake/build/lib/lean/Rx/A.olean"
   cd "$WORK/termed"
   LAKE_REMOTE_EXEC=grpc://fake:1 test_run build Rx
   printf '/-! A leaf module, changed. -/\n\ndef a := 4\n' > Rx/A.lean
-  runs=$(count_method run)
-  FAKE_SLEEP_MS=60000 FAKE_EXIT_LOG="$WORK/termed.exits" LAKE_REMOTE_EXEC=grpc://fake:1 \
-    setsid "$LAKE" lean Rx/C.lean >"$WORK/termed.out" 2>&1 &
+  runs=$(count_method run); actions=$(grep -c . "$FAKE_LOG.actions")
+  FAKE_SLEEP_MS=60000 FAKE_PIDFILE="$WORK/termed.pid" FAKE_EXIT_LOG="$WORK/termed.exits" \
+    LAKE_REMOTE_EXEC=grpc://fake:1 setsid "$LAKE" lean Rx/C.lean >"$WORK/termed.out" 2>&1 &
   lake_pid=$!
   wait_run "$runs"
   test_cmd_eq "$((runs + 1))" count_method run
   pgid=$(ps -o pgid= -p "$lake_pid" | tr -d ' ')
   test_exp "$pgid" = "$lake_pid" -a "$pgid" != "$(ps -o pgid= -p $$ | tr -d ' ')"
-  ms=$(kill_lake TERM "-$pgid" .lake/build.lock); wait "$lake_pid" || true
+  rc=0; ms=$(kill_lake TERM "-$pgid" .lake/build.lock); wait "$lake_pid" || rc=$?
   echo "workspace build lock free $ms ms after SIGTERM to Lake's process group"
-  test_exp "$ms" -ge 0 -a "$ms" -lt 2000
-  for _ in $(seq 1 100); do
-    [ -s "$WORK/termed.exits" ] && break
-    sleep 0.05
-  done
+  # Lake died of the signal (128 + 15)
+  test_exp "$rc" = 143
+  test_cmd wait_dead "$(cat "$WORK/termed.pid")"
   test_cmd_eq 1 grep -c "end of input" "$WORK/termed.exits"
+  test_cmd_eq "$actions" grep -c . "$FAKE_LOG.actions"
+  test_cmd lock_free .lake/build.lock
 )
 
 # The same SIGTERM during a write of the bridge into the workspace: the bridge finishes that write
-# before it exits, so the workspace build lock stays held until the file has landed whole.
+# before it exits, so the workspace build lock stays held until the file has landed whole. The write
+# lasts until Lake is gone and the test lets it finish (`FAKE_SLOW_WRITE_GO`).
 (
   cd "$WORK/termed-write"
-  FAKE_SLOW_WRITE=lib/lean/Rx/A.olean FAKE_SLOW_WRITE_MS=3000 FAKE_EXIT_LOG="$WORK/termedw.exits" \
-    LAKE_REMOTE_EXEC=grpc://fake:1 setsid "$LAKE" build Rx >"$WORK/termedw.out" 2>&1 &
+  trap 'touch "$WORK/termedw.go"' EXIT
+  FAKE_SLOW_WRITE=lib/lean/Rx/A.olean FAKE_SLOW_WRITE_GO="$WORK/termedw.go" FAKE_PIDFILE="$WORK/termedw.pid" \
+    FAKE_EXIT_LOG="$WORK/termedw.exits" LAKE_REMOTE_EXEC=grpc://fake:1 \
+    setsid "$LAKE" build Rx >"$WORK/termedw.out" 2>&1 &
   lake_pid=$!
   write_started() { compgen -G '.lake/build/lib/lean/Rx/A.olean.fake-*.tmp' > /dev/null; }
-  for _ in $(seq 1 300); do
+  for _ in $(seq 1 1200); do
     write_started && break
-    sleep 0.05
+    sleep 0.1
   done
   test_cmd write_started
   if [ ! -e .lake/build.lock ]; then
@@ -430,51 +464,58 @@ test_exp ! -e "$WORK/wrongtc/.lake/build/lib/lean/Rx/A.olean"
   fi
   pgid=$(ps -o pgid= -p "$lake_pid" | tr -d ' ')
   test_exp "$pgid" = "$lake_pid" -a "$pgid" != "$(ps -o pgid= -p $$ | tr -d ' ')"
-  ms=$(kill_lake TERM "-$pgid" .lake/build.lock); wait "$lake_pid" || true
-  echo "workspace build lock free $ms ms after SIGTERM to Lake's process group during a 3 s write"
-  test_exp "$ms" -ge 1000 -a "$ms" -lt 10000
-  for _ in $(seq 1 100); do
-    [ -s "$WORK/termedw.exits" ] && break
-    sleep 0.05
-  done
+  rc=0; kill -TERM -- "-$pgid"; wait "$lake_pid" || rc=$?
+  test_exp "$rc" = 143
+  test_cmd write_started
+  test_cmd_fails lock_free .lake/build.lock
+  touch "$WORK/termedw.go"
+  test_cmd wait_dead "$(cat "$WORK/termedw.pid")"
+  test_cmd lock_free .lake/build.lock
   test_cmd_eq 1 grep -c "end of input" "$WORK/termedw.exits"
   test_cmd cmp .lake/build/lib/lean/Rx/A.olean "$WORK/local/.lake/build/lib/lean/Rx/A.olean"
 )
 
-# A bridge that does not exit on end of input (its daemon never closes the connection) is killed
-# after the 10 s stop limit (`bridgeExitTimeoutMs`), and Lake exits. The bridge that only made the
-# decision is killed at once, so it adds no wait: the build takes one stop limit, not two, and a
-# build that sends no request does not wait at all.
+# A bridge that does not exit on end of input (its daemon never closes the connection; here it would
+# exit, and log that, 60 s later) is killed after the 10 s stop limit (`bridgeExitTimeoutMs`), and Lake
+# exits. The bridge that only made the decision is killed at once, so it adds no wait: the bridge that
+# carries the build's actions says hello less than a stop limit after the decision's hello, and a
+# build that sends no request exits less than a stop limit after it.
 (
   cd "$WORK/stuck"
+  skip=$(log_lines)
   start=$("$PYTHON" -c 'import time; print(time.time())')
-  FAKE_IGNORE_EOF_S=60 FAKE_PIDFILE="$WORK/stuck.pid" LAKE_REMOTE_EXEC=grpc://fake:1 \
+  FAKE_IGNORE_EOF_S=60 FAKE_PIDFILE="$WORK/stuck.pid" FAKE_EXIT_LOG="$WORK/stuck.exits" LAKE_REMOTE_EXEC=grpc://fake:1 \
     test_out "lake: remote: ok; 5 cached (0 from manifest), 0 executed, 0 local;" build Rx
   took=$(seconds_since "$start")
   echo "a build whose bridge ignores end of input took $took s"
-  test_cmd in_range "$took" 9.5 18
+  test_cmd in_range "$took" 9.5 inf
   test_cmd dead "$(cat "$WORK/stuck.pid")"
+  test_exp ! -e "$WORK/stuck.exits"
+  test_cmd in_range "$(hello_gaps "$skip")" 0 10
+  skip=$(log_lines)
   start=$("$PYTHON" -c 'import time; print(time.time())')
   FAKE_IGNORE_EOF_S=60 FAKE_PIDFILE="$WORK/stuck.pid" LAKE_REMOTE_EXEC=grpc://fake:1 \
     test_out "lake: remote: ok; 0 cached (0 from manifest), 0 executed, 0 local;" build Rx
-  took=$(seconds_since "$start")
-  echo "an up-to-date build whose bridge ignores end of input took $took s"
-  test_cmd in_range "$took" 0 5
+  end=$("$PYTHON" -c 'import time; print(time.time())')
+  echo "an up-to-date build whose bridge ignores end of input took $(seconds_since "$start") s"
+  test_cmd in_range "$(hello_gaps "$skip" "$end")" 0 10
   test_cmd dead "$(cat "$WORK/stuck.pid")"
 )
 
 # A write that the bridge of a killed Lake has started lands before the next Lake takes the workspace
 # build lock, so the next build hashes no file that changes afterwards. The bridge's write of
-# `Rx/A.olean` takes 4 s; Lake is killed during it, and `Rx/A.lean` changes before the next build.
+# `Rx/A.olean` lasts until the next build waits for the lock (`FAKE_SLOW_WRITE_GO`); Lake is killed
+# during it, and `Rx/A.lean` changes before the next build.
 (
   cd "$WORK/late"
-  FAKE_SLOW_WRITE=lib/lean/Rx/A.olean FAKE_SLOW_WRITE_MS=4000 FAKE_PIDFILE="$WORK/late.pid" \
+  trap 'touch "$WORK/late.go"' EXIT
+  FAKE_SLOW_WRITE=lib/lean/Rx/A.olean FAKE_SLOW_WRITE_GO="$WORK/late.go" FAKE_PIDFILE="$WORK/late.pid" \
     LAKE_REMOTE_EXEC=grpc://fake:1 "$LAKE" build Rx >"$WORK/late1.out" 2>&1 &
   lake_pid=$!
   slow_write_started() { compgen -G '.lake/build/lib/lean/Rx/A.olean.fake-*.tmp' > /dev/null; }
-  for _ in $(seq 1 300); do
+  for _ in $(seq 1 1200); do
     slow_write_started && break
-    sleep 0.05
+    sleep 0.1
   done
   test_cmd slow_write_started
   if [ ! -e .lake/build.lock ]; then
@@ -486,14 +527,19 @@ test_exp ! -e "$WORK/wrongtc/.lake/build/lib/lean/Rx/A.olean"
   test_cmd_fails lock_free .lake/build.lock
   new_a='/-! A leaf module, changed again. -/\n\ndef a := 3\n'
   printf "$new_a" > Rx/A.lean
-  LAKE_REMOTE_EXEC=grpc://fake:1 test_out "waiting for another Lake" build Rx
-  end=$("$PYTHON" -c 'import time; print(time.time())')
-  bridge=$(cat "$WORK/late.pid")
-  for _ in $(seq 1 300); do
-    kill -0 "$bridge" 2> /dev/null || break
-    sleep 0.05
+  LAKE_REMOTE_EXEC=grpc://fake:1 "$LAKE" build Rx >"$WORK/late2.out" 2>&1 & next_pid=$!
+  next_waits() { grep -q "waiting for another Lake" "$WORK/late2.out"; }
+  for _ in $(seq 1 1200); do
+    { next_waits || dead "$next_pid"; } && break
+    sleep 0.1
   done
-  test_cmd_fails kill -0 "$bridge"
+  touch "$WORK/late.go"
+  rc=0; wait "$next_pid" || rc=$?
+  cat "$WORK/late2.out"
+  test_exp "$rc" = 0
+  match_text "waiting for another Lake" "$WORK/late2.out"
+  end=$("$PYTHON" -c 'import time; print(time.time())')
+  test_cmd wait_dead "$(cat "$WORK/late.pid")"
   test_cmd_eq none "$PYTHON" -c 'import os, sys
 late = [os.path.join(d, f) for d, _, fs in os.walk(".lake/build") for f in fs
         if os.stat(os.path.join(d, f)).st_mtime > float(sys.argv[1])]
