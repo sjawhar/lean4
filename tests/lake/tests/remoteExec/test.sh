@@ -220,15 +220,31 @@ rm -rf "$WORK/timeout/.lake"
   test_status_out 75 "the build service's run of Rx.B failed" build Rx)
 match_text "lake: remote: unreachable; 2 cached (0 from manifest), 0 executed, 0 local;" "$WORK/timeout/produced.out"
 
-# After an UNAVAILABLE answer, a module whose job starts later (Rq.N waits 2 s for a local target) sends
-# no request and, with `fail`, fails at once, and its error names the service. Rx.A and Rx.B are the only
-# runs: Rx.M, which Rq.N imports, starts after `slow` too.
+# After an UNAVAILABLE answer, a module whose job starts later sends no request and, with `fail`, fails at
+# once, and its error names the service. Rq.N waits for a local target, `slow`, that ends once the test
+# sees Lake's report of Rx.B's failure, which Lake prints only after it has noted the answer. `slow` runs
+# on a thread of its own, so that its wait holds no build worker. Rx.A and Rx.B are the only runs: Rx.M,
+# which Rq.N imports, starts after `slow` too.
 mkdir -p "$WORK/unavail-later/Rq"; cp -r Rx.lean Rx "$WORK/unavail-later/"
-printf 'import Lake\nopen Lake DSL\npackage rz\ntarget slow : Unit := Job.async do\n  IO.sleep 2000\nlean_lib Rx\nlean_lib Rq where\n  extraDepTargets := #[`slow]\n' > "$WORK/unavail-later/lakefile.lean"
+printf 'import Lake\nopen Lake DSL\npackage rz\ntarget slow : Unit := Job.async (prio := .dedicated) do\n  let go : System.FilePath := ⟨(← IO.getEnv "UNAVAIL_GO").getD ""⟩\n  for _ in [0:1200] do\n    if ← go.pathExists then break\n    IO.sleep 100\nlean_lib Rx\nlean_lib Rq where\n  extraDepTargets := #[`slow]\n' > "$WORK/unavail-later/lakefile.lean"
 printf 'import Rx.M\n\n/-! A module whose build starts after a slow local target. -/\n\ndef n := m + 1\n' > "$WORK/unavail-later/Rq/N.lean"
 runs=$(count_method run)
-(cd "$WORK/unavail-later" && FAKE_UNAVAILABLE_TARGET=Rx.B LAKE_REMOTE_EXEC_FALLBACK=fail LAKE_REMOTE_EXEC=grpc://fake:1 \
-  test_status_out 75 "error: build service at grpc://fake:1 did not answer: Rx.B: the service did not answer" build Rx.B Rq.N)
+(
+  cd "$WORK/unavail-later"
+  echo '$' lake build Rx.B Rq.N
+  UNAVAIL_GO="$WORK/unavail-later.go" FAKE_UNAVAILABLE_TARGET=Rx.B LAKE_REMOTE_EXEC_FALLBACK=fail \
+    LAKE_REMOTE_EXEC=grpc://fake:1 "$LAKE" build Rx.B Rq.N > produced.out 2>&1 & lake_pid=$!
+  for _ in $(seq 1 1200); do
+    { grep -qF "the build service's run of Rx.B failed" produced.out || dead "$lake_pid"; } && break
+    sleep 0.1
+  done
+  touch "$WORK/unavail-later.go"
+  rc=0; wait "$lake_pid" || rc=$?
+  cat produced.out
+  test_exp "$rc" = 75
+  match_text "the build service's run of Rx.B failed" produced.out
+  match_text "error: build service at grpc://fake:1 did not answer: Rx.B: the service did not answer" produced.out
+)
 test_cmd_eq "$((runs + 2))" count_method run
 
 # With `fail`, a service that does not answer fails the build with exit code 75, and the line says so.
@@ -395,7 +411,7 @@ test_exp ! -e "$WORK/wrongtc/.lake/build/lib/lean/Rx/A.olean"
   has_lock=0; [ -e .lake/build.lock ] && has_lock=1
   printf '/-! A leaf module, changed. -/\n\ndef a := 2\n' > Rx/A.lean
   runs=$(count_method run); actions=$(grep -c . "$FAKE_LOG.actions")
-  FAKE_SLEEP_MS=60000 FAKE_DAEMON_S=600 FAKE_PIDFILE="$WORK/killed.pid" FAKE_EXIT_LOG="$WORK/killed.exits" \
+  FAKE_SLEEP_MS=600000 FAKE_DAEMON_S=600 FAKE_PIDFILE="$WORK/killed.pid" FAKE_EXIT_LOG="$WORK/killed.exits" \
     LAKE_REMOTE_EXEC=grpc://fake:1 "$LAKE" lean Rx/C.lean >"$WORK/killed.out" 2>&1 &
   lake_pid=$!
   wait_run "$runs"
@@ -406,8 +422,9 @@ test_exp ! -e "$WORK/wrongtc/.lake/build/lib/lean/Rx/A.olean"
   ms=$(kill_lake KILL "$lake_pid" .lake/build.lock); wait "$lake_pid" || true
   echo "workspace build lock free $ms ms after kill -9 of Lake"
   test_cmd wait_dead "$bridge"
+  trap 'kill -9 "$daemon" 2> /dev/null || true' EXIT
   test_cmd_eq 1 grep -c "end of input" "$WORK/killed.exits"
-  # The run in flight was cancelled in its 60 s sleep: the fake logs a run's action after that sleep
+  # The run in flight was cancelled in its 600 s sleep: the fake logs a run's action after that sleep
   test_cmd_eq "$actions" grep -c . "$FAKE_LOG.actions"
   test_cmd lock_free .lake/build.lock
   test_cmd_eq 0 fds_on "$daemon" .lake/build.lock
@@ -424,7 +441,7 @@ test_exp ! -e "$WORK/wrongtc/.lake/build/lib/lean/Rx/A.olean"
   LAKE_REMOTE_EXEC=grpc://fake:1 test_run build Rx
   printf '/-! A leaf module, changed. -/\n\ndef a := 4\n' > Rx/A.lean
   runs=$(count_method run); actions=$(grep -c . "$FAKE_LOG.actions")
-  FAKE_SLEEP_MS=60000 FAKE_PIDFILE="$WORK/termed.pid" FAKE_EXIT_LOG="$WORK/termed.exits" \
+  FAKE_SLEEP_MS=600000 FAKE_PIDFILE="$WORK/termed.pid" FAKE_EXIT_LOG="$WORK/termed.exits" \
     LAKE_REMOTE_EXEC=grpc://fake:1 setsid "$LAKE" lean Rx/C.lean >"$WORK/termed.out" 2>&1 &
   lake_pid=$!
   wait_run "$runs"
@@ -475,16 +492,17 @@ test_exp ! -e "$WORK/wrongtc/.lake/build/lib/lean/Rx/A.olean"
   test_cmd cmp .lake/build/lib/lean/Rx/A.olean "$WORK/local/.lake/build/lib/lean/Rx/A.olean"
 )
 
-# A bridge that does not exit on end of input (its daemon never closes the connection; here it would
-# exit, and log that, 60 s later) is killed after the 10 s stop limit (`bridgeExitTimeoutMs`), and Lake
-# exits. The bridge that only made the decision is killed at once, so it adds no wait: the bridge that
-# carries the build's actions says hello less than a stop limit after the decision's hello, and a
-# build that sends no request exits less than a stop limit after it.
+# A bridge that does not exit on end of input (its daemon never closes the connection) is killed
+# after the 10 s stop limit (`bridgeExitTimeoutMs`), and Lake exits. Here the bridge would exit, and
+# log that, 30 s after end of input, so no logged exit means Lake killed it before then. The bridge
+# that only made the decision is killed at once, so it adds no wait: the bridge that carries the
+# build's actions says hello less than a stop limit after the decision's hello, and a build that
+# sends no request exits less than a stop limit after it.
 (
   cd "$WORK/stuck"
   skip=$(log_lines)
   start=$("$PYTHON" -c 'import time; print(time.time())')
-  FAKE_IGNORE_EOF_S=60 FAKE_PIDFILE="$WORK/stuck.pid" FAKE_EXIT_LOG="$WORK/stuck.exits" LAKE_REMOTE_EXEC=grpc://fake:1 \
+  FAKE_IGNORE_EOF_S=30 FAKE_PIDFILE="$WORK/stuck.pid" FAKE_EXIT_LOG="$WORK/stuck.exits" LAKE_REMOTE_EXEC=grpc://fake:1 \
     test_out "lake: remote: ok; 5 cached (0 from manifest), 0 executed, 0 local;" build Rx
   took=$(seconds_since "$start")
   echo "a build whose bridge ignores end of input took $took s"
