@@ -232,19 +232,23 @@ case_one_refused() {
 }
 
 case_outage_recovers() {
-  # A remote that refuses every connection for the first 5 s of a build and then answers: the build
-  # stops reading it once its refused reads have gone on for 3 s, and compiles; a probe read after
-  # the outage gets an answer, so the build reads the remote again and restores the rest of the
-  # chain. The outage costs the modules compiled during it and until the probe, not the rest of the
-  # build.
+  # A remote that refuses every connection until 8 modules of the chain have compiled, and then
+  # answers: the build stops reading it once its refused reads have gone on for 3 s, and compiles; a
+  # probe read after the outage gets an answer, so the build reads the remote again and restores the
+  # rest of the chain. The outage costs the modules compiled during it and until the probe, not the
+  # rest of the build. Each of the 8 sleeps half a second as it compiles, so their refused reads go on
+  # for at least 3.5 s however fast or loaded the machine is, and the reads stop.
   local compiled
-  REFUSE=for:5 seeded_build Long.L40
+  REFUSE="until:$WORK_DIR/compiles:8" seeded_build Long.L40
   compiled="$(count '^Long\.' "$WORK_DIR/compiles")"
   echo "$compiled of the 40 modules of Long compiled"
-  # The 5 s of the outage and two probe intervals after it (the first probe can still be refused),
-  # at most two modules a second, and two more for the edges
+  # The 8 of the outage; then, at most two a second, those of the up to 2 s until the next probe may
+  # go and of the time that probe takes; and two more for the edges
   test_exp "$compiled" -le 20
-  # Every module that did not compile read its mapping, and so did the probe that got an answer
+  # The reads that reached the server, counted once the build has ended: the mapping read of each
+  # module that did not compile, and the probe that got an answer (it reads the mapping of a module
+  # that compiled). The reads and probes of the outage were refused, and no probe goes once the reads
+  # resume, so how fast the build went does not change the count.
   test_cmd_eq $((40 - compiled + 1)) count_path /in/ "$SERVER_LOG"
   stopped_status no 1 1
   test_cmd_eq 1 count 'stopped reading the remote cache: .*a probe read goes at most every 2 s' "$WORK_DIR/build.out"
