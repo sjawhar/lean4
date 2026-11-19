@@ -9,7 +9,6 @@ on which nothing listens, so that each connection of the run is refused (`curl` 
   from:N       the Nth run and every later one
   only:N       the Nth run alone
   until:FILE:N every run that starts while FILE has fewer than N lines
-  for:SECS     every run that starts less than SECS seconds after the first run started
 
 Each run appends a line `<number> <transfers> <start> refused|sent` to `REFUSE_LOG`, where `<start>`
 is the time it started, in seconds of the monotonic clock. Every other `curl` command (one without
@@ -24,7 +23,7 @@ import sys
 import time
 
 
-def refuse(n: int, plan: str, now: float, first: float) -> bool:
+def refuse(n: int, plan: str) -> bool:
     kind, _, arg = plan.partition(":")
     if kind == "all":
         return True
@@ -40,8 +39,6 @@ def refuse(n: int, plan: str, now: float, first: float) -> bool:
         except FileNotFoundError:
             lines = 0
         return lines < int(count)
-    if kind == "for":
-        return now - first < float(arg)
     raise SystemExit(f"refuse_curl.py: unknown REFUSE plan {plan!r}")
 
 
@@ -55,11 +52,10 @@ def main() -> None:
             fcntl.flock(log, fcntl.LOCK_EX)
             now = time.monotonic()
             log.seek(0)
-            starts = [float(line.split()[2]) for line in log if line.strip()]
-            n = len(starts) + 1
+            n = sum(1 for line in log if line.strip()) + 1
             with open(cfg) as f:
                 text = f.read()
-            refused = refuse(n, os.environ.get("REFUSE", "all"), now, starts[0] if starts else now)
+            refused = refuse(n, os.environ.get("REFUSE", "all"))
             if refused:
                 if os.environ.get("REFUSE_SILENT") == "1":
                     text = re.sub(
