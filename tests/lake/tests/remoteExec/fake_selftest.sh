@@ -11,10 +11,11 @@ export WORK
 trap 'rm -rf "$WORK"' EXIT
 
 "$PYTHON" - <<'PY'
-import hashlib, json, os, signal, subprocess, sys, time
+import hashlib, json, os, shutil, signal, subprocess, sys, time
 
 fake = os.environ["FAKE"]
 work = os.environ["WORK"]
+recorded = os.path.join(os.path.dirname(fake), "recorded")
 failures = []
 
 def check(name, cond, detail=""):
@@ -117,10 +118,13 @@ answers = [x for x in log if "method" not in x]
 check("and one line for the hello's answer, right after it, with its time",
       [x.get("answer") for x in answers] == ["hello"] and log[1] is answers[0] and answers[0]["reachable"] is True
       and before_first <= answers[0]["t"] <= time.time(), json.dumps(answers))
+check("every request line has the time it came, `t`",
+      all(isinstance(x.get("t"), float) and before_first <= x["t"] <= time.time() for x in requests), json.dumps(requests))
 actions = [json.loads(l) for l in open(os.path.join(work, "fake.log.actions"))]
 check("FAKE_LOG.actions holds one line per run", len(actions) == 2, str(len(actions)))
 check("an action names no local path", work not in json.dumps(actions), json.dumps(actions))
-check("an action names its inputs by digest", actions[0]["inputs"] == [["in.txt", want]], json.dumps(actions[0]["inputs"]))
+check("an action names its inputs by digest and executable bit, and its timeoutSecs",
+      actions[0]["inputs"] == [["in.txt", want, False]] and actions[0].get("timeoutSecs") == 3600, json.dumps(actions[0]))
 
 # --- the first request of a connection must be `hello` (contract C5.1)
 b2 = Bridge()
@@ -142,7 +146,7 @@ freq = dict(req, argv=["/bin/sh", "-c", "echo bad >&2; exit 3"], outputs=[], inp
 f1 = result(b4.call("run", freq))
 check("a failing action returns its exit code", f1["exitCode"] == 3 and f1["cached"] is False, json.dumps(f1))
 f2 = result(b4.call("run", freq))
-check("the fake stores no failure (slice 1)", f2["cached"] is False, json.dumps(f2))
+check("a failure of an action that declares no outputs is not stored", f2["cached"] is False, json.dumps(f2))
 b4.close()
 
 # --- the toolchain check (contract C5.1): verified only when the service's Lean is the client's
@@ -220,10 +224,8 @@ check("FAKE_OMIT_VERIFIED leaves out toolchainVerified and toolchainGithash",
       h9.get("reachable") is True and "toolchainVerified" not in h9 and "toolchainGithash" not in h9, json.dumps(h9))
 b9.close()
 
-# --- FAKE_TIMEOUT_TARGET, FAKE_OOM_TARGET, FAKE_DISK_TARGET, FAKE_UNAVAILABLE_TARGET: that target's
-# run fails so, another runs
-for var, code in (("FAKE_TIMEOUT_TARGET", "TIMEOUT"), ("FAKE_OOM_TARGET", "OOM"), ("FAKE_DISK_TARGET", "DISK_LIMIT"),
-                  ("FAKE_UNAVAILABLE_TARGET", "UNAVAILABLE")):
+# --- FAKE_TIMEOUT_TARGET, FAKE_UNAVAILABLE_TARGET: that target's run fails so, another runs
+for var, code in (("FAKE_TIMEOUT_TARGET", "TIMEOUT"), ("FAKE_UNAVAILABLE_TARGET", "UNAVAILABLE")):
     b10 = Bridge(**{var: "selftest-fail"})
     result(b10.call("hello", {"protocol": 1}))
     t1 = b10.call("run", dict(req, target="selftest-fail"))
@@ -379,6 +381,277 @@ for code in ("UNAVAILABLE", "NOT_FOUND"):
     mo = bm.call("materialize", {"files": [{"digest": want, "path": other}]})
     check("and another materialize writes", mo.get("result", {}).get("written") == 1, json.dumps(mo))
     bm.close()
+
+# Each case below runs on its own: an exception fails that case, not the rest of the self-test.
+def case(fn):
+    try:
+        fn()
+    except Exception as e:
+        check(f"{fn.__name__} runs to its end", False, f"{type(e).__name__}: {e}")
+
+def greeted(**env):
+    """A bridge that has said hello."""
+    b = Bridge(**env)
+    result(b.call("hello", {"protocol": 1}))
+    return b
+
+def sh(script, **kw):
+    """The `run` request of `/bin/sh -c script`, with no inputs and no outputs unless `kw` gives them."""
+    return dict(req, **{"argv": ["/bin/sh", "-c", script], "inputs": [], "outputs": [], **kw})
+
+def recorded_answer(name):
+    with open(os.path.join(recorded, name)) as f:
+        return json.load(f)
+
+def stream_digest(data):
+    return f"{hashlib.sha256(data).hexdigest()}/{len(data)}"
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+# --- the action key covers timeoutSecs and each input's executable bit (by path the file's mode, by digest
+# the request's `executable`), as the REAPI action and its input root do; not the mnemonic or the target
+@case
+def action_key():
+    b = greeted()
+    cat = sh("test -x in.txt && echo x; cat in.txt > out/out.txt", inputs=[{"rel": "in.txt", "path": src}],
+             outputs=["out/out.txt"])
+    k1 = result(b.call("run", cat))
+    k2 = result(b.call("run", dict(cat, mnemonic="SelfTestOther", target="selftest-other")))
+    check("the action key leaves out the mnemonic and the target",
+          k2["cached"] is True and k2["action"] == k1["action"], json.dumps([k1, k2]))
+    k3 = result(b.call("run", dict(cat, timeoutSecs=3601)))
+    check("the action key covers timeoutSecs", k3["cached"] is False and k3["action"] != k1["action"], json.dumps(k3))
+    exe = os.path.join(work, "in-exe.txt")
+    shutil.copyfile(src, exe)
+    os.chmod(exe, 0o755)
+    k4 = result(b.call("run", dict(cat, inputs=[{"rel": "in.txt", "path": exe}])))
+    check("the action key covers an input's executable bit, by path its file's mode, and the input has it",
+          k4["cached"] is False and k4["action"] != k1["action"] and k1["stdout"] == "" and k4["stdout"] == "x\n",
+          json.dumps([k1, k4]))
+    k5 = result(b.call("run", dict(cat, inputs=[{"rel": "in.txt", "digest": want}])))
+    k6 = result(b.call("run", dict(cat, inputs=[{"rel": "in.txt", "digest": want, "executable": True}],
+                                   skipCacheLookup=True)))
+    check("and by digest the request's `executable`: the same actions as by path, and the input has it",
+          k5["action"] == k1["action"] and k6["action"] == k4["action"] != k5["action"] and k6["stdout"] == "x\n",
+          json.dumps([k5, k6]))
+    actions = [json.loads(l) for l in open(os.path.join(work, "fake.log.actions"))][-6:]
+    check("FAKE_LOG.actions gives each action's timeoutSecs and its inputs' executable bits",
+          [(a.get("timeoutSecs"), a["inputs"][0][2:]) for a in actions] ==
+          [(3600, [False]), (3600, [False]), (3601, [False]), (3600, [True]), (3600, [False]), (3600, [True])],
+          json.dumps(actions))
+    b.close()
+
+# --- a result has the fields of the bridge's (recorded/fail-basic.json): no digest of an empty stream,
+# `outputs: null` when the action wrote no declared output, and the times of the execution in `metadata`
+@case
+def result_fields():
+    rec = recorded_answer("fail-basic.json")["result"]
+    b = greeted()
+    f = result(b.call("run", sh("printf failed >&2; exit 1", outputs=["out.olean"])))
+    check("a result has the fields of the bridge's", sorted(f) == sorted(rec), json.dumps(f))
+    check("a stream with bytes has a digest, an empty one has none",
+          f.get("stderrDigest") == stream_digest(b"failed") and "stdoutDigest" not in f, json.dumps(f))
+    check("`outputs` is null when the action wrote no declared output", f.get("outputs", []) is None, json.dumps(f))
+    check("`metadata` has the times of the execution's steps and the worker",
+          sorted(f.get("metadata") or {}) == sorted(rec["metadata"]), json.dumps(f.get("metadata")))
+    b.close()
+
+# --- the fake stores a failure of an action that declares outputs (a compile failure), as the service does,
+# and never a result that a signal ended
+@case
+def stored_failures():
+    b = greeted()
+    bad = sh("printf bad; exit 1", outputs=["out.olean"])
+    s1 = result(b.call("run", bad))
+    s2 = result(b.call("run", bad))
+    check("a failure of an action that declares outputs is stored, and served as cached",
+          s1["cached"] is False and s1["exitCode"] == 1 and s2["cached"] is True and s2["exitCode"] == 1
+          and s2["stdout"] == "bad" and s2["action"] == s1["action"], json.dumps([s1, s2]))
+    sig = sh("kill -9 $$", outputs=["out.olean"])
+    g1 = result(b.call("run", sig))
+    g2 = result(b.call("run", sig))
+    check("a result that a signal ended is not stored", g1["exitCode"] < 0 and g2["cached"] is False,
+          json.dumps([g1, g2]))
+    b.close()
+
+# --- FAKE_OOM_TARGET, FAKE_DISK_TARGET: that target's run answers a result with exit code -1 and no outputs,
+# with the fields of recorded/oom.json and recorded/disk-limit.json; with FAKE_FIELDS=new, also the signal
+# and the limits
+@case
+def killed_results():
+    for var, name, oom_kills, disk in (("FAKE_OOM_TARGET", "oom.json", 1, False),
+                                       ("FAKE_DISK_TARGET", "disk-limit.json", 0, True)):
+        rec = recorded_answer(name)["result"]
+        b = greeted(**{var: "selftest-killed"})
+        k = b.call("run", dict(req, target="selftest-killed")).get("result", {})
+        check(f"{var} answers the result of a killed action, with the fields of {name}",
+              sorted(k) == sorted(rec) and sorted(k.get("metadata") or {}) == sorted(rec["metadata"])
+              and all(k.get(f) == rec[f] for f in ("cached", "exitCode", "stdout", "stderr", "outputs"))
+              and "/" in k.get("action", ""), json.dumps(k))
+        o = b.call("run", req)
+        check("and another target runs", o.get("result", {}).get("exitCode") == 0, json.dumps(o))
+        b.close()
+        b = greeted(FAKE_FIELDS="new", **{var: "selftest-killed"})
+        k = b.call("run", dict(req, target="selftest-killed")).get("result", {})
+        lim = k.get("limits") or {}
+        check(f"with FAKE_FIELDS=new, {var} also gives the signal and the limits",
+              k.get("exitCode") == -1 and k.get("outputs", []) is None and k.get("terminationSignal") == "KILL"
+              and lim.get("oomKills") == oom_kills and lim.get("diskLimitExceeded") is disk
+              and isinstance(lim.get("writtenBytes"), int), json.dumps(k))
+        b.close()
+
+# --- FAKE_TIMEOUT_TARGET: a TIMEOUT with the fields of recorded/timeout.json; with FAKE_FIELDS=new, also the
+# action, the signal and the limits, and no digest of an empty stream
+@case
+def timeout_errors():
+    rec = recorded_answer("timeout.json")["error"]
+    b = greeted(FAKE_TIMEOUT_TARGET="selftest-slow")
+    t = b.call("run", dict(req, target="selftest-slow")).get("error", {})
+    check("FAKE_TIMEOUT_TARGET answers TIMEOUT with the fields of timeout.json",
+          t.get("code") == "TIMEOUT" and sorted(t) == sorted(rec), json.dumps(t))
+    b.close()
+    b = greeted(FAKE_FIELDS="new", FAKE_TIMEOUT_TARGET="selftest-slow")
+    t = b.call("run", dict(req, target="selftest-slow")).get("error", {})
+    check("with FAKE_FIELDS=new, the TIMEOUT also names the action, the signal and the limits",
+          t.get("code") == "TIMEOUT" and t.get("action") == r1["action"] and t.get("terminationSignal") == "KILL"
+          and (t.get("limits") or {}).get("oomKills") == 0 and "stdoutDigest" not in t and "stderrDigest" not in t,
+          json.dumps(t))
+    b.close()
+
+# --- FAKE_ENFORCE_TIMEOUT: the named targets' actions are killed at their timeoutSecs and answer TIMEOUT;
+# any other action runs to its end
+@case
+def enforced_timeouts():
+    pidfile = os.path.join(work, "enforced.pid")
+    slow = sh(f"printf early; echo $$ > {pidfile}; exec sleep 10", timeoutSecs=1, target="selftest-enforced")
+    b = greeted(FAKE_ENFORCE_TIMEOUT="selftest-other,selftest-enforced", FAKE_FIELDS="new")
+    t0 = time.monotonic()
+    e = b.call("run", slow).get("error", {})
+    dt = time.monotonic() - t0
+    pid = int(open(pidfile).read())
+    check("FAKE_ENFORCE_TIMEOUT kills that target's action at its timeoutSecs, and it answers TIMEOUT",
+          e.get("code") == "TIMEOUT" and 1 <= dt < 8 and not alive(pid), f"after {dt:.2f} s: {json.dumps(e)}")
+    check("with FAKE_FIELDS=new, with the digest of the stream it wrote",
+          e.get("stdoutDigest") == stream_digest(b"early") and "stderrDigest" not in e
+          and e.get("terminationSignal") == "KILL" and "/" in e.get("action", ""), json.dumps(e))
+    o = b.call("run", sh("sleep 2", timeoutSecs=1, target="selftest-free")).get("result", {})
+    check("and another target's action runs past its timeoutSecs to its end", o.get("exitCode") == 0, json.dumps(o))
+    b.close()
+    b = greeted(FAKE_ENFORCE_TIMEOUT="*")
+    e = b.call("run", sh("exec sleep 10", timeoutSecs=1, target="selftest-any")).get("error", {})
+    c = b.call("run", req).get("result", {})
+    check("`*` names every target, and a result in the action cache is served",
+          e.get("code") == "TIMEOUT" and sorted(e) == ["code", "message"] and c.get("cached") is True,
+          json.dumps([e, c]))
+    b.close()
+
+# --- FAKE_REPLAY_TARGET, FAKE_REPLAY_FILE: that target's run answers the recorded answer as it is
+@case
+def replays():
+    for name in ("fail-basic.json", "oom.json", "disk-limit.json", "timeout.json"):
+        rec = recorded_answer(name)
+        b = greeted(FAKE_REPLAY_TARGET="selftest-replay", FAKE_REPLAY_FILE=os.path.join(recorded, name))
+        r = b.call("run", dict(req, target="selftest-replay")) or {}
+        check(f"FAKE_REPLAY_FILE={name} answers the recorded answer",
+              {k: v for k, v in r.items() if k != "id"} == {k: v for k, v in rec.items() if k != "id"}, json.dumps(r))
+        b.close()
+    bare = os.path.join(work, "bare.json")
+    for body, key in (({"code": "SOMETHING_NEW", "message": "a recorded error"}, "error"),
+                      (recorded_answer("oom.json")["result"], "result")):
+        with open(bare, "w") as f:
+            json.dump(body, f)
+        b = greeted(FAKE_REPLAY_TARGET="selftest-replay", FAKE_REPLAY_FILE=bare)
+        r = b.call("run", dict(req, target="selftest-replay")) or {}
+        check(f"a file that holds only the {key} answers it", r.get(key) == body, json.dumps(r))
+        o = b.call("run", req)
+        check("and another target runs", o.get("result", {}).get("exitCode") == 0, json.dumps(o))
+        b.close()
+
+# --- FAKE_ERROR_TARGET=TARGET:CODE: that target's run answers an error with that code, whatever its text
+@case
+def error_codes():
+    for spec, target, code in (("selftest-err:SOMETHING_NEW", "selftest-err", "SOMETHING_NEW"),
+                               ("Nat0.Tac:c.o.export:INTERNAL", "Nat0.Tac:c.o.export", "INTERNAL")):
+        b = greeted(FAKE_ERROR_TARGET=spec)
+        e = b.call("run", dict(req, target=target))
+        check(f"FAKE_ERROR_TARGET={spec} answers {code} for {target}", e.get("error", {}).get("code") == code,
+              json.dumps(e))
+        o = b.call("run", req)
+        check("and another target runs", o.get("result", {}).get("exitCode") == 0, json.dumps(o))
+        b.close()
+
+# --- FAKE_EXTRA_OUTPUT_TARGET: that target's result also names an output that the request did not declare
+@case
+def extra_output():
+    b = greeted(FAKE_EXTRA_OUTPUT_TARGET="selftest-extra")
+    r = b.call("run", dict(req, target="selftest-extra")).get("result", {})
+    extra = [o for o in r.get("outputs") or [] if o["rel"] not in req["outputs"]]
+    m = b.call("materialize", {"files": [{"digest": extra[0]["digest"], "path": os.path.join(work, "extra.out")}]}) \
+        if extra else {}
+    check("FAKE_EXTRA_OUTPUT_TARGET's result also names an output the request did not declare, in the CAS",
+          r.get("exitCode") == 0 and len(extra) == 1 and m.get("result", {}).get("written") == 1, json.dumps([r, m]))
+    o = b.call("run", req).get("result", {})
+    check("and another target's result names only the declared outputs",
+          [x["rel"] for x in o.get("outputs") or []] == req["outputs"], json.dumps(o))
+    b.close()
+
+# --- FAKE_MALFORMED_TARGET: that target's result has an exitCode that is not a number
+@case
+def malformed_result():
+    b = greeted(FAKE_MALFORMED_TARGET="selftest-bad")
+    r = b.call("run", dict(req, target="selftest-bad")).get("result", {})
+    check("FAKE_MALFORMED_TARGET's result has an exitCode that is not a number", isinstance(r.get("exitCode"), str),
+          json.dumps(r))
+    o = b.call("run", req).get("result", {})
+    check("and another target's has a number", o.get("exitCode") == 0, json.dumps(o))
+    b.close()
+
+# --- an input given only by digest that the CAS lacks answers UNAVAILABLE with `missing`, as the bridge's
+# check of such inputs does; FAKE_DROP_ONCE: so does the first run that gives that digest, once
+@case
+def digest_inputs():
+    lost = hashlib.sha256(b"a blob that no one stored").hexdigest() + "/25"
+    b = greeted()
+    u = b.call("run", sh("true", inputs=[{"rel": "lost", "digest": lost}]))
+    check("an input by digest that the CAS lacks answers UNAVAILABLE, naming it in `missing`",
+          u.get("error", {}).get("code") == "UNAVAILABLE" and u["error"].get("missing") == [lost], json.dumps(u))
+    b.close()
+    drop = sh("cat in.txt > out/out.txt # dropped", inputs=[{"rel": "in.txt", "digest": want}], outputs=["out/out.txt"])
+    b = greeted(FAKE_DROP_ONCE=want)
+    d1 = b.call("run", drop)
+    d2 = b.call("run", drop)
+    check("FAKE_DROP_ONCE: the first run that gives that digest answers as if the CAS lacked it",
+          d1.get("error", {}).get("code") == "UNAVAILABLE" and d1["error"].get("missing") == [want], json.dumps(d1))
+    check("and the next one runs", d2.get("result", {}).get("exitCode") == 0, json.dumps(d2))
+    b.close()
+    b = greeted(FAKE_DROP_ONCE=want)
+    d3 = b.call("run", dict(drop, skipCacheLookup=True)).get("result", {})
+    check("also on a later connection", d3.get("exitCode") == 0 and d3.get("cached") is False, json.dumps(d3))
+    b.close()
+
+# --- FAKE_HELLO_DELAY_S: hello answers that much later
+@case
+def hello_delay():
+    b = Bridge(FAKE_HELLO_DELAY_S="1")
+    t0 = time.monotonic()
+    h = result(b.call("hello", {"protocol": 1}))
+    dt = time.monotonic() - t0
+    check("FAKE_HELLO_DELAY_S makes hello answer that much later", h.get("reachable") is True and dt >= 1,
+          f"after {dt:.2f} s")
+    b.close()
+
+# --- FAKE_FIELDS takes only `today` and `new`
+@case
+def fields_values():
+    env = dict(os.environ, FAKE_CAS=os.path.join(work, "cas"), FAKE_FIELDS="tomorrow")
+    p = subprocess.run([fake, "bridge"], input="", env=env, capture_output=True, text=True, timeout=30)
+    check("a FAKE_FIELDS other than today and new stops the fake", p.returncode == 2 and "FAKE_FIELDS" in p.stderr,
+          f"exit {p.returncode}: {p.stderr}")
 
 print(f"\n{len(failures)} failed")
 sys.exit(1 if failures else 0)
