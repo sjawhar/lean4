@@ -1,0 +1,9 @@
+name = "test"
+enableArtifactCache = true
+
+[[lean_lib]]
+name = "Hello"
+
+[[lean_exe]]
+name = "sha256"
+root = "Main"

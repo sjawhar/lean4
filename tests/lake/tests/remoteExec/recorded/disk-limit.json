@@ -1,0 +1,23 @@
+{
+  "id": 3,
+  "result": {
+    "action": "c0e765675b25875ad8c6f23388b750baab9acb3f16848b6b3f156465dbfbe6e6/278",
+    "cached": false,
+    "exitCode": -1,
+    "stdout": "",
+    "stderr": "",
+    "outputs": null,
+    "metadata": {
+      "queued": "2026-11-20T00:00:00Z",
+      "workerStart": "2026-11-20T00:00:00Z",
+      "inputFetchStart": "2026-11-20T00:00:00Z",
+      "inputFetchCompleted": "2026-11-20T00:00:00Z",
+      "executionStart": "2026-11-20T00:00:00Z",
+      "executionCompleted": "2026-11-20T00:00:00Z",
+      "outputUploadStart": "2026-11-20T00:00:00Z",
+      "outputUploadCompleted": "2026-11-20T00:00:00Z",
+      "workerCompleted": "2026-11-20T00:00:00Z",
+      "worker": "recorded-worker"
+    }
+  }
+}

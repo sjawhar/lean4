@@ -10,7 +10,9 @@ public import Lake.Util.Log
 import Lake.Util.Proc
 import Lake.Util.FilePath
 import Lake.Util.IO
-import Lake.Util.Url
+import Lake.Util.BuildSlots
+public import Lake.Util.Url
+import Lake.Util.CacheToken
 import Init.Data.String.Search
 import Init.Data.String.TakeDrop
 import Init.System.Platform
@@ -33,48 +35,19 @@ public def compileLeanIR
 : LogIO Unit := do
   createParentDirs irFile
   createParentDirs cFile
-  proc {
+  withBuildSlot do
+  proc (lend := true) {
     cmd := leanir.toString
     args := #[setupFile.toString, irFile.toString, cFile.toString]
     env := #[("LEAN_PATH", leanPath.toString)]
   }
 
-public def compileLeanModule
-  (leanFile relLeanFile : FilePath)
-  (setup : ModuleSetup) (setupFile : FilePath)
-  (arts : ModuleArtifacts)
-  (leanArgs : Array String := #[])
-  (leanPath : SearchPath := [])
-  (lean : FilePath := "lean")
-: LogIO Unit := do
-  let mut args := leanArgs.push leanFile.toString
-  if let some oleanFile := arts.olean? then
-    createParentDirs oleanFile
-    args := args ++ #["-o", oleanFile.toString]
-  if let some ileanFile := arts.ilean? then
-    createParentDirs ileanFile
-    args := args ++ #["-i", ileanFile.toString]
-  let opts := setup.options.toOptions
-  let postponeCompile := setup.isModule && Compiler.compiler.postponeCompile.get opts
-  if !postponeCompile then
-    if let some cFile := arts.c? then
-      createParentDirs cFile
-      args := args ++ #["-c", cFile.toString]
-  if let some bcFile := arts.bc? then
-    createParentDirs bcFile
-    args := args ++ #["-b", bcFile.toString]
-  createParentDirs setupFile
-  IO.FS.writeFile setupFile (toJson setup).pretty
-  args := args ++ #["--setup", setupFile.toString]
-  args := args.push "--json"
-  withLogErrorPos do
-  let out ← rawProc {
-    args
-    cmd := lean.toString
-    env := #[
-      ("LEAN_PATH", leanPath.toString)
-    ]
-  }
+/--
+Replays the stdout and stderr of a Lean module compile into the build log and fails on a bad
+exit, exactly as a local compile does. Shared by `compileLeanModule` and the build service's
+`fetchRemote`, so a module compiled on the service reports as a local compile would.
+-/
+public def logLeanOutput (out : IO.Process.Output) (relLeanFile : FilePath) : LogIO Unit := do
   let outLogPos ← getLogPos
   unless out.stdout.isEmpty do
     let txt ← out.stdout.split '\n' |>.foldM (init := "") fun (txt : String) ln => do
@@ -104,12 +77,57 @@ public def compileLeanModule
   else if out.exitCode ≠ 0 || hasErrors then
     error s!"Lean exited with code {out.exitCode}"
 
+/--
+Compiles a Lean module with `lean`, in a build slot (`withBuildSlot`), unless `takeSlot` is false:
+then the caller holds one for it (`withJobBuildSlot`).
+-/
+public def compileLeanModule
+  (leanFile relLeanFile : FilePath)
+  (setup : ModuleSetup) (setupFile : FilePath)
+  (arts : ModuleArtifacts)
+  (leanArgs : Array String := #[])
+  (leanPath : SearchPath := [])
+  (lean : FilePath := "lean")
+  (takeSlot := true)
+: LogIO Unit := do
+  let mut args := leanArgs.push leanFile.toString
+  if let some oleanFile := arts.olean? then
+    createParentDirs oleanFile
+    args := args ++ #["-o", oleanFile.toString]
+  if let some ileanFile := arts.ilean? then
+    createParentDirs ileanFile
+    args := args ++ #["-i", ileanFile.toString]
+  let opts := setup.options.toOptions
+  let postponeCompile := setup.isModule && Compiler.compiler.postponeCompile.get opts
+  if !postponeCompile then
+    if let some cFile := arts.c? then
+      createParentDirs cFile
+      args := args ++ #["-c", cFile.toString]
+  if let some bcFile := arts.bc? then
+    createParentDirs bcFile
+    args := args ++ #["-b", bcFile.toString]
+  createParentDirs setupFile
+  IO.FS.writeFile setupFile (toJson setup).pretty
+  args := args ++ #["--setup", setupFile.toString]
+  args := args.push "--json"
+  withLogErrorPos do
+  let run := rawProc (lend := true) {
+    args
+    cmd := lean.toString
+    env := #[
+      ("LEAN_PATH", leanPath.toString)
+    ]
+  }
+  let out ← if takeSlot then withBuildSlot run else run
+  logLeanOutput out relLeanFile
+
 public def compileO
   (oFile srcFile : FilePath)
   (moreArgs : Array String := #[]) (compiler : FilePath := "cc")
 : LogIO Unit := do
   createParentDirs oFile
-  proc {
+  withBuildSlot do
+  proc (lend := true) {
     cmd := compiler.toString
     args := #["-c", "-o", oFile.toString, srcFile.toString] ++ moreArgs
   }
@@ -140,14 +158,15 @@ public def compileStaticLib
   let args := #["rcs"]
   let args := if thin then args.push "--thin" else args
   let args := args.push libFile.toString ++ (← mkArgs libFile <| oFiles.map toString)
-  proc {cmd := ar.toString, args}
+  withBuildSlot <| proc (lend := true) {cmd := ar.toString, args}
 
 public def compileSharedLib
   (libFile : FilePath) (linkArgs : Array String)
   (linker : FilePath := "cc") (macosxDeploymentTarget? : Option String := none)
 : LogIO Unit := do
   createParentDirs libFile
-  proc {
+  withBuildSlot do
+  proc (lend := true) {
     cmd := linker.toString
     args := #["-shared", "-o", libFile.toString] ++ (← mkArgs libFile linkArgs)
     -- See `BuildConfig.macosxDeploymentTarget?` for details
@@ -159,24 +178,64 @@ public def compileExe
   (linker : FilePath := "cc") (macosxDeploymentTarget? : Option String := none)
 : LogIO Unit := do
   createParentDirs binFile
-  proc {
+  withBuildSlot do
+  proc (lend := true) {
     cmd := linker.toString
     args := #["-o", binFile.toString] ++ (← mkArgs binFile linkArgs)
     -- See `BuildConfig.macosxDeploymentTarget?` for details
     env :=  macosxDeploymentTarget?.elim #[] fun ver => #[("MACOSX_DEPLOYMENT_TARGET", some ver)]
   }
 
-/-- Download a file using `curl`, clobbering any existing file. -/
+/--
+Download a file using `curl`, replacing any existing file.
+
+`curl` writes to a temporary file next to `file`, unique to this download, which `check`
+vets before it is renamed into place. Thus, `file` never holds a partial download, and a
+failed download (whose temporary file is removed) leaves it as it was. The download gives up and
+tries again as `limits` says (see `TransferLimits.args`; by default, it gives up on a stall and is
+not tried again); with `maxFileSize?`, a larger file fails, and each try is bounded by the time
+such a file may take.
+
+With `cacheToken`, the request carries the cache token, ignores the user's `.curlrc` and does not
+follow redirects (see `withCacheTokenRequest`); a redirect is an error that names it.
+-/
 public def download
   (url : String) (file : FilePath) (headers : Array String := #[])
+  (cacheToken := false) (maxFileSize? : Option Nat := none)
+  (check : FilePath → LogIO PUnit := fun _ => pure ())
+  (limits : TransferLimits := {retries := 0})
 : LogIO PUnit := do
-  if (← file.pathExists) then
-    IO.FS.removeFile file
-  else
-    createParentDirs file
-  let args := #["-s", "-S", "-f", "-o", file.toString, "-L", url]
-  let args := headers.foldl (init := args) (· ++ #["-H", ·])
-  proc (quiet := true) {cmd := ← Internal.getCurl, args}
+  createParentDirs file
+  let tmp ← uniqueTmpPath file
+  try
+    let (code, out, token) ← withCacheTokenRequest url cacheToken fun _ args => do
+      let args := args ++ #["-s", "-S", "-f", "-o", tmp.toString, "-w", "%{http_code}"]
+      let args := args ++ limits.args maxFileSize?
+      let args := headers.foldl (init := args) (· ++ #["-H", ·])
+      let out ← rawProc {cmd := ← Internal.getCurl, args := args.push url}
+      return (out.stdout.trimAscii.toNat?.getD 0, out)
+    -- The standard output is the status code that `-w` reports
+    let out := {out with stdout := ""}
+    if out.exitCode = 0 then
+      logOutput out logVerbose
+    else
+      logOutput out logInfo
+      -- With `-f`, `curl` fails on an HTTP error status, which its exit code does not name
+      let status := if code == 0 then "" else s!" (HTTP {code})"
+      error s!"external command '{← Internal.getCurl}' exited with code {out.exitCode}{status}"
+    -- Without `-L`, `curl` succeeds on a redirect, having written the redirect's body
+    if 300 ≤ code && code < 400 then
+      if token then
+        error s!"{url}: the server redirected the download (status {code}), and a request \
+          that carries the token of `{CacheToken.cmdVar}` does not follow redirects"
+      else
+        error s!"{url}: the server answered the download with a redirect (status {code}) \
+          that `curl` could not follow"
+    check tmp
+    IO.FS.rename tmp file
+  finally
+    -- After a successful download, the temporary file is already gone
+    discard <| (removeFileIfExists tmp).toBaseIO
 
 /-- Unpack an archive `file` using `tar` into the directory `dir`. -/
 public def untar (file : FilePath) (dir : FilePath) (gzip := true) : LogIO PUnit := do
@@ -184,7 +243,8 @@ public def untar (file : FilePath) (dir : FilePath) (gzip := true) : LogIO PUnit
   let mut opts := "-xvv"
   if gzip then
     opts := opts.push 'z'
-  proc (quiet := true) {
+  withBuildSlot do
+  proc (quiet := true) (lend := true) {
     cmd := "tar",
     args := #[opts, "-f", file.toString, "-C", dir.toString]
   }

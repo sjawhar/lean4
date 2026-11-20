@@ -51,8 +51,7 @@ opaque connect (socket : @& Socket) (addr : @& SocketAddress) : IO Unit
 
 /--
 Sends data through an UDP socket. The `addr` parameter specifies the destination address. If `addr`
-is `none`, the data is sent to the default peer address set by `connect`. Throws an
-`IO.Error.invalidArgument` if a buffer is 4 GiB or larger.
+is `none`, the data is sent to the default peer address set by `connect`.
 -/
 @[extern "lean_uv_udp_send"]
 opaque send (socket : @& Socket) (data : Array ByteArray) (addr : @& Option SocketAddress) : IO (IO.Promise (Except IO.Error Unit))
@@ -66,8 +65,6 @@ Furthermore calling this function in parallel with `waitReadable` is not support
 A datagram larger than `size` is discarded in its entirety, and the promise resolves to an
 `IO.Error.resourceExhausted` instead of a truncated prefix. The socket stays usable, so a receive
 loop should handle the error per datagram.
-
-Throws an `IO.Error.invalidArgument` if `size` is 0 or at least 4 GiB.
 -/
 @[extern "lean_uv_udp_recv"]
 opaque recv (socket : @& Socket) (size : UInt64) : IO (IO.Promise (Except IO.Error (ByteArray × Option SocketAddress)))

@@ -575,6 +575,14 @@ USAGE:
 Greet the entity with the given name. Otherwise, greet the whole world.
 ```
 
+## Local Cache in Build-Service Mode
+
+With `LAKE_REMOTE_EXEC` set, Lake restores matching outputs from its local artifact cache before it sends a module to the build service. This includes read-only caches and cached archives. A local restore sends no build request and is not counted as a service result or a local compile.
+
+If the package writes the artifact cache, Lake also saves successful service outputs there. If artifact insertion is skipped, Lake keeps the build outputs without writing an input-to-output mapping. A cache write error warns and keeps the build outputs. Service mode never uses a retained cache mapping to download artifacts from a shared cache service. Kept-output checks and lineage apply to these restores just as they do to a local build.
+
+When Lake and the service report different, nonempty Lean githashes, only `LAKE_REMOTE_EXEC_FALLBACK=local` permits local compilation. Lake warns with both githashes and logs each fallback compile with result `toolchain-mismatch`. The `wait` and `fail` policies fail with exit code 75 instead of retrying a confirmed mismatch. A missing or failed toolchain verification without a confirmed mismatch remains an error under every policy.
+
 ## Building and Running Lake from the Source
 
 If you already have a Lean installation with `lake` packaged with it, you can build a new `lake` by just running `lake build`.

@@ -18,7 +18,7 @@ open Lean (Name)
 open System (FilePath)
 
 public def env (cmd : String) (args : Array String := #[]) : LakeT IO UInt32 := do
-  IO.Process.spawn {cmd, args, env := ← getAugmentedEnv} >>= (·.wait)
+  spawnProc {cmd, args, env := ← getAugmentedEnv} >>= (·.wait)
 
 public def exe
   (name : Name) (args  : Array String := #[]) (buildConfig : BuildConfig := {})
@@ -111,5 +111,5 @@ public def Workspace.evalLeanFile
 : IO UInt32 := do
   let spawnArgs ← ws.runBuild (cfg := buildConfig) do
     prepareLeanCommand leanFile moreArgs
-  let child ← IO.Process.spawn spawnArgs
+  let child ← spawnProc spawnArgs
   child.wait
