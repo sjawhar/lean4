@@ -156,15 +156,17 @@ test_exp "$(spawns t9b.log)" -le 4
 # reply: its requests are compiled and a new checker answers the next ones. The rejects give the
 # watchdog's reason, and the stub never reached the end of its 120 s hang (`t10.log.slept`), which
 # Lake would have waited for had it not killed the stub. This holds however long the build takes:
-# the watchdog would have to fire 116 s past its 3 s deadline to break it
+# the watchdog would have to fire 109 s past its 10 s deadline to break it. The same 10 s limit
+# applies to the new checker's replies, which the stub sends at once, so that load cannot get that
+# checker killed too (`spawns`)
 mkp t10
 test_run -d t10 build P
 seta t10 2
 export STUB_LOG="$PWD/t10.log"
-LAKE_KEPT_CHECKER="$STUB" LAKE_KEPT_CHECKER_TIMEOUT=3 STUB_MODE=hang-once \
+LAKE_KEPT_CHECKER="$STUB" LAKE_KEPT_CHECKER_TIMEOUT=10 STUB_MODE=hang-once \
   test_out 'Checked P.C' -d t10 build P
 match_pat 'Built P\.[BDEF]' produced.out
-match_text 'the checker sent no reply for 3 s and was killed' produced.out
+match_text 'the checker sent no reply for 10 s and was killed' produced.out
 test_exp ! -e t10.log.slept
 test_exp "$(spawns t10.log)" = 2
 
@@ -423,16 +425,16 @@ LAKE_KEPT_CHECKER="$STUB" LAKE_KEPT_CHECKER_TIMEOUT=0 test_err 'at least 1 secon
 # A checker that stops reading while Lake writes requests larger than a pipe's buffer (here setups of
 # over 64 KiB) is still killed after `LAKE_KEPT_CHECKER_TIMEOUT`, as `t10` checks: writes never block
 # the watchdog. A Lake whose writes held it up would wait for the stub's hang to end and fail the
-# `t32.log.slept` check; `timeout 1200` only ends a Lake that hangs for good
+# `t32.log.slept` check; `timeout 600` only ends a Lake that hangs for good
 mkp t32
 pad=$(head -c 70000 /dev/zero | tr '\0' x)
 sed_i "s/^maxHeartbeats = 300000\$/maxHeartbeats = 300000\nweak.keptCheckPad = \"$pad\"/" t32/lakefile.toml
 test_run -d t32 build P
 seta t32 2
 export STUB_LOG="$PWD/t32.log"
-LAKE_KEPT_CHECKER="$STUB" LAKE_KEPT_CHECKER_TIMEOUT=3 STUB_MODE=hang-once \
-  test_cmd_out 'Checked P.C' timeout 1200 "$LAKE" -d t32 build P
-match_text 'the checker sent no reply for 3 s and was killed' produced.out
+LAKE_KEPT_CHECKER="$STUB" LAKE_KEPT_CHECKER_TIMEOUT=10 STUB_MODE=hang-once \
+  test_cmd_out 'Checked P.C' timeout 600 "$LAKE" -d t32 build P
+match_text 'the checker sent no reply for 10 s and was killed' produced.out
 test_exp ! -e t32.log.slept
 test_cmd test "$(head -1 t32.log.json | wc -c)" -gt 65536
 test_exp "$(spawns t32.log)" = 2
@@ -440,13 +442,14 @@ test_exp "$(spawns t32.log)" = 2
 # A killed checker's own children are killed with it (they would hold its pipes open and keep Lake
 # from finishing until they exit). The stub's child creates `t33.log.slept` when its 60 s sleep ends,
 # before it exits, so a Lake that waited for it finishes after the file exists. This holds however
-# long the build takes: the watchdog would have to kill the stub's group 56 s past its 3 s deadline
+# long the build takes: the watchdog would have to kill the stub's group 49 s past its 10 s deadline
 # to break it
 mkp t33
 test_run -d t33 build P
 seta t33 2
 export STUB_LOG="$PWD/t33.log"
-LAKE_KEPT_CHECKER="$STUB" LAKE_KEPT_CHECKER_TIMEOUT=3 STUB_MODE=fork-hang-once test_out 'Checked P.C' -d t33 build P
+LAKE_KEPT_CHECKER="$STUB" LAKE_KEPT_CHECKER_TIMEOUT=10 STUB_MODE=fork-hang-once test_out 'Checked P.C' -d t33 build P
+match_text 'the checker sent no reply for 10 s and was killed' produced.out
 test_exp ! -e t33.log.slept
 
 # `LAKE_KEPT_EXCLUDE` applies to every build mode: with `--old`, an excluded kept module is
