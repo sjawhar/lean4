@@ -493,9 +493,9 @@ test_exp ! -e "$WORK/wrongtc/.lake/build/lib/lean/Rx/A.olean"
 # log that, 30 s after end of input, so no logged exit means Lake killed it before then. The bridge
 # that only made the decision is killed at once, so it adds no wait, in a build that sends requests
 # and in one that sends none: it would exit, and log that, 5 s after end of input (half a stop limit),
-# so no logged exit means Lake did not wait out a stop limit for it. The checks read the bridges' logs,
-# not a build's duration: Lake kills the decision's bridge right after closing its input, and the
-# build's 20 s before it would exit, so load does not make either log an exit.
+# so no logged exit means Lake did not wait out a stop limit for it. Load cannot make either bridge
+# log an exit: Lake kills the decision's bridge right after closing its input, and the build's 20 s
+# before it would exit; the one time checked is the lower bound of the stop limit.
 (
   cd "$WORK/stuck"
   hellos=$(count_method hello)
