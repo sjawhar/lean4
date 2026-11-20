@@ -173,11 +173,17 @@ no_match_text "no such file or directory" "$WORK/failed/produced.out"
 test_exp ! -e "$WORK/failed/.lake/build/lib/lean/Rx/B.olean"
 test_exp ! -e "$WORK/failed/.lake/build/lib/lean/Rx/B.trace"
 
-# An action that ran on the service and ended in TIMEOUT, OOM or DISK_LIMIT counts as executed too.
-for var in FAKE_TIMEOUT_TARGET FAKE_OOM_TARGET FAKE_DISK_TARGET; do
+# An action that ran on the service and ended in TIMEOUT counts as executed too.
+rm -rf "$WORK/timeout/.lake"
+(cd "$WORK/timeout" && FAKE_TIMEOUT_TARGET=Rx.B LAKE_REMOTE_EXEC=grpc://fake:1 \
+  test_err "the build service's run of Rx.B failed" build Rx)
+match_text "lake: remote: ok; 2 cached (0 from manifest), 1 executed, 0 local;" "$WORK/timeout/produced.out"
+# So does one that the service killed for its memory or its disk: a result with exit code -1 and no
+# outputs, which fails the module as a failed compile does.
+for var in FAKE_OOM_TARGET FAKE_DISK_TARGET; do
   rm -rf "$WORK/timeout/.lake"
   (cd "$WORK/timeout" && export "$var=Rx.B" && LAKE_REMOTE_EXEC=grpc://fake:1 \
-    test_err "the build service's run of Rx.B failed" build Rx)
+    test_err "Lean exited with code 255" build Rx)
   match_text "lake: remote: ok; 2 cached (0 from manifest), 1 executed, 0 local;" "$WORK/timeout/produced.out"
 done
 

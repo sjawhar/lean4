@@ -8,13 +8,24 @@ into the workspace starts after it, a write in progress finishes, and the fake e
 returned. Like a connected bridge, it ignores SIGINT, SIGHUP, SIGTERM and SIGPIPE, so that it
 outlives a client killed with its process group.
 
+Its answers have the shapes of the live bridge's (see `recorded/`). A result names its action by a
+key over the argv, environment, inline files, declared outputs, platform, working directory,
+`timeoutSecs` and each input's digest and executable bit (an input by path: its file's mode, as the
+bridge reads it; by digest: the request's `executable`), but not the mnemonic or the target. A stream
+that is empty has no digest; `outputs` is null when the action wrote no declared output; `metadata`
+has the execution's times. The action cache stores a result that exited 0, and one that exited
+nonzero when the request declares outputs (a compile failure), never one that a signal ended. An
+input given only by digest that the CAS lacks answers UNAVAILABLE with `missing`, as the bridge does
+before it executes an action.
+
 Knobs, all through the environment:
   FAKE_CAS            directory of the content store and the action cache; persists across Lake runs
-  FAKE_LOG            file taking one JSON line per request, and after each `hello` its answer as a
-                      line `{"answer": "hello", "reachable": …, "t": <seconds since the epoch>}`;
-                      `<FAKE_LOG>.actions` takes each `run`'s action, which names no path of this
-                      machine, so a test can check that the action a client sends is the same on
-                      every machine
+  FAKE_LOG            file taking one JSON line per request, with the time it came as `t` (seconds
+                      since the epoch), and after each `hello` its answer as a line
+                      `{"answer": "hello", "reachable": …, "t": …}`; `<FAKE_LOG>.actions` takes the
+                      action of each `run` that gets one: the fields of its key, each input as
+                      `[rel, digest, executable]`. It names no path of this machine, so a test can
+                      check that the action a client sends is the same on every machine
   FAKE_UNREACHABLE    `1`: `hello` answers `reachable: false`, as a build service that does not answer
   FAKE_UNREACHABLE_LATER  a file counting connections: `hello` answers `reachable: false` on every
                       connection after the first, as a service that stops answering mid-build
@@ -27,10 +38,30 @@ Knobs, all through the environment:
   FAKE_UNVERIFIED    `1`: `hello` reports the client's githash but toolchainVerified is false
   FAKE_HELLO_SEQUENCE `refused-later` or `mismatch-after-outage`: capabilities across connections
   FAKE_HELLO_STATE    the counter file for FAKE_HELLO_SEQUENCE
+  FAKE_HELLO_DELAY_S  every `hello` answers this many seconds late
+  FAKE_FIELDS         `today` (the default: the fields the live bridge sends today) or `new` (also the
+                      fields of contract C5.1 v7, `terminationSignal` and `limits`), for the answers
+                      of the three knobs below and of FAKE_ENFORCE_TIMEOUT
   FAKE_TIMEOUT_TARGET a target name: its `run` answers TIMEOUT, as an action that ran past its timeout
-  FAKE_OOM_TARGET     a target name: its `run` answers OOM, as an action that ran out of memory
-  FAKE_DISK_TARGET    a target name: its `run` answers DISK_LIMIT, as an action that filled its disk
+                      (`new`: the error also has `action`, `terminationSignal` and `limits`)
+  FAKE_OOM_TARGET     a target name: its `run` answers a result with exit code -1 and no outputs, as an
+                      action that the service killed for its memory (`new`: also `terminationSignal`
+                      KILL and `limits` with `oomKills` 1)
+  FAKE_DISK_TARGET    the same, as an action that filled its disk (`new`: `limits` with
+                      `diskLimitExceeded` true)
+  FAKE_ENFORCE_TIMEOUT targets, comma-separated, or `*` for every target: their action is killed at
+                      its `timeoutSecs` and answers TIMEOUT as above (`new`: with the digests of the
+                      streams it wrote); any other action runs to its end
   FAKE_UNAVAILABLE_TARGET a target name: its `run` answers UNAVAILABLE, as a service that did not answer
+  FAKE_ERROR_TARGET   `TARGET:CODE`: TARGET's `run` answers an error with code CODE, which may be any text
+  FAKE_REPLAY_TARGET  a target name: its `run` answers what FAKE_REPLAY_FILE holds, as it is: a
+  FAKE_REPLAY_FILE    recorded response line (`recorded/*.json`), or the `result` or `error` of one
+  FAKE_EXTRA_OUTPUT_TARGET a target name: its result also names an output that the request did not
+                      declare, whose blob is in the CAS
+  FAKE_MALFORMED_TARGET a target name: its result's `exitCode` is a string, not a number
+  FAKE_DROP_ONCE      a digest: the first `run` that gives it as an input by digest answers as if the
+                      CAS lacked it, once (the marker `<FAKE_CAS>.dropped-<hash>` records it), as a
+                      service that lost a blob
   FAKE_DOWN_FILE      a path: while it exists, the service is down: `hello` answers `reachable: false`
                       and every `run` and `materialize` answers UNAVAILABLE; a test removes it to
                       bring the service back
@@ -57,7 +88,7 @@ Knobs, all through the environment:
   FAKE_IGNORE_EOF_HELLO_ONLY_S  the same, for a fake that got no request but `hello` (as the bridge
                       of Lake's decision); default FAKE_IGNORE_EOF_S
 """
-import hashlib, json, os, queue, shutil, signal, subprocess, sys, tempfile, threading, time
+import datetime, hashlib, json, os, queue, shutil, signal, subprocess, sys, tempfile, threading, time
 
 CAS = os.environ["FAKE_CAS"]
 LOG = os.environ.get("FAKE_LOG")
@@ -67,6 +98,9 @@ SLOW_WRITE = os.environ.get("FAKE_SLOW_WRITE")
 SLOW_WRITE_GO = os.environ.get("FAKE_SLOW_WRITE_GO")
 CANCELLED = "cancelled, because the client closed its connection"
 DOWN_FILE = os.environ.get("FAKE_DOWN_FILE")
+FIELDS = os.environ.get("FAKE_FIELDS") or "today"
+# FAKE_DISK_TARGET's `writtenBytes`: the 101 GiB that the recorded disk-limit action (`fill --gib 101`) writes
+DISK_FILL_BYTES = 101 << 30
 
 _lock = threading.Lock()   # the in-flight counters, the log files and the CAS
 _out = threading.Lock()    # whole response lines on stdout
@@ -76,8 +110,9 @@ _gone = threading.Event()  # end of input: the client is gone
 
 
 class Err(Exception):
-    def __init__(self, code, msg, missing=()):
-        self.code, self.msg, self.missing = code, msg, list(missing)
+    """An error answer; `error` is its object, with `missing` only when it names digests (as the bridge's)."""
+    def __init__(self, code, message, missing=(), **fields):
+        self.error = {"code": code, "message": message, **({"missing": list(missing)} if missing else {}), **fields}
 
 
 def check_gone():
@@ -117,22 +152,92 @@ def check_down():
     if down(): raise Err("UNAVAILABLE", "fake: the service is down")
 
 
+def named(var, target):
+    """Whether the knob `var` names `target`."""
+    v = os.environ.get(var)
+    return bool(v) and v == target
+
+
+def enforced(target):
+    """Whether FAKE_ENFORCE_TIMEOUT names `target`."""
+    v = os.environ.get("FAKE_ENFORCE_TIMEOUT")
+    return bool(v) and (v == "*" or target in v.split(","))
+
+
+def stream_digests(out, err):
+    """The digests of an action's streams, as the bridge gives them: none for an empty stream."""
+    return {k: f"{hashlib.sha256(b).hexdigest()}/{len(b)}" for k, b in (("stdoutDigest", out), ("stderrDigest", err))
+            if b}
+
+
+def metadata(queued, started, ended, done):
+    """A result's `metadata`: the times (seconds since the epoch) of the execution's steps, and the worker."""
+    t = lambda s: datetime.datetime.fromtimestamp(s, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return {"queued": t(queued), "workerStart": t(queued), "inputFetchStart": t(queued),
+            "inputFetchCompleted": t(started), "executionStart": t(started), "executionCompleted": t(ended),
+            "outputUploadStart": t(ended), "outputUploadCompleted": t(done), "workerCompleted": t(done),
+            "worker": "fake"}
+
+
+def limits(oom_kills, written, disk):
+    return {"oomKills": oom_kills, "writtenBytes": written, "diskLimitExceeded": disk}
+
+
+def timeout_error(p, action, out=b"", err=b"", written=0):
+    """The TIMEOUT answer of an action that ran past its timeout."""
+    msg = f"{p.get('target')}: the action ran past its timeout"
+    if FIELDS != "new": return Err("TIMEOUT", msg)
+    return Err("TIMEOUT", msg, action=action, **stream_digests(out, err), terminationSignal="KILL",
+               limits=limits(0, written, False))
+
+
+def killed(action, disk):
+    """The result of an action that the service killed for its memory or, if `disk`, for filling its disk."""
+    now = time.time()
+    res = {"action": action, "cached": False, "exitCode": -1, "stdout": "", "stderr": "", "outputs": None,
+           "metadata": metadata(now, now, now, now)}
+    if FIELDS == "new":
+        res["terminationSignal"] = "KILL"
+        res["limits"] = limits(0, DISK_FILL_BYTES, True) if disk else limits(1, 0, False)
+    return res
+
+
+def replayed():
+    """The answer FAKE_REPLAY_FILE holds: a whole response line, or its result or error object."""
+    with open(os.environ["FAKE_REPLAY_FILE"]) as f: rec = json.load(f)
+    if "error" in rec or "code" in rec: raise Err(**rec.get("error", rec))
+    return rec.get("result", rec)
+
+
+def undeclared():
+    """An output that no request declares, with its blob in the CAS."""
+    fd, tmp = tempfile.mkstemp(prefix="fake-undeclared-")
+    try:
+        with os.fdopen(fd, "wb") as f: f.write(b"fake: an output the request did not declare\n")
+        return {"rel": "fake/undeclared.out", "digest": put(tmp), "executable": False}
+    finally:
+        os.remove(tmp)
+
+
 def run(p):
     global _inflight, _max_inflight
     check_gone()
+    target = p.get("target")
     trip = os.environ.get("FAKE_DOWN_AT_TARGET")
-    if trip and DOWN_FILE and p.get("target") == trip:
+    if trip and DOWN_FILE and target == trip:
         with _lock:
             if not os.path.exists(DOWN_FILE + ".tripped"):
                 open(DOWN_FILE + ".tripped", "w").close(); open(DOWN_FILE, "w").close()
     check_down()
-    for var, code, what in (("FAKE_TIMEOUT_TARGET", "TIMEOUT", "the action ran past its timeout"),
-                            ("FAKE_OOM_TARGET", "OOM", "the action ran out of memory"),
-                            ("FAKE_DISK_TARGET", "DISK_LIMIT", "the action filled its disk"),
-                            ("FAKE_UNAVAILABLE_TARGET", "UNAVAILABLE", "the service did not answer")):
-        target = os.environ.get(var)
-        if target and p.get("target") == target:
-            raise Err(code, f"{target}: {what}")
+    if named("FAKE_UNAVAILABLE_TARGET", target): raise Err("UNAVAILABLE", f"{target}: the service did not answer")
+    spec = os.environ.get("FAKE_ERROR_TARGET")
+    if spec and spec.rsplit(":", 1)[0] == target:
+        code = spec.rsplit(":", 1)[1]
+        raise Err(code, f"{target}: the service answered {code}")
+    if named("FAKE_REPLAY_TARGET", target): return replayed()
+    if named("FAKE_TIMEOUT_TARGET", target): raise timeout_error(p, f"{action_key(p)}/0")
+    if named("FAKE_OOM_TARGET", target): return killed(f"{action_key(p)}/0", disk=False)
+    if named("FAKE_DISK_TARGET", target): return killed(f"{action_key(p)}/0", disk=True)
     with _lock:
         _inflight += 1
         if _inflight > _max_inflight:
@@ -149,50 +254,105 @@ def run(p):
                 if time.monotonic() >= deadline:
                     raise Err("TIMEOUT", "test input barrier was not released")
                 if _gone.wait(0.01): check_gone()
-        return run_action(p)
+        res = run_action(p)
+        if named("FAKE_EXTRA_OUTPUT_TARGET", target): res = dict(res, outputs=(res["outputs"] or []) + [undeclared()])
+        if named("FAKE_MALFORMED_TARGET", target): res = dict(res, exitCode=str(res["exitCode"]))
+        return res
     finally:
         with _lock:
             _inflight -= 1
 
 
-def run_action(p):
+def executable(i):
+    """An input's executable bit: by path its file's mode, as the bridge reads it; by digest the request's."""
+    return os.stat(i["path"]).st_mode & 0o111 != 0 if i.get("path") else bool(i.get("executable"))
+
+
+def action_key(p):
+    """The key of `p`'s action in the action cache; logs the action to FAKE_LOG.actions."""
     act = {k: p.get(k) for k in ("argv", "env", "files", "outputs", "platform", "workingDirectory")}
-    act["inputs"] = sorted([i["rel"], i.get("digest") or file_digest(i["path"])] for i in p["inputs"])
-    key = hashlib.sha256(json.dumps(act, sort_keys=True).encode()).hexdigest()
+    act["timeoutSecs"] = p.get("timeoutSecs", 3600)
+    act["inputs"] = sorted([i["rel"], file_digest(i["path"]) if i.get("path") else i["digest"], executable(i)]
+                           for i in p["inputs"])
     append(LOG and LOG + ".actions", act)
+    return hashlib.sha256(json.dumps(act, sort_keys=True).encode()).hexdigest()
+
+
+def check_digest_inputs(p):
+    """Every input given only by digest is in the CAS, or the answer is UNAVAILABLE naming those it lacks."""
+    drop = os.environ.get("FAKE_DROP_ONCE")
+    missing = []
+    for i in p["inputs"]:
+        if i.get("path") or not i.get("digest"): continue
+        h = i["digest"].split("/")[0]
+        if not os.path.exists(os.path.join(CAS, h)) or (i["digest"] == drop and first_drop(h)):
+            missing.append(i["digest"])
+    if missing:
+        raise Err("UNAVAILABLE", f"the build service lacks {len(missing)} input blob(s) given only by digest", missing)
+
+
+def first_drop(h):
+    """Whether this is the first use of FAKE_DROP_ONCE's blob `h`, in any fake on this CAS."""
+    try:
+        os.close(os.open(f"{os.path.normpath(CAS)}.dropped-{h}", os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        return True
+    except FileExistsError:
+        return False
+
+
+def kill(proc):
+    """Kills an action's process and every process it started (its session)."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def tree_bytes(root):
+    return sum(os.lstat(os.path.join(d, f)).st_size for d, _, fs in os.walk(root) for f in fs)
+
+
+def run_action(p):
+    key = action_key(p)
     ac = os.path.join(CAS, "ac", key)
     if os.path.exists(ac) and not p.get("skipCacheLookup"):
         res = json.load(open(ac)); res["cached"] = True; return res
     if p.get("noExecute"): raise Err("NOT_FOUND", "no cached result")
+    check_digest_inputs(p)
+    queued = time.time()
     root = tempfile.mkdtemp(prefix="fake-root-")
     try:
         for i in p["inputs"]:
             dst = os.path.join(root, i["rel"]); os.makedirs(os.path.dirname(dst), exist_ok=True)
-            src = i.get("path") or os.path.join(CAS, i["digest"].split("/")[0])
-            if not os.path.exists(src): raise Err("NOT_FOUND", "missing input", [i["digest"]])
-            shutil.copyfile(src, dst)
-            if i.get("executable"): os.chmod(dst, 0o755)
+            shutil.copyfile(i.get("path") or os.path.join(CAS, i["digest"].split("/")[0]), dst)
+            if executable(i): os.chmod(dst, 0o755)
         for f in p.get("files", []):
             dst = os.path.join(root, f["rel"]); os.makedirs(os.path.dirname(dst), exist_ok=True)
             with open(dst, "w") as h: h.write(f["contents"])
         for o in p["outputs"]: os.makedirs(os.path.join(root, os.path.dirname(o)), exist_ok=True)
+        staged = tree_bytes(root)
         check_gone()
+        started = time.time()
         proc = subprocess.Popen(p["argv"], cwd=root, env=dict(p.get("env") or {}),
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        deadline = time.monotonic() + p.get("timeoutSecs", 3600) if enforced(p.get("target")) else None
         while True:
             try:
                 out, err = proc.communicate(timeout=0.05); break
             except subprocess.TimeoutExpired:
                 if _gone.is_set():
-                    proc.kill(); proc.communicate(); check_gone()
+                    kill(proc); proc.communicate(); check_gone()
+                if deadline is not None and time.monotonic() >= deadline:
+                    kill(proc); out, err = proc.communicate()
+                    raise timeout_error(p, f"{key}/0", out, err, max(0, tree_bytes(root) - staged))
+        ended = time.time()
         outs = [{"rel": o, "digest": put(os.path.join(root, o)), "executable": False}
                 for o in p["outputs"] if os.path.exists(os.path.join(root, o))]
         res = {"action": f"{key}/0", "cached": False, "exitCode": proc.returncode,
-               "stdout": out.decode(), "stderr": err.decode(),
-               "stdoutDigest": f"{hashlib.sha256(out).hexdigest()}/{len(out)}",
-               "stderrDigest": f"{hashlib.sha256(err).hexdigest()}/{len(err)}",
-               "outputs": outs, "metadata": {"worker": "fake"}}
-        if proc.returncode == 0:
+               "stdout": out.decode(), "stderr": err.decode(), **stream_digests(out, err),
+               "outputs": outs or None, "metadata": metadata(queued, started, ended, time.time())}
+        # As the service: a failure is stored only when the action declares outputs, never a kill.
+        if proc.returncode == 0 or (proc.returncode > 0 and p["outputs"]):
             os.makedirs(os.path.dirname(ac), exist_ok=True)
             tmp = tmp_name(ac)
             with open(tmp, "w") as h: json.dump(res, h)
@@ -231,6 +391,7 @@ def materialize(p):
 
 
 def hello(p):
+    time.sleep(float(os.environ.get("FAKE_HELLO_DELAY_S") or 0))
     res = hello_answer(p)
     # The answer too, with its time, so a test can tell when the service answered again
     append(LOG, {"answer": "hello", "reachable": res["reachable"], "t": time.time()})
@@ -286,9 +447,9 @@ def respond(req, greeted):
     try:
         return {"id": req["id"], "result": answer(req, greeted)}
     except Err as e:
-        return {"id": req["id"], "error": {"code": e.code, "message": e.msg, "missing": e.missing}}
+        return {"id": req["id"], "error": e.error}
     except Exception as e:                                  # never leave a client waiting
-        return {"id": req["id"], "error": {"code": "INTERNAL", "message": f"{type(e).__name__}: {e}", "missing": []}}
+        return {"id": req["id"], "error": {"code": "INTERNAL", "message": f"{type(e).__name__}: {e}"}}
 
 
 def write(resp):
@@ -303,6 +464,8 @@ def main():
     args = sys.argv[1:]
     if not args or args[0] != "bridge":
         sys.stderr.write(f"usage: {sys.argv[0]} bridge [--socket S]\n"); return 2
+    if FIELDS not in ("today", "new"):
+        sys.stderr.write(f"FAKE_FIELDS must be today or new, not {FIELDS}\n"); return 2
     for s in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM, signal.SIGPIPE): signal.signal(s, signal.SIG_IGN)
     pidfile = os.environ.get("FAKE_PIDFILE")
     if pidfile:
@@ -326,7 +489,7 @@ def main():
     greeted, requests = False, 0
     for line in sys.stdin:
         if not line.strip(): continue
-        req = json.loads(line); append(LOG, req); requests += 1
+        req = json.loads(line); append(LOG, dict(req, t=time.time())); requests += 1
         if not greeted:
             write(respond(req, False))
             # C5.1: a connection whose first request is not `hello` gets INVALID and closes.
