@@ -30,6 +30,17 @@ PUSH_TARGETS="Push Pre pushexe pair"
 PUSH_COMPILES=12
 
 push_check() { "$PYTHON" "$TEST_DIR/push_check.py" "$@"; }
+# Checks that the push whose output is in the file `$1` tried uploads again at most 3 times, after
+# 1, 2 and 4 s (`transferRetries`), and prints how many times it did
+upload_retries() {
+  "$PYTHON" -c '
+import re, sys
+out = open(sys.argv[1]).read()
+delays = [int(d) for d in re.findall(r"trying [0-9]+ transfers again in ([0-9]+) s", out)]
+assert delays == [1, 2, 4][: len(delays)], delays
+print(len(delays))
+' "$1"
+}
 # Starts both machines afresh, and removes what earlier cases uploaded for the package
 push_fresh() {
   test_cmd rm -rf "$PUSH_A" "$PUSH_B" "$PUSH_CACHE" "$PUSH_CACHE_B" "$STORE_DIR/a0/$PUSH_SCOPE"
@@ -457,26 +468,27 @@ case_push_concurrent() {
 case_push_stall() {
   # An upload whose server reads it and then does not answer gives up, as a download does:
   # the push fails long before the server would answer (after 15 minutes), keeps the queue,
-  # and records the failure. Each try of an upload gives up after 30 s without progress, and
-  # Lake tries it 4 times (after 1, 2 and 4 s). The two small files of `pair` go to one HTTP/1.1
-  # server, where `curl` 8.5 starts the second upload only once the first has given up, so each
-  # try of the pair can take 60 s and the push about 250 s.
+  # and records the failure. An upload gives up after 30 s without progress, which curl's
+  # "Operation too slow" names; a try of the two small files of `pair` takes 60 s at most (with
+  # `curl` 8.5, the second upload starts only once the first has given up), and Lake stops a
+  # `curl` run that still runs after 70 s (`transferRunMaxSecs`); and Lake tries the uploads
+  # again at most 3 times, after 1, 2 and 4 s. So the push ends within 4 * 70 + 7 s. The push's
+  # log shows the 30 s and the retries, however long load on the machine makes the push take;
+  # `timeout 400` only ends a push that hangs.
   push_fresh
   PUSH_SERVICE=stallput on_a test_run --dir "$PUSH_A" build pair
   test_cmd_eq 2 queued
-  local start elapsed rc
-  start="$(date +%s)"
+  local rc
   if PUSH_SERVICE=stallput on_a timeout 400 "$LAKE" cache push > push.out 2>&1; then
     rc=0
   else
     rc=$?
   fi
-  elapsed=$(($(date +%s) - start))
   cat push.out
-  echo "lake exited with code $rc after $elapsed seconds"
+  echo "lake exited with code $rc"
   test_exp "$rc" = 1
-  test_exp "$elapsed" -lt 300
-  match_text 'Operation too slow' push.out
+  match_text 'Operation too slow. Less than 1024 bytes/sec transferred the last 30 seconds' push.out
+  test_cmd upload_retries push.out
   test_cmd_eq 2 queued
   test_cmd push_check status "$PUSH_STATUS" 0 2 0 2
 }
@@ -484,9 +496,14 @@ case_push_stall() {
 case_push_dead() {
   # A push whose first chunk reaches no service at all stops there, instead of taking each later
   # chunk's full time too: every line stays in the queue, and the status file says why. Here the
-  # service reads each upload and never answers, and 120 lines make two chunks of 64 and 56, so a
-  # push that does not stop takes twice as long. A later push, with the service answering, sends
-  # them all.
+  # service reads each upload and never answers, and 120 lines make two chunks of 64 and 56; the
+  # status file counts only the first chunk's 64 lines as failed. The server logs each upload
+  # once it has read it, and its log holds only uploads of the first chunk's artifacts: no more
+  # objects than the push says that chunk sent, no mapping (a mapping goes only once its
+  # artifacts are up), and none more often than Lake tried it (at most 4 times: an upload is
+  # tried again at most 3 times, after 1, 2 and 4 s). These are counts, which no load on the
+  # machine changes; `timeout 600` only ends a push that hangs. A later push, with the service
+  # answering, sends them all.
   push_fresh
   cat > "$WORK_DIR/dead.toml" << EOF
 [[cache.service]]
@@ -498,21 +515,19 @@ EOF
   sed -e 's|/silent/|/ok/|g' "$WORK_DIR/dead.toml" > "$WORK_DIR/live.toml"
   LAKE_CONFIG="$WORK_DIR/dead.toml" PUSH_SERVICE=deadput build_a
   test_cmd push_check spread "$PUSH_CACHE" 10
-  local total start elapsed rc
+  local total retries rc
   total="$(queued)"
   test_exp "$total" = $((PUSH_COMPILES * 10))
-  start="$(date +%s)"
+  : > "$SERVER_LOG"
   if LAKE_CONFIG="$WORK_DIR/dead.toml" PUSH_SERVICE=deadput on_a timeout 600 "$LAKE" cache push \
       > push.out 2>&1; then
     rc=0
   else
     rc=$?
   fi
-  elapsed=$(($(date +%s) - start))
   tail -n 5 push.out
-  echo "lake exited with code $rc after $elapsed seconds"
+  echo "lake exited with code $rc"
   test_exp "$rc" = 1
-  test_exp "$elapsed" -lt 300
   match_text 'the push stops' push.out
   test_cmd_eq "$total" queued
   test_cmd push_check status "$PUSH_STATUS" 0 64 0 "$total"
@@ -521,6 +536,23 @@ import json, sys
 status = json.load(open(sys.argv[1]))
 assert "the push stops" in status["stopped"], status
 ' "$PUSH_STATUS"
+  retries="$(upload_retries push.out)"
+  "$PYTHON" -c '
+import collections, re, sys
+log, out = open(sys.argv[1]).read(), open(sys.argv[2]).read()
+tries = 1 + int(sys.argv[3])
+m = re.search(r"answered none of the ([0-9]+) uploads", out)
+assert m, "the push does not say how many uploads it sent"
+sent = int(m.group(1))
+puts = collections.Counter(p for method, p in re.findall(r"([A-Z]+) (\S+) -> silent ", log)
+                           if method == "PUT")
+print(len(puts), "of the", sent, "uploads reached the server, each in at most", tries, "tries:",
+      sorted(puts.values()))
+assert puts, "no upload reached the server"
+assert all(re.fullmatch(r"\S*/a/[0-9a-f]+\.art", p) for p in puts), puts
+assert len(puts) <= sent, (puts, sent)
+assert max(puts.values()) <= tries, puts
+' "$SERVER_LOG" push.out "$retries"
   # The service answers again: the next push sends every entry
   LAKE_CONFIG="$WORK_DIR/live.toml" PUSH_SERVICE=deadput on_a test_run cache push
   test_cmd_eq 0 queued
@@ -601,7 +633,12 @@ case_push_busy() {
 case_push_curl_hang() {
   # A `curl` run that never ends (here, one that sleeps after its transfers) is stopped once it
   # has run as long as its transfers may take: the push goes on, and the uploads that `curl`
-  # reported before count.
+  # reported before count, and go up once. The push runs two such runs, of the artifacts and then
+  # of the mappings, and Lake stops each at the limit it names, which must be that of its uploads
+  # (`transferRunMaxSecs`): 60 s, and 1 s for each MiB of the run's files, for each round of up
+  # to 50 transfers, and 10 s more. The uploads are those the server stored, so the limits
+  # follow from their sizes and not from how long the push took, which load on the machine
+  # stretches; `timeout 400` only ends a push that hangs.
   push_fresh
   build_a
   cat > "$WORK_DIR/hang-curl.sh" << EOF
@@ -610,21 +647,33 @@ case_push_curl_hang() {
 exec sleep 900
 EOF
   test_cmd chmod +x "$WORK_DIR/hang-curl.sh"
-  local start elapsed rc
-  start="$(date +%s)"
+  : > "$SERVER_LOG"
+  local rc
   if CURL="$WORK_DIR/hang-curl.sh" on_a timeout 400 "$LAKE" cache push > push.out 2>&1; then
     rc=0
   else
     rc=$?
   fi
-  elapsed=$(($(date +%s) - start))
   cat push.out
-  echo "lake exited with code $rc after $elapsed seconds"
+  echo "lake exited with code $rc"
   test_exp "$rc" = 0
-  test_exp "$elapsed" -lt 250
   match_text 'Lake stopped it' push.out
   test_cmd_eq 0 queued
   test_cmd push_check status "$PUSH_STATUS" $PUSH_COMPILES 0 0 0
+  test_cmd_eq 0 push_check duplicates "$SERVER_LOG"
+  "$PYTHON" -c '
+import os, re, sys
+out, scope = open(sys.argv[1]).read(), sys.argv[2]
+stops = [(int(n), int(secs)) for secs, n in re.findall(
+    r"curl had not ended after ([0-9]+) s, the longest its ([0-9]+) transfers may take", out)]
+def limit(kind):
+    files = [os.path.join(scope, kind, name) for name in os.listdir(os.path.join(scope, kind))]
+    size = sum(os.path.getsize(f) for f in files)
+    return len(files), (len(files) + 49) // 50 * (60 + size // 2**20) + 10
+want = [limit("a"), limit("in")]
+print("Lake stopped the runs at (transfers, seconds):", stops, "; their uploads allow", want)
+assert stops == want, (stops, want)
+' push.out "$STORE_DIR/a0/$PUSH_SCOPE"
 }
 
 case_push_resume() {

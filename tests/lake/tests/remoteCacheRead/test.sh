@@ -50,8 +50,23 @@ cat >> lakefile.toml << EOF
 name = "Busy"
 roots = [$(IFS=,; echo "${busy_roots[*]}")]
 EOF
+# A library of 4 modules, each of which imports the one before it, so that a build reads the
+# mapping of each module only after the reads of the modules before it have ended
+mkdir -p Chain
+echo 'def c1 := 1' > Chain/C1.lean
+for i in 2 3 4; do
+  printf 'import Chain.C%s\ndef c%s := %s\n' $((i - 1)) "$i" "$i" > "Chain/C$i.lean"
+done
+cat >> lakefile.toml << 'EOF'
+
+[[lean_lib]]
+name = "Chain"
+roots = ["Chain.C1", "Chain.C2", "Chain.C3", "Chain.C4"]
+EOF
 # A \`curl\` that records how many transfers each of its runs carries (the \`url =\` lines of the
-# configuration file it is given), one line per run, and the arguments of each run
+# configuration file it is given), one line per run, and the arguments of each run after that
+# number, one line per run that one write appends, so that runs at the same time keep their
+# lines whole
 cat > count-curl.sh << EOF
 #!/usr/bin/env bash
 urls=0
@@ -63,7 +78,8 @@ for arg in "\$@"; do
   prev=\$arg
 done
 echo "\$urls" >> '$WORK_DIR/curl-runs'
-{ printf '%s' "\$* " | tr '\n' ' '; echo; } >> '$WORK_DIR/curl-argv'
+argv="\$*"
+printf '%s %s \n' "\$urls" "\${argv//\$'\n'/ }" >> '$WORK_DIR/curl-argv'
 exec '$(type -P curl)' "\$@"
 EOF
 chmod +x count-curl.sh
@@ -228,21 +244,21 @@ case_read_silent() {
   # A remote cache that accepts each request and never answers costs a build seconds, not
   # minutes: a read gives up after 3 s without progress and is tried once more, and after 3
   # such reads in a row the build stops reading the remote cache (but for a probe read at most
-  # every 2 s, in the background). Every target compiles, the verbose log says once why the
-  # build stopped reading, and so does the read status.
-  local start local_secs elapsed
-  fresh
-  start="$(date +%s)"
-  test_run build Test native
-  local_secs=$(($(date +%s) - start))
+  # every 2 s, in the background, which is tried once). The build also reads `Chain`, whose last
+  # module reads only after the three it imports have, so by then the build has stopped reading:
+  # the stop always skips that read. This checks what the build did, which no load on the
+  # machine changes: every target compiles; the verbose log says once why the build stopped
+  # reading, and so does the read status, which counts one stop, after 3 reads; fewer reads went
+  # than there are targets (each that went says so at verbose level); and in the server's log,
+  # each mapping of such a read was asked for at most twice, and any other (a probe's) once. The
+  # one time checked is Lake's own, of the transfers of the read that stopped the reads: two
+  # tries that each waited the stall time, so at least 6 s, and at most 18 s, with 6 s a try for
+  # starting `curl`, its once-a-second speed check and Lake's reading of its report.
   fresh
   : > "$SERVER_LOG"
-  start="$(date +%s)"
-  LAKE_REMOTE_CACHE=silent test_out 'Built Test' -v build Test native
-  elapsed=$(($(date +%s) - start))
-  echo "the build took $elapsed seconds; without the remote cache, $local_secs seconds"
-  test_exp "$elapsed" -le $((local_secs + 30))
+  LAKE_REMOTE_CACHE=silent test_out 'Built Test' -v build Test native Chain
   match_text 'Built native' produced.out
+  match_text 'Built Chain.C4' produced.out
   test_cmd cp produced.out silent.out
   test_cmd_eq 1 count 'stopped reading the remote cache' silent.out
   "$PYTHON" -c '
@@ -251,6 +267,34 @@ status = json.load(open(sys.argv[1]))
 assert "stopped reading the remote cache" in status["stopped"], status
 assert status["failures"] >= 3, status
 ' "$CACHE_DIR/remote-status-read.json"
+  # The targets are those of `remote_targets` and the 4 modules of `Chain`
+  "$PYTHON" -c '
+import collections, json, re, sys
+log, out = open(sys.argv[1]).read(), open(sys.argv[2]).read()
+status = json.load(open(sys.argv[3]))
+targets = int(sys.argv[4])
+assert status["stops"] == 1 and status["resumes"] == 0, status
+m = re.search(r"(\d+) reads in a row waited for it and failed "
+              r"\(the transfers of the last one took (\d+) ms\)", status["stopped"])
+assert m, status
+print("stopped after %s reads; the transfers of the last one took %s ms" % m.groups())
+assert int(m.group(1)) == 3, status
+assert 2 * 3000 <= int(m.group(2)) <= 2 * (3000 + 6000), status
+# The reads that went, by input hash, and the requests for each mapping that reached the server
+went = set(re.findall(r"remote cache read for input `([0-9a-f]+)` failed", out))
+asked = collections.Counter()
+for method, path, answer in re.findall(r"([A-Z]+) (\S*/silent/\S*) -> (\S+) ", log):
+    m = re.fullmatch(r"\S*/in/([0-9a-f]+)\.json", path)
+    assert method == "GET" and m and answer == "silent", (method, path, answer)
+    asked[m.group(1)] += 1
+probed = {h: n for h, n in asked.items() if h not in went}
+print(len(went), "of", targets, "targets read; requests by mapping:", dict(asked))
+assert len(went) == status["failures"], (went, status)
+assert 3 <= len(went) < targets, (went, targets)
+assert all(asked[h] <= 2 for h in went), asked
+assert all(n == 1 for n in probed.values()), asked
+assert len(probed) <= status["probes"] <= targets - len(went), (probed, status)
+' "$SERVER_LOG" silent.out "$CACHE_DIR/remote-status-read.json" "$(($(remote_targets) + 4))"
 }
 
 case_read_shared_runs() {
@@ -258,10 +302,13 @@ case_read_shared_runs() {
   # `Many`, which import nothing, restore with their 32 reads (a mapping and an artifact each) in
   # fewer `curl` runs than reads, and at least one run carries several of them. One `curl`
   # process per read would be 32 runs of one transfer, each with a connection of its own. The
-  # remote answers each read after 2 s, so the build also shows that a run's transfers go at once
-  # and not one after another. The remote is plain HTTP, so each run connects its transfers at
-  # once (`--parallel-immediate`; see `Lake.parallelConnectArgs`).
-  local start elapsed runs most
+  # remote answers each read after 2 s, so the first runs still go when the later reads come,
+  # and those share runs. A run's transfers go at once, not one after another: the arguments of
+  # every run let `curl` run all of its transfers together (`-Z` with a `--parallel-max` of at
+  # least their number) and, since the remote is plain HTTP, connect each of them at once
+  # (`--parallel-immediate`; see `Lake.parallelConnectArgs`). No load on the machine changes
+  # those arguments.
+  local runs most
   LAKE_CACHE_DIR="$BUILD_CACHE_DIR" test_run build Many -o many-outputs.jsonl
   test_cmd rm -rf many-build
   test_cmd cp -r .lake/build many-build
@@ -270,22 +317,24 @@ case_read_shared_runs() {
   fresh
   : > "$SERVER_LOG"
   rm -f "$WORK_DIR/curl-runs" "$WORK_DIR/curl-argv"
-  start="$(date +%s)"
   LEAN_NUM_THREADS=16 CURL="$WORK_DIR/count-curl.sh" LAKE_REMOTE_CACHE=slow \
     test_not_out 'Built ' build Many
-  elapsed=$(($(date +%s) - start))
   runs="$(grep -c . "$WORK_DIR/curl-runs")"
   most="$(sort -n "$WORK_DIR/curl-runs" | tail -1)"
-  echo "the restore took $elapsed seconds in $runs curl runs for 32 reads;" \
-    "the largest run carried $most"
+  echo "the restore took $runs curl runs for 32 reads; the largest run carried $most"
   test_cmd_eq 16 count_path /in/ "$SERVER_LOG"
   test_cmd_eq 16 count_path /a/ "$SERVER_LOG"
   test_exp "$most" -ge 2
   test_exp "$runs" -lt 32
-  test_exp "$elapsed" -lt 60
-  test_exp "$(count '-Z ' "$WORK_DIR/curl-argv")" -ge 1
-  test_cmd_eq "$(count '-Z ' "$WORK_DIR/curl-argv")" \
-    count '-Z --parallel-max [0-9]* --parallel-immediate ' "$WORK_DIR/curl-argv"
+  "$PYTHON" -c '
+import re, sys
+runs = [line.split(" ", 1) for line in open(sys.argv[1]) if line.strip()]
+assert len(runs) == int(sys.argv[2]), (len(runs), sys.argv[2])
+for urls, argv in runs:
+    m = re.search(r"(?:^| )-Z --parallel-max ([0-9]+) --parallel-immediate ", argv)
+    assert m and int(m.group(1)) >= int(urls), (urls, argv)
+print("each of the", len(runs), "runs lets curl run all of its transfers at once")
+' "$WORK_DIR/curl-argv" "$runs"
 }
 
 case_read_compile_slots() {
