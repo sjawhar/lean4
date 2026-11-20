@@ -30,6 +30,13 @@ count_method() {
   "$PYTHON" -c 'import json,os,sys
 p=sys.argv[2]; print(0 if not os.path.exists(p) else sum(1 for l in open(p) if l.strip() and json.loads(l).get("method")==sys.argv[1]))' "$1" "$FAKE_LOG"
 }
+# run_targets SKIP: the sorted targets of the `run` requests after line SKIP of the fake's log, each once
+run_targets() {
+  "$PYTHON" -c 'import json,os,sys
+p=sys.argv[1]; ls=open(p).read().splitlines()[int(sys.argv[2]):] if os.path.exists(p) else []
+print(" ".join(sorted({e["params"]["target"] for e in map(json.loads, filter(str.strip, ls)) if e.get("method")=="run"})))' \
+    "$FAKE_LOG" "$1"
+}
 # same_outputs DIR: every output of DIR is byte-identical to the local build's
 same_outputs() {
   for f in $(cd "$WORK/local/.lake/build" && find lib ir -type f \( -name '*.olean*' -o -name '*.ilean' -o -name '*.ir' -o -name '*.ir.sig' -o -name '*.c' \) | sort); do
@@ -146,6 +153,7 @@ hellos=$(count_method hello)
 match_text "c says hi" "$WORK/remote2/produced.out"
 test_cmd same_actions
 test_cmd same_outputs "$WORK/remote2"
+# The decision's bridge and the build's: the service answers throughout, so no timer starts
 test_cmd_eq 2 echo "$(($(count_method hello) - hellos))"
 test_cmd_eq 1 grep -cxF "\"end of input $(cat "$WORK/remote2.pid")\"" "$WORK/exits.log"
 
@@ -285,21 +293,27 @@ printf 'module\n\n/-! A module that does not compile. -/\n\npublic def m : Nat :
 match_text "the build service's run of Rx.B failed" "$WORK/fb-mixed/produced.out"
 
 # A request that answers UNAVAILABLE mid-build (after the daemon's own retries): with the default fallback,
-# Rx.B compiles locally, and so do the modules after it, without a request: the service is not asked again
-# in this build. Rx.A and Rx.M came from the service's cache before.
-runs=$(count_method run)
+# Rx.B compiles locally. The timer then asks the service again and the fake answers, so a module that starts
+# after that answer goes to the service again; but Rx.C and Rx import Rx.B, whose promotion (its own run on the
+# service) answers UNAVAILABLE again, so they compile locally too and send no run of their own. The end-of-build
+# line says `ok` if a probe found the service after the last UNAVAILABLE answer, else `unreachable`, as timing
+# decides. Rx.A and Rx.M came from the service's cache before.
+skip=$(log_lines)
 (cd "$WORK/fb-unavail" && FAKE_UNAVAILABLE_TARGET=Rx.B LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_REMOTE_EXEC_LOG="$WORK/fb-unavail.jsonl" \
-  test_out "lake: remote: unreachable; 2 cached (0 from manifest), 0 executed, 3 local;" build Rx)
-test_cmd_eq "$((runs + 3))" count_method run
+  test_out_pat "lake: remote: (ok|unreachable); 2 cached \(0 from manifest\), 0 executed, 3 local;" build Rx)
+test_cmd_eq "Rx.A Rx.B Rx.M" run_targets "$skip"
 test_cmd same_outputs "$WORK/fb-unavail"
 test_cmd_eq "cached 2 local 3" results "$WORK/fb-unavail.jsonl"
 test_cmd_eq "Rx Rx.B Rx.C" local_targets "$WORK/fb-unavail.jsonl"
 
 # A materialize that answers UNAVAILABLE after a good run: the module compiles locally and counts once, as
-# `local`; the remote run's messages, already replayed, are dropped, so Rx.C's message shows once.
+# `local`; the remote run's messages, already replayed, are dropped, so Rx.C's message shows once. The timer
+# then asks the service again and the fake answers, so Rx may go to the service: Rx.C, compiled locally, is
+# promoted first, and that promotion's materialize answers UNAVAILABLE again, so Rx compiles locally too (a
+# promotion shows none of Rx.C's messages). The end-of-build line's state is as in `fb-unavail`.
 (cd "$WORK/fb-mat" && FAKE_MATERIALIZE_FAIL=UNAVAILABLE:/Rx/C.olean LAKE_REMOTE_EXEC=grpc://fake:1 \
   LAKE_REMOTE_EXEC_LOG="$WORK/fb-mat.jsonl" \
-  test_out "lake: remote: unreachable; 3 cached (0 from manifest), 0 executed, 2 local;" build Rx)
+  test_out_pat "lake: remote: (ok|unreachable); 3 cached \(0 from manifest\), 0 executed, 2 local;" build Rx)
 test_cmd_eq 1 grep -c "c says hi" "$WORK/fb-mat/produced.out"
 test_cmd same_outputs "$WORK/fb-mat"
 test_cmd_eq "Rx Rx.C" local_targets "$WORK/fb-mat.jsonl"
@@ -529,7 +543,7 @@ test_exp ! -e "$WORK/wrongtc/.lake/build/lib/lean/Rx/A.olean"
   test_cmd in_range "$took" 9.5 inf
   test_cmd dead "$(cat "$WORK/stuck.pid")"
   test_exp ! -e "$WORK/stuck.exits"
-  # The decision's bridge and the build's
+  # The decision's bridge and the build's: the service answers throughout, so no timer starts
   test_cmd_eq 2 echo "$(($(count_method hello) - hellos))"
   hellos=$(count_method hello)
   start=$("$PYTHON" -c 'import time; print(time.time())')
@@ -538,7 +552,7 @@ test_exp ! -e "$WORK/wrongtc/.lake/build/lib/lean/Rx/A.olean"
   echo "an up-to-date build whose bridge ignores end of input took $(seconds_since "$start") s"
   test_cmd dead "$(cat "$WORK/stuck.pid")"
   test_exp ! -e "$WORK/stuck.exits"
-  # The decision's bridge only
+  # The decision's bridge only: the service answers, so no timer starts
   test_cmd_eq 1 echo "$(($(count_method hello) - hellos))"
 )
 
