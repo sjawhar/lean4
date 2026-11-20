@@ -1,0 +1,6 @@
+name = "chain"
+
+[[lean_lib]]
+name = "Chain"
+roots = ["Chain.C10"]
+globs = ["Chain.+"]
