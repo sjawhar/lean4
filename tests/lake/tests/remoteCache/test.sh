@@ -244,17 +244,31 @@ case_token_cmd_time_limit() {
   # A token command that has not ended after 60 seconds is stopped, with the processes that
   # it started, and fails as a command that exits with an error does: the error names the
   # variable and the limit but not what the command printed, the other lookups of the build
-  # report it without running the command again, and the build compiles locally as soon as
-  # the command is stopped
+  # report it without running the command again, and the build compiles locally
   fresh
-  rm -f "$TOKEN_RUNS" "$WORK_DIR/token-sid"
+  local fifo="$WORK_DIR/token-fifo" life="$WORK_DIR/token-life" open_fifo= observer=
+  rm -f "$TOKEN_RUNS" "$WORK_DIR/token-sid" "$fifo" "$life"
   : > "$SERVER_LOG"
+  # A process outside the command's session times the command's life, since Lake stops it with
+  # SIGKILL, which no trap of the command can record: the command opens a FIFO, which ends this
+  # reader's wait in `open`, and the reader sees the FIFO's end once the last process that holds
+  # it (the shell, `sleep`) is gone. Not on Windows, where Lake's kill reaches only the shell.
+  if [ "$OS" != Windows_NT ]; then
+    test_cmd mkfifo "$fifo"
+    timeout 300 "$PYTHON" -c 'import os, sys, time
+fd = os.open(sys.argv[1], os.O_RDONLY)
+t0 = time.monotonic()
+while os.read(fd, 512): pass
+print(round((time.monotonic() - t0) * 1000), int(time.time()))' "$fifo" > "$life" 2>&1 &
+    observer=$!
+    open_fifo="exec 3> '$fifo'; "
+  fi
   local start elapsed rc
   start="$(date +%s)"
   # The command records its session (Lake starts it in a session of its own), so that the check
   # below sees only this test's processes, not those of another copy of the suite on the machine
   if LAKE_REMOTE_CACHE=bearer \
-      LAKE_CACHE_TOKEN_CMD="echo \$\$ > '$WORK_DIR/token-sid'; echo run >> '$TOKEN_RUNS'; echo printed-by-the-command; sleep 7531" \
+      LAKE_CACHE_TOKEN_CMD="echo \$\$ > '$WORK_DIR/token-sid'; ${open_fifo}echo run >> '$TOKEN_RUNS'; echo printed-by-the-command; sleep 7531" \
       timeout 300 "$LAKE" -v build Test native > produced.out 2>&1; then rc=0; else rc=$?; fi
   elapsed=$(($(date +%s) - start))
   cat produced.out
@@ -265,7 +279,6 @@ case_token_cmd_time_limit() {
   match_text 'Built Test' produced.out
   test_cmd_eq 1 token_runs
   test_cmd_eq 0 count ' -> ' "$SERVER_LOG"
-  test_exp "$elapsed" -lt 90
   # No process of the command's session is left. `ps -s` is the session selector of procps,
   # so this part runs on Linux alone; elsewhere `ps` has no `-s`. procps exits with 1 when it
   # selects no process, which is the expected outcome; any other failure fails the case.
@@ -278,6 +291,23 @@ case_token_cmd_time_limit() {
     test_cmd_eq 0 count . "$WORK_DIR/processes"
   else
     echo "SKIPPED the check for the command's processes: 'ps -s' needs Linux"
+  fi
+  # Lake stopped the command at its limit, measured over the command's life, not the build's:
+  # it ended no sooner than 60 s after Lake started (Lake's 60 s begin before the command's
+  # shell runs), and less than 65 s after the command started. Lake kills it (SIGKILL to its
+  # group) as soon as its poll, every 20 ms, finds the 60 s past; the other 5 s cover waking
+  # Lake's thread, the killed processes and the reader, which load delays by milliseconds, not
+  # by the seconds it adds to a compile.
+  if [ -n "$observer" ]; then
+    local observer_rc=0 life_ms end_s
+    wait "$observer" || observer_rc=$?
+    cat "$life"
+    test_exp "$observer_rc" = 0
+    read -r life_ms end_s < "$life"
+    test_exp "$((end_s - start))" -ge 60
+    test_exp "$life_ms" -lt 65000
+  else
+    echo "SKIPPED the check of the command's life: on Windows, Lake stops only its shell"
   fi
 }
 
