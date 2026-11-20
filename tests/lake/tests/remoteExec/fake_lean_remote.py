@@ -54,6 +54,8 @@ Knobs, all through the environment:
                       when the fake exits after its input ended (a fake that is killed writes none)
   FAKE_IGNORE_EOF_S   stay this many seconds after end of input before exiting, as a bridge whose
                       daemon does not close the connection
+  FAKE_IGNORE_EOF_HELLO_ONLY_S  the same, for a fake that got no request but `hello` (as the bridge
+                      of Lake's decision); default FAKE_IGNORE_EOF_S
 """
 import hashlib, json, os, queue, shutil, signal, subprocess, sys, tempfile, threading, time
 
@@ -321,10 +323,10 @@ def main():
         while (req := work.get()) is not None:
             write(respond(req, True))
 
-    greeted = False
+    greeted, requests = False, 0
     for line in sys.stdin:
         if not line.strip(): continue
-        req = json.loads(line); append(LOG, req)
+        req = json.loads(line); append(LOG, req); requests += 1
         if not greeted:
             write(respond(req, False))
             # C5.1: a connection whose first request is not `hello` gets INVALID and closes.
@@ -340,7 +342,9 @@ def main():
     _gone.set()
     work.put(None)
     for t in threads: t.join()
-    time.sleep(float(os.environ.get("FAKE_IGNORE_EOF_S") or 0))
+    stay = os.environ.get("FAKE_IGNORE_EOF_S")
+    if requests <= 1: stay = os.environ.get("FAKE_IGNORE_EOF_HELLO_ONLY_S") or stay
+    time.sleep(float(stay or 0))
     append(os.environ.get("FAKE_EXIT_LOG"), f"end of input {os.getpid()}")
     return 0
 

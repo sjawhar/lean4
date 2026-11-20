@@ -115,14 +115,6 @@ print(sum(1 for l in ls if l.strip() and json.loads(l).get("answer")=="hello" an
   done
   return 1
 }
-# hello_gaps SKIP [T]: the seconds from each hello answer after line SKIP of the fake's log to the next,
-# and from the last one to T (seconds since the epoch), if given
-hello_gaps() {
-  "$PYTHON" -c 'import json, sys
-ts = [json.loads(l)["t"] for l in open(sys.argv[1]).read().splitlines()[int(sys.argv[2]):]
-      if l.strip() and json.loads(l).get("answer") == "hello"] + [float(t) for t in sys.argv[3:]]
-print(" ".join(f"{b - a:.2f}" for a, b in zip(ts, ts[1:])))' "$FAKE_LOG" "$@"
-}
 
 (cd "$WORK/local" && test_run build Rx)
 
@@ -499,29 +491,33 @@ test_exp ! -e "$WORK/wrongtc/.lake/build/lib/lean/Rx/A.olean"
 # A bridge that does not exit on end of input (its daemon never closes the connection) is killed
 # after the 10 s stop limit (`bridgeExitTimeoutMs`), and Lake exits. Here the bridge would exit, and
 # log that, 30 s after end of input, so no logged exit means Lake killed it before then. The bridge
-# that only made the decision is killed at once, so it adds no wait: the bridge that carries the
-# build's actions says hello less than a stop limit after the decision's hello, and a build that
-# sends no request exits less than a stop limit after it.
+# that only made the decision is killed at once, so it adds no wait, in a build that sends requests
+# and in one that sends none: it would exit, and log that, 5 s after end of input (half a stop limit),
+# so no logged exit means Lake did not wait out a stop limit for it. The checks read the bridges' logs,
+# not a build's duration: Lake kills the decision's bridge right after closing its input, and the
+# build's 20 s before it would exit, so load does not make either log an exit.
 (
   cd "$WORK/stuck"
-  skip=$(log_lines)
+  hellos=$(count_method hello)
   start=$("$PYTHON" -c 'import time; print(time.time())')
-  FAKE_IGNORE_EOF_S=30 FAKE_PIDFILE="$WORK/stuck.pid" FAKE_EXIT_LOG="$WORK/stuck.exits" LAKE_REMOTE_EXEC=grpc://fake:1 \
-    test_out "lake: remote: ok; 5 cached (0 from manifest), 0 executed, 0 local;" build Rx
+  FAKE_IGNORE_EOF_S=30 FAKE_IGNORE_EOF_HELLO_ONLY_S=5 FAKE_PIDFILE="$WORK/stuck.pid" FAKE_EXIT_LOG="$WORK/stuck.exits" \
+    LAKE_REMOTE_EXEC=grpc://fake:1 test_out "lake: remote: ok; 5 cached (0 from manifest), 0 executed, 0 local;" build Rx
   took=$(seconds_since "$start")
   echo "a build whose bridge ignores end of input took $took s"
   test_cmd in_range "$took" 9.5 inf
   test_cmd dead "$(cat "$WORK/stuck.pid")"
   test_exp ! -e "$WORK/stuck.exits"
-  test_cmd in_range "$(hello_gaps "$skip")" 0 10
-  skip=$(log_lines)
+  # The decision's bridge and the build's
+  test_cmd_eq 2 echo "$(($(count_method hello) - hellos))"
+  hellos=$(count_method hello)
   start=$("$PYTHON" -c 'import time; print(time.time())')
-  FAKE_IGNORE_EOF_S=60 FAKE_PIDFILE="$WORK/stuck.pid" LAKE_REMOTE_EXEC=grpc://fake:1 \
+  FAKE_IGNORE_EOF_HELLO_ONLY_S=5 FAKE_PIDFILE="$WORK/stuck.pid" FAKE_EXIT_LOG="$WORK/stuck.exits" LAKE_REMOTE_EXEC=grpc://fake:1 \
     test_out "lake: remote: ok; 0 cached (0 from manifest), 0 executed, 0 local;" build Rx
-  end=$("$PYTHON" -c 'import time; print(time.time())')
   echo "an up-to-date build whose bridge ignores end of input took $(seconds_since "$start") s"
-  test_cmd in_range "$(hello_gaps "$skip" "$end")" 0 10
   test_cmd dead "$(cat "$WORK/stuck.pid")"
+  test_exp ! -e "$WORK/stuck.exits"
+  # The decision's bridge only
+  test_cmd_eq 1 echo "$(($(count_method hello) - hellos))"
 )
 
 # A write that the bridge of a killed Lake has started lands before the next Lake takes the workspace

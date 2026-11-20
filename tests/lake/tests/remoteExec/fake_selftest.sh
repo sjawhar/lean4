@@ -318,6 +318,22 @@ t0 = time.monotonic(); b15.p.stdin.close()
 rc15 = b15.p.wait(timeout=10); dt15 = time.monotonic() - t0
 check("FAKE_IGNORE_EOF_S keeps the fake after end of input", rc15 == 0 and dt15 >= 1, f"exit {rc15} after {dt15:.2f} s")
 
+# --- FAKE_IGNORE_EOF_HELLO_ONLY_S: the stay of a fake that got no request but hello; one that got a
+# request stays FAKE_IGNORE_EOF_S
+b16 = Bridge(FAKE_IGNORE_EOF_S="0", FAKE_IGNORE_EOF_HELLO_ONLY_S="1")
+result(b16.call("hello", {"protocol": 1}))
+t0 = time.monotonic(); rc16 = b16.close(); dt16 = time.monotonic() - t0
+check("FAKE_IGNORE_EOF_HELLO_ONLY_S keeps a fake that got only hello", rc16 == 0 and dt16 >= 1,
+      f"exit {rc16} after {dt16:.2f} s")
+b17 = Bridge(FAKE_IGNORE_EOF_S="0", FAKE_IGNORE_EOF_HELLO_ONLY_S="600")
+result(b17.call("hello", {"protocol": 1}))
+result(b17.call("digest", {"paths": [src]}))
+try:
+    rc17 = b17.close()
+except subprocess.TimeoutExpired:
+    rc17 = None; b17.p.kill(); b17.p.wait()
+check("and not one that got a request", rc17 == 0, f"exit {rc17}")
+
 # --- FAKE_DOWN_FILE: while the file exists, hello is unreachable and run and materialize are UNAVAILABLE
 downfile = os.path.join(work, "down")
 open(downfile, "w").close()
