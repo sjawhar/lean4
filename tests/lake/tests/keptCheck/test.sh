@@ -153,16 +153,19 @@ no_match_text 'Checked' produced.out
 test_exp "$(spawns t9b.log)" -le 4
 
 # A checker that stops answering is killed after `LAKE_KEPT_CHECKER_TIMEOUT` seconds without a
-# reply: its requests are compiled and a new checker answers the next ones
+# reply: its requests are compiled and a new checker answers the next ones. The rejects give the
+# watchdog's reason, and the stub never reached the end of its 120 s hang (`t10.log.slept`), which
+# Lake would have waited for had it not killed the stub. This holds however long the build takes:
+# the watchdog would have to fire 116 s past its 3 s deadline to break it
 mkp t10
 test_run -d t10 build P
 seta t10 2
 export STUB_LOG="$PWD/t10.log"
-start=$(date +%s)
 LAKE_KEPT_CHECKER="$STUB" LAKE_KEPT_CHECKER_TIMEOUT=3 STUB_MODE=hang-once \
   test_out 'Checked P.C' -d t10 build P
 match_pat 'Built P\.[BDEF]' produced.out
-test_exp $(( $(date +%s) - start )) -lt 120
+match_text 'the checker sent no reply for 3 s and was killed' produced.out
+test_exp ! -e t10.log.slept
 test_exp "$(spawns t10.log)" = 2
 
 # The `.olean` the checker read must be the one the trace describes: a reply with another hash is
@@ -209,7 +212,7 @@ seta t15 2
 export STUB_LOG="$PWD/t15.log" STUB_GO="$PWD/t15.go"
 ( if LAKE_KEPT_CHECKER="$STUB" STUB_MODE=wait-go "$LAKE" -d t15 build P > t15.out 2>&1
   then echo 0; else echo $?; fi > t15.rc ) &
-for _ in $(seq 300); do grep -qx P.B t15.log 2>/dev/null && break; sleep 0.1; done
+for _ in $(seq 3000); do grep -qx P.B t15.log 2>/dev/null && break; sleep 0.1; done
 test_cmd grep -qx P.B t15.log
 test_cmd touch -r t15/P/B.lean t15.mtime
 rm -f t15/P/B.lean
@@ -401,43 +404,50 @@ match_text 'which it was not asked or had already answered' produced.out
 no_match_text 'Checked P.B' produced.out
 # ... so a checker that stops reading and keeps sending such replies is killed at the first one, its
 # requests compile (which modules they are depends on the order Lake sends them in), and the build
-# completes
+# completes. The stub chatters for two minutes and then creates `t30c.log.slept`, so a Lake that
+# waited for it instead of killing it finishes after that file exists; `timeout 600` only ends a Lake
+# that hangs for good
 mkp t30c
 test_run -d t30c build P
 seta t30c 2
 export STUB_LOG="$PWD/t30c.log"
 LAKE_KEPT_CHECKER="$STUB" LAKE_KEPT_CHECKER_TIMEOUT=3 STUB_MODE=chatter-once \
-  test_cmd_out 'which it was not asked or had already answered' timeout 60 "$LAKE" -d t30c build P
+  test_cmd_out 'which it was not asked or had already answered' timeout 600 "$LAKE" -d t30c build P
 match_text 'Build completed successfully' produced.out
+test_exp ! -e t30c.log.slept
 
 # `LAKE_KEPT_CHECKER_TIMEOUT` must be at least one second
 mkp t31
 LAKE_KEPT_CHECKER="$STUB" LAKE_KEPT_CHECKER_TIMEOUT=0 test_err 'at least 1 second' -d t31 build P
 
 # A checker that stops reading while Lake writes requests larger than a pipe's buffer (here setups of
-# over 64 KiB) is still killed after `LAKE_KEPT_CHECKER_TIMEOUT`: writes never block the watchdog
+# over 64 KiB) is still killed after `LAKE_KEPT_CHECKER_TIMEOUT`, as `t10` checks: writes never block
+# the watchdog. A Lake whose writes held it up would wait for the stub's hang to end and fail the
+# `t32.log.slept` check; `timeout 1200` only ends a Lake that hangs for good
 mkp t32
 pad=$(head -c 70000 /dev/zero | tr '\0' x)
 sed_i "s/^maxHeartbeats = 300000\$/maxHeartbeats = 300000\nweak.keptCheckPad = \"$pad\"/" t32/lakefile.toml
 test_run -d t32 build P
 seta t32 2
 export STUB_LOG="$PWD/t32.log"
-start=$(date +%s)
 LAKE_KEPT_CHECKER="$STUB" LAKE_KEPT_CHECKER_TIMEOUT=3 STUB_MODE=hang-once \
-  test_cmd_out 'Checked P.C' timeout 100 "$LAKE" -d t32 build P
-test_exp $(( $(date +%s) - start )) -lt 60
+  test_cmd_out 'Checked P.C' timeout 1200 "$LAKE" -d t32 build P
+match_text 'the checker sent no reply for 3 s and was killed' produced.out
+test_exp ! -e t32.log.slept
 test_cmd test "$(head -1 t32.log.json | wc -c)" -gt 65536
 test_exp "$(spawns t32.log)" = 2
 
 # A killed checker's own children are killed with it (they would hold its pipes open and keep Lake
-# from finishing until they exit)
+# from finishing until they exit). The stub's child creates `t33.log.slept` when its 60 s sleep ends,
+# before it exits, so a Lake that waited for it finishes after the file exists. This holds however
+# long the build takes: the watchdog would have to kill the stub's group 56 s past its 3 s deadline
+# to break it
 mkp t33
 test_run -d t33 build P
 seta t33 2
 export STUB_LOG="$PWD/t33.log"
-start=$(date +%s)
 LAKE_KEPT_CHECKER="$STUB" LAKE_KEPT_CHECKER_TIMEOUT=3 STUB_MODE=fork-hang-once test_out 'Checked P.C' -d t33 build P
-test_exp $(( $(date +%s) - start )) -lt 40
+test_exp ! -e t33.log.slept
 
 # `LAKE_KEPT_EXCLUDE` applies to every build mode: with `--old`, an excluded kept module is
 # compiled (its kept outputs are removed with its trace) ...
@@ -614,7 +624,7 @@ cat > t62/w/W/X.lean <<EOF
 import Sh.K
 #eval show IO Unit from do
   IO.FS.writeFile "$gate/started" ""
-  for _ in [0:1200] do
+  for _ in [0:3000] do
     if (← System.FilePath.pathExists "$gate/go") then return
     IO.sleep 100
 theorem X.t : K.u = 5 := rfl
@@ -622,7 +632,7 @@ EOF
 export STUB_LOG="$PWD/t62.log"
 ( LAKE_KEPT_CHECKER="$STUB" "$LAKE" -d t62/w build W > t62.r1 2>&1; echo $? > t62.r1.rc ) &
 r1pid=$!
-for _ in $(seq 600); do [ -e "$gate/started" ] && break; sleep 0.1; done
+for _ in $(seq 3000); do [ -e "$gate/started" ] && break; sleep 0.1; done
 test_exp -e "$gate/started"
 # `Sh.K` is kept right now; the `shared` tree rebuilds it normally, giving it an ordinary key
 test_cmd grep -q '"kept":true' "$KKEY"
@@ -721,31 +731,39 @@ LAKE_KEPT_CHECKER="$STUB" STUB_MODE=mute-once \
 script_pid=$!
 set +m
 # (the stub stops answering at its first request, whichever candidate that is)
-for _ in $(seq 300); do [ -s t50.log ] && break; sleep 0.1; done
+for _ in $(seq 3000); do [ -s t50.log ] && break; sleep 0.1; done
 test_exp -s t50.log
 test_cmd kill -INT -- "-$script_pid"
 if wait "$script_pid"; then rc=0; else rc=$?; fi
 test_exp "$rc" = 130
 test_exp ! -e t50.after
 stub_pid=$(head -1 t50.log.pids)
-for _ in $(seq 50); do kill -0 "$stub_pid" 2>/dev/null || break; sleep 0.1; done
+for _ in $(seq 3000); do kill -0 "$stub_pid" 2>/dev/null || break; sleep 0.1; done
 test_cmd_fails kill -0 "$stub_pid"
-if timeout 30 "$LAKE" -d t50 build P --no-build > t50nb.out 2>&1; then rc=0; else rc=$?; fi
+if timeout 600 "$LAKE" -d t50 build P --no-build > t50nb.out 2>&1; then rc=0; else rc=$?; fi
 test_cmd cat t50nb.out
 test_exp "$rc" = 3
 test_cmd_fails grep -q 'waiting for another Lake process' t50nb.out
-# ... and so with `timeout`, which sends `SIGTERM` to its own process group (Lake's, not the checker's)
+# ... and so with `SIGTERM` to Lake's process group, which is what `timeout` sends (to its own group:
+# Lake's, not the checker's). It is sent once the checker has a request, however long the build takes
+# to get there
 mkp t51
 test_run -d t51 build P
 seta t51 2
 export STUB_LOG="$PWD/t51.log"
-if LAKE_KEPT_CHECKER="$STUB" STUB_MODE=mute-once timeout 5 "$LAKE" -d t51 build P > t51.out 2>&1; then
-  rc=0; else rc=$?; fi
-test_exp "$rc" = 124
+set -m
+LAKE_KEPT_CHECKER="$STUB" STUB_MODE=mute-once "$LAKE" -d t51 build P > t51.out 2>&1 &
+lake_pid=$!
+set +m
+for _ in $(seq 3000); do [ -s t51.log ] && break; sleep 0.1; done
+test_exp -s t51.log
+test_cmd kill -TERM -- "-$lake_pid"
+if wait "$lake_pid"; then rc=0; else rc=$?; fi
+test_exp "$rc" = 143
 stub_pid=$(head -1 t51.log.pids)
-for _ in $(seq 50); do kill -0 "$stub_pid" 2>/dev/null || break; sleep 0.1; done
+for _ in $(seq 3000); do kill -0 "$stub_pid" 2>/dev/null || break; sleep 0.1; done
 test_cmd_fails kill -0 "$stub_pid"
-if timeout 30 "$LAKE" -d t51 build P --no-build > t51nb.out 2>&1; then rc=0; else rc=$?; fi
+if timeout 600 "$LAKE" -d t51 build P --no-build > t51nb.out 2>&1; then rc=0; else rc=$?; fi
 test_exp "$rc" = 3
 test_cmd_fails grep -q 'waiting for another Lake process' t51nb.out
 
@@ -851,7 +869,7 @@ seta t36x 2
 export STUB_LOG="$PWD/t36.log" STUB_GO="$PWD/t36.go"
 ( if LAKE_KEPT_CHECKER="$STUB" STUB_MODE=wait-go "$LAKE" -d t36y build P > t36y.out 2>&1
   then echo 0; else echo $?; fi > t36y.rc ) &
-for _ in $(seq 300); do grep -qx P.B t36.log 2>/dev/null && break; sleep 0.1; done
+for _ in $(seq 3000); do grep -qx P.B t36.log 2>/dev/null && break; sleep 0.1; done
 test_cmd grep -qx P.B t36.log
 test_out 'Built P.B' -d t36x build P
 test_cmd touch "$STUB_GO"
