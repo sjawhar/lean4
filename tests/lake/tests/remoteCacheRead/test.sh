@@ -251,9 +251,13 @@ case_read_silent() {
   # reading, and so does the read status, which counts one stop, after 3 reads; fewer reads went
   # than there are targets (each that went says so at verbose level); and in the server's log,
   # each mapping of such a read was asked for at most twice, and any other (a probe's) once. The
-  # one time checked is Lake's own, of the transfers of the read that stopped the reads: two
-  # tries that each waited the stall time, so at least 6 s, and at most 18 s, with 6 s a try for
-  # starting `curl`, its once-a-second speed check and Lake's reading of its report.
+  # one time checked is Lake's own, of the transfers of the read that stopped the reads: at least
+  # 6 s and at most 18 s. A read whose try waited the stall time (3 s) is tried again, unless
+  # that try ended more than 9 s after the read was sent (the retry, 1 s later, would start after
+  # `retryMaxSecs`, 10 s). At most 3 reads go at once here, so none waits for a run of the read
+  # broker, and such a try itself took more than 9 s. So the transfers took two tries of at least
+  # 3 s, or one of more than 9 s, and at most 18 s, with 6 s a try for starting `curl`, its
+  # once-a-second speed check and Lake's reading of its report.
   fresh
   : > "$SERVER_LOG"
   LAKE_REMOTE_CACHE=silent test_out 'Built Test' -v build Test native Chain
@@ -261,12 +265,6 @@ case_read_silent() {
   match_text 'Built Chain.C4' produced.out
   test_cmd cp produced.out silent.out
   test_cmd_eq 1 count 'stopped reading the remote cache' silent.out
-  "$PYTHON" -c '
-import json, sys
-status = json.load(open(sys.argv[1]))
-assert "stopped reading the remote cache" in status["stopped"], status
-assert status["failures"] >= 3, status
-' "$CACHE_DIR/remote-status-read.json"
   # The targets are those of `remote_targets` and the 4 modules of `Chain`
   "$PYTHON" -c '
 import collections, json, re, sys
@@ -274,6 +272,7 @@ log, out = open(sys.argv[1]).read(), open(sys.argv[2]).read()
 status = json.load(open(sys.argv[3]))
 targets = int(sys.argv[4])
 assert status["stops"] == 1 and status["resumes"] == 0, status
+assert status["stopped"].startswith("stopped reading the remote cache:"), status
 m = re.search(r"(\d+) reads in a row waited for it and failed "
               r"\(the transfers of the last one took (\d+) ms\)", status["stopped"])
 assert m, status

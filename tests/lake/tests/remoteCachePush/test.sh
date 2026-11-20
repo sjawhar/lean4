@@ -637,17 +637,27 @@ case_push_curl_hang() {
   # of the mappings, and Lake stops each at the limit it names, which must be that of its uploads
   # (`transferRunMaxSecs`): 60 s, and 1 s for each MiB of the run's files, for each round of up
   # to 50 transfers, and 10 s more. The uploads are those the server stored, so the limits
-  # follow from their sizes and not from how long the push took, which load on the machine
-  # stretches; `timeout 400` only ends a push that hangs.
+  # follow from their sizes and not from how long the push took. A watcher in the run's script
+  # times its wait, from the end of its transfers until Lake has killed and reaped it (the
+  # watcher holds none of the run's output, which Lake reads to its end first): each wait is less
+  # than its limit and 5 s more, for Lake's look every 20 ms at whether the run has ended, the
+  # watcher's every 0.2 s, its whole seconds, and processes that wake late. Only the waits are
+  # timed, not the build or the push; `timeout 400` only ends a push that hangs.
   push_fresh
   build_a
   cat > "$WORK_DIR/hang-curl.sh" << EOF
 #!/bin/sh
 "$(type -P curl)" "\$@"
+t=\$(date +%s)
+(
+  while kill -0 \$\$ 2> /dev/null; do sleep 0.2; done
+  echo \$((\$(date +%s) - t)) >> '$WORK_DIR/hang-lives'
+) < /dev/null > /dev/null 2>&1 &
 exec sleep 900
 EOF
   test_cmd chmod +x "$WORK_DIR/hang-curl.sh"
   : > "$SERVER_LOG"
+  rm -f "$WORK_DIR/hang-lives"
   local rc
   if CURL="$WORK_DIR/hang-curl.sh" on_a timeout 400 "$LAKE" cache push > push.out 2>&1; then
     rc=0
@@ -660,20 +670,39 @@ EOF
   match_text 'Lake stopped it' push.out
   test_cmd_eq 0 queued
   test_cmd push_check status "$PUSH_STATUS" $PUSH_COMPILES 0 0 0
-  test_cmd_eq 0 push_check duplicates "$SERVER_LOG"
+  # Only this push's uploads: the server logs an upload of `case_push_stall` when it answers it,
+  # 15 minutes after it was sent, which can fall in this push
+  grep '^PUT /bearer/' "$SERVER_LOG" > "$WORK_DIR/hang-puts.log" || true
+  test_exp -s "$WORK_DIR/hang-puts.log"
+  test_cmd_eq 0 push_check duplicates "$WORK_DIR/hang-puts.log"
   "$PYTHON" -c '
-import os, re, sys
-out, scope = open(sys.argv[1]).read(), sys.argv[2]
+import os, re, sys, time
+out, scope, lives_file = open(sys.argv[1]).read(), sys.argv[2], sys.argv[3]
 stops = [(int(n), int(secs)) for secs, n in re.findall(
     r"curl had not ended after ([0-9]+) s, the longest its ([0-9]+) transfers may take", out)]
 def limit(kind):
-    files = [os.path.join(scope, kind, name) for name in os.listdir(os.path.join(scope, kind))]
+    # A write of the server that is still going leaves a `<path>.put.<thread>` file
+    files = [os.path.join(scope, kind, name) for name in os.listdir(os.path.join(scope, kind))
+             if name.endswith((".art", ".json"))]
     size = sum(os.path.getsize(f) for f in files)
     return len(files), (len(files) + 49) // 50 * (60 + size // 2**20) + 10
 want = [limit("a"), limit("in")]
 print("Lake stopped the runs at (transfers, seconds):", stops, "; their uploads allow", want)
 assert stops == want, (stops, want)
-' push.out "$STORE_DIR/a0/$PUSH_SCOPE"
+# A watcher writes once its run is gone, which can be just after Lake has ended; 60 s only
+# guards against a watcher that never writes
+deadline = time.monotonic() + 60
+while True:
+    lives = []
+    if os.path.exists(lives_file):
+        lives = [int(n) for n in open(lives_file).read().split("\n")[:-1]]
+    if len(lives) >= len(stops) or time.monotonic() > deadline:
+        break
+    time.sleep(0.1)
+print("the runs waited", lives, "s after their transfers until Lake stopped them")
+assert len(lives) == len(stops), (lives, stops)
+assert all(life < secs + 5 for life, (_, secs) in zip(lives, stops)), (lives, stops)
+' push.out "$STORE_DIR/a0/$PUSH_SCOPE" "$WORK_DIR/hang-lives"
 }
 
 case_push_resume() {
