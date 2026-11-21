@@ -10,6 +10,7 @@ public import Lake.Build.Job.Monad
 public import Lake.Build.CcIdentity
 public import Lake.Config.Monad
 public import Lake.Util.JsonObject
+public import Lake.Util.RemoteExec
 public import Lake.Util.IO
 public import Lake.Build.Actions
 public import Lake.Build.RemoteCache
@@ -77,21 +78,25 @@ public structure BuildMetadata where
   so that an archive's contents depend only on the module's outputs.
   -/
   localHash? : Option Hash := none
+  /--
+  The build service's record of the outputs (`remote`), for outputs that a service action made. It
+  is kept out of `outputs?` too, and an archive does not keep it.
+  -/
+  remote? : Option RemoteExec.Record := none
 
 /-- The current version of the trace file format. -/
 def BuildMetadata.schemaVersion : String := "2025-09-10"
 
 public protected def BuildMetadata.toJson (self : BuildMetadata) : Json :=
-  let obj := ({} : JsonObject)
+  ({} : JsonObject)
     |>.insert "schemaVersion" schemaVersion
     |>.insert "depHash" self.depHash
     |>.insert "inputs" self.inputs
     |>.insert "outputs" self.outputs?
     |>.insert "log" self.log
     |>.insert "synthetic" self.synthetic
-  match self.localHash? with
-  | some hash => obj.insert "localHash" hash
-  | none => obj
+    |>.insertSome "localHash" self.localHash?
+    |>.insertSome "remote" self.remote?
 
 public instance : ToJson BuildMetadata := ⟨BuildMetadata.toJson⟩
 
@@ -114,7 +119,9 @@ public def BuildMetadata.fromJsonObject? (obj : JsonObject) : Except String Buil
   let log ← obj.getD "log" {}
   let synthetic ← obj.getD "synthetic" false
   let localHash? ← obj.get? "localHash"
-  return {depHash, inputs, outputs?, log, synthetic, localHash?}
+  -- A record that does not parse is no record: the trace still describes its outputs
+  let remote? : Option RemoteExec.Record := (obj.get? "remote").toOption.join
+  return {depHash, inputs, outputs?, log, synthetic, localHash?, remote?}
 
 public protected def BuildMetadata.fromJson? (json : Json) : Except String BuildMetadata := do
   match json with
@@ -145,8 +152,9 @@ public def BuildMetadata.parse (contents : String) : Except String BuildMetadata
 /-- Construct build metadata from a cached input-to-output mapping and the build log stored with it. -/
 public def BuildMetadata.ofFetch
   (inputHash : Hash) (outputs : Json) (log : Log) (localHash? : Option Hash := none)
+  (remote? : Option RemoteExec.Record := none)
 : BuildMetadata :=
-  {depHash := inputHash, outputs? := outputs, synthetic := true, inputs := #[], log, localHash?}
+  {depHash := inputHash, outputs? := outputs, synthetic := true, inputs := #[], log, localHash?, remote?}
 
 partial def serializeInputs (inputs : Array BuildTrace) : Array (String × Json) :=
   inputs.foldl (init := {}) fun r trace =>
@@ -159,6 +167,7 @@ partial def serializeInputs (inputs : Array BuildTrace) : Array (String × Json)
 
 def BuildMetadata.ofBuildCore
   (depTrace : BuildTrace) (outputs : Json) (log : Log) (localHash? : Option Hash := none)
+  (remote? : Option RemoteExec.Record := none)
 : BuildMetadata where
   inputs := serializeInputs depTrace.inputs
   depHash := depTrace.hash
@@ -166,11 +175,13 @@ def BuildMetadata.ofBuildCore
   synthetic := false
   log
   localHash?
+  remote?
 
 /-- Construct trace file contents from a build's trace, outputs, and log. -/
 @[inline] public def BuildMetadata.ofBuild
    [ToJson α]  (depTrace : BuildTrace) (outputs : α) (log : Log) (localHash? : Option Hash := none)
-:= BuildMetadata.ofBuildCore depTrace (toJson outputs) log localHash?
+   (remote? : Option RemoteExec.Record := none)
+:= BuildMetadata.ofBuildCore depTrace (toJson outputs) log localHash? remote?
 
 /-- The state of the trace file data saved on the file system. -/
 public inductive SavedTrace
@@ -182,6 +193,11 @@ public inductive SavedTrace
 public def SavedTrace.log : SavedTrace → Log
 | .ok data => data.log
 | _ => {}
+
+/-- The service record of the saved trace (`BuildMetadata.remote?`), if any. -/
+public def SavedTrace.remote? : SavedTrace → Option RemoteExec.Record
+| .ok data => data.remote?
+| _ => none
 
 /--
 Try to read data from a trace file.
@@ -219,20 +235,21 @@ def BuildMetadata.replayCached (data : BuildMetadata) : JobM Unit := do
 
 /--
 Write a trace file containing metadata on an artifact fetched from a cache,
-including the log of its build stored in the cache, and replay that log.
+including the log of its build stored in the cache (and the cache entry's service record), and replay that log.
 -/
 public def writeFetchTrace
   (path : FilePath) (inputHash : Hash) (outputs : Json) (log : Log) (localHash? : Option Hash := none)
+  (remote? : Option RemoteExec.Record := none)
 : JobM Unit := do
-  let data := BuildMetadata.ofFetch inputHash outputs log localHash?
+  let data := BuildMetadata.ofFetch inputHash outputs log localHash? remote?
   data.writeFile path
   data.replayCached
 
 /-- Write a trace file containing metadata about a build. -/
 @[inline] public def writeBuildTrace
   [ToJson α] (path : FilePath) (depTrace : BuildTrace) (outputs : α) (log : Log)
-  (localHash? : Option Hash := none)
-: IO Unit := BuildMetadata.writeFile path (.ofBuild depTrace outputs log localHash?)
+  (localHash? : Option Hash := none) (remote? : Option RemoteExec.Record := none)
+: IO Unit := BuildMetadata.writeFile path (.ofBuild depTrace outputs log localHash? remote?)
 
 /-- Indicator of whether a build's output(s) are up-to-date. -/
 public inductive OutputStatus
@@ -360,7 +377,8 @@ open ToOutputJson in
 Runs `build` as a build action of kind `action`.
 
 The build's input trace (`depTrace`), JSON description of the result of `build`, and log are saved to `traceFile`
-(with `localHash?`, see `BuildMetadata.localHash?`) if the build completes without a fatal error (i.e., it does not
+(with `localHash?`, see `BuildMetadata.localHash?`, and the service record that `remote?` gives for the result, see
+`BuildMetadata.remote?`) if the build completes without a fatal error (i.e., it does not
 `throw`). Then, for an action of kind `.build`, it sets the job's `JobState.built`: set after `build` returns, so a
 site within `build` that clears the flag cannot clear it for this action.
 -/
@@ -368,6 +386,7 @@ site within `build` that clears the flag cannot clear it for this action.
   [ToOutputJson α]
   (depTrace : BuildTrace) (traceFile : FilePath) (build : JobM α)
   (action : JobAction := .build) (localHash? : Option Hash := none)
+  (remote? : α → Option RemoteExec.Record := fun _ => none)
 : JobM α := do
   updateAction action
   let noBuildTraceFile := traceFile.addExtension "nobuild"
@@ -383,7 +402,7 @@ site within `build` that clears the flag cannot clear it for this action.
       let iniPos ← getLogPos
       let a ← build -- fatal errors will abort here
       let log := (← getLog).takeFrom iniPos
-      writeBuildTrace traceFile depTrace (toOutputJson a) log localHash?
+      writeBuildTrace traceFile depTrace (toOutputJson a) log localHash? (remote? a)
       removeFileIfExists noBuildTraceFile
       if action matches .build then
         modify ({· with built := true})
@@ -781,6 +800,18 @@ public class ResolveOutputs (α : Type) where
   /-- **For internal use only.** -/
   resolveOutputs (out : CacheOutput) : JobM α
 
+/--
+Outputs found in the Lake cache (`getArtifacts?`), with the log of the build that produced them, the
+service record of the trace or cache entry that named them (`BuildMetadata.remote?`, `CacheOutput.remote?`),
+and whether the shared remote cache's mapping named them (`readRemoteOutputs?`).
+
+**For internal use only.**
+-/
+public structure CacheHit (α : Type) where
+  arts : α
+  log : Log
+  remote? : Option RemoteExec.Record := none
+  fromRemoteCache : Bool := false
 
 open ResolveOutputs in
 /--
@@ -796,7 +827,7 @@ nothing unless `LAKE_REMOTE_CACHE` names a service) and replaces the local one.
 @[specialize] def getArtifactsUsingCache?
   [ResolveOutputs α] (inputHash : Hash) (pkg : Package) (target : String) (srcHash? : Option Hash)
   (remoteRead := true)
-: JobM (Option (α × Log)) := do
+: JobM (Option (CacheHit α)) := do
   let reportIssue (e : Log.Pos) : JobM Unit := do
     let log ← takeLogFrom e
     let msg := s!"input '{inputHash.toString.take 7}' found in package artifact cache, \
@@ -805,10 +836,11 @@ nothing unless `LAKE_REMOTE_CACHE` names a service) and replaces the local one.
     -- Must be `trace` to avoid breaking `--wfail` / `--iofail` builds
     -- TODO: Figure out a way to split cache and build failures
     logVerbose msg
-  let resolve (out : CacheOutput) : JobM (Option (α × Log)) := do
+  let resolve (out : CacheOutput) (fromRemoteCache : Bool) : JobM (Option (CacheHit α)) := do
     try
       let localOut := if remoteRead || out.service?.isNone then out else CacheOutput.ofData out.data
-      return some (← resolveOutputs localOut, out.log?.getD {})
+      let arts ← resolveOutputs localOut
+      return some {arts, log := out.log?.getD {}, remote? := out.remote?, fromRemoteCache := fromRemoteCache}
     catch e =>
       reportIssue e
       return none
@@ -817,7 +849,7 @@ nothing unless `LAKE_REMOTE_CACHE` names a service) and replaces the local one.
     reportIssue e
     pure none
   if let some out := local? then
-    if let some a ← resolve out then
+    if let some a ← resolve out false then
       return some a
   unless remoteRead do return none
   -- A local mapping file that exists but cannot be used (it does not parse, or its artifacts are
@@ -829,7 +861,7 @@ nothing unless `LAKE_REMOTE_CACHE` names a service) and replaces the local one.
   cancelIfBuildCanceled
   let some out := out?
     | return none
-  let a? ← resolve out
+  let a? ← resolve out true
   -- As above: the artifacts of the mapping were read from the remote cache as well
   cancelIfBuildCanceled
   return a?
@@ -839,7 +871,7 @@ open ResolveOutputs in
 Retrieve artifacts from the Lake cache using only the outputs stored in the saved trace file.
 
 If the cache is writable, saves the input-to-output mapping derived from the trace
-(with the trace's log) to the cache, unless a mapping for the `inputHash` already exists.
+(with the trace's log and service record) to the cache, unless a mapping for the `inputHash` already exists.
 
 **For internal use only.**
 -/
@@ -853,7 +885,7 @@ If the cache is writable, saves the input-to-output mapping derived from the tra
           let arts ← resolveOutputs (.ofData out)
           if (← pkg.isArtifactCacheWritable) then
             let act := (← getLakeCache).writeOutputs pkg.cacheScope inputHash out
-              (log := data.log) (overwrite := false)
+              (log := data.log) (remote? := data.remote?) (overwrite := false)
             if let .error e ← act.toBaseIO then
               logWarning s!"could not write outputs to cache: {e}"
           return some arts
@@ -865,20 +897,18 @@ open ResolveOutputs in
 /--
 Retrieve artifacts from the Lake cache using the outputs stored in either
 the saved trace file or in the cached input-to-content mapping,
-along with the build log stored with them. With `remoteRead := false`, the shared remote cache is
-not read (see `getArtifactsUsingCache?`).
+along with the build log and service record stored with them. With `remoteRead := false`, the shared
+remote cache is not read (see `getArtifactsUsingCache?`).
 
 **For internal use only.**
 -/
 @[inline] public nonrec def getArtifacts?
   [ResolveOutputs α] (inputHash : Hash) (savedTrace : SavedTrace) (pkg : Package)
   (target : String) (srcHash? : Option Hash) (remoteRead := true)
-: JobM (Option (α × Log)) := do
+: JobM (Option (CacheHit α)) := do
   if let some a ← getArtifactsUsingTrace? inputHash savedTrace pkg then
-    return some (a, savedTrace.log)
-  if let some a ← getArtifactsUsingCache? inputHash pkg target srcHash? remoteRead then
-    return some a
-  return none
+    return some {arts := a, log := savedTrace.log, remote? := savedTrace.remote?}
+  getArtifactsUsingCache? inputHash pkg target srcHash? remoteRead
 
 /-- **For internal use only.** -/
 public def resolveArtifact
@@ -1074,6 +1104,16 @@ public def restoreArtifact
 @[inline] public def Internal.getOutputsRef? [Functor m] [MonadBuild m] (pkg : Package) : m (Option CacheRef) :=
   readThe BuildContext <&> fun ctx => if pkg.wsIdx = ctx.outputsIdx then ctx.outputsRef? else none
 
+/-- **For internal use only.** `art` with the modification time of its trace file `traceFile`, if that exists. -/
+public def Internal.withTraceMTime (art : Artifact) (traceFile : FilePath) : JobM Artifact := do
+  match (← getMTime traceFile |>.toBaseIO) with
+  | .ok mtime =>
+    return {art with mtime}
+  | .error (.noFileOrDirectory ..) => -- trace file may not exist
+    return art
+  | .error e =>
+    error s!"failed to retrieve artifact modification time: {e}"
+
 /--
 Uses the current job's trace to search Lake's local artifact cache for an artifact
 with a matching extension (`ext`) and content hash. If one is found, use it.
@@ -1090,11 +1130,13 @@ If `exe := true`, the `file` will be marked executable.
 
 If `platformIndependent := true`, the artifact will be included in
 platform-independent caches.
+
+If `remoteRead := false`, the shared remote cache is not read (see `getArtifacts?`).
 -/
 public def buildArtifactUnlessUpToDate
   (file : FilePath) (build : JobM PUnit)
   (text := false) (ext := "art") (restore := false) (exe := false)
-  (platformIndependent := false)
+  (platformIndependent := false) (remoteRead := true)
 : JobM Artifact := do
   -- Whether this call completes a build action (not a job it continues)
   let builtHere ← trackBuilds
@@ -1105,11 +1147,13 @@ public def buildArtifactUnlessUpToDate
     let inputHash := depTrace.hash
     let fetchArt? restore := do
       let target ← currentRemoteCacheTarget
-      let some ((art : XArtifact exe), log) ← getArtifacts? inputHash savedTrace pkg target none
+      let some (hit : CacheHit (XArtifact exe)) ←
+          getArtifacts? inputHash savedTrace pkg target none remoteRead
         | return none
+      let art := hit.arts
       unless (← savedTrace.replayCachedIfUpToDate inputHash) do
         removeFileIfExists file
-        writeFetchTrace traceFile inputHash (toJson art.descr) log
+        writeFetchTrace traceFile inputHash (toJson art.descr) hit.log (remote? := hit.remote?)
       if restore then
         some <$> restoreArtifact file art exe text
       else
@@ -1165,7 +1209,7 @@ public def buildArtifactUnlessUpToDate
     if let some ref ← Internal.getOutputsRef? pkg then
       ref.insert inputHash art.descr platformIndependent
     setTrace art.trace
-    setMTime art traceFile
+    Internal.withTraceMTime art traceFile
   else
     let art ←
       if (← savedTrace.replayIfUpToDate file depTrace) then
@@ -1173,7 +1217,7 @@ public def buildArtifactUnlessUpToDate
       else
         doBuild depTrace traceFile
     setTrace art.trace
-    setMTime art traceFile
+    Internal.withTraceMTime art traceFile
 where
   doBuild depTrace traceFile :=
     inline <| buildAction depTrace traceFile do
@@ -1182,14 +1226,90 @@ where
       clearFileHash file
       removeFileIfExists traceFile
       computeArtifact file ext text
-  setMTime art traceFile := do
-    match (← getMTime traceFile |>.toBaseIO) with
-    | .ok mtime =>
-      return {art with mtime}
-    | .error (.noFileOrDirectory ..) => -- trace file may not exist
-      return art
-    | .error e =>
-      error s!"failed to retrieve artifact modification time: {e}"
+
+/-! ### Service mode's native artifacts
+
+The Lake cache's side of a native artifact's build on the build service (`Lake.buildNativeArtifact`), which keeps
+the service's record (`RemoteExec.Record`) beside the artifact in its trace and its cache entry.
+-/
+
+/--
+**For internal use only.**
+The service record (`BuildMetadata.remote?`) of a saved trace if it describes `file`: the file exists and has the
+hash of the trace's output (see `ToOutputJson Artifact`). A record that does not describe the file is no record.
+-/
+public def SavedTrace.fileRecord? (self : SavedTrace) (file : FilePath) : JobM (Option RemoteExec.Record) := do
+  let .ok data := self | return none
+  let some record := data.remote? | return none
+  let some descr := self.artifactDescr? | return none
+  unless (← file.pathExists) do return none
+  return if (← fetchFileHash file) == descr.hash then some record else none
+
+/--
+**For internal use only.**
+The service record of a saved trace that is up to date with `inputHash`, if it describes `file`
+(`SavedTrace.fileRecord?`).
+-/
+public def SavedTrace.serviceRecord? (self : SavedTrace) (inputHash : Hash) (file : FilePath) :
+    JobM (Option RemoteExec.Record) := do
+  let .ok data := self | return none
+  unless data.depHash == inputHash do return none
+  self.fileRecord? file
+
+/--
+**For internal use only.**
+Restores the artifact of `inputHash` from the Lake cache to `file`, whose trace file is `traceFile` (`getArtifacts?`,
+without the shared remote cache) if the saved trace or the cache entry that names it has a service record, with the
+executable bit that the record gives its output `recordExt`, and writes the trace as `buildArtifactUnlessUpToDate`
+does. Returns the artifact and its record.
+-/
+public def restoreServiceArtifact?
+  (pkg : Package) (inputHash : Hash) (savedTrace : SavedTrace) (file traceFile : FilePath) (recordExt : String)
+: JobM (Option (Artifact × RemoteExec.Record)) := do
+  unless (← pkg.isArtifactCacheReadable) do return none
+  let target ← currentRemoteCacheTarget
+  let some (hit : CacheHit (XArtifact false)) ←
+      getArtifacts? inputHash savedTrace pkg target none (remoteRead := false)
+    | return none
+  let some record := hit.remote? | return none
+  unless (← savedTrace.replayCachedIfUpToDate inputHash) do
+    removeFileIfExists file
+    writeFetchTrace traceFile inputHash (toJson hit.arts.descr) hit.log (remote? := record)
+  return some (← restoreArtifact file hit.arts (record.executable recordExt), record)
+
+/--
+**For internal use only.**
+Saves `file`, which holds the output of a build service action, to the Lake cache as `buildArtifactUnlessUpToDate`
+saves a build's artifact, with the service record `record` and the build's `log` in its cache entry. The artifact
+keeps the path `file` and the executable bit `exe`. Without a writable Lake cache, it is only computed.
+-/
+public def cacheServiceArtifact
+  (pkg : Package) (inputHash : Hash) (file : FilePath) (ext : String) (exe : Bool)
+  (record : RemoteExec.Record) (log : Log)
+: JobM Artifact := do
+  unless (← pkg.isArtifactCacheWritable) do
+    return ← computeArtifact file ext
+  let art ← cacheArtifact file ext (exe := exe) (useLocalFile := true)
+  unless art.cacheSkipped do
+    (← getLakeCache).writeOutputs pkg.cacheScope inputHash art.descr (log := log) (remote? := some record)
+  return art
+
+/--
+**For internal use only.**
+The artifact of `file`, whose saved trace is up to date with `inputHash` and has the service record `record` that
+describes `file` (`SavedTrace.serviceRecord?`), as `buildArtifactUnlessUpToDate` replays an up-to-date artifact: with a
+writable Lake cache, from the cache entry that the trace names (`getArtifactsUsingTrace?`, which writes the
+input's cache entry only if it is missing). When the cache holds no such entry, or is not writable, as
+`cacheServiceArtifact` saves `file` with the trace's log.
+-/
+public def replayServiceArtifact
+  (pkg : Package) (inputHash : Hash) (savedTrace : SavedTrace) (file : FilePath) (ext : String) (exe : Bool)
+  (record : RemoteExec.Record)
+: JobM Artifact := do
+  if (← pkg.isArtifactCacheWritable) then
+    if let some (art : XArtifact exe) ← getArtifactsUsingTrace? inputHash savedTrace pkg then
+      return ← restoreArtifact file art exe
+  cacheServiceArtifact pkg inputHash file ext exe record savedTrace.log
 
 /--
 Build `file` using `build` after `dep` completes if the dependency's
@@ -1315,6 +1435,50 @@ def placeFileAs (src name tmp : FilePath) : JobM FilePath := do
 
 /--
 **For internal use only.**
+Mixes the trace of an object file that `Internal.buildLeanO` builds into the current job's trace, but for the
+identity of the C compiler (`addCcTrace`), which `Internal.buildLeanO` adds last.
+-/
+public def Internal.addLeanOTrace
+  (traceArgs : Array String) (leanIncludeDir? : Option (FilePath × BuildTrace))
+: JobM PUnit := do
+  addLeanTrace
+  if let some (_, trace) := leanIncludeDir? then
+    -- Lean-produced C files contain `#include <lean/lean.h>`.
+    -- Usually this dependency is captured by the Lean trace, but not with an override.
+    addTrace trace
+  addPureTrace traceArgs "traceArgs"
+  addPlatformTrace -- object files are platform-dependent artifacts
+  let lean ← getLeanInstall
+  -- With the toolchain's own compiler, the flags name the Lean installation's directory
+  addPureTrace (lean.ccFlags.map (·.replace lean.sysroot.toString "<sysroot>")) "ccFlags"
+
+/--
+**For internal use only.**
+The arguments of the Lean toolchain's C compiler for an object file that `Internal.buildLeanO` builds, but for the
+input and output files.
+-/
+public def Internal.leanOArgs
+  (lean : LeanInstall) (weakArgs traceArgs : Array String) (leanIncludeDir? : Option (FilePath × BuildTrace))
+: Array String :=
+  let includeDir := leanIncludeDir?.elim lean.includeDir (·.1)
+  #["-I", includeDir.toString] ++ lean.ccFlags ++ weakArgs ++ traceArgs
+
+/--
+**For internal use only.**
+Compiles the object file `oFile` of a Lean C file `srcFile` with the Lean toolchain's C compiler and the arguments
+`args` (`Internal.leanOArgs`), under the path `srcName?` if it is set (see `Internal.buildLeanO`).
+-/
+public def Internal.compileLeanO
+  (oFile srcFile : FilePath) (args : Array String) (srcName? : Option FilePath)
+: JobM PUnit := do
+  -- The temporary copy is named after this job's object file, so the jobs that compile one
+  -- source (with and without exports) never share it
+  let tmp := FilePath.mk s!"{oFile}.{← IO.Process.getPID}.src.tmp"
+  let srcFile ← srcName?.elim (pure srcFile) (placeFileAs srcFile · tmp)
+  compileO oFile srcFile args (← getLeanInstall).cc
+
+/--
+**For internal use only.**
 Build an object file from a source fie job (i.e, a `lean -c` output)
 using the Lean toolchain's C compiler.
 
@@ -1330,25 +1494,12 @@ public def Internal.buildLeanO
   (srcName? : Option FilePath := none)
 : SpawnM (Job FilePath) := do
   let lean ← getLeanInstall
-  let includeDir := leanIncludeDir?.elim lean.includeDir (·.1)
-  let args := #["-I", includeDir.toString] ++ lean.ccFlags ++ weakArgs ++ traceArgs
+  let args := Internal.leanOArgs lean weakArgs traceArgs leanIncludeDir?
   (← withCcIdentity lean.cc args srcJob).mapM fun srcFile => do
-    addLeanTrace
-    if let some (_, trace) := leanIncludeDir? then
-      -- Lean-produced C files contain `#include <lean/lean.h>`.
-      -- Usually this dependency is captured by the Lean trace, but not with an override.
-      addTrace trace
-    addPureTrace traceArgs "traceArgs"
-    addPlatformTrace -- object files are platform-dependent artifacts
-    -- With the toolchain's own compiler, the flags name the Lean installation's directory
-    addPureTrace (lean.ccFlags.map (·.replace lean.sysroot.toString "<sysroot>")) "ccFlags"
+    Internal.addLeanOTrace traceArgs leanIncludeDir?
     addCcTrace lean.cc args (ccLanguage lean.cc srcFile)
     let art ← buildArtifactUnlessUpToDate oFile (ext := "o") do
-      -- The temporary copy is named after this job's object file, so the jobs that compile one
-      -- source (with and without exports) never share it
-      let tmp := FilePath.mk s!"{oFile}.{← IO.Process.getPID}.src.tmp"
-      let srcFile ← srcName?.elim (pure srcFile) (placeFileAs srcFile · tmp)
-      compileO oFile srcFile args lean.cc
+      Internal.compileLeanO oFile srcFile args srcName?
     return art.path
 
 /--
@@ -1491,6 +1642,26 @@ public def buildSharedLib
       linker plugin linkDeps macosxDeploymentTarget?
 
 /--
+**For internal use only.**
+Mixes the trace of a shared library that `buildLeanSharedLibSync` links into the current job's trace.
+-/
+public def Internal.addLeanSharedLibTrace : JobM PUnit := do
+  addLeanTrace
+  addPlatformTrace -- shared libraries are platform-dependent artifacts
+
+/--
+**For internal use only.**
+Links the shared library `libFile` with the Lean toolchain's linker (see `buildLeanSharedLibSync`).
+-/
+public def Internal.linkLeanSharedLib
+  (libFile : FilePath) (linkObjs : Array FilePath) (linkLibs : Array Dynlib)
+  (args : Array String := #[]) (linkDeps := Platform.isWindows)
+  (macosxDeploymentTarget? : Option String := none)
+: JobM PUnit := do
+  let args ← mkLeanLinkArgs linkObjs linkLibs args linkDeps (sharedLean := true)
+  compileSharedLib libFile args (← getLeanCc) macosxDeploymentTarget?
+
+/--
 Build a shared library linking Lean by using the Lean toolchain's linker.
 
 The library will statically link in `linkObjs` (e.g., object files or
@@ -1509,13 +1680,11 @@ public def buildLeanSharedLibSync
   (linkDeps := Platform.isWindows)
   (macosxDeploymentTarget? : Option String := none)
 : JobM Dynlib := do
-  addLeanTrace
-  addPlatformTrace -- shared libraries are platform-dependent artifacts
+  Internal.addLeanSharedLibTrace
   -- Lean plugins are required to have a specific name
   -- and thus need to restored from the cache with that name
   let art ← buildArtifactUnlessUpToDate libFile (ext := sharedLibExt) (restore := true) do
-    let args ← mkLeanLinkArgs linkObjs linkLibs args linkDeps (sharedLean := true)
-    compileSharedLib libFile args (← getLeanCc) macosxDeploymentTarget?
+    Internal.linkLeanSharedLib libFile linkObjs linkLibs args linkDeps macosxDeploymentTarget?
   return {name := libName, path := art.path, deps := linkLibs, plugin}
 
 /--

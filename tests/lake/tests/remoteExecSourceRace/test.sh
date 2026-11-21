@@ -12,6 +12,7 @@ export LAKE_REMOTE_EXEC_TOOLCHAIN=sha256:000000000000000000000000000000000000000
 export LAKE_REMOTE_EXEC_SYSROOT="$(lean --print-prefix)"
 export LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true LAKE_CACHE_DIR="$W/cache"
 export FAKE_CAS="$W/cas" FAKE_LOG="$W/fake.log" FAKE_INPUT_BARRIER="$W/input"
+export LAKE_REMOTE_EXEC_LOG="$W/race.jsonl"
 # The service reads B after Lake hashed A. Neither the trace, the cache mapping nor -o may
 # record B as A's output. The barrier orders the edit before the fake reads any input.
 "$LAKE" -d "$W/race" build P -o "$W/outputs.jsonl" > "$W/build.log" 2>&1 &
@@ -38,3 +39,6 @@ if out.exists():
     assert len(entries) == 0, f'stale -o export entries survived: {entries}'
 print('source race: no stale trace, local mapping or -o export')
 PY
+# Row L29: the raced module's one line is `error` with code `source-changed`
+test_cmd python3 "$HERE/../remoteExec/lines_check.py" "$W/race.jsonl" --modules P \
+  --expect 'P:result=error,code=source-changed'

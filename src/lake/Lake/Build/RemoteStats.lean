@@ -40,7 +40,7 @@ public instance : ToString RemoteState := ⟨RemoteState.toString⟩
 
 /--
 Counts for a build's end-of-build line: Lean module results, and separately C-object and
-plugin-link results ("other actions"). A result is `cached` (served by the service), `manifest`
+shared-library results ("other actions"). A result is `cached` (served by the service), `manifest`
 (a subset of cached, found through the manifest), `executed` (the service ran the action for this
 build, a compile that failed there included; an action run again counts once per run), or `local`
 (compiled on this machine by the fallback `local`, because the service did not answer or its
@@ -73,6 +73,15 @@ public def addLean (self : RemoteStats) (cached : Bool) (fromManifest := false) 
 /-- Records one locally compiled Lean module (the fallback). -/
 public def addLeanLocal (self : RemoteStats) : RemoteStats :=
   {self with localBuilt := self.localBuilt + 1}
+
+/-- Records one result of the service for a C object or a shared library (`other actions`). -/
+public def addOther (self : RemoteStats) (cached : Bool) : RemoteStats :=
+  if cached then {self with otherCached := self.otherCached + 1}
+  else {self with otherExecuted := self.otherExecuted + 1}
+
+/-- Records one C object or shared library that the fallback built on this machine. -/
+public def addOtherLocal (self : RemoteStats) : RemoteStats :=
+  {self with otherLocal := self.otherLocal + 1}
 
 /-- Records one unavailable-service (`fail`) or toolchain-mismatch (`wait` or `fail`) failure. -/
 public def addUnavailableFailure (self : RemoteStats) : RemoteStats :=

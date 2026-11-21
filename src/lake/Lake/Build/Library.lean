@@ -8,6 +8,7 @@ module
 prelude
 public import Lake.Config.FacetConfig
 import Lake.Build.Common
+import Lake.Build.RemoteExec
 import Lake.Build.Targets
 import Lake.Build.Job.Register
 import Lake.Build.Target.Fetch
@@ -151,6 +152,10 @@ public def LeanLib.staticExportFacetConfig : LibraryFacetConfig staticExportFace
 
 /-! ## Build Shared Lib -/
 
+/--
+Build the library's shared library. In service mode, the build service links it (`LinkSharedLibrary`,
+`buildNativeSharedLib`), unless the library has `moreLinkObjs` or its package has an `extern_lib`.
+-/
 def LeanLib.recBuildShared (self : LeanLib) : FetchM (Job Dynlib) := do
   withRegisterJob s!"{self.name}:shared" <| withCurrPackage self.pkg do
   let mods ← (← self.modules.fetch).await
@@ -175,8 +180,12 @@ def LeanLib.recBuildShared (self : LeanLib) : FetchM (Job Dynlib) := do
     let jobs ← self.pkg.externLibs.foldlM
       (·.push <$> ·.dynlib.fetch) jobs
     return jobs
-  buildLeanSharedLib self.libName self.sharedLibFile objJobs libJobs
-    self.weakLinkArgs self.linkArgs self.isPlugin
+  if !self.moreLinkObjs.isEmpty || !self.pkg.externLibs.isEmpty then
+    return ← buildLeanSharedLib self.libName self.sharedLibFile objJobs libJobs
+      self.weakLinkArgs self.linkArgs self.isPlugin
+  buildNativeSharedLib .linkSharedLibrary s!"{self.pkg.prettyName}/{self.name}:shared"
+    (remoteBuildPath self.pkg self.sharedLibFile) self.libName self.sharedLibFile objJobs libJobs self.weakLinkArgs
+    self.linkArgs self.isPlugin
 
 /-- The `LibraryFacetConfig` for the builtin `sharedFacet`. -/
 public def LeanLib.sharedFacetConfig : LibraryFacetConfig sharedFacet :=

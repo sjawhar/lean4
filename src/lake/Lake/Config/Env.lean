@@ -25,11 +25,13 @@ namespace Lake
 What a build does when the build service does not answer (`LAKE_REMOTE_EXEC_FALLBACK`): when the
 `hello` that decides finds it unreachable, or a request still answers `UNAVAILABLE` after the
 daemon's own retries. A result of the service (a failed compile, `OOM`, `TIMEOUT`, `DISK_LIMIT`) is
-never a reason to fall back, and a service that refuses (another toolchain) fails whatever this says.
+never a reason to fall back, and a refused service (one that did not verify its toolchain) fails
+whatever this says.
 -/
 public inductive RemoteFallback
-  /-- Compile on this machine and publish nothing (the default; design "Failure"). After the service
-  did not answer once, every later module of the build compiles locally without asking it again. -/
+  /-- Build on this machine and publish nothing (the default). While the service does not answer,
+  every later job builds here at once without a request, and the re-probe timer asks the service
+  again (`Lake.startProbeTimer`). -/
   | compileLocally
   /-- Never compile on this machine: wait for the service, probing it again after 1, 2, 4 … 30 s. -/
   | wait
@@ -47,6 +49,12 @@ public inductive RemoteMaterialize
   /-- Only for processes Lake itself starts that read them (`none`): `setup-file` prints absent paths. -/
   | never
   deriving Inhabited, DecidableEq, Repr
+
+/-- The default of `LAKE_REMOTE_EXEC_TIMEOUT`, in seconds. -/
+public def defaultRemoteTimeoutSecs : Nat := 3600
+
+/-- The largest value of `LAKE_REMOTE_EXEC_TIMEOUT`, in seconds. -/
+public def maxRemoteTimeoutSecs : Nat := 21600
 
 /-- The build service settings of this Lake process (`LAKE_REMOTE_EXEC*`, contract C5.1). -/
 public structure RemoteExecConfig where
@@ -66,6 +74,8 @@ public structure RemoteExecConfig where
   manifestOut? : Option System.FilePath := none
   skipCache : Bool := false
   rerunFailures : Bool := false
+  /-- The longest a service action may run, in seconds (`LAKE_REMOTE_EXEC_TIMEOUT`). -/
+  timeoutSecs : Nat := defaultRemoteTimeoutSecs
   deriving Inhabited, Repr
 
 /-- A Lake environment. -/
@@ -409,8 +419,16 @@ where
       | some "all" => pure .all
       | some "none" => pure .never
       | some v => throw s!"'LAKE_REMOTE_EXEC_MATERIALIZE' must be needed, all or none, got '{v}'"
+    let timeoutSecs : Nat ← match ← get "LAKE_REMOTE_EXEC_TIMEOUT" with
+      | none => pure defaultRemoteTimeoutSecs
+      | some v =>
+        -- ASCII digits only: `String.toNat?` also reads `_` separators
+        let n := if v.all Char.isDigit then v.toNat?.getD 0 else 0
+        if 0 < n ∧ n ≤ maxRemoteTimeoutSecs then pure n else
+          throw s!"'LAKE_REMOTE_EXEC_TIMEOUT' must be a whole number of seconds from 1 to {maxRemoteTimeoutSecs}, \
+            got '{v}'"
     return some {
-      endpoint, fallback, materialize
+      endpoint, fallback, materialize, timeoutSecs
       toolchain? := ← get "LAKE_REMOTE_EXEC_TOOLCHAIN"
       sysroot? := (← get "LAKE_REMOTE_EXEC_SYSROOT").map FilePath.mk
       cc := (← get "LAKE_REMOTE_EXEC_CC").getD "/usr/bin/cc"
