@@ -1461,8 +1461,7 @@ def remoteHead (presetup : ModulePreSetup) (s : RemoteSession) : JobM RemoteHead
   -- In `Workspace.leanPath` order (`Config/Workspace.lean:356-357`), each package's dir rewritten.
   let leanPath := String.intercalate ":" <|
     ws.packages.foldl (fun dirs pkg => s!"lib/{pkg.keyName}" :: dirs) []
-  let platform := #[("arch", "x86_64"), ("memory", "std"), ("os", "linux"), ("toolchain", s.toolchain)]
-  return {platform, sysroot := sysrootStr, leanPath, plugins, dynlibs, inputFiles}
+  return {platform := s.platform, sysroot := sysrootStr, leanPath, plugins, dynlibs, inputFiles}
 
 /-- The exact module-compile `run` request (contract C2.1): relative paths, `setup.json` inline,
 the toolchain as a platform property. -/
@@ -1517,30 +1516,6 @@ def Module.remoteRunRequest (mod : Module) (presetup : ModulePreSetup) (head : R
     ("timeoutSecs", (toJson timeoutSecs : Json)),
     ("mnemonic", "LeanModule"),
     ("target", mod.name.toString)]
-
-/--
-Leaves the build action of `fetchRemote` after a request answers `UNAVAILABLE`, either after the
-daemon's retries (contract C5.1) or because the bridge rejected its `hello`. `epoch` is `remoteEpoch`,
-read just before that request was sent. A failed bridge `hello` also rejects requests as
-`UNAVAILABLE`; its saved verdict distinguishes an unverified service (always fatal) from a confirmed
-toolchain mismatch (local fallback only under `local`, otherwise exit 75). An unavailable service
-under `fail` also errors with `msg`, counted for exit 75 (`recordUnavailableFailure`). These failures
-put their code in `outcome`. Otherwise it notes `msg` and `epoch` in `why` and fails without a log
-entry, from `pos`, where the action started; `fetchRemote` drops what the action logged and sends the
-request again or takes the fallback. Either way the action writes no trace.
--/
-def remoteUnavailable (s : RemoteSession) (outcome : IO.Ref RemoteOutcome)
-    (why : IO.Ref (Option (String × Nat))) (pos : Log.Pos) (epoch : Nat) (msg : String) : JobM α := do
-  match ← remoteDecision? with
-  | some (.refused refusal) => failRefused s outcome refusal
-  | some (.toolchainMismatch mismatch) =>
-    if s.cfg.fallback != .compileLocally then
-      failMismatch s outcome mismatch
-  | _ => pure ()
-  if s.cfg.fallback == .fail then
-    failUnavailable outcome msg
-  why.set (some (msg, epoch))
-  throw pos
 
 /-- The outputs of a module that a service action made (`Module.buildRemote`): their artifacts, the
 service's record of them, and the module's line. -/
@@ -1661,10 +1636,10 @@ with the service's record of the outputs. Returns `none` when the service is una
 confirmed toolchain mismatch and `LAKE_REMOTE_EXEC_FALLBACK` is `local` (`useService`,
 `remoteUnavailable`): the caller then compiles on this machine, where imports' outputs were
 materialized. A request that answers `UNAVAILABLE` after a probe found the service again (the epoch
-moved since it was sent) is sent again. Under `wait`, an unavailable request is retried once the
-service answers (`awaitServiceAgain`); a confirmed mismatch fails with exit 75. A result of the
-service (a nonzero exit, `OOM`, `TIMEOUT`, `DISK_LIMIT`) and every other error are the module's
-result, never a reason to fall back. Each path sets the module's line (`line`).
+moved since it was sent) is sent again (`retryWhileUnavailable`). Under `wait`, an unavailable
+request is retried once the service answers (`awaitServiceAgain`); a confirmed mismatch fails with
+exit 75. A result of the service (a nonzero exit, `OOM`, `TIMEOUT`, `DISK_LIMIT`) and every other
+error are the module's result, never a reason to fall back. Each path sets the module's line (`line`).
 -/
 def Module.fetchRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSession) (line : ModuleLine)
     (savedTrace : SavedTrace) (fromCache : SavedTrace → JobM (Option ModuleOutputArtifacts)) :
@@ -1689,21 +1664,12 @@ def Module.fetchRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSes
     line.outcome.set (.error "no-build")
   else if !(← useService s line.outcome) then
     return none
-  repeat
-    let why ← IO.mkRef (none : Option (String × Nat))
-    try
-      let b ← buildAction depTrace mod.traceFile (mod.buildRemote presetup s line.outcome why)
+  let some b ← retryWhileUnavailable s line.outcome fun why =>
+      buildAction depTrace mod.traceFile (mod.buildRemote presetup s line.outcome why)
         (remote? := (some ·.record))
-      line.outcome.set b.outcome
-      return some (← mod.cacheRemoteOutputs presetup inputHash b.arts b.record)
-    catch pos =>
-      let some (_, epoch) ← why.get | throw pos
-      dropLogFrom pos
-      if s.cfg.fallback == .wait then
-        awaitServiceAgain s line.outcome epoch
-      else if (← remoteEpoch) == epoch then
-        return none
-  return none
+    | return none
+  line.outcome.set b.outcome
+  return some (← mod.cacheRemoteOutputs presetup inputHash b.arts b.record)
 
 end RemoteExec
 
@@ -3005,6 +2971,7 @@ public def Module.bcFacetConfig : ModuleFacetConfig bcFacet :=
 /--
 Recursively build the module's object file from its C file produced by `lean`
 with `-DLEAN_EXPORTING` set, which exports Lean symbols defined within the C files.
+In service mode, the build service compiles it (`buildModuleO`).
 -/
 def Module.recBuildLeanCToOExport (self : Module) : FetchM (Job FilePath) := do
   let suffix := if (← getIsVerbose) then " (with exports)" else ""
@@ -3012,7 +2979,8 @@ def Module.recBuildLeanCToOExport (self : Module) : FetchM (Job FilePath) := do
   -- TODO: add option to pass a target triplet for cross compilation
   let leancArgs := self.leancArgs ++ #["-DLEAN_EXPORTING"]
   let leanIncludeDir? ← self.pkg.getLeanIncludeDir?
-  Internal.buildLeanO self.coExportFile (← self.c.fetch) self.weakLeancArgs leancArgs leanIncludeDir?
+  buildModuleO self "c.o.export" self.coExportFile (← self.c.fetch) self.weakLeancArgs leancArgs
+    leanIncludeDir?
 
 /-- The `ModuleFacetConfig` for the builtin `coExportFacet`. -/
 public def Module.coExportFacetConfig : ModuleFacetConfig coExportFacet :=
@@ -3021,13 +2989,15 @@ public def Module.coExportFacetConfig : ModuleFacetConfig coExportFacet :=
 /--
 Recursively build the module's object file from its C file produced by `lean`.
 This version does not export any Lean symbols.
+In service mode, the build service compiles it (`buildModuleO`).
 -/
 def Module.recBuildLeanCToONoExport (self : Module) : FetchM (Job FilePath) := do
   let suffix := if (← getIsVerbose) then " (without exports)" else ""
   withRegisterJob s!"{self.name}:c.o{suffix}" <| withCurrPackage self.pkg do
   -- TODO: add option to pass a target triplet for cross compilation
   let leanIncludeDir? ← self.pkg.getLeanIncludeDir?
-  Internal.buildLeanO self.coNoExportFile (← self.c.fetch) self.weakLeancArgs self.leancArgs leanIncludeDir?
+  buildModuleO self "c.o.noexport" self.coNoExportFile (← self.c.fetch) self.weakLeancArgs
+    self.leancArgs leanIncludeDir?
 
 /-- The `ModuleFacetConfig` for the builtin `coNoExportFacet`. -/
 public def Module.coNoExportFacetConfig : ModuleFacetConfig coNoExportFacet :=
@@ -3120,6 +3090,7 @@ public def Module.linkInfoNoExportFacetConfig : ModuleFacetConfig linkInfoNoExpo
 /--
 Recursively build the shared library of a module
 (e.g., for `--load-dynlib` or `--plugin`).
+In service mode, the build service links it (`LinkShared`, `buildNativeSharedLib`).
 -/
 def Module.recBuildDynlib (mod : Module) : FetchM (Job Dynlib) :=
   withRegisterJob s!"{mod.name}:dynlib" <| withCurrPackage mod.pkg do
@@ -3141,8 +3112,8 @@ def Module.recBuildDynlib (mod : Module) : FetchM (Job Dynlib) :=
     let libJobs ← mod.pkg.externLibs.foldlM
       (·.push <$> ·.dynlib.fetch) libJobs
     return libJobs
-  buildLeanSharedLib mod.dynlibName mod.dynlibFile objJobs libJobs
-    mod.weakLinkArgs mod.linkArgs (plugin := true)
+  buildNativeSharedLib .linkShared s!"{mod.name}:dynlib" s!"lib/{mod.pkg.keyName}/{mod.dynlibName}.{sharedLibExt}"
+    mod.dynlibName mod.dynlibFile objJobs libJobs mod.weakLinkArgs mod.linkArgs (plugin := true)
 
 /-- The `ModuleFacetConfig` for the builtin `dynlibFacet`. -/
 public def Module.dynlibFacetConfig : ModuleFacetConfig dynlibFacet :=
