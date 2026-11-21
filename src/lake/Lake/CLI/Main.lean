@@ -1066,11 +1066,9 @@ protected def build : CliM PUnit := do
   -- here once, and the build still runs, so that each module writes its line. Lake then exits with
   -- code 1 for a refused service and 75 for a mismatch, also when no module needed a build.
   let failure? ← startRemoteSession ws
-  if let some msg := failure? then logError msg
-  let refused := (← remoteDecision?) matches some (.refused _)
+  if let some (msg, _) := failure? then logError msg
   ws.runBuild (buildSpecs specs) {buildConfig with forgetContext := opts.oneShot}
-  if failure?.isSome then
-    exit (if refused then 1 else remoteUnavailableCode)
+  if let some (_, code) := failure? then exit code
 
 protected def checkBuild : CliM PUnit := do
   processOptions lakeOption
