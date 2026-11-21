@@ -33,7 +33,8 @@ mkp t3
 touch "$GO"
 LAKE_CACHE_DIR="$CASE_DIR/cache3" "$LAKE" -d t3 build P.X > /dev/null 2>&1
 tamper t3
-if ! LAKE_CACHE_DIR="$CASE_DIR/cache4" "$LAKE" -d t3 build P.X 2>&1 | grep -qF 'does not match its trace'; then
+LAKE_CACHE_DIR="$CASE_DIR/cache4" "$LAKE" -d t3 build P.X > "$CASE_DIR/check.log" 2>&1
+if ! grep -qF 'does not match its trace' "$CASE_DIR/check.log"; then
   echo 'SKIP: no check of the outputs against the trace in this Lake'
   exit 0
 fi
