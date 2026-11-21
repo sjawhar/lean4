@@ -285,6 +285,23 @@ row_S10f() (
   match_text "lake: remote: unreachable; 0 cached (0 from manifest), 0 executed, 1 local;" "$D/out"
 )
 
+# S10n: S10s with `lake build --no-build` of Rx.A, which needs a build: Rx.A's job first waits for the library's
+# extra target `slow` (5 s), so the build ends while the probe's `hello` is held. Lake exits as it does without a
+# held probe, with the code of `--no-build` (3) and its end-of-build line, within 3 s of the build's end
+row_S10n() (
+  local rc=0
+  enter_row S10n; held_bridges
+  rm lakefile.toml
+  printf 'import Lake\nopen Lake DSL\npackage rx\ntarget slow : Unit := Job.async (prio := .dedicated) do\n  IO.sleep 5000\nlean_lib Rx where\n  extraDepTargets := #[`slow]\n' \
+    > lakefile.lean
+  lbuild --no-build Rx.A || rc=$?
+  test_exp "$rc" = 3
+  pcheck "exit=$(cat "$D/exit")"
+  pcheck held hellos=1
+  lines --modules Rx.A --expect 'Rx.A:result=error,code=no-build'
+  match_text "lake: remote: unreachable; 0 cached (0 from manifest), 0 executed, 0 local;" "$D/out"
+)
+
 # S11: under `fail` and `wait` no timer runs. Under `fail` Rx.A fails at once, and a target that sleeps 5 s keeps
 # the build going: only the decision says `hello`. Under `wait` the probes are `awaitService`'s: one at a time, 1 s
 # and then 2 s apart, and after the one that finds the service only the bridge that carries the requests says
@@ -349,4 +366,4 @@ row_k5() (
   pcheck "promoted=${pairs#,}"
 )
 
-run_rows S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S10w S10t S10s S10f S11 S12 k5
+run_rows S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S10w S10t S10s S10f S10n S11 S12 k5
