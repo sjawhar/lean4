@@ -74,6 +74,15 @@ public def addLean (self : RemoteStats) (cached : Bool) (fromManifest := false) 
 public def addLeanLocal (self : RemoteStats) : RemoteStats :=
   {self with localBuilt := self.localBuilt + 1}
 
+/-- Records one result of the service for a C object or a shared library (`other actions`). -/
+public def addOther (self : RemoteStats) (cached : Bool) : RemoteStats :=
+  if cached then {self with otherCached := self.otherCached + 1}
+  else {self with otherExecuted := self.otherExecuted + 1}
+
+/-- Records one C object or shared library that the fallback built on this machine. -/
+public def addOtherLocal (self : RemoteStats) : RemoteStats :=
+  {self with otherLocal := self.otherLocal + 1}
+
 /-- Records one unavailable-service (`fail`) or toolchain-mismatch (`wait` or `fail`) failure. -/
 public def addUnavailableFailure (self : RemoteStats) : RemoteStats :=
   {self with unavailableFailures := self.unavailableFailures + 1}
