@@ -442,6 +442,15 @@ public instance : FromJson Record := ⟨fun j => do
   let o ← JsonObject.fromJson? j
   return {action := ← o.get "action", outputs := ← o.get "outputs"}⟩
 
+/-- The record of the action `action` with `outputs`, each output's name, digest and executable bit. -/
+public def Record.ofOutputs (action : String) (outputs : Array (String × Digest × Bool)) : Record where
+  action
+  outputs := outputs.foldl (init := {}) fun outs (name, digest, executable) => outs.insert name {digest, executable}
+
+/-- Whether the record's output `name` is executable (`false` when the record has no such output). -/
+public def Record.executable (r : Record) (name : String) : Bool :=
+  (r.outputs.get? name).any (·.executable)
+
 /-- The result of a `materialize` request. -/
 public structure MaterializeResult where
   written : Nat := 0

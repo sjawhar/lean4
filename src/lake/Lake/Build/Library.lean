@@ -169,9 +169,9 @@ def LeanLib.recBuildShared (self : LeanLib) : FetchM (Job Dynlib) := do
   if !self.moreLinkObjs.isEmpty || !self.pkg.externLibs.isEmpty then
     return ← buildLeanSharedLib self.libName self.sharedLibFile objJobs libJobs
       self.weakLinkArgs self.linkArgs self.isPlugin
-  let rel := s!"native/{self.pkg.keyName}/{self.pkg.config.nativeLibDir.normalize / self.sharedLibFileName}"
-  buildNativeSharedLib .linkSharedLibrary s!"{self.pkg.prettyName}/{self.name}:shared" rel self.libName
-    self.sharedLibFile objJobs libJobs self.weakLinkArgs self.linkArgs self.isPlugin
+  buildNativeSharedLib .linkSharedLibrary s!"{self.pkg.prettyName}/{self.name}:shared"
+    (remoteBuildPath self.pkg self.sharedLibFile) self.libName self.sharedLibFile objJobs libJobs self.weakLinkArgs
+    self.linkArgs self.isPlugin
 
 /-- The `LibraryFacetConfig` for the builtin `sharedFacet`. -/
 public def LeanLib.sharedFacetConfig : LibraryFacetConfig sharedFacet :=

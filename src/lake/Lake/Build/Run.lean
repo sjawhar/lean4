@@ -513,12 +513,6 @@ def runQueuedPush (ws : Workspace) (logger : MonadLog BaseIO) : BaseIO Unit := d
   | .ok rc => logger.logEntry (.warning s!"`lake cache push` exited with code {rc}")
   | .error e => logger.logEntry (.warning s!"could not run `lake cache push`: {e}")
 
-/--
-Exit code of a build whose every failure is an unavailable service under `fail`, or a confirmed
-toolchain mismatch under `wait` or `fail`: 75 (`EX_TEMPFAIL`), distinct from a broken build.
--/
-public def remoteUnavailableCode : ExitCode := 75
-
 def failedOnlyForService (bctx : BuildContext) (result : MonitorResult) : BaseIO Bool := do
   let some rcfg := bctx.workspace.lakeEnv.remoteExec?
     | return false
