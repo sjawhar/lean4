@@ -596,6 +596,10 @@ public def appendRemoteLog (path : FilePath) (kind target : String) (start : Rem
     h.putStr text
     h.flush
 
+/-- The message that the job for `target` could not append its line to `LAKE_REMOTE_EXEC_LOG` (`e`). -/
+public def remoteLineAppendFailure (target : String) (e : IO.Error) : String :=
+  s!"{target}: could not append its line to LAKE_REMOTE_EXEC_LOG: {e}"
+
 /--
 Runs `act`, the work of a job for `target` that writes its one line of `LAKE_REMOTE_EXEC_LOG` with `write`: when `act`
 fails, the line is `error` with code `canceled` for a canceled job, else `outcome`; when `act` returns a result that
@@ -605,7 +609,7 @@ public def withRemoteLine (target : String) (write : RemoteOutcome → IO Unit) 
     (act : JobM α) (done : α → Bool := fun _ => true) : JobM α := do
   let writeLine (o : RemoteOutcome) : JobM Unit := do
     if let .error e ← (write o).toBaseIO then
-      error s!"{target}: could not append its line to LAKE_REMOTE_EXEC_LOG: {e}"
+      error (remoteLineAppendFailure target e)
   let r ← tryCatch act fun e => do
     writeLine (← if (← getThe JobState).canceled then pure (RemoteOutcome.error "canceled") else outcome.get)
     throw e
@@ -1388,8 +1392,7 @@ def NativeAction.fetch (act : NativeAction) (s : RemoteSession) (build : JobM PU
   -- In every mode; a file with no record goes to the service only as a service action's input (its promotion)
   if (← savedTrace.fileUpToDate inputHash file) then
     discard <| savedTrace.replayCachedIfUpToDate inputHash
-    let record? := savedTrace.remote?
-    let art ← replayServiceArtifact pkg inputHash savedTrace file ext (record?.any (·.executable name)) record?
+    let (art, record?) ← replayServiceArtifact pkg inputHash savedTrace file ext name
     outcome.set (.ofRecord "local-cache" record?)
     return ← finish art record?
   if let some (art, record) ← restoreServiceArtifact? pkg inputHash savedTrace file traceFile name then

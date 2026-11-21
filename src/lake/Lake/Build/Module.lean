@@ -1392,13 +1392,14 @@ def ModuleLine.write (line : ModuleLine) (mod : Module) (o : RemoteOutcome) : IO
 /--
 Writes the line of a module job that ended before `fetchCore` wrote one: its presetup failed, so
 `Job.bindM` never ran the job's work, or `--fail-fast` canceled the job before or between its runs. The
-line is `import-failed` when the job of one of the module's direct imports ended in an error, else
-`error` with code `canceled` for a canceled job, else `error` with code `setup`. It reads only jobs that
-have finished, and waits for none: the module's own job (a module that imports itself) is the one this
-ends, and an import whose failure failed the presetup has finished, or its presetup has (then its job
-fails too). The line is written before any reader sees the job's result. A module whose import failed is
-no failure of its own (exit code 75 counts the failures of the service, `failedOnlyForService`), so the
-job logs no error; a line it cannot append is a warning in its log.
+line is `import-failed` when a job of one of the module's direct imports that the presetup waits on
+ended in an error: its `elabArts`, its presetup, or, while the build's cancellation token is unset, its
+`metaExportInfo` (`fetchImportInfo`), which also waits on its `irArts`. Else the line is `error` with code
+`canceled` for a canceled job, else `error` with code `setup`. It reads only jobs that have finished, and
+waits for none: an import's job whose failure failed the presetup has finished, or the import's presetup
+has (then that job fails too). The line is written before any reader sees the job's result. A module
+whose import failed is no failure of its own (exit code 75 counts the failures of the service,
+`failedOnlyForService`), so the job logs no error; a line it cannot append is a warning in its log.
 -/
 def Module.writeUnwrittenLine (mod : Module) (line : ModuleLine) (job : Job ModuleOutputArtifacts) :
     SpawnM (Job ModuleOutputArtifacts) := .ofFn fun _ _ _ store ctx _ =>
@@ -1406,30 +1407,38 @@ def Module.writeUnwrittenLine (mod : Module) (line : ModuleLine) (job : Job Modu
     let .error e s := r | return r
     if ← line.written.get then return r
     let snap ← store.get
+    let canceling ← match ctx.cancelTk? with
+      | some tk => tk.isSet
+      | none => pure false
     -- The result of a job that the build started, if it has finished (read with no wait)
     let finished? {α : Type} (job? : Option (Job α)) : BaseIO (Option (JobResult α)) := do
       let some job := job? | return none
       if ← IO.hasFinished job.task then return some job.task.get else return none
     let failed {α : Type} (job? : Option (Job α)) : BaseIO Bool := do
       return ((← finished? job?) matches some (.error ..))
-    -- The direct imports, from the module's header if it was read
+    -- The direct imports, from the module's header if it was read: for each import, every package's
+    -- module of its name, as `fetchImportInfo` waits on each
     let imports : Array Module := match (← finished? (snap.getInfo? mod.input)) with
-      | some (.ok input _) => input.imports.filterMap (·.module?) |>.filter (· != mod)
+      | some (.ok input _) =>
+        -- Not a self-import: the module's own presetup, which it fails, would make the line
+        -- `import-failed`, not `error` with code `setup`
+        input.imports.filter (·.module != mod.name) |>.flatMap (ctx.workspace.findModules ·.module)
       | _ => #[]
+    -- Once the cancellation token is set, an import's `metaExportInfo` also fails when the token canceled a
+    -- continuation it waits on (its `irArts`, after its `elabArts` succeeded), which the renewed state of a
+    -- registered job no longer says: so it counts only while the token is unset
     let importFailed ← imports.anyM fun imp =>
-      failed (snap.getInfo? imp.elabArts) <||> failed (snap.getInfo? imp.presetup)
+      failed (snap.getInfo? imp.elabArts) <||> failed (snap.getInfo? imp.presetup) <||>
+        (if canceling then pure false else failed (snap.getInfo? imp.metaExportInfo))
     -- A job canceled while it waited for a registered job that was canceled (whose readers
     -- get its state renewed, `JobState.canceled` cleared) has no error of its own logged
-    let canceled ← pure s.canceled <||> do
-      let some tk := ctx.cancelTk? | return false
-      return (← tk.isSet) && !(s.log.hasEntries && s.log.maxLv ≥ .error)
+    let canceled := s.canceled || (canceling && !(s.log.hasEntries && s.log.maxLv ≥ .error))
     let o : RemoteOutcome :=
       if importFailed then {result := "import-failed"}
       else if canceled then .error "canceled"
       else .error "setup"
     let .error err ← (line.write mod o).toBaseIO | return r
-    return .error e <| s.logEntry <|
-      .warning s!"{mod.name}: could not append its line to LAKE_REMOTE_EXEC_LOG: {err}"
+    return .error e <| s.logEntry <| .warning (remoteLineAppendFailure mod.name.toString err)
 
 /--
 The path part of a module's action (contract C2.1): plugins, dynlibs and `LEAN_PATH`, rewritten to input-root-relative

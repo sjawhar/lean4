@@ -1288,20 +1288,21 @@ public def cacheServiceArtifact
 /--
 **For internal use only.**
 The artifact of `file`, whose saved trace is up to date with `inputHash` and describes `file`
-(`SavedTrace.fileUpToDate`), with the trace's service record `record?` (`none`: the trace has no record, as after a
-local build, so the trace and the cache entry keep none), as `buildArtifactUnlessUpToDate` replays an up-to-date
-artifact: with a writable Lake cache, from the cache entry that the trace names (`getArtifactsUsingTrace?`, which
-writes the input's cache entry only if it is missing). When the cache holds no such entry, or is not writable, as
-`cacheServiceArtifact` saves `file` with the trace's log.
+(`SavedTrace.fileUpToDate`), and the trace's service record (`none` after a local build, so the cache entry keeps
+none), with the executable bit that the record gives its output `recordExt`, as `buildArtifactUnlessUpToDate`
+replays an up-to-date artifact: with a writable Lake cache, from the cache entry that the trace names
+(`getArtifactsUsingTrace?`, which writes the input's cache entry only if it is missing). When the cache holds no such
+entry, or is not writable, as `cacheServiceArtifact` saves `file` under `ext` with the trace's log.
 -/
 public def replayServiceArtifact
-  (pkg : Package) (inputHash : Hash) (savedTrace : SavedTrace) (file : FilePath) (ext : String) (exe : Bool)
-  (record? : Option RemoteExec.Record)
-: JobM Artifact := do
+  (pkg : Package) (inputHash : Hash) (savedTrace : SavedTrace) (file : FilePath) (ext recordExt : String)
+: JobM (Artifact × Option RemoteExec.Record) := do
+  let record? := savedTrace.remote?
+  let exe := record?.any (·.executable recordExt)
   if (← pkg.isArtifactCacheWritable) then
     if let some (art : XArtifact exe) ← getArtifactsUsingTrace? inputHash savedTrace pkg then
-      return ← restoreArtifact file art exe
-  cacheServiceArtifact pkg inputHash file ext exe record? savedTrace.log
+      return (← restoreArtifact file art exe, record?)
+  return (← cacheServiceArtifact pkg inputHash file ext exe record? savedTrace.log, record?)
 
 /--
 Build `file` using `build` after `dep` completes if the dependency's
