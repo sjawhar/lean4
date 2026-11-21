@@ -152,6 +152,26 @@ test_out 'Built T.A' build T
 no_stamp T.A
 test_cmd touch T/A.lean
 
+# A build that reads the source less than 2 s after an edit (at the time the edit set) keeps no
+# identity for it either. `touch` changes the identity and not the contents, so the build hashes the
+# source again and compiles nothing. On a local filesystem, a file's modification time is a reading
+# of the clock that `date` reads, and the build reads the source after the edit and before it ends,
+# so a build that ends less than 2 s after the source's modification time (`date -r`; a `date` taken
+# before the edit can be a clock tick later) read it less than 2 s after the edit. A slower build
+# proves nothing, and is tried again.
+for _ in {1..20}; do
+  test_cmd touch T/A.lean
+  edited=$(date -r T/A.lean +%s%N)
+  test_run build T
+  span=$(($(date +%s%N) - edited))
+  if [ $span -lt 2000000000 ]; then break; fi
+done
+if [ $span -lt 2000000000 ]; then
+  no_stamp T.A
+else
+  echo "SKIPPED: check of the 2 s rule: each of 20 builds ended 2 s or more after its edit"
+fi
+
 # The rule is checked against the moment Lake read the source, however late the write comes. The
 # source's modification time is set to 3 s after the edit, so a read up to 5 s after the edit is
 # less than 2 s after it. Another process then holds the lock of `source.stamps` for 6 s, and a
