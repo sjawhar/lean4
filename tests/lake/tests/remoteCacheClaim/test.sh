@@ -912,6 +912,42 @@ case_claim_free_slot_wake() {
   CLAIM_SLOTS=1 run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" freeSlotWake
 }
 
+case_claim_rebuild_counted() {
+  # A module whose trace is current but whose outputs `keepOutputs?` rejects (they no longer
+  # match the trace) compiles again, and that compile fills a slot as any other compile does.
+  # A's tree keeps `Rebuild.Held`'s outputs and trace from a build that claimed nothing, its
+  # `.olean` then gets one more byte, and neither cache maps the input. With one slot,
+  # `rebuildThenNext` starts the build of `Rebuild.Held`, whose compile then waits for the case,
+  # and starts the build of `Rebuild.Next` only once that compile runs: the slot is full, so the
+  # build claims `Rebuild.Next` before it compiles it. A compile that did not count would leave
+  # the slot free, and `Rebuild.Next` would compile with no claim request.
+  claim_fresh
+  LAKE_REMOTE_CACHE_CLAIMS=false run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Rebuild.Held
+  local lib="$TREE_A/.lake/build/lib/lean/Rebuild" gate="$WORK_DIR/rebuild-gate" next
+  test_cmd cp "$lib/Held.olean" "$lib/Held.olean.new"
+  test_cmd chmod u+w "$lib/Held.olean.new"
+  printf x >> "$lib/Held.olean.new"
+  test_cmd mv -f "$lib/Held.olean.new" "$lib/Held.olean"
+  test_cmd rm -rf "$CACHE_A" "$gate"
+  test_cmd mkdir "$gate"
+  : > "$SERVER_LOG"
+  CLAIM_SLOTS=1 LEAN_NUM_THREADS=4 LAKE_TEST_REBUILD_GATE="$gate" \
+    start_build "$TREE_A" "$CACHE_A" "$LOG_A" rebuildThenNext
+  PID_A=$!
+  test_cmd claim_check wait-text "$LOG_A" 'Built Rebuild.Next' --timeout 300
+  # `Rebuild.Held`'s compile has started, and still waits for the case
+  test_exp -e "$gate/started"
+  no_match_text 'Built Rebuild.Held' "$LOG_A"
+  next="$("$PYTHON" -c 'import json, sys; print(json.load(open(sys.argv[1]))["depHash"])' \
+    "$lib/Next.trace")"
+  test_cmd_eq 1 count "^PUT /bearer/a0/claim/.*/$next -> 200 auth=bearer gen=0$" "$SERVER_LOG"
+  test_cmd touch "$gate/go"
+  wait_build $PID_A "$LOG_A"
+  # `Rebuild.Held` compiled because `keepOutputs?` rejected its outputs
+  match_text 'does not match its trace' "$LOG_A"
+  match_text 'Built Rebuild.Held' "$LOG_A"
+}
+
 case_claim_read_retry() {
   # A claim read that the remote cache answers with a server error (503) is sent again, 1 s
   # later: B reads another host's `failed` claim of `Claim.A` once more, takes it over and
@@ -1069,6 +1105,7 @@ run_cases case_claim_two_builds case_claim_one_push case_claim_order case_claim_
   case_claim_push_start_wfail case_claim_foreground_push case_claim_follow_reap \
   case_claim_unreadable case_claim_local_clock case_claim_stream case_claim_off \
   case_claim_fail_open case_claim_share case_claim_free_slots case_claim_saturated \
-  case_claim_free_slot_wake case_claim_read_retry case_claim_write_retry case_claim_write_race \
+  case_claim_free_slot_wake case_claim_rebuild_counted case_claim_read_retry \
+  case_claim_write_retry case_claim_write_race \
   case_claim_write_unread case_claim_rewrite_unread case_claim_connect_retry \
   case_claim_sent_timeout case_claim_read_sent_timeout
