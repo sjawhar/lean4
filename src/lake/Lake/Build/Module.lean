@@ -13,6 +13,7 @@ import Lean.Elab.ParseImportsFast
 import Lake.Util.Proc
 import Lake.Build.Job.Register
 import Lake.Build.Common
+import Lake.Build.InputLock
 import Lake.Build.Target
 import Init.Omega
 
@@ -1196,22 +1197,8 @@ where
     let savedTrace ← readTraceFile mod.traceFile
     if (← mod.pkg.isArtifactCacheWritable) then
       let restore ← mod.pkg.restoreAllArtifacts
-      match (← fetchFromCache? presetup savedTrace restore) with
-      | .complete arts =>
-        return arts
-      | .incomplete savedTrace ltar? =>
-        let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
-        if status.isUpToDate then
-          unless (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) do
-            -- Restoring from the archive stamps the trace with the current input
-            -- hash, so only do it on a verified hash match. An mtime-only match
-            -- leaves the hash unconfirmed, so rebuild instead.
-            if status == .hashUpToDate then
-              mod.unpackLtar mod.ltarFile depTrace.hash
-            else
-              discard <| mod.buildLean presetup
-        else
-          discard <| mod.buildLean presetup
+      let finish (status : OutputStatus) (ltar? : Option Artifact) :
+          JobM ModuleOutputArtifacts := do
         if status.isCacheable then
           let arts ← mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile
           let arts := {arts with ltar? := arts.ltar? <|> ltar?}
@@ -1220,6 +1207,47 @@ where
         else
           let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
           return {arts with ltar? := arts.ltar? <|> ltar?}
+      let outputsReady (status : OutputStatus) : JobM Bool :=
+        pure status.isUpToDate <&&>
+          mod.checkArtifactsExist presetup.isModule presetup.postponeCompile
+      let restoreOrBuild (status : OutputStatus) : JobM Unit := do
+        -- Restoring from the archive stamps the trace with the current input
+        -- hash, so only do it on a verified hash match. An mtime-only match
+        -- leaves the hash unconfirmed, so rebuild instead.
+        if status == .hashUpToDate then
+          mod.unpackLtar mod.ltarFile depTrace.hash
+        else
+          discard <| mod.buildLean presetup
+      match (← fetchFromCache? presetup savedTrace restore) with
+      | .complete arts =>
+        return arts
+      | .incomplete savedTrace ltar? =>
+        let logPos ← getLogPos
+        let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
+        if (← outputsReady status) then
+          return ← finish status ltar?
+        -- Another Lake process may be building this input: wait for it, then look again.
+        let lockPos ← getLogPos
+        match (← acquireInputLock? mod.pkg.cacheScope depTrace.hash) with
+        | none =>
+          restoreOrBuild status
+          finish status ltar?
+        | some lock =>
+          -- The second look replays the saved log anew, so drop the first look's log
+          -- but keep the lock's own messages.
+          modifyThe Log fun log => log.dropFrom logPos ++ log.takeFrom lockPos
+          try
+            match (← fetchFromCache? presetup savedTrace restore) with
+            | .complete arts =>
+              return arts
+            | .incomplete savedTrace ltar? =>
+              let status ←
+                savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
+              unless (← outputsReady status) do
+                restoreOrBuild status
+              finish status ltar?
+          finally
+            lock.release
     else
       let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
       if status.isUpToDate then
