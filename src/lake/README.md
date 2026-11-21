@@ -662,7 +662,7 @@ Under `local`, Lake asks the service again with a `hello` on a bridge of its own
 * If the service runs another Lean, the later modules build on this machine with the result `toolchain-mismatch`, and Lake stops asking.
 * If the service refuses, nothing changes, and Lake asks again.
 
-Lake stops asking when the build ends. A compile that failed on the service, and the answers `OOM`, `TIMEOUT` and `DISK_LIMIT`, are the result of the module, never a reason to fall back.
+Lake stops asking when the build ends: it waits at most 1 s for a `hello` still in flight, and then goes on, or exits, without its answer. A compile that failed on the service, and the answers `OOM`, `TIMEOUT` and `DISK_LIMIT`, are the result of the module, never a reason to fall back.
 
 ### Another Lean on the Service
 
