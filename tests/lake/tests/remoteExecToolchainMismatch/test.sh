@@ -19,6 +19,9 @@ make_case() {
   printf 'module\nimport A\n/-! A root built only by the selected fallback. -/\npublic def p := a + 1\n' > "$W/$1/P.lean"
 }
 
+# check_lines LOG ARGS...: the checks of a LAKE_REMOTE_EXEC_LOG file by ../remoteExec/lines_check.py
+check_lines() { test_cmd "$PYTHON" "$HERE/../remoteExec/lines_check.py" "$@"; }
+
 # The baseline proves that the same inputs compile without any service.
 make_case baseline
 (cd "$W/baseline" && test_run build P)
@@ -42,24 +45,20 @@ for when in initial later; do
         match_text "warning:" produced.out
         match_text "runs Lean $REMOTE_GITHASH, but this Lake uses Lean $LOCAL_GITHASH" produced.out
         cmp .lake/build/lib/lean/P.olean "$W/baseline/.lake/build/lib/lean/P.olean"
-        "$PYTHON" - "$LAKE_REMOTE_EXEC_LOG" <<'PY'
-import json, sys
-rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
-assert sorted(row['target'] for row in rows) == ['A', 'P'], rows
-assert all(row['kind'] == 'lean' and row['result'] == 'toolchain-mismatch'
-           and row['action'] == '' and row['outputs'] == {} and row['exitCode'] == 0
-           and row['wallMs'] > 0 for row in rows), rows
-PY
-        # A replay does not compile, so it adds no mismatch result to the per-target log.
+        check_lines "$LAKE_REMOTE_EXEC_LOG" --modules A,P \
+          --expect '*:result=toolchain-mismatch,action=null,outputs=null,exitCode=0,wallMs>0'
+        # A replay does not compile: it adds a `local-cache` line for each module, with no service record.
         if [ "$when" = initial ]; then
-          test_status_out 0 "0 local;" build P
-          test_cmd_eq 2 wc -l < "$LAKE_REMOTE_EXEC_LOG"
+          LAKE_REMOTE_EXEC_LOG="$W/$name.replay.jsonl" test_status_out 0 "0 local;" build P
+          check_lines "$W/$name.replay.jsonl" --modules A,P --expect '*:result=local-cache,action=null,outputs=null'
         fi
       else
         test_status_out 75 "runs Lean $REMOTE_GITHASH, but this Lake uses Lean $LOCAL_GITHASH" build P
         test_exp ! -e .lake/build/lib/lean/A.olean
         test_exp ! -e .lake/build/lib/lean/P.trace
-        test_exp ! -s "$LAKE_REMOTE_EXEC_LOG"
+        # No request is sent: A's line is `error` with code `toolchain-mismatch`, and P's import failed.
+        check_lines "$LAKE_REMOTE_EXEC_LOG" --modules A,P --expect 'A:result=error,code=toolchain-mismatch' \
+          --expect 'P:result=import-failed,rest=null'
       fi
       "$PYTHON" - "$FAKE_LOG" <<'PY'
 import json, sys
@@ -100,7 +99,8 @@ make_case probe-wait
   test_exp "$rc" = 75
   match_text "runs Lean $REMOTE_GITHASH, but this Lake uses Lean $LOCAL_GITHASH" "$W/probe-wait.out"
   test_exp ! -e .lake/build/lib/lean/A.olean
-  test_exp ! -s "$LAKE_REMOTE_EXEC_LOG"
+  check_lines "$LAKE_REMOTE_EXEC_LOG" --modules A,P --expect 'A:result=error,code=toolchain-mismatch' \
+    --expect 'P:result=import-failed,rest=null'
   "$PYTHON" - "$FAKE_LOG" <<'PY'
 import json, sys
 rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
@@ -109,7 +109,8 @@ PY
 )
 
 # Missing verification, or an explicit failed verification with the SAME hash, is not a
-# confirmed mismatch. Even `local` must fail closed, not silently downgrade such a refusal.
+# confirmed mismatch. Even `local` must fail closed, not silently downgrade such a refusal:
+# A's line is `error` with code `toolchain-unverified`, and P's import failed.
 for refusal in missing same; do
   for mode in local wait fail; do
     name="unverified-$refusal-$mode"
@@ -117,10 +118,12 @@ for refusal in missing same; do
     (
       cd "$W/$name"
       export LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_REMOTE_EXEC_FALLBACK="$mode"
-      export FAKE_LOG="$W/$name.fake.log" FAKE_CAS="$W/$name.cas"
+      export LAKE_REMOTE_EXEC_LOG="$W/$name.jsonl" FAKE_LOG="$W/$name.fake.log" FAKE_CAS="$W/$name.cas"
       if [ "$refusal" = missing ]; then export FAKE_OMIT_VERIFIED=1; else export FAKE_UNVERIFIED=1; fi
       test_status_out 1 'did not verify its toolchain' build P
       test_exp ! -e .lake/build/lib/lean/A.olean
+      check_lines "$LAKE_REMOTE_EXEC_LOG" --modules A,P --expect 'A:result=error,code=toolchain-unverified' \
+        --expect 'P:result=import-failed,rest=null'
     )
   done
 done
@@ -154,7 +157,8 @@ for mode in fail wait local; do
     test_exp -s "$TEST_GITHASH_PROBE_LOG"
     test_exp ! -e .lake/build/lib/lean/A.olean
     test_exp ! -e .lake/build/lib/lean/P.trace
-    test_exp ! -s "$LAKE_REMOTE_EXEC_LOG"
+    check_lines "$LAKE_REMOTE_EXEC_LOG" --modules A,P --expect 'A:result=error,code=toolchain-unverified' \
+      --expect 'P:result=import-failed,rest=null'
     "$PYTHON" - "$FAKE_LOG" <<'PY'
 import json, sys
 rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
