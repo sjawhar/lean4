@@ -1061,11 +1061,16 @@ protected def build : CliM PUnit := do
     | none, none => return none
   let buildConfig := mkBuildConfig opts (out := .stdout) (showSuccess := true) outputsPackage?
   -- Say `hello` to the build service at the build's start, so its GetCapabilities carries the
-  -- build's invocation id (contract C5.1). A no-op when service mode is off.
-  if let some mismatch ← startRemoteSession ws then
-    logError mismatch
-    exit remoteUnavailableCode
+  -- build's invocation id (contract C5.1). A no-op when service mode is off. A refused service, or a
+  -- confirmed mismatch under `wait` or `fail`, fails each module that needs a build: its message shows
+  -- here once, and the build still runs, so that each module writes its line. Lake then exits with
+  -- code 1 for a refused service and 75 for a mismatch, also when no module needed a build.
+  let failure? ← startRemoteSession ws
+  if let some msg := failure? then logError msg
+  let refused := (← remoteDecision?) matches some (.refused _)
   ws.runBuild (buildSpecs specs) {buildConfig with forgetContext := opts.oneShot}
+  if failure?.isSome then
+    exit (if refused then 1 else remoteUnavailableCode)
 
 protected def checkBuild : CliM PUnit := do
   processOptions lakeOption

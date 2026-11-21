@@ -322,15 +322,151 @@ toolchain mismatched under `wait` or `fail` (for exit code 75, `Lake.finalizeBui
 public def recordUnavailableFailure : JobM Unit := do
   (← (·.remoteStats) <$> getBuildContext).modify (·.addUnavailableFailure)
 
+/-! ## The per-target log (`LAKE_REMOTE_EXEC_LOG`) -/
+
+/-- One line of `LAKE_REMOTE_EXEC_LOG` but its `kind`, `target` and times (see `appendRemoteLog`). -/
+public structure RemoteOutcome where
+  /-- `cached`, `executed`, `local-cache`, `local`, `toolchain-mismatch`, `bucket`, `import-failed`,
+  `timeout`, `oom`, `disk-limit` or `error`. -/
+  result : String
+  action? : Option String := none
+  outputs? : Option (Array (String × RemoteExec.Digest)) := none
+  exitCode? : Option Int := none
+  terminationSignal? : Option String := none
+  stdoutDigest? : Option RemoteExec.Digest := none
+  stderrDigest? : Option RemoteExec.Digest := none
+  /-- For `error` only: the bridge's code as it sent it, or a Lake code (`setup`, `request`, …). -/
+  code? : Option String := none
+  limits? : Option JsonObject := none
+  deriving Inhabited
+
+namespace RemoteOutcome
+
+public def error (code : String) : RemoteOutcome := {result := "error", code? := code}
+
+/-- The result a `limits` object gives (contract C5.1 v7): `oom` when the sandbox killed a process for
+its memory, else `disk-limit` when the action filled its disk, whatever the exit code. -/
+def limitsResult? (limits : JsonObject) : Option String :=
+  if (limits.getD "oomKills" (0 : Nat)).toOption.getD 0 > 0 then some "oom"
+  else if (limits.getD "diskLimitExceeded" false).toOption.getD false then some "disk-limit"
+  else none
+
+/-- The line of a `run` result, with the outputs it names by extension: `oom` or `disk-limit` when its
+`limits` say so, else `cached` or `executed`. -/
+public def ofRun (r : RemoteExec.RunResult) (outputs : Array (String × RemoteExec.Digest)) :
+    RemoteOutcome where
+  result := (r.limits?.bind limitsResult?).getD (if r.cached then "cached" else "executed")
+  action? := if r.action.isEmpty then none else some r.action
+  outputs? := if outputs.isEmpty then none else some outputs
+  exitCode? := some r.exitCode
+  terminationSignal? := r.terminationSignal?
+  stdoutDigest? := r.stdoutDigest?
+  stderrDigest? := r.stderrDigest?
+  limits? := r.limits?
+
+/-- The line of an error of the bridge that is the module's result: `timeout` with the error's
+fields, `oom`, `disk-limit`, or `error` with the bridge's code as it sent it. -/
+public def ofError (e : RemoteExec.Error) : RemoteOutcome :=
+  match e.code with
+  | .timeout => {
+      result := "timeout", action? := e.action?, terminationSignal? := e.terminationSignal?
+      stdoutDigest? := e.stdoutDigest?, stderrDigest? := e.stderrDigest?, limits? := e.limits? }
+  | .oom => {result := "oom"}
+  | .diskLimit => {result := "disk-limit"}
+  | _ => error e.codeText
+
+/-- The line of outputs found without a compile (`local-cache`, `bucket`), with the action and
+outputs of their service record, if any. -/
+public def ofRecord (result : String) (record? : Option RemoteExec.Record) : RemoteOutcome where
+  result
+  action? := record?.bind fun r => if r.action.isEmpty then none else some r.action
+  outputs? := record?.bind fun r =>
+    if r.outputs.isEmpty then none
+    else some (r.outputs.foldl (init := #[]) fun outs ext o => outs.push (ext, o.digest))
+
+end RemoteOutcome
+
+/-- When a job's work started, for its line: since the Unix epoch and on the monotonic clock, in
+milliseconds. -/
+public structure RemoteLogStart where
+  epochMs : Nat
+  monoMs : Nat
+
+open Std.Time.Internal in
+public def RemoteLogStart.now : BaseIO RemoteLogStart := do
+  let epochMs ← match ← Std.Time.Timestamp.now.toBaseIO with
+    | .ok t => pure (UnitVal.val t.toMillisecondsSinceUnixEpoch).toNat
+    | .error _ => pure 0
+  return {epochMs, monoMs := ← IO.monoMsNow}
+
+builtin_initialize remoteLogLock : Std.Mutex Unit ← Std.Mutex.new ()
+
+/--
+Appends one line to the log at `path` (`LAKE_REMOTE_EXEC_LOG`): a JSON object with every field, `null`
+for a field with no value; `wallMs` runs from `start` to now. Jobs write their lines at once, so each
+line goes out under a process-wide lock, as one write of the line and its newline.
+-/
+public def appendRemoteLog (path : FilePath) (kind target : String) (start : RemoteLogStart)
+    (o : RemoteOutcome) : IO Unit := do
+  let outputs? := o.outputs?.map fun outs => Json.mkObj (outs.toList.map fun (ext, d) => (ext, toJson d))
+  let line := Json.mkObj [
+    ("kind", kind), ("target", target), ("result", o.result), ("action", toJson o.action?),
+    ("outputs", toJson outputs?), ("exitCode", toJson o.exitCode?),
+    ("terminationSignal", toJson o.terminationSignal?), ("stdoutDigest", toJson o.stdoutDigest?),
+    ("stderrDigest", toJson o.stderrDigest?), ("code", toJson o.code?), ("limits", toJson o.limits?),
+    ("wallMs", toJson ((← IO.monoMsNow) - start.monoMs)), ("startMs", toJson start.epochMs)]
+  let text := line.compress.push '\n'
+  remoteLogLock.atomically (m := IO) do
+    let h ← IO.FS.Handle.mk path .append
+    h.putStr text
+    h.flush
+
+/-! ## Failing a job for the service -/
+
+/-- Whether this process printed the message of its refused or mismatched service yet (see
+`decisionError`). -/
+builtin_initialize remoteDecisionReported : IO.Ref Bool ← IO.mkRef false
+
+/-- The error of a job that a refused service or a confirmed toolchain mismatch fails: the decision's
+message `msg` the first time this process reports it, then `short`, so that the message shows once. -/
+def decisionError (msg short : String) : BaseIO String := do
+  if ← remoteDecisionReported.modifyGet fun done => (done, true) then return short
+  return msg
+
+/-- Fails a job because the service did not answer under `fail` (code `UNAVAILABLE` in `outcome`),
+counted for exit code 75. -/
+public def failUnavailable (outcome : IO.Ref RemoteOutcome) (msg : String) : JobM α := do
+  recordUnavailableFailure
+  outcome.set (.error "UNAVAILABLE")
+  error msg
+
+/-- Fails a job because of a confirmed toolchain mismatch under `wait` or `fail` (code
+`toolchain-mismatch` in `outcome`), counted for exit code 75. -/
+public def failMismatch (s : RemoteSession) (outcome : IO.Ref RemoteOutcome) (msg : String) : JobM α := do
+  recordUnavailableFailure
+  outcome.set (.error "toolchain-mismatch")
+  error (← decisionError msg s!"build service at {s.cfg.endpoint} runs another Lean (see the error above)")
+
+/-- Fails a job because the service is refused, whatever the fallback (code `toolchain-unverified` in
+`outcome`). -/
+public def failRefused (s : RemoteSession) (outcome : IO.Ref RemoteOutcome) (msg : String) : JobM α := do
+  outcome.set (.error "toolchain-unverified")
+  error (← decisionError msg s!"build service at {s.cfg.endpoint} is refused (see the error above)")
+
+/-- Fails a job whose wait for the service (`awaitService`) ended in a refusal or a mismatch. -/
+def failAwait (s : RemoteSession) (outcome : IO.Ref RemoteOutcome) (msg : String) : JobM α := do
+  if let some (.toolchainMismatch _) ← remoteDecision? then failMismatch s outcome msg
+  failRefused s outcome msg
+
 /--
 The fallback `wait` for a job whose request answered `UNAVAILABLE` (see `awaitService`): returns once
 the service answers again, so the job sends the request again. `epoch` is `remoteEpoch` read before
-the request was sent.
+the request was sent. A refusal or a mismatch fails the job, with its code in `outcome`.
 -/
-public def awaitServiceAgain (s : RemoteSession) (epoch : Nat) : JobM Unit := do
+public def awaitServiceAgain (s : RemoteSession) (outcome : IO.Ref RemoteOutcome) (epoch : Nat) :
+    JobM Unit := do
   if let .error msg ← awaitService s.client s.cfg.endpoint s.leanGithash (some epoch) then
-    if let some (.toolchainMismatch _) ← remoteDecision? then recordUnavailableFailure
-    error msg
+    failAwait s outcome msg
 
 /--
 Whether a module that needs the build service sends its request (contract C5.1): says `hello` once
@@ -340,35 +476,34 @@ this machine; once the service did not answer, every later module of this proces
 request, and the next build asks again. Under `fail` it errors with the decision's message, counted
 (`recordUnavailableFailure`); under `wait` it returns `true` once the service answers
 (`awaitService`). A refused service fails the module whatever the fallback. A confirmed toolchain
-mismatch falls back only under `local`; `wait` and `fail` fail with exit code 75.
+mismatch falls back only under `local`; `wait` and `fail` fail with exit code 75. A failure puts its
+code in `outcome`.
 -/
-public def useService (s : RemoteSession) : JobM Bool := do
+public def useService (s : RemoteSession) (outcome : IO.Ref RemoteOutcome) : JobM Bool := do
   match ← ensureDecision s.client s.cfg.endpoint s.leanGithash with
   | .active => return true
   | .toolchainMismatch msg =>
     if s.cfg.fallback == .compileLocally then
       warnToolchainMismatch msg
       return false
-    recordUnavailableFailure
-    error msg
-  | .refused msg => error msg
+    failMismatch s outcome msg
+  | .refused msg => failRefused s outcome msg
   | .unreachable msg =>
     match s.cfg.fallback with
     | .compileLocally => return false
-    | .fail =>
-      recordUnavailableFailure
-      error msg
+    | .fail => failUnavailable outcome msg
     | .wait =>
       if let .error msg ← awaitService s.client s.cfg.endpoint s.leanGithash none then
-        if let some (.toolchainMismatch _) ← remoteDecision? then recordUnavailableFailure
-        error msg
+        failAwait s outcome msg
       return true
 
 /--
 The `hello` that `lake build` sends at its start (with `command := build`), so that every build's
-GetCapabilities carries the build's invocation id; it makes this process's decision. An unverified
-service fails here. A confirmed mismatch warns and returns `none` under `local`, or returns the
-error message for the caller to fail with exit code 75 under `wait` and `fail`.
+GetCapabilities carries the build's invocation id; it makes this process's decision. Returns the
+message of a decision that fails each module that needs a build, for the caller to print once: a
+refused service, or a confirmed mismatch under `wait` or `fail`. The build still runs, so that each
+module writes its line; the modules' own errors then refer to the message (`decisionError`). A
+confirmed mismatch under `local` warns and returns `none`.
 -/
 public def startRemoteSession (ws : Workspace) : IO (Option String) := do
   let some cfg := ws.lakeEnv.remoteExec?
@@ -387,12 +522,17 @@ public def startRemoteSession (ws : Workspace) : IO (Option String) := do
   -- does not delay the build's start. The build's first request starts the bridge again, which then
   -- holds the lock for as long as it can write into `.lake/build` (`RemoteExec.bridgeExitTimeoutMs`).
   RemoteExec.killBridge
-  if let .refused msg := decision then
-    throw (IO.userError msg)
-  if let .toolchainMismatch msg := decision then
-    if cfg.fallback != .compileLocally then return some msg
+  match decision with
+  | .refused msg =>
+    remoteDecisionReported.set true
+    return some msg
+  | .toolchainMismatch msg =>
+    if cfg.fallback != .compileLocally then
+      remoteDecisionReported.set true
+      return some msg
     warnToolchainMismatch msg
-  return none
+    return none
+  | _ => return none
 
 /-- The service's state for the end-of-build line (contract C5.1): `idle` when no `hello` was sent. -/
 public def remoteDecisionState : BaseIO RemoteState := do
@@ -403,7 +543,7 @@ public def remoteDecisionState : BaseIO RemoteState := do
   | some (.toolchainMismatch msg) => return .off msg
   | some (.refused msg) => return .off msg
 
-/-! ## Statistics and the per-target log -/
+/-! ## Statistics -/
 
 /-- The build's remote-statistics reference (for the end-of-build line). -/
 public def getRemoteStats : JobM (IO.Ref RemoteStats) :=
@@ -416,20 +556,6 @@ public def recordRemoteModule (cached : Bool) : JobM Unit := do
 /-- Records one Lean module that the fallback `local` compiled on this machine. -/
 public def recordRemoteLocal : JobM Unit := do
   (← getRemoteStats).modify (·.addLeanLocal)
-
-/-- Appends one line to `LAKE_REMOTE_EXEC_LOG`, if set (contract C5.1: `kind`, `target`, `result`,
-`action`, `outputs` by extension, `exitCode`, `wallMs`). `result` is `cached` or `executed` for a
-result of the service, `local` for an unavailable-service fallback compile, or `toolchain-mismatch`
-for a confirmed-mismatch fallback compile (both have no action or outputs). -/
-public def appendRemoteLog (s : RemoteSession) (kind target result action : String) (exitCode : Int)
-    (outputs : Array (String × RemoteExec.Digest)) (wallMs : Nat) : JobM Unit := do
-  let some path := s.cfg.log?
-    | return
-  let outs := Json.mkObj (outputs.toList.map fun (ext, d) => (ext, (toJson d : Json)))
-  let line := (Json.mkObj [
-    ("kind", kind), ("target", target), ("result", result), ("action", action),
-    ("outputs", outs), ("exitCode", (toJson exitCode : Json)), ("wallMs", (toJson wallMs : Json))]).compress
-  (do let h ← IO.FS.Handle.mk path .append; h.putStrLn line : IO Unit)
 
 /-! ## Path rewriting (contract C2.1) -/
 
@@ -487,14 +613,16 @@ def callService (s : RemoteSession) (method : String) (params : Json) :
       noteUnusable (.unreachable s!"build service at {s.cfg.endpoint} did not answer: {e.message}")
   return r
 
-/-- Sends a `run` request and parses its result. -/
+/-- Sends a `run` request and parses its result. A result that does not parse is an `internal` error
+whose code text is Lake's `malformed-result`, the code of its line. -/
 public def runAction (s : RemoteSession) (params : Json) :
     JobM (Except RemoteExec.Error RemoteExec.RunResult) := do
   match ← callService s "run" params with
   | .error e => return .error e
   | .ok j => match RemoteExec.RunResult.ofJson? j with
     | .ok r => return .ok r
-    | .error msg => return .error {code := .internal, message := s!"malformed run result: {msg}"}
+    | .error msg => return .error {
+        code := .internal, codeText := "malformed-result", message := s!"malformed run result: {msg}"}
 
 /-- Materializes output blobs to local paths through the daemon. -/
 public def materializeFiles (s : RemoteSession) (files : Array (RemoteExec.Digest × FilePath × Bool)) :
