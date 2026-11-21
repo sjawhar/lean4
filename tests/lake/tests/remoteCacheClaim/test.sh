@@ -976,7 +976,7 @@ case_claim_rebuild_counted() {
   CLAIM_SLOTS=1 LEAN_NUM_THREADS=4 LAKE_TEST_REBUILD_GATE="$gate" \
     start_build "$TREE_A" "$CACHE_A" "$LOG_A" rebuildThenNext
   PID_A=$!
-  test_cmd claim_check wait-text "$LOG_A" 'Built Rebuild.Next' --timeout 300
+  test_cmd claim_check wait-text "$LOG_A" 'Built Rebuild.Next' --timeout "$HANG_SECS"
   # `Rebuild.Held`'s compile has started, and still waits for the case
   test_exp -e "$gate/started"
   no_match_text 'Built Rebuild.Held' "$LOG_A"
