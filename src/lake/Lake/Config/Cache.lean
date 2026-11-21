@@ -14,7 +14,7 @@ public import Lake.Config.Artifact
 public import Lake.Config.RemoteCache
 public import Lake.Util.Sha256
 public import Lake.Util.ReadBroker
-public import Lake.Util.RemoteExec
+public import Lake.Util.RemoteRecord
 import Lake.Config.InstallPath
 import Lake.Build.Actions
 import Lake.Util.Url

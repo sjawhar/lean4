@@ -222,11 +222,12 @@ has `moreLinkObjs` or whose package has an `extern_lib`.
 No file that this machine compiled is an input of an action on the service, except a shared
 library that stays on this machine (above) and the files that `leanir` writes. A module, C object
 or shared library that this machine built (by the fallback, in an earlier build, or with service
-mode off) has no service record. Before an action on the service takes it as an input, Lake runs
-its own action on the service and writes the service's files over the local ones. This promotion
-writes no line: the target keeps its one line. The outputs that LAKE_USAGE_CUTOFF kept or skipped
-are promoted in the same way. The actions of one commit have the same digests on two machines
-when LAKE_REMOTE_EXEC_SYSROOT (unset: the path of the local sysroot), LAKE_REMOTE_EXEC_TOOLCHAIN,
+mode off) has no service record. While its trace is up to date, Lake uses it in every mode, with
+the result local-cache. Before an action on the service takes it as an input, Lake runs its own
+action on the service and writes the service's files over the local ones. This promotion writes
+no line: the target keeps its one line. The outputs that LAKE_USAGE_CUTOFF kept or skipped are
+promoted in the same way. The actions of one commit have the same digests on two machines when
+LAKE_REMOTE_EXEC_SYSROOT (unset: the path of the local sysroot), LAKE_REMOTE_EXEC_TOOLCHAIN,
 LAKE_REMOTE_EXEC_CC, LAKE_REMOTE_EXEC_PATH and LAKE_REMOTE_EXEC_TIMEOUT are the same on both.
 
 The service does not answer when its `hello` finds it unreachable, or when a request still answers
@@ -274,8 +275,9 @@ The results:
   executed            the service ran the action for this build (a failed compile has an
                       exitCode other than 0)
   cached              the service's cache gave the result of the same action
-  oom, disk-limit     the sandbox killed a process for its memory, or the action filled its disk,
-                      whatever the exit code
+  oom, disk-limit     the service answered OOM or DISK_LIMIT, or the action's limits say that the
+                      sandbox killed a process for its memory or that the action filled its disk
+                      (whatever the exit code)
   timeout             the action ran longer than LAKE_REMOTE_EXEC_TIMEOUT
   local-cache         Lake found the outputs on this machine and sent no request (action and
                       outputs give the service's record, or null when no service action made them)

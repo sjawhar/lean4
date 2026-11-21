@@ -10,7 +10,7 @@ public import Lake.Build.Job.Monad
 public import Lake.Build.CcIdentity
 public import Lake.Config.Monad
 public import Lake.Util.JsonObject
-public import Lake.Util.RemoteExec
+public import Lake.Util.RemoteRecord
 public import Lake.Util.IO
 public import Lake.Build.Actions
 public import Lake.Build.RemoteCache
@@ -1230,31 +1230,34 @@ where
 /-! ### Service mode's native artifacts
 
 The Lake cache's side of a native artifact's build on the build service (`Lake.buildNativeArtifact`), which keeps
-the service's record (`RemoteExec.Record`) beside the artifact in its trace and its cache entry.
+the service's record (`RemoteExec.Record`) beside the artifact in its trace and its cache entry. A native artifact
+that a local build made has no record.
 -/
+
+/-- Whether `file` exists and has the hash of the saved trace's output (see `ToOutputJson Artifact`). -/
+def SavedTrace.describesFile (self : SavedTrace) (file : FilePath) : JobM Bool := do
+  let some descr := self.artifactDescr? | return false
+  unless (← file.pathExists) do return false
+  return (← fetchFileHash file) == descr.hash
 
 /--
 **For internal use only.**
-The service record (`BuildMetadata.remote?`) of a saved trace if it describes `file`: the file exists and has the
-hash of the trace's output (see `ToOutputJson Artifact`). A record that does not describe the file is no record.
+The service record (`BuildMetadata.remote?`) of a saved trace if the trace describes `file`
+(`SavedTrace.describesFile`). A record that does not describe the file is no record.
 -/
 public def SavedTrace.fileRecord? (self : SavedTrace) (file : FilePath) : JobM (Option RemoteExec.Record) := do
-  let .ok data := self | return none
-  let some record := data.remote? | return none
-  let some descr := self.artifactDescr? | return none
-  unless (← file.pathExists) do return none
-  return if (← fetchFileHash file) == descr.hash then some record else none
+  let some record := self.remote? | return none
+  return if (← self.describesFile file) then some record else none
 
 /--
 **For internal use only.**
-The service record of a saved trace that is up to date with `inputHash`, if it describes `file`
-(`SavedTrace.fileRecord?`).
+Whether a saved trace is up to date with `inputHash` and describes `file` (`SavedTrace.describesFile`), so that its
+service record, if it has one, describes `file` too.
 -/
-public def SavedTrace.serviceRecord? (self : SavedTrace) (inputHash : Hash) (file : FilePath) :
-    JobM (Option RemoteExec.Record) := do
-  let .ok data := self | return none
-  unless data.depHash == inputHash do return none
-  self.fileRecord? file
+public def SavedTrace.fileUpToDate (self : SavedTrace) (inputHash : Hash) (file : FilePath) : JobM Bool := do
+  let .ok data := self | return false
+  unless data.depHash == inputHash do return false
+  self.describesFile file
 
 /--
 **For internal use only.**
@@ -1279,37 +1282,39 @@ public def restoreServiceArtifact?
 
 /--
 **For internal use only.**
-Saves `file`, which holds the output of a build service action, to the Lake cache as `buildArtifactUnlessUpToDate`
-saves a build's artifact, with the service record `record` and the build's `log` in its cache entry. The artifact
-keeps the path `file` and the executable bit `exe`. Without a writable Lake cache, it is only computed.
+Saves `file`, a native artifact of service mode, to the Lake cache as `buildArtifactUnlessUpToDate` saves a build's
+artifact, with the build's `log` and the service record `record?` of the file in its cache entry: `none` when no service
+action made the file (a local build did), so the cache entry keeps no record. The artifact keeps the path `file` and
+the executable bit `exe`. Without a writable Lake cache, it is only computed.
 -/
 public def cacheServiceArtifact
   (pkg : Package) (inputHash : Hash) (file : FilePath) (ext : String) (exe : Bool)
-  (record : RemoteExec.Record) (log : Log)
+  (record? : Option RemoteExec.Record) (log : Log)
 : JobM Artifact := do
   unless (← pkg.isArtifactCacheWritable) do
     return ← computeArtifact file ext
   let art ← cacheArtifact file ext (exe := exe) (useLocalFile := true)
   unless art.cacheSkipped do
-    (← getLakeCache).writeOutputs pkg.cacheScope inputHash art.descr (log := log) (remote? := some record)
+    (← getLakeCache).writeOutputs pkg.cacheScope inputHash art.descr (log := log) (remote? := record?)
   return art
 
 /--
 **For internal use only.**
-The artifact of `file`, whose saved trace is up to date with `inputHash` and has the service record `record` that
-describes `file` (`SavedTrace.serviceRecord?`), as `buildArtifactUnlessUpToDate` replays an up-to-date artifact: with a
-writable Lake cache, from the cache entry that the trace names (`getArtifactsUsingTrace?`, which writes the
-input's cache entry only if it is missing). When the cache holds no such entry, or is not writable, as
+The artifact of `file`, whose saved trace is up to date with `inputHash` and describes `file`
+(`SavedTrace.fileUpToDate`), with the trace's service record `record?` (`none`: the trace has no record, as after a
+local build, so the trace and the cache entry keep none), as `buildArtifactUnlessUpToDate` replays an up-to-date
+artifact: with a writable Lake cache, from the cache entry that the trace names (`getArtifactsUsingTrace?`, which
+writes the input's cache entry only if it is missing). When the cache holds no such entry, or is not writable, as
 `cacheServiceArtifact` saves `file` with the trace's log.
 -/
 public def replayServiceArtifact
   (pkg : Package) (inputHash : Hash) (savedTrace : SavedTrace) (file : FilePath) (ext : String) (exe : Bool)
-  (record : RemoteExec.Record)
+  (record? : Option RemoteExec.Record)
 : JobM Artifact := do
   if (← pkg.isArtifactCacheWritable) then
     if let some (art : XArtifact exe) ← getArtifactsUsingTrace? inputHash savedTrace pkg then
       return ← restoreArtifact file art exe
-  cacheServiceArtifact pkg inputHash file ext exe record savedTrace.log
+  cacheServiceArtifact pkg inputHash file ext exe record? savedTrace.log
 
 /--
 Build `file` using `build` after `dep` completes if the dependency's
