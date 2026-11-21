@@ -27,8 +27,9 @@ that a package's configuration runs, such as a custom target, may start processe
 processes a build spawns inherit the workspace build lock (`buildLockHandle`), so that the compilers
 of a killed Lake keep the workspace locked until they exit. A process that may outlive the build in
 a session of its own (the kept-module checker, the detached `lake cache push` of the shared remote
-cache, the cache token command) is spawned with `inheritBuildLock := false`: the lock is made
-non-inheritable for that spawn only, which no other spawn can overlap.
+cache, the cache token command, the `lean-remote` bridge of a probe of the build service) is spawned
+with `inheritBuildLock := false`: the lock is made non-inheritable for that spawn only, which no
+other spawn can overlap.
 -/
 public def spawnProc (args : IO.Process.SpawnArgs) (inheritBuildLock := true) :
     IO (IO.Process.Child args.toStdioConfig) :=

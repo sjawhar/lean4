@@ -114,7 +114,7 @@ builtin_initialize connRef : Std.Mutex (Option Conn) ← Std.Mutex.new none
 /-- The serial of the last connection started (see `Conn.serial`). -/
 builtin_initialize connSerial : IO.Ref Nat ← IO.mkRef 0
 
-/-- Kills a bridge process and reaps it. -/
+/-- Kills a bridge process (with its process group, if it has one of its own) and reaps it. -/
 def reap {cfg : IO.Process.StdioConfig} (child : IO.Process.Child cfg) : BaseIO Unit := do
   let _ ← child.kill.toBaseIO
   let _ ← child.wait.toBaseIO
@@ -196,12 +196,12 @@ partial def readLoop (out : IO.FS.Handle) (conn : Conn) : BaseIO Unit := do
 
 /--
 Ends probes (`probe`) from another task: once `stop` has run, the bridge of a probe made with it that
-waits for its `hello` answer is killed, and each later probe made with it fails at once as
-`unavailable`. Probes made without one, and the probes of another `ProbeStop`, go on.
+waits for its `hello` answer is killed with its process group, and each later probe made with it
+fails at once as `unavailable`. Probes made without one, and the probes of another `ProbeStop`, go on.
 -/
 public structure ProbeStop where
   /-- Whether `stop` has run, and the bridge of the probe that waits for its `hello` answer. -/
-  state : Std.Mutex (Bool × Option (IO.Process.Child {stdin := .null, stdout := .piped, stderr := .inherit}))
+  state : Std.Mutex (Bool × Option (IO.Process.Child {stdin := .piped, stdout := .piped, stderr := .inherit}))
 
 public def ProbeStop.new : BaseIO ProbeStop :=
   return {state := ← Std.Mutex.new (false, none)}
@@ -209,8 +209,8 @@ public def ProbeStop.new : BaseIO ProbeStop :=
 public def ProbeStop.isStopped (s : ProbeStop) : BaseIO Bool :=
   s.state.atomically do return (← get).1
 
-/-- Only kills the bridge: `connect`, which waits for its `hello` answer, reaps it, so its pid cannot be
-reused before the kill. -/
+/-- Only kills the bridge's process group: `probe`, which waits for its `hello` answer, reaps the
+bridge, so the group's id (the bridge's pid) cannot be reused before the kill. -/
 public def ProbeStop.stop (s : ProbeStop) : BaseIO Unit :=
   s.state.atomically do
     if let some child := (← get).2 then
@@ -219,7 +219,7 @@ public def ProbeStop.stop (s : ProbeStop) : BaseIO Unit :=
 
 /-- Registers the bridge of a probe that waits for its `hello` answer; `false` if `stop` has run. -/
 def ProbeStop.watch (s : ProbeStop)
-    (child : IO.Process.Child {stdin := .null, stdout := .piped, stderr := .inherit}) : BaseIO Bool :=
+    (child : IO.Process.Child {stdin := .piped, stdout := .piped, stderr := .inherit}) : BaseIO Bool :=
   s.state.atomically do
     if (← get).1 then return false
     set (false, some child)
@@ -228,44 +228,49 @@ def ProbeStop.watch (s : ProbeStop)
 def ProbeStop.unwatch (s : ProbeStop) : BaseIO Unit :=
   s.state.atomically do modify fun (stopped, _) => (stopped, none)
 
-/-- Starts a bridge and says `hello` on it before any other request (contract C5.1); a bridge
-started again after one exited says `hello` again with the same params, so the invocation id stays
-the build's. With `stop?`, the bridge is registered there while it waits for the `hello` answer. -/
-def connect (cfg : ClientConfig) (stop? : Option ProbeStop := none) : BaseIO (Except Error Conn) := do
+/-- Starts a bridge (`lean-remote bridge`, with `--socket` if set) with `spawnProc`, its messages on
+Lake's standard error; with `setsid`, in a session and process group of its own. -/
+def spawnBridge (cfg : ClientConfig) (setsid : Bool) (inheritBuildLock := true) :
+    BaseIO (Except Error (IO.Process.Child {stdin := .piped, stdout := .piped, stderr := .inherit})) := do
   let args := #["bridge"] ++ (cfg.socket?.elim #[] fun s => #["--socket", s.toString])
-  -- The bridge writes its messages to Lake's standard error. A reader of that stream (a pipe, `tee`)
-  -- therefore sees it end only when the bridge exits too, which after a killed Lake is once the
-  -- daemon has cancelled that Lake's requests; no limit of Lake's applies then.
-  -- It stays in Lake's process group (no `setsid`), so a signal to the group reaches it as the build
-  -- lock design expects: a connected bridge ignores it and outlives Lake until end of input.
-  let spawnedChild ← match ← (spawnProc {cmd := cfg.exe.toString, args, stdin := .piped, stdout := .piped, stderr := .inherit}).toBaseIO with
-    | .ok c => pure c
-    | .error e => return .error {code := .invalid, message := s!"LAKE_REMOTE_EXEC is set but `{cfg.exe}` cannot run: {e}"}
-  let (stdin, child) ← match ← spawnedChild.takeStdin.toBaseIO with
-    | .ok r => pure r
-    | .error e => return .error {code := .internal, message := s!"taking the lean-remote bridge's stdin: {e}"}
-  if let some stop := stop? then
-    unless ← stop.watch child do
-      reap child
-      return .error {code := .unavailable, message := "the probe of the build service was stopped"}
+  match ← (spawnProc (inheritBuildLock := inheritBuildLock)
+      {cmd := cfg.exe.toString, args, stdin := .piped, stdout := .piped, stderr := .inherit, setsid}).toBaseIO with
+  | .ok c => return .ok c
+  | .error e => return .error {code := .invalid, message := s!"LAKE_REMOTE_EXEC is set but `{cfg.exe}` cannot run: {e}"}
+
+/-- Says `hello` on a bridge just started, before any other request (contract C5.1): writes the
+request with `cfg.helloParams` to `stdin`, and returns the result of the answer that `stdout` brings. -/
+def sayHello (cfg : ClientConfig) (stdin stdout : IO.FS.Handle) : BaseIO (Except Error Json) := do
   let r ← (do
     stdin.putStrLn (Json.mkObj [("id", (0 : Nat)), ("method", "hello"), ("params", cfg.helloParams)]).compress
     stdin.flush
-    child.stdout.getLine).toBaseIO
-  -- Before any reap below, so that `ProbeStop.stop` never kills a pid that was reaped
-  if let some stop := stop? then stop.unwatch
-  -- A bridge that has not answered `hello` carries no write into the workspace, so it is killed.
+    stdout.getLine).toBaseIO
   let .ok line := r
-    | reap child
-      return .error {code := .unavailable, message := "the lean-remote bridge did not answer hello"}
-  let hello ← match Json.parse line >>= (pure <| decodeResponse ·) with
-    | .error _ =>
-      reap child
-      return .error {code := .unavailable, message := "the lean-remote bridge exited before answering hello"}
-    | .ok (.error e) =>
+    | return .error {code := .unavailable, message := "the lean-remote bridge did not answer hello"}
+  match Json.parse line with
+  | .ok j => return decodeResponse j
+  | .error _ => return .error {code := .unavailable, message := "the lean-remote bridge exited before answering hello"}
+
+/-- Starts a bridge and says `hello` on it (`sayHello`); a bridge started again after one exited says
+`hello` again with the same params, so the invocation id stays the build's. -/
+def connect (cfg : ClientConfig) : BaseIO (Except Error Conn) := do
+  -- The bridge writes its messages to Lake's standard error. A reader of that stream (a pipe, `tee`)
+  -- therefore sees it end only when the bridge exits too, which after a killed Lake is once the
+  -- daemon has cancelled that Lake's requests; no limit of Lake's applies then.
+  -- It stays in Lake's process group (unlike a probe's bridge), so a signal to the group reaches it
+  -- as the build lock design expects: a connected bridge ignores it and outlives Lake until end of input.
+  let spawnedChild ← match ← spawnBridge cfg (setsid := false) with
+    | .ok c => pure c
+    | .error e => return .error e
+  let (stdin, child) ← match ← spawnedChild.takeStdin.toBaseIO with
+    | .ok r => pure r
+    | .error e => return .error {code := .internal, message := s!"taking the lean-remote bridge's stdin: {e}"}
+  -- A bridge that has not answered `hello` carries no write into the workspace, so it is killed.
+  let hello ← match ← sayHello cfg stdin child.stdout with
+    | .ok h => pure h
+    | .error e =>
       reap child
       return .error e
-    | .ok (.ok h) => pure h
   let serial ← connSerial.modifyGet fun n => (n + 1, n + 1)
   let stdin ← IO.mkRef (some stdin)
   let pending ← Std.Mutex.new {}
@@ -288,17 +293,31 @@ public def hello (cfg : ClientConfig) : BaseIO (Except Error Json) :=
   return (← getConn cfg).map (·.hello)
 
 /--
-Asks whether the service answers now, on a bridge of its own: it says `hello` and is killed at once,
-so it carries no request and no write into the workspace, and this process's connection (and the
-requests in flight on it) stays as it is. `stop?` can end it from another task (`ProbeStop`).
+Asks whether the service answers now, on a bridge of its own: it says `hello` and is killed at once
+with its process group, so it carries no request and no write into the workspace, and this process's
+connection (and the requests in flight on it) stays as it is. `stop?` can end it from another task
+(`ProbeStop`).
 -/
 public def probe (cfg : ClientConfig) (stop? : Option ProbeStop := none) : BaseIO (Except Error Json) := do
-  match ← connect cfg stop? with
-  | .error e => return .error e
-  | .ok conn =>
-    conn.writeLock.atomically (m := BaseIO) do conn.stdin.set none
-    reap conn.child
-    return .ok conn.hello
+  -- A process group of its own, so that a kill also reaches a bridge that the bridge command runs as
+  -- its child (a wrapper without `exec`), which would otherwise hold its standard output open until it
+  -- answers; the daemon that a bridge may start is in a session of its own, which the kill never reaches.
+  -- Without the build lock: it carries no write into the workspace, and one that hangs on its `hello`
+  -- after a killed Lake must not keep the workspace locked
+  let child ← match ← spawnBridge cfg (setsid := true) (inheritBuildLock := false) with
+    | .ok c => pure c
+    | .error e => return .error e
+  if let some stop := stop? then
+    unless ← stop.watch child do
+      reap child
+      return .error {code := .unavailable, message := "the probe of the build service was stopped"}
+  -- On the child `spawnProc` returned: the one `Child.takeStdin` returns has lost `setsid`, so its
+  -- `kill` would reach the bridge command only
+  let hello ← sayHello cfg child.stdin child.stdout
+  -- Before the reap, so that `ProbeStop.stop` never kills the group of a bridge that was reaped
+  if let some stop := stop? then stop.unwatch
+  reap child
+  return hello
 
 /--
 Stops this process's bridge (`stopBridge`) if its `hello` does not pass `admits`, in one section of
