@@ -11,7 +11,7 @@ public import Lake.Util.Log
 public import Lake.Util.JsonObject
 public import Lake.Util.String
 import Lake.Util.Proc
-import Std.Sync.Mutex
+public import Std.Sync.Mutex
 import Std.Data.HashMap
 import Init.Data.String.Basic
 import Init.Data.String.Legacy
@@ -194,10 +194,44 @@ partial def readLoop (out : IO.FS.Handle) (conn : Conn) : BaseIO Unit := do
     readLoop out conn
   | .error e => closeConn conn s!"reading the lean-remote bridge: {e}"
 
+/--
+Ends probes (`probe`) from another task: once `stop` has run, the bridge of a probe made with it that
+waits for its `hello` answer is killed, and each later probe made with it fails at once as
+`unavailable`. Probes made without one, and the probes of another `ProbeStop`, go on.
+-/
+public structure ProbeStop where
+  /-- Whether `stop` has run, and the bridge of the probe that waits for its `hello` answer. -/
+  state : Std.Mutex (Bool × Option (IO.Process.Child {stdin := .null, stdout := .piped, stderr := .inherit}))
+
+public def ProbeStop.new : BaseIO ProbeStop :=
+  return {state := ← Std.Mutex.new (false, none)}
+
+public def ProbeStop.isStopped (s : ProbeStop) : BaseIO Bool :=
+  s.state.atomically do return (← get).1
+
+/-- Only kills the bridge: `connect`, which waits for its `hello` answer, reaps it, so its pid cannot be
+reused before the kill. -/
+public def ProbeStop.stop (s : ProbeStop) : BaseIO Unit :=
+  s.state.atomically do
+    if let some child := (← get).2 then
+      discard <| (child.kill.toBaseIO : BaseIO _)
+    modify fun _ => (true, none)
+
+/-- Registers the bridge of a probe that waits for its `hello` answer; `false` if `stop` has run. -/
+def ProbeStop.watch (s : ProbeStop)
+    (child : IO.Process.Child {stdin := .null, stdout := .piped, stderr := .inherit}) : BaseIO Bool :=
+  s.state.atomically do
+    if (← get).1 then return false
+    set (false, some child)
+    return true
+
+def ProbeStop.unwatch (s : ProbeStop) : BaseIO Unit :=
+  s.state.atomically do modify fun (stopped, _) => (stopped, none)
+
 /-- Starts a bridge and says `hello` on it before any other request (contract C5.1); a bridge
 started again after one exited says `hello` again with the same params, so the invocation id stays
-the build's. -/
-def connect (cfg : ClientConfig) : BaseIO (Except Error Conn) := do
+the build's. With `stop?`, the bridge is registered there while it waits for the `hello` answer. -/
+def connect (cfg : ClientConfig) (stop? : Option ProbeStop := none) : BaseIO (Except Error Conn) := do
   let args := #["bridge"] ++ (cfg.socket?.elim #[] fun s => #["--socket", s.toString])
   -- The bridge writes its messages to Lake's standard error. A reader of that stream (a pipe, `tee`)
   -- therefore sees it end only when the bridge exits too, which after a killed Lake is once the
@@ -211,10 +245,16 @@ def connect (cfg : ClientConfig) : BaseIO (Except Error Conn) := do
   let (stdin, child) ← match ← spawnedChild.takeStdin.toBaseIO with
     | .ok r => pure r
     | .error e => return .error {code := .internal, message := s!"taking the lean-remote bridge's stdin: {e}"}
+  if let some stop := stop? then
+    unless ← stop.watch child do
+      reap child
+      return .error {code := .unavailable, message := "the probe of the build service was stopped"}
   let r ← (do
     stdin.putStrLn (Json.mkObj [("id", (0 : Nat)), ("method", "hello"), ("params", cfg.helloParams)]).compress
     stdin.flush
     child.stdout.getLine).toBaseIO
+  -- Before any reap below, so that `ProbeStop.stop` never kills a pid that was reaped
+  if let some stop := stop? then stop.unwatch
   -- A bridge that has not answered `hello` carries no write into the workspace, so it is killed.
   let .ok line := r
     | reap child
@@ -251,10 +291,10 @@ public def hello (cfg : ClientConfig) : BaseIO (Except Error Json) :=
 /--
 Asks whether the service answers now, on a bridge of its own: it says `hello` and is killed at once,
 so it carries no request and no write into the workspace, and this process's connection (and the
-requests in flight on it) stays as it is.
+requests in flight on it) stays as it is. `stop?` can end it from another task (`ProbeStop`).
 -/
-public def probe (cfg : ClientConfig) : BaseIO (Except Error Json) := do
-  match ← connect cfg with
+public def probe (cfg : ClientConfig) (stop? : Option ProbeStop := none) : BaseIO (Except Error Json) := do
+  match ← connect cfg stop? with
   | .error e => return .error e
   | .ok conn =>
     conn.writeLock.atomically (m := BaseIO) do conn.stdin.set none

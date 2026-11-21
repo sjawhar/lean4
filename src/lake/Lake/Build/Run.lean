@@ -15,7 +15,6 @@ import Lake.Util.JsonObject
 import Lake.Util.IO
 import Lake.Config.PushQueue
 import Lake.Build.Claim
-import Lake.Util.RemoteExec
 import Lake.Build.RemoteExec
 
 /-! # Build Runner
@@ -536,8 +535,9 @@ def finalizeBuild
     let state ← remoteDecisionState
     print! mctx.out s!"{({stats with state}).line}\n"
     flush mctx.out
-  -- The build is done with the service; stop the bridge before Lake goes on (e.g. `lake exe` runs).
-  RemoteExec.shutdown
+  -- The build is done with the service; stop the re-probe timer and the bridge before Lake goes on
+  -- (e.g. `lake exe` runs).
+  shutdownRemote
   let remoteStatus ← bctx.remoteReadStatus.get
   if remoteStatus.failures > 0 then
     if let .error e ← (writeRemoteReadStatus bctx.workspace.lakeCache remoteStatus).toBaseIO then

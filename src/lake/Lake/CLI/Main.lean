@@ -1535,6 +1535,6 @@ def lake : CliM PUnit := do
 
 /-- Runs the Lake command `args`. With `oneShot`, the process exits when it returns (`LakeOptions.oneShot`). -/
 public def cli (args : List String) (oneShot := false) : BaseIO ExitCode := do
-  -- However a command ends (an exception included), stop the build-service bridge: its read task
-  -- would otherwise keep this process from exiting.
-  try inline <| (lake).run args oneShot finally RemoteExec.shutdown
+  -- However a command ends (an exception included), stop the build service's re-probe timer and
+  -- bridge: their tasks would otherwise keep this process from exiting.
+  try inline <| (lake).run args oneShot finally shutdownRemote
