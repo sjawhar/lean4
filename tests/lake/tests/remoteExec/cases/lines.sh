@@ -1,5 +1,5 @@
 # The `lines` group of test.sh, which sources it: the rows of the log line's table (LAKE_REMOTE_EXEC_LOG),
-# L1-L31 with L4b, L5b, L5c, L5d and L9b, but L8 (remoteExecToolchainMismatch) and L29
+# L1-L33 with L4b, L5b, L5c, L5d and L9b, but L8 (remoteExecToolchainMismatch) and L29
 # (remoteExecSourceRace). Each row builds in directories of its own under $WORK/lines, and each build writes
 # its lines to a log of its own, which `lines_check.py` checks: one `lean` line for each module of the build,
 # every field with its type, and the row's own rules. L2, L3 and L4 build on L1's tree, Lake cache and
@@ -464,5 +464,29 @@ row_L31() (
   lines L31 --modules "$mods" --expect '*:result=executed|cached'
 )
 
+# L32: a module that imports itself: its setup fails, and its line, `error` with code `setup`, waits for no
+# job (not its own, which it ends); `timeout` makes a wait fail the row
+row_L32() (
+  local rc=0
+  enter L32; log_to L32
+  printf 'import Rx.Self\n\n/-! A module that imports itself. -/\n\ndef s := 1\n' > Rx/Self.lean
+  LAKE_REMOTE_EXEC=grpc://fake:1 timeout 120 "$LAKE" build Rx.Self > produced.out 2>&1 || rc=$?
+  cat produced.out
+  test_exp "$rc" = 1
+  match_text 'Rx/Self.lean: module imports itself' produced.out
+  lines L32 --modules Rx.Self --expect 'Rx.Self:result=error,code=setup'
+)
+
+# L33: L26's build with a LAKE_REMOTE_EXEC_LOG that Lake cannot append to (a directory): the job of each
+# module warns that its line is lost, and the exit code stays 1
+row_L33() (
+  enter L33; log_to L33
+  mkdir -p "$LAKE_REMOTE_EXEC_LOG"
+  printf 'import Rx.Nope\n\n/-! A module that imports a module that does not exist. -/\n\ndef e := 1\n' > Rx/E.lean
+  LAKE_REMOTE_EXEC=grpc://fake:1 \
+    test_status_out 1 'Rx.E: could not append its line to LAKE_REMOTE_EXEC_LOG' build Rx.E
+  match_text 'Rx.Nope: could not append its line to LAKE_REMOTE_EXEC_LOG' produced.out
+)
+
 run_rows L1 L2 L3 L4 L4b L5 L5d L5b L5c L6 L7 L9 L9b L10 L11 L12 L13 L14 L15 L16 L17 L18 L19 L20 L21 L22 \
-  L23 L24 L25 L26 L27 L28 L30 L31
+  L23 L24 L25 L26 L27 L28 L30 L31 L32 L33

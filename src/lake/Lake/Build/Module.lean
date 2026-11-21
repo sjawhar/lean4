@@ -1393,37 +1393,43 @@ def ModuleLine.write (line : ModuleLine) (mod : Module) (o : RemoteOutcome) : IO
 Writes the line of a module job that ended before `fetchCore` wrote one: its presetup failed, so
 `Job.bindM` never ran the job's work, or `--fail-fast` canceled the job before or between its runs. The
 line is `import-failed` when the job of one of the module's direct imports ended in an error, else
-`error` with code `canceled` for a canceled job, else `error` with code `setup`. It is written before any
-reader sees the job's result, and nothing goes into the job's log: a module whose import failed is no
-failure of its own (exit code 75 counts the failures of the service, `failedOnlyForService`).
+`error` with code `canceled` for a canceled job, else `error` with code `setup`. It reads only jobs that
+have finished, and waits for none: the module's own job (a module that imports itself) is the one this
+ends, and an import whose failure failed the presetup has finished, or its presetup has (then its job
+fails too). The line is written before any reader sees the job's result. A module whose import failed is
+no failure of its own (exit code 75 counts the failures of the service, `failedOnlyForService`), so the
+job logs no error; a line it cannot append is a warning in its log.
 -/
 def Module.writeUnwrittenLine (mod : Module) (line : ModuleLine) (job : Job ModuleOutputArtifacts) :
     SpawnM (Job ModuleOutputArtifacts) := .ofFn fun _ _ _ store ctx _ =>
-  job.bindTask fun task => BaseIO.bindTask task (sync := true) fun r => do
-    let .error _ s := r | return .pure r
-    if ← line.written.get then return .pure r
+  job.bindTask fun task => BaseIO.mapTask (t := task) (sync := true) fun r => do
+    let .error e s := r | return r
+    if ← line.written.get then return r
     let snap ← store.get
-    -- The direct imports, from the module's header if it was read; only jobs the build started count
-    let input? : Option (Job ModuleInput) := snap.getInfo? mod.input
-    let input := input?.elim (Task.pure none) (·.task.map some)
-    BaseIO.bindTask input fun input? => do
-      let imports : Array Module := match input? with
-        | some (.ok input _) => input.imports.filterMap (·.module?)
-        | _ => #[]
-      let jobs : Array (Job ModuleOutputArtifacts) :=
-        imports.filterMap fun imp => snap.getInfo? imp.elabArts
-      BaseIO.mapTasks (tasks := jobs.toList.map (·.task)) fun results => do
-        -- A job canceled while it waited for a registered job that was canceled (whose readers
-        -- get its state renewed, `JobState.canceled` cleared) has no error of its own logged
-        let canceled ← pure s.canceled <||> do
-          let some tk := ctx.cancelTk? | return false
-          return (← tk.isSet) && !(s.log.hasEntries && s.log.maxLv ≥ .error)
-        let o : RemoteOutcome :=
-          if results.any (· matches .error ..) then {result := "import-failed"}
-          else if canceled then .error "canceled"
-          else .error "setup"
-        discard <| (line.write mod o).toBaseIO
-        return r
+    -- The result of a job that the build started, if it has finished (read with no wait)
+    let finished? {α : Type} (job? : Option (Job α)) : BaseIO (Option (JobResult α)) := do
+      let some job := job? | return none
+      if ← IO.hasFinished job.task then return some job.task.get else return none
+    let failed {α : Type} (job? : Option (Job α)) : BaseIO Bool := do
+      return ((← finished? job?) matches some (.error ..))
+    -- The direct imports, from the module's header if it was read
+    let imports : Array Module := match (← finished? (snap.getInfo? mod.input)) with
+      | some (.ok input _) => input.imports.filterMap (·.module?) |>.filter (· != mod)
+      | _ => #[]
+    let importFailed ← imports.anyM fun imp =>
+      failed (snap.getInfo? imp.elabArts) <||> failed (snap.getInfo? imp.presetup)
+    -- A job canceled while it waited for a registered job that was canceled (whose readers
+    -- get its state renewed, `JobState.canceled` cleared) has no error of its own logged
+    let canceled ← pure s.canceled <||> do
+      let some tk := ctx.cancelTk? | return false
+      return (← tk.isSet) && !(s.log.hasEntries && s.log.maxLv ≥ .error)
+    let o : RemoteOutcome :=
+      if importFailed then {result := "import-failed"}
+      else if canceled then .error "canceled"
+      else .error "setup"
+    let .error err ← (line.write mod o).toBaseIO | return r
+    return .error e <| s.logEntry <|
+      .warning s!"{mod.name}: could not append its line to LAKE_REMOTE_EXEC_LOG: {err}"
 
 /--
 The path part of a module's action (contract C2.1): plugins, dynlibs and `LEAN_PATH`, rewritten to input-root-relative
