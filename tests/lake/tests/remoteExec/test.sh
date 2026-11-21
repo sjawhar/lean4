@@ -13,8 +13,10 @@ PYTHON="${PYTHON:-python3}"
 TEST_DIR="$(norm_path "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)")"
 WORK="$TEST_DIR/work"; mkdir -p "$WORK"
 
-# The fake itself first, so that the cases below test Lake and not the fake.
+# The fake and the checkers first, so that the cases below test Lake and not them.
 test_cmd bash "$TEST_DIR/fake_selftest.sh"
+test_cmd "$PYTHON" "$TEST_DIR/lines_check.py" --self-test
+test_cmd "$PYTHON" "$TEST_DIR/probe_check.py" --self-test
 
 for d in local remote remote2 failed timeout unreach later later-local later2 wrongtc killed termed termed-write stuck \
     late late-ref fb-local fb-mixed fb-unavail fb-mat fb-mat-nf fb-seed fb-restore fb-wait fb-wait-mid \
@@ -82,9 +84,9 @@ seconds_since() { "$PYTHON" -c 'import sys, time; print(round(time.time() - floa
 in_range() { "$PYTHON" -c 'import sys; x, lo, hi = map(float, sys.argv[1:]); sys.exit(0 if lo <= x < hi else 1)' "$@"; }
 # dead PID: PID is no longer running
 dead() { ! kill -0 "$1" 2> /dev/null; }
-# wait_dead PID: wait up to 120 s until PID is no longer running
+# wait_dead PID [S]: wait up to S s (default 120) until PID is no longer running
 wait_dead() {
-  for _ in $(seq 1 1200); do
+  for _ in $(seq 1 $((${2:-120} * 10))); do
     dead "$1" && return 0
     sleep 0.1
   done
@@ -106,15 +108,6 @@ results() {
 c=collections.Counter(json.loads(l)["result"] for l in open(sys.argv[1]) if l.strip())
 print(" ".join(f"{k} {c[k]}" for k in sorted(c)))' "$1"
 }
-# local_targets FILE: the sorted targets of the `local` lines of a LAKE_REMOTE_EXEC_LOG file; each line names
-# no action and no output, and has the compile's own wall time
-local_targets() {
-  "$PYTHON" -c 'import json,sys
-ls=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
-ls=[l for l in ls if l["result"]=="local"]
-assert all(l["kind"]=="lean" and l["action"] is None and l["outputs"] is None and l["exitCode"]==0 and l["wallMs"]>0 for l in ls), ls
-print(" ".join(sorted(l["target"] for l in ls)))' "$1"
-}
 # check_lines LOG ARGS...: lines_check.py's checks of a LAKE_REMOTE_EXEC_LOG file (see its docstring)
 check_lines() { test_cmd "$PYTHON" "$TEST_DIR/lines_check.py" "$@"; }
 # log_lines: how many lines the fake's log has
@@ -122,13 +115,54 @@ log_lines() { if [ -f "$FAKE_LOG" ]; then wc -l < "$FAKE_LOG"; else echo 0; fi; 
 # wait_down SKIP N: wait up to 120 s until N hello answers after line SKIP of the fake's log said unreachable
 wait_down() {
   for _ in $(seq 1 1200); do
-    [ "$("$PYTHON" -c 'import json,sys
-ls=open(sys.argv[1]).read().splitlines()[int(sys.argv[2]):]
+    [ "$("$PYTHON" -c 'import json,os,sys
+p=sys.argv[1]; ls=open(p).read().splitlines()[int(sys.argv[2]):] if os.path.exists(p) else []
 print(sum(1 for l in ls if l.strip() and json.loads(l).get("answer")=="hello" and not json.loads(l)["reachable"]))' \
       "$FAKE_LOG" "$1")" -ge "$2" ] && return 0
     sleep 0.1
   done
   return 1
+}
+
+# The helpers below are the case files': the rows of a group work in its directory GW, $WORK/<group>.
+# enter NAME [PKG]: a fresh copy of the test package (or of $TEST_DIR/PKG) in $GW/NAME, made the working directory,
+# with the new Lake cache $GW/NAME.cache and the new service $GW/NAME.cas (GROUP_CAS, if the group has one service)
+enter() {
+  rm -rf "$GW/$1" "$GW/$1.cas" "$GW/$1.cache"; mkdir -p "$GW/$1"
+  if [ -n "${2:-}" ]; then
+    cp -r "$TEST_DIR/$2/." "$GW/$1/"
+  else
+    cp -r "$TEST_DIR/lakefile.toml" "$TEST_DIR/Rx.lean" "$TEST_DIR/Rx" "$GW/$1/"
+  fi
+  chmod -R u+w "$GW/$1"
+  cd "$GW/$1"
+  export LAKE_CACHE_DIR="$GW/$1.cache" FAKE_CAS="${GROUP_CAS:-$GW/$1.cas}"
+}
+# logs NAME: the next builds log to the new files $GW/NAME.fake.log (the fake's) and $GW/NAME.jsonl (Lake's lines)
+logs() {
+  export FAKE_LOG="$GW/$1.fake.log" LAKE_REMOTE_EXEC_LOG="$GW/$1.jsonl"
+  rm -f "$FAKE_LOG" "$FAKE_LOG.actions" "$LAKE_REMOTE_EXEC_LOG"
+}
+# native_lines LOG: the lines of LAKE_REMOTE_EXEC_LOG file LOG whose kind is not `lean`, each `TARGET=RESULT`, sorted
+native_lines() {
+  "$PYTHON" -c 'import json, os, sys
+p = sys.argv[1]
+ls = [json.loads(l) for l in open(p) if l.strip()] if os.path.exists(p) else []
+print(" ".join(sorted("%s=%s" % (l.get("target"), l.get("result")) for l in ls if l.get("kind") != "lean")))' "$1"
+}
+# toolchain DIR: DIR becomes a toolchain that holds the test's Lake beside Lean, as a release does: links to the
+# files of `lean --print-prefix`, with a copy of $LAKE as `bin/lake`. Lean loads Lake's own shared library as a
+# plugin wherever it loads a plugin of the workspace, and a request names that library only under the sysroot:
+# the test's Lake has it in tests/lake/.lake/build, so it sends no request that loads a plugin (`plugin … is
+# outside the workspace`). Beside Lean, Lake's library is the sysroot's lib/lean/libLake_shared.so.
+toolchain() {
+  local sysroot f
+  sysroot=$(lean --print-prefix)
+  rm -rf "$1"; mkdir -p "$1/bin"
+  for f in "$sysroot"/*; do [ "${f##*/}" = bin ] || ln -s "$f" "$1/"; done
+  for f in "$sysroot"/bin/*; do [ "${f##*/}" = lake ] || ln -s "$f" "$1/bin/"; done
+  f=$(command -v "$LAKE")
+  ln "$f" "$1/bin/lake" 2> /dev/null || cp "$f" "$1/bin/lake"
 }
 
 group_base() {
@@ -280,7 +314,8 @@ match_text "c says hi" "$WORK/fb-local/produced.out"
 test_cmd_eq "$runs" count_method run
 test_cmd same_outputs "$WORK/fb-local"
 test_cmd_eq "local 5" results "$WORK/fb-local.jsonl"
-test_cmd_eq "Rx Rx.A Rx.B Rx.C Rx.M" local_targets "$WORK/fb-local.jsonl"
+check_lines "$WORK/fb-local.jsonl" --modules Rx,Rx.A,Rx.B,Rx.C,Rx.M \
+  --expect '*:kind=lean,result=local,action=null,outputs=null,exitCode=0,wallMs>0'
 (cd "$WORK/fb-local" && FAKE_UNREACHABLE=1 LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_REMOTE_EXEC_LOG="$WORK/fb-local.jsonl" \
   test_out "lake: remote: unreachable; 0 cached (0 from manifest), 0 executed, 0 local;" build Rx)
 test_cmd_eq "local 5 local-cache 5" results "$WORK/fb-local.jsonl"
@@ -304,7 +339,8 @@ skip=$(log_lines)
 test_cmd_eq "Rx.A Rx.B Rx.M" run_targets "$skip"
 test_cmd same_outputs "$WORK/fb-unavail"
 test_cmd_eq "cached 2 local 3" results "$WORK/fb-unavail.jsonl"
-test_cmd_eq "Rx Rx.B Rx.C" local_targets "$WORK/fb-unavail.jsonl"
+check_lines "$WORK/fb-unavail.jsonl" --modules Rx,Rx.A,Rx.B,Rx.C,Rx.M \
+  --expect 'Rx|Rx.B|Rx.C:kind=lean,result=local,action=null,outputs=null,exitCode=0,wallMs>0'
 
 # A materialize that answers UNAVAILABLE after a good run: the module compiles locally and counts once, as
 # `local`; the remote run's messages, already replayed, are dropped, so Rx.C's message shows once. The timer
@@ -316,14 +352,17 @@ test_cmd_eq "Rx Rx.B Rx.C" local_targets "$WORK/fb-unavail.jsonl"
   test_out_pat "lake: remote: (ok|unreachable); 3 cached \(0 from manifest\), 0 executed, 2 local;" build Rx)
 test_cmd_eq 1 grep -c "c says hi" "$WORK/fb-mat/produced.out"
 test_cmd same_outputs "$WORK/fb-mat"
-test_cmd_eq "Rx Rx.C" local_targets "$WORK/fb-mat.jsonl"
+check_lines "$WORK/fb-mat.jsonl" --modules Rx,Rx.A,Rx.B,Rx.C,Rx.M \
+  --expect 'Rx|Rx.C:kind=lean,result=local,action=null,outputs=null,exitCode=0,wallMs>0' \
+  --expect 'Rx.A|Rx.B|Rx.M:result!=local'
 
 # Any other materialize failure is not a fallback: the build fails, and the module's one line is `error`
 # with code `materialize`.
 (cd "$WORK/fb-mat-nf" && FAKE_MATERIALIZE_FAIL=NOT_FOUND:/Rx/B.olean LAKE_REMOTE_EXEC=grpc://fake:1 \
   LAKE_REMOTE_EXEC_LOG="$WORK/fb-mat-nf.jsonl" \
   test_status_out 1 "materializing Rx.B from the build service failed" build Rx)
-check_lines "$WORK/fb-mat-nf.jsonl" --expect 'Rx.B:result=error,code=materialize'
+check_lines "$WORK/fb-mat-nf.jsonl" --modules Rx,Rx.A,Rx.B,Rx.C,Rx.M \
+  --expect 'Rx.B:result=error,code=materialize'
 
 # `local` counts compiles only: a fresh tree whose fallback finds its modules in the Lake cache restores them,
 # replays the saved log of each (here Rx.C's message), records `0 local`, and writes a `local-cache` line for
@@ -347,7 +386,8 @@ printf 'import Rx\n\n/-! A module that imports the library root, so its compile 
   test_out_pat "Reused Rx( |$)" -v build Rx.D)
 match_text "lake: remote: unreachable; 0 cached (0 from manifest), 0 executed, 1 local;" "$WORK/fb-restore/produced.out"
 test_cmd_eq "local 1 local-cache 5" results "$WORK/fb-consume.jsonl"
-test_cmd_eq "Rx.D" local_targets "$WORK/fb-consume.jsonl"
+check_lines "$WORK/fb-consume.jsonl" --modules Rx,Rx.A,Rx.B,Rx.C,Rx.M,Rx.D \
+  --expect 'Rx.D:kind=lean,result=local,action=null,outputs=null,exitCode=0,wallMs>0'
 # The `Rx.olean` that Lake gives Rx's readers has the bytes of the one a local build makes, and it is the cache's
 # file: the tree has none.
 rx_olean=$(cd "$WORK/fb-restore" && LAKE_CACHE_DIR="$WORK/fb-cache" LAKE_ARTIFACT_CACHE=true \
@@ -650,6 +690,7 @@ for g in ${selected//,/ }; do
   case " $ALL_GROUPS " in *" $g "*) ;; *) echo "group $g: unknown"; failed=1; continue ;; esac
   if [ ! -f "$TEST_DIR/$file" ]; then
     echo "group $g: missing"
+    failed=1
     continue
   fi
   echo "# group $g"
@@ -659,7 +700,7 @@ for g in ${selected//,/ }; do
   (
     set -eE
     trap on_err ERR
-    if [ "$g" = base ]; then group_base; else source "$TEST_DIR/$file"; fi
+    if [ "$g" = base ]; then group_base; else GW="$WORK/$g"; mkdir -p "$GW"; source "$TEST_DIR/$file"; fi
   )
   rc=$?
   set -e

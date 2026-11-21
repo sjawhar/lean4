@@ -18,7 +18,8 @@ end is the latest `startMs + wallMs` of Lake's lines. A module is a target of a 
   hellos=N        exactly N `hello`s asked after the failure
   down            every `hello` answer after the failure said unreachable
   up              a `hello` answer after the failure said reachable
-  answered        every probe was asked and answered before the build's end (none was in flight then)
+  answered        a probe was asked, and every probe was asked and answered before the build's end (none was in
+                  flight then)
   held            the last probe was asked before the build's end and has no answer
   in-flight=T     a probe was in flight (asked, not yet answered) when module T's job started
   runs=T:N        T has exactly N `run`s
@@ -26,14 +27,15 @@ end is the latest `startMs + wallMs` of Lake's lines. A module is a target of a 
   reconnect[=S]   after the reachable answer exactly one `hello` was asked (a new bridge; no probe follows),
                   after S (seconds since the epoch) if given, and a `run` came after it
   service         a module has a `run` after the reachable answer
-  after           every module whose job started more than 1 s after the reachable answer is `executed` or
-                  `cached`
+  after           a module's job started more than 1 s after the reachable answer, and every such module is
+                  `executed` or `cached`
   no-wait         no `local` module started more than 5 s after the latest end of the modules that started
                   before it (a module that waited for a probe would)
   promoted=I:L,…  each pair is a module I and a module L it imports; for each pair whose L is `local` and whose I
                   has a `run`, L has a `run` before I's first one (its promotion), and at least one pair is so
-  cas=DIR         every entry of the fake's action cache DIR/ac is the result of a `run` the fake executed: its
-                  name is the key of an action of FAKE_LOG.actions, and its `action` names that key
+  inputs=DIR      an action of the fake (FAKE_LOG.actions) takes an input that is not a source file (`.lean`), and
+                  each such input has the digest of an output of a `run` that the fake executed (its action cache
+                  DIR/ac): no output of a compile on this machine is an input of a service action
   exit=MS         Lake exited (MS, milliseconds since the epoch) at most 3 s after the build's end: the 1 s that
                   the timer may add, and 2 s for what follows the last line under load (the end-of-build line,
                   Lake's exit, the caller's clock read)
@@ -41,7 +43,7 @@ end is the latest `startMs + wallMs` of Lake's lines. A module is a target of a 
 With --until PID the logs are read again every 0.1 s until the checks pass, PID has exited, or 120 s passed.
 Exits 1 with each failure when a check fails.
 """
-import argparse, hashlib, json, os, sys, tempfile, time
+import argparse, json, os, sys, tempfile, time
 
 SCHEDULE = (1, 2, 4, 8, 16, 30)
 FIRST_MAX_S = 60
@@ -191,6 +193,8 @@ def check_down(L):
 
 def check_answered(L):
     L.need_failure()
+    if not L.probes:
+        raise Fail("no probe after the failure")
     end = L.build_end()
     for k, p in enumerate(L.probes, 1):
         if p["answer"] is None or p["answer"] > end:
@@ -259,6 +263,8 @@ def check_service(L):
 def check_after(L):
     L.need_up()
     late = [l for l in L.lean() if L.times(l)[0] > L.up_t + AFTER_S]
+    if not late:
+        raise Fail(f"no module started more than {AFTER_S} s after the reachable answer ({L.rel(L.up_t)})")
     bad = [l for l in late if l.get("result") not in ("executed", "cached")]
     if bad:
         raise Fail("module(s) that started more than 1 s after the reachable answer "
@@ -296,19 +302,20 @@ def check_promoted(L, spec):
         raise Fail("no local module is imported by a module that has a run")
 
 
-def check_cas(L, d):
-    keys = {hashlib.sha256(json.dumps(a, sort_keys=True).encode()).hexdigest()
-            for a in read_jsonl(L.fake_path + ".actions")}
+def check_inputs(L, d):
     ac = os.path.join(d, "ac")
+    made = set()
     for name in sorted(os.listdir(ac)) if os.path.isdir(ac) else []:
-        if name.endswith(".tmp"):
-            continue
-        if name not in keys:
-            raise Fail(f"the action cache holds {name}, which no run of the fake's log has as its key")
-        with open(os.path.join(ac, name)) as f:
-            action = json.load(f).get("action")
-        if action != f"{name}/0":
-            raise Fail(f"the action cache entry {name} names the action {action}")
+        if not name.endswith(".tmp"):
+            with open(os.path.join(ac, name)) as f:
+                made |= {o.get("digest") for o in json.load(f).get("outputs") or []}
+    taken = [(rel, digest) for a in read_jsonl(L.fake_path + ".actions") for rel, digest, _ in a.get("inputs") or []
+             if not rel.endswith(".lean")]
+    if not taken:
+        raise Fail("no action of the fake's log takes an input that is not a source file")
+    bad = sorted({rel for rel, digest in taken if digest not in made})
+    if bad:
+        raise Fail("the fake's actions take files that no run of the fake made: " + ", ".join(bad))
 
 
 def check_exit(L, ms):
@@ -334,10 +341,10 @@ CHECKS = {
     "after": lambda L, a: check_after(L),
     "no-wait": lambda L, a: check_no_wait(L),
     "promoted": check_promoted,
-    "cas": check_cas,
+    "inputs": check_inputs,
     "exit": check_exit,
 }
-NEEDS_ARG = ("hellos", "in-flight", "runs", "resent", "promoted", "cas", "exit")
+NEEDS_ARG = ("hellos", "in-flight", "runs", "resent", "promoted", "inputs", "exit")
 
 
 def parse_checks(checks, lake):
@@ -492,6 +499,7 @@ def self_test():
         case("a probe in flight at the end", held, end_lake, ["answered"], "was not answered before the build's end")
         case("a probe after the end", write([answer(0, False), hello(12), answer(12.1, False)]), end_lake,
              ["answered"], "was not answered before the build's end")
+        case("no probe to answer", write([answer(0, False)]), end_lake, ["answered"], "no probe after the failure")
         case("held", held, end_lake, ["held"])
         case("held, but answered", answered, end_lake, ["held"], "was answered")
         case("held, but asked after the end", write([answer(0, False), hello(12)]), end_lake, ["held"],
@@ -541,7 +549,10 @@ def self_test():
                                                           line("C2", "local", 11.3, 2.5)]), ["after"],
              "C2 local (started +11.30 s)")
         case("a local module within 1 s of the answer", k5, write([line("C1", "local", 0.2, 7.8),
-                                                                  line("C2", "local", 8.1, 1.0)]), ["after"])
+                                                                  line("C2", "local", 8.1, 1.0),
+                                                                  line("C3", "executed", 9.5, 1.0)]), ["after"])
+        case("no module after the answer", k5, write([line("C1", "local", 0.2, 7.8)]), ["after"],
+             "no module started more than 1 s after the reachable answer")
 
         # k5's promotion order: C1 local, imported by C2, which ran on the service
         chain = "C2:C1,C3:C2"
@@ -556,25 +567,29 @@ def self_test():
              "no local module is imported")
         case("a bad pair", k5, lake, ["promoted=C2"], "usage: promoted needs")
 
-        # The fake's action cache: keys of the actions it logged
-        act = {"argv": ["lean"], "inputs": [], "timeoutSecs": 3600}
-        key = hashlib.sha256(json.dumps(act, sort_keys=True).encode()).hexdigest()
-        fake = write([answer(0, False)])
-        with open(fake + ".actions", "w") as f:
-            f.write(json.dumps(act, sort_keys=True) + "\n")
+        # The inputs of the fake's actions: a source file, and C1's olean as the fake's run made it or as this
+        # machine compiled it
         cas = os.path.join(d, "cas")
         os.makedirs(os.path.join(cas, "ac"))
-        with open(os.path.join(cas, "ac", key), "w") as f:
-            json.dump({"action": f"{key}/0"}, f)
-        case("the fake's own runs", fake, None, [f"cas={cas}"])
-        with open(os.path.join(cas, "ac", "f" * 64), "w") as f:
-            json.dump({"action": "f" * 64 + "/0"}, f)
-        case("an entry of no run", fake, None, [f"cas={cas}"], "which no run of the fake's log has")
-        os.remove(os.path.join(cas, "ac", "f" * 64))
-        with open(os.path.join(cas, "ac", key), "w") as f:
-            json.dump({"action": "e" * 64 + "/0"}, f)
-        case("an entry of another action", fake, None, [f"cas={cas}"], "names the action")
-        case("no action cache", fake, None, [f"cas={os.path.join(d, 'none')}"])
+        svc, local = "c" * 64 + "/300", "d" * 64 + "/300"
+        with open(os.path.join(cas, "ac", "a" * 64), "w") as f:
+            json.dump({"action": "a" * 64 + "/0",
+                       "outputs": [{"rel": "lib/chain/Chain/C1.olean", "digest": svc, "executable": False}]}, f)
+        src = ["src/Chain/C2.lean", "e" * 64 + "/40", False]
+
+        def acted(*inputs):
+            fake = write([answer(0, False)])
+            with open(fake + ".actions", "w") as f:
+                f.write(json.dumps({"argv": ["lean"], "inputs": list(inputs), "timeoutSecs": 3600}, sort_keys=True)
+                        + "\n")
+            return fake
+
+        fake = acted(src, ["lib/chain/Chain/C1.olean", svc, False])
+        case("inputs that the fake's runs made", fake, None, [f"inputs={cas}"])
+        case("a local olean as an input", acted(src, ["lib/chain/Chain/C1.olean", local, False]), None,
+             [f"inputs={cas}"], "no run of the fake made: lib/chain/Chain/C1.olean")
+        case("no input but a source file", acted(src), None, [f"inputs={cas}"], "takes an input that is not a source")
+        case("no action cache", fake, None, [f"inputs={os.path.join(d, 'none')}"], "no run of the fake made")
         case("an unknown check", fake, None, ["nope"], "usage: unknown check")
         case("a check without its value", fake, None, ["runs"], "usage: check runs needs a value")
     for b in bad:

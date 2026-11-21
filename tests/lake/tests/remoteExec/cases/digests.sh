@@ -6,51 +6,20 @@
 # build has a fake log and a LAKE_REMOTE_EXEC_LOG of its own. D4 builds on D2's service: `build_D2` builds D2's tree
 # once, so that each of them also runs alone.
 
-DW="$WORK/digests"
-mkdir -p "$DW"
+DW=$GW
 export LAKE_REMOTE_EXEC=grpc://fake:1
 unset LAKE_REMOTE_EXEC_TIMEOUT LAKE_REMOTE_EXEC_FALLBACK LAKE_ARTIFACT_CACHE LAKE_RESTORE_ARTIFACTS
 # The service's C compiler and the PATH of its actions: this machine's `cc`, and the `ld.lld` that the link flags'
 # `-fuse-ld=lld` need. With LAKE_REMOTE_EXEC_SYSROOT and LAKE_REMOTE_EXEC_TOOLCHAIN (test.sh) they are the four
 # settings that make two machines send the same actions
-export LAKE_REMOTE_EXEC_CC="$(command -v cc)" LAKE_REMOTE_EXEC_PATH="$(dirname "$(command -v ld.lld)"):/usr/bin:/bin"
+LAKE_REMOTE_EXEC_CC=$(command -v cc)
+lld=$(command -v ld.lld)
+export LAKE_REMOTE_EXEC_CC LAKE_REMOTE_EXEC_PATH="$(dirname "$lld"):/usr/bin:/bin"
 RX_MODS=Rx,Rx.A,Rx.B,Rx.C,Rx.M
 
-# toolchain DIR: DIR becomes a toolchain that holds the test's Lake beside Lean, as a release does: links to the
-# files of `lean --print-prefix`, with a copy of $LAKE as `bin/lake`. Lean loads Lake's own shared library as a
-# plugin wherever it loads a plugin of the workspace, and a request names that library only under the sysroot:
-# the test's Lake has it in tests/lake/.lake/build, so it sends no request that loads a plugin (`plugin … is
-# outside the workspace`). Beside Lean, Lake's library is the sysroot's lib/lean/libLake_shared.so.
-toolchain() {
-  local sysroot f
-  sysroot=$(lean --print-prefix)
-  rm -rf "$1"; mkdir -p "$1/bin"
-  for f in "$sysroot"/*; do [ "${f##*/}" = bin ] || ln -s "$f" "$1/"; done
-  for f in "$sysroot"/bin/*; do [ "${f##*/}" = lake ] || ln -s "$f" "$1/bin/"; done
-  f=$(command -v "$LAKE")
-  ln "$f" "$1/bin/lake" 2> /dev/null || cp "$f" "$1/bin/lake"
-}
 toolchain "$DW/tc"
 export LAKE="$DW/tc/bin/lake"
 
-# enter NAME [rx]: a fresh copy of `native/` (or of the package Rx) in $DW/NAME, made the working directory, with
-# the new service $DW/NAME.cas and Lake cache $DW/NAME.cache
-enter() {
-  rm -rf "$DW/$1" "$DW/$1.cas" "$DW/$1.cache"; mkdir -p "$DW/$1"
-  if [ "${2:-}" = rx ]; then
-    cp -r "$TEST_DIR/lakefile.toml" "$TEST_DIR/Rx.lean" "$TEST_DIR/Rx" "$DW/$1/"
-  else
-    cp -r "$TEST_DIR/native/." "$DW/$1/"
-  fi
-  chmod -R u+w "$DW/$1"
-  cd "$DW/$1"
-  export FAKE_CAS="$DW/$1.cas" LAKE_CACHE_DIR="$DW/$1.cache"
-}
-# logs NAME: the next builds log to the new files $DW/NAME.fake.log (the fake's) and $DW/NAME.jsonl (Lake's lines)
-logs() {
-  export FAKE_LOG="$DW/$1.fake.log" LAKE_REMOTE_EXEC_LOG="$DW/$1.jsonl"
-  rm -f "$FAKE_LOG" "$FAKE_LOG.actions" "$LAKE_REMOTE_EXEC_LOG"
-}
 # The helpers below read the fake's log LOG with these functions: `runs(LOG)` its `run` requests (their params),
 # in order; `action(LOG, T)` the key of target T's last run, which is the SHA-256 of the line of LOG.actions with
 # that run's argv and outputs; `result(LOG, T)` what the fake stored for T's action (its action cache entry in
@@ -141,26 +110,6 @@ got = (rec.get("action"), sorted(o.get("digest") for o in (rec.get("outputs") or
 print("%s: record %s, want %s" % (trace, json.dumps(got), json.dumps(want)))
 sys.exit(0 if res and got == want else 1)' "$FAKE_LOG" "$1" "$2"
 }
-# service_inputs: every input of every action of the fake's log but a source file (`.lean`) has the digest of an
-# output of an action that the fake ran (its action cache): no local output is an input of a service action
-service_inputs() {
-  "$PYTHON" -c "$FAKE_PY"'
-ac = os.path.join(os.environ["FAKE_CAS"], "ac")
-made = {o["digest"] for k in (os.listdir(ac) if os.path.isdir(ac) else [])
-        for o in json.load(open(os.path.join(ac, k))).get("outputs") or []}
-acts = actions(sys.argv[1]).values()
-bad = [(a["outputs"], rel) for a in acts for rel, d, _ in a["inputs"] if not rel.endswith(".lean") and d not in made]
-for outs, rel in bad: print("the action of %s takes %s, which no action of the service wrote" % (outs, rel))
-print("%d actions" % len(acts))
-sys.exit(1 if bad or not acts else 0)' "$FAKE_LOG"
-}
-# native_lines LOG: the lines of LAKE_REMOTE_EXEC_LOG file LOG whose kind is not `lean`, each `TARGET=RESULT`, sorted
-native_lines() {
-  "$PYTHON" -c 'import json, os, sys
-p = sys.argv[1]
-ls = [json.loads(l) for l in open(p) if l.strip()] if os.path.exists(p) else []
-print(" ".join(sorted("%s=%s" % (l.get("target"), l.get("result")) for l in ls if l.get("kind") != "lean")))' "$1"
-}
 # serviced LOG: every target that has a `run` in the fake's log has its lines in LOG `executed` or `cached` (a
 # promoted target keeps the line of its local outputs), and so has Nat0.Tac's module library
 serviced() {
@@ -176,7 +125,7 @@ row_D1() (
   local g
   rm -rf "$DW/D1.cas"
   for g in g g0; do
-    enter "D1-$g"; export FAKE_CAS="$DW/D1.cas"; logs "D1-$g"
+    enter "D1-$g" native; export FAKE_CAS="$DW/D1.cas"; logs "D1-$g"
     mkdir -p "$DW/D1-$g.bin"
     printf '#!/bin/sh\nexec "%s" -%s "$@"\n' "$LAKE_REMOTE_EXEC_CC" "$g" > "$DW/D1-$g.bin/cc"
     chmod +x "$DW/D1-$g.bin/cc"
@@ -188,7 +137,7 @@ row_D1() (
 # D2's tree: `native/` built through a service of its own
 build_D2() (
   [ ! -e "$DW/D2.built" ] || exit 0
-  enter D2; logs D2
+  enter D2 native; logs D2
   test_run build Use2 Nat0:shared
   touch "$DW/D2.built"
 )
@@ -209,11 +158,11 @@ row_D2() (
 row_D3() (
   local dep
   export LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true
-  enter D3-first; logs D3-first
+  enter D3-first native; logs D3-first
   test_run build Nat0.Use
   dep=$("$PYTHON" -c 'import json, sys; print(json.load(open(sys.argv[1]))["depHash"])' .lake/build/lib/lean/Nat0/Use.trace)
   test_cmd rm "$LAKE_CACHE_DIR"/outputs/*/"$dep.json"
-  enter D3; export FAKE_CAS="$DW/D3-first.cas" LAKE_CACHE_DIR="$DW/D3-first.cache"; logs D3
+  enter D3 native; export FAKE_CAS="$DW/D3-first.cas" LAKE_CACHE_DIR="$DW/D3-first.cache"; logs D3
   test_run build Nat0.Use
   test_cmd_eq "LeanModule:Nat0.Use" run_seq
   test_cmd by_digest Nat0.Use Nat0.Tac:dynlib "$DW/D3-first.fake.log"
@@ -226,8 +175,8 @@ row_D3() (
 row_D4() (
   local lib
   build_D2
-  lib=$(FAKE_LOG="$DW/D2.fake.log" FAKE_CAS="$DW/D2.cas" fake_out Nat0.Tac:dynlib || true)
-  enter D4; export FAKE_CAS="$DW/D2.cas"; logs D4
+  lib=$(FAKE_LOG="$DW/D2.fake.log" FAKE_CAS="$DW/D2.cas" fake_out Nat0.Tac:dynlib)
+  enter D4 native; export FAKE_CAS="$DW/D2.cas"; logs D4
   printf '\n-- a change of D4\n' >> Nat0/Use.lean
   FAKE_DROP_ONCE="$lib" test_run build Nat0.Use
   test_cmd_eq "LinkShared:Nat0.Tac:dynlib LeanModule:Nat0.Use LinkShared:Nat0.Tac:dynlib! LeanModule:Nat0.Use" \
@@ -241,7 +190,7 @@ row_D4() (
 # digest, and the library's file holds the service's bytes
 row_D5() (
   local lib
-  enter D5; logs D5-local
+  enter D5 native; logs D5-local
   FAKE_UNREACHABLE=1 test_run build +Nat0.Tac:dynlib
   check_lines "$DW/D5-local.jsonl" --modules Nat0.Tac \
     --expect 'Nat0.Tac:dynlib:kind=shared,result=local,action=null,outputs=null,exitCode=0'
@@ -260,7 +209,7 @@ row_D5() (
 # and has only lines of the service
 row_D6() (
   local pid rc
-  enter D6-fail; logs D6-fail-down
+  enter D6-fail native; logs D6-fail-down
   FAKE_UNREACHABLE=1 LAKE_REMOTE_EXEC_FALLBACK=fail test_status 75 build Nat0.Use
   test_exp ! -e .lake/build/lib/lean/native_Nat0_Tac.so
   test_exp ! -e .lake/build/ir/Nat0/Tac.c.o.export
@@ -270,7 +219,7 @@ row_D6() (
   logs D6-fail
   LAKE_REMOTE_EXEC_FALLBACK=fail test_run build Nat0.Use
   serviced "$DW/D6-fail.jsonl"
-  enter D6-wait; logs D6-wait
+  enter D6-wait native; logs D6-wait
   touch "$DW/D6.down"
   (FAKE_DOWN_FILE="$DW/D6.down" LAKE_REMOTE_EXEC_FALLBACK=wait "$LAKE" build Nat0.Use > "$DW/D6-wait.out" 2>&1) &
   pid=$!
@@ -287,7 +236,7 @@ row_D6() (
 # has the service's record; Rx.A has one line in each build, `local`, then `local-cache` with no record (it
 # replayed its local trace before the promotion)
 row_D7() (
-  enter D7 rx; logs D7-local
+  enter D7; logs D7-local
   FAKE_UNREACHABLE=1 test_run build Rx.A
   logs D7
   test_run build Rx.B
@@ -305,13 +254,13 @@ row_D7() (
 row_D8() (
   local fb
   for fb in local fail wait; do
-    enter "D8-$fb" rx
+    enter "D8-$fb"
     (unset LAKE_REMOTE_EXEC LAKE_REMOTE_EXEC_LOG; test_run build Rx)
     logs "D8-$fb"
     printf '\ndef b2 := b + 1\n' >> Rx/B.lean
     LAKE_REMOTE_EXEC_FALLBACK="$fb" test_run build Rx
     test_cmd_eq "LeanModule:Rx.A LeanModule:Rx.B" run_seq Rx.A Rx.B
-    test_cmd service_inputs
+    test_cmd "$PYTHON" "$TEST_DIR/probe_check.py" --fake "$FAKE_LOG" "inputs=$FAKE_CAS"
     check_lines "$DW/D8-$fb.jsonl" --modules "$RX_MODS" \
       --expect 'Rx.A|Rx.M:result=local-cache,action=null,outputs=null,code=null' --expect 'Rx.B|Rx.C|Rx:result=executed'
   done
@@ -320,7 +269,7 @@ row_D8() (
 # D9: D7 with the service answering UNAVAILABLE for Rx.A's run: under `local` the promotion fails and Rx.B compiles
 # here, with no request of its own; under `fail` Rx.B fails with UNAVAILABLE
 row_D9() (
-  enter D9-local rx; logs D9-local-first
+  enter D9-local; logs D9-local-first
   FAKE_UNREACHABLE=1 test_run build Rx.A
   logs D9-local
   FAKE_UNAVAILABLE_TARGET=Rx.A test_run build Rx.B
@@ -328,7 +277,7 @@ row_D9() (
   check_lines "$DW/D9-local.jsonl" --modules Rx.A,Rx.B \
     --expect 'Rx.A:result=local-cache,action=null,outputs=null,code=null' \
     --expect 'Rx.B:result=local,action=null,outputs=null,exitCode=0'
-  enter D9-fail rx; logs D9-fail-first
+  enter D9-fail; logs D9-fail-first
   FAKE_UNREACHABLE=1 test_run build Rx.A
   logs D9-fail
   FAKE_UNAVAILABLE_TARGET=Rx.A LAKE_REMOTE_EXEC_FALLBACK=fail test_status 75 build Rx.B

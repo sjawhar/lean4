@@ -53,7 +53,7 @@ Knobs, all through the environment:
                       its `timeoutSecs` and answers TIMEOUT as above (`new`: with the digests of the
                       streams it wrote); any other action runs to its end
   FAKE_UNAVAILABLE_TARGET a target name: its `run` answers UNAVAILABLE, as a service that did not answer
-  FAKE_ERROR_TARGET   `TARGET:CODE`: TARGET's `run` answers an error with code CODE, which may be any text
+  FAKE_ERROR_TARGET   `TARGET:CODE`: TARGET's `run` answers an error with code CODE, any text without `:`
   FAKE_REPLAY_TARGET  a target name: its `run` answers what FAKE_REPLAY_FILE holds, as it is: a
   FAKE_REPLAY_FILE    recorded response line (`recorded/*.json`), or the `result` or `error` of one
   FAKE_EXTRA_OUTPUT_TARGET a target name: its result also names an output that the request did not
@@ -99,6 +99,8 @@ SLOW_WRITE_GO = os.environ.get("FAKE_SLOW_WRITE_GO")
 CANCELLED = "cancelled, because the client closed its connection"
 DOWN_FILE = os.environ.get("FAKE_DOWN_FILE")
 FIELDS = os.environ.get("FAKE_FIELDS") or "today"
+# The `timeoutSecs` of a request that gives none
+DEFAULT_TIMEOUT_S = 3600
 # FAKE_DISK_TARGET's `writtenBytes`: the 101 GiB that the recorded disk-limit action (`fill --gib 101`) writes
 DISK_FILL_BYTES = 101 << 30
 
@@ -131,16 +133,25 @@ def tmp_name(path):
     return f"{path}.fake-{os.getpid()}-{threading.get_ident()}.tmp"
 
 
+def blob_path(digest):
+    """The CAS file of the blob with `digest`."""
+    return os.path.join(CAS, digest.split("/")[0])
+
+
 def put(path):
-    d = file_digest(path); dst = os.path.join(CAS, d.split("/")[0])
+    d = file_digest(path); dst = blob_path(d)
     if not os.path.exists(dst):
         tmp = tmp_name(dst); shutil.copyfile(path, tmp); os.replace(tmp, dst)
     return d
 
 
-def append(name, obj):
+def append_line(name, line):
     if name:
-        with _lock, open(name, "a") as f: f.write(json.dumps(obj, sort_keys=True) + "\n")
+        with _lock, open(name, "a") as f: f.write(line + "\n")
+
+
+def append(name, obj):
+    append_line(name, json.dumps(obj, sort_keys=True))
 
 
 def down():
@@ -223,21 +234,18 @@ def run(p):
     global _inflight, _max_inflight
     check_gone()
     target = p.get("target")
-    trip = os.environ.get("FAKE_DOWN_AT_TARGET")
-    if trip and DOWN_FILE and target == trip:
+    if DOWN_FILE and named("FAKE_DOWN_AT_TARGET", target):
         with _lock:
             if not os.path.exists(DOWN_FILE + ".tripped"):
                 open(DOWN_FILE + ".tripped", "w").close(); open(DOWN_FILE, "w").close()
     check_down()
     if named("FAKE_UNAVAILABLE_TARGET", target): raise Err("UNAVAILABLE", f"{target}: the service did not answer")
-    spec = os.environ.get("FAKE_ERROR_TARGET")
-    if spec and spec.rsplit(":", 1)[0] == target:
-        code = spec.rsplit(":", 1)[1]
-        raise Err(code, f"{target}: the service answered {code}")
+    error_target, sep, code = (os.environ.get("FAKE_ERROR_TARGET") or "").rpartition(":")
+    if sep and error_target == target: raise Err(code, f"{target}: the service answered {code}")
     if named("FAKE_REPLAY_TARGET", target): return replayed()
-    if named("FAKE_TIMEOUT_TARGET", target): raise timeout_error(p, f"{action_key(p)}/0")
-    if named("FAKE_OOM_TARGET", target): return killed(f"{action_key(p)}/0", disk=False)
-    if named("FAKE_DISK_TARGET", target): return killed(f"{action_key(p)}/0", disk=True)
+    if named("FAKE_TIMEOUT_TARGET", target): raise timeout_error(p, action_digest(action_key(p)))
+    if named("FAKE_OOM_TARGET", target): return killed(action_digest(action_key(p)), disk=False)
+    if named("FAKE_DISK_TARGET", target): return killed(action_digest(action_key(p)), disk=True)
     with _lock:
         _inflight += 1
         if _inflight > _max_inflight:
@@ -269,13 +277,19 @@ def executable(i):
 
 
 def action_key(p):
-    """The key of `p`'s action in the action cache; logs the action to FAKE_LOG.actions."""
+    """The key of `p`'s action in the action cache: the SHA-256 of the line it logs to FAKE_LOG.actions."""
     act = {k: p.get(k) for k in ("argv", "env", "files", "outputs", "platform", "workingDirectory")}
-    act["timeoutSecs"] = p.get("timeoutSecs", 3600)
+    act["timeoutSecs"] = p.get("timeoutSecs", DEFAULT_TIMEOUT_S)
     act["inputs"] = sorted([i["rel"], file_digest(i["path"]) if i.get("path") else i["digest"], executable(i)]
                            for i in p["inputs"])
-    append(LOG and LOG + ".actions", act)
-    return hashlib.sha256(json.dumps(act, sort_keys=True).encode()).hexdigest()
+    line = json.dumps(act, sort_keys=True)
+    append_line(LOG and LOG + ".actions", line)
+    return hashlib.sha256(line.encode()).hexdigest()
+
+
+def action_digest(key):
+    """The digest that names the action with `key` in an answer, as the bridge's."""
+    return f"{key}/0"
 
 
 def check_digest_inputs(p):
@@ -284,17 +298,18 @@ def check_digest_inputs(p):
     missing = []
     for i in p["inputs"]:
         if i.get("path") or not i.get("digest"): continue
-        h = i["digest"].split("/")[0]
-        if not os.path.exists(os.path.join(CAS, h)) or (i["digest"] == drop and first_drop(h)):
+        blob = blob_path(i["digest"])
+        if not os.path.exists(blob) or (i["digest"] == drop and first_drop(blob)):
             missing.append(i["digest"])
     if missing:
         raise Err("UNAVAILABLE", f"the build service lacks {len(missing)} input blob(s) given only by digest", missing)
 
 
-def first_drop(h):
-    """Whether this is the first use of FAKE_DROP_ONCE's blob `h`, in any fake on this CAS."""
+def first_drop(blob):
+    """Whether this is the first use of FAKE_DROP_ONCE's blob file `blob`, in any fake on this CAS."""
     try:
-        os.close(os.open(f"{os.path.normpath(CAS)}.dropped-{h}", os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        os.close(os.open(f"{os.path.normpath(CAS)}.dropped-{os.path.basename(blob)}",
+                         os.O_CREAT | os.O_EXCL | os.O_WRONLY))
         return True
     except FileExistsError:
         return False
@@ -324,18 +339,19 @@ def run_action(p):
     try:
         for i in p["inputs"]:
             dst = os.path.join(root, i["rel"]); os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copyfile(i.get("path") or os.path.join(CAS, i["digest"].split("/")[0]), dst)
+            shutil.copyfile(i.get("path") or blob_path(i["digest"]), dst)
             if executable(i): os.chmod(dst, 0o755)
         for f in p.get("files", []):
             dst = os.path.join(root, f["rel"]); os.makedirs(os.path.dirname(dst), exist_ok=True)
             with open(dst, "w") as h: h.write(f["contents"])
         for o in p["outputs"]: os.makedirs(os.path.join(root, os.path.dirname(o)), exist_ok=True)
-        staged = tree_bytes(root)
+        enforce = enforced(p.get("target"))
+        staged = tree_bytes(root) if enforce else 0
         check_gone()
         started = time.time()
         proc = subprocess.Popen(p["argv"], cwd=root, env=dict(p.get("env") or {}),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
-        deadline = time.monotonic() + p.get("timeoutSecs", 3600) if enforced(p.get("target")) else None
+        deadline = time.monotonic() + p.get("timeoutSecs", DEFAULT_TIMEOUT_S) if enforce else None
         while True:
             try:
                 out, err = proc.communicate(timeout=0.05); break
@@ -344,11 +360,11 @@ def run_action(p):
                     kill(proc); proc.communicate(); check_gone()
                 if deadline is not None and time.monotonic() >= deadline:
                     kill(proc); out, err = proc.communicate()
-                    raise timeout_error(p, f"{key}/0", out, err, max(0, tree_bytes(root) - staged))
+                    raise timeout_error(p, action_digest(key), out, err, max(0, tree_bytes(root) - staged))
         ended = time.time()
         outs = [{"rel": o, "digest": put(os.path.join(root, o)), "executable": False}
                 for o in p["outputs"] if os.path.exists(os.path.join(root, o))]
-        res = {"action": f"{key}/0", "cached": False, "exitCode": proc.returncode,
+        res = {"action": action_digest(key), "cached": False, "exitCode": proc.returncode,
                "stdout": out.decode(), "stderr": err.decode(), **stream_digests(out, err),
                "outputs": outs or None, "metadata": metadata(queued, started, ended, time.time())}
         # As the service: a failure is stored only when the action declares outputs, never a kill.
@@ -372,7 +388,7 @@ def materialize(p):
             raise Err(code, f"fake: a materialize of *{suffix} answers {code}")
     for f in p["files"]:
         check_gone()                    # no write into the workspace starts after end of input
-        h = f["digest"].split("/")[0]; src = os.path.join(CAS, h)
+        src = blob_path(f["digest"])
         if os.path.exists(f["path"]) and file_digest(f["path"]) == f["digest"]:
             present += 1; continue
         if not os.path.exists(src): raise Err("NOT_FOUND", "blob not in the CAS", [f["digest"]])

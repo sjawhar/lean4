@@ -76,6 +76,7 @@ python3 - "$W" <<'PY' || failures=$((failures+1))
 import json, pathlib, sys
 w = pathlib.Path(sys.argv[1])
 requests = [json.loads(x) for x in (w/'excluded.log').read_text().splitlines() if x.strip()]
+# P.A, compiled on this machine, is promoted (run on the service) before P.B's run
 assert [x['params']['target'] for x in requests if x.get('method') == 'run'] == ['P.A', 'P.B'], requests
 t = json.loads((w/'excluded/.lake/build/lib/lean/P/B.trace').read_text())
 assert 'kf' not in t['outputs'], t
