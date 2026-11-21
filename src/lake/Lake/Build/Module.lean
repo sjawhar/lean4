@@ -1743,10 +1743,16 @@ Fetch a module's outputs from the build service (contract C5.1): replay an up-to
 request, else restore them from the local Lake cache with no request (`fromCache`, as `fetchLocal`
 restores before a compile), otherwise `run` the action, materialize the outputs, write the trace as a
 local compile does (`buildRemote`), and save them to the local Lake cache (`cacheRemoteOutputs`), both
-with the service's record of the outputs. Returns `none` when the service is unavailable or has a
-confirmed toolchain mismatch and `LAKE_REMOTE_EXEC_FALLBACK` is `local` (`useService`,
-`remoteUnavailable`): the caller then compiles on this machine, where imports' outputs were
-materialized. A request that answers `UNAVAILABLE` after a probe found the service again (the epoch
+with the service's record of the outputs. Outputs with no record whose trace is up to date in a build
+with the usage cutoff on come from a local compile with `--usage` (which writes digests into the
+`.olean`), a usage skip or a kept check, so a service compile does not give their bytes: when the build
+uses the service (`serviceAnswers`, not `--no-build`), the module is compiled there instead, so that
+each importer of this build takes the hash of the service's outputs, as the next build does. Without
+the cutoff, a local compile with the same toolchain gives the service's bytes, so such outputs replay
+and are promoted only when a service action takes them (`Module.serviceFor`). Returns `none` when the
+service is unavailable or has a confirmed toolchain mismatch and `LAKE_REMOTE_EXEC_FALLBACK` is `local`
+(`useService`, `remoteUnavailable`): the caller then compiles on this machine, where imports' outputs
+were materialized. A request that answers `UNAVAILABLE` after a probe found the service again (the epoch
 moved since it was sent) is sent again (`retryWhileUnavailable`). Under `wait`, an unavailable
 request is retried once the service answers (`awaitServiceAgain`); a confirmed mismatch fails with
 exit 75. A result of the service (a nonzero exit, `OOM`, `TIMEOUT`, `DISK_LIMIT`) and every other
@@ -1761,15 +1767,25 @@ def Module.fetchRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSes
   line.outcome.set (.error "materialize")
   -- The outputs are checked before the saved log is replayed, so a module that is rebuilt because
   -- an output went missing does not print its messages twice.
-  if (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) then
-    if (← savedTrace.replayCachedIfUpToDate inputHash) then
-      let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
-      line.outcome.set (.ofRecord "local-cache" savedTrace.remote?)
-      return some {arts with keptFrom? := savedTrace.keptFrom?}
-  line.found.set none
-  if let some arts ← fromCache savedTrace then
-    line.outcome.set ((← line.found.get).getD (.ofRecord "local-cache" none))
-    return some arts
+  let outputsHere ← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile
+  let traced := match savedTrace with
+    | .ok data => data.depHash == inputHash
+    | _ => false
+  -- The usage cutoff's setting is an input of the trace, so the build's setting is the outputs'
+  let toService ← do
+    if !outputsHere || !traced || savedTrace.remote?.isSome || (← getNoBuild) || !(← usageCutoffEnabled) then
+      pure false
+    else serviceAnswers s
+  unless toService do
+    if outputsHere then
+      if (← savedTrace.replayCachedIfUpToDate inputHash) then
+        let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
+        line.outcome.set (.ofRecord "local-cache" savedTrace.remote?)
+        return some {arts with keptFrom? := savedTrace.keptFrom?}
+    line.found.set none
+    if let some arts ← fromCache savedTrace then
+      line.outcome.set ((← line.found.get).getD (.ofRecord "local-cache" none))
+      return some arts
   -- Under `--no-build` the action fails before any request (`buildAction`): no `hello`, no wait.
   if (← getNoBuild) then
     line.outcome.set (.error "no-build")

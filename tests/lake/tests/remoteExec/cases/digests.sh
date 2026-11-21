@@ -1,8 +1,8 @@
 # The `digests` group of test.sh, which sources it: the inputs of service actions (A7, and the promotion of A4),
-# rows D1-D9. A Lean action takes a plugin by the digest and executable bit of the service's output, so two machines
+# rows D1-D11. A Lean action takes a plugin by the digest and executable bit of the service's output, so two machines
 # send the same actions (D1-D4); an input that this machine compiled is first compiled again on the service (its
-# promotion), so no local output is an input of a service action (D5-D9). D1-D6 build the package `native/` (see
-# cases/native.sh), D7-D9 the package Rx. Each row builds in directories of its own under $WORK/digests, and each
+# promotion), so no local output is an input of a service action (D5-D11). D1-D6 build the package `native/` (see
+# cases/native.sh), D7-D11 the package Rx. Each row builds in directories of its own under $WORK/digests, and each
 # build has a fake log and a LAKE_REMOTE_EXEC_LOG of its own. D4 builds on D2's service: `build_D2` builds D2's tree
 # once, so that each of them also runs alone.
 
@@ -185,9 +185,10 @@ row_D4() (
 )
 
 # D5: Nat0.Tac's module library is built here while the service does not answer (`shared` `local`). Once it
-# answers, Nat0.Use's request takes the library by its service digest, so Lake first promotes it: Nat0.Tac's
-# compile, its object and the library run on the service, before Nat0.Use's run; the request names the library's
-# digest, and the library's file holds the service's bytes
+# answers, Nat0.Tac's object, up to date with no service record, is built on the service by its own job, which first
+# promotes Nat0.Tac for its C file, and the library, whose input changed, is built there too: Nat0.Tac's compile, its
+# object and the library run on the service, before Nat0.Use's run; Nat0.Use's request names the library's digest,
+# and the library's file holds the service's bytes
 row_D5() (
   local lib
   enter D5 native; logs D5-local
@@ -286,4 +287,55 @@ row_D9() (
     --expect 'Rx.A:result=local-cache,action=null,outputs=null,code=null' --expect 'Rx.B:result=error,code=UNAVAILABLE'
 )
 
-run_rows D1 D2 D3 D4 D5 D6 D7 D8 D9
+# D10: a tree that the fallback compiled with the usage cutoff off, then Rx.B changed and built through the service:
+# Rx.A and Rx.M replay, and are promoted when the requests of Rx.B and Rx take them, after their importers hashed
+# their local outputs. A local compile with the same toolchain gives the service's bytes, so the build leaves the tree
+# up to date: `--no-build` builds nothing, each line has the service's record, and the next build sends no request
+row_D10() (
+  enter D10; logs D10-local
+  FAKE_UNREACHABLE=1 test_run build Rx
+  logs D10
+  printf '\ndef b2 := b + 1\n' >> Rx/B.lean
+  test_run build Rx
+  test_cmd_eq "LeanModule:Rx.A LeanModule:Rx.B" run_seq Rx.A Rx.B
+  test_cmd_eq "LeanModule:Rx.M LeanModule:Rx" run_seq Rx.M Rx
+  check_lines "$DW/D10.jsonl" --modules "$RX_MODS" \
+    --expect 'Rx.A|Rx.M:result=local-cache,action=null,outputs=null,code=null' --expect 'Rx.B|Rx.C|Rx:result=executed'
+  logs D10-no-build
+  test_run build --no-build Rx
+  test_cmd_eq 0 count_method run
+  check_lines "$DW/D10-no-build.jsonl" --modules "$RX_MODS" \
+    --expect '*:result=local-cache,action=digest,outputs=digests,code=null'
+  logs D10-again
+  test_run build Rx
+  test_cmd_eq 0 count_method run
+)
+
+# D11: the fallback builds the tree with the usage cutoff on, then a change of Rx.A that Rx.B does not use skips Rx.B's
+# compile, which keeps its outputs (L5c). Then Rx.C changed and built through the service: with the cutoff on, no
+# local output is what the service compiles (a local compile passes `--usage`, which writes digests into the
+# `.olean`, and a skip keeps older outputs), so each module goes to the service in its own job, Rx.A first, and each
+# importer takes the service's outputs. The build leaves the tree up to date: `--no-build` builds nothing, each line
+# has the service's record, and the next build sends no request
+row_D11() (
+  enter D11; export LAKE_USAGE_CUTOFF=1; logs D11-local
+  FAKE_UNREACHABLE=1 test_run build Rx
+  printf '\ndef unusedA := 0\n' >> Rx/A.lean
+  logs D11-skip
+  FAKE_UNREACHABLE=1 test_out "Replayed Rx.B" -v build Rx
+  logs D11
+  printf '\ndef c2 := c + 1\n' >> Rx/C.lean
+  test_run build Rx
+  test_cmd_eq "LeanModule:Rx.A LeanModule:Rx.B LeanModule:Rx.C" run_seq Rx.A Rx.B Rx.C
+  check_lines "$DW/D11.jsonl" --modules "$RX_MODS" --expect '*:result=executed,action=digest,outputs=digests,exitCode=0'
+  logs D11-no-build
+  test_run build --no-build Rx
+  test_cmd_eq 0 count_method run
+  check_lines "$DW/D11-no-build.jsonl" --modules "$RX_MODS" \
+    --expect '*:result=local-cache,action=digest,outputs=digests,code=null'
+  logs D11-again
+  test_run build Rx
+  test_cmd_eq 0 count_method run
+)
+
+run_rows D1 D2 D3 D4 D5 D6 D7 D8 D9 D10 D11

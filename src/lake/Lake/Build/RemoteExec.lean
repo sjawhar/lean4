@@ -694,6 +694,13 @@ public def useService (s : RemoteSession) (outcome : IO.Ref RemoteOutcome) : Job
       return true
 
 /--
+Whether the build service answers by this process's decision (`ensureDecision`, as `useService` reads it): `true`
+exactly when `useService` would answer `true` at once, with no wait for the service and no failure of the job.
+-/
+public def serviceAnswers (s : RemoteSession) : BaseIO Bool :=
+  return (← ensureDecision s.client s.cfg.endpoint s.leanGithash s.cfg.fallback) matches .active
+
+/--
 Exit code of a build whose every failure is an unavailable service under `fail`, or a confirmed
 toolchain mismatch under `wait` or `fail`: 75 (`EX_TEMPFAIL`), distinct from a broken build.
 -/
@@ -971,7 +978,11 @@ inputs promoted first, and the service's outputs are materialized over the local
 place, so a process that has an old file open keeps it); the `.hash` files, the trace and the Lake cache entry then
 follow the service's bytes, with the service's record. A promotion writes no line of `LAKE_REMOTE_EXEC_LOG` (the job of
 its target wrote that), and one promotion serves every job of the process (`promoteOnce`). Under `--no-build` no
-service action runs, so nothing is promoted.
+service action runs, so nothing is promoted. A native artifact that is up to date with no record is promoted by its
+own job when the build uses the service (`buildNativeArtifact`), before any consumer takes its hash, and so is such a
+module in a build with the usage cutoff on, whose outputs a service compile does not reproduce (`Module.fetchRemote`).
+The promotion here serves the others: native artifacts that their jobs built or replayed here while the build did not
+use the service, and modules whose local compile gives the service's bytes, so that their importers' hashes hold.
 -/
 
 /-- Why a promotion (`promoteOnce`) gave its input no service record. -/
@@ -1389,13 +1400,17 @@ def NativeAction.fetch (act : NativeAction) (s : RemoteSession) (build : JobM PU
     return (← Internal.withTraceMTime art traceFile, native record?)
   -- A replay or a restore that fails did not bring the output into the tree
   outcome.set (.error "materialize")
-  -- In every mode; a file with no record goes to the service only as a service action's input (its promotion)
   if (← savedTrace.fileUpToDate inputHash file) then
-    discard <| savedTrace.replayCachedIfUpToDate inputHash
-    let (art, record?) ← replayServiceArtifact pkg inputHash savedTrace file ext name
-    outcome.set (.ofRecord "local-cache" record?)
-    return ← finish art record?
-  if let some (art, record) ← restoreServiceArtifact? pkg inputHash savedTrace file traceFile name then
+    -- A file that a local build made has no record: a build that uses the service builds it there (below), so that
+    -- each consumer of this build takes the hash of the service's bytes, as the next build does
+    let toService ← do
+      if savedTrace.remote?.isSome || (← getNoBuild) then pure false else serviceAnswers s
+    unless toService do
+      discard <| savedTrace.replayCachedIfUpToDate inputHash
+      let (art, record?) ← replayServiceArtifact pkg inputHash savedTrace file ext name
+      outcome.set (.ofRecord "local-cache" record?)
+      return ← finish art record?
+  else if let some (art, record) ← restoreServiceArtifact? pkg inputHash savedTrace file traceFile name then
     outcome.set (.ofRecord "local-cache" record)
     return ← finish art (some record)
   let useIt ← do
@@ -1429,17 +1444,20 @@ def NativeAction.fetch (act : NativeAction) (s : RemoteSession) (build : JobM PU
 Builds the native artifact of `act` in service mode (contract C3.1) as `buildArtifactUnlessUpToDate` builds it with
 `build` (under the extension `NativeKind.cacheExt` in the Lake cache), with the current job's trace and the timeout
 rule (`RemoteSession.mixTimeout`). The artifact is up to date when its trace has the job's input hash and describes
-the file (`SavedTrace.fileUpToDate`): in every mode, `--no-build` and each fallback included, the job replays it
-(`replayServiceArtifact`) with the trace's service record, or with none when a local build made the file; such a file
-goes to the service only when a service action takes it as an input (`NativeArtifact.serviceOutput`). Else the Lake
-cache restores it when its trace or entry has a service record (`restoreServiceArtifact?`; the shared remote cache is
-not read, because its native bytes come from another machine's compiler). Else `useService` decides: the service runs
-the action (`NativeAction.buildRemote`, its inputs promoted first), its output is materialized at the file's path, and
-the trace and the Lake cache entry (`cacheServiceArtifact`) get the service's record. The fallback `local` builds the
-artifact here with `build` on `buildArtifactUnlessUpToDate`'s path, with no record; under `fail` and `wait` it follows
-the rules of a Lean module (`useService`, `retryWhileUnavailable`). Under `--no-build` it sends no request. The
-job writes one line to `LAKE_REMOTE_EXEC_LOG`, also when it fails (`withRemoteLine`), and registers the artifact
-(`nativeArtifacts`).
+the file (`SavedTrace.fileUpToDate`): the job replays it (`replayServiceArtifact`) with the trace's service record. A
+file that a local build made has no record: under `--no-build`, and while the build does not use the service
+(`serviceAnswers`: the service does not answer, is refused or runs another Lean), it replays with none, and goes to
+the service later only when a service action takes it as an input (`NativeArtifact.serviceOutput`); otherwise the job
+builds it on the service as below (its promotion), so that each consumer of this build takes the hash of the
+service's bytes, as the next build does. An artifact that is not up to date is restored from the Lake cache when its
+trace or entry has a service record (`restoreServiceArtifact?`; the shared remote cache is not read, because its
+native bytes come from another machine's compiler). Else `useService` decides: the service runs the action
+(`NativeAction.buildRemote`, its inputs promoted first), its output is materialized at the file's path, and the trace
+and the Lake cache entry (`cacheServiceArtifact`) get the service's record. The fallback `local` builds the artifact
+here with `build` on `buildArtifactUnlessUpToDate`'s path, with no record (it replays a file that is up to date); under
+`fail` and `wait` it follows the rules of a Lean module (`useService`, `retryWhileUnavailable`). Under `--no-build` it
+sends no request. The job writes one line to `LAKE_REMOTE_EXEC_LOG`, also when it fails (`withRemoteLine`), and
+registers the artifact (`nativeArtifacts`).
 -/
 public def buildNativeArtifact (s : RemoteSession) (act : NativeAction) (build : JobM PUnit) : JobM Artifact := do
   let start ← RemoteLogStart.now
