@@ -1,8 +1,8 @@
 # The `digests` group of test.sh, which sources it: the inputs of service actions (A7, and the promotion of A4),
-# rows D1-D11. A Lean action takes a plugin by the digest and executable bit of the service's output, so two machines
+# rows D1-D12. A Lean action takes a plugin by the digest and executable bit of the service's output, so two machines
 # send the same actions (D1-D4); an input that this machine compiled is first compiled again on the service (its
-# promotion), so no local output is an input of a service action (D5-D11). D1-D6 build the package `native/` (see
-# cases/native.sh), D7-D11 the package Rx. Each row builds in directories of its own under $WORK/digests, and each
+# promotion), so no local output is an input of a service action (D5-D12). D1-D6 build the package `native/` (see
+# cases/native.sh), D7-D12 the package Rx. Each row builds in directories of its own under $WORK/digests, and each
 # build has a fake log and a LAKE_REMOTE_EXEC_LOG of its own. D4 builds on D2's service: `build_D2` builds D2's tree
 # once, so that each of them also runs alone.
 
@@ -338,4 +338,26 @@ row_D11() (
   test_cmd_eq 0 count_method run
 )
 
-run_rows D1 D2 D3 D4 D5 D6 D7 D8 D9 D10 D11
+# D12: the fallback builds the tree with the usage cutoff on, and its compiles fill a Lake cache (artifact cache on)
+# with no service record. A fresh tree on that cache, built through the service, restores none of them: with the cutoff
+# on, they are not what the service compiles (D11), so each module goes to the service in its own job, as on a cache
+# miss. The build leaves the tree up to date: `--no-build` builds nothing, each line has the service's record, and the
+# next build sends no request
+row_D12() (
+  export LAKE_USAGE_CUTOFF=1 LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true
+  enter D12-local; logs D12-local
+  FAKE_UNREACHABLE=1 test_run build Rx
+  enter D12; export LAKE_CACHE_DIR="$DW/D12-local.cache"; logs D12
+  test_run build Rx
+  check_lines "$DW/D12.jsonl" --modules "$RX_MODS" --expect '*:result=executed|cached,action=digest,outputs=digests'
+  logs D12-no-build
+  test_run build --no-build Rx
+  test_cmd_eq 0 count_method run
+  check_lines "$DW/D12-no-build.jsonl" --modules "$RX_MODS" \
+    --expect '*:result=local-cache,action=digest,outputs=digests,code=null'
+  logs D12-again
+  test_run build Rx
+  test_cmd_eq 0 count_method run
+)
+
+run_rows D1 D2 D3 D4 D5 D6 D7 D8 D9 D10 D11 D12
