@@ -1466,7 +1466,8 @@ def remoteHead (presetup : ModulePreSetup) (s : RemoteSession) : JobM RemoteHead
 
 /-- The exact module-compile `run` request (contract C2.1): relative paths, `setup.json` inline,
 the toolchain as a platform property. -/
-def Module.remoteRunRequest (mod : Module) (presetup : ModulePreSetup) (head : RemoteHead) : JobM Json := do
+def Module.remoteRunRequest (mod : Module) (presetup : ModulePreSetup) (head : RemoteHead)
+    (timeoutSecs : Nat) : JobM Json := do
   let setup ← mkModuleSetup mod presetup
   let (importArts, importFiles) ← rewriteImportArts setup.importArts
   let newSetup : ModuleSetup := {setup with
@@ -1513,7 +1514,7 @@ def Module.remoteRunRequest (mod : Module) (presetup : ModulePreSetup) (head : R
     ("files", Json.arr #[Json.mkObj [("rel", "setup.json"), ("contents", setupJson)]]),
     ("outputs", (toJson outs : Json)),
     ("platform", platformJson),
-    ("timeoutSecs", (toJson (3600 : Nat) : Json)),
+    ("timeoutSecs", (toJson timeoutSecs : Json)),
     ("mnemonic", "LeanModule"),
     ("target", mod.name.toString)]
 
@@ -1564,7 +1565,7 @@ def Module.buildRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSes
   let pos ← getLogPos
   outcome.set (.error "request")
   let head ← remoteHead presetup s
-  let params ← mod.remoteRunRequest presetup head
+  let params ← mod.remoteRunRequest presetup head s.cfg.timeoutSecs
   let runEpoch ← remoteEpoch
   let result ← match ← runAction s params with
     | .ok r => pure r
@@ -2531,6 +2532,7 @@ where
       JobM (ClaimLoop ModuleOutputArtifacts) := do
     let some line := line? | fetchLocal presetup sawDone none
     let some s ← remoteSession? | fetchLocal presetup sawDone none
+    if let some t := s.cfg.timeoutTrace? then addTrace t
     let r ← tryCatch (fetchService presetup sawDone s line) fun e => do
       let o : RemoteOutcome ←
         if (← getThe JobState).canceled then pure (.error "canceled") else line.outcome.get
