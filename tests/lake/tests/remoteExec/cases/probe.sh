@@ -1,32 +1,23 @@
 # The `probe` group of test.sh, which sources it: the re-probe of the build service under the fallback `local`,
 # rows S1-S12 of its state table and the k5 case. Each row builds in a directory of its own under $WORK/probe,
-# with its own service (FAKE_CAS), fake log and LAKE_REMOTE_EXEC_LOG in $WORK/probe/<row>.d. probe_check.py
-# reads the times of the fake's `hello` and `run` lines (`t`) and of Lake's lines (`startMs`, `wallMs`); its
-# margins are wide, for a loaded machine. S1, S4 and S9 read one build (`build_down`), so that each of them also
-# runs alone.
+# with its own service and Lake cache (`enter`), and its fake log and LAKE_REMOTE_EXEC_LOG in
+# $WORK/probe/<row>.d. probe_check.py reads the times of the fake's `hello` and `run` lines (`t`) and of Lake's
+# lines (`startMs`, `wallMs`); its margins are wide, for a loaded machine. S1, S4 and S9 read one build
+# (`build_down`), so that each of them also runs alone.
 
-PW="$WORK/probe"
-mkdir -p "$PW"
+PW=$GW
 
-# logs NAME: the row state of NAME, in $PW/NAME.d (D): its service, Lake cache, fake log, per-target log and
-# Lake's output; the builds after it are in service mode
-logs() {
+# state NAME: the row state of NAME, in $PW/NAME.d (D): its fake log, per-target log and Lake's output; the builds
+# after it are in service mode
+state() {
   D="$PW/$1.d"
-  export LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_CACHE_DIR="$D/cache" FAKE_CAS="$D/cas" FAKE_LOG="$D/fake.log" \
-    LAKE_REMOTE_EXEC_LOG="$D/lines.jsonl"
+  export LAKE_REMOTE_EXEC=grpc://fake:1 FAKE_LOG="$D/fake.log" LAKE_REMOTE_EXEC_LOG="$D/lines.jsonl"
 }
-# enter NAME [PKG]: a fresh copy of the test package (or of $TEST_DIR/PKG) in $PW/NAME, made the working
-# directory, with a fresh row state (`logs`)
-enter() {
-  rm -rf "$PW/$1" "$PW/$1.d"; mkdir -p "$PW/$1" "$PW/$1.d"
-  if [ -n "${2:-}" ]; then
-    cp -r "$TEST_DIR/$2/." "$PW/$1/"
-  else
-    cp -r "$TEST_DIR/lakefile.toml" "$TEST_DIR/Rx.lean" "$TEST_DIR/Rx" "$PW/$1/"
-  fi
-  chmod -R u+w "$PW/$1"
-  cd "$PW/$1"
-  logs "$1"
+# enter_row NAME [PKG]: `enter NAME [PKG]`, with a fresh row state (`state`)
+enter_row() {
+  enter "$@"
+  rm -rf "$PW/$1.d"; mkdir -p "$PW/$1.d"
+  state "$1"
 }
 # slow NAME MS [IMPORT]: the module Rx.NAME, which imports IMPORT (if given) and whose compile takes MS ms
 slow() {
@@ -64,20 +55,12 @@ bridges() {
 lines() { check_lines "$LAKE_REMOTE_EXEC_LOG" "$@"; }
 # pcheck ARGS...: probe_check.py's checks of the row's fake log and per-target log (see its docstring)
 pcheck() { test_cmd "$PYTHON" "$TEST_DIR/probe_check.py" --fake "$FAKE_LOG" --lake "$LAKE_REMOTE_EXEC_LOG" "$@"; }
-# gone PID: PID is no longer running, at the latest 2 s from now
-gone() {
-  for _ in $(seq 1 20); do
-    dead "$1" && return 0
-    sleep 0.1
-  done
-  dead "$1"
-}
 
 # The build of S1, S4 and S9: the service never answers, and Rx.Sl's compile takes 22 s, so the timer probes
 # 1, 3, 7 and 15 s after the decision's `hello` and sleeps (until 31 s) when the build ends
 build_down() (
   [ ! -e "$PW/down.built" ] || exit 0
-  enter down
+  enter_row down
   slow Sl 22000
   FAKE_UNREACHABLE=1 lbuild Rx.A Rx.Sl
   touch "$PW/down.built"
@@ -86,7 +69,7 @@ build_down() (
 # S1: the decision's `hello` finds the service down: the timer starts (its first probe 1 s later), and the
 # modules compile locally with no request
 row_S1() (
-  build_down; logs down
+  build_down; state down
   pcheck probes=1
   test_cmd_eq 0 count_method run
   lines --modules Rx.A,Rx.Sl --expect '*:result=local,action=null,outputs=null,exitCode=0'
@@ -97,7 +80,7 @@ row_S1() (
 # compiles locally and is not sent again, and Rx.Sl (8 s), which imports it, compiles locally while the probes
 # find the service down
 row_S2() (
-  enter S2
+  enter_row S2
   slow Sl 8000 Rx.B
   FAKE_DOWN_FILE="$D/down" FAKE_DOWN_AT_TARGET=Rx.B lbuild Rx.B Rx.Sl
   pcheck --failure run:Rx.B probes=1 down runs=Rx.B:1
@@ -112,7 +95,7 @@ row_S2() (
 # that request answers UNAVAILABLE
 row_S3() (
   local lake_pid rc=0
-  enter S3; bridges
+  enter_row S3; bridges
   slow Sl 20000; slow W 3000
   printf 'import Rx.W\n\n/-! A module whose run answers UNAVAILABLE. -/\n\ndef u := w\n' > Rx/U.lean
   # The killed bridge leaves its action's scratch root in the row's directory
@@ -133,7 +116,7 @@ row_S3() (
 # S4: a probe that finds the service down leaves the modules local, and the next probe follows the schedule:
 # 2 s after the first probe's answer, then 4 s after the second's
 row_S4() (
-  build_down; logs down
+  build_down; state down
   pcheck probes=3 down
 )
 
@@ -142,7 +125,7 @@ row_S4() (
 # the service; the bridge that carries the first request (2) finds it down, so Rx.Q1 (10 s) compiles locally;
 # every later bridge finds the service
 row_S5() (
-  enter S5; bridges
+  enter_row S5; bridges
   printf 'export FAKE_UNREACHABLE=1 BRIDGE_TIMED=1\n' > "$B/2.env"
   slow Q1 10000; slow Q2 0 Rx.Q1
   lbuild Rx.Q2
@@ -155,7 +138,7 @@ row_S5() (
 # `toolchain-mismatch`, with the warning once, and the timer stops. The decision finds the service down; every
 # later `hello` answers with another Lean (`mismatch-after-outage`)
 row_S6() (
-  enter S6
+  enter_row S6
   slow Q1 6000; slow Q2 0 Rx.Q1
   FAKE_HELLO_SEQUENCE=mismatch-after-outage FAKE_HELLO_STATE="$D/hello.state" lbuild Rx.Q2
   pcheck probes=1 hellos=1
@@ -171,7 +154,7 @@ row_S6() (
 # compile locally, nothing fails, and the next probe follows the schedule. The decision finds the service down;
 # the service of every later bridge refuses
 row_S7() (
-  enter S7; bridges
+  enter_row S7; bridges
   printf 'export FAKE_UNREACHABLE=1\n' > "$B/1.env"
   printf 'export FAKE_UNVERIFIED=1\n' > "$B/rest.env"
   slow Sl 8000
@@ -185,7 +168,7 @@ row_S7() (
 # S8: a module that is ready while a probe is in flight compiles locally at once. The decision finds the service
 # down, and the `hello` of every probe is held for 30 s
 row_S8() (
-  enter S8; bridges
+  enter_row S8; bridges
   printf 'export FAKE_UNREACHABLE=1\n' > "$B/1.env"
   printf 'export FAKE_UNREACHABLE=1 FAKE_HELLO_DELAY_S=30\n' > "$B/rest.env"
   slow Q1 3000; slow Q2 3000 Rx.Q1; slow Q3 0 Rx.Q2
@@ -197,7 +180,7 @@ row_S8() (
 # S9: the build ends while the timer sleeps (its next probe is due 31 s after the failure, some 8 s after the
 # build's end): Lake exits within 1 s of the build's end, here 3 s (see probe_check.py's `exit`)
 row_S9() (
-  build_down; logs down
+  build_down; state down
   pcheck probes=1
   pcheck answered
   pcheck "exit=$(cat "$D/exit")"
@@ -206,30 +189,30 @@ row_S9() (
 # S10: the build ends while the `hello` of a probe is held (60 s): Lake kills that probe's bridge and exits within
 # 1 s of the build's end, here 3 s (as in S9)
 row_S10() (
-  enter S10; bridges
+  enter_row S10; bridges
   printf 'export FAKE_UNREACHABLE=1\n' > "$B/1.env"
   printf 'export FAKE_UNREACHABLE=1 FAKE_HELLO_DELAY_S=60\n' > "$B/rest.env"
   slow Sl 5000
   lbuild Rx.Sl
   pcheck held hellos=1
   pcheck "exit=$(cat "$D/exit")"
-  test_cmd gone "$(cat "$B/2.pid")"
+  test_cmd wait_dead "$(cat "$B/2.pid")" 2
 )
 
-# S11: under `fail` and `wait` no timer runs, and the `hello`s are today's. Under `fail` Rx.A fails at once, and
-# a target that sleeps 5 s keeps the build going: only the decision says `hello`. Under `wait` the probes are
-# `awaitService`'s: one at a time, 1 s and then 2 s apart, and after the one that finds the service only the
-# bridge that carries the requests says `hello`
+# S11: under `fail` and `wait` no timer runs. Under `fail` Rx.A fails at once, and a target that sleeps 5 s keeps
+# the build going: only the decision says `hello`. Under `wait` the probes are `awaitService`'s: one at a time, 1 s
+# and then 2 s apart, and after the one that finds the service only the bridge that carries the requests says
+# `hello`
 row_S11() (
   local lake_pid rc=0
-  enter S11-fail
+  enter_row S11-fail
   rm lakefile.toml
   printf 'import Lake\nopen Lake DSL\npackage rx\ntarget slow : Unit := Job.async (prio := .dedicated) do\n  IO.sleep 5000\nlean_lib Rx\n' \
     > lakefile.lean
   FAKE_UNREACHABLE=1 LAKE_REMOTE_EXEC_FALLBACK=fail lbuild Rx.A slow || rc=$?
   test_exp "$rc" = 75
   test_cmd_eq 1 count_method hello
-  enter S11-wait
+  enter_row S11-wait
   touch "$D/down"
   echo '$' lake build Rx.A
   FAKE_DOWN_FILE="$D/down" LAKE_REMOTE_EXEC_FALLBACK=wait "$LAKE" build Rx.A > "$D/out" 2>&1 & lake_pid=$!
@@ -247,7 +230,7 @@ row_S11() (
 # service. The decision finds the service down; the first probe finds it answering, while Rx.Q1 (8 s) compiles
 # locally
 row_S12() (
-  enter S12; bridges
+  enter_row S12; bridges
   printf 'export FAKE_UNREACHABLE=1\n' > "$B/1.env"
   slow Q1 8000; slow Q2 0 Rx.Q1; slow Q3 0 Rx.Q2
   lbuild Rx.Q3
@@ -258,12 +241,12 @@ row_S12() (
 # k5 (S1, S4, S5, S8 and S12 on `chain/`, ten modules in a chain, each 10 s): the service is down when the build
 # starts and answers again 30 s later. The modules compile locally without waiting for a probe until a probe finds
 # the service; every module that starts after that goes to the service, and each module compiled locally that it
-# imports is first promoted (its own run on the service), so no local output is an input of a service action. No
-# local compile is in the service's action cache or in the push queue of the shared cache (LAKE_REMOTE_CACHE). The
-# promotion order is checked last.
+# imports is first promoted (its own run on the service), so no local output is an input of a service action: each
+# input of the fake's actions but a source file is an output of the fake's runs. No local compile is in the push
+# queue of the shared cache (LAKE_REMOTE_CACHE).
 row_k5() (
   local i up_pid pairs=
-  enter k5 chain
+  enter_row k5 chain
   touch "$D/down"
   (sleep 30; rm -f "$D/down") & up_pid=$!
   trap 'kill "$up_pid" 2> /dev/null || true' EXIT
@@ -272,7 +255,7 @@ row_k5() (
   pcheck no-wait
   pcheck service
   pcheck after
-  pcheck "cas=$FAKE_CAS"
+  pcheck "inputs=$FAKE_CAS"
   test_exp ! -e "$LAKE_CACHE_DIR/push.jsonl"
   match_pat 'lake: remote: [a-z]+; [0-9]+ cached \([0-9]+ from manifest\), [1-9][0-9]* executed, [1-9][0-9]* local;' \
     "$D/out"

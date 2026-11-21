@@ -5,23 +5,14 @@
 # every field with its type, and the row's own rules. L2, L3 and L4 build on L1's tree, Lake cache and
 # service: `build_L1` builds that tree once, so that each of them also runs without L1.
 
-LW="$WORK/lines"
-mkdir -p "$LW"
-# The group's own service, so that L1's actions are new to it
-export FAKE_CAS="$LW/cas" FAKE_LOG="$LW/fake.log"
+LW=$GW
+# The group's own service, so that L1's actions are new to it; the service of every row (see `enter`)
+GROUP_CAS="$LW/cas"
+export FAKE_CAS="$GROUP_CAS" FAKE_LOG="$LW/fake.log"
 MODS=Rx,Rx.A,Rx.B,Rx.C,Rx.M
 # The rules of an `import-failed` line: every field but its result and times is null
 IMPORT_FAILED='result=import-failed,rest=null'
 
-# enter DIR [CACHE]: a fresh copy of the test package in $LW/DIR, made the working directory, with the
-# Lake cache $LW/CACHE.cache (default: DIR's own)
-enter() {
-  rm -rf "$LW/$1"; mkdir -p "$LW/$1"
-  cp -r "$TEST_DIR/lakefile.toml" "$TEST_DIR/Rx.lean" "$TEST_DIR/Rx" "$LW/$1/"
-  chmod -R u+w "$LW/$1"
-  cd "$LW/$1"
-  export LAKE_CACHE_DIR="$LW/${2:-$1}.cache"
-}
 # log_to NAME: the next builds write their lines to $LW/NAME.jsonl
 log_to() { export LAKE_REMOTE_EXEC_LOG="$LW/$1.jsonl"; }
 # lines NAME ARGS...: lines_check.py's checks of $LW/NAME.jsonl
@@ -93,7 +84,7 @@ row_L4b() (
   test_run build Rx
   lines L4b --modules "$MODS" --expect '*:result=local-cache,action=digest,outputs=digests,code=null' \
     --same-as "$LW/L4b-seed.jsonl:action,outputs"
-  enter L4b-fresh L4b; log_to L4b-fresh
+  enter L4b-fresh; export LAKE_CACHE_DIR="$LW/L4b.cache"; log_to L4b-fresh
   test_run build Rx
   lines L4b-fresh --modules "$MODS" --expect '*:result=local-cache,action=digest,outputs=digests,code=null' \
     --same-as "$LW/L4b-seed.jsonl:action,outputs"
@@ -119,7 +110,7 @@ row_L5d() (
   log_to L5d
   test_run build Rx
   lines L5d --modules "$MODS" --expect '*:result=local-cache,action=null,outputs=null,code=null'
-  enter L5d-fresh L5d; log_to L5d-fresh
+  enter L5d-fresh; export LAKE_CACHE_DIR="$LW/L5d.cache"; log_to L5d-fresh
   test_run build Rx
   lines L5d-fresh --modules "$MODS" --expect '*:result=local-cache,action=null,outputs=null,code=null'
 )
@@ -128,7 +119,7 @@ row_L5d() (
 # service): an archive keeps no service record, so the restored modules have none, whether the reader's
 # cache is read-only or writable
 row_L5b() (
-  enter L5b-seed L5b
+  enter L5b-seed; export LAKE_CACHE_DIR="$LW/L5b.cache"
   export LAKE_RESTORE_ARTIFACTS=true
   log_to L5b-seed
   LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_ARTIFACT_CACHE=true test_run build Rx -o "$LW/L5b-outputs.jsonl"
@@ -137,7 +128,7 @@ row_L5b() (
     # Each reader starts with the archives and no other artifact
     find "$LAKE_CACHE_DIR/artifacts" -type f ! -name '*.ltar' -delete
     test_exp "$(find "$LAKE_CACHE_DIR/artifacts" -type f -name '*.ltar' | wc -l)" -gt 0
-    enter "L5b-$t" L5b; log_to "L5b-$t"
+    enter "L5b-$t"; export LAKE_CACHE_DIR="$LW/L5b.cache"; log_to "L5b-$t"
     if [ "$t" = writable ]; then export LAKE_ARTIFACT_CACHE=true; else unset LAKE_ARTIFACT_CACHE; fi
     # The service does not answer and the fallback is `fail`: only a restore builds the tree
     FAKE_UNREACHABLE=1 LAKE_REMOTE_EXEC_FALLBACK=fail LAKE_REMOTE_EXEC=grpc://fake:1 test_run build Rx
@@ -241,7 +232,7 @@ for root, ext in ((sys.argv[1], ".trace"), (sys.argv[2], ".json")):
   test_run build Rx
   lines L9b --modules "$MODS" --expect '*:result=local-cache,action=digest,outputs=digests,code=null' \
     --same-as "$LW/L9b-seed.jsonl:action,outputs"
-  enter L9b-fresh L9b; log_to L9b-fresh
+  enter L9b-fresh; export LAKE_CACHE_DIR="$LW/L9b.cache"; log_to L9b-fresh
   test_run build Rx
   lines L9b-fresh --modules "$MODS" --expect '*:result=local-cache,action=digest,outputs=digests,code=null' \
     --same-as "$LW/L9b-seed.jsonl:action,outputs"

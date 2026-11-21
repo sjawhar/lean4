@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """lines_check.py: checks a LAKE_REMOTE_EXEC_LOG file against the lines a test expects.
 
-  lines_check.py LOG [--modules M,...] [--expect 'TARGETS:RULES']... [--same-as 'OTHER:FIELD,...']...
+  lines_check.py LOG [--modules M,...] [--expect 'TARGETS:RULES']... [--same-as 'OTHER:FIELD,...']... [--unique]
   lines_check.py --self-test
 
 Every line of LOG is a JSON object with every field of the log line, each of its type: `kind`, `target`,
@@ -11,14 +11,15 @@ null), `exitCode`, `terminationSignal`, `stdoutDigest`, `stderrDigest`, `code`, 
 
   --modules M,...     exactly one line of kind `lean` for each module M, and no other `lean` line
   --expect T:RULES    every line whose target is T follows RULES, and T has at least one line. T is a
-                      target, `A|B` (both), or `*` (every line). RULES are comma-separated: FIELD=VALUES
-                      (`|` separates alternatives), FIELD!=VALUES, FIELD>=N or FIELD>N, where FIELD may
-                      name a field of an object field (`limits.oomKills`). A value is `null`, `true`,
-                      `false`, an integer, `digest`, `digests` (a non-empty object of digests), `object`,
-                      or else the text itself. `rest=null`: every field that no other rule names is null,
-                      but `kind`, `target`, `result`, `wallMs` and `startMs`.
+                      target, `A|B` (both), or `*` (every line; the log has at least one). RULES are
+                      comma-separated: FIELD=VALUES (`|` separates alternatives), FIELD!=VALUES, FIELD>=N or
+                      FIELD>N, where FIELD may name a field of an object field (`limits.oomKills`). A value is
+                      `null`, `true`, `false`, an integer, `digest`, `digests` (a non-empty object of digests),
+                      `object`, or else the text itself. `rest=null`: every field that no other rule names is
+                      null, but `kind`, `target`, `result`, `wallMs` and `startMs`.
   --same-as O:F,...   every line has one line of the same kind and target in the log O, with the same
-                      fields F,...
+                      fields F,..., which both lines have
+  --unique            no two lines have the same kind and target
 """
 import argparse, json, os, re, sys, tempfile
 
@@ -174,7 +175,7 @@ def rule_errors(line, rules):
     return errors
 
 
-def check(log, modules=None, expects=(), same_as=()):
+def check(log, modules=None, expects=(), same_as=(), unique=False):
     """The failures of the log at `log` against the options, each `(line, message)` (`line` None for one of
     the whole log); none when it passes."""
     lines, read_errors = read_log(log)
@@ -196,6 +197,8 @@ def check(log, modules=None, expects=(), same_as=()):
         rules = parse_rules(rule_text)
         if targets == "*":
             chosen = lines
+            if not lines:
+                errors.append((None, f"the log has no line (--expect {spec})"))
         else:
             names = targets.split("|")
             chosen = [l for l in lines if l.get("target") in names]
@@ -217,8 +220,20 @@ def check(log, modules=None, expects=(), same_as=()):
                 errors.append((line, f"has {len(match)} lines of the same kind and target in {other}, not 1"))
                 continue
             for f in fields.split(","):
-                if lookup(line, f) != lookup(match[0], f):
+                mine, theirs = lookup(line, f), lookup(match[0], f)
+                if mine is MISSING:
+                    errors.append((line, f"has no `{f}` (--same-as {spec})"))
+                elif theirs is MISSING:
+                    errors.append((line, f"{other}'s line {show(match[0])} has no `{f}` (--same-as)"))
+                elif mine != theirs:
                     errors.append((line, f"`{f}` differs from {other}'s line {show(match[0])}"))
+    if unique:
+        counts = {}
+        for line in lines:
+            key = (line.get("kind"), line.get("target"))
+            counts[key] = counts.get(key, 0) + 1
+        errors += [(None, f"{n} lines of kind {kind} and target {target}, not 1 (--unique)")
+                   for (kind, target), n in counts.items() if n > 1]
     return errors
 
 
@@ -228,6 +243,7 @@ def main(argv):
     p.add_argument("--modules")
     p.add_argument("--expect", action="append", default=[])
     p.add_argument("--same-as", action="append", default=[])
+    p.add_argument("--unique", action="store_true")
     p.add_argument("--self-test", action="store_true")
     a = p.parse_args(argv)
     if a.self_test:
@@ -235,7 +251,7 @@ def main(argv):
     if not a.log:
         p.error("LOG is required")
     try:
-        errors = check(a.log, a.modules, a.expect, a.same_as)
+        errors = check(a.log, a.modules, a.expect, a.same_as, a.unique)
     except Usage as e:
         p.error(str(e))
     if errors:
@@ -341,6 +357,13 @@ def self_test():
              same_as=[f"{good}:action,outputs"])
         case("a target that another log lacks", log(line("C")), "has 0 lines of the same kind",
              same_as=[f"{good}:action"])
+        case("a field that neither log has", log(line("A")), "has no `actoin`", same_as=[f"{good}:actoin"])
+        case("a field that the other log's line lacks", log(dict(line("A"), extra=1)),
+             "has no `extra`", same_as=[f"{good}:extra"])
+        case("every line of a log with no line", log(), "the log has no line", expects=["*:result=executed"])
+        case("unique lines", log(line("A"), line("A", kind="c"), line("B")), unique=True)
+        case("two lines of one kind and target", log(line("A"), line("B"), line("A")),
+             "2 lines of kind lean and target A", unique=True)
         case("a bad rule", good, "usage: bad rule", expects=["A:exitCode"])
     for f in failures:
         print(f"lines_check self-test: FAILED {f}")

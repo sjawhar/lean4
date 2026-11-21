@@ -3,24 +3,18 @@
 # FAKE_ENFORCE_TIMEOUT). Each row builds in a directory of its own under $WORK/timeout, and each build has a
 # fake log of its own. T6 builds on T1's tree: `build_T1` builds it once, so that each of them also runs alone.
 
-TW="$WORK/timeout"
-mkdir -p "$TW"
-# The group's own service; no artifact cache, so that a build that is not up to date sends its requests
-export LAKE_REMOTE_EXEC=grpc://fake:1 FAKE_CAS="$TW/cas"
+TW=$GW
+# The group's own service, the service of every row (see `enter`); no artifact cache, so that a build that is not
+# up to date sends its requests
+GROUP_CAS="$TW/cas"
+export LAKE_REMOTE_EXEC=grpc://fake:1 FAKE_CAS="$GROUP_CAS"
 unset LAKE_REMOTE_EXEC_TIMEOUT LAKE_ARTIFACT_CACHE
 
-# enter DIR: a fresh copy of the test package in $TW/DIR, made the working directory, with its own Lake cache
-enter() {
-  rm -rf "$TW/$1"; mkdir -p "$TW/$1"
-  cp -r "$TEST_DIR/lakefile.toml" "$TEST_DIR/Rx.lean" "$TEST_DIR/Rx" "$TW/$1/"
-  chmod -R u+w "$TW/$1"
-  cd "$TW/$1"
-  export LAKE_CACHE_DIR="$TW/$1.cache"
-}
 # fake_log NAME: the next builds log to a new fake log, $TW/NAME.fake.log
 fake_log() { export FAKE_LOG="$TW/$1.fake.log"; rm -f "$FAKE_LOG" "$FAKE_LOG.actions"; }
-# timeouts [TARGET]: the `timeoutSecs` values of the `run` requests (of TARGET) in the fake's log, sorted, each once
-timeouts() {
+# target_timeouts [TARGET]: the `timeoutSecs` values of the `run` requests (of TARGET) in the fake's log, sorted,
+# each once
+target_timeouts() {
   "$PYTHON" -c 'import json, os, sys
 p, target = sys.argv[1], sys.argv[2:]
 ls = [json.loads(l) for l in open(p) if l.strip()] if os.path.exists(p) else []
@@ -40,19 +34,19 @@ build_T1() (
 row_T1() (
   build_T1
   export FAKE_LOG="$TW/T1.fake.log"
-  test_cmd_eq 3600 timeouts Rx.A
+  test_cmd_eq 3600 target_timeouts Rx.A
 )
 
 # T2 and T3: a set value is each request's timeout, here 1 s and the largest, 21600 s (6 h)
 row_T2() (
   enter T2; fake_log T2
   LAKE_REMOTE_EXEC_TIMEOUT=1 test_run build Rx.A
-  test_cmd_eq 1 timeouts Rx.A
+  test_cmd_eq 1 target_timeouts Rx.A
 )
 row_T3() (
   enter T3; fake_log T3
   LAKE_REMOTE_EXEC_TIMEOUT=21600 test_run build Rx.A
-  test_cmd_eq 21600 timeouts Rx.A
+  test_cmd_eq 21600 target_timeouts Rx.A
 )
 
 # T4: a value that is not a whole number of seconds from 1 to 21600 stops Lake when it reads its environment,
@@ -71,7 +65,7 @@ row_T4() (
 row_T5() (
   enter T5; fake_log T5
   LAKE_REMOTE_EXEC_TIMEOUT= test_run build Rx.A
-  test_cmd_eq 3600 timeouts Rx.A
+  test_cmd_eq 3600 target_timeouts Rx.A
 )
 
 # T6: a timeout other than 3600 s is part of each module's trace. T1's tree (built with the default) built again
@@ -83,11 +77,11 @@ row_T6() (
   fake_log T6-1
   LAKE_REMOTE_EXEC_TIMEOUT=1 test_run build Rx
   test_cmd_eq "Rx Rx.A Rx.B Rx.C Rx.M" run_targets 0
-  test_cmd_eq 1 timeouts
+  test_cmd_eq 1 target_timeouts
   fake_log T6-unset
   test_out "lake: remote: ok; 5 cached (0 from manifest), 0 executed, 0 local;" build Rx
   test_cmd_eq "Rx Rx.A Rx.B Rx.C Rx.M" run_targets 0
-  test_cmd_eq 3600 timeouts
+  test_cmd_eq 3600 target_timeouts
   fake_log T6-again
   test_out "lake: remote: ok; 0 cached (0 from manifest), 0 executed, 0 local;" build Rx
   test_cmd_eq 0 count_method run
