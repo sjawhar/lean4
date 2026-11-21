@@ -212,6 +212,25 @@ row_S10w() (
   pcheck held hellos=1
 )
 
+# S10t: S10w with a bridge command that runs the bridge under GNU `timeout` without exec (`killBridge` names
+# `timeout`). `timeout` moves itself and the bridge into a process group of their own, inside the bridge
+# command's session. The build ends while the probe's `hello` is held (60 s), and Lake still exits within 1 s
+# of the build's end, here 3 s (as in S10)
+row_S10t() (
+  enter_row S10t
+  B="$D/b"; mkdir -p "$B"
+  printf '%s\n' '#!/bin/sh' \
+    'n=1; while ! (set -C; : > "$BRIDGES/$n.start") 2> /dev/null; do n=$((n + 1)); done' \
+    '[ "$n" = 1 ] || export FAKE_HELLO_DELAY_S=60' \
+    'timeout 600 "$FAKE" "$@"' > "$B/bridge"
+  chmod +x "$B/bridge"
+  export BRIDGES="$B" FAKE="$TEST_DIR/fake_lean_remote.py" LAKE_REMOTE_EXEC_CLIENT="$B/bridge" FAKE_UNREACHABLE=1
+  slow Sl 5000
+  lbuild Rx.Sl
+  pcheck "exit=$(cat "$D/exit")"
+  pcheck held hellos=1
+)
+
 # S11: under `fail` and `wait` no timer runs. Under `fail` Rx.A fails at once, and a target that sleeps 5 s keeps
 # the build going: only the decision says `hello`. Under `wait` the probes are `awaitService`'s: one at a time, 1 s
 # and then 2 s apart, and after the one that finds the service only the bridge that carries the requests says
@@ -276,4 +295,4 @@ row_k5() (
   pcheck "promoted=${pairs#,}"
 )
 
-run_rows S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S10w S11 S12 k5
+run_rows S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S10w S10t S11 S12 k5
