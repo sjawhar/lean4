@@ -206,11 +206,12 @@ has `moreLinkObjs` or whose package has an `extern_lib`.
 No file that this machine compiled is an input of an action on the service, except a shared
 library that stays on this machine (above) and the files that `leanir` writes. A module, C object
 or shared library that this machine built (by the fallback, in an earlier build, or with service
-mode off) has no service record. Before an action on the service takes it as an input, Lake runs
-its own action on the service and writes the service's files over the local ones. This promotion
-writes no line: the target keeps its one line. The outputs that LAKE_USAGE_CUTOFF kept or skipped
-are promoted in the same way. The actions of one commit have the same digests on two machines
-when LAKE_REMOTE_EXEC_SYSROOT (unset: the path of the local sysroot), LAKE_REMOTE_EXEC_TOOLCHAIN,
+mode off) has no service record. While its trace is up to date, Lake uses it in every mode, with
+the result local-cache. Before an action on the service takes it as an input, Lake runs its own
+action on the service and writes the service's files over the local ones. This promotion writes
+no line: the target keeps its one line. The outputs that LAKE_USAGE_CUTOFF kept or skipped are
+promoted in the same way. The actions of one commit have the same digests on two machines when
+LAKE_REMOTE_EXEC_SYSROOT (unset: the path of the local sysroot), LAKE_REMOTE_EXEC_TOOLCHAIN,
 LAKE_REMOTE_EXEC_CC, LAKE_REMOTE_EXEC_PATH and LAKE_REMOTE_EXEC_TIMEOUT are the same on both.
 
 The service does not answer when its `hello` finds it unreachable, or when a request still answers
