@@ -258,8 +258,9 @@ The results:
   executed            the service ran the action for this build (a failed compile has an
                       exitCode other than 0)
   cached              the service's cache gave the result of the same action
-  oom, disk-limit     the sandbox killed a process for its memory, or the action filled its disk,
-                      whatever the exit code
+  oom, disk-limit     the service answered OOM or DISK_LIMIT, or the action's limits say that the
+                      sandbox killed a process for its memory or that the action filled its disk
+                      (whatever the exit code)
   timeout             the action ran longer than LAKE_REMOTE_EXEC_TIMEOUT
   local-cache         Lake found the outputs on this machine and sent no request (action and
                       outputs give the service's record, or null when no service action made them)

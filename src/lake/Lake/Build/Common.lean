@@ -9,7 +9,7 @@ prelude
 public import Lake.Build.Job.Monad
 public import Lake.Config.Monad
 public import Lake.Util.JsonObject
-public import Lake.Util.RemoteExec
+public import Lake.Util.RemoteRecord
 public import Lake.Util.IO
 public import Lake.Build.Actions
 public import Lake.Build.RemoteCache
