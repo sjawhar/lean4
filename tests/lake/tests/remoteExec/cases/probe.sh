@@ -231,6 +231,60 @@ row_S10t() (
   pcheck held hellos=1
 )
 
+# held_bridges: LAKE_REMOTE_EXEC_CLIENT becomes a bridge command, numbered as in `bridges`, whose fake the kill
+# of the bridge's process group does not end. Bridge 1 (the decision's) is the fake itself, which finds the
+# service down. Each later bridge ignores SIGTERM and SIGHUP, keeps the fake's input open after Lake's input
+# ends, and runs the fake in a session of its own; that fake answers its `hello` 60 s late, writes its pid to
+# $D/b/N.fakepid, and is killed when the row ends
+held_bridges() {
+  B="$D/b"; mkdir -p "$B"
+  printf '%s\n' '#!/bin/sh' \
+    'n=1; while ! (set -C; : > "$BRIDGES/$n.start") 2> /dev/null; do n=$((n + 1)); done' \
+    '[ "$n" != 1 ] || exec "$FAKE" "$@"' \
+    'export FAKE_HELLO_DELAY_S=60 FAKE_PIDFILE="$BRIDGES/$n.fakepid"' \
+    "trap '' TERM HUP" \
+    '{ cat; exec sleep 600; } | "$PYTHON" -c '\''import os, sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])'\'' "$FAKE" "$@"' \
+    > "$B/bridge"
+  chmod +x "$B/bridge"
+  export BRIDGES="$B" FAKE="$TEST_DIR/fake_lean_remote.py" LAKE_REMOTE_EXEC_CLIENT="$B/bridge" FAKE_UNREACHABLE=1 PYTHON
+  trap 'for f in "$B"/*.fakepid; do [ ! -f "$f" ] || kill -9 "$(cat "$f")" 2> /dev/null || true; done' EXIT
+}
+
+# S10s: S10t with a bridge command whose probe neither the kill of the bridge's process group nor end of input
+# ends (`held_bridges`): its fake holds Lake's read of the `hello` answer for 60 s. The build ends while that
+# `hello` is held, and Lake waits at most 1 s for the probe and exits without it, within 3 s of the build's end
+# (as in S10): with code 0, after its end-of-build line, a line of its log for each module and the build lock's
+# release
+row_S10s() (
+  local rc=0
+  enter_row S10s; held_bridges
+  slow Sl 5000
+  lbuild Rx.Sl || rc=$?
+  test_exp "$rc" = 0
+  pcheck "exit=$(cat "$D/exit")"
+  pcheck held hellos=1
+  lines --modules Rx.Sl --expect 'Rx.Sl:result=local,action=null,outputs=null,exitCode=0'
+  match_text "lake: remote: unreachable; 0 cached (0 from manifest), 0 executed, 1 local;" "$D/out"
+  test_cmd lock_free .lake/build.lock
+)
+
+# S10f: S10s with a build that fails (Rx.Bad, which imports Rx.Sl, does not compile): Lake exits as it does
+# without a held probe, with code 1, the error and its end-of-build line, within 3 s of the build's end
+row_S10f() (
+  local rc=0
+  enter_row S10f; held_bridges
+  slow Sl 5000
+  printf 'import Rx.Sl\n\n/-! A module that does not compile. -/\n\ndef bad : Nat := undefinedIdentS10f\n' > Rx/Bad.lean
+  lbuild Rx.Bad || rc=$?
+  test_exp "$rc" = 1
+  pcheck "exit=$(cat "$D/exit")"
+  pcheck held hellos=1
+  lines --modules Rx.Sl,Rx.Bad --expect 'Rx.Sl:result=local,action=null,outputs=null,exitCode=0' \
+    --expect 'Rx.Bad:result=local,action=null,outputs=null,exitCode=null'
+  match_text undefinedIdentS10f "$D/out"
+  match_text "lake: remote: unreachable; 0 cached (0 from manifest), 0 executed, 1 local;" "$D/out"
+)
+
 # S11: under `fail` and `wait` no timer runs. Under `fail` Rx.A fails at once, and a target that sleeps 5 s keeps
 # the build going: only the decision says `hello`. Under `wait` the probes are `awaitService`'s: one at a time, 1 s
 # and then 2 s apart, and after the one that finds the service only the bridge that carries the requests says
@@ -295,4 +349,4 @@ row_k5() (
   pcheck "promoted=${pairs#,}"
 )
 
-run_rows S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S10w S10t S11 S12 k5
+run_rows S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S10w S10t S10s S10f S11 S12 k5

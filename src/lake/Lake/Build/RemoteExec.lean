@@ -268,7 +268,8 @@ def probeVerdict (client : RemoteExec.ClientConfig) (endpoint leanGithash : Stri
 /-- A running re-probe timer (`startProbeTimer`). -/
 structure ProbeTimer where
   serial : Nat
-  /-- Ends its sleep and its probe in flight (`stopProbeTimer`). -/
+  /-- Ends its sleep and kills the bridge of its probe in flight with its process group
+  (`stopProbeTimer`). -/
   stop : RemoteExec.ProbeStop
   task : Task Unit
 
@@ -288,17 +289,21 @@ def sleepUnlessStopped (stop : RemoteExec.ProbeStop) (ms : Nat) : BaseIO Bool :=
     IO.sleep (min 100 (deadline - now)).toUInt32
   return true
 
-/-- Writes the re-probe timer's verdict `d` if the decision is still `.unreachable` (`.active` also
-moves `remoteEpochRef` on), and removes the timer, in one section of `remoteDecisionRef`: a failure
-noted after the verdict then starts a new timer. -/
+/-- Ends the re-probe timer with its verdict `d` unless `stopProbeTimer` removed it first, in one
+section of `remoteDecisionRef`: removes the timer and writes `d` if the decision is still `.unreachable`
+(`.active` also moves `remoteEpochRef` on). A failure noted after the verdict then starts a new timer. -/
 def endProbeTimer (serial : Nat) (d : SessionDecision) : BaseIO Unit :=
   remoteDecisionRef.atomically do
+    let running ← remoteProbeTimer.atomically (m := BaseIO) do
+      if let some t ← getThe (Option ProbeTimer) then
+        if t.serial == serial then
+          set (none : Option ProbeTimer)
+          return true
+      return false
+    unless running do return
     if let some (.unreachable _) ← getThe (Option SessionDecision) then
       set (some d : Option SessionDecision)
       if d matches .active then remoteEpochRef.modify (· + 1)
-    remoteProbeTimer.atomically (m := BaseIO) do
-      if let some t ← getThe (Option ProbeTimer) then
-        if t.serial == serial then set (none : Option ProbeTimer)
 
 /-- The re-probe timer's loop (see `startProbeTimer`). -/
 def probeTimerLoop (client : RemoteExec.ClientConfig) (endpoint leanGithash : String) (serial : Nat)
@@ -331,7 +336,7 @@ every 30 s. It holds no lock while it sleeps or probes, so `useService` answers 
 meanwhile, and it takes `remoteDecisionRef` only to write a verdict (`endProbeTimer`): a service in
 use makes the decision `.active` and moves `remoteEpochRef` on, after the connection whose `hello`
 refuses requests is dropped; another Lean makes it `.toolchainMismatch`; either ends the timer. A
-refused or unreachable service is probed again. `stopProbeTimer` ends it.
+refused or unreachable service is probed again. `stopProbeTimer` stops it.
 -/
 def startProbeTimer (client : RemoteExec.ClientConfig) (endpoint leanGithash : String) : BaseIO Unit :=
   remoteProbeTimer.atomically do
@@ -341,17 +346,38 @@ def startProbeTimer (client : RemoteExec.ClientConfig) (endpoint leanGithash : S
     let task ← BaseIO.asTask (prio := .dedicated) (probeTimerLoop client endpoint leanGithash serial stop)
     set (some {serial, stop, task : ProbeTimer})
 
-/-- Stops the re-probe timer, if one runs, and waits for its end: the stop ends its sleep within
-100 ms, or kills the bridge of its probe in flight, which carries no request but `hello`. -/
+/-- The longest the re-probe timer may delay Lake's exit: how long `stopProbeTimer` waits for its end,
+in milliseconds. -/
+def probeStopWaitMs : Nat := 1000
+
+/-- See `remoteProbeAbandoned`. -/
+builtin_initialize remoteProbeAbandonedRef : IO.Ref Bool ← IO.mkRef false
+
+/-- Whether `stopProbeTimer` abandoned a re-probe timer in this process. Its task may still run, and
+the runtime waits for every task when `main` returns, so `Lake.cli` then exits the process instead. -/
+public def remoteProbeAbandoned : BaseIO Bool :=
+  remoteProbeAbandonedRef.get
+
+/--
+Stops the re-probe timer, if one runs, and waits at most `probeStopWaitMs` for its end. The stop ends
+its sleep within 100 ms, or kills the bridge of its probe in flight, which carries no request but
+`hello`, with its process group. A process that the bridge command moved out of that group can hold
+the probe until the service answers its `hello`; the timer is then abandoned (`remoteProbeAbandoned`),
+and once its probe returns it writes no verdict and starts nothing. Lake's ends of that probe's pipes
+close only when the probe ends or Lake exits, as the kill needs the child that `spawn` returned, which
+keeps its standard input.
+-/
 def stopProbeTimer : BaseIO Unit := do
   let some t ← remoteProbeTimer.atomically (modifyGet fun t => (t, (none : Option ProbeTimer)))
     | return
   t.stop.stop
-  discard <| IO.wait t.task
+  unless ← waitUntil t.task ((← IO.monoMsNow) + probeStopWaitMs) do
+    remoteProbeAbandonedRef.set true
 
 /-- Ends this process's use of the build service, so that Lake can go on or exit: stops the re-probe
 timer (`stopProbeTimer`) and then the bridge (`RemoteExec.shutdown`); either's task would otherwise
-keep the process alive. Called at a build's end and however a Lake command ends. -/
+keep the process alive, as the task of a timer that `stopProbeTimer` abandons still does (`Lake.cli`
+then exits the process). Called at a build's end and however a Lake command ends. -/
 public def shutdownRemote : BaseIO Unit := do
   stopProbeTimer
   RemoteExec.shutdown
