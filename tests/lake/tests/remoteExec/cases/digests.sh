@@ -1,8 +1,8 @@
 # The `digests` group of test.sh, which sources it: the inputs of service actions (A7, and the promotion of A4),
-# rows D1-D9. A Lean action takes a plugin by the digest and executable bit of the service's output, so two machines
+# rows D1-D10. A Lean action takes a plugin by the digest and executable bit of the service's output, so two machines
 # send the same actions (D1-D4); an input that this machine compiled is first compiled again on the service (its
-# promotion), so no local output is an input of a service action (D5-D9). D1-D6 build the package `native/` (see
-# cases/native.sh), D7-D9 the package Rx. Each row builds in directories of its own under $WORK/digests, and each
+# promotion), so no local output is an input of a service action (D5-D10). D1-D6 build the package `native/` (see
+# cases/native.sh), D7-D10 the package Rx. Each row builds in directories of its own under $WORK/digests, and each
 # build has a fake log and a LAKE_REMOTE_EXEC_LOG of its own. D4 builds on D2's service: `build_D2` builds D2's tree
 # once, so that each of them also runs alone.
 
@@ -115,6 +115,21 @@ sys.exit(0 if res and got == want else 1)' "$FAKE_LOG" "$1" "$2"
 serviced() {
   check_lines "$1" --modules Nat0.Tac,Nat0.Use --expect "$(run_targets 0 | tr ' ' '|'):result=executed|cached" \
     --expect 'Nat0.Tac:dynlib:kind=shared,result=executed|cached'
+}
+# service_files TREE TARGET: each output of TARGET's action, as the fake stored it, has the same bytes in the tree TREE
+# (`lib/<pkg>/…` in `.lake/build/lib/lean`, `ir/<pkg>/…` in `.lake/build/ir`), and there is one at least
+service_files() {
+  "$PYTHON" -c "$FAKE_PY"'
+log, tree, t = sys.argv[1:4]
+outs = (result(log, t) or {}).get("outputs") or []
+def same(o):
+    top, _, rest = o["rel"].split("/", 2)
+    local = os.path.join(tree, ".lake", "build", "lib/lean" if top == "lib" else "ir", rest)
+    blob = os.path.join(os.environ["FAKE_CAS"], o["digest"].split("/")[0])
+    return os.path.exists(local) and open(local, "rb").read() == open(blob, "rb").read()
+other = [o["rel"] for o in outs if not same(o)]
+print("%s: %d outputs of %s, other bytes in %s" % (tree, len(outs), t, " ".join(other) or "none"))
+sys.exit(0 if outs and not other else 1)' "$FAKE_LOG" "$@"
 }
 
 # D1 (k7): `native/` built through the service from two directories at different paths, each with a `cc` of its
@@ -286,4 +301,63 @@ row_D9() (
     --expect 'Rx.A:result=local-cache,action=null,outputs=null,code=null' --expect 'Rx.B:result=error,code=UNAVAILABLE'
 )
 
-run_rows D1 D2 D3 D4 D5 D6 D7 D8 D9
+# D10: two trees on one Lake cache (artifact cache on) and one service, where Rx.A has no service record (the first
+# compiled it while the service did not answer, the second restored it from the cache), build Rx.B at once. The first
+# promotes Rx.A holding Rx.A's input lock, its run held at the fake's barrier until the second waits for that lock;
+# the second then restores the first's promotion from the Lake cache and sends no request for Rx.A. Rx.A's action runs
+# once, both builds succeed, both trees end with the service's bytes and Rx.A's trace has the service's record, and
+# each Rx.A keeps the line `local-cache` of its replay with no record
+row_D10() (
+  local dep lock pa pb rca rcb
+  export LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true
+  # Both trees build on D10-a's Lake cache and service, which `enter D10-a` sets
+  enter D10-b; enter D10-a; logs D10-a-local
+  FAKE_UNREACHABLE=1 test_run build Rx.A
+  cd "$DW/D10-b"; logs D10-b-local
+  FAKE_UNREACHABLE=1 test_run build Rx.A
+  check_lines "$DW/D10-b-local.jsonl" --modules Rx.A --expect 'Rx.A:result=local-cache,action=null,outputs=null'
+  dep=$("$PYTHON" -c 'import json, sys; print(json.load(open(sys.argv[1]))["depHash"])' .lake/build/lib/lean/Rx/A.trace)
+  lock=$(echo "$LAKE_CACHE_DIR"/locks/*/"$dep")
+  test_exp -f "$lock"
+  rm -f "$DW/D10.barrier".*
+  logs D10-a
+  (cd "$DW/D10-a" && export FAKE_INPUT_BARRIER="$DW/D10.barrier" && exec "$LAKE" build Rx.B > "$DW/D10-a.out" 2>&1) &
+  pa=$!
+  for _ in $(seq 1 1200); do
+    [ ! -e "$DW/D10.barrier.ready" ] || break
+    ! dead "$pa" || break
+    sleep 0.1
+  done
+  test_exp -e "$DW/D10.barrier.ready" || { kill "$pa" 2> /dev/null; cat "$DW/D10-a.out"; false; }
+  logs D10-b
+  (cd "$DW/D10-b" && exec "$LAKE" -v build Rx.B > "$DW/D10-b.out" 2>&1) &
+  pb=$!
+  # Until the second waits for the lock (it has the lock file open), has sent its own run of Rx.A, or has ended
+  for _ in $(seq 1 1200); do
+    [ "$(fds_on "$pb" "$lock" 2> /dev/null || echo 0)" = 0 ] || break
+    [ -z "$(run_seq Rx.A)" ] || break
+    ! dead "$pb" || break
+    sleep 0.1
+  done
+  touch "$DW/D10.barrier.go"
+  rca=0; wait "$pa" || rca=$?
+  rcb=0; wait "$pb" || rcb=$?
+  cat "$DW/D10-a.out" "$DW/D10-b.out"
+  cat "$DW/D10-a.fake.log" "$DW/D10-b.fake.log" > "$DW/D10.fake.log"
+  FAKE_LOG="$DW/D10.fake.log" test_cmd_eq "LeanModule:Rx.A" run_seq Rx.A
+  test_exp "$rca" = 0
+  test_exp "$rcb" = 0
+  test_cmd grep -q "for another Lake process to build this input" "$DW/D10-b.out"
+  export FAKE_LOG="$DW/D10-a.fake.log"
+  test_cmd service_files "$DW/D10-a" Rx.A
+  test_cmd service_files "$DW/D10-b" Rx.A
+  test_cmd record_of "$DW/D10-a/.lake/build/lib/lean/Rx/A.trace" Rx.A
+  test_cmd record_of "$DW/D10-b/.lake/build/lib/lean/Rx/A.trace" Rx.A
+  test_cmd "$PYTHON" "$TEST_DIR/probe_check.py" --fake "$DW/D10-b.fake.log" "inputs=$FAKE_CAS"
+  check_lines "$DW/D10-a.jsonl" --modules Rx.A,Rx.B \
+    --expect 'Rx.A:result=local-cache,action=null,outputs=null,code=null' --expect 'Rx.B:result=executed|cached'
+  check_lines "$DW/D10-b.jsonl" --modules Rx.A,Rx.B \
+    --expect 'Rx.A:result=local-cache,action=null,outputs=null,code=null' --expect 'Rx.B:result=executed|cached'
+)
+
+run_rows D1 D2 D3 D4 D5 D6 D7 D8 D9 D10

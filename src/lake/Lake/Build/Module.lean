@@ -1660,8 +1660,8 @@ def remoteHead (presetup : ModulePreSetup) (s : RemoteSession) : JobM (Except Pr
   return .ok {sysroot := sysrootStr, leanPath, plugins, dynlibs, inputFiles, digestInputs}
 
 /-- A module's outputs as a service action takes them (`Module.serviceFor`): the service record that describes them
-and, when this process promoted the module (`Module.promote`), its outputs since then, which hold the service's bytes
-and are the files that requests name. -/
+and, when this process promoted the module (`Module.promote`, which can restore another process's promotion), its
+outputs since then, which hold the service's bytes and are the files that requests name. -/
 structure ModuleService where
   record : RemoteExec.Record
   promoted? : Option ModuleOutputArtifacts := none
@@ -1725,6 +1725,30 @@ def Module.cacheRemoteOutputs (mod : Module) (presetup : ModulePreSetup) (inputH
       keeping the build outputs:{details}"
     return arts
 
+/--
+Another Lake process's promotion of the module, if the Lake cache entry of its input `depTrace` has the service's
+record (`Module.promote` reads it under the input lock): restores the entry's outputs over the module's files and
+writes the trace as a promotion does, with that record.
+-/
+def Module.restorePromoted? (mod : Module) (depTrace : BuildTrace) : JobM (Option ModuleService) := do
+  let out? ← try (← getLakeCache).readOutputs? mod.pkg.cacheScope depTrace.hash catch e => do
+    dropLogFrom e
+    pure none
+  let some out := out? | return none
+  let some record := out.remote? | return none
+  let arts? ← try some <$> resolveModuleOutputArtifacts (.ofData out.data) catch e => do
+    dropLogFrom e
+    pure none
+  let some arts := arts? | return none
+  let log := (← readTraceFile mod.traceFile).log
+  -- The files have the local build's bytes, which `restoreArtifact` would replace only with a warning; the `.ltar` and
+  -- the usage sidecars go too, as in a promotion
+  mod.clearOutputArtifacts
+  mod.clearOutputHashes
+  let arts ← mod.restoreAllArtifacts arts
+  writeBuildTrace mod.traceFile depTrace (toJson arts.descrs) log (remote? := some record)
+  return some {record, promoted? := some arts}
+
 mutual
 
 /--
@@ -1745,16 +1769,18 @@ Promotes the module (see "Promotion of the inputs of service actions" in `Lake.B
 on the service, its imports and plugins promoted first (`Module.remoteRunRequest`, `remoteHead`), and materializes the
 outputs over its files. The `.hash` files, the trace and the Lake cache entry (`cacheRemoteOutputs`) then follow the
 service's bytes, with the service's record; the old `.ltar` (packed from the old outputs) and the usage sidecars
-(which only a local compile writes) go, which also ends a kept lineage. The module's job wrote its one line already,
-and the promotion replays none of Lean's messages and counts in no statistic.
+(which only a local compile writes) go, which also ends a kept lineage. The run, the materialize and the writes hold
+the input lock of the module's input (`promotionRun`); under it, a cache entry that has the service's record (another
+process promoted the module) is restored instead, with no request (`Module.restorePromoted?`). The module's job wrote
+its one line already, and the promotion replays none of Lean's messages and counts in no statistic.
 -/
 partial def Module.promote (mod : Module) (s : RemoteSession) : JobM (Except PromotionError ModuleService) := do
   let some presetup ← (← mod.presetup.fetch).wait?
     | return .error (.failed s!"{mod.name}: its setup failed")
   let msg (what : String) := s!"promoting {mod.name}: {what}"
-  let result ← match ← promotionRun s msg (mod.serviceRequest presetup s) with
-    | .ok r => pure r
-    | .error e => return .error e
+  let depTrace := s.mixTimeout presetup.trace
+  promotionRun s msg mod.pkg depTrace.hash (mod.serviceRequest presetup s) (some (mod.restorePromoted? depTrace))
+    fun result => do
   let outputFiles := mod.remoteOutputFiles
   let mut found := #[]
   for o in result.outputs do
@@ -1774,7 +1800,6 @@ partial def Module.promote (mod : Module) (s : RemoteSession) : JobM (Except Pro
   let arts ← withBuildSlot do
     mod.computeArtifacts presetup.isModule presetup.postponeCompile
   let record := RemoteExec.Record.ofOutputs result.action (found.map fun (ext, d, _, x) => (ext, d, x))
-  let depTrace := s.mixTimeout presetup.trace
   writeBuildTrace mod.traceFile depTrace (toJson arts.descrs) (← readTraceFile mod.traceFile).log
     (remote? := some record)
   let arts ← mod.cacheRemoteOutputs presetup depTrace.hash arts record

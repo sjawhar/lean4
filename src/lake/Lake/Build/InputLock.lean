@@ -14,11 +14,17 @@ import Lake.Util.IO
 /-! # Input Lock
 
 When two Lake processes on one machine share one writable artifact cache and both must build
-the same input (a module with the same input hash), only one of them builds it. Before a build
-that would compile or unpack the input's outputs, a job takes an exclusive `flock` of the file
-`<cache dir>/locks/<scope>/<input hash>`, looks in the local cache again, and keeps the lock
-until the outputs are in the cache (or the build failed). A job that waited on the lock thus
-restores the outputs the other process cached.
+the same input (an input hash of a package), only one of them builds it. A job takes an exclusive
+`flock` of the file `<cache dir>/locks/<scope>/<input hash>` before it builds the input's outputs:
+a module's build before it would compile or unpack the module's outputs (`fetchLocal` in
+`Lake.Build.Module`), and a promotion of a module or a native artifact to the build service
+before it runs the input's action there (`promotionRun` in `Lake.Build.RemoteExec`). Under the
+lock the job looks in the local cache again, and it keeps the lock until the outputs are in the
+cache (or the build failed). A job that waited on the lock thus restores the outputs the other
+process cached. No job waits on one input lock while it holds another, so two processes never
+wait on each other: a promotion takes the lock only once its request is made (which promotes the
+request's inputs first), and releases it while it makes a lost input again. A native artifact's
+own job (`buildNativeArtifact`) takes no lock.
 
 The lock is off when `LAKE_NO_BUILD_LOCK` is true, under `--no-build`, and wherever the cache is
 not writable (the callers take it only on that path). If the lock file cannot be opened or locked,

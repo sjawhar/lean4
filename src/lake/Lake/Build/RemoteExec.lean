@@ -14,6 +14,7 @@ public import Lake.Build.Job.Monad
 public import Lake.Config.Monad
 public import Lake.Config.Module
 public import Lean.Setup
+import Lake.Build.InputLock
 import Lake.Util.Proc
 import Lean.Compiler.FFI
 import Std.Data.HashMap
@@ -924,6 +925,13 @@ place, so a process that has an old file open keeps it); the `.hash` files, the 
 follow the service's bytes, with the service's record. A promotion writes no line of `LAKE_REMOTE_EXEC_LOG` (the job of
 its target wrote that), and one promotion serves every job of the process (`promoteOnce`). Under `--no-build` no
 service action runs, so nothing is promoted.
+
+Where the input's package writes the artifact cache, a promotion holds the input lock of the input whose cache entry it
+writes (`acquireInputLock?`, which a module's build also takes) over its run, the materialize and the writes, so that
+Lake processes that share the cache promote each input once: under the lock it reads that cache entry again, and
+restores another process's promotion, with its record, in place of a request. No promotion waits for a lock while it
+holds one, so two promotions never wait on each other: it takes the lock only once its request is made, which promotes
+the request's inputs first, and releases it while it makes a lost input again (`promotionRun`).
 -/
 
 /-- Why a promotion (`promoteOnce`) gave its input no service record. -/
@@ -1058,6 +1066,42 @@ public def nativeArtifact? (file : FilePath) : BaseIO (Option NativeArtifact) :=
 def nativeTraceFile (file : FilePath) : FilePath :=
   FilePath.mk (file.toString ++ ".trace")
 
+/-- Ends a promotion of the native artifact `a`, whose file now holds the service's output `art` with the service's
+record `record`: writes the record into the file's trace, which keeps the log of `savedTrace`, and `nativeArtifacts`. -/
+def NativeArtifact.notePromoted (a : NativeArtifact) (savedTrace : SavedTrace) (art : Artifact)
+    (record : RemoteExec.Record) : JobM Unit := do
+  let data := match savedTrace with
+    | .ok data => {data with outputs? := some (toJson art.descr), remote? := some record}
+    | _ => BuildMetadata.ofFetch a.inputHash (toJson art.descr) {} (remote? := some record)
+  data.writeFile (nativeTraceFile a.action.file)
+  registerNativeArtifact {a with record? := some record}
+
+/--
+Another Lake process's promotion of the native artifact `a`, if the Lake cache entry of its input has the service's
+record (`NativeAction.promote` reads it under the input lock): restores the entry's output to the artifact's file with
+the record's executable bit, ends the promotion as `NativeAction.promote` does (`NativeArtifact.notePromoted`), and
+returns the output on the service.
+-/
+def NativeArtifact.restorePromoted? (a : NativeArtifact) : JobM (Option RemoteExec.RecordOutput) := do
+  let file := a.action.file
+  let out? ← try (← getLakeCache).readOutputs? a.pkg.cacheScope a.inputHash catch e => do
+    dropLogFrom e
+    pure none
+  let some out := out? | return none
+  let some record := out.remote? | return none
+  let some o := record.outputs.get? a.action.kind.outputName | return none
+  let art? ← try some <$> resolveArtifactOutput (.ofData out.data) (exe := o.executable) catch e => do
+    dropLogFrom e
+    pure none
+  let some art := art? | return none
+  let savedTrace ← readTraceFile (nativeTraceFile file)
+  -- The file has the local build's bytes, which `restoreArtifact` would replace only with a warning
+  removeFileIfExists file
+  clearFileHash file
+  let art ← restoreArtifact file art o.executable
+  a.notePromoted savedTrace art record
+  return some o
+
 /-- The promotions of this process's native artifacts by their local path (`NativeArtifact.serviceOutput`). -/
 builtin_initialize nativePromotions :
     Std.Mutex (Std.HashMap FilePath (IO.Promise (Except PromotionError RemoteExec.RecordOutput))) ←
@@ -1080,6 +1124,14 @@ public inductive NativeRequestInputs
 public def NativeRequestInputs.byDigest : NativeRequestInputs → Array (RemoteExec.Digest × FilePath)
   | .source .. => #[]
   | .objects objs => objs.map fun (_, o, file) => (o.digest, file)
+
+/-- The inputs by digest of a `run` request (`byDigest`) whose blobs the service lost, as its answer `r` names them
+(contract C5.1): the `missing` digests of an `UNAVAILABLE` answer. -/
+def lostInputs (r : Except RemoteExec.Error RemoteExec.RunResult) (byDigest : Array (RemoteExec.Digest × FilePath)) :
+    Array (RemoteExec.Digest × FilePath) :=
+  match r with
+  | .error e => if e.code == .unavailable then byDigest.filter (e.missing.contains ·.1) else #[]
+  | .ok _ => #[]
 
 /-- A `run` request's input that it takes by path: its path in the input root and its local path. -/
 public def remoteInputByPath (rel : String) (path : FilePath) : Json :=
@@ -1179,8 +1231,8 @@ partial def NativeAction.serviceRequest (act : NativeAction) (s : RemoteSession)
 Sends the `run` request that `build` makes (its params, and each input that it takes by digest with the local path of
 the native artifact of this process that made it), and returns the answer with `remoteEpoch`, read before the request
 was sent. When the answer is `UNAVAILABLE` with `missing` naming one of those digests, the service lost that blob
-(contract C5.1): the native action that made it runs once more past the action cache (`rerunLostBlob`), and `build`
-makes the request again, which is sent once more; that answer is the result.
+(contract C5.1): the native action that made it runs once more past the action cache, and `build` makes the request
+again (`remakeLost`), which is sent once more; that answer is the result.
 -/
 public partial def runRetryingLost (s : RemoteSession)
     (build : JobM (Except PromotionError (Json × Array (RemoteExec.Digest × FilePath)))) :
@@ -1190,16 +1242,22 @@ public partial def runRetryingLost (s : RemoteSession)
     | .error e => return .error e
   let epoch ← remoteEpoch
   let r ← runAction s epoch params (lost := byDigest.map (·.1))
-  let .error e := r | return .ok (epoch, r)
-  let lost := if e.code == .unavailable then byDigest.filter (e.missing.contains ·.1) else #[]
+  let lost := lostInputs r byDigest
   if lost.isEmpty then return .ok (epoch, r)
-  for (digest, file) in lost do
-    if let .error pe ← rerunLostBlob s digest file then return .error pe
-  let (params, _) ← match ← build with
+  let (params, _) ← match ← remakeLost s lost build with
     | .ok r => pure r
     | .error e => return .error e
   let epoch ← remoteEpoch
   return .ok (epoch, ← runAction s epoch params)
+
+/-- Runs once more each native action that made a `lost` input of a request (`rerunLostBlob`), then makes the request
+again with `build`. -/
+partial def remakeLost (s : RemoteSession) (lost : Array (RemoteExec.Digest × FilePath))
+    (build : JobM (Except PromotionError (Json × Array (RemoteExec.Digest × FilePath)))) :
+    JobM (Except PromotionError (Json × Array (RemoteExec.Digest × FilePath))) := do
+  for (digest, file) in lost do
+    if let .error pe ← rerunLostBlob s digest file then return .error pe
+  build
 
 /-- Runs the native action of this process that made the blob `digest` that the service lost, whose artifact is at
 `file`, once more past the service's action cache (`NativeAction.promote`), once per blob in this process. -/
@@ -1210,37 +1268,69 @@ public partial def rerunLostBlob (s : RemoteSession) (digest : RemoteExec.Digest
   return (← promoteOnce lostBlobRuns digest (a.action.promote s (skipCacheLookup := true))).map fun _ => ()
 
 /--
-Runs the action of a promotion (`runRetryingLost` with `build`) and returns its result: a request that failed, or a run
-that exited with a nonzero code, is the promotion's error, with the message that `msg` makes.
+Runs the action of a promotion of the input `inputHash` of `pkg` with the request that `build` makes, and ends the
+promotion with `finish` on the run's result: a request that failed, or a run that exited with a nonzero code, is the
+promotion's error, with the message that `msg` makes. Where `pkg` writes the artifact cache, the run and `finish` hold
+the input lock (`acquireInputLock?`), under which `found?` first looks for another process's promotion of the input:
+what it finds ends the promotion with no request. So that no promotion waits for a lock while it holds one, the lock
+is taken after `build`, which promotes the request's inputs, and released while a lost input is made again
+(`remakeLost`), which can promote it; then it is taken again and `found?` looks again.
 -/
-public partial def promotionRun (s : RemoteSession) (msg : String → String)
-    (build : JobM (Except PromotionError (Json × Array (RemoteExec.Digest × FilePath)))) :
-    JobM (Except PromotionError RemoteExec.RunResult) := do
-  let (epoch, r) ← match ← runRetryingLost s build with
+public partial def promotionRun (s : RemoteSession) (msg : String → String) (pkg : Package) (inputHash : Hash)
+    (build : JobM (Except PromotionError (Json × Array (RemoteExec.Digest × FilePath))))
+    (found? : Option (JobM (Option α))) (finish : RemoteExec.RunResult → JobM (Except PromotionError α)) :
+    JobM (Except PromotionError α) := do
+  let (params, byDigest) ← match ← build with
     | .ok r => pure r
     | .error e => return .error e
-  let result ← match r with
-    | .ok r => pure r
-    | .error e => return .error (.ofError e epoch (msg s!"the build service's run failed: {e.message}"))
-  unless result.exitCode == 0 do
-    return .error (.failed (msg s!"the build service's run exited with code {result.exitCode}"))
-  return .ok result
+  let held ← IO.mkRef (none : Option InputLock)
+  -- Takes the lock unless it is off, and under it returns what `found?` finds
+  let lock : JobM (Option α) := do
+    unless (← pkg.isArtifactCacheWritable) do return none
+    let some l ← acquireInputLock? pkg.cacheScope inputHash | return none
+    held.set (some l)
+    found?.getD (pure none)
+  let unlock : BaseIO Unit := do
+    if let some l ← held.swap none then l.release
+  try
+    if let some a ← lock then return .ok a
+    let mut epoch ← remoteEpoch
+    let mut answer ← runAction s epoch params (lost := byDigest.map (·.1))
+    let lost := lostInputs answer byDigest
+    unless lost.isEmpty do
+      unlock
+      let (params, _) ← match ← remakeLost s lost build with
+        | .ok r => pure r
+        | .error e => return .error e
+      if let some a ← lock then return .ok a
+      epoch ← remoteEpoch
+      answer ← runAction s epoch params
+    let result ← match answer with
+      | .ok r => pure r
+      | .error e => return .error (.ofError e epoch (msg s!"the build service's run failed: {e.message}"))
+    unless result.exitCode == 0 do
+      return .error (.failed (msg s!"the build service's run exited with code {result.exitCode}"))
+    finish result
+  finally
+    unlock
 
 /--
 Promotes the native artifact of `act` (see "Promotion of the inputs of service actions"): runs its action on the
 service, its inputs promoted first (`NativeAction.serviceInputs`), and, with `skipCacheLookup`, past the service's
 action cache; then materializes the output over the artifact's file with the output's executable bit, and writes the
-service's record into the file's trace, its Lake cache entry (`cacheServiceArtifact`) and `nativeArtifacts`. Returns
-the output.
+service's record into the file's trace, its Lake cache entry (`cacheServiceArtifact`) and `nativeArtifacts`. The run,
+the materialize and the writes hold the input lock of the artifact's input (`promotionRun`); under it, a cache entry
+that has the service's record (another process promoted the artifact) is restored instead, with no request
+(`NativeArtifact.restorePromoted?`), but not with `skipCacheLookup`, whose run puts a lost blob back on the service.
+Returns the output.
 -/
 public partial def NativeAction.promote (act : NativeAction) (s : RemoteSession) (skipCacheLookup := false) :
     JobM (Except PromotionError RemoteExec.RecordOutput) := do
   let some a ← nativeArtifact? act.file
     | return .error (.failed s!"{act.target}: no native job of this build made it")
   let msg (what : String) := s!"promoting {act.target}: {what}"
-  let result ← match ← promotionRun s msg (act.serviceRequest s skipCacheLookup) with
-    | .ok r => pure r
-    | .error e => return .error e
+  let found? := if skipCacheLookup then none else some a.restorePromoted?
+  promotionRun s msg a.pkg a.inputHash (act.serviceRequest s skipCacheLookup) found? fun result => do
   let some out := result.outputs.find? (·.rel == act.rel)
     | return .error (.failed (msg "the build service's run made no output"))
   let materializeEpoch ← remoteEpoch
@@ -1250,14 +1340,9 @@ public partial def NativeAction.promote (act : NativeAction) (s : RemoteSession)
   if let .error e := materialized then
     return .error (.ofError e materializeEpoch (msg s!"materializing failed: {e.message}"))
   let record := RemoteExec.Record.ofOutputs result.action #[(act.kind.outputName, out.digest, out.executable)]
-  let traceFile := nativeTraceFile act.file
-  let savedTrace ← readTraceFile traceFile
+  let savedTrace ← readTraceFile (nativeTraceFile act.file)
   let art ← cacheServiceArtifact a.pkg a.inputHash act.file act.kind.cacheExt out.executable record savedTrace.log
-  let data := match savedTrace with
-    | .ok data => {data with outputs? := some (toJson art.descr), remote? := some record}
-    | _ => BuildMetadata.ofFetch a.inputHash (toJson art.descr) {} (remote? := some record)
-  data.writeFile traceFile
-  registerNativeArtifact {a with record? := some record}
+  a.notePromoted savedTrace art record
   return .ok {digest := out.digest, executable := out.executable}
 
 end
