@@ -87,7 +87,7 @@ public structure BuildMetadata where
 def BuildMetadata.schemaVersion : String := "2025-09-10"
 
 public protected def BuildMetadata.toJson (self : BuildMetadata) : Json :=
-  let obj := ({} : JsonObject)
+  ({} : JsonObject)
     |>.insert "schemaVersion" schemaVersion
     |>.insert "depHash" self.depHash
     |>.insert "inputs" self.inputs
@@ -96,7 +96,6 @@ public protected def BuildMetadata.toJson (self : BuildMetadata) : Json :=
     |>.insert "synthetic" self.synthetic
     |>.insertSome "localHash" self.localHash?
     |>.insertSome "remote" self.remote?
-  obj
 
 public instance : ToJson BuildMetadata := ⟨BuildMetadata.toJson⟩
 
@@ -1246,13 +1245,13 @@ public def SavedTrace.serviceRecord? (self : SavedTrace) (inputHash : Hash) (fil
 
 /--
 **For internal use only.**
-Restores the artifact of `inputHash` from the Lake cache to `file` (`getArtifacts?`, without the shared remote cache)
-if the saved trace or the cache entry that names it has a service record, with the executable bit that the record
-gives its output `recordExt`, and writes the trace of `file` as `buildArtifactUnlessUpToDate` does. Returns the
-artifact and its record.
+Restores the artifact of `inputHash` from the Lake cache to `file`, whose trace file is `traceFile` (`getArtifacts?`,
+without the shared remote cache) if the saved trace or the cache entry that names it has a service record, with the
+executable bit that the record gives its output `recordExt`, and writes the trace as `buildArtifactUnlessUpToDate`
+does. Returns the artifact and its record.
 -/
 public def restoreServiceArtifact?
-  (pkg : Package) (inputHash : Hash) (savedTrace : SavedTrace) (file : FilePath) (recordExt : String)
+  (pkg : Package) (inputHash : Hash) (savedTrace : SavedTrace) (file traceFile : FilePath) (recordExt : String)
 : JobM (Option (Artifact × RemoteExec.Record)) := do
   unless (← pkg.isArtifactCacheReadable) do return none
   let target ← currentRemoteCacheTarget
@@ -1262,9 +1261,8 @@ public def restoreServiceArtifact?
   let some record := hit.remote? | return none
   unless (← savedTrace.replayCachedIfUpToDate inputHash) do
     removeFileIfExists file
-    writeFetchTrace (file.toString ++ ".trace") inputHash (toJson hit.arts.descr) hit.log (remote? := record)
-  let exe := (record.outputs.get? recordExt).any (·.executable)
-  return some (← restoreArtifact file hit.arts exe, record)
+    writeFetchTrace traceFile inputHash (toJson hit.arts.descr) hit.log (remote? := record)
+  return some (← restoreArtifact file hit.arts (record.executable recordExt), record)
 
 /--
 **For internal use only.**
@@ -1282,6 +1280,23 @@ public def cacheServiceArtifact
   unless art.cacheSkipped do
     (← getLakeCache).writeOutputs pkg.cacheScope inputHash art.descr (log := log) (remote? := some record)
   return art
+
+/--
+**For internal use only.**
+The artifact of `file`, whose saved trace is up to date with `inputHash` and has the service record `record` that
+describes `file` (`SavedTrace.serviceRecord?`), as `buildArtifactUnlessUpToDate` replays an up-to-date artifact: with a
+writable Lake cache, from the cache entry that the trace names (`getArtifactsUsingTrace?`, which writes the
+input's cache entry only if it is missing). When the cache holds no such entry, or is not writable, as
+`cacheServiceArtifact` saves `file` with the trace's log.
+-/
+public def replayServiceArtifact
+  (pkg : Package) (inputHash : Hash) (savedTrace : SavedTrace) (file : FilePath) (ext : String) (exe : Bool)
+  (record : RemoteExec.Record)
+: JobM Artifact := do
+  if (← pkg.isArtifactCacheWritable) then
+    if let some (art : XArtifact exe) ← getArtifactsUsingTrace? inputHash savedTrace pkg then
+      return ← restoreArtifact file art exe
+  cacheServiceArtifact pkg inputHash file ext exe record savedTrace.log
 
 /--
 Build `file` using `build` after `dep` completes if the dependency's

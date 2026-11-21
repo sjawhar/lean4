@@ -44,16 +44,23 @@ public structure RemoteSession where
   toolchain : String
   leanGithash : String
 
-/-- The platform of every action of the session (contract C2.1), a Lean module's and a native one's. -/
-public def RemoteSession.platform (s : RemoteSession) : Array (String × String) :=
-  #[("arch", "x86_64"), ("memory", "std"), ("os", "linux"), ("toolchain", s.toolchain)]
+/-- The platform of every action of the session (contract C2.1), a Lean module's and a native one's, as the request's
+`platform` object. -/
+public def RemoteSession.platformJson (s : RemoteSession) : Json :=
+  Json.mkObj [("arch", "x86_64"), ("memory", "std"), ("os", "linux"), ("toolchain", s.toolchain)]
 
 /--
-The platform and path part of a module's action: the part that does not depend on the module's
-source bytes.
+`t` with the session's timeout mixed in (the timeout rule of a service-mode job's trace): unchanged for the default,
+so that a build with the default has the traces of a build outside service mode and replays its tree.
+-/
+public def RemoteSession.mixTimeout (s : RemoteSession) (t : BuildTrace) : BuildTrace :=
+  if s.cfg.timeoutSecs == defaultRemoteTimeoutSecs then t else t.mix (pureTrace s.cfg.timeoutSecs "remote timeout")
+
+/--
+The path part of a module's action (its plugins, dynlibs and `LEAN_PATH`): the part that does not depend on the
+module's source bytes.
 -/
 public structure RemoteHead where
-  platform : Array (String × String)
   sysroot : String
   leanPath : String
   /-- Each plugin's and dynlib's name in the action: in the input root, or under the remote sysroot. -/
@@ -63,7 +70,8 @@ public structure RemoteHead where
   inputFiles : Array (FilePath × String)
   /--
   Local path, input-root-relative path and output on the service of each plugin/dynlib that is a native artifact
-  (`nativeServiceOutput`): the action takes it by the digest and executable bit of the service's output (A7).
+  (`nativeServiceOutput`): the action takes it by the digest and executable bit of the service's output, so that no
+  local output is an input of the action.
   -/
   digestInputs : Array (FilePath × String × RemoteExec.RecordOutput)
 
@@ -431,6 +439,11 @@ public def remoteEpoch : BaseIO Nat :=
 public def remoteDecision? : BaseIO (Option SessionDecision) :=
   remoteDecisionRef.atomically (getThe (Option SessionDecision))
 
+/-- The result of the line of a job that the fallback `local` builds on this machine: `toolchain-mismatch` when the
+service runs another Lean, else `local`. -/
+public def fallbackResult : BaseIO String := do
+  return if (← remoteDecision?) matches some (.toolchainMismatch _) then "toolchain-mismatch" else "local"
+
 /-- Records one job (a module's, a C object's or a shared library's) that failed because the service
 was unavailable under `fail`, or its toolchain mismatched under `wait` or `fail` (for exit code 75,
 `Lake.finalizeBuild`). -/
@@ -458,6 +471,9 @@ public structure RemoteOutcome where
 namespace RemoteOutcome
 
 public def error (code : String) : RemoteOutcome := {result := "error", code? := code}
+
+/-- The line `o` as an `error` with the code `code`, with `o`'s other fields. -/
+public def asError (o : RemoteOutcome) (code : String) : RemoteOutcome := {o with result := "error", code? := code}
 
 /-- The result a `limits` object gives (contract C5.1 v7): `oom` when the sandbox killed a process for
 its memory, else `disk-limit` when the action filled its disk, whatever the exit code. -/
@@ -536,6 +552,22 @@ public def appendRemoteLog (path : FilePath) (kind target : String) (start : Rem
     h.putStr text
     h.flush
 
+/--
+Runs `act`, the work of a job for `target` that writes its one line of `LAKE_REMOTE_EXEC_LOG` with `write`: when `act`
+fails, the line is `error` with code `canceled` for a canceled job, else `outcome`; when `act` returns a result that
+`done` accepts, it is `outcome`. A line that cannot be written fails the job.
+-/
+public def withRemoteLine (target : String) (write : RemoteOutcome → IO Unit) (outcome : IO.Ref RemoteOutcome)
+    (act : JobM α) (done : α → Bool := fun _ => true) : JobM α := do
+  let writeLine (o : RemoteOutcome) : JobM Unit := do
+    if let .error e ← (write o).toBaseIO then
+      error s!"{target}: could not append its line to LAKE_REMOTE_EXEC_LOG: {e}"
+  let r ← tryCatch act fun e => do
+    writeLine (← if (← getThe JobState).canceled then pure (RemoteOutcome.error "canceled") else outcome.get)
+    throw e
+  if done r then writeLine (← outcome.get)
+  return r
+
 /-! ## Failing a job for the service -/
 
 /-- Whether this process printed the message of its refused or mismatched service yet (see
@@ -545,7 +577,7 @@ builtin_initialize remoteDecisionReported : IO.Ref Bool ← IO.mkRef false
 /-- The error of a job that a refused service or a confirmed toolchain mismatch fails: the decision's
 message `msg` the first time this process reports it, then `short`, so that the message shows once. -/
 def decisionError (msg short : String) : BaseIO String := do
-  if ← remoteDecisionReported.modifyGet fun done => (done, true) then return short
+  if ← remoteDecisionReported.swap true then return short
   return msg
 
 /-- Fails a job because the service did not answer under `fail` (code `UNAVAILABLE` in `outcome`),
@@ -614,14 +646,20 @@ public def useService (s : RemoteSession) (outcome : IO.Ref RemoteOutcome) : Job
       return true
 
 /--
+Exit code of a build whose every failure is an unavailable service under `fail`, or a confirmed
+toolchain mismatch under `wait` or `fail`: 75 (`EX_TEMPFAIL`), distinct from a broken build.
+-/
+public def remoteUnavailableCode : ExitCode := 75
+
+/--
 The `hello` that `lake build` sends at its start (with `command := build`), so that every build's
 GetCapabilities carries the build's invocation id; it makes this process's decision. Returns the
-message of a decision that fails each module that needs a build, for the caller to print once: a
-refused service, or a confirmed mismatch under `wait` or `fail`. The build still runs, so that each
-module writes its line; the modules' own errors then refer to the message (`decisionError`). A
+message of a decision that fails each module that needs a build, for the caller to print once, with the build's exit
+code: a refused service (1), or a confirmed mismatch under `wait` or `fail` (`remoteUnavailableCode`). The build still
+runs, so that each module writes its line; the modules' own errors then refer to the message (`decisionError`). A
 confirmed mismatch under `local` warns and returns `none`.
 -/
-public def startRemoteSession (ws : Workspace) : IO (Option String) := do
+public def startRemoteSession (ws : Workspace) : IO (Option (String × ExitCode)) := do
   let some cfg := ws.lakeEnv.remoteExec?
     | return none
   let some _ := cfg.toolchain?
@@ -641,11 +679,11 @@ public def startRemoteSession (ws : Workspace) : IO (Option String) := do
   match decision with
   | .refused msg =>
     remoteDecisionReported.set true
-    return some msg
+    return some (msg, 1)
   | .toolchainMismatch msg =>
     if cfg.fallback != .compileLocally then
       remoteDecisionReported.set true
-      return some msg
+      return some (msg, remoteUnavailableCode)
     warnToolchainMismatch msg
     return none
   | _ => return none
@@ -694,6 +732,19 @@ public def remoteIrPath (mod : Module) (ext : String) : String :=
 /-- `src/<Module/Path>.lean` in the action's input root. -/
 public def remoteSrcPath (mod : Module) : String :=
   (Lean.modToFilePath "src" mod.name "lean").toString
+
+/-- `p` relative to the directory `dir`, if `p` lies below it. -/
+public def pathBelow? (dir p : FilePath) : Option String :=
+  (p.toString.dropPrefix? (dir.toString ++ "/")).map (·.toString)
+
+/--
+The path in the action's input root of `file`, a file of `pkg`'s build (contract C2.1): `lib/<pkg>/…` below the
+package's `leanLibDir`, else `native/<pkg>/…` below its `buildDir`; `none` below neither.
+-/
+public def remoteBuildPath (pkg : Package) (file : FilePath) : Option String :=
+  match pathBelow? pkg.leanLibDir file with
+  | some rel => some s!"lib/{pkg.keyName}/{rel}"
+  | none => (pathBelow? pkg.buildDir file).map fun rel => s!"native/{pkg.keyName}/{rel}"
 
 /-- The extensions of `ImportArtifacts` by position (Lean `Setup.lean:69-93`). -/
 public def importArtExts : Array (Array String) :=
@@ -825,7 +876,45 @@ public def retryWhileUnavailable (s : RemoteSession) (outcome : IO.Ref RemoteOut
         return none
   return none
 
-/-! ## Promotion of the inputs of service actions (A4, A7)
+/--
+Leaves the build action of a service action for `target`, which started at the log position `pos`, because its `run`
+request, sent at `epoch`, failed with `e`: through `remoteUnavailable` for `UNAVAILABLE`, else with `e` as the job's
+result, counted with `count` when the service ran the action and it failed there.
+-/
+public def leaveRunError (s : RemoteSession) (outcome : IO.Ref RemoteOutcome) (why : IO.Ref (Option (String × Nat)))
+    (pos : Log.Pos) (epoch : Nat) (target : String) (count : Bool → JobM Unit) (e : RemoteExec.Error) : JobM α := do
+  let msg := s!"the build service's run of {target} failed: {e.message}"
+  if e.code == .unavailable then
+    remoteUnavailable s outcome why pos epoch msg
+  -- These answers say the service ran the action and it failed there (contract C5.1).
+  if e.code == .oom || e.code == .timeout || e.code == .diskLimit then
+    count false
+  outcome.set (.ofError e)
+  error msg
+
+/--
+Materializes `files`, the outputs of the service action for `target` whose build action started at the log position
+`pos`, and counts the service's result (`cached` or not) with `count`: once the outputs are here, or when `materialize`
+fails for another reason than `UNAVAILABLE`. An `UNAVAILABLE` answer leaves through `remoteUnavailable`, counted first
+under `fail`.
+-/
+public def materializeOrLeave (s : RemoteSession) (outcome : IO.Ref RemoteOutcome)
+    (why : IO.Ref (Option (String × Nat))) (pos : Log.Pos) (target : String) (count : Bool → JobM Unit) (cached : Bool)
+    (files : Array (RemoteExec.Digest × FilePath × Bool)) : JobM Unit := do
+  let epoch ← remoteEpoch
+  match ← materializeFiles s epoch files with
+  | .ok _ => count cached
+  | .error e =>
+    let msg := s!"materializing {target} from the build service failed: {e.message}"
+    if e.code == .unavailable then
+      -- Under `fail` the service's result stays the job's; otherwise the fallback replaces it.
+      if s.cfg.fallback == .fail then
+        count cached
+      remoteUnavailable s outcome why pos epoch msg
+    count cached
+    error msg
+
+/-! ## Promotion of the inputs of service actions
 
 No local output is an input of a service action. An input that has no service record (a module or a native artifact
 that this machine built: under the fallback, in an earlier build, or with service mode off) is promoted before a
@@ -905,6 +994,10 @@ public def NativeKind.lineKind : NativeKind → String
 public def NativeKind.outputName : NativeKind → String
   | .cCompile => "o" | _ => "so"
 
+/-- The extension of the action's output in the Lake cache: `o`, or the platform's shared library extension. -/
+public def NativeKind.cacheExt : NativeKind → String
+  | .cCompile => "o" | _ => sharedLibExt
+
 /-- What a native action reads. -/
 public inductive NativeInputs
   /--
@@ -936,13 +1029,12 @@ public structure NativeAction where
   args : Array String
   deriving Inhabited
 
-/-- A native artifact of this process: its action; the package, input hash and Lake cache extension of its job; and
-the service's record of the file when the file holds the service's output. -/
+/-- A native artifact of this process: its action; the package and input hash of its job; and the service's record of
+the file when the file holds the service's output. -/
 public structure NativeArtifact where
   action : NativeAction
   pkg : Package
   inputHash : Hash
-  ext : String
   record? : Option RemoteExec.Record
   deriving Inhabited
 
@@ -962,7 +1054,11 @@ public def registerNativeArtifact (a : NativeArtifact) : BaseIO Unit :=
 public def nativeArtifact? (file : FilePath) : BaseIO (Option NativeArtifact) :=
   nativeArtifacts.atomically ((·[file]?) <$> get)
 
-/-- The promotions of this process's native artifacts by their local path (`nativeServiceOutput`). -/
+/-- The trace file of the native artifact at `file`, as `buildArtifactUnlessUpToDate` names it. -/
+def nativeTraceFile (file : FilePath) : FilePath :=
+  FilePath.mk (file.toString ++ ".trace")
+
+/-- The promotions of this process's native artifacts by their local path (`NativeArtifact.serviceOutput`). -/
 builtin_initialize nativePromotions :
     Std.Mutex (Std.HashMap FilePath (IO.Promise (Except PromotionError RemoteExec.RecordOutput))) ←
   Std.Mutex.new {}
@@ -985,6 +1081,14 @@ public def NativeRequestInputs.byDigest : NativeRequestInputs → Array (RemoteE
   | .source .. => #[]
   | .objects objs => objs.map fun (_, o, file) => (o.digest, file)
 
+/-- A `run` request's input that it takes by path: its path in the input root and its local path. -/
+public def remoteInputByPath (rel : String) (path : FilePath) : Json :=
+  Json.mkObj [("rel", rel), ("path", path.toString)]
+
+/-- A `run` request's input that it takes by digest: its path in the input root and its output on the service. -/
+public def remoteInputByDigest (rel : String) (o : RemoteExec.RecordOutput) : Json :=
+  Json.mkObj [("rel", rel), ("digest", toJson o.digest), ("executable", o.executable)]
+
 /--
 The `run` request of a native action (contract C3.1) with its inputs `ins` (`NativeAction.serviceInputs`); with
 `skipCacheLookup`, the service runs it past its action cache. The arguments are in the order of a local build's
@@ -1000,13 +1104,12 @@ public def NativeAction.request (act : NativeAction) (s : RemoteSession) (ins : 
     | .source file rel =>
       let argv := #[cc, "-c", "-o", act.rel, rel, "-I", s!"{s.sysroot}/include"] ++
         Lean.Compiler.FFI.getCFlags' ++ #["-Wno-unused-command-line-argument"] ++ act.args
-      (argv, #[Json.mkObj [("rel", rel), ("path", file.toString)]], #[])
+      (argv, #[remoteInputByPath rel file], #[])
     | .objects objs =>
       let rsp := act.rel ++ ".rsp"
       let args := objs.map (·.1) ++ act.args ++ #["-L", s!"{s.sysroot}/lib/lean"] ++
         Lean.Compiler.FFI.getLinkerFlags' (linkStatic := false)
-      let inputs := objs.map fun (rel, o, _) =>
-        Json.mkObj [("rel", rel), ("digest", toJson o.digest), ("executable", o.executable)]
+      let inputs := objs.map fun (rel, o, _) => remoteInputByDigest rel o
       let rspFile := Json.mkObj [("rel", rsp), ("contents", rspContents args)]
       (#[cc, "-shared", "-o", act.rel, s!"@{rsp}"], inputs, #[rspFile])
   let params : List (String × Json) := [
@@ -1017,7 +1120,7 @@ public def NativeAction.request (act : NativeAction) (s : RemoteSession) (ins : 
     ("inputDirs", Json.arr #[]),
     ("files", Json.arr files),
     ("outputs", toJson #[act.rel]),
-    ("platform", Json.mkObj (s.platform.map fun (k, v) => (k, (toJson v : Json))).toList),
+    ("platform", s.platformJson),
     ("timeoutSecs", toJson s.cfg.timeoutSecs),
     ("mnemonic", act.kind.mnemonic),
     ("target", act.target)]
@@ -1027,22 +1130,29 @@ mutual
 
 /--
 The output on the service of the native artifact of this process at `file`, as a request takes it by digest: from its
-service record (`nativeArtifacts`), else from its promotion (`NativeAction.promote`, once per file in this process). A
-file that no native job of this process made has the output of its trace's record, if that record describes the file
-(`SavedTrace.fileRecord?`), and else none: a request takes such a file by path.
+service record or its promotion (`NativeArtifact.serviceOutput`). A file that no native job of this process made has
+the output of its trace's record, if that record describes the file (`SavedTrace.fileRecord?`), and else none: a
+request takes such a file by path.
 -/
 public partial def nativeServiceOutput (s : RemoteSession) (file : FilePath) :
     JobM (Except PromotionError (Option RemoteExec.RecordOutput)) := do
   let some a ← nativeArtifact? file | do
-    let record? ← (← readTraceFile (file.toString ++ ".trace")).fileRecord? file
+    let record? ← (← readTraceFile (nativeTraceFile file)).fileRecord? file
     -- The record of a native artifact has its one output
     return .ok (record?.bind (·.outputs.toList.head?.map (·.2)))
-  if let some o := a.output? then return .ok (some o)
-  return (← promoteOnce nativePromotions file (a.action.promote s)).map some
+  return (← a.serviceOutput s).map some
+
+/-- The output on the service of the native artifact `a`: from its service record, else from its promotion
+(`NativeAction.promote`, once per file in this process). -/
+partial def NativeArtifact.serviceOutput (a : NativeArtifact) (s : RemoteSession) :
+    JobM (Except PromotionError RemoteExec.RecordOutput) := do
+  if let some o := a.output? then return .ok o
+  promoteOnce nativePromotions a.action.file (a.action.promote s)
 
 /--
 The inputs of a native action as its request takes them: a `CCompile`'s C file once its module has a service record,
-and a link's objects by their output on the service (`nativeServiceOutput`), each promoted first if it has no record.
+and a link's objects by their output on the service (`NativeArtifact.serviceOutput`), each promoted first if it has no
+record.
 -/
 public partial def NativeAction.serviceInputs (act : NativeAction) (s : RemoteSession) :
     JobM (Except PromotionError NativeRequestInputs) := do
@@ -1054,11 +1164,16 @@ public partial def NativeAction.serviceInputs (act : NativeAction) (s : RemoteSe
     for file in files do
       let some a ← nativeArtifact? file
         | return .error (.failed s!"{act.target}: the object {file} is no native artifact of this build")
-      match ← nativeServiceOutput s file with
-      | .ok (some o) => objs := objs.push (a.action.rel, o, file)
-      | .ok none => return .error (.failed s!"{act.target}: the object {file} has no output on the build service")
+      match ← a.serviceOutput s with
+      | .ok o => objs := objs.push (a.action.rel, o, file)
       | .error e => return .error e
     return .ok (.objects objs)
+
+/-- The `run` request of a native action with its inputs (`NativeAction.serviceInputs`, `NativeAction.request`), and
+each input that it takes by digest with its local path. -/
+partial def NativeAction.serviceRequest (act : NativeAction) (s : RemoteSession) (skipCacheLookup := false) :
+    JobM (Except PromotionError (Json × Array (RemoteExec.Digest × FilePath))) := do
+  return (← act.serviceInputs s).map fun ins => (act.request s ins skipCacheLookup, ins.byDigest)
 
 /--
 Sends the `run` request that `build` makes (its params, and each input that it takes by digest with the local path of
@@ -1095,6 +1210,23 @@ public partial def rerunLostBlob (s : RemoteSession) (digest : RemoteExec.Digest
   return (← promoteOnce lostBlobRuns digest (a.action.promote s (skipCacheLookup := true))).map fun _ => ()
 
 /--
+Runs the action of a promotion (`runRetryingLost` with `build`) and returns its result: a request that failed, or a run
+that exited with a nonzero code, is the promotion's error, with the message that `msg` makes.
+-/
+public partial def promotionRun (s : RemoteSession) (msg : String → String)
+    (build : JobM (Except PromotionError (Json × Array (RemoteExec.Digest × FilePath)))) :
+    JobM (Except PromotionError RemoteExec.RunResult) := do
+  let (epoch, r) ← match ← runRetryingLost s build with
+    | .ok r => pure r
+    | .error e => return .error e
+  let result ← match r with
+    | .ok r => pure r
+    | .error e => return .error (.ofError e epoch (msg s!"the build service's run failed: {e.message}"))
+  unless result.exitCode == 0 do
+    return .error (.failed (msg s!"the build service's run exited with code {result.exitCode}"))
+  return .ok result
+
+/--
 Promotes the native artifact of `act` (see "Promotion of the inputs of service actions"): runs its action on the
 service, its inputs promoted first (`NativeAction.serviceInputs`), and, with `skipCacheLookup`, past the service's
 action cache; then materializes the output over the artifact's file with the output's executable bit, and writes the
@@ -1106,15 +1238,9 @@ public partial def NativeAction.promote (act : NativeAction) (s : RemoteSession)
   let some a ← nativeArtifact? act.file
     | return .error (.failed s!"{act.target}: no native job of this build made it")
   let msg (what : String) := s!"promoting {act.target}: {what}"
-  let (epoch, r) ← match ← runRetryingLost s (do
-      return (← act.serviceInputs s).map fun ins => (act.request s ins skipCacheLookup, ins.byDigest)) with
+  let result ← match ← promotionRun s msg (act.serviceRequest s skipCacheLookup) with
     | .ok r => pure r
     | .error e => return .error e
-  let result ← match r with
-    | .ok r => pure r
-    | .error e => return .error (.ofError e epoch (msg s!"the build service's run failed: {e.message}"))
-  unless result.exitCode == 0 do
-    return .error (.failed (msg s!"the build service's run exited with code {result.exitCode}"))
   let some out := result.outputs.find? (·.rel == act.rel)
     | return .error (.failed (msg "the build service's run made no output"))
   let materializeEpoch ← remoteEpoch
@@ -1123,19 +1249,16 @@ public partial def NativeAction.promote (act : NativeAction) (s : RemoteSession)
   clearFileHash act.file
   if let .error e := materialized then
     return .error (.ofError e materializeEpoch (msg s!"materializing failed: {e.message}"))
-  let output : RemoteExec.RecordOutput := {digest := out.digest, executable := out.executable}
-  let record : RemoteExec.Record := {
-    action := result.action
-    outputs := ({} : Std.TreeMap String RemoteExec.RecordOutput).insert act.kind.outputName output }
-  let traceFile := FilePath.mk (act.file.toString ++ ".trace")
+  let record := RemoteExec.Record.ofOutputs result.action #[(act.kind.outputName, out.digest, out.executable)]
+  let traceFile := nativeTraceFile act.file
   let savedTrace ← readTraceFile traceFile
-  let art ← cacheServiceArtifact a.pkg a.inputHash act.file a.ext out.executable record savedTrace.log
+  let art ← cacheServiceArtifact a.pkg a.inputHash act.file act.kind.cacheExt out.executable record savedTrace.log
   let data := match savedTrace with
     | .ok data => {data with outputs? := some (toJson art.descr), remote? := some record}
     | _ => BuildMetadata.ofFetch a.inputHash (toJson art.descr) {} (remote? := some record)
   data.writeFile traceFile
   registerNativeArtifact {a with record? := some record}
-  return .ok output
+  return .ok {digest := out.digest, executable := out.executable}
 
 end
 
@@ -1150,34 +1273,26 @@ instance : ToOutputJson NativeBuild := ⟨(ToOutputJson.toOutputJson ·.art)⟩
 
 /--
 The build action of a native artifact on the service (`buildNativeArtifact`): `run` the action, its inputs promoted
-first and a lost input made again (`NativeAction.serviceInputs`, `runRetryingLost`), replay its output and fail on a
+first and a lost input made again (`NativeAction.serviceRequest`, `runRetryingLost`), replay its output and fail on a
 bad exit as a local build does (`proc`), then materialize its output at the artifact's file with the output's
-executable bit and hash it (as an artifact with extension `ext`). A request that answers `UNAVAILABLE`, or a promotion
-whose request does, leaves through `remoteUnavailable`. The service's result counts once, when it is the job's, as a
-Lean module's does (`Module.buildRemote`). Each step sets the line the job writes if it fails there (`outcome`).
+executable bit and hash it (as an artifact with the extension `NativeKind.cacheExt`). A request that answers
+`UNAVAILABLE`, or a promotion whose request does, leaves through `remoteUnavailable`. The service's result counts once,
+when it is the job's, as a Lean module's does (`Module.buildRemote`). Each step sets the line the job writes if it fails
+there (`outcome`).
 -/
-def NativeAction.buildRemote (act : NativeAction) (s : RemoteSession) (ext : String) (outcome : IO.Ref RemoteOutcome)
+def NativeAction.buildRemote (act : NativeAction) (s : RemoteSession) (outcome : IO.Ref RemoteOutcome)
     (why : IO.Ref (Option (String × Nat))) : JobM NativeBuild := do
   let pos ← getLogPos
   outcome.set (.error "request")
-  let (runEpoch, r) ← match ← runRetryingLost s (do
-      return (← act.serviceInputs s).map fun ins => (act.request s ins, ins.byDigest)) with
+  let (runEpoch, r) ← match ← runRetryingLost s (act.serviceRequest s) with
     | .ok r => pure r
     | .error e => e.leave s outcome why pos
   let result ← match r with
     | .ok r => pure r
-    | .error e =>
-      let msg := s!"the build service's run of {act.target} failed: {e.message}"
-      if e.code == .unavailable then
-        remoteUnavailable s outcome why pos runEpoch msg
-      -- These answers say the service ran the action and it failed there (contract C5.1).
-      if e.code == .oom || e.code == .timeout || e.code == .diskLimit then
-        recordRemoteNative (cached := false)
-      outcome.set (.ofError e)
-      error msg
+    | .error e => leaveRunError s outcome why pos runEpoch act.target recordRemoteNative e
   let name := act.kind.outputName
   if let some o := result.outputs.find? (·.rel != act.rel) then
-    outcome.set {RemoteOutcome.ofRun result #[] with result := "error", code? := "undeclared-output"}
+    outcome.set ((RemoteOutcome.ofRun result #[]).asError "undeclared-output")
     error s!"the build service returned an unexpected output {o.rel} for {act.target}"
   let out? := result.outputs[0]?
   let run := RemoteOutcome.ofRun result (out?.toArray.map fun o => (name, o.digest))
@@ -1192,45 +1307,32 @@ def NativeAction.buildRemote (act : NativeAction) (s : RemoteSession) (ext : Str
     outcome.set run
     throw e
   -- From here on, a failure is the job's with the run's fields
-  outcome.set {run with result := "error", code? := "materialize"}
+  outcome.set (run.asError "materialize")
   let some out := out?
     | recordRemoteNative result.cached
       error s!"the build service's run of {act.target} made no output"
   removeFileIfExists act.file
   clearFileHash act.file
-  let materializeEpoch ← remoteEpoch
-  match ← materializeFiles s materializeEpoch #[(out.digest, act.file, out.executable)] with
-  | .ok _ => recordRemoteNative result.cached
-  | .error e =>
-    let msg := s!"materializing {act.target} from the build service failed: {e.message}"
-    if e.code == .unavailable then
-      -- Under `fail` the service's result stays the job's; otherwise the fallback replaces it.
-      if s.cfg.fallback == .fail then
-        recordRemoteNative result.cached
-      remoteUnavailable s outcome why pos materializeEpoch msg
-    recordRemoteNative result.cached
-    error msg
-  let art ← computeArtifact act.file ext
-  let record : RemoteExec.Record := {
-    action := result.action
-    outputs := ({} : Std.TreeMap String RemoteExec.RecordOutput).insert name
-      {digest := out.digest, executable := out.executable} }
+  materializeOrLeave s outcome why pos act.target recordRemoteNative result.cached
+    #[(out.digest, act.file, out.executable)]
+  let art ← computeArtifact act.file act.kind.cacheExt
+  let record := RemoteExec.Record.ofOutputs result.action #[(name, out.digest, out.executable)]
   return {art, record, outcome := run}
 
 /-- The job of `buildNativeArtifact` but its line: returns the artifact and its entry of `nativeArtifacts`. -/
-def NativeAction.fetch (act : NativeAction) (s : RemoteSession) (ext : String) (build : JobM PUnit)
+def NativeAction.fetch (act : NativeAction) (s : RemoteSession) (build : JobM PUnit)
     (outcome : IO.Ref RemoteOutcome) : JobM (Artifact × NativeArtifact) := do
-  if let some t := s.cfg.timeoutTrace? then addTrace t
+  modifyTrace s.mixTimeout
   let depTrace ← getTrace
   let inputHash := depTrace.hash
   let file := act.file
-  let traceFile := FilePath.mk (file.toString ++ ".trace")
+  let ext := act.kind.cacheExt
+  let traceFile := nativeTraceFile file
   let savedTrace ← readTraceFile traceFile
   let some pkg ← getCurrPackage?
     | error s!"{act.target}: a native artifact of service mode belongs to no package"
   let name := act.kind.outputName
-  let exe (record : RemoteExec.Record) := (record.outputs.get? name).any (·.executable)
-  let native (record? : Option RemoteExec.Record) : NativeArtifact := {action := act, pkg, inputHash, ext, record?}
+  let native (record? : Option RemoteExec.Record) : NativeArtifact := {action := act, pkg, inputHash, record?}
   let finish (art : Artifact) (record : RemoteExec.Record) : JobM (Artifact × NativeArtifact) := do
     if let some ref ← Internal.getOutputsRef? pkg then
       ref.insert inputHash art.descr
@@ -1240,10 +1342,10 @@ def NativeAction.fetch (act : NativeAction) (s : RemoteSession) (ext : String) (
   outcome.set (.error "materialize")
   if let some record ← savedTrace.serviceRecord? inputHash file then
     discard <| savedTrace.replayCachedIfUpToDate inputHash
-    let art ← cacheServiceArtifact pkg inputHash file ext (exe record) record savedTrace.log
+    let art ← replayServiceArtifact pkg inputHash savedTrace file ext (record.executable name) record
     outcome.set (.ofRecord "local-cache" record)
     return ← finish art record
-  if let some (art, record) ← restoreServiceArtifact? pkg inputHash savedTrace file name then
+  if let some (art, record) ← restoreServiceArtifact? pkg inputHash savedTrace file traceFile name then
     outcome.set (.ofRecord "local-cache" record)
     return ← finish art record
   let useIt ← do
@@ -1254,14 +1356,13 @@ def NativeAction.fetch (act : NativeAction) (s : RemoteSession) (ext : String) (
     else useService s outcome
   if useIt then
     let built? ← retryWhileUnavailable s outcome fun why =>
-      buildAction depTrace traceFile (act.buildRemote s ext outcome why) (remote? := (some ·.record))
+      buildAction depTrace traceFile (act.buildRemote s outcome why) (remote? := (some ·.record))
     if let some b := built? then
-      let art ← cacheServiceArtifact pkg inputHash file ext (exe b.record) b.record
+      let art ← cacheServiceArtifact pkg inputHash file ext (b.record.executable name) b.record
         (← readTraceFile traceFile).log
       outcome.set b.outcome
       return ← finish art b.record
-  let result := if (← remoteDecision?) matches some (.toolchainMismatch _) then
-    "toolchain-mismatch" else "local"
+  let result ← fallbackResult
   -- A local build that fails gives the line no exit code
   outcome.set {result}
   let built ← trackBuilds
@@ -1276,31 +1377,27 @@ def NativeAction.fetch (act : NativeAction) (s : RemoteSession) (ext : String) (
 
 /--
 Builds the native artifact of `act` in service mode (contract C3.1) as `buildArtifactUnlessUpToDate` builds it with
-`build` (`ext` is its extension in the Lake cache), with the current job's trace and the timeout rule
-(`RemoteExecConfig.timeoutTrace?`). The artifact is up to date when its trace has the job's input hash and a service
-record that describes the file (`SavedTrace.serviceRecord?`): the job replays it. Else the Lake cache restores it
-when its trace or entry has a service record (`restoreServiceArtifact?`; the shared remote cache is not read, because
-its native bytes come from another machine's compiler). Else `useService` decides: the service runs the action
-(`NativeAction.buildRemote`, its inputs promoted first), its output is materialized at the file's path, and the trace
-and the Lake cache entry (`cacheServiceArtifact`) get the service's record. The fallback `local` builds the artifact
-here with `build` on `buildArtifactUnlessUpToDate`'s path, with no record; under `fail` and `wait` it follows the rules
-of a Lean module (`useService`, `retryWhileUnavailable`). Under `--no-build` it sends no request. The job writes one line
-to `LAKE_REMOTE_EXEC_LOG`, also when it fails, and registers the artifact (`nativeArtifacts`).
+`build` (under the extension `NativeKind.cacheExt` in the Lake cache), with the current job's trace and the timeout
+rule (`RemoteSession.mixTimeout`). The artifact is up to date when its trace has the job's input hash and a service
+record that describes the file (`SavedTrace.serviceRecord?`): the job replays it (`replayServiceArtifact`). Else the
+Lake cache restores it when its trace or entry has a service record (`restoreServiceArtifact?`; the shared remote cache
+is not read, because its native bytes come from another machine's compiler). Else `useService` decides: the service
+runs the action (`NativeAction.buildRemote`, its inputs promoted first), its output is materialized at the file's path,
+and the trace and the Lake cache entry (`cacheServiceArtifact`) get the service's record. The fallback `local` builds
+the artifact here with `build` on `buildArtifactUnlessUpToDate`'s path, with no record; under `fail` and `wait` it
+follows the rules of a Lean module (`useService`, `retryWhileUnavailable`). Under `--no-build` it sends no request. The
+job writes one line to `LAKE_REMOTE_EXEC_LOG`, also when it fails (`withRemoteLine`), and registers the artifact
+(`nativeArtifacts`).
 -/
-public def buildNativeArtifact (s : RemoteSession) (act : NativeAction) (ext : String) (build : JobM PUnit) :
-    JobM Artifact := do
+public def buildNativeArtifact (s : RemoteSession) (act : NativeAction) (build : JobM PUnit) : JobM Artifact := do
   let start ← RemoteLogStart.now
   let outcome ← IO.mkRef (RemoteOutcome.error "materialize")
-  let writeLine (o : RemoteOutcome) : JobM Unit := do
-    let some log := s.cfg.log? | return
-    if let .error e ← (appendRemoteLog log act.kind.lineKind act.target start o).toBaseIO then
-      error s!"{act.target}: could not append its line to LAKE_REMOTE_EXEC_LOG: {e}"
-  let (art, native) ← tryCatch (act.fetch s ext build outcome) fun e => do
-    writeLine (← if (← getThe JobState).canceled then pure (RemoteOutcome.error "canceled") else outcome.get)
-    throw e
-  registerNativeArtifact native
-  writeLine (← outcome.get)
-  return art
+  let write (o : RemoteOutcome) : IO Unit := do
+    if let some log := s.cfg.log? then appendRemoteLog log act.kind.lineKind act.target start o
+  withRemoteLine act.target write outcome do
+    let (art, native) ← act.fetch s build outcome
+    registerNativeArtifact native
+    return art
 
 /--
 Builds the object file `oFile` of a module from its C file as `Internal.buildLeanO` does, with the same trace; in
@@ -1320,31 +1417,34 @@ public def buildModuleO (mod : Module) (facet : String) (oFile : FilePath) (cJob
         let act : NativeAction := {
           kind := .cCompile, target := s!"{mod.name}:{facet}", file := oFile, rel := remoteIrPath mod facet
           inputs := .source cFile (remoteIrPath mod "c") promote, args := weakArgs ++ traceArgs }
-        buildNativeArtifact s act "o" compile
+        buildNativeArtifact s act compile
     return art.path
 
 /--
 Links a Lean shared library as `buildLeanSharedLib` does, with the same trace; in service mode on the build service
-(`buildNativeArtifact`) as the action `kind` with `target`, whose output is `rel` in the input root. As on Linux, no
-library of `linkLibs` is an argument of the link (`linkDeps` is false), so none is an input of the action. A link one
-of whose objects is no native artifact of this build (an object of the LLVM backend, or of another target) links here,
-as `buildLeanSharedLib` does, and writes no line.
+(`buildNativeArtifact`) as the action `kind` with `target`, whose output is `rel?` in the input root
+(`remoteBuildPath`). As on Linux, no library of `linkLibs` is an argument of the link (`linkDeps` is false), so none is
+an input of the action. A link whose output has no path in the input root, or one of whose objects is no native
+artifact of this build (an object of the LLVM backend, or of another target), links here, as `buildLeanSharedLib`
+does, and writes no line.
 -/
-public def buildNativeSharedLib (kind : NativeKind) (target rel : String) (libName : String) (libFile : FilePath)
-    (linkObjs : Array (Job FilePath)) (linkLibs : Array (Job Dynlib)) (weakArgs traceArgs : Array String)
-    (plugin : Bool) : SpawnM (Job Dynlib) :=
+public def buildNativeSharedLib (kind : NativeKind) (target : String) (rel? : Option String) (libName : String)
+    (libFile : FilePath) (linkObjs : Array (Job FilePath)) (linkLibs : Array (Job Dynlib))
+    (weakArgs traceArgs : Array String) (plugin : Bool) : SpawnM (Job Dynlib) :=
   (Job.collectArray linkObjs "linkObjs").bindM (sync := true) fun objs => do
   (Job.collectArray linkLibs "linkLibs").mapM fun libs => do
     addPureTrace traceArgs "traceArgs"
     let args := weakArgs ++ traceArgs
     let some s ← remoteSession?
       | buildLeanSharedLibSync libName libFile objs libs args plugin
+    let some rel := rel?
+      | buildLeanSharedLibSync libName libFile objs libs args plugin
     let registered ← objs.allM fun obj => do return (← nativeArtifact? obj).isSome
     unless registered do
       return ← buildLeanSharedLibSync libName libFile objs libs args plugin
     Internal.addLeanSharedLibTrace
     let act : NativeAction := {kind, target, file := libFile, rel, inputs := .objects objs, args}
-    let art ← buildNativeArtifact s act sharedLibExt (Internal.linkLeanSharedLib libFile objs libs args)
+    let art ← buildNativeArtifact s act (Internal.linkLeanSharedLib libFile objs libs args)
     return {name := libName, path := art.path, deps := libs, plugin}
 
 end Lake

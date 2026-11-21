@@ -53,6 +53,9 @@ public inductive RemoteMaterialize
 /-- The default of `LAKE_REMOTE_EXEC_TIMEOUT`, in seconds. -/
 public def defaultRemoteTimeoutSecs : Nat := 3600
 
+/-- The largest value of `LAKE_REMOTE_EXEC_TIMEOUT`, in seconds. -/
+public def maxRemoteTimeoutSecs : Nat := 21600
+
 /-- The build service settings of this Lake process (`LAKE_REMOTE_EXEC*`, contract C5.1). -/
 public structure RemoteExecConfig where
   endpoint : String
@@ -74,15 +77,6 @@ public structure RemoteExecConfig where
   /-- The longest a service action may run, in seconds (`LAKE_REMOTE_EXEC_TIMEOUT`). -/
   timeoutSecs : Nat := defaultRemoteTimeoutSecs
   deriving Inhabited, Repr
-
-/--
-The trace that a service-mode action mixes into its own for the timeout, if any: none for the
-default, so that a build with the default has the traces of a build outside service mode and
-replays its tree.
--/
-public def RemoteExecConfig.timeoutTrace? (cfg : RemoteExecConfig) : Option BuildTrace :=
-  if cfg.timeoutSecs == defaultRemoteTimeoutSecs then none
-  else some (.ofHash (pureHash cfg.timeoutSecs) s!"remote timeout: {cfg.timeoutSecs}")
 
 /-- A Lake environment. -/
 public structure Env where
@@ -421,8 +415,9 @@ where
       | some v =>
         -- ASCII digits only: `String.toNat?` also reads `_` separators
         let n := if v.all Char.isDigit then v.toNat?.getD 0 else 0
-        if 0 < n ∧ n ≤ 21600 then pure n else
-          throw s!"'LAKE_REMOTE_EXEC_TIMEOUT' must be a whole number of seconds from 1 to 21600, got '{v}'"
+        if 0 < n ∧ n ≤ maxRemoteTimeoutSecs then pure n else
+          throw s!"'LAKE_REMOTE_EXEC_TIMEOUT' must be a whole number of seconds from 1 to {maxRemoteTimeoutSecs}, \
+            got '{v}'"
     return some {
       endpoint, fallback, materialize, timeoutSecs
       toolchain? := ← get "LAKE_REMOTE_EXEC_TOOLCHAIN"
