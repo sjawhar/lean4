@@ -125,9 +125,10 @@ def warnToolchainMismatch (message : String) : BaseIO Unit :=
 
 /--
 How many times this process found the build service answering again after it had not (fallback
-`wait`, `awaitService`). A job reads it before it sends a request; when the request fails and the
-count has moved since, another job already probed and found the service, so this one only sends the
-request again. Jobs whose requests failed together therefore cause one probe, not one each.
+`wait`, `awaitService`; fallback `local`, the re-probe timer, `startProbeTimer`). A job reads it
+before it sends a request; when the request fails and the count has moved since, a probe has found
+the service after the request was sent, so this job only sends the request again. Under `wait`, jobs
+whose requests failed together therefore cause one probe, not one each.
 -/
 builtin_initialize remoteEpochRef : IO.Ref Nat ← IO.mkRef 0
 
@@ -165,16 +166,17 @@ Whether requests may go on a connection whose `hello` answered `j` (`ClientConfi
 it passes the decision's check. `lake build` decides before it waits for the workspace build lock
 and starts the bridge that carries its actions after the wait, so that bridge's own `hello` can find
 the service gone or another toolchain. Such a `hello` refuses every request; a refusal is recorded.
-An unreachable `hello` is recorded too, except under `wait`: there the connection can be one that a
-probe (`awaitService`) has already replaced, and its stale answer must not undo the probe's newer
-verdict. The refused request then answers `UNAVAILABLE`, and `fetchRemote`'s epoch rule handles it.
+An unreachable `hello` is recorded here only under `fail`: under `wait` and `local` the connection
+can be one that a probe (`awaitService`, the re-probe timer) has already replaced, and its stale
+answer must not undo the probe's newer verdict. The refused request then answers `UNAVAILABLE`, and
+`callService` (under `local`) and `fetchRemote` apply the epoch rule.
 -/
 def admitHello (endpoint leanGithash : String) (fallback : RemoteFallback) (j : Json) :
     BaseIO (Option String) := do
   match helloVerdict endpoint leanGithash j with
   | .active => return none
   | .unreachable msg =>
-    unless fallback == .wait do
+    if fallback == .fail then
       noteUnusable (.unreachable msg)
     return some msg
   | .toolchainMismatch msg =>
@@ -216,23 +218,11 @@ def helloOutcome (endpoint leanGithash : String) (r : Except RemoteExec.Error Js
 def decide (client : RemoteExec.ClientConfig) (endpoint leanGithash : String) : BaseIO SessionDecision := do
   return helloOutcome endpoint leanGithash (← RemoteExec.hello client)
 
-/--
-The decision, made once per process while holding the lock: every worker waits for the one `hello`
-instead of starting a bridge of its own, and a failed decision is kept like a good one.
--/
-def ensureDecision (client : RemoteExec.ClientConfig) (endpoint leanGithash : String) :
-    BaseIO SessionDecision :=
-  remoteDecisionRef.atomically do
-    if let some d ← getThe (Option SessionDecision) then return d
-    let d ← decide client endpoint leanGithash
-    set (some d : Option SessionDecision)
-    return d
-
-/-- The fallback `wait`'s first delay between two probes of the service, in milliseconds; each
-next one is twice the last, up to `remoteProbeMaxDelayMs`. -/
+/-- The first delay between two probes of the service (the fallback `wait`'s and the re-probe
+timer's), in milliseconds; each next one is twice the last, up to `remoteProbeMaxDelayMs`. -/
 def remoteProbeFirstDelayMs : UInt32 := 1000
 
-/-- The fallback `wait`'s longest delay between two probes of the service, in milliseconds. -/
+/-- The longest delay between two probes of the service, in milliseconds. -/
 def remoteProbeMaxDelayMs : UInt32 := 30000
 
 /-- How often the fallback `wait` says again that it still waits, in milliseconds. -/
@@ -244,10 +234,119 @@ def utcNowText : BaseIO String := do
   | .ok now => return (Std.Time.DateTime.ofTimestampWithZone now .UTC).toISO8601String
   | .error _ => return "an unknown time"
 
-/-- The verdict of a `hello` on a bridge of its own (`RemoteExec.probe`), as `decide` makes it. -/
-def probeVerdict (client : RemoteExec.ClientConfig) (endpoint leanGithash : String) :
-    BaseIO SessionDecision := do
-  return helloOutcome endpoint leanGithash (← RemoteExec.probe client)
+/-- The verdict of a `hello` on a bridge of its own (`RemoteExec.probe`, which `stop?` can end), as
+`decide` makes it. -/
+def probeVerdict (client : RemoteExec.ClientConfig) (endpoint leanGithash : String)
+    (stop? : Option RemoteExec.ProbeStop := none) : BaseIO SessionDecision := do
+  return helloOutcome endpoint leanGithash (← RemoteExec.probe client stop?)
+
+/-! ## The re-probe timer of the fallback `local` -/
+
+/-- A running re-probe timer (`startProbeTimer`). -/
+structure ProbeTimer where
+  serial : Nat
+  /-- Ends its sleep and its probe in flight (`stopProbeTimer`). -/
+  stop : RemoteExec.ProbeStop
+  task : Task Unit
+
+/-- The re-probe timer while it runs. -/
+builtin_initialize remoteProbeTimer : Std.Mutex (Option ProbeTimer) ← Std.Mutex.new none
+
+/-- The serial of the last re-probe timer started. -/
+builtin_initialize remoteProbeTimerSerial : IO.Ref Nat ← IO.mkRef 0
+
+/-- Sleeps `ms` milliseconds in slices of at most 100 ms; `false` as soon as `stop` has run. -/
+def sleepUnlessStopped (stop : RemoteExec.ProbeStop) (ms : Nat) : BaseIO Bool := do
+  let deadline := (← IO.monoMsNow) + ms
+  repeat
+    if ← stop.isStopped then return false
+    let now ← IO.monoMsNow
+    if now ≥ deadline then return true
+    IO.sleep (min 100 (deadline - now)).toUInt32
+  return true
+
+/-- Writes the re-probe timer's verdict `d` if the decision is still `.unreachable` (`.active` also
+moves `remoteEpochRef` on), and removes the timer, in one section of `remoteDecisionRef`: a failure
+noted after the verdict then starts a new timer. -/
+def endProbeTimer (serial : Nat) (d : SessionDecision) : BaseIO Unit :=
+  remoteDecisionRef.atomically do
+    if let some (.unreachable _) ← getThe (Option SessionDecision) then
+      set (some d : Option SessionDecision)
+      if d matches .active then remoteEpochRef.modify (· + 1)
+    remoteProbeTimer.atomically (m := BaseIO) do
+      if let some t ← getThe (Option ProbeTimer) then
+        if t.serial == serial then set (none : Option ProbeTimer)
+
+/-- The re-probe timer's loop (see `startProbeTimer`). -/
+def probeTimerLoop (client : RemoteExec.ClientConfig) (endpoint leanGithash : String) (serial : Nat)
+    (stop : RemoteExec.ProbeStop) : BaseIO Unit := do
+  let mut delay := remoteProbeFirstDelayMs
+  repeat
+    unless ← sleepUnlessStopped stop delay.toNat do return
+    delay := min (2 * delay) remoteProbeMaxDelayMs
+    let verdict ← probeVerdict client endpoint leanGithash (some stop)
+    if ← stop.isStopped then return
+    match verdict with
+    | .active =>
+      -- A connection whose own `hello` refuses requests goes; the next request starts a new one
+      RemoteExec.dropUnless fun h => helloVerdict endpoint leanGithash h matches .active
+      endProbeTimer serial .active
+      return
+    | .toolchainMismatch msg =>
+      endProbeTimer serial (.toolchainMismatch msg)
+      return
+    -- A refused service stays unused and fails nothing
+    | .unreachable _ | .refused _ => pure ()
+
+/--
+Starts the re-probe timer of the fallback `local`, unless one runs. Its callers hold
+`remoteDecisionRef` and have just made the decision `.unreachable`: the first `hello`
+(`ensureDecision`), or a request that answered `UNAVAILABLE` (`noteUnreachable`; a connection whose
+`hello` `admitHello` finds unreachable refuses its requests so). The timer probes on a bridge of its
+own (`RemoteExec.probe`) 1 s after that, then 2, 4, 8, 16 and 30 s after each probe's answer, then
+every 30 s. It holds no lock while it sleeps or probes, so `useService` answers `false` at once
+meanwhile, and it takes `remoteDecisionRef` only to write a verdict (`endProbeTimer`): a service in
+use makes the decision `.active` and moves `remoteEpochRef` on, after the connection whose `hello`
+refuses requests is dropped; another Lean makes it `.toolchainMismatch`; either ends the timer. A
+refused or unreachable service is probed again. `stopProbeTimer` ends it.
+-/
+def startProbeTimer (client : RemoteExec.ClientConfig) (endpoint leanGithash : String) : BaseIO Unit :=
+  remoteProbeTimer.atomically do
+    if (← getThe (Option ProbeTimer)).isSome then return
+    let serial ← remoteProbeTimerSerial.modifyGet fun n => (n + 1, n + 1)
+    let stop ← RemoteExec.ProbeStop.new
+    let task ← BaseIO.asTask (prio := .dedicated) (probeTimerLoop client endpoint leanGithash serial stop)
+    set (some {serial, stop, task : ProbeTimer})
+
+/-- Stops the re-probe timer, if one runs, and waits for its end: the stop ends its sleep within
+100 ms, or kills the bridge of its probe in flight, which carries no request but `hello`. -/
+def stopProbeTimer : BaseIO Unit := do
+  let some t ← remoteProbeTimer.atomically (modifyGet fun t => (t, (none : Option ProbeTimer)))
+    | return
+  t.stop.stop
+  discard <| IO.wait t.task
+
+/-- Ends this process's use of the build service, so that Lake can go on or exit: stops the re-probe
+timer (`stopProbeTimer`) and then the bridge (`RemoteExec.shutdown`); either's task would otherwise
+keep the process alive. Called at a build's end and however a Lake command ends. -/
+public def shutdownRemote : BaseIO Unit := do
+  stopProbeTimer
+  RemoteExec.shutdown
+
+/--
+The decision, made once per process while holding the lock: every worker waits for the one `hello`
+instead of starting a bridge of its own, and a failed decision is kept like a good one. Under the
+fallback `local` a decision `.unreachable` starts the re-probe timer, which may change it later.
+-/
+def ensureDecision (client : RemoteExec.ClientConfig) (endpoint leanGithash : String)
+    (fallback : RemoteFallback) : BaseIO SessionDecision :=
+  remoteDecisionRef.atomically do
+    if let some d ← getThe (Option SessionDecision) then return d
+    let d ← decide client endpoint leanGithash
+    set (some d : Option SessionDecision)
+    if (d matches .unreachable _) && fallback == .compileLocally then
+      startProbeTimer client endpoint leanGithash
+    return d
 
 /-- Prints the fallback `wait`'s line on standard error (a job's log shows only when the job ends). -/
 def printWaiting (endpoint since : String) : BaseIO Unit :=
@@ -309,7 +408,7 @@ def awaitService (client : RemoteExec.ClientConfig) (endpoint leanGithash : Stri
             waiting := some (since, now)
     return .ok ()
 
-/-- `remoteEpochRef`'s count, read by a job before each request it sends (see `awaitService`). -/
+/-- `remoteEpochRef`'s count, read by a job before each request it sends (see `remoteEpochRef`). -/
 public def remoteEpoch : BaseIO Nat :=
   remoteEpochRef.get
 
@@ -472,15 +571,15 @@ public def awaitServiceAgain (s : RemoteSession) (outcome : IO.Ref RemoteOutcome
 Whether a module that needs the build service sends its request (contract C5.1): says `hello` once
 per process (`ensureDecision`) and applies `LAKE_REMOTE_EXEC_FALLBACK` when the service does not
 answer. `true`: send it. `false`: the fallback is `local` (the default), and the module compiles on
-this machine; once the service did not answer, every later module of this process does so without a
-request, and the next build asks again. Under `fail` it errors with the decision's message, counted
-(`recordUnavailableFailure`); under `wait` it returns `true` once the service answers
-(`awaitService`). A refused service fails the module whatever the fallback. A confirmed toolchain
-mismatch falls back only under `local`; `wait` and `fail` fail with exit code 75. A failure puts its
-code in `outcome`.
+this machine; while the service does not answer, every later module does so at once without a
+request, until the re-probe timer (`startProbeTimer`) finds the service again. Under `fail` it
+errors with the decision's message, counted (`recordUnavailableFailure`); under `wait` it returns
+`true` once the service answers (`awaitService`). A refused service fails the module whatever the
+fallback. A confirmed toolchain mismatch falls back only under `local`; `wait` and `fail` fail with
+exit code 75. A failure puts its code in `outcome`.
 -/
 public def useService (s : RemoteSession) (outcome : IO.Ref RemoteOutcome) : JobM Bool := do
-  match ← ensureDecision s.client s.cfg.endpoint s.leanGithash with
+  match ← ensureDecision s.client s.cfg.endpoint s.leanGithash s.cfg.fallback with
   | .active => return true
   | .toolchainMismatch msg =>
     if s.cfg.fallback == .compileLocally then
@@ -516,7 +615,7 @@ public def startRemoteSession (ws : Workspace) : IO (Option String) := do
   let leanGithash := ws.lakeEnv.lean.githash
   let helloParams ← mkHelloParams cfg sysroot leanGithash (command? := some "build")
   let client : RemoteExec.ClientConfig := {exe := cfg.client, socket? := cfg.socket?, helloParams}
-  let decision ← ensureDecision client cfg.endpoint leanGithash
+  let decision ← ensureDecision client cfg.endpoint leanGithash cfg.fallback
   -- This bridge starts before the build does, so it does not hold the workspace build lock, and it
   -- carried nothing but `hello`, so no write of it can land: it is killed at once, and a stuck daemon
   -- does not delay the build's start. The build's first request starts the bridge again, which then
@@ -600,36 +699,54 @@ public def rewriteImportArts (arts : NameMap ImportArtifacts) :
 
 /-! ## Typed `run` and `materialize` -/
 
-/-- Sends one request on the session's connection. An `UNAVAILABLE` answer means the service did
-not answer (contract C5.1), so the end-of-build line says `unreachable` and every later module takes
-the fallback. Under `wait` the decision is left alone, here and in `admitHello`: an answer that a
+/--
+Records that the service in use did not answer a request sent at `epoch` (`remoteEpoch`, read before
+the request was sent), so that the end-of-build line says `unreachable` and every later module takes
+the fallback; under `local` this starts the re-probe timer (`startProbeTimer`). A failure is not
+recorded when the timer found the service again after the request was sent (the epoch moved): the
+job sends the request again (`fetchRemote`).
+-/
+def noteUnreachable (s : RemoteSession) (epoch : Nat) (msg : String) : BaseIO Unit :=
+  remoteDecisionRef.atomically do
+    if let some .active ← getThe (Option SessionDecision) then
+      if (← remoteEpochRef.get) == epoch then
+        set (some (SessionDecision.unreachable msg))
+        if s.cfg.fallback == .compileLocally then
+          startProbeTimer s.client s.cfg.endpoint s.leanGithash
+
+/-- Sends one request on the session's connection; `epoch` is `remoteEpoch`, read before the request
+was sent. An `UNAVAILABLE` answer means the service did not answer (contract C5.1): see
+`noteUnreachable`. Under `wait` the decision is left alone, here and in `admitHello`: an answer that a
 request got before a probe (`awaitService`) found the service again must not undo that verdict; the
 job sends the request again or probes, by `fetchRemote`'s epoch rule. -/
-def callService (s : RemoteSession) (method : String) (params : Json) :
+def callService (s : RemoteSession) (epoch : Nat) (method : String) (params : Json) :
     BaseIO (Except RemoteExec.Error Json) := do
   let r ← RemoteExec.call s.client method params
   if let .error e := r then
     if e.code == .unavailable && s.cfg.fallback != .wait then
-      noteUnusable (.unreachable s!"build service at {s.cfg.endpoint} did not answer: {e.message}")
+      noteUnreachable s epoch s!"build service at {s.cfg.endpoint} did not answer: {e.message}"
   return r
 
-/-- Sends a `run` request and parses its result. A result that does not parse is an `internal` error
-whose code text is Lake's `malformed-result`, the code of its line. -/
-public def runAction (s : RemoteSession) (params : Json) :
+/-- Sends a `run` request and parses its result; `epoch` is `remoteEpoch`, read before (see
+`callService`). A result that does not parse is an `internal` error whose code text is Lake's
+`malformed-result`, the code of its line. -/
+public def runAction (s : RemoteSession) (epoch : Nat) (params : Json) :
     JobM (Except RemoteExec.Error RemoteExec.RunResult) := do
-  match ← callService s "run" params with
+  match ← callService s epoch "run" params with
   | .error e => return .error e
   | .ok j => match RemoteExec.RunResult.ofJson? j with
     | .ok r => return .ok r
     | .error msg => return .error {
         code := .internal, codeText := "malformed-result", message := s!"malformed run result: {msg}"}
 
-/-- Materializes output blobs to local paths through the daemon. -/
-public def materializeFiles (s : RemoteSession) (files : Array (RemoteExec.Digest × FilePath × Bool)) :
+/-- Materializes output blobs to local paths through the daemon; `epoch` is `remoteEpoch`, read
+before (see `callService`). -/
+public def materializeFiles (s : RemoteSession) (epoch : Nat)
+    (files : Array (RemoteExec.Digest × FilePath × Bool)) :
     JobM (Except RemoteExec.Error RemoteExec.MaterializeResult) := do
   let arr := files.map fun (d, p, exe) =>
     Json.mkObj [("digest", (toJson d : Json)), ("path", p.toString), ("executable", exe)]
-  match ← callService s "materialize" (Json.mkObj [("files", Json.arr arr)]) with
+  match ← callService s epoch "materialize" (Json.mkObj [("files", Json.arr arr)]) with
   | .error e => return .error e
   | .ok j => match RemoteExec.MaterializeResult.ofJson? j with
     | .ok r => return .ok r

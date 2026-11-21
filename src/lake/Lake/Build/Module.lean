@@ -1526,8 +1526,8 @@ read just before that request was sent. A failed bridge `hello` also rejects req
 toolchain mismatch (local fallback only under `local`, otherwise exit 75). An unavailable service
 under `fail` also errors with `msg`, counted for exit 75 (`recordUnavailableFailure`). These failures
 put their code in `outcome`. Otherwise it notes `msg` and `epoch` in `why` and fails without a log
-entry, from `pos`, where the action started; `fetchRemote` drops what the action logged and takes the
-fallback. Either way the action writes no trace.
+entry, from `pos`, where the action started; `fetchRemote` drops what the action logged and sends the
+request again or takes the fallback. Either way the action writes no trace.
 -/
 def remoteUnavailable (s : RemoteSession) (outcome : IO.Ref RemoteOutcome)
     (why : IO.Ref (Option (String × Nat))) (pos : Log.Pos) (epoch : Nat) (msg : String) : JobM α := do
@@ -1567,7 +1567,7 @@ def Module.buildRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSes
   let head ← remoteHead presetup s
   let params ← mod.remoteRunRequest presetup head s.cfg.timeoutSecs
   let runEpoch ← remoteEpoch
-  let result ← match ← runAction s params with
+  let result ← match ← runAction s runEpoch params with
     | .ok r => pure r
     | .error e =>
       let msg := s!"the build service's run of {mod.name} failed: {e.message}"
@@ -1610,7 +1610,7 @@ def Module.buildRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSes
   let failed (code : String) : RemoteOutcome := {run with result := "error", code? := code}
   outcome.set (failed "materialize")
   let materializeEpoch ← remoteEpoch
-  match ← materializeFiles s (found.map fun (_, d, p, x) => (d, p, x)) with
+  match ← materializeFiles s materializeEpoch (found.map fun (_, d, p, x) => (d, p, x)) with
   | .ok _ => recordRemoteModule result.cached
   | .error e =>
     let msg := s!"materializing {mod.name} from the build service failed: {e.message}"
@@ -1660,10 +1660,11 @@ local compile does (`buildRemote`), and save them to the local Lake cache (`cach
 with the service's record of the outputs. Returns `none` when the service is unavailable or has a
 confirmed toolchain mismatch and `LAKE_REMOTE_EXEC_FALLBACK` is `local` (`useService`,
 `remoteUnavailable`): the caller then compiles on this machine, where imports' outputs were
-materialized. Under `wait`, an unavailable request is retried once the service answers
-(`awaitServiceAgain`); a confirmed mismatch fails with exit 75. A result of the service (a nonzero
-exit, `OOM`, `TIMEOUT`, `DISK_LIMIT`) and every other error are the module's result, never a reason
-to fall back. Each path sets the module's line (`line`).
+materialized. A request that answers `UNAVAILABLE` after a probe found the service again (the epoch
+moved since it was sent) is sent again. Under `wait`, an unavailable request is retried once the
+service answers (`awaitServiceAgain`); a confirmed mismatch fails with exit 75. A result of the
+service (a nonzero exit, `OOM`, `TIMEOUT`, `DISK_LIMIT`) and every other error are the module's
+result, never a reason to fall back. Each path sets the module's line (`line`).
 -/
 def Module.fetchRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSession) (line : ModuleLine)
     (savedTrace : SavedTrace) (fromCache : SavedTrace → JobM (Option ModuleOutputArtifacts)) :
@@ -1700,7 +1701,7 @@ def Module.fetchRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSes
       dropLogFrom pos
       if s.cfg.fallback == .wait then
         awaitServiceAgain s line.outcome epoch
-      else
+      else if (← remoteEpoch) == epoch then
         return none
   return none
 
