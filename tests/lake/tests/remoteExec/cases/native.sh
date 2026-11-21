@@ -1,10 +1,11 @@
-# The `native` group of test.sh, which sources it: the C compiles and links of service mode (A6), rows N1-N9,
+# The `native` group of test.sh, which sources it: the C compiles and links of service mode (A6), rows N1-N12,
 # where N8 is T7 (the timeout of native actions), so the row is named T7. The package `native/` has a library
 # `Nat0` whose modules are precompiled, so each module has an object (`CCompile`), `Nat0.Use`'s compile loads
 # `Nat0.Tac`'s module library (`LinkShared`) as a plugin, and `Use2`'s compile loads `Nat0`'s library
 # (`LinkSharedLibrary`). Each row builds in a directory of its own under $WORK/native, with its own service
 # (FAKE_CAS) and Lake cache, and each build has a fake log and a LAKE_REMOTE_EXEC_LOG of its own. N2, N4 and N5
-# read N1's tree: `build_N1` builds it once, so that each of them also runs alone.
+# read N1's tree, and N10 and N12 read N10's: `build_N1` and `build_N10` build each once, so that each row also runs
+# alone.
 
 NW=$GW
 export LAKE_REMOTE_EXEC=grpc://fake:1
@@ -24,6 +25,8 @@ NATIVES='CCompile:Nat0.Tac:c.o.export CCompile:Nat0.Use:c.o.export CCompile:Nat0
 # Their files in the tree, and the targets of `lake query` that give each one's path
 FILES='.lake/build/ir/Nat0/Tac.c.o.export .lake/build/ir/Nat0/Use.c.o.export .lake/build/ir/Nat0.c.o.export .lake/build/lib/lean/native_Nat0_Tac.so .lake/build/lib/lean/native_Nat0_Use.so .lake/build/lib/libnative_Nat0.so'
 QUERY='+Nat0.Tac:o.export +Nat0.Use:o.export +Nat0:o.export +Nat0.Tac:dynlib +Nat0.Use:dynlib Nat0:shared'
+# The header of Nat0/Use.lean as the editor sends it to `lake setup-file` on standard input
+USE_HEADER='{"isModule":false,"imports":[{"module":"Nat0.Tac","isMeta":false,"isExported":true,"importAll":false}]}'
 
 toolchain "$NW/tc"
 export LAKE="$NW/tc/bin/lake"
@@ -72,6 +75,22 @@ for f in files:
         bad.append("%s is %s; the outputs of the fake there: %s" % (f, d, sorted(outs.get(f, ()))))
 print("\n".join(bad) or "%d files hold the outputs of the fake" % len(files))
 sys.exit(1 if bad else 0)' "$FAKE_CAS" "$@"
+}
+# by_service_digest TARGET PRODUCER: TARGET's last `run` request takes the output of PRODUCER's `run` by digest,
+# `{rel, digest, executable}` with no path, and that digest is of an output that the fake stored there (its action
+# cache)
+by_service_digest() {
+  "$PYTHON" -c 'import json, os, sys
+log, cas, t, prod = sys.argv[1:5]
+runs = [e["params"] for e in map(json.loads, filter(str.strip, open(log))) if e.get("method") == "run"]
+rels = {o for p in runs if p.get("target") == prod for o in p["outputs"]}
+ac = os.path.join(cas, "ac")
+outs = {o["digest"] for k in (sorted(os.listdir(ac)) if os.path.isdir(ac) else [])
+        for o in json.load(open(os.path.join(ac, k))).get("outputs") or [] if o["rel"] in rels}
+got = [i for p in runs if p.get("target") == t for i in p["inputs"] if i.get("rel") in rels][-1:]
+print("%s takes %s; the outputs of the fake there: %s" % (t, json.dumps(got), sorted(outs)))
+sys.exit(0 if got and sorted(got[0]) == ["digest", "executable", "rel"] and got[0]["digest"] in outs else 1)' \
+    "$FAKE_LOG" "$FAKE_CAS" "$@"
 }
 
 # N1's tree: `native/` built through a service that has none of its actions; Lake's output is in $NW/N1.out
@@ -186,4 +205,62 @@ row_N9() (
   test_cmd_eq "Nat0.Tac:c.o.export=timeout" native_lines "$NW/N9.jsonl"
 )
 
-run_rows N1 N2 N3 N4 N5 N6 N7 T7 N9
+# N10's tree: `native/` with the default target Use2 (which `lake shake` checks), built here by the fallback `local`
+# while the service does not answer, so no target has a service record
+build_N10() (
+  [ ! -e "$NW/N10.built" ] || exit 0
+  enter N10 native; logs N10-local
+  { echo 'defaultTargets = ["Use2"]'; cat "$TEST_DIR/native/lakefile.toml"; } > lakefile.toml
+  FAKE_UNREACHABLE=1 test_run build Use2 Nat0:shared
+  touch "$NW/N10.built"
+)
+
+# N10: an object or library whose trace is up to date replays in every mode, also with no service record. On N10's
+# tree, `--no-build` builds nothing and sends no request, and each line is `local-cache` with no record; the editor's
+# `lake setup-file --no-build --no-cache` of Nat0.Use (its absolute path, its header on standard input), whose compile
+# loads Nat0.Tac's module library, succeeds and names that library
+row_N10() (
+  build_N10
+  state N10; logs N10
+  test_run build --no-build Use2 Nat0:shared
+  test_cmd_eq 0 count_method run
+  check_lines "$NW/N10.jsonl" --modules "$MODS" \
+    --expect "Nat0|Nat0.Tac|Nat0.Use|Use2|$OBJS|$LIBS:result=local-cache,action=null,outputs=null,code=null" --unique
+  logs N10-setup
+  echo "$USE_HEADER" | test_out native_Nat0_Tac.so setup-file "$PWD/Nat0/Use.lean" - --no-build --no-cache
+  test_cmd_eq 0 count_method run
+  check_lines "$NW/N10-setup.jsonl" \
+    --expect 'Nat0.Tac:c.o.export|Nat0.Tac:dynlib:result=local-cache,action=null,outputs=null,code=null'
+)
+
+# N11: a tree built here by the fallback `local`, then Use2 changed and built with the service answering: the objects
+# and libraries replay (`local-cache`, no record) and send no request of their own, and Use2's request takes Nat0's
+# library by the digest of the service's output. So Lake first promotes the library and its inputs (their runs on the
+# service, which the end-of-build line does not count), and their files then hold the service's bytes
+row_N11() (
+  enter N11 native; logs N11-local
+  FAKE_UNREACHABLE=1 test_run build Use2 Nat0:shared
+  logs N11
+  printf '\n-- a change of N11\n' >> Use2.lean
+  lake_out build Use2 Nat0:shared
+  cp produced.out "$NW/N11.out"
+  check_lines "$NW/N11.jsonl" --modules "$MODS" --expect 'Use2:result=executed' \
+    --expect "Nat0|Nat0.Tac|Nat0.Use|$OBJS|$LIBS:result=local-cache,action=null,outputs=null,code=null" --unique
+  match_text "other actions: 0 cached, 0 executed, 0 local" "$NW/N11.out"
+  test_cmd_eq "$NATIVES" natives
+  test_cmd by_service_digest Use2 native/Nat0:shared
+  test_cmd fake_bytes $FILES
+  test_cmd "$PYTHON" "$TEST_DIR/probe_check.py" --fake "$FAKE_LOG" "inputs=$FAKE_CAS"
+)
+
+# N12: `lake shake` checks N10's tree as `--no-build` does (`Workspace.checkNoBuild`), so it does not stop with
+# "there are out of date oleans": it goes on to shake the files, and stops there because they are no `module`s
+row_N12() (
+  build_N10
+  state N10; logs N12
+  lake_out shake Use2 || true
+  no_match_text "out of date oleans" produced.out
+  match_text 'only works with `module`s' produced.out
+)
+
+run_rows N1 N2 N3 N4 N5 N6 N7 T7 N9 N10 N11 N12
