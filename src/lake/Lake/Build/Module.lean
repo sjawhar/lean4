@@ -2972,8 +2972,8 @@ where
                 | return none
               some <$> cacheOutputs arts ltar? none false
             if let some r := kept? then return r
-          -- The rebuild counts as a running compile (`withClaim`); the wait for the input lock
-          -- does not
+          -- The unpack or rebuild and the caching count as a running compile (`withClaim`); the
+          -- wait for the input lock does not
           withLock fun _ ltar? => withClaim none do
             -- Restoring from the archive stamps the trace with the current input hash, so only
             -- missing outputs after a verified hash match are restored
