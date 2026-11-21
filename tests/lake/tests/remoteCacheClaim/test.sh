@@ -29,10 +29,16 @@ CLAIM_MODULES=4
 # What a fresh build of `Claim claimexe` compiles: those modules, `Main`, its object file and the
 # executable
 CLAIM_COMPILES=7
-# The time limit, in seconds, of a build that must end long before a fault would let it (one
-# that waits out the default takeover time, 600 s, or another build): far above what such a build
-# takes on a loaded host, and far below what the fault takes
-SOON_SECS=120
+# The time limit, in seconds, of each build (see `build.sh`) and of each wait for what a build
+# does. It only ends a hang: the cases check what a build waited for by its log and the remote
+# cache's, not by the time it took. On a host with 8 busy loops per CPU, the link of `claimexe`
+# alone takes up to about 200 s.
+HANG_SECS=1200
+# Lake's default takeover time (`LAKE_CLAIM_TAKEOVER_SECS`)
+TAKEOVER_SECS=600
+# A gate of `Claim.Slow` that no case opens: a build that compiles `Claim.Slow` with it holds the
+# claim until the build is killed
+CLOSED_GATE="$WORK_DIR/closed.gate"
 
 claim_check() { "$PYTHON" "$TEST_DIR/claim_check.py" "$@"; }
 push_check() { "$PYTHON" "$TEST_DIR/../remoteCachePush/push_check.py" "$@"; }
@@ -74,14 +80,14 @@ chmod +x "$WORK_DIR/refuse-claim-curl.sh"
 
 # One machine's build, in a session of its own (so that a case can kill all of it):
 # `build.sh <tree> <cache> <log> <target>...`. The other settings come from the environment.
-# It records its process ID in `<log>.pid`, and stops the build after `$BUILD_TIMEOUT` seconds
-# (by default 600), so that a build that waits for a claim too long fails instead of hanging.
+# It records its process ID in `<log>.pid`, and stops the build after `$HANG_SECS` seconds, so that
+# a build that hangs (for example, waiting for a claim that never goes stale) fails instead.
 # `$LAKE_CMD` is the Lake command (by default `build`), and `$LAKE_PRELOAD` a library that Lake
 # (not this script) runs with as `LD_PRELOAD`.
 cat > "$WORK_DIR/build.sh" << 'EOF'
 tree=$1; cache=$2; log=$3; shift 3
 echo $$ > "$log.pid"
-LAKE_CACHE_DIR="$cache" exec timeout "${BUILD_TIMEOUT:-600}" env LD_PRELOAD="${LAKE_PRELOAD:-}" \
+LAKE_CACHE_DIR="$cache" exec timeout "$HANG_SECS" env LD_PRELOAD="${LAKE_PRELOAD:-}" \
   "$LAKE" -v --dir "$tree" "${LAKE_CMD:-build}" "$@" > "$log" 2>&1
 EOF
 # As `tools/lbq.sh` does: holds a lock on descriptor 9 for the command it runs, and also keeps a
@@ -93,7 +99,7 @@ flock 9
 exec 12> "$lock.extra"
 "$@"
 EOF
-export LAKE
+export LAKE HANG_SECS
 
 # Kills what earlier cases left running: each machine's build session, and the detached pushes
 # that its builds started (each in a process group of its own, with the `curl` runs of its
@@ -189,15 +195,15 @@ wait_build() {
 # Waits until the queue of a machine's cache is empty and no push runs on it: the detached
 # `lake cache push` that its build started (if it queued anything) is done
 wait_push() {
-  local i
+  local deadline=$((SECONDS + HANG_SECS))
   echo "\$ wait_push $1"
-  for i in $(seq 1 1200); do
+  while [ "$SECONDS" -lt "$deadline" ]; do
     if [ "$(queued_lines "$1")" = 0 ] && flock -n "$1/push.lock" true 2> /dev/null; then
       return 0
     fi
     sleep 0.1
   done
-  echo "FAILURE: the queue of $1 was not pushed after 120 s"
+  echo "FAILURE: the queue of $1 was not pushed after $HANG_SECS s"
   return 1
 }
 # The input hashes that a machine's queue holds for a target
@@ -282,11 +288,12 @@ case_claim_order() {
   # Two builds that reach shared modules in opposite orders, with one worker each, do not
   # deadlock: `Order.AB` imports `Claim.A` and then `Claim.B`, and `Order.BA` the other way. A
   # machine holds a claim only while it compiles, so each compiles what it claimed and restores
-  # the rest.
+  # the rest. A deadlock would never end (each holder keeps rewriting its claim, so neither goes
+  # stale): only the hang guard would end it.
   claim_fresh
-  LEAN_NUM_THREADS=1 BUILD_TIMEOUT=120 start_build "$TREE_A" "$CACHE_A" "$LOG_A" Order.AB
+  LEAN_NUM_THREADS=1 start_build "$TREE_A" "$CACHE_A" "$LOG_A" Order.AB
   PID_A=$!
-  LEAN_NUM_THREADS=1 BUILD_TIMEOUT=120 start_build "$TREE_B" "$CACHE_B" "$LOG_B" Order.BA
+  LEAN_NUM_THREADS=1 start_build "$TREE_B" "$CACHE_B" "$LOG_B" Order.BA
   PID_B=$!
   wait_build $PID_A "$LOG_A"
   wait_build $PID_B "$LOG_B"
@@ -297,15 +304,17 @@ case_claim_order() {
 
 case_claim_failed() {
   # A machine whose compile fails marks its claim `failed`, so the machine that waits for it
-  # compiles the target at once instead of after the takeover time.
+  # compiles the target at once instead of after the takeover time: it takes the claim over at
+  # its first read of it.
   claim_fresh
   LAKE_TEST_CLAIM_FAIL=1 run_build 1 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.Flaky
   match_text 'LAKE_TEST_CLAIM_FAIL is set' "$LOG_A"
   FLAKY="$(ls "$CLAIMS")"
   test_cmd claim_check state "$CLAIMS/$FLAKY" failed
   : > "$SERVER_LOG"
-  BUILD_TIMEOUT=$SOON_SECS run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim.Flaky
+  run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim.Flaky
   match_text 'Built Claim.Flaky' "$LOG_B"
+  test_cmd claim_check took-over "$LOG_B" --hash "$FLAKY" --state failed --first-look
   # B took the claim over from the generation that held `failed`: after its create was refused
   # (412), its first successful write of the claim names that generation (later writes mark the
   # claim `queued`, then `done`)
@@ -318,23 +327,32 @@ case_claim_failed() {
 case_claim_takeover() {
   # A live holder refreshes its claim within the takeover time, so a machine that waits much
   # longer than the takeover time does not take over while the holder still compiles. Once the
-  # holder is killed, the waiting machine takes the claim over and compiles. A rewrites its claim
-  # about every second (a quarter of its own takeover time, 5 s), and B's takeover time, 15 s,
-  # leaves room for rewrites that a loaded host delays.
+  # holder is killed, the waiting machine takes the claim over and compiles. A compiles
+  # `Claim.Slow` until the case kills it, and rewrites its claim about every second (a quarter of
+  # its own takeover time, 5 s); B's takeover time, 15 s, leaves room for rewrites that a loaded
+  # host delays.
+  local holder
   claim_fresh
-  LAKE_CLAIM_TAKEOVER_SECS=5 LAKE_TEST_CLAIM_SLEEP=600000 \
+  LAKE_CLAIM_TAKEOVER_SECS=5 LAKE_TEST_CLAIM_GATE="$CLOSED_GATE" \
     start_build "$TREE_A" "$CACHE_A" "$LOG_A" Claim.Slow
   PID_A=$!
   # A claims `Claim.Slow`, its only target
-  test_cmd claim_check wait-entries "$CLAIMS" 1 --timeout 60
+  test_cmd claim_check wait-entries "$CLAIMS" 1 --timeout $HANG_SECS
   SLOW="$(ls "$CLAIMS")"
-  # Alive: A refreshes its claim (each refresh is a new generation) while B waits
+  holder="$(build_holder "$LOG_A")"
+  test_exp -n "$holder"
+  # Alive: A refreshes its claim (each refresh is a new generation) while B waits. B reads the
+  # claim again no sooner than 5 s (`remoteClaimPollMs`) after its previous read, so by its 8th
+  # read it has waited at least 35 s by its own clock, more than twice its takeover time.
   : > "$SERVER_LOG"
   LAKE_CLAIM_TAKEOVER_SECS=15 start_build "$TREE_B" "$CACHE_B" "$LOG_B" Claim.Slow
   PID_B=$!
-  sleep 35
+  test_cmd claim_check wait-count "$SERVER_LOG" "^GET /bearer/a0/claim/.*/$SLOW -> 200 " 8 \
+    --timeout $HANG_SECS
   test_exp -d /proc/$PID_B
   no_match_text 'Built Claim.Slow' "$LOG_B"
+  # The claim still names A: B never took it over
+  match_text "\"holder\":\"$holder\"" "$CLAIMS/$SLOW"
   test_exp "$(count "^PUT /bearer/a0/claim/.*/$SLOW -> 200 auth=bearer gen=[1-9]" "$SERVER_LOG")" -ge 3
   # Killed: B takes the claim over
   test_cmd kill -KILL -- -"$(cat "$LOG_A.pid")"
@@ -349,18 +367,20 @@ case_claim_takeover() {
 case_claim_dead_holder() {
   # A build that is killed on this machine leaves its claims `building`, with nothing that
   # refreshes them. The next build on the same machine sees that the holder (this host, a process
-  # that no longer runs) is gone, and takes the claim over at once, with the default takeover
-  # time (600 s) still far off.
+  # that no longer runs) is gone, and takes the claim over once it has seen it unchanged for 5 s
+  # (`remoteClaimGoneGraceSecs`), long before the claim could be stale by the default takeover
+  # time (600 s), by the remote cache's clock or by its own.
   claim_fresh
-  LAKE_TEST_CLAIM_SLEEP=600000 start_build "$TREE_A" "$CACHE_A" "$LOG_A" Claim.Slow
+  LAKE_TEST_CLAIM_GATE="$CLOSED_GATE" start_build "$TREE_A" "$CACHE_A" "$LOG_A" Claim.Slow
   PID_A=$!
-  test_cmd claim_check wait-entries "$CLAIMS" 1 --timeout 60
+  test_cmd claim_check wait-entries "$CLAIMS" 1 --timeout $HANG_SECS
   test_cmd claim_check state "$CLAIMS/$(ls "$CLAIMS")" building
   test_cmd kill -KILL -- -"$(cat "$LOG_A.pid")"
   wait $PID_A || true
-  BUILD_TIMEOUT=$SOON_SECS run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim.Slow
+  run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim.Slow
   match_text 'Built Claim.Slow' "$LOG_B"
   match_text 'holder gone' "$LOG_B"
+  test_cmd claim_check took-over "$LOG_B" --gone --before $TAKEOVER_SECS
 }
 
 case_claim_stale() {
@@ -370,23 +390,26 @@ case_claim_stale() {
   claim_fresh
   LAKE_REMOTE_CACHE_CLAIMS=false run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.Slow
   SLOW="$(inputs "$CACHE_A" Claim.Slow)"
-  # A fresh object whose `at` is an hour old: not stale; it goes stale after the takeover time
+  # A fresh object whose `at` is an hour old: not stale; B takes it over only once it is stale by
+  # the takeover time, by the remote cache's clock or by its own
   put_claim "$SLOW" building $(( $(date +%s) - 3600 ))
   START=$(date +%s)
-  LAKE_CLAIM_TAKEOVER_SECS=5 BUILD_TIMEOUT=$SOON_SECS \
-    run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim.Slow
+  LAKE_CLAIM_TAKEOVER_SECS=5 run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim.Slow
   match_text 'Built Claim.Slow' "$LOG_B"
   test_exp $(( $(date +%s) - START )) -ge 5
-  # An object that the remote cache last replaced an hour ago, whose `at` is now: stale at once,
-  # with the default takeover time. B starts afresh, without what its push uploaded.
+  test_cmd claim_check took-over "$LOG_B" --stale 5
+  # An object that the remote cache last replaced an hour ago, whose `at` is now: stale at once
+  # (at B's first read) with the default takeover time, by the remote cache's clock. B starts
+  # afresh, without what its push uploaded.
   wait_push "$CACHE_B"
   test_cmd rm -rf "$TREE_B" "$CACHE_B" "$CLAIMS" "$OBJECTS"
   test_cmd cp -r "$TEST_DIR/claim" "$TREE_B"
   test_cmd chmod -R u+w "$TREE_B"
   put_claim "$SLOW" building
   test_cmd touch -d '1 hour ago' "$CLAIMS/$SLOW"
-  BUILD_TIMEOUT=$SOON_SECS run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim.Slow
+  run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim.Slow
   match_text 'Built Claim.Slow' "$LOG_B"
+  test_cmd claim_check took-over "$LOG_B" --first-look --stale $TAKEOVER_SECS
 }
 
 case_claim_detached_push() {
@@ -449,8 +472,9 @@ case_claim_pool_slot() {
   LEAN_NUM_THREADS=1 LAKE_CLAIM_DEFER_SECS=0 start_build "$TREE_B" "$CACHE_B" "$LOG_B" copied Extra
   PID_B=$!
   # The build reads the live claim (a `GET` of it), and so waits for it
-  test_cmd claim_check wait-text "$SERVER_LOG" "/$COPIED -> 200 auth=bearer gen=-" --timeout 120
-  test_cmd claim_check wait-text "$LOG_B" 'Ran claim/Extra:default' --timeout 120
+  test_cmd claim_check wait-text "$SERVER_LOG" "/$COPIED -> 200 auth=bearer gen=-" \
+    --timeout $HANG_SECS
+  test_cmd claim_check wait-text "$LOG_B" 'Ran claim/Extra:default' --timeout $HANG_SECS
   no_match_text 'Built claim/copied' "$LOG_B"
   test_cmd touch -d '1 hour ago' "$CLAIMS/$COPIED"
   wait_build $PID_B "$LOG_B"
@@ -461,15 +485,19 @@ case_claim_pool_slot() {
 
 case_claim_fail_fast() {
   # With `--fail-fast`, a target other than a module that waits for another machine's claim stops
-  # waiting once the build is canceled: `Claim.Flaky` fails, and the build ends long before the
-  # default takeover time (600 s) of `claim/copied`'s claim.
+  # waiting once the build is canceled: `Claim.Flaky` fails, and the build ends without taking
+  # over `claim/copied`'s claim, which it would do once the claim was stale by the default
+  # takeover time (600 s).
   claim_fresh
   LAKE_REMOTE_CACHE_CLAIMS=false run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" copied
-  put_claim "$(inputs "$CACHE_A" claim/copied)" building
-  LAKE_TEST_CLAIM_FAIL=1 BUILD_TIMEOUT=$SOON_SECS \
-    run_build 1 "$TREE_B" "$CACHE_B" "$LOG_B" --fail-fast copied Claim.Flaky
+  COPIED="$(inputs "$CACHE_A" claim/copied)"
+  put_claim "$COPIED" building
+  : > "$SERVER_LOG"
+  LAKE_TEST_CLAIM_FAIL=1 run_build 1 "$TREE_B" "$CACHE_B" "$LOG_B" --fail-fast copied Claim.Flaky
   match_text 'LAKE_TEST_CLAIM_FAIL is set' "$LOG_B"
   no_match_text 'Built claim/copied' "$LOG_B"
+  # B never wrote the claim: its create was refused (412), and it did not take the claim over
+  test_cmd_eq 0 count "^PUT /bearer/a0/claim/.*/$COPIED -> 200 " "$SERVER_LOG"
 }
 
 case_claim_off() {
@@ -504,22 +532,22 @@ case_claim_fail_open() {
 case_claim_same_pid() {
   # Two builds whose Lake processes have one process ID (as in two containers that share the
   # cache; here an `LD_PRELOAD` `getpid` gives both 4242) share one cache. The first build queues
-  # `Claim.A` and starts its push, then keeps compiling `Claim.Slow`; the second build queues
-  # `Claim.B` while the first still runs. Each build's push follows a file of its own, so the
-  # second build does not wait for the first, which compiles `Claim.Slow` for 300 seconds.
+  # `Claim.A` and starts its push, then compiles `Claim.Slow` until it is killed; the second
+  # build queues `Claim.B` while the first still runs. Each build's push follows a file of its
+  # own, so the second build ends while the first still compiles: it does not wait for it.
   claim_fresh
   test_cmd cc -shared -fPIC -o "$WORK_DIR/same-pid.so" "$TEST_DIR/SamePidLake.c" -ldl
-  LAKE_PRELOAD="$WORK_DIR/same-pid.so" LAKE_TEST_CLAIM_SLEEP=300000 \
+  LAKE_PRELOAD="$WORK_DIR/same-pid.so" LAKE_TEST_CLAIM_GATE="$CLOSED_GATE" \
     start_build "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A Claim.Slow
   PID_A=$!
   # A's first queued output (`Claim.A`'s) started its push
-  test_cmd claim_check wait-text "$CACHE_A/push.log" 'lake cache push: started' --timeout 60
-  LAKE_PRELOAD="$WORK_DIR/same-pid.so" BUILD_TIMEOUT=$SOON_SECS \
-    run_build 0 "$TREE_B" "$CACHE_A" "$LOG_B" Claim.B
+  test_cmd claim_check wait-text "$CACHE_A/push.log" 'lake cache push: started' \
+    --timeout $HANG_SECS
+  LAKE_PRELOAD="$WORK_DIR/same-pid.so" run_build 0 "$TREE_B" "$CACHE_A" "$LOG_B" Claim.B
   match_text 'Built Claim.B' "$LOG_B"
   test_exp -d /proc/$PID_A
   # Two follow files, one per build (A still builds; B's push waits for A's)
-  test_cmd claim_check wait-entries "$CACHE_A/push-follow" 2 --timeout 10
+  test_cmd claim_check wait-entries "$CACHE_A/push-follow" 2 --timeout $HANG_SECS
 }
 
 case_claim_queued() {
@@ -532,7 +560,7 @@ case_claim_queued() {
   CLAIM_SERVICE=slowobj run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim claimexe
   test_cmd_eq $CLAIM_COMPILES claim_check built-by "$LOG_A"
   test_exp ! -e "$CACHE_A/remote-status-push.json"
-  CLAIM_SERVICE=slowobj BUILD_TIMEOUT=120 run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim claimexe
+  CLAIM_SERVICE=slowobj run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim claimexe
   test_cmd_eq 0 claim_check built-by "$LOG_B"
   test_cmd_eq $CLAIM_COMPILES machine_targets "$LOG_B"
   wait_push "$CACHE_A"
@@ -549,7 +577,7 @@ case_claim_queued_late_line() {
   CLAIM_SERVICE=slowobj LAKE_TEST_CLAIM_SLEEP=3000 \
     run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A Claim.Slow
   test_cmd_eq 2 claim_check built-by "$LOG_A"
-  CLAIM_SERVICE=slowobj BUILD_TIMEOUT=120 run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim.A Claim.Slow
+  CLAIM_SERVICE=slowobj run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim.A Claim.Slow
   test_cmd_eq 0 claim_check built-by "$LOG_B"
   no_match_text 'holder gone' "$LOG_B"
   wait_push "$CACHE_A"
@@ -569,32 +597,36 @@ case_claim_taker_retry() {
 
 case_claim_queued_killed() {
   # A build killed with its push, after the claim of a compiled input says `queued`, leaves no
-  # mapping and nothing that will upload one. The next build takes that claim over at once (its
-  # holder's process is gone), instead of waiting out the takeover time.
+  # mapping and nothing that will upload one. The next build takes that claim over once it has
+  # seen it unchanged for 5 s (its holder's process is gone), instead of waiting out the takeover
+  # time (600 s): by the remote cache's clock and by its own, the claim was not stale yet.
   claim_fresh
   CLAIM_SERVICE=slowobj start_build "$TREE_A" "$CACHE_A" "$LOG_A" Claim claimexe
   PID_A=$!
   # Wait until a claim of A's is `queued`, which only a compiled input gets
-  test_cmd claim_check wait-state "$CLAIMS" queued --timeout 120
+  test_cmd claim_check wait-state "$CLAIMS" queued --timeout $HANG_SECS
   QUEUED="$(claim_check first-state "$CLAIMS" queued)"
   test_cmd kill -KILL -- -"$(cat "$LOG_A.pid")"
   wait $PID_A || true
   kill_machines
   test_exp ! -e "$OBJECTS/in/$QUEUED.json"
-  CLAIM_SERVICE=slowobj BUILD_TIMEOUT=$SOON_SECS \
-    run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim claimexe
+  CLAIM_SERVICE=slowobj run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim claimexe
   match_text 'holder gone' "$LOG_B"
+  test_cmd claim_check took-over "$LOG_B" --hash "$QUEUED" --state queued --gone \
+    --before $TAKEOVER_SECS
   wait_push "$CACHE_B"
 }
 
 case_claim_exe_push() {
   # `lake exe` keeps its Lake process while the program runs. The push that its build started
-  # follows the build, not the process: it ends once the build has, while the program still runs.
+  # follows the build, not the process: it ends once the build has, while the program still runs
+  # (here it waits as long as the hang guard lets the build run).
   claim_fresh
-  LAKE_CMD=exe LAKE_TEST_CLAIM_EXE_SLEEP=120000 start_build "$TREE_A" "$CACHE_A" "$LOG_A" claimexe
+  LAKE_CMD=exe LAKE_TEST_CLAIM_EXE_SLEEP=$((HANG_SECS * 1000)) \
+    start_build "$TREE_A" "$CACHE_A" "$LOG_A" claimexe
   PID_A=$!
-  test_cmd claim_check wait-text "$LOG_A" 'claimexe started' --timeout 60
-  test_cmd claim_check wait-file "$CACHE_A/remote-status-push.json" --timeout 100
+  test_cmd claim_check wait-text "$LOG_A" 'claimexe started' --timeout $HANG_SECS
+  test_cmd claim_check wait-file "$CACHE_A/remote-status-push.json" --timeout $HANG_SECS
   test_exp -d /proc/$PID_A
   no_match_text 'Hello, claim' "$LOG_A"
   test_cmd push_check status "$CACHE_A/remote-status-push.json" 3 0 0 0
@@ -603,15 +635,15 @@ case_claim_exe_push() {
 case_claim_push_retry() {
   # A push that follows a build tries an upload that failed again (after 30 seconds) while the
   # build still runs: the first upload of each artifact is refused here, and `Claim.A`'s mapping
-  # is in the remote cache before the build (which then compiles `Claim.Slow` for 120 seconds)
-  # ends.
+  # is in the remote cache while the build still compiles `Claim.Slow`, which it does until it is
+  # killed.
   claim_fresh
-  CLAIM_SERVICE=denyartonce LAKE_TEST_CLAIM_SLEEP=120000 \
+  CLAIM_SERVICE=denyartonce LAKE_TEST_CLAIM_GATE="$CLOSED_GATE" \
     start_build "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A Claim.Slow
   PID_A=$!
-  test_cmd claim_check wait-text "$CACHE_A/push.jsonl" '"target":"Claim.A"' --timeout 60
+  test_cmd claim_check wait-text "$CACHE_A/push.jsonl" '"target":"Claim.A"' --timeout $HANG_SECS
   A_INPUT="$(inputs "$CACHE_A" Claim.A)"
-  test_cmd claim_check wait-file "$OBJECTS/in/$A_INPUT.json" --timeout 100
+  test_cmd claim_check wait-file "$OBJECTS/in/$A_INPUT.json" --timeout $HANG_SECS
   test_exp -d /proc/$PID_A
   match_text 'trying 1 failed queue entries again' "$CACHE_A/push.log"
 }
@@ -669,9 +701,10 @@ case_claim_follow_reap() {
   test_cmd touch "$CACHE_A/push-follow/build.1.0.dead.tmp"
   test_cmd touch -d '2 days ago' "$CACHE_A/push-follow/build.1.0.dead.tmp"
   test_cmd touch "$CACHE_A/push-follow/build.2.0.fresh.tmp"
-  LAKE_TEST_CLAIM_SLEEP=60000 start_build "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A Claim.Slow
+  LAKE_TEST_CLAIM_GATE="$CLOSED_GATE" start_build "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A Claim.Slow
   PID_A=$!
-  test_cmd claim_check wait-text "$CACHE_A/push.log" 'lake cache push: started' --timeout 60
+  test_cmd claim_check wait-text "$CACHE_A/push.log" 'lake cache push: started' \
+    --timeout $HANG_SECS
   test_exp ! -e "$CACHE_A/push-follow/build.1.0.dead.tmp"
   test_exp -e "$CACHE_A/push-follow/build.2.0.fresh.tmp"
   # The running build's own file is there
@@ -682,11 +715,13 @@ case_claim_follow_reap() {
 
 case_claim_unreadable() {
   # A claim that cannot be read (an invalid body, no times), which nothing rewrites, is a claim
-  # failure: the build compiles at once without a claim and records the failure.
+  # failure: the build compiles at once without a claim, never waiting for it, and records the
+  # failure.
   claim_fresh
-  CLAIM_SERVICE=badclaim LAKE_CLAIM_TAKEOVER_SECS=3 BUILD_TIMEOUT=$SOON_SECS \
+  CLAIM_SERVICE=badclaim LAKE_CLAIM_TAKEOVER_SECS=3 \
     run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
   match_text 'Built Claim.A' "$LOG_A"
+  no_match_text 'waiting for the claim' "$LOG_A"
   match_text 'is unreadable' "$CACHE_A/remote-status-read.json"
 }
 
@@ -698,21 +733,25 @@ case_claim_local_clock() {
   LAKE_REMOTE_CACHE_CLAIMS=false run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
   put_claim "$(inputs "$CACHE_A" Claim.A)" building $(( $(date +%s) + 86400 ))
   START=$(date +%s)
-  CLAIM_SERVICE=notimes LAKE_CLAIM_TAKEOVER_SECS=5 BUILD_TIMEOUT=$SOON_SECS \
-    run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim.A
+  CLAIM_SERVICE=notimes LAKE_CLAIM_TAKEOVER_SECS=5 run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim.A
   match_text 'Built Claim.A' "$LOG_B"
   test_exp $(( $(date +%s) - START )) -ge 5
   match_text 'unchanged for' "$LOG_B"
+  # By B's own clock, as the answers have no times: unchanged for its takeover time (5 s), and for
+  # less than 60 s, which covers the 15 s for which B may first leave the input to the claim's
+  # holder (`LAKE_CLAIM_DEFER_SECS`), and leaves 40 s for its requests
+  test_cmd claim_check took-over "$LOG_B" --stale 5 --before 60
 }
 
 case_claim_stream() {
   # An answer to a claim request that does not end, sent faster than any speed limit, is cut
-  # off by the request's limits (64 KiB, or 20 s), long before it ends (after 2 minutes): the
-  # build compiles without a claim and records the failure.
+  # off by the request's limits (64 KiB, or 20 s), long before it ends (after 2 minutes): `curl`
+  # stops it (exit code 63 or 28), where an answer read to its end leaves exit code 0. The build
+  # compiles without a claim and records the failure.
   claim_fresh
-  CLAIM_SERVICE=streamclaim BUILD_TIMEOUT=100 run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
+  CLAIM_SERVICE=streamclaim run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
   match_text 'Built Claim.A' "$LOG_A"
-  match_text 'did not finish' "$CACHE_A/remote-status-read.json"
+  match_pat 'did not finish \(curl exit code (28|63);' "$CACHE_A/remote-status-read.json"
 }
 
 # Writes the module `Claim.Share.Y<i>`, which imports `Claim.Slow`, into both machines' trees
@@ -727,9 +766,9 @@ share_module() {
 # The holder of the claims of a machine's build that `start_build` started (see `claimHolder`):
 # the host and the process ID of its `lake`, the child of the `timeout` that `build.sh` became
 build_holder() {
-  local pid=
-  claim_check wait-file "$1.pid" --timeout 30 > /dev/null
-  for _ in $(seq 1 100); do
+  local pid= deadline=$((SECONDS + HANG_SECS))
+  claim_check wait-file "$1.pid" --timeout $HANG_SECS > /dev/null
+  while [ "$SECONDS" -lt "$deadline" ]; do
     pid="$(pgrep -P "$(cat "$1.pid")" || true)"
     [ -n "$pid" ] && break
     sleep 0.1
@@ -751,15 +790,15 @@ share_builds() {
   share_module "$SHARE_EVEN"
   share_module "$SHARE_ODD"
   test_cmd rm -f "$WORK_DIR/slow.gate"
-  LAKE_TEST_CLAIM_GATE="$WORK_DIR/slow.gate" LAKE_CLAIM_TAKEOVER_SECS=4 BUILD_TIMEOUT=240 \
+  LAKE_TEST_CLAIM_GATE="$WORK_DIR/slow.gate" LAKE_CLAIM_TAKEOVER_SECS=4 \
     start_build "$TREE_A" "$CACHE_A" "$LOG_A" Claim.Slow
   PID_A=$!
-  test_cmd claim_check wait-file "$CLAIMS/$SHARE_SLOW" --timeout 60
+  test_cmd claim_check wait-file "$CLAIMS/$SHARE_SLOW" --timeout $HANG_SECS
   HOLDER_A="$(build_holder "$LOG_A")"
   test_exp -n "$HOLDER_A"
   : > "$SERVER_LOG"
   (
-    export "$@" LAKE_CLAIM_TAKEOVER_SECS=20 BUILD_TIMEOUT=120
+    export "$@" LAKE_CLAIM_TAKEOVER_SECS=20
     start_build "$TREE_B" "$CACHE_B" "$LOG_B" \
       "Claim.Share.Y$SHARE_EVEN" "Claim.Share.Y$SHARE_ODD"
     wait $!
@@ -768,7 +807,8 @@ share_builds() {
   HOLDER_B="$(build_holder "$LOG_B")"
   test_exp -n "$HOLDER_B"
   echo "the builds are $HOLDER_A (A) and $HOLDER_B (B)"
-  test_cmd claim_check wait-text "$SERVER_LOG" "/$SHARE_SLOW -> 200 auth=bearer gen=-" --timeout 120
+  test_cmd claim_check wait-text "$SERVER_LOG" "/$SHARE_SLOW -> 200 auth=bearer gen=-" \
+    --timeout $HANG_SECS
   test_cmd touch "$WORK_DIR/slow.gate"
   wait_build $PID_A "$LOG_A"
   wait_build $PID_B "$LOG_B"
@@ -832,10 +872,11 @@ case_claim_share() {
   no_match_text 'leaving the input ' "$LOG_B"
   # A claim that says `queued` names a push, which compiles nothing (a push writes its own
   # process ID into the claims it holds): it takes no share. B waits for such a claim of
-  # `Claim.Slow` (of another host, so never a gone holder) until it is stale (20 s, so it looks
-  # at it again several times), and then takes it over. The holder is named so that it would own
-  # `Claim.Slow`'s input if it took a share (a holder that starts with `!` sorts before this
-  # host's, one that starts with `~` after it), so B would leave that input to it while it waits.
+  # `Claim.Slow` (of another host, so never a gone holder) until it is stale by its takeover time
+  # (20 s, so it looks at it again several times; not the default 600 s), and then takes it over.
+  # The holder is named so that it would own `Claim.Slow`'s input if it took a share (a holder
+  # that starts with `!` sorts before this host's, one that starts with `~` after it), so B would
+  # leave that input to it while it waits.
   claim_fresh
   share_module "$SHARE_EVEN"
   share_module "$SHARE_ODD"
@@ -845,9 +886,11 @@ case_claim_share() {
     peer='~other:2'
   fi
   put_claim "$SHARE_SLOW" queued '' "$peer"
-  LAKE_CLAIM_DEFER_SECS=2 LAKE_CLAIM_TAKEOVER_SECS=20 BUILD_TIMEOUT=120 \
+  LAKE_CLAIM_DEFER_SECS=2 LAKE_CLAIM_TAKEOVER_SECS=20 \
     run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" "Claim.Share.Y$SHARE_EVEN" "Claim.Share.Y$SHARE_ODD"
   match_text 'taking over the claim' "$LOG_B"
+  test_cmd claim_check took-over "$LOG_B" --hash "$SHARE_SLOW" --state queued --stale 20 \
+    --before $TAKEOVER_SECS
   no_match_text 'leaving the input ' "$LOG_B"
   test_cmd_eq 3 claim_check built-by "$LOG_B"
   wait_push "$CACHE_B"
@@ -870,7 +913,7 @@ case_claim_free_slots() {
     test_cmd cp -r "$TEST_DIR/claim" "$TREE_B"
     test_cmd chmod -R u+w "$TREE_B"
     put_claim "$a" building
-    CLAIM_SLOTS=$slots LEAN_NUM_THREADS=4 BUILD_TIMEOUT=$SOON_SECS \
+    CLAIM_SLOTS=$slots LEAN_NUM_THREADS=4 \
       run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim
     test_cmd_eq 4 claim_check built-by "$LOG_B"
     # The only claim is the other build's, as it wrote it
@@ -888,15 +931,14 @@ case_claim_saturated() {
   # The slot-1 Wide arm checks only that all three modules build and the queue drains;
   # its claim count depends on scheduling.
   claim_fresh
-  CLAIM_SLOTS=1 BUILD_TIMEOUT=$SOON_SECS \
-    run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" claimSaturated
+  CLAIM_SLOTS=1 run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" claimSaturated
   test_cmd_eq 1 claim_check count-files "$CLAIMS"
-  CLAIM_SLOTS=1 LEAN_NUM_THREADS=2 LAKE_TEST_CLAIM_SLEEP=2000 BUILD_TIMEOUT=120 \
+  CLAIM_SLOTS=1 LEAN_NUM_THREADS=2 LAKE_TEST_CLAIM_SLEEP=2000 \
     run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Wide
   test_cmd_eq 3 claim_check built-by "$LOG_A"
   wait_push "$CACHE_A"
   claim_fresh
-  CLAIM_SLOTS=3 LEAN_NUM_THREADS=8 LAKE_TEST_CLAIM_SLEEP=2000 BUILD_TIMEOUT=120 \
+  CLAIM_SLOTS=3 LEAN_NUM_THREADS=8 LAKE_TEST_CLAIM_SLEEP=2000 \
     run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Wide
   test_cmd_eq 3 claim_check built-by "$LOG_A"
   test_cmd_eq 0 claim_check count-files "$CLAIMS"
@@ -934,7 +976,7 @@ case_claim_rebuild_counted() {
   CLAIM_SLOTS=1 LEAN_NUM_THREADS=4 LAKE_TEST_REBUILD_GATE="$gate" \
     start_build "$TREE_A" "$CACHE_A" "$LOG_A" rebuildThenNext
   PID_A=$!
-  test_cmd claim_check wait-text "$LOG_A" 'Built Rebuild.Next' --timeout 300
+  test_cmd claim_check wait-text "$LOG_A" 'Built Rebuild.Next' --timeout "$HANG_SECS"
   # `Rebuild.Held`'s compile has started, and still waits for the case
   test_exp -e "$gate/started"
   no_match_text 'Built Rebuild.Held' "$LOG_A"
@@ -950,15 +992,15 @@ case_claim_rebuild_counted() {
 
 case_claim_read_retry() {
   # A claim read that the remote cache answers with a server error (503) is sent again, 1 s
-  # later: B reads another host's `failed` claim of `Claim.A` once more, takes it over and
-  # compiles, and records no claim failure.
+  # later: B reads another host's `failed` claim of `Claim.A` once more, takes it over at that
+  # read and compiles, and records no claim failure.
   claim_fresh
   LAKE_REMOTE_CACHE_CLAIMS=false run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
   put_claim "$(inputs "$CACHE_A" Claim.A)" failed
   : > "$SERVER_LOG"
-  CLAIM_SERVICE=claimgeterror BUILD_TIMEOUT=$SOON_SECS \
-    run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim.A
+  CLAIM_SERVICE=claimgeterror run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim.A
   test_cmd_eq 1 claim_check built-by "$LOG_B"
+  test_cmd claim_check took-over "$LOG_B" --state failed --first-look
   test_cmd_eq 1 count '^GET /claimgeterror/a0/claim/.* -> 503 ' "$SERVER_LOG"
   test_exp "$(count '^GET /claimgeterror/a0/claim/.* -> 200 ' "$SERVER_LOG")" -ge 1
   no_claim_failure "$CACHE_B"
@@ -967,15 +1009,16 @@ case_claim_read_retry() {
 case_claim_write_retry() {
   # A claim write that got a server error (500) is sent again: when the first send did not write
   # the claim, the second one does; when it did (its answer was lost), the second one gets 412,
-  # and a read finds this build's own body (its nonce), so the build holds the claim. Either way
-  # the build compiles once, under its claim, which its push marks `done`.
+  # and a read finds this build's own body (its nonce), so the build holds the claim, and never
+  # waits for it as another build's. Either way the build compiles once, under its claim, which
+  # its push marks `done`.
   local service
   for service in claimputerror claimputlost; do
     claim_fresh
     : > "$SERVER_LOG"
-    CLAIM_SERVICE=$service BUILD_TIMEOUT=$SOON_SECS \
-      run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
+    CLAIM_SERVICE=$service run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
     test_cmd_eq 1 claim_check built-by "$LOG_A"
+    no_match_text 'waiting for the claim' "$LOG_A"
     test_cmd_eq 1 count "^PUT /$service/a0/claim/.* -> 500 " "$SERVER_LOG"
     # Only the second send of the write that happened finds the claim written
     test_cmd_eq "$([ "$service" = claimputlost ] && echo 1 || echo 0)" \
@@ -990,14 +1033,16 @@ case_claim_write_race() {
   # The first write of the claim of `Claim.A` got a server error, and what the remote cache then
   # holds is another writer's claim: the same holder, state and time, another nonce. The second
   # send gets 412, and the build does not take that claim for its own: it waits until the claim
-  # is stale (`LAKE_CLAIM_TAKEOVER_SECS=5`), takes it over and compiles.
+  # is stale (`LAKE_CLAIM_TAKEOVER_SECS=5`, by the remote cache's clock or its own), takes it over
+  # and compiles.
   claim_fresh
   START=$(date +%s)
-  CLAIM_SERVICE=claimputrace LAKE_CLAIM_TAKEOVER_SECS=5 BUILD_TIMEOUT=$SOON_SECS \
+  CLAIM_SERVICE=claimputrace LAKE_CLAIM_TAKEOVER_SECS=5 \
     run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
   test_cmd_eq 1 claim_check built-by "$LOG_A"
   test_exp $(( $(date +%s) - START )) -ge 5
   match_text 'taking over the claim' "$LOG_A"
+  test_cmd claim_check took-over "$LOG_A" --stale 5
 }
 
 case_claim_write_unread() {
@@ -1007,8 +1052,7 @@ case_claim_write_unread() {
   # take the claim for another build's, whose wait would last the takeover time (600 s).
   claim_fresh
   : > "$SERVER_LOG"
-  CLAIM_SERVICE=claimputlostread BUILD_TIMEOUT=$SOON_SECS \
-    run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
+  CLAIM_SERVICE=claimputlostread run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
   test_cmd_eq 1 claim_check built-by "$LOG_A"
   test_cmd_eq 1 count '^PUT /claimputlostread/a0/claim/.* -> 412 ' "$SERVER_LOG"
   test_cmd_eq 3 count '^GET /claimputlostread/a0/claim/.* -> 503 ' "$SERVER_LOG"
@@ -1017,15 +1061,21 @@ case_claim_write_unread() {
 }
 
 case_claim_rewrite_unread() {
-  # A compiles `Claim.Slow` (8 s), and rewrites its claim every second
-  # (`LAKE_CLAIM_TAKEOVER_SECS=4`). The first rewrite happens and gets a server error, its second
-  # send gets 412, and its read back gets 503: its outcome is unknown. The next rewrite gets 412,
-  # and a read finds the first rewrite's body, so A keeps the claim, with that generation, and its
-  # push marks it `done`.
+  # A compiles `Claim.Slow`, and rewrites its claim every second (`LAKE_CLAIM_TAKEOVER_SECS=4`).
+  # The first rewrite happens and gets a server error, its second send gets 412, and its read back
+  # gets 503: its outcome is unknown. The next rewrite gets 412, and a read finds the first
+  # rewrite's body (the first read of the claim that gets 200), so A keeps the claim, with that
+  # generation. The case then opens the gate of A's compile, and A's push marks the claim `done`.
   claim_fresh
   : > "$SERVER_LOG"
-  CLAIM_SERVICE=claimrewritelost LAKE_CLAIM_TAKEOVER_SECS=4 LAKE_TEST_CLAIM_SLEEP=8000 \
-    BUILD_TIMEOUT=$SOON_SECS run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.Slow
+  test_cmd rm -f "$WORK_DIR/slow.gate"
+  CLAIM_SERVICE=claimrewritelost LAKE_CLAIM_TAKEOVER_SECS=4 \
+    LAKE_TEST_CLAIM_GATE="$WORK_DIR/slow.gate" start_build "$TREE_A" "$CACHE_A" "$LOG_A" Claim.Slow
+  PID_A=$!
+  test_cmd claim_check wait-count "$SERVER_LOG" '^GET /claimrewritelost/a0/claim/.* -> 200 ' 1 \
+    --timeout $HANG_SECS
+  test_cmd touch "$WORK_DIR/slow.gate"
+  wait_build $PID_A "$LOG_A"
   test_cmd_eq 1 claim_check built-by "$LOG_A"
   test_cmd_eq 1 count '^PUT /claimrewritelost/a0/claim/.* -> 500 ' "$SERVER_LOG"
   test_cmd_eq 3 count '^GET /claimrewritelost/a0/claim/.* -> 503 ' "$SERVER_LOG"
@@ -1038,25 +1088,27 @@ case_claim_connect_retry() {
   # A claim request that did not reach the remote cache is sent again, a write as well as a read:
   # a connection that could not be made (`curl` exit code 7), and a time-out before `curl` began
   # to send the request (28, `time_pretransfer` 0). Here the first write and the first read of
-  # each claim fail so. A compiles `Claim.A` under its claim; then B finds another host's `failed`
-  # claim of `Claim.A` (its write gets 412, so it reads the claim) and takes it over. Neither
-  # records a claim failure.
+  # each claim fail so. A compiles `Claim.A` under its claim, without waiting for it; then B finds
+  # another host's `failed` claim of `Claim.A` (its write gets 412, so it reads the claim) and
+  # takes it over at its first read of it. Neither records a claim failure.
   local exit
   for exit in 7 28; do
     claim_fresh
     rm -rf "$WORK_DIR/refused"
-    REFUSE_EXIT=$exit CURL="$WORK_DIR/refuse-claim-curl.sh" BUILD_TIMEOUT=$SOON_SECS \
+    REFUSE_EXIT=$exit CURL="$WORK_DIR/refuse-claim-curl.sh" \
       run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
     test_cmd_eq 1 claim_check built-by "$LOG_A"
+    no_match_text 'waiting for the claim' "$LOG_A"
     test_exp "$(count_files "$WORK_DIR/refused/PUT")" -ge 1
     no_claim_failure "$CACHE_A"
     claim_fresh
     LAKE_REMOTE_CACHE_CLAIMS=false run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
     put_claim "$(inputs "$CACHE_A" Claim.A)" failed
     rm -rf "$WORK_DIR/refused"
-    REFUSE_EXIT=$exit CURL="$WORK_DIR/refuse-claim-curl.sh" BUILD_TIMEOUT=$SOON_SECS \
+    REFUSE_EXIT=$exit CURL="$WORK_DIR/refuse-claim-curl.sh" \
       run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim.A
     test_cmd_eq 1 claim_check built-by "$LOG_B"
+    test_cmd claim_check took-over "$LOG_B" --state failed --first-look
     test_exp "$(count_files "$WORK_DIR/refused/GET")" -ge 1
     no_claim_failure "$CACHE_B"
   done
@@ -1070,7 +1122,7 @@ case_claim_sent_timeout() {
   rm -rf "$WORK_DIR/refused"
   : > "$WORK_DIR/claim-calls"
   REFUSE_EXIT=28 REFUSE_PRETRANSFER=0.5 REFUSE_VERBS=PUT CURL="$WORK_DIR/refuse-claim-curl.sh" \
-    BUILD_TIMEOUT=$SOON_SECS run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
+    run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
   test_cmd_eq 1 claim_check built-by "$LOG_A"
   test_cmd_eq 1 count '^PUT .*x-goog-if-generation-match: 0 ' "$WORK_DIR/claim-calls"
   match_text '/a0/claim/' "$CACHE_A/remote-status-read.json"
@@ -1080,19 +1132,20 @@ case_claim_read_sent_timeout() {
   # A claim read that timed out after `curl` began to send it (`curl` exit code 28,
   # `time_pretransfer` above 0) is sent again: a read changes nothing. B finds another host's
   # `failed` claim of `Claim.A` (its write gets 412, so it reads the claim), its first read times
-  # out so, and its second reads the claim: B takes it over, compiles, and records no claim
-  # failure.
+  # out so, and its second reads the claim: B takes it over at that read, compiles, and records no
+  # claim failure.
   claim_fresh
   LAKE_REMOTE_CACHE_CLAIMS=false run_build 0 "$TREE_A" "$CACHE_A" "$LOG_A" Claim.A
   put_claim "$(inputs "$CACHE_A" Claim.A)" failed
   rm -rf "$WORK_DIR/refused"
   : > "$WORK_DIR/claim-calls"
   REFUSE_EXIT=28 REFUSE_PRETRANSFER=0.5 REFUSE_VERBS=GET CURL="$WORK_DIR/refuse-claim-curl.sh" \
-    BUILD_TIMEOUT=$SOON_SECS run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim.A
+    run_build 0 "$TREE_B" "$CACHE_B" "$LOG_B" Claim.A
   test_cmd_eq 1 claim_check built-by "$LOG_B"
   test_cmd_eq 1 count_files "$WORK_DIR/refused/GET"
   test_exp "$(count '^GET ' "$WORK_DIR/claim-calls")" -ge 2
   match_text 'taking over the claim' "$LOG_B"
+  test_cmd claim_check took-over "$LOG_B" --state failed --first-look
   no_claim_failure "$CACHE_B"
 }
 
