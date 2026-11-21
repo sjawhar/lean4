@@ -50,7 +50,7 @@ public def RemoteSession.platform (s : RemoteSession) : Array (String × String)
 
 /--
 The platform and path part of a module's action: the part that does not depend on the module's
-source bytes, reused by the service key (slice 3).
+source bytes.
 -/
 public structure RemoteHead where
   platform : Array (String × String)
@@ -110,11 +110,14 @@ public def mkHelloParams (cfg : RemoteExecConfig) (sysroot : FilePath)
 
 /-! ## Session -/
 
-/-- This process's verdict on the build service, made once (see `ensureDecision`). -/
+/-- This process's verdict on the build service: made by the first `hello` (`ensureDecision`), then
+changed by a refusing `hello` (`admitHello`), a request that the service did not answer
+(`noteUnreachable`), a probe of the fallback `wait` (`awaitService`) or the re-probe timer of the
+fallback `local` (`endProbeTimer`). -/
 public inductive SessionDecision
   /-- The service answered and its toolchain runs this Lake's Lean: in use. -/
   | active
-  /-- The service did not answer; `LAKE_REMOTE_EXEC_FALLBACK` decides what a module that needs it does
+  /-- The service did not answer; `LAKE_REMOTE_EXEC_FALLBACK` decides what a job that needs it does
   (see `useService`). -/
   | unreachable (message : String)
   /-- The service answered with a different Lean githash. Only `local` may fall back. -/
@@ -181,7 +184,7 @@ the service gone or another toolchain. Such a `hello` refuses every request; a r
 An unreachable `hello` is recorded here only under `fail`: under `wait` and `local` the connection
 can be one that a probe (`awaitService`, the re-probe timer) has already replaced, and its stale
 answer must not undo the probe's newer verdict. The refused request then answers `UNAVAILABLE`, and
-`callService` (under `local`) and `fetchRemote` apply the epoch rule.
+`callService` (under `local`) and `retryWhileUnavailable` apply the epoch rule.
 -/
 def admitHello (endpoint leanGithash : String) (fallback : RemoteFallback) (j : Json) :
     BaseIO (Option String) := do
@@ -428,8 +431,9 @@ public def remoteEpoch : BaseIO Nat :=
 public def remoteDecision? : BaseIO (Option SessionDecision) :=
   remoteDecisionRef.atomically (getThe (Option SessionDecision))
 
-/-- Records one Lean module that failed because the service was unavailable under `fail`, or its
-toolchain mismatched under `wait` or `fail` (for exit code 75, `Lake.finalizeBuild`). -/
+/-- Records one job (a module's, a C object's or a shared library's) that failed because the service
+was unavailable under `fail`, or its toolchain mismatched under `wait` or `fail` (for exit code 75,
+`Lake.finalizeBuild`). -/
 public def recordUnavailableFailure : JobM Unit := do
   (← (·.remoteStats) <$> getBuildContext).modify (·.addUnavailableFailure)
 
@@ -580,15 +584,16 @@ public def awaitServiceAgain (s : RemoteSession) (outcome : IO.Ref RemoteOutcome
     failAwait s outcome msg
 
 /--
-Whether a module that needs the build service sends its request (contract C5.1): says `hello` once
-per process (`ensureDecision`) and applies `LAKE_REMOTE_EXEC_FALLBACK` when the service does not
-answer. `true`: send it. `false`: the fallback is `local` (the default), and the module compiles on
-this machine; while the service does not answer, every later module does so at once without a
-request, until the re-probe timer (`startProbeTimer`) finds the service again. Under `fail` it
-errors with the decision's message, counted (`recordUnavailableFailure`); under `wait` it returns
-`true` once the service answers (`awaitService`). A refused service fails the module whatever the
-fallback. A confirmed toolchain mismatch falls back only under `local`; `wait` and `fail` fail with
-exit code 75. A failure puts its code in `outcome`.
+Whether a job that needs the build service (a module's, a C object's or a shared library's) sends
+its request (contract C5.1): says `hello` once per process (`ensureDecision`) and applies
+`LAKE_REMOTE_EXEC_FALLBACK` when the service does not answer. `true`: send it. `false`: the fallback
+is `local` (the default), and the job builds on this machine; while the service does not answer,
+every later job does so at once without a request, until the re-probe timer (`startProbeTimer`)
+finds the service again. Under `fail` it errors with the decision's message, counted
+(`recordUnavailableFailure`); under `wait` it returns `true` once the service answers
+(`awaitService`). A refused service fails the job whatever the fallback. A confirmed toolchain
+mismatch falls back only under `local`; `wait` and `fail` fail with exit code 75. A failure puts its
+code in `outcome`.
 -/
 public def useService (s : RemoteSession) (outcome : IO.Ref RemoteOutcome) : JobM Bool := do
   match ← ensureDecision s.client s.cfg.endpoint s.leanGithash s.cfg.fallback with
@@ -721,10 +726,10 @@ public def rewriteImportArts (arts : NameMap ImportArtifacts) :
 
 /--
 Records that the service in use did not answer a request sent at `epoch` (`remoteEpoch`, read before
-the request was sent), so that the end-of-build line says `unreachable` and every later module takes
+the request was sent), so that the end-of-build line says `unreachable` and every later job takes
 the fallback; under `local` this starts the re-probe timer (`startProbeTimer`). A failure is not
 recorded when the timer found the service again after the request was sent (the epoch moved): the
-job sends the request again (`fetchRemote`).
+job sends the request again (`retryWhileUnavailable`).
 -/
 def noteUnreachable (s : RemoteSession) (epoch : Nat) (msg : String) : BaseIO Unit :=
   remoteDecisionRef.atomically do
@@ -738,9 +743,9 @@ def noteUnreachable (s : RemoteSession) (epoch : Nat) (msg : String) : BaseIO Un
 was sent. An `UNAVAILABLE` answer means the service did not answer (contract C5.1): see
 `noteUnreachable`. Under `wait` the decision is left alone, here and in `admitHello`: an answer that a
 request got before a probe (`awaitService`) found the service again must not undo that verdict; the
-job sends the request again or probes, by `fetchRemote`'s epoch rule. An `UNAVAILABLE` answer whose
-`missing` names one of `lost`, inputs that the caller can make again (`runRetryingLost`), came from a
-service that answered, and is not noted either. -/
+job sends the request again or probes, by `retryWhileUnavailable`'s epoch rule. An `UNAVAILABLE`
+answer whose `missing` names one of `lost`, inputs that the caller can make again
+(`runRetryingLost`), came from a service that answered, and is not noted either. -/
 def callService (s : RemoteSession) (epoch : Nat) (method : String) (params : Json)
     (lost : Array RemoteExec.Digest := #[]) : BaseIO (Except RemoteExec.Error Json) := do
   let r ← RemoteExec.call s.client method params
@@ -1091,10 +1096,10 @@ public partial def rerunLostBlob (s : RemoteSession) (digest : RemoteExec.Digest
 
 /--
 Promotes the native artifact of `act` (see "Promotion of the inputs of service actions"): runs its action on the
-service, its inputs promoted first (`NativeAction.serviceInputs`), and with `skipCacheLookup` past the service's action
-cache; then materializes the output over the artifact's file with the output's executable bit, and writes the
-service's record into the file's trace, its Lake cache entry (`cacheServiceArtifact`) and `nativeArtifacts`. Returns the
-output.
+service, its inputs promoted first (`NativeAction.serviceInputs`), and, with `skipCacheLookup`, past the service's
+action cache; then materializes the output over the artifact's file with the output's executable bit, and writes the
+service's record into the file's trace, its Lake cache entry (`cacheServiceArtifact`) and `nativeArtifacts`. Returns
+the output.
 -/
 public partial def NativeAction.promote (act : NativeAction) (s : RemoteSession) (skipCacheLookup := false) :
     JobM (Except PromotionError RemoteExec.RecordOutput) := do

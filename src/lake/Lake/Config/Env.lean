@@ -25,11 +25,13 @@ namespace Lake
 What a build does when the build service does not answer (`LAKE_REMOTE_EXEC_FALLBACK`): when the
 `hello` that decides finds it unreachable, or a request still answers `UNAVAILABLE` after the
 daemon's own retries. A result of the service (a failed compile, `OOM`, `TIMEOUT`, `DISK_LIMIT`) is
-never a reason to fall back, and a service that refuses (another toolchain) fails whatever this says.
+never a reason to fall back, and a refused service (one that did not verify its toolchain) fails
+whatever this says.
 -/
 public inductive RemoteFallback
-  /-- Compile on this machine and publish nothing (the default; design "Failure"). After the service
-  did not answer once, every later module of the build compiles locally without asking it again. -/
+  /-- Build on this machine and publish nothing (the default). While the service does not answer,
+  every later job builds here at once without a request, and the re-probe timer asks the service
+  again (`Lake.startProbeTimer`). -/
   | compileLocally
   /-- Never compile on this machine: wait for the service, probing it again after 1, 2, 4 … 30 s. -/
   | wait
