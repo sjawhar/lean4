@@ -1223,18 +1223,26 @@ the service's record (`RemoteExec.Record`) beside the artifact in its trace and 
 
 /--
 **For internal use only.**
-The service record (`BuildMetadata.remote?`) of a saved trace that is up to date with `inputHash`, if it describes
-`file`: the file exists and has the hash of the trace's output (see `ToOutputJson Artifact`). A record that does
-not describe the file is no record.
+The service record (`BuildMetadata.remote?`) of a saved trace if it describes `file`: the file exists and has the
+hash of the trace's output (see `ToOutputJson Artifact`). A record that does not describe the file is no record.
+-/
+public def SavedTrace.fileRecord? (self : SavedTrace) (file : FilePath) : JobM (Option RemoteExec.Record) := do
+  let .ok data := self | return none
+  let some record := data.remote? | return none
+  let some descr := self.artifactDescr? | return none
+  unless (← file.pathExists) do return none
+  return if (← fetchFileHash file) == descr.hash then some record else none
+
+/--
+**For internal use only.**
+The service record of a saved trace that is up to date with `inputHash`, if it describes `file`
+(`SavedTrace.fileRecord?`).
 -/
 public def SavedTrace.serviceRecord? (self : SavedTrace) (inputHash : Hash) (file : FilePath) :
     JobM (Option RemoteExec.Record) := do
   let .ok data := self | return none
   unless data.depHash == inputHash do return none
-  let some record := data.remote? | return none
-  let some descr := self.artifactDescr? | return none
-  unless (← file.pathExists) do return none
-  return if (← fetchFileHash file) == descr.hash then some record else none
+  self.fileRecord? file
 
 /--
 **For internal use only.**
