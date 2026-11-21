@@ -2573,8 +2573,6 @@ structure KeptCheckRelock where
   unlocked : JobM KeptVerdict → JobM KeptVerdict
   /-- Under the lock, the outputs of the input that another Lake process cached, if any. -/
   reread : JobM (Option ModuleOutputArtifacts)
-  /-- Whether `reread` gave the outputs, in place of a compile. -/
-  restored : IO.Ref Bool
 
 /--
 Recursively build a Lean module.
@@ -2924,6 +2922,8 @@ where
             | .wait wait => return .wait wait
             | .compile claim? =>
               withClaim claim? do
+                -- Whether `reread` gave the outputs, in place of a compile
+                let restored ← IO.mkRef false
                 -- The checker's wait does not hold up another process's compile of the input; a
                 -- compile after the check first reads the local cache again
                 let relock : KeptCheckRelock := {
@@ -2936,14 +2936,15 @@ where
                   reread := do
                     unless (← held.get).isSome do return none
                     match (← fetchFromCache? presetup savedTrace restore (remoteRead := false)) with
-                    | .complete arts => return some arts
+                    | .complete arts =>
+                      restored.set true
+                      return some arts
                     | .incomplete .. => return none
-                  restored := ← IO.mkRef false
                 }
                 -- The outputs of a usage skip or build, already in the cache.
                 let arts ← mod.skipOrBuild presetup savedTrace depTrace (cacheWith? := some restore)
                   (compile := checkOrBuild presetup savedTrace (some restore) (relock? := some relock))
-                if (← relock.restored.get) then
+                if (← restored.get) then
                   if restore then mod.stampOutputs savedTrace depTrace.hash
                   return .done arts
                 if let some compiledFor := alias? then
@@ -2971,22 +2972,23 @@ where
                 | return none
               some <$> cacheOutputs arts ltar? none false
             if let some r := kept? then return r
-          withLock fun _ ltar? => do
-            -- Outputs that exist were rejected by `keepOutputs?`, so rebuild them.
-            -- Restoring from the archive stamps the trace with the current input
-            -- hash, so only do it on a verified hash match. An mtime-only match
-            -- leaves the hash unconfirmed, so rebuild instead.
+          -- The rebuild counts as a running compile (`withClaim`); the wait for the input lock
+          -- does not
+          withLock fun _ ltar? => withClaim none do
+            -- Restoring from the archive stamps the trace with the current input hash, so only
+            -- missing outputs after a verified hash match are restored
             if !exist && status == .hashUpToDate then
               unless (← unpackLocalLtar depTrace.hash) do
                 discard <| mod.buildLean presetup
             else
+              -- Rebuilds outputs that exist, which `keepOutputs?` rejected, and missing ones after
+              -- an mtime-only match, which leaves the hash unconfirmed
               discard <| mod.buildLean presetup
-            withClaim none do
-              if status.isCacheable then
-                cacheOutputs (← mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile)
-                  ltar? none false
-              else
-                uncacheable ltar?
+            if status.isCacheable then
+              cacheOutputs (← mod.cacheOutputArtifacts presetup.isModule restore presetup.postponeCompile)
+                ltar? none false
+            else
+              uncacheable ltar?
     else .done <$> do
       let status ← savedTrace.replayIfUpToDate' (oldTrace := presetup.srcMTime) mod depTrace
       if status.isUpToDate then
@@ -3082,7 +3084,6 @@ where
           why := reason
         if let some relock := relock? then
           if let some arts ← relock.reread then
-            relock.restored.set true
             return (arts, true)
         logInfo s!"kept-module check: {why}; compiling"
     return (← mod.buildLean presetup (decided?.map (·.2)) hashes, false)
