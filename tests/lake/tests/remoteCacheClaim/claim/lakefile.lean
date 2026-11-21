@@ -30,6 +30,35 @@ milliseconds, built only when named.
 lean_lib Wide where
   roots := #[`Wide.One, `Wide.Two, `Wide.Three]
 
+/--
+`Rebuild.Held`, whose compile the environment can hold, and `Rebuild.Next`, which imports nothing,
+built only when named.
+-/
+lean_lib Rebuild where
+  roots := #[`Rebuild.Held, `Rebuild.Next]
+
+/--
+Starts the build of `Rebuild.Held`, waits until its compile has made the file `started` in the
+directory that `LAKE_TEST_REBUILD_GATE` names (and fails after 300 s, which only ends a hang), and
+only then starts the build of `Rebuild.Next`: so `Rebuild.Next` is decided while `Rebuild.Held`
+compiles.
+-/
+target rebuildThenNext : Unit := do
+  let some heldMod ← findModule? `Rebuild.Held | error "no module Rebuild.Held"
+  let some nextMod ← findModule? `Rebuild.Next | error "no module Rebuild.Next"
+  let heldJob ← heldMod.olean.fetch
+  let started : Job Unit ← Job.async (prio := .dedicated) do
+    let some dir ← IO.getEnv "LAKE_TEST_REBUILD_GATE" | error "LAKE_TEST_REBUILD_GATE is not set"
+    let deadline := (← IO.monoMsNow) + 300000
+    repeat
+      if ← (FilePath.mk dir / "started").pathExists then break
+      if (← IO.monoMsNow) ≥ deadline then
+        error s!"{dir}/started did not appear within 300 s"
+      IO.sleep 50
+  started.await
+  let nextJob ← nextMod.olean.fetch
+  return heldJob.mix nextJob
+
 /-- Checks both sides of the claim threshold with one explicitly counted operation. -/
 target claimSaturated pkg : Unit := Job.async do
   match ← claimInput pkg (Hash.ofHex "0000000000000002") with

@@ -19,12 +19,13 @@ the same input (an input hash of a package), only one of them builds it. A job t
 a module's build before it would compile or unpack the module's outputs (`fetchLocal` in
 `Lake.Build.Module`), and a promotion of a module or a native artifact to the build service
 before it runs the input's action there (`promotionRun` in `Lake.Build.RemoteExec`). Under the
-lock the job looks in the local cache again, and it keeps the lock until the outputs are in the
-cache (or the build failed). A job that waited on the lock thus restores the outputs the other
-process cached. No job waits on one input lock while it holds another, so two processes never
-wait on each other: a promotion takes the lock only once its request is made (which promotes the
-request's inputs first), and releases it while it makes a lost input again. A native artifact's
-own job (`buildNativeArtifact`) takes no lock.
+lock the job looks in the local cache again. The job holds the lock until the outputs are in the
+cache or the build failed, and may release it earlier while it waits for something else. A job
+that waited on the lock thus restores the outputs the other process cached, if any. No job waits
+on one input lock while it holds another, so two processes never wait on each other: a promotion
+takes the lock only once its request is made (which promotes the request's inputs first), and
+releases it while it makes a lost input again. A native artifact's own job (`buildNativeArtifact`)
+takes no lock.
 
 The lock is off when `LAKE_NO_BUILD_LOCK` is true, under `--no-build`, and wherever the cache is
 not writable (the callers take it only on that path). If the lock file cannot be opened or locked,
