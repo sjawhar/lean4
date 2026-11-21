@@ -375,17 +375,19 @@ open ToOutputJson in
 /--
 Runs `build` as a build action of kind `action`.
 
-The build's input trace (`depTrace`), JSON description of the result of `build`, and log are saved to `traceFile`
-(with `localHash?`, see `BuildMetadata.localHash?`, and the service record that `remote?` gives for the result, see
-`BuildMetadata.remote?`) if the build completes without a fatal error (i.e., it does not
-`throw`). Then, for an action of kind `.build`, it sets the job's `JobState.built`: set after `build` returns, so a
-site within `build` that clears the flag cannot clear it for this action.
+The build's input trace (`depTrace`, or the trace that `finalTrace` gives for the result of `build`: that of an action
+whose inputs changed while it ran, as the promotion of a service action's inputs changes them), JSON description of the
+result of `build`, and log are saved to `traceFile` (with `localHash?`, see `BuildMetadata.localHash?`, and the service
+record that `remote?` gives for the result, see `BuildMetadata.remote?`) if the build completes without a fatal error
+(i.e., it does not `throw`). Then, for an action of kind `.build`, it sets the job's `JobState.built`: set after `build`
+returns, so a site within `build` that clears the flag cannot clear it for this action.
 -/
 @[specialize] public def buildAction
   [ToOutputJson α]
   (depTrace : BuildTrace) (traceFile : FilePath) (build : JobM α)
   (action : JobAction := .build) (localHash? : Option Hash := none)
   (remote? : α → Option RemoteExec.Record := fun _ => none)
+  (finalTrace : α → BuildTrace := fun _ => depTrace)
 : JobM α := do
   updateAction action
   let noBuildTraceFile := traceFile.addExtension "nobuild"
@@ -401,7 +403,7 @@ site within `build` that clears the flag cannot clear it for this action.
       let iniPos ← getLogPos
       let a ← build -- fatal errors will abort here
       let log := (← getLog).takeFrom iniPos
-      writeBuildTrace traceFile depTrace (toOutputJson a) log localHash? (remote? a)
+      writeBuildTrace traceFile (finalTrace a) (toOutputJson a) log localHash? (remote? a)
       removeFileIfExists noBuildTraceFile
       if action matches .build then
         modify ({· with built := true})

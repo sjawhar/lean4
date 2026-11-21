@@ -639,7 +639,7 @@ So is a module with no service record whose trace is up to date in a build with 
 
 With the cutoff off, Lake uses a module whose trace is up to date as it is, with the result `local-cache`, and promotes it only when a service action takes it as an input. This relies on one assumption: a local compile with the same toolchain writes the bytes that the service writes. If a toolchain breaks it, the modules that hashed the local outputs build once more on the service in the next build; no result is wrong.
 
-With the cutoff on, when the service answers again in the middle of a build, each module of that build that took the hash of an output compiled on this machine goes to the service in the next build, and `lake build --no-build` exits with code 3 until then. This includes the service action whose request promoted that output; the service can answer it from its cache.
+With the cutoff on, when the service answers again in the middle of a build, each module that the build compiled or replayed on this machine while the service did not answer, and that took the hash of an output that a later request promoted, goes to the service in the next build, and `lake build --no-build` exits with code 3 until then.
 
 Lake promotes under every fallback when the service answers. A promotion that gets no answer from the service has the same effect as a request of the target that needs it: `local` builds that target on this machine, `fail` fails it with the code `UNAVAILABLE`, and `wait` waits. Under `--no-build`, Lake sends no request and promotes nothing.
 

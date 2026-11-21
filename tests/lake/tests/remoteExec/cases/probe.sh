@@ -1,9 +1,9 @@
 # The `probe` group of test.sh, which sources it: the re-probe of the build service under the fallback `local`,
-# rows S1-S12 of its state table and the k5 case. Each row builds in a directory of its own under $WORK/probe,
-# with its own service and Lake cache (`enter`), and its fake log and LAKE_REMOTE_EXEC_LOG in
-# $WORK/probe/<row>.d. probe_check.py reads the times of the fake's `hello` and `run` lines (`t`) and of Lake's
-# lines (`startMs`, `wallMs`); its margins are wide, for a loaded machine. S1, S4 and S9 read one build
-# (`build_down`), so that each of them also runs alone.
+# rows S1-S12 of its state table, the k5 case, and P1-P2 (the traces of a build that the service joins in its middle).
+# Each row builds in a directory of its own under $WORK/probe, with its own service and Lake cache (`enter`), and its
+# fake log and LAKE_REMOTE_EXEC_LOG in $WORK/probe/<row>.d. probe_check.py reads the times of the fake's `hello` and
+# `run` lines (`t`) and of Lake's lines (`startMs`, `wallMs`); its margins are wide, for a loaded machine. S1, S4 and
+# S9 read one build (`build_down`), so that each of them also runs alone.
 
 PW=$GW
 
@@ -366,4 +366,50 @@ row_k5() (
   pcheck "promoted=${pairs#,}"
 )
 
-run_rows S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S10w S10t S10s S10f S10n S11 S12 k5
+# qb_midway: Rx.W (25 s) and Rx.QB, which imports Rx.QA and Rx.W, then `lake build Rx.QB` with the usage cutoff on,
+# the service not answering when the build starts and answering again 10 s later, while Rx.W compiles here: so Rx.QB
+# goes to the service, whose request promotes the modules that it imports
+qb_midway() {
+  local up_pid
+  export LAKE_USAGE_CUTOFF=1
+  slow W 25000
+  printf 'import Rx.QA\nimport Rx.W\n\ndef qb := qa + w\n' > Rx/QB.lean
+  touch "$D/down"
+  (sleep 10; rm -f "$D/down") & up_pid=$!
+  trap "kill $up_pid 2> /dev/null || true" EXIT
+  FAKE_DOWN_FILE="$D/down" lbuild Rx.QB
+}
+
+# P1: Rx.QA and Rx.W compile here while the service does not answer, and a probe finds it again while Rx.W compiles
+# (`qb_midway`); then Rx.QB goes to the service, whose request promotes Rx.QA and Rx.W. Rx.QB's trace has the hash
+# of its inputs after those promotions, the one the next build computes: `--no-build` of Rx.QB builds nothing, and
+# the next build sends no request
+row_P1() (
+  enter_row P1
+  printf 'def qa := 1\n' > Rx/QA.lean
+  qb_midway
+  lines --modules Rx.QA,Rx.W,Rx.QB --expect 'Rx.QA|Rx.W:result=local' --expect 'Rx.QB:result=executed|cached'
+  pcheck promoted=Rx.QB:Rx.QA,Rx.QB:Rx.W
+  export FAKE_LOG="$D/again.fake.log" LAKE_REMOTE_EXEC_LOG="$D/again.jsonl"
+  test_run build --no-build Rx.QB
+  test_run build Rx.QB
+  test_cmd_eq 0 count_method run
+)
+
+# P2: P1 with a chain: Rx.QA0 and Rx.QA, which imports it, compile here while the service does not answer, and Rx.QB's
+# request promotes Rx.QA0, then Rx.QA, whose own request takes Rx.QA0's promoted outputs. Each trace has the hash of
+# its module's inputs after the promotions: `--no-build` of Rx.QA and of Rx.QB builds nothing
+row_P2() (
+  enter_row P2
+  printf 'def qa0 := 1\n' > Rx/QA0.lean
+  printf 'import Rx.QA0\n\ndef qa := qa0\n' > Rx/QA.lean
+  qb_midway
+  lines --modules Rx.QA0,Rx.QA,Rx.W,Rx.QB --expect 'Rx.QA0|Rx.QA|Rx.W:result=local' \
+    --expect 'Rx.QB:result=executed|cached'
+  pcheck promoted=Rx.QA:Rx.QA0,Rx.QB:Rx.QA
+  export FAKE_LOG="$D/again.fake.log" LAKE_REMOTE_EXEC_LOG="$D/again.jsonl"
+  test_run build --no-build Rx.QA
+  test_run build --no-build Rx.QB
+)
+
+run_rows S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S10w S10t S10s S10f S10n S11 S12 k5 P1 P2
