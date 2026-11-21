@@ -9,6 +9,7 @@ prelude
 public import Lake.Build.Job.Monad
 public import Lake.Config.Monad
 public import Lake.Util.JsonObject
+public import Lake.Util.RemoteExec
 public import Lake.Util.IO
 public import Lake.Build.Actions
 public import Lake.Build.RemoteCache
@@ -76,6 +77,11 @@ public structure BuildMetadata where
   so that an archive's contents depend only on the module's outputs.
   -/
   localHash? : Option Hash := none
+  /--
+  The build service's record of the outputs (`remote`), for outputs that a service action made. It
+  is kept out of `outputs?` too, and an archive does not keep it.
+  -/
+  remote? : Option RemoteExec.Record := none
 
 /-- The current version of the trace file format. -/
 def BuildMetadata.schemaVersion : String := "2025-09-10"
@@ -88,9 +94,9 @@ public protected def BuildMetadata.toJson (self : BuildMetadata) : Json :=
     |>.insert "outputs" self.outputs?
     |>.insert "log" self.log
     |>.insert "synthetic" self.synthetic
-  match self.localHash? with
-  | some hash => obj.insert "localHash" hash
-  | none => obj
+    |>.insertSome "localHash" self.localHash?
+    |>.insertSome "remote" self.remote?
+  obj
 
 public instance : ToJson BuildMetadata := ⟨BuildMetadata.toJson⟩
 
@@ -113,7 +119,9 @@ public def BuildMetadata.fromJsonObject? (obj : JsonObject) : Except String Buil
   let log ← obj.getD "log" {}
   let synthetic ← obj.getD "synthetic" false
   let localHash? ← obj.get? "localHash"
-  return {depHash, inputs, outputs?, log, synthetic, localHash?}
+  -- A record that does not parse is no record: the trace still describes its outputs
+  let remote? : Option RemoteExec.Record := (obj.get? "remote").toOption.join
+  return {depHash, inputs, outputs?, log, synthetic, localHash?, remote?}
 
 public protected def BuildMetadata.fromJson? (json : Json) : Except String BuildMetadata := do
   match json with
@@ -144,8 +152,9 @@ public def BuildMetadata.parse (contents : String) : Except String BuildMetadata
 /-- Construct build metadata from a cached input-to-output mapping and the build log stored with it. -/
 public def BuildMetadata.ofFetch
   (inputHash : Hash) (outputs : Json) (log : Log) (localHash? : Option Hash := none)
+  (remote? : Option RemoteExec.Record := none)
 : BuildMetadata :=
-  {depHash := inputHash, outputs? := outputs, synthetic := true, inputs := #[], log, localHash?}
+  {depHash := inputHash, outputs? := outputs, synthetic := true, inputs := #[], log, localHash?, remote?}
 
 partial def serializeInputs (inputs : Array BuildTrace) : Array (String × Json) :=
   inputs.foldl (init := {}) fun r trace =>
@@ -158,6 +167,7 @@ partial def serializeInputs (inputs : Array BuildTrace) : Array (String × Json)
 
 def BuildMetadata.ofBuildCore
   (depTrace : BuildTrace) (outputs : Json) (log : Log) (localHash? : Option Hash := none)
+  (remote? : Option RemoteExec.Record := none)
 : BuildMetadata where
   inputs := serializeInputs depTrace.inputs
   depHash := depTrace.hash
@@ -165,11 +175,13 @@ def BuildMetadata.ofBuildCore
   synthetic := false
   log
   localHash?
+  remote?
 
 /-- Construct trace file contents from a build's trace, outputs, and log. -/
 @[inline] public def BuildMetadata.ofBuild
    [ToJson α]  (depTrace : BuildTrace) (outputs : α) (log : Log) (localHash? : Option Hash := none)
-:= BuildMetadata.ofBuildCore depTrace (toJson outputs) log localHash?
+   (remote? : Option RemoteExec.Record := none)
+:= BuildMetadata.ofBuildCore depTrace (toJson outputs) log localHash? remote?
 
 /-- The state of the trace file data saved on the file system. -/
 public inductive SavedTrace
@@ -181,6 +193,11 @@ public inductive SavedTrace
 public def SavedTrace.log : SavedTrace → Log
 | .ok data => data.log
 | _ => {}
+
+/-- The service record of the saved trace (`BuildMetadata.remote?`), if any. -/
+public def SavedTrace.remote? : SavedTrace → Option RemoteExec.Record
+| .ok data => data.remote?
+| _ => none
 
 /--
 Try to read data from a trace file.
@@ -218,20 +235,21 @@ def BuildMetadata.replayCached (data : BuildMetadata) : JobM Unit := do
 
 /--
 Write a trace file containing metadata on an artifact fetched from a cache,
-including the log of its build stored in the cache, and replay that log.
+including the log of its build stored in the cache (and the cache entry's service record), and replay that log.
 -/
 public def writeFetchTrace
   (path : FilePath) (inputHash : Hash) (outputs : Json) (log : Log) (localHash? : Option Hash := none)
+  (remote? : Option RemoteExec.Record := none)
 : JobM Unit := do
-  let data := BuildMetadata.ofFetch inputHash outputs log localHash?
+  let data := BuildMetadata.ofFetch inputHash outputs log localHash? remote?
   data.writeFile path
   data.replayCached
 
 /-- Write a trace file containing metadata about a build. -/
 @[inline] public def writeBuildTrace
   [ToJson α] (path : FilePath) (depTrace : BuildTrace) (outputs : α) (log : Log)
-  (localHash? : Option Hash := none)
-: IO Unit := BuildMetadata.writeFile path (.ofBuild depTrace outputs log localHash?)
+  (localHash? : Option Hash := none) (remote? : Option RemoteExec.Record := none)
+: IO Unit := BuildMetadata.writeFile path (.ofBuild depTrace outputs log localHash? remote?)
 
 /-- Indicator of whether a build's output(s) are up-to-date. -/
 public inductive OutputStatus
@@ -359,7 +377,8 @@ open ToOutputJson in
 Runs `build` as a build action of kind `action`.
 
 The build's input trace (`depTrace`), JSON description of the result of `build`, and log are saved to `traceFile`
-(with `localHash?`, see `BuildMetadata.localHash?`) if the build completes without a fatal error (i.e., it does not
+(with `localHash?`, see `BuildMetadata.localHash?`, and the service record that `remote?` gives for the result, see
+`BuildMetadata.remote?`) if the build completes without a fatal error (i.e., it does not
 `throw`). Then, for an action of kind `.build`, it sets the job's `JobState.built`: set after `build` returns, so a
 site within `build` that clears the flag cannot clear it for this action.
 -/
@@ -367,6 +386,7 @@ site within `build` that clears the flag cannot clear it for this action.
   [ToOutputJson α]
   (depTrace : BuildTrace) (traceFile : FilePath) (build : JobM α)
   (action : JobAction := .build) (localHash? : Option Hash := none)
+  (remote? : α → Option RemoteExec.Record := fun _ => none)
 : JobM α := do
   updateAction action
   let noBuildTraceFile := traceFile.addExtension "nobuild"
@@ -382,7 +402,7 @@ site within `build` that clears the flag cannot clear it for this action.
       let iniPos ← getLogPos
       let a ← build -- fatal errors will abort here
       let log := (← getLog).takeFrom iniPos
-      writeBuildTrace traceFile depTrace (toOutputJson a) log localHash?
+      writeBuildTrace traceFile depTrace (toOutputJson a) log localHash? (remote? a)
       removeFileIfExists noBuildTraceFile
       if action matches .build then
         modify ({· with built := true})
@@ -780,6 +800,18 @@ public class ResolveOutputs (α : Type) where
   /-- **For internal use only.** -/
   resolveOutputs (out : CacheOutput) : JobM α
 
+/--
+Outputs found in the Lake cache (`getArtifacts?`), with the log of the build that produced them, the
+service record of the trace or cache entry that named them (`BuildMetadata.remote?`, `CacheOutput.remote?`),
+and whether the shared remote cache's mapping named them (`readRemoteOutputs?`).
+
+**For internal use only.**
+-/
+public structure CacheHit (α : Type) where
+  arts : α
+  log : Log
+  remote? : Option RemoteExec.Record := none
+  fromRemoteCache : Bool := false
 
 open ResolveOutputs in
 /--
@@ -795,7 +827,7 @@ nothing unless `LAKE_REMOTE_CACHE` names a service) and replaces the local one.
 @[specialize] def getArtifactsUsingCache?
   [ResolveOutputs α] (inputHash : Hash) (pkg : Package) (target : String) (srcHash? : Option Hash)
   (remoteRead := true)
-: JobM (Option (α × Log)) := do
+: JobM (Option (CacheHit α)) := do
   let reportIssue (e : Log.Pos) : JobM Unit := do
     let log ← takeLogFrom e
     let msg := s!"input '{inputHash.toString.take 7}' found in package artifact cache, \
@@ -804,10 +836,11 @@ nothing unless `LAKE_REMOTE_CACHE` names a service) and replaces the local one.
     -- Must be `trace` to avoid breaking `--wfail` / `--iofail` builds
     -- TODO: Figure out a way to split cache and build failures
     logVerbose msg
-  let resolve (out : CacheOutput) : JobM (Option (α × Log)) := do
+  let resolve (out : CacheOutput) (fromRemoteCache : Bool) : JobM (Option (CacheHit α)) := do
     try
       let localOut := if remoteRead || out.service?.isNone then out else CacheOutput.ofData out.data
-      return some (← resolveOutputs localOut, out.log?.getD {})
+      let arts ← resolveOutputs localOut
+      return some {arts, log := out.log?.getD {}, remote? := out.remote?, fromRemoteCache := fromRemoteCache}
     catch e =>
       reportIssue e
       return none
@@ -816,7 +849,7 @@ nothing unless `LAKE_REMOTE_CACHE` names a service) and replaces the local one.
     reportIssue e
     pure none
   if let some out := local? then
-    if let some a ← resolve out then
+    if let some a ← resolve out false then
       return some a
   unless remoteRead do return none
   -- A local mapping file that exists but cannot be used (it does not parse, or its artifacts are
@@ -828,7 +861,7 @@ nothing unless `LAKE_REMOTE_CACHE` names a service) and replaces the local one.
   cancelIfBuildCanceled
   let some out := out?
     | return none
-  let a? ← resolve out
+  let a? ← resolve out true
   -- As above: the artifacts of the mapping were read from the remote cache as well
   cancelIfBuildCanceled
   return a?
@@ -838,7 +871,7 @@ open ResolveOutputs in
 Retrieve artifacts from the Lake cache using only the outputs stored in the saved trace file.
 
 If the cache is writable, saves the input-to-output mapping derived from the trace
-(with the trace's log) to the cache, unless a mapping for the `inputHash` already exists.
+(with the trace's log and service record) to the cache, unless a mapping for the `inputHash` already exists.
 
 **For internal use only.**
 -/
@@ -852,7 +885,7 @@ If the cache is writable, saves the input-to-output mapping derived from the tra
           let arts ← resolveOutputs (.ofData out)
           if (← pkg.isArtifactCacheWritable) then
             let act := (← getLakeCache).writeOutputs pkg.cacheScope inputHash out
-              (log := data.log) (overwrite := false)
+              (log := data.log) (remote? := data.remote?) (overwrite := false)
             if let .error e ← act.toBaseIO then
               logWarning s!"could not write outputs to cache: {e}"
           return some arts
@@ -864,20 +897,18 @@ open ResolveOutputs in
 /--
 Retrieve artifacts from the Lake cache using the outputs stored in either
 the saved trace file or in the cached input-to-content mapping,
-along with the build log stored with them. With `remoteRead := false`, the shared remote cache is
-not read (see `getArtifactsUsingCache?`).
+along with the build log and service record stored with them. With `remoteRead := false`, the shared
+remote cache is not read (see `getArtifactsUsingCache?`).
 
 **For internal use only.**
 -/
 @[inline] public nonrec def getArtifacts?
   [ResolveOutputs α] (inputHash : Hash) (savedTrace : SavedTrace) (pkg : Package)
   (target : String) (srcHash? : Option Hash) (remoteRead := true)
-: JobM (Option (α × Log)) := do
+: JobM (Option (CacheHit α)) := do
   if let some a ← getArtifactsUsingTrace? inputHash savedTrace pkg then
-    return some (a, savedTrace.log)
-  if let some a ← getArtifactsUsingCache? inputHash pkg target srcHash? remoteRead then
-    return some a
-  return none
+    return some {arts := a, log := savedTrace.log, remote? := savedTrace.remote?}
+  getArtifactsUsingCache? inputHash pkg target srcHash? remoteRead
 
 /-- **For internal use only.** -/
 public def resolveArtifact
@@ -1093,11 +1124,12 @@ public def buildArtifactUnlessUpToDate
     let inputHash := depTrace.hash
     let fetchArt? restore := do
       let target ← currentRemoteCacheTarget
-      let some ((art : XArtifact exe), log) ← getArtifacts? inputHash savedTrace pkg target none
+      let some (hit : CacheHit (XArtifact exe)) ← getArtifacts? inputHash savedTrace pkg target none
         | return none
+      let art := hit.arts
       unless (← savedTrace.replayCachedIfUpToDate inputHash) do
         removeFileIfExists file
-        writeFetchTrace traceFile inputHash (toJson art.descr) log
+        writeFetchTrace traceFile inputHash (toJson art.descr) hit.log (remote? := hit.remote?)
       if restore then
         some <$> restoreArtifact file art exe text
       else
