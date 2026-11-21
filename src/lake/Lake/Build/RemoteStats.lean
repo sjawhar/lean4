@@ -40,7 +40,7 @@ public instance : ToString RemoteState := ⟨RemoteState.toString⟩
 
 /--
 Counts for a build's end-of-build line: Lean module results, and separately C-object and
-plugin-link results ("other actions"). A result is `cached` (served by the service), `manifest`
+shared-library results ("other actions"). A result is `cached` (served by the service), `manifest`
 (a subset of cached, found through the manifest), `executed` (the service ran the action for this
 build, a compile that failed there included; an action run again counts once per run), or `local`
 (compiled on this machine by the fallback `local`, because the service did not answer or its
