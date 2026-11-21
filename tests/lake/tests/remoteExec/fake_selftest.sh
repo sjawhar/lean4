@@ -51,9 +51,17 @@ def result(resp):
     assert resp is not None and "result" in resp, resp
     return resp["result"]
 
-def digest_of(path):
-    data = open(path, "rb").read()
+def digest_of(x):
+    """The digest of `x`: bytes, or the path of a file."""
+    data = x if isinstance(x, bytes) else open(x, "rb").read()
     return f"{hashlib.sha256(data).hexdigest()}/{len(data)}"
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
 
 # --- the exchange a module compile makes: hello, digest, run, run again, materialize
 src = os.path.join(work, "in.txt")
@@ -139,7 +147,7 @@ check("FAKE_UNREACHABLE makes hello unreachable", h3.get("reachable") is False, 
 check("and it gives a reason", bool(h3.get("reason")), json.dumps(h3))
 b3.close()
 
-# --- a nonzero exit is a result, and the fake stores no failure
+# --- a nonzero exit is a result, and the fake stores no failure of an action that declares no outputs
 b4 = Bridge()
 result(b4.call("hello", {"protocol": 1}))
 freq = dict(req, argv=["/bin/sh", "-c", "echo bad >&2; exit 3"], outputs=[], inputs=[], mnemonic="SelfTestBad")
@@ -210,12 +218,9 @@ check("the bridge keeps a descriptor it inherited", holds(b8.p.pid, lockfile))
 check("the FAKE_DAEMON_S child closes every descriptor it inherited", not holds(dpid, lockfile))
 b8.close()
 os.close(lockfd)
-try:
-    os.kill(dpid, 0); alive = True
-except ProcessLookupError:
-    alive = False
-check("the FAKE_DAEMON_S child outlives its bridge", alive)
-if alive: os.kill(dpid, 9)
+daemon_alive = alive(dpid)
+check("the FAKE_DAEMON_S child outlives its bridge", daemon_alive)
+if daemon_alive: os.kill(dpid, 9)
 
 # --- FAKE_OMIT_VERIFIED: a hello without the toolchain check's fields
 b9 = Bridge(FAKE_OMIT_VERIFIED="1")
@@ -403,16 +408,6 @@ def recorded_answer(name):
     with open(os.path.join(recorded, name)) as f:
         return json.load(f)
 
-def stream_digest(data):
-    return f"{hashlib.sha256(data).hexdigest()}/{len(data)}"
-
-def alive(pid):
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-
 # --- the action key covers timeoutSecs and each input's executable bit (by path the file's mode, by digest
 # the request's `executable`), as the REAPI action and its input root do; not the mnemonic or the target
 @case
@@ -455,7 +450,7 @@ def result_fields():
     f = result(b.call("run", sh("printf failed >&2; exit 1", outputs=["out.olean"])))
     check("a result has the fields of the bridge's", sorted(f) == sorted(rec), json.dumps(f))
     check("a stream with bytes has a digest, an empty one has none",
-          f.get("stderrDigest") == stream_digest(b"failed") and "stdoutDigest" not in f, json.dumps(f))
+          f.get("stderrDigest") == digest_of(b"failed") and "stdoutDigest" not in f, json.dumps(f))
     check("`outputs` is null when the action wrote no declared output", f.get("outputs", []) is None, json.dumps(f))
     check("`metadata` has the times of the execution's steps and the worker",
           sorted(f.get("metadata") or {}) == sorted(rec["metadata"]), json.dumps(f.get("metadata")))
@@ -537,7 +532,7 @@ def enforced_timeouts():
     check("FAKE_ENFORCE_TIMEOUT kills that target's action at its timeoutSecs, and it answers TIMEOUT",
           e.get("code") == "TIMEOUT" and 1 <= dt < 8 and not alive(pid), f"after {dt:.2f} s: {json.dumps(e)}")
     check("with FAKE_FIELDS=new, with the digest of the stream it wrote",
-          e.get("stdoutDigest") == stream_digest(b"early") and "stderrDigest" not in e
+          e.get("stdoutDigest") == digest_of(b"early") and "stderrDigest" not in e
           and e.get("terminationSignal") == "KILL" and "/" in e.get("action", ""), json.dumps(e))
     o = b.call("run", sh("sleep 2", timeoutSecs=1, target="selftest-free")).get("result", {})
     check("and another target's action runs past its timeoutSecs to its end", o.get("exitCode") == 0, json.dumps(o))
