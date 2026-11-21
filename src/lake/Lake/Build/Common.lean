@@ -1093,6 +1093,16 @@ public def restoreArtifact
 @[inline] public def Internal.getOutputsRef? [Functor m] [MonadBuild m] (pkg : Package) : m (Option CacheRef) :=
   readThe BuildContext <&> fun ctx => if pkg.wsIdx = ctx.outputsIdx then ctx.outputsRef? else none
 
+/-- **For internal use only.** `art` with the modification time of its trace file `traceFile`, if that exists. -/
+public def Internal.withTraceMTime (art : Artifact) (traceFile : FilePath) : JobM Artifact := do
+  match (← getMTime traceFile |>.toBaseIO) with
+  | .ok mtime =>
+    return {art with mtime}
+  | .error (.noFileOrDirectory ..) => -- trace file may not exist
+    return art
+  | .error e =>
+    error s!"failed to retrieve artifact modification time: {e}"
+
 /--
 Uses the current job's trace to search Lake's local artifact cache for an artifact
 with a matching extension (`ext`) and content hash. If one is found, use it.
@@ -1109,11 +1119,13 @@ If `exe := true`, the `file` will be marked executable.
 
 If `platformIndependent := true`, the artifact will be included in
 platform-independent caches.
+
+If `remoteRead := false`, the shared remote cache is not read (see `getArtifacts?`).
 -/
 public def buildArtifactUnlessUpToDate
   (file : FilePath) (build : JobM PUnit)
   (text := false) (ext := "art") (restore := false) (exe := false)
-  (platformIndependent := false)
+  (platformIndependent := false) (remoteRead := true)
 : JobM Artifact := do
   -- Whether this call completes a build action (not a job it continues)
   let builtHere ← trackBuilds
@@ -1124,7 +1136,8 @@ public def buildArtifactUnlessUpToDate
     let inputHash := depTrace.hash
     let fetchArt? restore := do
       let target ← currentRemoteCacheTarget
-      let some (hit : CacheHit (XArtifact exe)) ← getArtifacts? inputHash savedTrace pkg target none
+      let some (hit : CacheHit (XArtifact exe)) ←
+          getArtifacts? inputHash savedTrace pkg target none remoteRead
         | return none
       let art := hit.arts
       unless (← savedTrace.replayCachedIfUpToDate inputHash) do
@@ -1184,7 +1197,7 @@ public def buildArtifactUnlessUpToDate
     if let some ref ← Internal.getOutputsRef? pkg then
       ref.insert inputHash art.descr platformIndependent
     setTrace art.trace
-    setMTime art traceFile
+    Internal.withTraceMTime art traceFile
   else
     let art ←
       if (← savedTrace.replayIfUpToDate file depTrace) then
@@ -1192,7 +1205,7 @@ public def buildArtifactUnlessUpToDate
       else
         doBuild depTrace traceFile
     setTrace art.trace
-    setMTime art traceFile
+    Internal.withTraceMTime art traceFile
 where
   doBuild depTrace traceFile :=
     inline <| buildAction depTrace traceFile do
@@ -1201,14 +1214,66 @@ where
       clearFileHash file
       removeFileIfExists traceFile
       computeArtifact file ext text
-  setMTime art traceFile := do
-    match (← getMTime traceFile |>.toBaseIO) with
-    | .ok mtime =>
-      return {art with mtime}
-    | .error (.noFileOrDirectory ..) => -- trace file may not exist
-      return art
-    | .error e =>
-      error s!"failed to retrieve artifact modification time: {e}"
+
+/-! ### Service mode's native artifacts
+
+The Lake cache's side of a native artifact's build on the build service (`Lake.buildNativeArtifact`), which keeps
+the service's record (`RemoteExec.Record`) beside the artifact in its trace and its cache entry.
+-/
+
+/--
+**For internal use only.**
+The service record (`BuildMetadata.remote?`) of a saved trace that is up to date with `inputHash`, if it describes
+`file`: the file exists and has the hash of the trace's output (see `ToOutputJson Artifact`). A record that does
+not describe the file is no record.
+-/
+public def SavedTrace.serviceRecord? (self : SavedTrace) (inputHash : Hash) (file : FilePath) :
+    JobM (Option RemoteExec.Record) := do
+  let .ok data := self | return none
+  unless data.depHash == inputHash do return none
+  let some record := data.remote? | return none
+  let some descr := self.artifactDescr? | return none
+  unless (← file.pathExists) do return none
+  return if (← fetchFileHash file) == descr.hash then some record else none
+
+/--
+**For internal use only.**
+Restores the artifact of `inputHash` from the Lake cache to `file` (`getArtifacts?`, without the shared remote cache)
+if the saved trace or the cache entry that names it has a service record, with the executable bit that the record
+gives its output `recordExt`, and writes the trace of `file` as `buildArtifactUnlessUpToDate` does. Returns the
+artifact and its record.
+-/
+public def restoreServiceArtifact?
+  (pkg : Package) (inputHash : Hash) (savedTrace : SavedTrace) (file : FilePath) (recordExt : String)
+: JobM (Option (Artifact × RemoteExec.Record)) := do
+  unless (← pkg.isArtifactCacheReadable) do return none
+  let target ← currentRemoteCacheTarget
+  let some (hit : CacheHit (XArtifact false)) ←
+      getArtifacts? inputHash savedTrace pkg target none (remoteRead := false)
+    | return none
+  let some record := hit.remote? | return none
+  unless (← savedTrace.replayCachedIfUpToDate inputHash) do
+    removeFileIfExists file
+    writeFetchTrace (file.toString ++ ".trace") inputHash (toJson hit.arts.descr) hit.log (remote? := record)
+  let exe := (record.outputs.get? recordExt).any (·.executable)
+  return some (← restoreArtifact file hit.arts exe, record)
+
+/--
+**For internal use only.**
+Saves `file`, which holds the output of a build service action, to the Lake cache as `buildArtifactUnlessUpToDate`
+saves a build's artifact, with the service record `record` and the build's `log` in its cache entry. The artifact
+keeps the path `file` and the executable bit `exe`. Without a writable Lake cache, it is only computed.
+-/
+public def cacheServiceArtifact
+  (pkg : Package) (inputHash : Hash) (file : FilePath) (ext : String) (exe : Bool)
+  (record : RemoteExec.Record) (log : Log)
+: JobM Artifact := do
+  unless (← pkg.isArtifactCacheWritable) do
+    return ← computeArtifact file ext
+  let art ← cacheArtifact file ext (exe := exe) (useLocalFile := true)
+  unless art.cacheSkipped do
+    (← getLakeCache).writeOutputs pkg.cacheScope inputHash art.descr (log := log) (remote? := some record)
+  return art
 
 /--
 Build `file` using `build` after `dep` completes if the dependency's
@@ -1308,6 +1373,35 @@ which will be computed in the resulting `Job` before building.
 
 /--
 **For internal use only.**
+Mixes the trace of an object file that `Internal.buildLeanO` builds into the current job's trace.
+-/
+public def Internal.addLeanOTrace
+  (traceArgs : Array String) (leanIncludeDir? : Option (FilePath × BuildTrace))
+: JobM PUnit := do
+  addLeanTrace
+  if let some (_, trace) := leanIncludeDir? then
+    -- Lean-produced C files contain `#include <lean/lean.h>`.
+    -- Usually this dependency is captured by the Lean trace, but not with an override.
+    addTrace trace
+  addPureTrace traceArgs "traceArgs"
+  addPlatformTrace -- object files are platform-dependent artifacts
+
+/--
+**For internal use only.**
+Compiles the object file `oFile` of a Lean C file `srcFile` with the Lean toolchain's C compiler
+(see `Internal.buildLeanO`).
+-/
+public def Internal.compileLeanO
+  (oFile srcFile : FilePath) (weakArgs traceArgs : Array String)
+  (leanIncludeDir? : Option (FilePath × BuildTrace))
+: JobM PUnit := do
+  let lean ← getLeanInstall
+  let includeDir := leanIncludeDir?.elim lean.includeDir (·.1)
+  let args := #["-I", includeDir.toString] ++ lean.ccFlags ++ weakArgs ++ traceArgs
+  compileO oFile srcFile args lean.cc
+
+/--
+**For internal use only.**
 Build an object file from a source fie job (i.e, a `lean -c` output)
 using the Lean toolchain's C compiler.
 -/
@@ -1317,18 +1411,9 @@ public def Internal.buildLeanO
   (leanIncludeDir? : Option (FilePath × BuildTrace) := none)
 : SpawnM (Job FilePath) :=
   srcJob.mapM fun srcFile => do
-    addLeanTrace
-    if let some (_, trace) := leanIncludeDir? then
-      -- Lean-produced C files contain `#include <lean/lean.h>`.
-      -- Usually this dependency is captured by the Lean trace, but not with an override.
-      addTrace trace
-    addPureTrace traceArgs "traceArgs"
-    addPlatformTrace -- object files are platform-dependent artifacts
+    Internal.addLeanOTrace traceArgs leanIncludeDir?
     let art ← buildArtifactUnlessUpToDate oFile (ext := "o") do
-      let lean ← getLeanInstall
-      let includeDir := leanIncludeDir?.elim lean.includeDir (·.1)
-      let args := #["-I", includeDir.toString] ++ lean.ccFlags ++ weakArgs ++ traceArgs
-      compileO oFile srcFile args lean.cc
+      Internal.compileLeanO oFile srcFile weakArgs traceArgs leanIncludeDir?
     return art.path
 
 /--
@@ -1471,6 +1556,26 @@ public def buildSharedLib
       linker plugin linkDeps macosxDeploymentTarget?
 
 /--
+**For internal use only.**
+Mixes the trace of a shared library that `buildLeanSharedLibSync` links into the current job's trace.
+-/
+public def Internal.addLeanSharedLibTrace : JobM PUnit := do
+  addLeanTrace
+  addPlatformTrace -- shared libraries are platform-dependent artifacts
+
+/--
+**For internal use only.**
+Links the shared library `libFile` with the Lean toolchain's linker (see `buildLeanSharedLibSync`).
+-/
+public def Internal.linkLeanSharedLib
+  (libFile : FilePath) (linkObjs : Array FilePath) (linkLibs : Array Dynlib)
+  (args : Array String := #[]) (linkDeps := Platform.isWindows)
+  (macosxDeploymentTarget? : Option String := none)
+: JobM PUnit := do
+  let args ← mkLeanLinkArgs linkObjs linkLibs args linkDeps (sharedLean := true)
+  compileSharedLib libFile args (← getLeanCc) macosxDeploymentTarget?
+
+/--
 Build a shared library linking Lean by using the Lean toolchain's linker.
 
 The library will statically link in `linkObjs` (e.g., object files or
@@ -1489,13 +1594,11 @@ public def buildLeanSharedLibSync
   (linkDeps := Platform.isWindows)
   (macosxDeploymentTarget? : Option String := none)
 : JobM Dynlib := do
-  addLeanTrace
-  addPlatformTrace -- shared libraries are platform-dependent artifacts
+  Internal.addLeanSharedLibTrace
   -- Lean plugins are required to have a specific name
   -- and thus need to restored from the cache with that name
   let art ← buildArtifactUnlessUpToDate libFile (ext := sharedLibExt) (restore := true) do
-    let args ← mkLeanLinkArgs linkObjs linkLibs args linkDeps (sharedLean := true)
-    compileSharedLib libFile args (← getLeanCc) macosxDeploymentTarget?
+    Internal.linkLeanSharedLib libFile linkObjs linkLibs args linkDeps macosxDeploymentTarget?
   return {name := libName, path := art.path, deps := linkLibs, plugin}
 
 /--

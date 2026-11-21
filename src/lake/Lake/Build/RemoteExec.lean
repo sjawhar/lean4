@@ -14,6 +14,9 @@ public import Lake.Build.Job.Monad
 public import Lake.Config.Monad
 public import Lake.Config.Module
 public import Lean.Setup
+import Lake.Util.Proc
+import Lean.Compiler.FFI
+import Std.Data.HashMap
 import Std.Time
 
 /-! # Build-service mode for Lake (client side, contract C5.1)
@@ -21,9 +24,10 @@ import Std.Time
 Service mode (`LAKE_REMOTE_EXEC=<endpoint>`) turns a module compile into a REAPI action with
 relative paths and the toolchain as a platform property, and asks the build service for its result
 through `lean-remote bridge` (see `Lake.Util.RemoteExec`). This module holds the per-process
-session, the path rewriting of contract C2.1, and the typed `run`/`materialize` calls. The parts
-that need `Build/Module.lean`'s private helpers (`remoteHead`, `remoteRunRequest`, `fetchRemote`)
-live in that file's `section RemoteExec`.
+session, the path rewriting of contract C2.1, the typed `run`/`materialize` calls, and the native
+actions of contract C3.1 (a module's C object and shared library, a library's shared library) with
+their build. The parts that need `Build/Module.lean`'s private helpers (`remoteHead`,
+`remoteRunRequest`, `fetchRemote`) live in that file's `section RemoteExec`.
 -/
 
 open System Lean
@@ -38,6 +42,10 @@ public structure RemoteSession where
   sysroot : FilePath
   toolchain : String
   leanGithash : String
+
+/-- The platform of every action of the session (contract C2.1), a Lean module's and a native one's. -/
+public def RemoteSession.platform (s : RemoteSession) : Array (String × String) :=
+  #[("arch", "x86_64"), ("memory", "std"), ("os", "linux"), ("toolchain", s.toolchain)]
 
 /--
 The platform and path part of a module's action: the part that does not depend on the module's
@@ -656,6 +664,14 @@ public def recordRemoteModule (cached : Bool) : JobM Unit := do
 public def recordRemoteLocal : JobM Unit := do
   (← getRemoteStats).modify (·.addLeanLocal)
 
+/-- Records one result of the service for a C object or a shared library. -/
+public def recordRemoteNative (cached : Bool) : JobM Unit := do
+  (← getRemoteStats).modify (·.addOther cached)
+
+/-- Records one C object or shared library that the fallback `local` built on this machine. -/
+public def recordRemoteNativeLocal : JobM Unit := do
+  (← getRemoteStats).modify (·.addOtherLocal)
+
 /-! ## Path rewriting (contract C2.1) -/
 
 /-- `lib/<pkg>/<Module/Path>.<ext>` in the action's input root (contract C2.1). -/
@@ -751,5 +767,375 @@ public def materializeFiles (s : RemoteSession) (epoch : Nat)
   | .ok j => match RemoteExec.MaterializeResult.ofJson? j with
     | .ok r => return .ok r
     | .error msg => return .error {code := .internal, message := s!"malformed materialize result: {msg}"}
+
+/--
+Leaves the build action of a service action (`Module.buildRemote`, `NativeAction.buildRemote`) after a request
+answers `UNAVAILABLE`, either after the daemon's retries (contract C5.1) or because the bridge rejected its `hello`.
+`epoch` is `remoteEpoch`, read just before that request was sent. A failed bridge `hello` also rejects requests as
+`UNAVAILABLE`; its saved verdict distinguishes an unverified service (always fatal) from a confirmed toolchain
+mismatch (local fallback only under `local`, otherwise exit 75). An unavailable service under `fail` also errors with
+`msg`, counted for exit 75 (`recordUnavailableFailure`). These failures put their code in `outcome`. Otherwise it
+notes `msg` and `epoch` in `why` and fails without a log entry, from `pos`, where the action started;
+`retryWhileUnavailable` drops what the action logged and sends the request again or takes the fallback. Either way the
+action writes no trace.
+-/
+public def remoteUnavailable (s : RemoteSession) (outcome : IO.Ref RemoteOutcome)
+    (why : IO.Ref (Option (String × Nat))) (pos : Log.Pos) (epoch : Nat) (msg : String) : JobM α := do
+  match ← remoteDecision? with
+  | some (.refused refusal) => failRefused s outcome refusal
+  | some (.toolchainMismatch mismatch) =>
+    if s.cfg.fallback != .compileLocally then
+      failMismatch s outcome mismatch
+  | _ => pure ()
+  if s.cfg.fallback == .fail then
+    failUnavailable outcome msg
+  why.set (some (msg, epoch))
+  throw pos
+
+/--
+Runs `build`, the build action of a service action, until its result is the job's. When the action leaves through
+`remoteUnavailable`, which notes why in the reference that `build` gets, the job drops what the action logged and sends
+the request again: under `wait` once the service answers again (`awaitServiceAgain`), otherwise when a probe found the
+service again after the request was sent (the epoch moved). Else it returns `none`, and the fallback `local` builds on
+this machine. Every other failure is the job's.
+-/
+public def retryWhileUnavailable (s : RemoteSession) (outcome : IO.Ref RemoteOutcome)
+    (build : IO.Ref (Option (String × Nat)) → JobM α) : JobM (Option α) := do
+  repeat
+    let why ← IO.mkRef (none : Option (String × Nat))
+    try
+      return some (← build why)
+    catch pos =>
+      let some (_, epoch) ← why.get | throw pos
+      dropLogFrom pos
+      if s.cfg.fallback == .wait then
+        awaitServiceAgain s outcome epoch
+      else if (← remoteEpoch) == epoch then
+        return none
+  return none
+
+/-! ## Native actions (contract C3.1) -/
+
+/-- A native action of service mode: a module's C object, a module's shared library, or a library's shared library. -/
+public inductive NativeKind
+  | cCompile | linkShared | linkSharedLibrary
+  deriving Inhabited
+
+/-- The `mnemonic` of the action's request. -/
+public def NativeKind.mnemonic : NativeKind → String
+  | .cCompile => "CCompile" | .linkShared => "LinkShared" | .linkSharedLibrary => "LinkSharedLibrary"
+
+/-- The `kind` of the job's line: `c` or `shared`. -/
+public def NativeKind.lineKind : NativeKind → String
+  | .cCompile => "c" | _ => "shared"
+
+/-- The name of the action's output in the job's line and in the service record: `o` or `so`. -/
+public def NativeKind.outputName : NativeKind → String
+  | .cCompile => "o" | _ => "so"
+
+/-- What a native action reads. -/
+public inductive NativeInputs
+  /-- `CCompile`: the C file, an input by path: its local path and its path in the input root. -/
+  | source (file : FilePath) (rel : String)
+  /-- A link: the objects' local paths, each the output of a native action of this build (`nativeArtifact?`), which
+  the request takes by their service digest. -/
+  | objects (files : Array FilePath)
+  deriving Inhabited
+
+/-- A native action of service mode: the data its `run` request is built from (`NativeAction.request`). -/
+public structure NativeAction where
+  kind : NativeKind
+  /-- The request's and the line's target: `<module>:c.o.export`, `<module>:c.o.noexport`, `<module>:dynlib` or
+  `<package>/<library>:shared`. -/
+  target : String
+  /-- The output's local path. -/
+  file : FilePath
+  /-- The output's path in the action's input root (contract C2.1). -/
+  rel : String
+  inputs : NativeInputs
+  /-- The arguments after the fixed ones: `CCompile`'s are the module's `weakLeancArgs` and `leancArgs`, a link's the
+  `weakLinkArgs` and `linkArgs`. -/
+  args : Array String
+  deriving Inhabited
+
+/-- A native artifact of this process: its action, and the service's record of the file when the file holds the
+service's output. -/
+public structure NativeArtifact where
+  action : NativeAction
+  record? : Option RemoteExec.Record
+  deriving Inhabited
+
+/-- The native artifacts of this process by their local path: each native job of service mode registers its artifact
+however it got it (a replay, a restore, the service, the fallback). -/
+builtin_initialize nativeArtifacts : Std.Mutex (Std.HashMap FilePath NativeArtifact) ← Std.Mutex.new {}
+
+/-- Registers a native artifact of this process (`nativeArtifacts`). -/
+public def registerNativeArtifact (a : NativeArtifact) : BaseIO Unit :=
+  nativeArtifacts.atomically (modify (·.insert a.action.file a))
+
+/-- The native artifact of this process at `file`, if a native job of service mode got it. -/
+public def nativeArtifact? (file : FilePath) : BaseIO (Option NativeArtifact) :=
+  nativeArtifacts.atomically ((·[file]?) <$> get)
+
+/-- The objects of a link as its request takes them, from `nativeArtifacts`: each one's path in the input root and its
+output on the service; `none` when one has no service record (the fallback built it here) or is no native artifact
+of this process. A `CCompile` takes none. -/
+public def NativeAction.serviceObjects? (act : NativeAction) :
+    BaseIO (Option (Array (String × RemoteExec.RecordOutput))) := do
+  let .objects files := act.inputs | return some #[]
+  let mut objs := #[]
+  for file in files do
+    let some a ← nativeArtifact? file | return none
+    let some o := a.record?.bind (·.outputs.get? NativeKind.cCompile.outputName) | return none
+    objs := objs.push (a.action.rel, o)
+  return some objs
+
+/--
+The `run` request of a native action (contract C3.1); `objs` are a link's objects (`NativeAction.serviceObjects?`).
+The arguments are in the order of a local build's (`compileO`, `compileSharedLib`, `mkLeanLinkArgs`), with
+`LAKE_REMOTE_EXEC_CC` as the compiler and the linker, the remote sysroot's headers and libraries, and Lean's C and link
+flags (`getCFlags'`, `getLinkerFlags'`), which name no path of this machine; a link's arguments are in a response file
+inline in the request. The action runs with `LAKE_REMOTE_EXEC_PATH` as its `PATH`, on the platform of the session's
+Lean actions.
+-/
+public def NativeAction.request (act : NativeAction) (s : RemoteSession)
+    (objs : Array (String × RemoteExec.RecordOutput)) : Json := Id.run do
+  let cc := s.cfg.cc.toString
+  let (argv, inputs, files) : Array String × Array Json × Array Json := match act.inputs with
+    | .source file rel =>
+      let argv := #[cc, "-c", "-o", act.rel, rel, "-I", s!"{s.sysroot}/include"] ++
+        Lean.Compiler.FFI.getCFlags' ++ #["-Wno-unused-command-line-argument"] ++ act.args
+      (argv, #[Json.mkObj [("rel", rel), ("path", file.toString)]], #[])
+    | .objects _ =>
+      let rsp := act.rel ++ ".rsp"
+      let args := objs.map (·.1) ++ act.args ++ #["-L", s!"{s.sysroot}/lib/lean"] ++
+        Lean.Compiler.FFI.getLinkerFlags' (linkStatic := false)
+      let inputs := objs.map fun (rel, o) =>
+        Json.mkObj [("rel", rel), ("digest", toJson o.digest), ("executable", o.executable)]
+      let rspFile := Json.mkObj [("rel", rsp), ("contents", rspContents args)]
+      (#[cc, "-shared", "-o", act.rel, s!"@{rsp}"], inputs, #[rspFile])
+  return Json.mkObj [
+    ("argv", toJson argv),
+    ("env", Json.mkObj [("PATH", s.cfg.path)]),
+    ("workingDirectory", ""),
+    ("inputs", Json.arr inputs),
+    ("inputDirs", Json.arr #[]),
+    ("files", Json.arr files),
+    ("outputs", toJson #[act.rel]),
+    ("platform", Json.mkObj (s.platform.map fun (k, v) => (k, (toJson v : Json))).toList),
+    ("timeoutSecs", toJson s.cfg.timeoutSecs),
+    ("mnemonic", act.kind.mnemonic),
+    ("target", act.target)]
+
+/-- A native artifact that a service action made (`NativeAction.buildRemote`), with the service's record of it and the
+job's line. -/
+structure NativeBuild where
+  art : Artifact
+  record : RemoteExec.Record
+  outcome : RemoteOutcome
+
+instance : ToOutputJson NativeBuild := ⟨(ToOutputJson.toOutputJson ·.art)⟩
+
+/--
+The build action of a native artifact on the service (`buildNativeArtifact`): `run` the action, replay its output and
+fail on a bad exit as a local build does (`proc`), then materialize its output at the artifact's file with the output's
+executable bit and hash it (as an artifact with extension `ext`). A request that answers `UNAVAILABLE` leaves through
+`remoteUnavailable`. The service's result counts once, when it is the job's, as a Lean module's does
+(`Module.buildRemote`). Each step sets the line the job writes if it fails there (`outcome`).
+-/
+def NativeAction.buildRemote (act : NativeAction) (s : RemoteSession)
+    (objs : Array (String × RemoteExec.RecordOutput)) (ext : String) (outcome : IO.Ref RemoteOutcome)
+    (why : IO.Ref (Option (String × Nat))) : JobM NativeBuild := do
+  let pos ← getLogPos
+  outcome.set (.error "request")
+  let params := act.request s objs
+  let runEpoch ← remoteEpoch
+  let result ← match ← runAction s runEpoch params with
+    | .ok r => pure r
+    | .error e =>
+      let msg := s!"the build service's run of {act.target} failed: {e.message}"
+      if e.code == .unavailable then
+        remoteUnavailable s outcome why pos runEpoch msg
+      -- These answers say the service ran the action and it failed there (contract C5.1).
+      if e.code == .oom || e.code == .timeout || e.code == .diskLimit then
+        recordRemoteNative (cached := false)
+      outcome.set (.ofError e)
+      error msg
+  let name := act.kind.outputName
+  if let some o := result.outputs.find? (·.rel != act.rel) then
+    outcome.set {RemoteOutcome.ofRun result #[] with result := "error", code? := "undeclared-output"}
+    error s!"the build service returned an unexpected output {o.rel} for {act.target}"
+  let out? := result.outputs[0]?
+  let run := RemoteOutcome.ofRun result (out?.toArray.map fun o => (name, o.digest))
+  -- Replay the action's output and fail on a bad exit, as a local build does.
+  try
+    withLogErrorPos do
+      logOutput {exitCode := 0, stdout := result.stdout, stderr := result.stderr} logInfo
+      unless result.exitCode == 0 do
+        error s!"the build service's run of {act.target} exited with code {result.exitCode}"
+  catch e =>
+    recordRemoteNative result.cached
+    outcome.set run
+    throw e
+  -- From here on, a failure is the job's with the run's fields
+  outcome.set {run with result := "error", code? := "materialize"}
+  let some out := out?
+    | recordRemoteNative result.cached
+      error s!"the build service's run of {act.target} made no output"
+  removeFileIfExists act.file
+  clearFileHash act.file
+  let materializeEpoch ← remoteEpoch
+  match ← materializeFiles s materializeEpoch #[(out.digest, act.file, out.executable)] with
+  | .ok _ => recordRemoteNative result.cached
+  | .error e =>
+    let msg := s!"materializing {act.target} from the build service failed: {e.message}"
+    if e.code == .unavailable then
+      -- Under `fail` the service's result stays the job's; otherwise the fallback replaces it.
+      if s.cfg.fallback == .fail then
+        recordRemoteNative result.cached
+      remoteUnavailable s outcome why pos materializeEpoch msg
+    recordRemoteNative result.cached
+    error msg
+  let art ← computeArtifact act.file ext
+  let record : RemoteExec.Record := {
+    action := result.action
+    outputs := ({} : Std.TreeMap String RemoteExec.RecordOutput).insert name
+      {digest := out.digest, executable := out.executable} }
+  return {art, record, outcome := run}
+
+/-- The job of `buildNativeArtifact` but its line: returns the artifact and, when the file holds the service's output,
+its record. -/
+def NativeAction.fetch (act : NativeAction) (s : RemoteSession) (ext : String) (build : JobM PUnit)
+    (outcome : IO.Ref RemoteOutcome) : JobM (Artifact × Option RemoteExec.Record) := do
+  if let some t := s.cfg.timeoutTrace? then addTrace t
+  let depTrace ← getTrace
+  let inputHash := depTrace.hash
+  let file := act.file
+  let traceFile := FilePath.mk (file.toString ++ ".trace")
+  let savedTrace ← readTraceFile traceFile
+  let some pkg ← getCurrPackage?
+    | error s!"{act.target}: a native artifact of service mode belongs to no package"
+  let name := act.kind.outputName
+  let exe (record : RemoteExec.Record) := (record.outputs.get? name).any (·.executable)
+  let finish (art : Artifact) (record? : Option RemoteExec.Record) :
+      JobM (Artifact × Option RemoteExec.Record) := do
+    if let some ref ← Internal.getOutputsRef? pkg then
+      ref.insert inputHash art.descr
+    setTrace art.trace
+    return (← Internal.withTraceMTime art traceFile, record?)
+  -- A replay or a restore that fails did not bring the output into the tree
+  outcome.set (.error "materialize")
+  if let some record ← savedTrace.serviceRecord? inputHash file then
+    discard <| savedTrace.replayCachedIfUpToDate inputHash
+    let art ← cacheServiceArtifact pkg inputHash file ext (exe record) record savedTrace.log
+    outcome.set (.ofRecord "local-cache" record)
+    return ← finish art (some record)
+  if let some (art, record) ← restoreServiceArtifact? pkg inputHash savedTrace file name then
+    outcome.set (.ofRecord "local-cache" record)
+    return ← finish art (some record)
+  let objs? ← act.serviceObjects?
+  let useIt ← do
+    if (← getNoBuild) then
+      -- `buildAction` fails before any request
+      outcome.set (.error "no-build")
+      pure true
+    -- A link takes no object that the fallback built here: it links here too
+    else if objs?.isNone then pure false
+    else useService s outcome
+  if useIt then
+    let built? ← retryWhileUnavailable s outcome fun why =>
+      buildAction depTrace traceFile (act.buildRemote s (objs?.getD #[]) ext outcome why)
+        (remote? := (some ·.record))
+    if let some b := built? then
+      let art ← cacheServiceArtifact pkg inputHash file ext (exe b.record) b.record
+        (← readTraceFile traceFile).log
+      outcome.set b.outcome
+      return ← finish art (some b.record)
+  let result := if (← remoteDecision?) matches some (.toolchainMismatch _) then
+    "toolchain-mismatch" else "local"
+  -- A local build that fails gives the line no exit code
+  outcome.set {result}
+  let built ← trackBuilds
+  -- Native outputs are always at their path, which a link's request names
+  let art ← buildArtifactUnlessUpToDate file build (ext := ext) (restore := true) (remoteRead := false)
+  if (← built) then
+    recordRemoteNativeLocal
+    outcome.set {result, exitCode? := some 0}
+  else
+    outcome.set (.ofRecord "local-cache" none)
+  return (art, none)
+
+/--
+Builds the native artifact of `act` in service mode (contract C3.1) as `buildArtifactUnlessUpToDate` builds it with
+`build` (`ext` is its extension in the Lake cache), with the current job's trace and the timeout rule
+(`RemoteExecConfig.timeoutTrace?`). The artifact is up to date when its trace has the job's input hash and a service
+record that describes the file (`SavedTrace.serviceRecord?`): the job replays it. Else the Lake cache restores it
+when its trace or entry has a service record (`restoreServiceArtifact?`; the shared remote cache is not read, because
+its native bytes come from another machine's compiler). Else `useService` decides: the service runs the action
+(`NativeAction.buildRemote`), its output is materialized at the file's path, and the trace and the Lake cache entry
+(`cacheServiceArtifact`) get the service's record. The fallback `local`, and a link whose object the fallback built,
+build the artifact here with `build` on `buildArtifactUnlessUpToDate`'s path, with no record; under `fail` and `wait`
+it follows the rules of a Lean module (`useService`, `retryWhileUnavailable`). Under `--no-build` it sends no request.
+The job writes one line to `LAKE_REMOTE_EXEC_LOG`, also when it fails, and registers the artifact
+(`nativeArtifacts`).
+-/
+public def buildNativeArtifact (s : RemoteSession) (act : NativeAction) (ext : String) (build : JobM PUnit) :
+    JobM Artifact := do
+  let start ← RemoteLogStart.now
+  let outcome ← IO.mkRef (RemoteOutcome.error "materialize")
+  let writeLine (o : RemoteOutcome) : JobM Unit := do
+    let some log := s.cfg.log? | return
+    if let .error e ← (appendRemoteLog log act.kind.lineKind act.target start o).toBaseIO then
+      error s!"{act.target}: could not append its line to LAKE_REMOTE_EXEC_LOG: {e}"
+  let (art, record?) ← tryCatch (act.fetch s ext build outcome) fun e => do
+    writeLine (← if (← getThe JobState).canceled then pure (RemoteOutcome.error "canceled") else outcome.get)
+    throw e
+  registerNativeArtifact {action := act, record?}
+  writeLine (← outcome.get)
+  return art
+
+/--
+Builds the object file `oFile` of a module from its C file as `Internal.buildLeanO` does, with the same trace; in
+service mode on the build service (`CCompile`, `buildNativeArtifact`). `facet` is the object's facet, `c.o.export` or
+`c.o.noexport`.
+-/
+public def buildModuleO (mod : Module) (facet : String) (oFile : FilePath) (cJob : Job FilePath)
+    (weakArgs traceArgs : Array String) (leanIncludeDir? : Option (FilePath × BuildTrace)) :
+    SpawnM (Job FilePath) :=
+  cJob.mapM fun cFile => do
+    Internal.addLeanOTrace traceArgs leanIncludeDir?
+    let compile := Internal.compileLeanO oFile cFile weakArgs traceArgs leanIncludeDir?
+    let art ← match ← remoteSession? with
+      | none => buildArtifactUnlessUpToDate oFile compile (ext := "o")
+      | some s =>
+        let act : NativeAction := {
+          kind := .cCompile, target := s!"{mod.name}:{facet}", file := oFile, rel := remoteIrPath mod facet
+          inputs := .source cFile (remoteIrPath mod "c"), args := weakArgs ++ traceArgs }
+        buildNativeArtifact s act "o" compile
+    return art.path
+
+/--
+Links a Lean shared library as `buildLeanSharedLib` does, with the same trace; in service mode on the build service
+(`buildNativeArtifact`) as the action `kind` with `target`, whose output is `rel` in the input root. As on Linux, no
+library of `linkLibs` is an argument of the link (`linkDeps` is false), so none is an input of the action. A link one
+of whose objects is no native artifact of this build (an object of the LLVM backend, or of another target) links here,
+as `buildLeanSharedLib` does, and writes no line.
+-/
+public def buildNativeSharedLib (kind : NativeKind) (target rel : String) (libName : String) (libFile : FilePath)
+    (linkObjs : Array (Job FilePath)) (linkLibs : Array (Job Dynlib)) (weakArgs traceArgs : Array String)
+    (plugin : Bool) : SpawnM (Job Dynlib) :=
+  (Job.collectArray linkObjs "linkObjs").bindM (sync := true) fun objs => do
+  (Job.collectArray linkLibs "linkLibs").mapM fun libs => do
+    addPureTrace traceArgs "traceArgs"
+    let args := weakArgs ++ traceArgs
+    let some s ← remoteSession?
+      | buildLeanSharedLibSync libName libFile objs libs args plugin
+    let registered ← objs.allM fun obj => do return (← nativeArtifact? obj).isSome
+    unless registered do
+      return ← buildLeanSharedLibSync libName libFile objs libs args plugin
+    Internal.addLeanSharedLibTrace
+    let act : NativeAction := {kind, target, file := libFile, rel, inputs := .objects objs, args}
+    let art ← buildNativeArtifact s act sharedLibExt (Internal.linkLeanSharedLib libFile objs libs args)
+    return {name := libName, path := art.path, deps := libs, plugin}
 
 end Lake
