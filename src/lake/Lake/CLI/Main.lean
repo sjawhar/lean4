@@ -1582,8 +1582,19 @@ def lake : CliM PUnit := do
       else
         throw <| CliError.missingCommand
 
-/-- Runs the Lake command `args`. With `oneShot`, the process exits when it returns (`LakeOptions.oneShot`). -/
+/--
+Runs the Lake command `args`. With `oneShot`, the process exits when it returns
+(`LakeOptions.oneShot`); if the command abandoned a re-probe of the build service
+(`remoteProbeAbandoned`), `cli` ends the process itself (`exitProcess`) with the command's exit code
+once the command has ended.
+-/
 public def cli (args : List String) (oneShot := false) : BaseIO ExitCode := do
   -- However a command ends (an exception included), stop the build service's re-probe timer and
   -- bridge: their tasks would otherwise keep this process from exiting.
-  try inline <| (lake).run args oneShot finally shutdownRemote
+  let rc ← try inline <| (lake).run args oneShot finally shutdownRemote
+  -- When `main` returns, the runtime waits for every task, the abandoned re-probe's too, which waits
+  -- for its bridge. On POSIX the status is the one that returning `rc` gives.
+  if oneShot && (← remoteProbeAbandoned) then
+    (exitProcess rc.toUInt8).catchExceptions fun _ => pure rc
+  else
+    return rc
