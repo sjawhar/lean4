@@ -354,7 +354,8 @@ def probeStopWaitMs : Nat := 1000
 builtin_initialize remoteProbeAbandonedRef : IO.Ref Bool ← IO.mkRef false
 
 /-- Whether `stopProbeTimer` abandoned a re-probe timer in this process. Its task may still run, and
-the runtime waits for every task when `main` returns, so `Lake.cli` then exits the process instead. -/
+the runtime waits for every task when `main` returns, so `Lake.cli` then ends the process with
+`exitProcess` instead. -/
 public def remoteProbeAbandoned : BaseIO Bool :=
   remoteProbeAbandonedRef.get
 
@@ -376,11 +377,28 @@ def stopProbeTimer : BaseIO Unit := do
 
 /-- Ends this process's use of the build service, so that Lake can go on or exit: stops the re-probe
 timer (`stopProbeTimer`) and then the bridge (`RemoteExec.shutdown`); either's task would otherwise
-keep the process alive, as the task of a timer that `stopProbeTimer` abandons still does (`Lake.cli`
-then exits the process). Called at a build's end and however a Lake command ends. -/
+keep the process alive, as the task of a timer that `stopProbeTimer` abandons still does (see
+`exitProcess`). Called at a build's end and however a Lake command ends. -/
 public def shutdownRemote : BaseIO Unit := do
   stopProbeTimer
   RemoteExec.shutdown
+
+/--
+Ends the process with exit code `rc`. Once `stopProbeTimer` has abandoned a re-probe
+(`remoteProbeAbandoned`), it flushes Lake's standard output and error and uses
+`IO.Process.forceExit`: `IO.Process.exit` would wait for the probe, as glibc's `exit` flushes every
+stdio stream and takes each stream's lock, and the abandoned probe's `getLine` holds the lock of the
+probe's stdout. Each file Lake still holds open then is flushed as it is written.
+-/
+public def exitProcess (rc : UInt8) : IO α := do
+  if ← remoteProbeAbandoned then
+    try
+      (← IO.getStdout).flush
+      (← IO.getStderr).flush
+    catch _ => pure ()
+    IO.Process.forceExit rc
+  else
+    IO.Process.exit rc
 
 /--
 The decision, made once per process while holding the lock: every worker waits for the one `hello`

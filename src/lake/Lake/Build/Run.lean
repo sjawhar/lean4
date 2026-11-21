@@ -555,9 +555,9 @@ def finalizeBuild
     return a
   | .error e =>
     if cfg.noBuild && result.wantsRebuild then
-      IO.Process.exit noBuildCode.toUInt8
+      exitProcess noBuildCode.toUInt8
     else if (← failedOnlyForService bctx result) then
-      IO.Process.exit remoteUnavailableCode.toUInt8
+      exitProcess remoteUnavailableCode.toUInt8
     else
       throw (IO.userError e)
 
