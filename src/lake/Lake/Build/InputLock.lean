@@ -16,9 +16,10 @@ import Lake.Util.IO
 When two Lake processes on one machine share one writable artifact cache and both must build
 the same input (a module with the same input hash), only one of them builds it. Before a build
 that would compile or unpack the input's outputs, a job takes an exclusive `flock` of the file
-`<cache dir>/locks/<scope>/<input hash>`, looks in the local cache again, and keeps the lock
-until the outputs are in the cache (or the build failed). A job that waited on the lock thus
-restores the outputs the other process cached.
+`<cache dir>/locks/<scope>/<input hash>` and looks in the local cache again. The job holds the
+lock until the outputs are in the cache or the build failed, and may release it earlier while it
+waits for something else. A job that waited on the lock thus restores the outputs the other
+process cached, if any.
 
 The lock is off when `LAKE_NO_BUILD_LOCK` is true, under `--no-build`, and wherever the cache is
 not writable (the callers take it only on that path). If the lock file cannot be opened or locked,
