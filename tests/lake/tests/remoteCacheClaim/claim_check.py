@@ -62,6 +62,50 @@ def state(args):
         sys.exit(f"claim {claim} has no current wall-clock time in `at`")
 
 
+TAKEOVER = re.compile(
+    r"taking over the claim (\S+) \(state (\S+), last written (-?\d+|\?) s ago, "
+    r"unchanged for (\d+) s here(, holder gone)?\)"
+)
+
+
+def took_over(args):
+    """Checks the claims that the build in `log` took over (of the input `--hash` only, if
+    given): it took over at least one, and each in state `--state`, from a gone holder
+    (`--gone`), at its first read of that generation of the claim (`--first-look`: unchanged for
+    0 s), once the claim was stale by `--stale` seconds (last written, by the remote cache's
+    clock, or unchanged, by the build's own, for at least that long), and before `--before`
+    seconds had passed (last written, when the answer had times, and unchanged for less than
+    that long). Prints the lines that say so."""
+    found = []
+    with open(args.log, errors="replace") as f:
+        for line in f:
+            m = TAKEOVER.search(line)
+            if m and (args.hash is None or m.group(1).endswith("/" + args.hash)):
+                found.append(m)
+    if not found:
+        sys.exit(f"{args.log} took over no claim" + (f" of {args.hash}" if args.hash else ""))
+    for m in found:
+        print(m.group(0))
+    for m in found:
+        _, state, written, unchanged, gone = m.groups()
+        age = None if written == "?" else int(written)
+        unchanged = int(unchanged)
+        if args.state is not None and state != args.state:
+            sys.exit(f"took over a claim in state {state}, expected {args.state}")
+        if args.gone and gone is None:
+            sys.exit("took over a claim whose holder is not gone")
+        if args.first_look and unchanged != 0:
+            sys.exit(f"took over a claim that it had seen unchanged for {unchanged} s")
+        if args.stale is not None and not (
+            (age is not None and age >= args.stale) or unchanged >= args.stale
+        ):
+            sys.exit(f"took over a claim that was not stale by {args.stale} s")
+        if args.before is not None and not (
+            unchanged < args.before and (age is None or age < args.before)
+        ):
+            sys.exit(f"took over a claim no sooner than {args.before} s after it was written or seen")
+
+
 def wait_text(args):
     """Waits until a file contains a text."""
     deadline = time.time() + args.timeout
@@ -72,6 +116,24 @@ def wait_text(args):
                     return
         time.sleep(0.05)
     sys.exit(f"{args.file} does not contain {args.text!r} after {args.timeout} s")
+
+
+def wait_count(args):
+    """Waits until at least `n` lines of a file match a regular expression."""
+    pattern = re.compile(args.pattern)
+    deadline = time.time() + args.timeout
+    n = 0
+    while time.time() < deadline:
+        if os.path.exists(args.file):
+            with open(args.file, errors="replace") as f:
+                n = sum(1 for line in f if pattern.search(line))
+            if n >= args.n:
+                return
+        time.sleep(0.05)
+    sys.exit(
+        f"{args.file} has {n} lines that match {args.pattern!r} after {args.timeout} s, "
+        f"expected {args.n}"
+    )
 
 
 def wait_entries(args):
@@ -233,11 +295,28 @@ def main():
     p.add_argument("expect")
     p.set_defaults(run=state)
 
+    p = sub.add_parser("took-over", help=took_over.__doc__)
+    p.add_argument("log")
+    p.add_argument("--hash")
+    p.add_argument("--state")
+    p.add_argument("--gone", action="store_true")
+    p.add_argument("--first-look", action="store_true")
+    p.add_argument("--stale", type=int)
+    p.add_argument("--before", type=int)
+    p.set_defaults(run=took_over)
+
     p = sub.add_parser("wait-text", help=wait_text.__doc__)
     p.add_argument("file")
     p.add_argument("text")
     p.add_argument("--timeout", type=float, default=60)
     p.set_defaults(run=wait_text)
+
+    p = sub.add_parser("wait-count", help=wait_count.__doc__)
+    p.add_argument("file")
+    p.add_argument("pattern")
+    p.add_argument("n", type=int)
+    p.add_argument("--timeout", type=float, default=60)
+    p.set_defaults(run=wait_count)
 
     p = sub.add_parser("wait-entries", help=wait_entries.__doc__)
     p.add_argument("dir")
