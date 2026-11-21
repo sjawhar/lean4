@@ -222,13 +222,21 @@ has `moreLinkObjs` or whose package has an `extern_lib`.
 No file that this machine compiled is an input of an action on the service, except a shared
 library that stays on this machine (above) and the files that `leanir` writes. A module, C object
 or shared library that this machine built (by the fallback, in an earlier build, or with service
-mode off) has no service record. While its trace is up to date, Lake uses it in every mode, with
-the result local-cache. Before an action on the service takes it as an input, Lake runs its own
-action on the service and writes the service's files over the local ones. This promotion writes
-no line: the target keeps its one line. The outputs that LAKE_USAGE_CUTOFF kept or skipped are
-promoted in the same way. The actions of one commit have the same digests on two machines when
-LAKE_REMOTE_EXEC_SYSROOT (unset: the path of the local sysroot), LAKE_REMOTE_EXEC_TOOLCHAIN,
-LAKE_REMOTE_EXEC_CC, LAKE_REMOTE_EXEC_PATH and LAKE_REMOTE_EXEC_TIMEOUT are the same on both.
+mode off) has no service record. While its trace is up to date, Lake uses it as it is, with the
+result local-cache, under --no-build and while the build does not use the service (it does not
+answer, is refused or runs another Lean). When the build uses the service, the job of such a C
+object or shared library runs its action there and writes the service's file over the local one,
+with the result of that run, before the other jobs take the file. So does the job of such a module
+in a build with LAKE_USAGE_CUTOFF on: a local compile then passes --usage, which writes digests into
+the .olean, and the cutoff keeps or skips outputs, so they are not what the service compiles. Lake
+uses any other such module as it is. Before an action on the service takes an output with no
+record as an input, Lake runs its own action on the service and writes the service's files over
+the local ones. This promotion writes no line: the target keeps its one line. Lake assumes that,
+with the cutoff off, a local compile with the same toolchain gives the service's bytes; if it does
+not, the modules that import a promoted one build again on the service in the next build. The
+actions of one commit have the same digests on two machines when LAKE_REMOTE_EXEC_SYSROOT (unset:
+the path of the local sysroot), LAKE_REMOTE_EXEC_TOOLCHAIN, LAKE_REMOTE_EXEC_CC,
+LAKE_REMOTE_EXEC_PATH and LAKE_REMOTE_EXEC_TIMEOUT are the same on both.
 
 The service does not answer when its `hello` finds it unreachable, or when a request still answers
 UNAVAILABLE after the daemon's own retries. Then LAKE_REMOTE_EXEC_FALLBACK decides, for a module,
@@ -301,8 +309,8 @@ The build ends with `lake: remote: <state>; <c> cached (<m> from manifest), <e> 
 other actions: <c> cached, <e> executed, <l> local`. The first counts are for Lean modules, and the
 other actions are the C objects and shared libraries. `executed` counts every action that the
 service ran for this build, compiles that failed there included. `local` counts what the fallback
-built on this machine. Lake counts no local-cache line and no promotion. `<state>` is ok,
-unreachable, off: <reason>, or idle."
+built on this machine. Lake counts no local-cache line and no promotion of an input. `<state>` is
+ok, unreachable, off: <reason>, or idle."
 
 def helpQuery :=
 "Build targets and output results

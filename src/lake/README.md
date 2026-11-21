@@ -623,7 +623,7 @@ Besides the action of each Lean module, the service runs three native actions:
 * `LinkShared` links the shared library of a module (the facet `dynlib`, which Lean loads as a plugin).
 * `LinkSharedLibrary` links the shared library of a library (the facet `shared`).
 
-These actions run `LAKE_REMOTE_EXEC_CC` with `LAKE_REMOTE_EXEC_PATH` as `PATH`, and with the headers and libraries of `LAKE_REMOTE_EXEC_SYSROOT`. Lake starts no C compiler or linker of this machine for them. A C object or shared library whose trace is up to date is used as it is in every mode (with the service answering or not, under `--no-build`, and under each fallback), also when a local build made it, and its line has the result `local-cache`. Lake runs the action of such a local file on the service only when an action on the service takes the file as an input (see [Inputs of Service Actions](#inputs-of-service-actions)). From the Lake cache, Lake takes a C object or shared library only together with the service's record of the file. Otherwise it sends the action to the service. When the service does not answer, the fallback `local` builds the file with the local compiler, as outside service mode.
+These actions run `LAKE_REMOTE_EXEC_CC` with `LAKE_REMOTE_EXEC_PATH` as `PATH`, and with the headers and libraries of `LAKE_REMOTE_EXEC_SYSROOT`. Lake starts no C compiler or linker of this machine for them. A C object or shared library whose trace is up to date and has the service's record is used as it is, and its line has the result `local-cache`. A C object or shared library that a local build made has no record. While its trace is up to date, Lake uses it as it is under `--no-build` and while the build does not use the service (the service does not answer, is refused, or runs another Lean): its line has the result `local-cache`, with `action` and `outputs` `null`, and Lake runs its action on the service later only when an action on the service takes the file as an input (see [Inputs of Service Actions](#inputs-of-service-actions)). When the build uses the service, the job of such a file sends its action to the service and writes the service's file over the local one, so that the other jobs of the build take the service's file; its line has the result of that run, `executed` or `cached`. From the Lake cache, Lake takes a C object or shared library only together with the service's record of the file. Otherwise it sends the action to the service. When the service does not answer, the fallback `local` builds the file with the local compiler, as outside service mode.
 
 These targets stay on this machine, as outside service mode, and write no line to `LAKE_REMOTE_EXEC_LOG`:
 
@@ -645,7 +645,11 @@ A module, C object or shared library that this machine built has no service reco
 4. Lake writes the service's files over the local files.
 5. Lake writes the service's record into the trace and into the Lake cache entry, and releases the lock.
 
-One promotion serves every job of the build that needs the output. A promotion writes no line to `LAKE_REMOTE_EXEC_LOG`, and the end-of-build line does not count it. The promoted target keeps the one line that its job wrote, for example `local` or `local-cache`. The outputs that `LAKE_USAGE_CUTOFF` kept or skipped are local outputs too. Lake promotes them when a service action needs them: the service compiles the current source, and its outputs replace the kept outputs.
+One promotion serves every job of the build that needs the output. A promotion writes no line to `LAKE_REMOTE_EXEC_LOG`, and the end-of-build line does not count it. The promoted target keeps the one line that its job wrote, for example `local` or `local-cache`. A C object or shared library whose trace is up to date is promoted by its own job instead, when the build uses the service, before the other jobs take its file (see [Native Code on the Service](#native-code-on-the-service)).
+
+So is a module with no service record whose trace is up to date in a build with `LAKE_USAGE_CUTOFF` on. Its outputs are not what the service compiles: a local compile with the cutoff passes `--usage`, which writes usage digests into the `.olean`, and the cutoff keeps or skips outputs of an older compile. When the build uses the service, the job of such a module sends its action to the service, and its line has the result of that run; the service compiles the current source, and its outputs replace the local ones, kept outputs included, before the importers of the module take them. Under `--no-build`, and while the build does not use the service, Lake uses such a module as it is.
+
+With the cutoff off, Lake uses a module whose trace is up to date as it is, with the result `local-cache`, and promotes it only when a service action takes it as an input. This relies on one assumption: a local compile with the same toolchain writes the bytes that the service writes. If a toolchain breaks it, the modules that hashed the local outputs build once more on the service in the next build; no result is wrong.
 
 Lake promotes under every fallback when the service answers. A promotion that gets no answer from the service has the same effect as a request of the target that needs it: `local` builds that target on this machine, `fail` fails it with the code `UNAVAILABLE`, and `wait` waits. Under `--no-build`, Lake sends no request and promotes nothing.
 
@@ -741,7 +745,7 @@ These write no line:
 * the file that `lake lean` runs, because it is not a module of the build (its imports write their lines)
 * a C object or shared library whose input failed (the line of the module gives the cause)
 * the targets that stay on this machine (see [Native Code on the Service](#native-code-on-the-service))
-* a promotion (the promoted target keeps its one line)
+* the promotion of an input (the promoted target keeps its one line)
 
 At the end of the build, Lake prints a line of this form:
 
@@ -749,7 +753,7 @@ At the end of the build, Lake prints a line of this form:
 lake: remote: <state>; <c> cached (<m> from manifest), <e> executed, <l> local; other actions: <c> cached, <e> executed, <l> local
 ```
 
-The first counts are for Lean modules. The other actions are the C objects and shared libraries. `executed` counts each action that the service ran for this build, compiles that failed there included. `local` counts what the fallback built on this machine. Lake does not count the outputs that it found on this machine (`local-cache`), or promotions. `<state>` is `ok`, `unreachable`, `off: <reason>` or `idle`.
+The first counts are for Lean modules. The other actions are the C objects and shared libraries. `executed` counts each action that the service ran for this build, compiles that failed there included. `local` counts what the fallback built on this machine. Lake does not count the outputs that it found on this machine (`local-cache`), or the promotions of inputs. `<state>` is `ok`, `unreachable`, `off: <reason>` or `idle`.
 
 ### Local Cache in Build-Service Mode
 

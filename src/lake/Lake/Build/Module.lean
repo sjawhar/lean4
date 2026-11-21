@@ -1585,14 +1585,15 @@ def ModuleLine.write (line : ModuleLine) (mod : Module) (o : RemoteOutcome) : IO
 /--
 Writes the line of a module job that ended before `fetchCore` wrote one: its presetup failed, so
 `Job.bindM` never ran the job's work, or `--fail-fast` canceled the job before or between its runs. The
-line is `import-failed` when the job of one of the module's direct imports failed (a canceled import did
-not, as the presetup's import fold takes it), else `error` with code `canceled` for a canceled job, else
-`error` with code `setup`. It reads only jobs that have finished, and waits for none: the module's own job
-(a module that imports itself) is the one this ends, and an import whose failure failed the presetup has
-finished, or its presetup has (then its job fails too). The line is written before any reader sees the
-job's result. A module whose import failed is no failure of its own (exit code 75 counts the failures of
-the service, `failedOnlyForService`), so the job logs no error; a line it cannot append is a warning in
-its log.
+line is `import-failed` when a job of one of the module's direct imports that the presetup waits on
+failed (an import that was only canceled did not, as the presetup's import fold takes it): its
+`elabArts`, its presetup, or, while the build's cancellation token is unset, its `metaExportInfo`
+(`fetchImportInfo`), which also waits on its `irArts`. Else the line is `error` with code `canceled` for
+a canceled job, else `error` with code `setup`. It reads only jobs that have finished, and waits for
+none: an import's job whose failure failed the presetup has finished, or the import's presetup has (then
+that job fails too). The line is written before any reader sees the job's result. A module whose import
+failed is no failure of its own (exit code 75 counts the failures of the service,
+`failedOnlyForService`), so the job logs no error; a line it cannot append is a warning in its log.
 -/
 def Module.writeUnwrittenLine (mod : Module) (line : ModuleLine) (job : Job ModuleOutputArtifacts) :
     SpawnM (Job ModuleOutputArtifacts) := .ofFn fun _ _ _ store ctx _ =>
@@ -1600,6 +1601,9 @@ def Module.writeUnwrittenLine (mod : Module) (line : ModuleLine) (job : Job Modu
     let .error e s := r | return r
     if ← line.written.get then return r
     let snap ← store.get
+    let canceling ← match ctx.cancelTk? with
+      | some tk => tk.isSet
+      | none => pure false
     -- The result of a job that the build started, if it has finished (read with no wait)
     let finished? {α : Type} (job? : Option (Job α)) : BaseIO (Option (JobResult α)) := do
       let some job := job? | return none
@@ -1609,24 +1613,29 @@ def Module.writeUnwrittenLine (mod : Module) (line : ModuleLine) (job : Job Modu
       return match ← finished? job? with
         | some (.error _ si) => !si.canceled || si.log.maxLv ≥ .error
         | _ => false
-    -- The direct imports, from the module's header if it was read
+    -- The direct imports, from the module's header if it was read: for each import, every package's
+    -- module of its name, as `fetchImportInfo` waits on each
     let imports : Array Module := match (← finished? (snap.getInfo? mod.input)) with
-      | some (.ok input _) => input.imports.filterMap (·.module?) |>.filter (· != mod)
+      | some (.ok input _) =>
+        -- Not a self-import: the module's own presetup, which it fails, would make the line
+        -- `import-failed`, not `error` with code `setup`
+        input.imports.filter (·.module != mod.name) |>.flatMap (ctx.workspace.findModules ·.module)
       | _ => #[]
+    -- Once the cancellation token is set, an import's `metaExportInfo` also fails when the token canceled a
+    -- continuation it waits on (its `irArts`, after its `elabArts` succeeded), which the renewed state of a
+    -- registered job no longer says: so it counts only while the token is unset
     let importFailed ← imports.anyM fun imp =>
-      failed (snap.getInfo? imp.elabArts) <||> failed (snap.getInfo? imp.presetup)
+      failed (snap.getInfo? imp.elabArts) <||> failed (snap.getInfo? imp.presetup) <||>
+        (if canceling then pure false else failed (snap.getInfo? imp.metaExportInfo))
     -- A job that failed with no error of its own logged once the build was canceled was canceled
     -- too, as a fetch is (`isCanceledFetch`)
-    let canceled ← pure s.canceled <||> do
-      let some tk := ctx.cancelTk? | return false
-      return (← tk.isSet) && !(s.log.hasEntries && s.log.maxLv ≥ .error)
+    let canceled := s.canceled || (canceling && !(s.log.hasEntries && s.log.maxLv ≥ .error))
     let o : RemoteOutcome :=
       if importFailed then {result := "import-failed"}
       else if canceled then .error "canceled"
       else .error "setup"
     let .error err ← (line.write mod o).toBaseIO | return r
-    return .error e <| s.logEntry <|
-      .warning s!"{mod.name}: could not append its line to LAKE_REMOTE_EXEC_LOG: {err}"
+    return .error e <| s.logEntry <| .warning (remoteLineAppendFailure mod.name.toString err)
 
 /--
 The path part of a module's action (contract C2.1): plugins, dynlibs and `LEAN_PATH`, rewritten to input-root-relative
@@ -1956,10 +1965,16 @@ Fetch a module's outputs from the build service (contract C5.1): replay an up-to
 request, else restore them from the local Lake cache with no request (`fromCache`, as `fetchLocal`
 restores before a compile), otherwise `run` the action, materialize the outputs, write the trace as a
 local compile does (`buildRemote`), and save them to the local Lake cache (`cacheRemoteOutputs`), both
-with the service's record of the outputs. Returns `none` when the service is unavailable or has a
-confirmed toolchain mismatch and `LAKE_REMOTE_EXEC_FALLBACK` is `local` (`useService`,
-`remoteUnavailable`): the caller then compiles on this machine, where imports' outputs were
-materialized. A request that answers `UNAVAILABLE` after a probe found the service again (the epoch
+with the service's record of the outputs. Outputs with no record whose trace is up to date in a build
+with the usage cutoff on come from a local compile with `--usage` (which writes digests into the
+`.olean`), a usage skip or a kept check, so a service compile does not give their bytes: when the build
+uses the service (`serviceAnswers`, not `--no-build`), the module is compiled there instead, so that
+each importer of this build takes the hash of the service's outputs, as the next build does. Without
+the cutoff, a local compile with the same toolchain gives the service's bytes, so such outputs replay
+and are promoted only when a service action takes them (`Module.serviceFor`). Returns `none` when the
+service is unavailable or has a confirmed toolchain mismatch and `LAKE_REMOTE_EXEC_FALLBACK` is `local`
+(`useService`, `remoteUnavailable`): the caller then compiles on this machine, where imports' outputs
+were materialized. A request that answers `UNAVAILABLE` after a probe found the service again (the epoch
 moved since it was sent) is sent again (`retryWhileUnavailable`). Under `wait`, an unavailable
 request is retried once the service answers (`awaitServiceAgain`); a confirmed mismatch fails with
 exit 75. A result of the service (a nonzero exit, `OOM`, `TIMEOUT`, `DISK_LIMIT`) and every other
@@ -1974,15 +1989,25 @@ def Module.fetchRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSes
   line.outcome.set (.error "materialize")
   -- The outputs are checked before the saved log is replayed, so a module that is rebuilt because
   -- an output went missing does not print its messages twice.
-  if (← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile) then
-    if (← savedTrace.replayCachedIfUpToDate inputHash) then
-      let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
-      line.outcome.set (.ofRecord "local-cache" savedTrace.remote?)
-      return some {arts with keptFrom? := savedTrace.keptFrom?}
-  line.found.set none
-  if let some arts ← fromCache savedTrace then
-    line.outcome.set ((← line.found.get).getD (.ofRecord "local-cache" none))
-    return some arts
+  let outputsHere ← mod.checkArtifactsExist presetup.isModule presetup.postponeCompile
+  let traced := match savedTrace with
+    | .ok data => data.depHash == inputHash
+    | _ => false
+  -- The usage cutoff's setting is an input of the trace, so the build's setting is the outputs'
+  let toService ← do
+    if !outputsHere || !traced || savedTrace.remote?.isSome || (← getNoBuild) || !(← usageCutoffEnabled) then
+      pure false
+    else serviceAnswers s
+  unless toService do
+    if outputsHere then
+      if (← savedTrace.replayCachedIfUpToDate inputHash) then
+        let arts ← mod.computeArtifacts presetup.isModule presetup.postponeCompile
+        line.outcome.set (.ofRecord "local-cache" savedTrace.remote?)
+        return some {arts with keptFrom? := savedTrace.keptFrom?}
+    line.found.set none
+    if let some arts ← fromCache savedTrace then
+      line.outcome.set ((← line.found.get).getD (.ofRecord "local-cache" none))
+      return some arts
   -- Under `--no-build` the action fails before any request (`buildAction`): no `hello`, no wait.
   if (← getNoBuild) then
     line.outcome.set (.error "no-build")

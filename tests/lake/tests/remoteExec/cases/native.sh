@@ -1,11 +1,11 @@
-# The `native` group of test.sh, which sources it: the C compiles and links of service mode (A6), rows N1-N12,
+# The `native` group of test.sh, which sources it: the C compiles and links of service mode (A6), rows N1-N13,
 # where N8 is T7 (the timeout of native actions), so the row is named T7. The package `native/` has a library
 # `Nat0` whose modules are precompiled, so each module has an object (`CCompile`), `Nat0.Use`'s compile loads
 # `Nat0.Tac`'s module library (`LinkShared`) as a plugin, and `Use2`'s compile loads `Nat0`'s library
 # (`LinkSharedLibrary`). Each row builds in a directory of its own under $WORK/native, with its own service
 # (FAKE_CAS) and Lake cache, and each build has a fake log and a LAKE_REMOTE_EXEC_LOG of its own. N2, N4 and N5
-# read N1's tree, and N10 and N12 read N10's: `build_N1` and `build_N10` build each once, so that each row also runs
-# alone.
+# read N1's tree, N10 and N12 read N10's, and N11 and N13 read N11's: `build_N1`, `build_N10` and `build_N11` build
+# each once, so that each row also runs alone.
 
 NW=$GW
 export LAKE_REMOTE_EXEC=grpc://fake:1
@@ -233,20 +233,36 @@ row_N10() (
     --expect 'Nat0.Tac:c.o.export|Nat0.Tac:dynlib:result=local-cache,action=null,outputs=null,code=null'
 )
 
-# N11: a tree built here by the fallback `local`, then Use2 changed and built with the service answering: the objects
-# and libraries replay (`local-cache`, no record) and send no request of their own, and Use2's request takes Nat0's
-# library by the digest of the service's output. So Lake first promotes the library and its inputs (their runs on the
-# service, which the end-of-build line does not count), and their files then hold the service's bytes
-row_N11() (
+# N11's tree: `native/` built here by the fallback `local` while the service does not answer, with a local C compiler
+# that writes other bytes than the service's (`-g`, as D1's), then Use2 changed and built with the service answering;
+# Lake's output of that build is in $NW/N11.out
+build_N11() (
+  [ ! -e "$NW/N11.built" ] || exit 0
   enter N11 native; logs N11-local
-  FAKE_UNREACHABLE=1 test_run build Use2 Nat0:shared
+  mkdir -p "$NW/N11.bin"
+  printf '#!/bin/sh\nexec "%s" -g "$@"\n' "$LAKE_REMOTE_EXEC_CC" > "$NW/N11.bin/cc"
+  chmod +x "$NW/N11.bin/cc"
+  LEAN_CC=cc PATH="$NW/N11.bin:$PATH" FAKE_UNREACHABLE=1 test_run build Use2 Nat0:shared
   logs N11
   printf '\n-- a change of N11\n' >> Use2.lean
   lake_out build Use2 Nat0:shared
   cp produced.out "$NW/N11.out"
-  check_lines "$NW/N11.jsonl" --modules "$MODS" --expect 'Use2:result=executed' \
-    --expect "Nat0|Nat0.Tac|Nat0.Use|$OBJS|$LIBS:result=local-cache,action=null,outputs=null,code=null" --unique
-  match_text "other actions: 0 cached, 0 executed, 0 local" "$NW/N11.out"
+  touch "$NW/N11.built"
+)
+
+# N11: in N11's second build the objects are up to date with no service record, and the service answers: so each
+# object's job builds it on the service (`executed`, counted), and each consumer takes the service's bytes. The
+# libraries that link the objects, and Nat0.Use and Nat0, whose compiles load those libraries, are out of date, and
+# build on the service too. Nat0.Tac replays (`local-cache`, no record), and is promoted when its object's request
+# takes its C file. Use2's request takes Nat0's library by the digest of the service's output, and the files hold the
+# service's bytes
+row_N11() (
+  build_N11
+  state N11; export FAKE_LOG="$NW/N11.fake.log"
+  check_lines "$NW/N11.jsonl" --modules "$MODS" --expect 'Nat0|Nat0.Use|Use2:result=executed' \
+    --expect 'Nat0.Tac:result=local-cache,action=null,outputs=null,code=null' \
+    --expect "$OBJS|$LIBS:result=executed,action=digest,outputs=digests,exitCode=0,code=null" --unique
+  match_text "other actions: 0 cached, 6 executed, 0 local" "$NW/N11.out"
   test_cmd_eq "$NATIVES" natives
   test_cmd by_service_digest Use2 native/Nat0:shared
   test_cmd fake_bytes $FILES
@@ -263,4 +279,19 @@ row_N12() (
   match_text 'only works with `module`s' produced.out
 )
 
-run_rows N1 N2 N3 N4 N5 N6 N7 T7 N9 N10 N11 N12
+# N13: N11's second build leaves the tree up to date: `--no-build` builds nothing and sends no request, and each
+# line is `local-cache` with the service's record; the next build sends no request either
+row_N13() (
+  build_N11
+  state N11; logs N13
+  test_run build --no-build Use2 Nat0:shared
+  test_cmd_eq 0 count_method run
+  check_lines "$NW/N13.jsonl" --modules "$MODS" \
+    --expect "Nat0|Nat0.Tac|Nat0.Use|Use2|$OBJS|$LIBS:result=local-cache,action=digest,outputs=digests,code=null" \
+    --unique
+  logs N13-again
+  test_run build Use2 Nat0:shared
+  test_cmd_eq 0 count_method run
+)
+
+run_rows N1 N2 N3 N4 N5 N6 N7 T7 N9 N10 N11 N12 N13
