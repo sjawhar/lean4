@@ -633,6 +633,8 @@ These targets stay on this machine, as outside service mode, and write no line t
 * `leanir`, the separate code generation of a module with `postponeCompile`
 * the shared library of a library that has `moreLinkObjs`, or whose package has an `extern_lib`
 
+After a promotion (see [Inputs of Service Actions](#inputs-of-service-actions)) changes the `.olean` of a module with `postponeCompile`, the next build runs the module's `leanir` step again. If that step writes other files, the modules that import it go to the service again.
+
 ### Inputs of Service Actions
 
 No file that this machine compiled is an input of an action on the service, with two exceptions: a shared library that stays on this machine (see the list above), and the files that `leanir` writes. Lake sends the imports of a module by path, and their files hold the outputs of the service. Lake sends each other plugin and shared library of the workspace by the digest and the executable bit of the service's output, not as a local file.

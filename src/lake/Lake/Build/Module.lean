@@ -1553,6 +1553,61 @@ def Module.checkSourceUnchanged (mod : Module) (presetup : ModulePreSetup) : Job
     error s!"{relSrcFile}: source file was modified during the build; \
       its outputs were discarded (build again to compile the current version)"
 
+/--
+The outputs that a module's archive (`.ltar`) holds after its trace, in archive order, each with
+the base directory it is relative to: `false` for the library directory (the `.olean` parts,
+`.ilean` and IR), `true` for the IR directory (the `.c` and `.bc`).
+-/
+public def ModuleOutputDescrs.ltarFiles
+  (descrs : ModuleOutputDescrs)
+: Except String (Array (ArtifactDescr × Bool)) := do
+  -- Note: oleans parts must be in the order of `.olean`, `.olean.server`, `.olean.private`
+  let mut files := descrs.oleanParts.map (·, false)
+  files := files.push (descrs.ilean, false)
+  if let some descr := descrs.irSig? then
+    files := files.push (descr, false)
+  if let some descr := descrs.ir? then
+    files := files.push (descr, false)
+  if let some descr := descrs.c? then
+    files := files.push (descr, true)
+  if Internal.hasLLVMBackend () then
+    let some descr := descrs.bc?
+      | throw "LLVM backend enabled but module outputs lack bitcode"
+    files := files.push (descr, true)
+  return files
+
+/--
+The `leantar` arguments that pack a module's outputs into the archive `ltar`: its trace,
+`fileName "trace"`, then the file `fileName ext` of each output of `files` (see `ltarFiles`),
+relative to `libDir` or `irDir`.
+
+`-s` strips the trace's `depHash`, so that the archive's bytes depend only on the files it holds.
+Consumers supply the hash again on unpack (see `Module.unpackLtar`).
+-/
+public def ltarPackArgs
+  (files : Array (ArtifactDescr × Bool)) (fileName : String → String) (libDir irDir ltar : FilePath)
+: Array String :=
+  let args := #["-s", "-C", libDir.toString, "-C", irDir.toString, ltar.toString, fileName "trace"]
+  files.foldl (init := args) fun args (descr, inIrDir) =>
+    args.push "-i" |>.push (if inIrDir then "1" else "0") |>.push (fileName descr.ext)
+
+def Module.packLtar
+  (self : Module) (arts : ModuleOutputArtifacts)
+: JobM Artifact := do
+  let arts ← id do
+    if (← self.checkArtifactsExist arts.isModule arts.c?.isNone) then
+      return arts
+    else self.restoreAllArtifacts arts
+  let files ← match arts.descrs.ltarFiles with
+    | .ok files => pure files
+    | .error e => error e
+  let args := ltarPackArgs files self.fileName self.leanLibDir self.irDir self.ltarFile
+  withBuildSlot <| proc (quiet := true) (lend := true) {cmd := (← getLeantar).toString, args}
+  if (← self.pkg.isArtifactCacheWritable) then
+    cacheArtifact self.ltarFile "ltar" (useLocalFile := ← self.pkg.restoreAllArtifacts)
+  else
+    computeArtifact self.ltarFile "ltar"
+
 section RemoteExec
 /-! ## Build service (contract C2.1, C5.1)
 
@@ -1712,8 +1767,9 @@ builtin_initialize modulePromotions :
 place of the outputs that the module's job hashed. -/
 builtin_initialize promotedModules : Std.Mutex (NameMap ModuleOutputArtifacts) ← Std.Mutex.new {}
 
-/-- For each module that its job built on the service (`Module.fetchRemote`), the hash of its trace and of its Lake
-cache entry (`RemoteBuild.depTrace`), which its entry in the `-o` outputs file takes too (`recBuildIRArts`). -/
+/-- For each module that its job built on the service (`Module.fetchRemote`) or that this process promoted
+(`Module.promote`), the hash of its trace and of its Lake cache entry (`RemoteBuild.depTrace`, `Module.retrace`), which
+its entry in the `-o` outputs file takes too (`recBuildIRArts`). -/
 builtin_initialize serviceInputHashes : Std.Mutex (NameMap Hash) ← Std.Mutex.new {}
 
 /-- The service record of the module's outputs `arts`, its job's result: its trace's, if the trace describes those
@@ -1772,12 +1828,39 @@ def Module.cacheRemoteOutputs (mod : Module) (presetup : ModulePreSetup) (inputH
     return arts
 
 /--
+Ends a promotion of the module (`Module.promote`, `Module.restorePromoted?`), whose files now hold the outputs `arts`
+with the service's bytes and whose trace is written under `depTrace`, the module's trace after the promotion of its
+inputs (`Module.retrace`): the trace of a `--no-build` run goes, and `serviceInputHashes` takes `depTrace`'s hash. When
+the old `.ltar` existed (`hadLtar`) or the build writes `-o` mappings, the archive is packed again from the outputs,
+and the module's `-o` entry, which its `irArts` job wrote before any promotion of the module (`trackOutputsIfEnabled`),
+becomes `depTrace`'s hash mapped to that archive, with no kept lineage. Notes the outputs in `promotedModules` and
+returns them.
+-/
+def Module.notePromoted (mod : Module) (presetup : ModulePreSetup) (depTrace : BuildTrace) (hadLtar : Bool)
+    (arts : ModuleOutputArtifacts) : JobM ModuleOutputArtifacts := do
+  removeFileIfExists (mod.traceFile.addExtension "nobuild")
+  let jobHash? ← serviceInputHashes.atomically (m := BaseIO) <|
+    modifyGet fun hashes => (hashes.find? mod.name, hashes.insert mod.name depTrace.hash)
+  let outputsRef? ← Internal.getOutputsRef? mod.pkg
+  let mut arts := arts
+  if hadLtar || outputsRef?.isSome then
+    -- After the trace, which the archive holds
+    let ltar ← mod.packLtar arts
+    arts := {arts with ltar? := some ltar}
+    if let some ref := outputsRef? then
+      -- The key of `trackOutputsIfEnabled`: the `irArts` job's trace is the setup's
+      ref.replace (jobHash?.getD presetup.trace.hash) depTrace.hash ltar.descr (mod.platformIndependent.getD false)
+  promotedModules.atomically (m := BaseIO) (modify (·.insert mod.name arts))
+  return arts
+
+/--
 Another Lake process's promotion of the module, if the Lake cache entry of `depTrace`, the module's trace after the
 promotion of its inputs (`Module.retrace`), has the service's record (`Module.promote` reads it under the input lock):
-restores the entry's outputs over the module's files, writes the trace as a promotion does, with that record, and notes
-the outputs in `promotedModules`.
+restores the entry's outputs over the module's files, writes the trace as a promotion does, with that record, and ends
+the promotion as `Module.promote` does (`Module.notePromoted`).
 -/
-def Module.restorePromoted? (mod : Module) (depTrace : BuildTrace) : JobM (Option ModuleService) := do
+def Module.restorePromoted? (mod : Module) (presetup : ModulePreSetup) (depTrace : BuildTrace) :
+    JobM (Option ModuleService) := do
   let out? ← try (← getLakeCache).readOutputs? mod.pkg.cacheScope depTrace.hash catch e => do
     dropLogFrom e
     pure none
@@ -1788,13 +1871,14 @@ def Module.restorePromoted? (mod : Module) (depTrace : BuildTrace) : JobM (Optio
     pure none
   let some arts := arts? | return none
   let log := (← readTraceFile mod.traceFile).log
+  let hadLtar ← mod.ltarFile.pathExists
   -- The files have the local build's bytes, which `restoreArtifact` would replace only with a warning; the `.ltar` and
   -- the usage sidecars go too, as in a promotion
   mod.clearOutputArtifacts
   mod.clearOutputHashes
   let arts ← mod.restoreAllArtifacts arts
   writeBuildTrace mod.traceFile depTrace (toJson arts.descrs) log (remote? := some record)
-  promotedModules.atomically (m := BaseIO) (modify (·.insert mod.name arts))
+  let arts ← mod.notePromoted presetup depTrace hadLtar arts
   return some {record, promoted? := some arts}
 
 /-- The value of `job`, a job of the build that ended; else why there is none, naming `what` the job made. -/
@@ -1949,19 +2033,22 @@ Promotes the module (see "Promotion of the inputs of service actions" in `Lake.B
 on the service, its imports and plugins promoted first (`Module.remoteRunRequest`, `remoteHead`), and materializes the
 outputs over its files. The `.hash` files, the trace and the Lake cache entry (`cacheRemoteOutputs`) then follow the
 service's bytes, with the service's record, the trace and the entry under the hash of the module's inputs after their
-promotion (`Module.retrace`); the old `.ltar` (packed from the old outputs) and the usage sidecars (which only a local
-compile writes) go, which also ends a kept lineage. The run, the materialize and the writes hold the input lock of the
+promotion (`Module.retrace`); the old `.ltar` (packed from the old outputs), the usage sidecars (which only a local
+compile writes) and the trace of a `--no-build` run go, which also ends a kept lineage. When the old `.ltar` existed or
+the build writes `-o` mappings, the archive is packed again from the promoted outputs, and the module's `-o` entry, which
+its `irArts` job wrote before any promotion of the module (`trackOutputsIfEnabled`), becomes the hash of the trace
+mapped to that archive (`Module.notePromoted`). The run, the materialize and the writes hold the input lock of the
 module's input under the hash from before that promotion, which the module's build takes (`promotionRun`); under it, a
-cache entry that has the service's record (another process promoted the module) is restored instead, with no request
-(`Module.restorePromoted?`). The module's job wrote its one line already, and the promotion replays none of Lean's
-messages and counts in no statistic.
+cache entry that has the service's record (another process promoted the module) is restored instead, with no request,
+and leaves the same records (`Module.restorePromoted?`). The module's job wrote its one line already, and the promotion
+replays none of Lean's messages and counts in no statistic.
 -/
 partial def Module.promote (mod : Module) (s : RemoteSession) : JobM (Except PromotionError ModuleService) := do
   let some presetup ← (← mod.presetup.fetch).wait?
     | return .error (.failed s!"{mod.name}: its setup failed")
   let msg (what : String) := s!"promoting {mod.name}: {what}"
   promotionRun s msg mod.pkg (s.mixTimeout presetup.trace).hash (mod.serviceRequest presetup s)
-    (some (do mod.restorePromoted? (← mod.retrace presetup s))) fun result => do
+    (some (do mod.restorePromoted? presetup (← mod.retrace presetup s))) fun result => do
   let outputFiles := mod.remoteOutputFiles
   let mut found := #[]
   for o in result.outputs do
@@ -1974,6 +2061,7 @@ partial def Module.promote (mod : Module) (s : RemoteSession) : JobM (Except Pro
   mod.clearOutputHashes
   if let .error e := materialized then
     return .error (.ofError e materializeEpoch (msg s!"materializing failed: {e.message}"))
+  let hadLtar ← mod.ltarFile.pathExists
   removeFileIfExists mod.ltarFile
   removeFileIfExists mod.usageFile
   removeFileIfExists mod.resolvedFile
@@ -1985,7 +2073,7 @@ partial def Module.promote (mod : Module) (s : RemoteSession) : JobM (Except Pro
   writeBuildTrace mod.traceFile depTrace (toJson arts.descrs) (← readTraceFile mod.traceFile).log
     (remote? := some record)
   let arts ← mod.cacheRemoteOutputs presetup depTrace.hash arts record
-  promotedModules.atomically (m := BaseIO) (modify (·.insert mod.name arts))
+  let arts ← mod.notePromoted presetup depTrace hadLtar arts
   return .ok {record, promoted? := some arts}
 
 /-- The `run` request of the module's action with its head (`remoteHead`, `Module.remoteRunRequest`), and each input
@@ -2259,61 +2347,6 @@ def Module.withSavedKeptFrom (mod : Module) (arts : ModuleOutputArtifacts) : Job
   if arts.keptFrom?.isSome then return arts
   return {arts with keptFrom? := (← readTraceFile mod.traceFile).keptFrom?}
 
-/--
-The outputs that a module's archive (`.ltar`) holds after its trace, in archive order, each with
-the base directory it is relative to: `false` for the library directory (the `.olean` parts,
-`.ilean` and IR), `true` for the IR directory (the `.c` and `.bc`).
--/
-public def ModuleOutputDescrs.ltarFiles
-  (descrs : ModuleOutputDescrs)
-: Except String (Array (ArtifactDescr × Bool)) := do
-  -- Note: oleans parts must be in the order of `.olean`, `.olean.server`, `.olean.private`
-  let mut files := descrs.oleanParts.map (·, false)
-  files := files.push (descrs.ilean, false)
-  if let some descr := descrs.irSig? then
-    files := files.push (descr, false)
-  if let some descr := descrs.ir? then
-    files := files.push (descr, false)
-  if let some descr := descrs.c? then
-    files := files.push (descr, true)
-  if Lean.Internal.hasLLVMBackend () then
-    let some descr := descrs.bc?
-      | throw "LLVM backend enabled but module outputs lack bitcode"
-    files := files.push (descr, true)
-  return files
-
-/--
-The `leantar` arguments that pack a module's outputs into the archive `ltar`: its trace,
-`fileName "trace"`, then the file `fileName ext` of each output of `files` (see `ltarFiles`),
-relative to `libDir` or `irDir`.
-
-`-s` strips the trace's `depHash`, so that the archive's bytes depend only on the files it holds.
-Consumers supply the hash again on unpack (see `Module.unpackLtar`).
--/
-public def ltarPackArgs
-  (files : Array (ArtifactDescr × Bool)) (fileName : String → String) (libDir irDir ltar : FilePath)
-: Array String :=
-  let args := #["-s", "-C", libDir.toString, "-C", irDir.toString, ltar.toString, fileName "trace"]
-  files.foldl (init := args) fun args (descr, inIrDir) =>
-    args.push "-i" |>.push (if inIrDir then "1" else "0") |>.push (fileName descr.ext)
-
-def Module.packLtar
-  (self : Module) (arts : ModuleOutputArtifacts)
-: JobM Artifact := do
-  let arts ← id do
-    if (← self.checkArtifactsExist arts.isModule arts.c?.isNone) then
-      return arts
-    else self.restoreAllArtifacts arts
-  let files ← match arts.descrs.ltarFiles with
-    | .ok files => pure files
-    | .error e => error e
-  let args := ltarPackArgs files self.fileName self.leanLibDir self.irDir self.ltarFile
-  withBuildSlot <| proc (quiet := true) (lend := true) {cmd := (← getLeantar).toString, args}
-  if (← self.pkg.isArtifactCacheWritable) then
-    cacheArtifact self.ltarFile "ltar" (useLocalFile := ← self.pkg.restoreAllArtifacts)
-  else
-    computeArtifact self.ltarFile "ltar"
-
 def Module.unpackLtar (self : Module) (ltar : FilePath) (inputHash : Hash) : JobM Unit := do
   -- Archive has no `depHash` (packed with `-s`); supply it via `-j -` JSON stdin.
   let input := Json.arr #[Json.mkObj [
@@ -2446,6 +2479,8 @@ def Module.rejectArchive
 def Module.recBuildLtar (self : Module) : FetchM (Job FilePath) := do
   withRegisterJob s!"{self.name}:ltar" <| withCurrPackage self.pkg do
   (← self.irArts.fetch).mapM fun arts => do
+    -- A promotion replaced the outputs that the module's job made
+    let arts := (← promotedModules.atomically (m := BaseIO) (return (← get).find? self.name)).getD arts
     let art ← arts.ltar?.getDM do
       if (← getNoBuild) then
         modify ({· with wantsRebuild := true})
@@ -3720,7 +3755,8 @@ where
   cache entry that its job's service action wrote (`serviceInputHashes`), else of the job's trace.
   The entry of a module whose outputs a kept-module check accepted also carries their lineage
   (`{"l": <archive>, "kf": <hash>}`), so that a cache installing the file applies the supersede
-  rule to it (`Cache.writeOutputsCore`).
+  rule to it (`Cache.writeOutputsCore`). A later promotion of the module replaces the entry
+  (`Module.promote`).
   -/
   trackOutputsIfEnabled arts : JobM ModuleOutputArtifacts := do
     if let some ref ← Internal.getOutputsRef? mod.pkg then

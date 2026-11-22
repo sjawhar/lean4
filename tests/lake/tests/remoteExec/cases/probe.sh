@@ -412,4 +412,61 @@ row_P2() (
   test_run build --no-build Rx.QB
 )
 
-run_rows S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S10w S10t S10s S10f S10n S11 S12 k5 P1 P2
+# qa_chain: Rx.QA0, Rx.QA (which imports it), Rx.W (25 s) and Rx.QB (which imports Rx.QA and Rx.W), with the usage
+# cutoff and the artifact cache on
+qa_chain() {
+  export LAKE_USAGE_CUTOFF=1 LAKE_ARTIFACT_CACHE=true
+  printf 'def qa0 := 1\n' > Rx/QA0.lean
+  printf 'import Rx.QA0\n\ndef qa := qa0\n' > Rx/QA.lean
+  slow W 25000
+  printf 'import Rx.QA\nimport Rx.W\n\ndef qb := qa + w\n' > Rx/QB.lean
+}
+# o_restore NAME: the mappings of the row's `lake build Rx.QB -o $D/outputs.jsonl` serve a fresh tree: a fresh copy
+# of the row's sources in $PW/NAME, and a new Lake cache that holds only the archives of the row's cache, into which
+# `lake cache add` installs the mappings. The fresh tree, with service mode off (the same input hashes) and that cache,
+# restores Rx.QB and its imports with no compile, with the bytes that the row's tree holds
+o_restore() {
+  local tree=$PWD fresh="$PW/$1" m
+  rm -rf "$fresh" "$fresh.cache"; mkdir -p "$fresh" "$fresh.cache"
+  cp -r "$tree/lakefile.toml" "$tree/Rx.lean" "$tree/Rx" "$fresh/"; chmod -R u+w "$fresh"
+  cp -r "$LAKE_CACHE_DIR/artifacts" "$fresh.cache/"
+  find "$fresh.cache/artifacts" -type f ! -name '*.ltar' -delete
+  test_exp "$(find "$fresh.cache/artifacts" -type f -name '*.ltar' | wc -l)" -gt 0
+  (
+    cd "$fresh"; unset LAKE_REMOTE_EXEC
+    export LAKE_CACHE_DIR="$fresh.cache" LAKE_RESTORE_ARTIFACTS=true
+    test_run cache add "$D/outputs.jsonl"
+    lake_out build Rx.QB
+    no_match_text "Built Rx." produced.out
+  )
+  for m in QA0 QA W QB; do test_cmd cmp "$tree/.lake/build/lib/lean/Rx/$m.olean" "$fresh/.lake/build/lib/lean/Rx/$m.olean"; done
+}
+
+# P3c: the case of P3 with no promotion, so that P3 tests the mappings and not their restore: the service answers
+# the whole build, every module goes to it, and the build's mappings serve a fresh tree (`o_restore`)
+row_P3c() (
+  enter_row P3c; qa_chain
+  lbuild Rx.QB -o "$D/outputs.jsonl"
+  lines --modules Rx.QA0,Rx.QA,Rx.W,Rx.QB --expect '*:result=executed'
+  o_restore P3c-fresh
+)
+
+# P3: P2 with the artifact cache and `lake build -o`: Rx.QA0, Rx.QA and Rx.W compile here while the service does not
+# answer, and Rx.QB's request promotes them. The build's mappings are those of its outputs after the promotions, not
+# those its jobs wrote before them: each names the input hash of the module's trace and the archive of the service's
+# outputs, and none maps a module's input hash from before the promotions to its local outputs, so they serve a
+# fresh tree as P3c's do (`o_restore`)
+row_P3() (
+  local up_pid
+  enter_row P3; qa_chain
+  touch "$D/down"
+  (sleep 10; rm -f "$D/down") & up_pid=$!
+  trap "kill $up_pid 2> /dev/null || true" EXIT
+  FAKE_DOWN_FILE="$D/down" lbuild Rx.QB -o "$D/outputs.jsonl"
+  lines --modules Rx.QA0,Rx.QA,Rx.W,Rx.QB --expect 'Rx.QA0|Rx.QA|Rx.W:result=local' \
+    --expect 'Rx.QB:result=executed|cached'
+  pcheck promoted=Rx.QA:Rx.QA0,Rx.QB:Rx.QA
+  o_restore P3-fresh
+)
+
+run_rows S1 S2 S3 S4 S5 S6 S7 S8 S9 S10 S10w S10t S10s S10f S10n S11 S12 k5 P1 P2 P3c P3

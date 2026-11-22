@@ -217,7 +217,9 @@ machine for them. Lake writes the outputs of each action into the build director
 ends. These stay on this machine and write no line: executables, static libraries, `extern_lib`
 targets and other targets with build code of their own, `leanir` (`postponeCompile`), LLVM
 objects (`bc.o`) and the shared libraries that link them, and the shared library of a library that
-has `moreLinkObjs` or whose package has an `extern_lib`.
+has `moreLinkObjs` or whose package has an `extern_lib`. After a promotion (below) changes the
+.olean of a module with `postponeCompile`, the next build runs the module's `leanir` step again. If
+that step writes other files, the modules that import it go to the service again.
 
 No file that this machine compiled is an input of an action on the service, except a shared
 library that stays on this machine (above) and the files that `leanir` writes. A module, C object

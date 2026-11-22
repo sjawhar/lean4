@@ -1,4 +1,4 @@
-# The `native` group of test.sh, which sources it: the C compiles and links of service mode (A6), rows N1-N14,
+# The `native` group of test.sh, which sources it: the C compiles and links of service mode (A6), rows N1-N15,
 # where N8 is T7 (the timeout of native actions), so the row is named T7. The package `native/` has a library
 # `Nat0` whose modules are precompiled, so each module has an object (`CCompile`), `Nat0.Use`'s compile loads
 # `Nat0.Tac`'s module library (`LinkShared`) as a plugin, and `Use2`'s compile loads `Nat0`'s library
@@ -316,4 +316,80 @@ row_N14() (
   test_cmd_eq 0 count_method run
 )
 
-run_rows N1 N2 N3 N4 N5 N6 N7 T7 N9 N10 N11 N12 N13 N14
+# N15: N14 with a chain of modules, the usage cutoff, the artifact cache and `lake build -o`. Nat0.Tac, Nat0.Use (which
+# imports it), their objects and module libraries compile here while the service does not answer, with N14's local C
+# compiler (`-g`, no delay); then so does Nat0.Slow, which imports Nat0.Use and is in Nat0: its compile brings the
+# service back (it removes the down file) and lasts until a probe has found the service. The targets after it go to
+# the service, and their requests promote each of those modules, objects and module libraries. After the build no
+# file names a promoted one as it was before its promotion (`promo_check.py`). The Lake cache's entry under an input
+# hash from before a promotion stays: it is a valid compile of inputs that this tree no longer holds, and no check
+# reads it. `--no-build` builds nothing, the next build sends no request, and the build's mappings serve a fresh tree:
+# a copy of the sources and a new Lake cache that holds only the artifacts that the mappings name, which `lake cache
+# add` installs. With service mode off, the fresh tree restores every target with no compile or link, but the objects,
+# with the bytes that the row's tree holds: on this tree an object's trace with service mode off also holds the local
+# C compiler's identity (`addCcTrace`), which a trace of service mode does not, so the objects compile again here (with
+# the same compiler as the fake's, so with the same bytes, and no link needs to run again).
+row_N15() (
+  local f fresh="$NW/N15-fresh"
+  enter N15 native; logs N15
+  export LAKE_USAGE_CUTOFF=1 LAKE_ARTIFACT_CACHE=true
+  mkdir -p "$NW/N15.bin"
+  printf '#!/bin/sh\nexec "%s" -g "$@"\n' "$LAKE_REMOTE_EXEC_CC" > "$NW/N15.bin/cc"
+  chmod +x "$NW/N15.bin/cc"
+  cat > Nat0/Slow.lean << EOF
+import Nat0.Use
+
+/-! A module whose compile brings the build service back: it removes the fake's down file, then waits until the fake
+answered a \`hello\` as reachable (at most 120 s), and 2 s more. -/
+
+#eval show IO Unit from do
+  let down : System.FilePath := "$NW/N15.down"
+  if !(← down.pathExists) then return
+  IO.FS.removeFile down
+  for _ in [0:1200] do
+    if ((← IO.FS.readFile "$FAKE_LOG").splitOn "\"reachable\": true").length > 1 then
+      IO.sleep 2000
+      return
+    IO.sleep 100
+
+def slow : Nat := zero
+EOF
+  printf 'import Nat0.Tac\nimport Nat0.Use\nimport Nat0.Slow\n\n/-! The root of the library `Nat0`. -/\n' > Nat0.lean
+  touch "$NW/N15.down"
+  LEAN_CC=cc PATH="$NW/N15.bin:$PATH" FAKE_DOWN_FILE="$NW/N15.down" \
+    test_run build Use2 Nat0:shared -o "$NW/N15.outputs.jsonl"
+  check_lines "$NW/N15.jsonl" --modules Nat0,Nat0.Tac,Nat0.Use,Nat0.Slow,Use2 \
+    --expect 'Nat0.Tac|Nat0.Use|Nat0.Slow:result=local' --expect 'Nat0|Use2:result=executed|cached' \
+    --expect 'Nat0.Tac:c.o.export|Nat0.Use:c.o.export|Nat0.Tac:dynlib|Nat0.Use:dynlib:result=local' \
+    --expect 'Nat0.Slow:c.o.export|Nat0:c.o.export|native/Nat0:shared:result=executed|cached' --unique
+  test_cmd "$PYTHON" "$TEST_DIR/promo_check.py" --tree "$PWD" --cache "$LAKE_CACHE_DIR" \
+    --outputs "$NW/N15.outputs.jsonl" --lake "$LAKE_REMOTE_EXEC_LOG" --fake "$FAKE_LOG" Nat0.Tac Nat0.Use Nat0.Slow \
+    Nat0.Tac:c.o.export=.lake/build/ir/Nat0/Tac.c.o.export Nat0.Use:c.o.export=.lake/build/ir/Nat0/Use.c.o.export \
+    Nat0.Tac:dynlib=.lake/build/lib/lean/native_Nat0_Tac.so Nat0.Use:dynlib=.lake/build/lib/lean/native_Nat0_Use.so
+  logs N15-again
+  test_run build --no-build Use2 Nat0:shared
+  test_run build Use2 Nat0:shared
+  test_cmd_eq 0 count_method run
+  rm -rf "$fresh" "$fresh.cache"; mkdir -p "$fresh" "$fresh.cache/artifacts"
+  cp -r lakefile.toml Nat0.lean Nat0 Use2.lean "$fresh/"
+  "$PYTHON" -c 'import json, shutil, sys
+for _, v in [json.loads(l) for l in open(sys.argv[1]) if l.strip()][1:]:
+    shutil.copy(sys.argv[2] + "/artifacts/" + v, sys.argv[3] + "/artifacts/")' \
+    "$NW/N15.outputs.jsonl" "$LAKE_CACHE_DIR" "$fresh.cache"
+  (
+    cd "$fresh"; unset LAKE_REMOTE_EXEC
+    export LAKE_CACHE_DIR="$fresh.cache" LAKE_RESTORE_ARTIFACTS=true
+    test_run cache add "$NW/N15.outputs.jsonl"
+    lake_out build Use2 Nat0:shared
+    test_cmd "$PYTHON" -c 'import re, sys
+built = re.findall(r"Built (\S+)", open("produced.out").read())
+print(built)
+sys.exit(1 if [t for t in built if not re.search(r":c\.o(\.export)?$", t)] else 0)'
+  )
+  for f in $FILES .lake/build/ir/Nat0/Slow.c.o.export .lake/build/lib/lean/Nat0.olean \
+      .lake/build/lib/lean/Nat0/{Tac,Use,Slow}.olean .lake/build/lib/lean/Use2.olean; do
+    test_cmd cmp "$f" "$fresh/$f"
+  done
+)
+
+run_rows N1 N2 N3 N4 N5 N6 N7 T7 N9 N10 N11 N12 N13 N14 N15
