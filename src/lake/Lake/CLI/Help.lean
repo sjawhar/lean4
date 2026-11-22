@@ -201,9 +201,10 @@ machine for them. Lake writes the outputs of each action into the build director
 ends. These stay on this machine and write no line: executables, static libraries, `extern_lib`
 targets and other targets with build code of their own, `leanir` (`postponeCompile`), LLVM
 objects (`bc.o`) and the shared libraries that link them, and the shared library of a library that
-has `moreLinkObjs` or whose package has an `extern_lib`. After a promotion (below) changes the
-.olean of a module with `postponeCompile`, the next build runs the module's `leanir` step again. If
-that step writes other files, the modules that import it go to the service again.
+has `moreLinkObjs` or whose link takes an `extern_lib` as an argument (on Windows). After a
+promotion (below) changes the .olean of a module with `postponeCompile`, the next build runs the
+module's `leanir` step again. If that step writes other files, the modules that import it go to
+the service again.
 
 No file that this machine compiled is an input of an action on the service, except a shared
 library that stays on this machine (above) and the files that `leanir` writes. A module, C object
@@ -215,8 +216,9 @@ object or shared library runs its action there and writes the service's file ove
 with the result of that run, before the other jobs take the file. So does the job of such a module
 in a build with LAKE_USAGE_CUTOFF on: a local compile then passes --usage, which writes digests into
 the .olean, and the cutoff keeps or skips outputs, so they are not what the service compiles. This
-holds also for module outputs in the Lake cache with no record (an archive keeps none): the job
-compiles the module on the service and does not restore them. Lake uses any other such module as it
+holds also for module outputs in the Lake cache with no record: the job compiles the module on the
+service and does not restore them. So does the job of a module that the Lake cache holds as an
+archive (.ltar), which keeps no record, whatever the cutoff. Lake uses any other such module as it
 is. Before an action on the service takes an output with no record as an input, Lake runs its own
 action on the service and writes the service's files over the local ones. This promotion writes no
 line: the target keeps its one line. Lake assumes that, with the cutoff off, a local compile of a

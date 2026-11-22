@@ -703,7 +703,7 @@ def serviceAnswers (s : RemoteSession) : BaseIO Bool :=
 /--
 Whether the build uses the service (`serviceAnswers`) and is not `--no-build`, which sends no request. Then a local
 output with no service record goes to the service in its own job: a native artifact's (`NativeAction.fetch`), and a
-module's with the usage cutoff on (`Module.fetchRemote`).
+module's that an archive holds, or with the usage cutoff on (`Module.fetchRemote`).
 -/
 public def buildUsesService (s : RemoteSession) : JobM Bool := do
   if (← getNoBuild) then return false

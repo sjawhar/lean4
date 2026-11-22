@@ -1,5 +1,5 @@
 # The `lines` group of test.sh, which sources it: the rows of the log line's table (LAKE_REMOTE_EXEC_LOG),
-# L1-L34 with L4b, L5b, L5c, L5d and L9b, but L8 (remoteExecToolchainMismatch) and L29
+# L1-L34 with L4b, L5b, L5c, L5d, L5e and L9b, but L8 (remoteExecToolchainMismatch) and L29
 # (remoteExecSourceRace). Each row builds in directories of its own under $WORK/lines, and each build writes
 # its lines to a log of its own, which `lines_check.py` checks: one `lean` line for each module of the build,
 # every field with its type, and the row's own rules. L2, L3 and L4 build on L1's tree, Lake cache and
@@ -136,6 +136,27 @@ row_L5b() (
   done
 )
 
+# L5e: with the cutoff off, the Lake cache holds each module only as an archive (L5b's seed). Under `--no-build` a
+# tree restores each one from its archive, which keeps no record: `local-cache` with no action and no outputs. In a
+# build that uses the service, each one goes to the service instead, whose cache answers from the seed's run: `cached`
+# with the action and the outputs. Each tree reads the seed's cache and does not write it, so the archives stay its
+# only entries
+row_L5e() (
+  export LAKE_USAGE_CUTOFF=0 LAKE_RESTORE_ARTIFACTS=true LAKE_REMOTE_EXEC=grpc://fake:1
+  enter L5e-seed; log_to L5e-seed
+  LAKE_ARTIFACT_CACHE=true test_run build Rx -o "$LW/L5e-outputs.jsonl"
+  test_run cache add "$LW/L5e-outputs.jsonl"
+  find "$LAKE_CACHE_DIR/artifacts" -type f ! -name '*.ltar' -delete
+  test_exp "$(find "$LAKE_CACHE_DIR/artifacts" -type f -name '*.ltar' | wc -l)" -gt 0
+  enter L5e-nobuild; export LAKE_CACHE_DIR="$LW/L5e-seed.cache"; log_to L5e-nobuild
+  test_run build --no-build Rx
+  lines L5e-nobuild --modules "$MODS" --expect '*:result=local-cache,action=null,outputs=null,code=null'
+  test_exp "$(find "$LAKE_CACHE_DIR/artifacts" -type f ! -name '*.ltar' | wc -l)" -eq 0
+  enter L5e-service; export LAKE_CACHE_DIR="$LW/L5e-seed.cache"; log_to L5e-service
+  test_run build Rx
+  lines L5e-service --modules "$MODS" --expect '*:result=cached,action=digest,outputs=digests,code=null'
+)
+
 # L5c: under the fallback, with the usage cutoff, a change of Rx.A that Rx.B does not use: Rx.A compiles,
 # and Rx.B's compile is skipped (`Replayed`), with no record
 row_L5c() (
@@ -264,15 +285,19 @@ row_L11() (
     --expect 'Rx.B:result=timeout,action=null,stdoutDigest=null,stderrDigest=null,exitCode=null,terminationSignal=null,limits=null'
 )
 
-# L12: with LAKE_REMOTE_EXEC_TIMEOUT=1 the service ends Rx.S's compile, a 5 s `#eval`, at 1 s and answers
-# TIMEOUT with the new fields: the line gives the action, the signal and the limits
+# L12: with LAKE_REMOTE_EXEC_TIMEOUT=5 the service ends Rx.S's compile, which writes a line on its stderr and then
+# runs a 60 s `#eval`, at 5 s and answers TIMEOUT with the new fields: the line gives the action, the signal, the
+# limits and the digest of the stderr, none of the empty stdout. The line goes to stderr's file itself, past the
+# `#eval`'s capture of its streams, and is flushed before the kill
 row_L12() (
   enter L12; log_to L12
-  printf '/-! A module whose compile runs past a timeout of 1 s. -/\n\n#eval IO.sleep 5000\n' > Rx/S.lean
-  FAKE_FIELDS=new FAKE_ENFORCE_TIMEOUT=Rx.S LAKE_REMOTE_EXEC_TIMEOUT=1 LAKE_REMOTE_EXEC=grpc://fake:1 \
+  printf '%s\n' '/-! A module whose compile writes a line on its stderr, then runs past a timeout of 5 s. -/' '' \
+    '#eval show IO Unit from do' '  let h ← IO.FS.Handle.mk "/dev/stderr" .append' '  h.putStrLn "Rx.S: started"' \
+    '  h.flush' '' '#eval IO.sleep 60000' > Rx/S.lean
+  FAKE_FIELDS=new FAKE_ENFORCE_TIMEOUT=Rx.S LAKE_REMOTE_EXEC_TIMEOUT=5 LAKE_REMOTE_EXEC=grpc://fake:1 \
     test_fails build Rx.S
   lines L12 --modules Rx.S \
-    --expect 'Rx.S:result=timeout,action=digest,terminationSignal=KILL,exitCode=null,limits=object'
+    --expect 'Rx.S:result=timeout,action=digest,terminationSignal=KILL,exitCode=null,limits=object,stdoutDigest=null,stderrDigest=digest'
 )
 
 # L13: the recorded answer of an action killed for its memory, from today's bridge: an OK result with exit
@@ -285,16 +310,18 @@ row_L13() (
     --expect 'Rx.B:result=executed,exitCode=-1,limits=null,terminationSignal=null'
 )
 
-# L14: the same with the new fields: `limits.oomKills` makes the result `oom`
+# L14: the same with the new fields: `limits.oomKills` makes the result `oom`; the line gives the digest of the
+# action's stdout, none of its empty stderr
 row_L14() (
   enter L14; log_to L14
   FAKE_OOM_TARGET=Rx.B FAKE_FIELDS=new LAKE_REMOTE_EXEC=grpc://fake:1 test_fails build Rx
   lines L14 --modules "$MODS" --expect "Rx.C|Rx:$IMPORT_FAILED" \
-    --expect 'Rx.B:result=oom,limits.oomKills>=1,terminationSignal=KILL'
+    --expect 'Rx.B:result=oom,limits.oomKills>=1,terminationSignal=KILL,stdoutDigest=digest,stderrDigest=null'
 )
 
 # L15: an action that filled its disk: the recorded answer of today's bridge is `executed` with exit code -1;
-# with the new fields, `limits.diskLimitExceeded` makes it `disk-limit`
+# with the new fields, `limits.diskLimitExceeded` makes it `disk-limit`, and the line gives the digest of the
+# action's stdout, none of its empty stderr
 row_L15() (
   export LAKE_REMOTE_EXEC=grpc://fake:1
   enter L15; log_to L15
@@ -303,7 +330,7 @@ row_L15() (
   enter L15-new; log_to L15-new
   FAKE_DISK_TARGET=Rx.B FAKE_FIELDS=new test_fails build Rx
   lines L15-new --modules "$MODS" --expect "Rx.C|Rx:$IMPORT_FAILED" \
-    --expect 'Rx.B:result=disk-limit,limits.diskLimitExceeded=true,terminationSignal=KILL'
+    --expect 'Rx.B:result=disk-limit,limits.diskLimitExceeded=true,terminationSignal=KILL,stdoutDigest=digest,stderrDigest=null'
 )
 
 # L16: the recorded failed action of today's bridge: exit code 1, a digest of its stderr and none of its
@@ -504,5 +531,5 @@ row_L34() (
   lines L34 --modules Rx.P,Rx.Q --expect 'Rx.P:result=executed|cached,exitCode=0' --expect "Rx.Q:$IMPORT_FAILED"
 )
 
-run_rows L1 L2 L3 L4 L4b L5 L5d L5b L5c L6 L7 L9 L9b L10 L11 L12 L13 L14 L15 L16 L17 L18 L19 L20 L21 L22 \
+run_rows L1 L2 L3 L4 L4b L5 L5d L5b L5e L5c L6 L7 L9 L9b L10 L11 L12 L13 L14 L15 L16 L17 L18 L19 L20 L21 L22 \
   L23 L24 L25 L26 L27 L28 L30 L31 L32 L33 L34

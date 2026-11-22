@@ -1,11 +1,11 @@
-# The `native` group of test.sh, which sources it: the C compiles and links of service mode (A6), rows N1-N15,
+# The `native` group of test.sh, which sources it: the C compiles and links of service mode (A6), rows N1-N16,
 # where N8 is T7 (the timeout of native actions), so the row is named T7. The package `native/` has a library
 # `Nat0` whose modules are precompiled, so each module has an object (`CCompile`), `Nat0.Use`'s compile loads
 # `Nat0.Tac`'s module library (`LinkShared`) as a plugin, and `Use2`'s compile loads `Nat0`'s library
-# (`LinkSharedLibrary`). Each row builds in a directory of its own under $WORK/native, with its own service
-# (FAKE_CAS) and Lake cache, and each build has a fake log and a LAKE_REMOTE_EXEC_LOG of its own. N2, N4 and N5
-# read N1's tree, N10 and N12 read N10's, and N11 and N13 read N11's: `build_N1`, `build_N10` and `build_N11` build
-# each once, so that each row also runs alone.
+# (`LinkSharedLibrary`). N16 builds the package `ext/`, which has an `extern_lib`. Each row builds in a directory of
+# its own under $WORK/native, with its own service (FAKE_CAS) and Lake cache, and each build has a fake log and a
+# LAKE_REMOTE_EXEC_LOG of its own. N2, N4 and N5 read N1's tree, N10 and N12 read N10's, and N11 and N13 read N11's:
+# `build_N1`, `build_N10` and `build_N11` build each once, so that each row also runs alone.
 
 NW=$GW
 export LAKE_REMOTE_EXEC=grpc://fake:1
@@ -28,6 +28,8 @@ QUERY='+Nat0.Tac:o.export +Nat0.Use:o.export +Nat0:o.export +Nat0.Tac:dynlib +Na
 # The header of Nat0/Use.lean as the editor sends it to `lake setup-file` on standard input
 USE_HEADER='{"isModule":false,"imports":[{"module":"Nat0.Tac","isMeta":false,"isExported":true,"importAll":false}]}'
 
+# The `.olean` files of the test's Lake (beside it), which `own_toolchain` puts in a toolchain
+OWN_LAKE_LIB=$(dirname "$(command -v "$LAKE")")/../lib/lean
 toolchain "$NW/tc"
 export LAKE="$NW/tc/bin/lake"
 
@@ -91,6 +93,18 @@ got = [i for p in runs if p.get("target") == t for i in p["inputs"] if i.get("re
 print("%s takes %s; the outputs of the fake there: %s" % (t, json.dumps(got), sorted(outs)))
 sys.exit(0 if got and sorted(got[0]) == ["digest", "executable", "rel"] and got[0]["digest"] in outs else 1)' \
     "$FAKE_LOG" "$FAKE_CAS" "$@"
+}
+# own_toolchain DIR: `toolchain DIR`, with the `.olean` files of the test's Lake in DIR/lib/lean in place of the
+# sysroot's, as a release has those of its `bin/lake`: a `lakefile.lean`, which imports Lake, needs them. The sysroot's
+# other files stay, Lake's shared library among them
+own_toolchain() {
+  local sysroot f
+  sysroot=$(lean --print-prefix)
+  toolchain "$1"
+  rm "$1/lib"; mkdir -p "$1/lib/lean"
+  for f in "$sysroot"/lib/*; do [ "${f##*/}" = lean ] || ln -s "$f" "$1/lib/"; done
+  for f in "$OWN_LAKE_LIB"/*; do ln -s "$f" "$1/lib/lean/"; done
+  for f in "$sysroot"/lib/lean/*; do [ -e "$1/lib/lean/${f##*/}" ] || ln -s "$f" "$1/lib/lean/"; done
 }
 
 # N1's tree: `native/` built through a service that has none of its actions; Lake's output is in $NW/N1.out
@@ -387,4 +401,25 @@ for _, v in [json.loads(l) for l in open(sys.argv[1]) if l.strip()][1:]:
   done
 )
 
-run_rows N1 N2 N3 N4 N5 N6 N7 T7 N9 N10 N11 N12 N13 N14 N15
+# N16: the shared library of `ext/`'s library Ext0, whose package has an `extern_lib`, is an action of the service
+# (`LinkSharedLibrary`), as any other library's: on Linux its link takes no library as an argument, the external
+# library neither. The `extern_lib` and its object build here and write no line. UseExt, which precompiles its
+# imports, compiles on the service too: its request takes that library by the digest of the service's output, and its
+# compile loads it and the external library and runs the external function (`native_decide`). The package's
+# `lakefile.lean` imports Lake, so the row's toolchain has the `.olean` files of the test's Lake (`own_toolchain`)
+row_N16() (
+  own_toolchain "$NW/N16.tc"
+  export LAKE="$NW/N16.tc/bin/lake"
+  enter N16 ext; logs N16
+  test_run build UseExt
+  test_cmd_eq 'CCompile:Ext0:c.o.export LinkSharedLibrary:ext/Ext0:shared' natives
+  check_lines "$NW/N16.jsonl" --modules Ext0,UseExt --expect 'Ext0|UseExt:kind=lean,result=executed' \
+    --expect 'Ext0:c.o.export:kind=c,result=executed,action=digest,outputs.o=digest,exitCode=0,code=null' \
+    --expect 'ext/Ext0:shared:kind=shared,result=executed,action=digest,outputs.so=digest,exitCode=0,code=null' \
+    --unique
+  test_cmd_eq 'Ext0:c.o.export=executed ext/Ext0:shared=executed' native_lines "$NW/N16.jsonl"
+  test_cmd by_service_digest UseExt ext/Ext0:shared
+  test_cmd fake_bytes .lake/build/lib/libext_Ext0.so
+)
+
+run_rows N1 N2 N3 N4 N5 N6 N7 T7 N9 N10 N11 N12 N13 N14 N15 N16

@@ -140,7 +140,8 @@ public def LeanLib.staticExportFacetConfig : LibraryFacetConfig staticExportFace
 
 /--
 Build the library's shared library. In service mode, the build service links it (`LinkSharedLibrary`,
-`buildNativeSharedLib`), unless the library has `moreLinkObjs` or its package has an `extern_lib`.
+`buildNativeSharedLib`), unless its link takes a file that no native action of the build made: the library's
+`moreLinkObjs`, or its package's `extern_lib`s where the link takes its libraries as arguments (`linkDeps`).
 -/
 def LeanLib.recBuildShared (self : LeanLib) : FetchM (Job Dynlib) := do
   withRegisterJob s!"{self.name}:shared" <| withCurrPackage self.pkg do
@@ -166,9 +167,11 @@ def LeanLib.recBuildShared (self : LeanLib) : FetchM (Job Dynlib) := do
     let jobs ← self.pkg.externLibs.foldlM
       (·.push <$> ·.dynlib.fetch) jobs
     return jobs
-  if !self.moreLinkObjs.isEmpty || !self.pkg.externLibs.isEmpty then
+  -- The link takes the libraries of `libJobs`, an `extern_lib`'s among them, as arguments only with `linkDeps`
+  let linkDeps := System.Platform.isWindows
+  if !self.moreLinkObjs.isEmpty || (linkDeps && !self.pkg.externLibs.isEmpty) then
     return ← buildLeanSharedLib self.libName self.sharedLibFile objJobs libJobs
-      self.weakLinkArgs self.linkArgs self.isPlugin
+      self.weakLinkArgs self.linkArgs self.isPlugin (linkDeps := linkDeps)
   buildNativeSharedLib .linkSharedLibrary s!"{self.pkg.prettyName}/{self.name}:shared"
     (remoteBuildPath self.pkg self.sharedLibFile) self.libName self.sharedLibFile objJobs libJobs self.weakLinkArgs
     self.linkArgs self.isPlugin

@@ -43,10 +43,12 @@ Knobs, all through the environment:
                       fields of contract C5.1 v7, `terminationSignal` and `limits`), for the answers
                       of the three knobs below and of FAKE_ENFORCE_TIMEOUT
   FAKE_TIMEOUT_TARGET a target name: its `run` answers TIMEOUT, as an action that ran past its timeout
-                      (`new`: the error also has `action`, `terminationSignal` and `limits`)
+                      (`new`: the error also has `action`, `terminationSignal`, `limits`, and the digest of
+                      the line the action wrote on its stdout before (`killed_streams`), none of its empty
+                      stderr)
   FAKE_OOM_TARGET     a target name: its `run` answers a result with exit code -1 and no outputs, as an
                       action that the service killed for its memory (`new`: also `terminationSignal`
-                      KILL and `limits` with `oomKills` 1)
+                      KILL, `limits` with `oomKills` 1, and that line on `stdout`, with its digest)
   FAKE_DISK_TARGET    the same, as an action that filled its disk (`new`: `limits` with
                       `diskLimitExceeded` true)
   FAKE_ENFORCE_TIMEOUT targets, comma-separated, or `*` for every target: their action is killed at
@@ -194,6 +196,12 @@ def limits(oom_kills, written, disk):
     return {"oomKills": oom_kills, "writtenBytes": written, "diskLimitExceeded": disk}
 
 
+def killed_streams(target):
+    """What a killed action of FAKE_TIMEOUT_TARGET, FAKE_OOM_TARGET or FAKE_DISK_TARGET wrote before (`new`): a line
+    on its stdout, nothing on its stderr."""
+    return f"{target}: started\n".encode(), b""
+
+
 def timeout_error(p, action, out=b"", err=b"", written=0):
     """The TIMEOUT answer of an action that ran past its timeout."""
     msg = f"{p.get('target')}: the action ran past its timeout"
@@ -202,12 +210,14 @@ def timeout_error(p, action, out=b"", err=b"", written=0):
                limits=limits(0, written, False))
 
 
-def killed(action, disk):
+def killed(target, action, disk):
     """The result of an action that the service killed for its memory or, if `disk`, for filling its disk."""
     now = time.time()
     res = {"action": action, "cached": False, "exitCode": -1, "stdout": "", "stderr": "", "outputs": None,
            "metadata": metadata(now, now, now, now)}
     if FIELDS == "new":
+        out, err = killed_streams(target)
+        res.update(stdout=out.decode(), stderr=err.decode(), **stream_digests(out, err))
         res["terminationSignal"] = "KILL"
         res["limits"] = limits(0, DISK_FILL_BYTES, True) if disk else limits(1, 0, False)
     return res
@@ -243,9 +253,10 @@ def run(p):
     error_target, sep, code = (os.environ.get("FAKE_ERROR_TARGET") or "").rpartition(":")
     if sep and error_target == target: raise Err(code, f"{target}: the service answered {code}")
     if named("FAKE_REPLAY_TARGET", target): return replayed()
-    if named("FAKE_TIMEOUT_TARGET", target): raise timeout_error(p, action_digest(action_key(p)))
-    if named("FAKE_OOM_TARGET", target): return killed(action_digest(action_key(p)), disk=False)
-    if named("FAKE_DISK_TARGET", target): return killed(action_digest(action_key(p)), disk=True)
+    if named("FAKE_TIMEOUT_TARGET", target):
+        raise timeout_error(p, action_digest(action_key(p)), *killed_streams(target))
+    if named("FAKE_OOM_TARGET", target): return killed(target, action_digest(action_key(p)), disk=False)
+    if named("FAKE_DISK_TARGET", target): return killed(target, action_digest(action_key(p)), disk=True)
     with _lock:
         _inflight += 1
         if _inflight > _max_inflight:
