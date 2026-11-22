@@ -1,4 +1,4 @@
-# The `native` group of test.sh, which sources it: the C compiles and links of service mode (A6), rows N1-N13,
+# The `native` group of test.sh, which sources it: the C compiles and links of service mode (A6), rows N1-N14,
 # where N8 is T7 (the timeout of native actions), so the row is named T7. The package `native/` has a library
 # `Nat0` whose modules are precompiled, so each module has an object (`CCompile`), `Nat0.Use`'s compile loads
 # `Nat0.Tac`'s module library (`LinkShared`) as a plugin, and `Use2`'s compile loads `Nat0`'s library
@@ -294,4 +294,26 @@ row_N13() (
   test_cmd_eq 0 count_method run
 )
 
-run_rows N1 N2 N3 N4 N5 N6 N7 T7 N9 N10 N11 N12 N13
+# N14: the service answers again in the middle of a build. Nat0.Tac and its object compile here while the service does
+# not answer, the object with a local C compiler that writes other bytes than the service's (`-g`, as N11's) and that
+# brings the service back and takes 30 s, so that a probe finds the service while it runs; then the link of Nat0.Tac's
+# module library goes to the service, and its request promotes the object (and Nat0.Tac for the object's C file). The
+# library's trace has the hash of its inputs after that promotion, the one the next build computes: `--no-build` of
+# the library builds nothing, and the next build sends no request
+row_N14() (
+  enter N14 native; logs N14
+  mkdir -p "$NW/N14.bin"
+  printf '#!/bin/sh\nrm -f "%s"\nsleep 30\nexec "%s" -g "$@"\n' "$NW/N14.down" "$LAKE_REMOTE_EXEC_CC" > "$NW/N14.bin/cc"
+  chmod +x "$NW/N14.bin/cc"
+  touch "$NW/N14.down"
+  LEAN_CC=cc PATH="$NW/N14.bin:$PATH" FAKE_DOWN_FILE="$NW/N14.down" test_run build +Nat0.Tac:dynlib
+  check_lines "$NW/N14.jsonl" --modules Nat0.Tac --expect 'Nat0.Tac:result=local' \
+    --expect 'Nat0.Tac:c.o.export:kind=c,result=local' --expect 'Nat0.Tac:dynlib:kind=shared,result=executed|cached'
+  test_cmd_eq "CCompile:Nat0.Tac:c.o.export LinkShared:Nat0.Tac:dynlib" natives
+  logs N14-again
+  test_run build --no-build +Nat0.Tac:dynlib
+  test_run build +Nat0.Tac:dynlib
+  test_cmd_eq 0 count_method run
+)
+
+run_rows N1 N2 N3 N4 N5 N6 N7 T7 N9 N10 N11 N12 N13 N14

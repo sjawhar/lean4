@@ -247,9 +247,9 @@ a C object or a shared library:
           one also builds here at once, with no request. Lake asks the service again 1 s after
           the failure, then after 2, 4, 8 and 16 s, then every 30 s. Each one that starts after
           the service answers goes to the service again. With LAKE_USAGE_CUTOFF on, each module
-          of the build that took the hash of an output compiled here goes to the service in the
-          next build, also the service action whose request promoted it, and `lake build
-          --no-build` exits with code 3 until then.
+          that the build compiled or replayed here while the service did not answer, and that
+          took the hash of an output that a later request promoted, goes to the service in the
+          next build, and `lake build --no-build` exits with code 3 until then.
   wait    builds nothing on this machine. Lake asks again after 1, 2, 4 … 30 s and says so on
           standard error.
   fail    fails it with the code UNAVAILABLE. The build exits with code 75 when each of its
