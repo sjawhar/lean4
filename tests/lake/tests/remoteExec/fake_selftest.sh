@@ -475,8 +475,8 @@ def stored_failures():
     b.close()
 
 # --- FAKE_OOM_TARGET, FAKE_DISK_TARGET: that target's run answers a result with exit code -1 and no outputs,
-# with the fields of recorded/oom.json and recorded/disk-limit.json; with FAKE_FIELDS=new, also the signal
-# and the limits
+# with the fields of recorded/oom.json and recorded/disk-limit.json; with FAKE_FIELDS=new, also the signal,
+# the limits, and the line that the action wrote on stdout before, with its digest
 @case
 def killed_results():
     for var, name, oom_kills, disk in (("FAKE_OOM_TARGET", "oom.json", 1, False),
@@ -494,14 +494,18 @@ def killed_results():
         b = greeted(FAKE_FIELDS="new", **{var: "selftest-killed"})
         k = b.call("run", dict(req, target="selftest-killed")).get("result", {})
         lim = k.get("limits") or {}
-        check(f"with FAKE_FIELDS=new, {var} also gives the signal and the limits",
+        line = b"selftest-killed: started\n"
+        check(f"with FAKE_FIELDS=new, {var} also gives the signal, the limits and the stream it wrote",
               k.get("exitCode") == -1 and k.get("outputs", []) is None and k.get("terminationSignal") == "KILL"
               and lim.get("oomKills") == oom_kills and lim.get("diskLimitExceeded") is disk
-              and isinstance(lim.get("writtenBytes"), int), json.dumps(k))
+              and isinstance(lim.get("writtenBytes"), int) and k.get("stdout") == line.decode()
+              and k.get("stdoutDigest") == digest_of(line) and k.get("stderr") == "" and "stderrDigest" not in k,
+              json.dumps(k))
         b.close()
 
 # --- FAKE_TIMEOUT_TARGET: a TIMEOUT with the fields of recorded/timeout.json; with FAKE_FIELDS=new, also the
-# action, the signal and the limits, and no digest of an empty stream
+# action, the signal, the limits, and the digest of the line that the action wrote on stdout before, none of
+# its empty stderr
 @case
 def timeout_errors():
     rec = recorded_answer("timeout.json")["error"]
@@ -512,9 +516,10 @@ def timeout_errors():
     b.close()
     b = greeted(FAKE_FIELDS="new", FAKE_TIMEOUT_TARGET="selftest-slow")
     t = b.call("run", dict(req, target="selftest-slow")).get("error", {})
-    check("with FAKE_FIELDS=new, the TIMEOUT also names the action, the signal and the limits",
+    check("with FAKE_FIELDS=new, the TIMEOUT also names the action, the signal, the limits and the stream",
           t.get("code") == "TIMEOUT" and t.get("action") == r1["action"] and t.get("terminationSignal") == "KILL"
-          and (t.get("limits") or {}).get("oomKills") == 0 and "stdoutDigest" not in t and "stderrDigest" not in t,
+          and (t.get("limits") or {}).get("oomKills") == 0
+          and t.get("stdoutDigest") == digest_of(b"selftest-slow: started\n") and "stderrDigest" not in t,
           json.dumps(t))
     b.close()
 
