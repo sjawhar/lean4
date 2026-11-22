@@ -19,6 +19,7 @@ public import Lake.Build.Info
 public import Lake.Build.Infos
 public import Lake.Build.InitFacets
 public import Lake.Build.InputFile
+public import Lake.Build.InputLock
 public import Lake.Build.Job
 public import Lake.Build.Key
 public import Lake.Build.Library
