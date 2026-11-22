@@ -2019,15 +2019,17 @@ restores before a compile), otherwise `run` the action, materialize the outputs,
 local compile does (`buildRemote`), and save them to the local Lake cache (`cacheRemoteOutputs`), both
 with the service's record of the outputs and under the hash of the module's inputs after the request promoted them
 (`Module.retrace`), which the next build computes; its `-o` entry takes that hash too (`serviceInputHashes`).
-Outputs with no record in a build with the usage cutoff on come from a local compile with `--usage` (which writes
-digests into the `.olean`), a usage skip or a kept check, so a service compile does not give their bytes. This holds
-for outputs here whose trace is up to date, and for a Lake cache entry with no record. When the build uses the service
-(`buildUsesService`), such a module is compiled there instead of replayed or restored, so that each importer of this
-build takes the hash of the service's outputs, as the next build does. Without the cutoff, a local compile with the
-same toolchain gives the service's bytes, so such outputs replay or restore and are promoted only when a service
-action takes them (`Module.serviceFor`). An archive (`.ltar`) keeps no record, so while the build uses the service a
-module that the Lake cache holds as an archive goes to the service, whatever the cutoff, instead of unpacking it: the
-service's cache answers when the archive holds its outputs, and the module's line has the service's record. Returns
+A module with no service record goes to the service instead of being replayed, restored or unpacked, when the build
+uses it (`buildUsesService`), in two cases (`needRecord`). With the usage cutoff on, its outputs come from a local
+compile with `--usage` (which writes digests into the `.olean`), a usage skip or a kept check, so a service compile does
+not give their bytes; this holds for outputs here whose trace is up to date and for a Lake cache entry. Whatever the
+cutoff, its outputs came from an archive (`.ltar`), which keeps no record, so a service action may have made them: an
+archive in the Lake cache, or outputs whose trace or Lake cache entry says that an unpack wrote them
+(`BuildMetadata.fromArchive`, `CacheOutput.fromArchive`). Each importer of this build then takes the hash of the
+service's outputs, as the next build does, and the module's line has the service's record; the service's cache answers
+when it ran the same action before and keeps its entry, whatever packed the archive. Without the cutoff, a local
+compile with the same toolchain gives the service's bytes, so other outputs with no record replay or restore and are
+promoted only when a service action takes them (`Module.serviceFor`). Returns
 `none` when the service is unavailable or has a confirmed toolchain mismatch and `LAKE_REMOTE_EXEC_FALLBACK` is
 `local` (`useService`, `remoteUnavailable`): the caller then compiles on this machine, where imports' outputs were
 materialized. A request that answers `UNAVAILABLE` after a probe found the service again (the epoch moved since it
@@ -2049,13 +2051,13 @@ def Module.fetchRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSes
   let traced := match savedTrace with
     | .ok data => data.depHash == inputHash
     | _ => false
-  -- Whether outputs with no record go to the service, given whether an archive holds them (`fetchFromCache?`):
-  -- an archive's always, others only with the usage cutoff on, whose setting is an input of the trace, so the build's
-  -- setting is the outputs'.
-  let needRecord (archive : Bool) : JobM Bool := do
-    if archive || (← usageCutoffEnabled) then buildUsesService s else pure false
+  -- Whether outputs with no record go to the service, given whether they came from an archive (`fetchFromCache?`,
+  -- `SavedTrace.fromArchive`): those always, others only with the usage cutoff on, whose setting is an input of the
+  -- trace, so the build's setting is the outputs'.
+  let needRecord (fromArchive : Bool) : JobM Bool := do
+    if fromArchive || (← usageCutoffEnabled) then buildUsesService s else pure false
   let toService ← do
-    if !outputsHere || !traced || savedTrace.remote?.isSome then pure false else needRecord false
+    if !outputsHere || !traced || savedTrace.remote?.isSome then pure false else needRecord savedTrace.fromArchive
   unless toService do
     if outputsHere then
       if (← savedTrace.replayCachedIfUpToDate inputHash) then
@@ -2143,6 +2145,10 @@ def Module.withSavedKeptFrom (mod : Module) (arts : ModuleOutputArtifacts) : Job
   if arts.keptFrom?.isSome then return arts
   return {arts with keptFrom? := (← readTraceFile mod.traceFile).keptFrom?}
 
+/--
+Unpacks `ltar`, an archive of the module's outputs, into the build directory, with the archive's trace, which it marks
+(`BuildMetadata.fromArchive`): an archive keeps no service record.
+-/
 def Module.unpackLtar (self : Module) (ltar : FilePath) (inputHash : Hash) : JobM Unit := do
   -- Archive has no `depHash` (packed with `-s`); supply it via `-j -` JSON stdin.
   let input := Json.arr #[Json.mkObj [
@@ -2156,6 +2162,10 @@ def Module.unpackLtar (self : Module) (ltar : FilePath) (inputHash : Hash) : Job
   ]
   withBuildSlot <| proc (quiet := true) (input? := input.compress) (lend := true)
     {cmd := (← getLeantar).toString, args}
+  -- A trace that does not parse is left as it is, for its reader to report
+  if let .ok contents ← (IO.FS.readFile self.traceFile).toBaseIO then
+    if let .ok data := BuildMetadata.parse contents then
+      BuildMetadata.writeFile self.traceFile {data with fromArchive := true}
 
 /--
 The cached archives that this process could not unpack, as `<cache scope>/<input hash>`: a build
@@ -2708,9 +2718,10 @@ def Module.recBuildElabArts (mod : Module) : FetchM (Job ModuleOutputArtifacts) 
       | .wait wait => return .wait wait
   if let some line := line?.filter (·.log?.isSome) then mod.writeUnwrittenLine line job else return job
 where
-  /- Restores the module's outputs from the Lake cache. When `needRecord`, given whether the hit is an archive, answers
-  `true` for outputs with no service record (an archive keeps none), restores nothing, so that the caller builds the
-  module. -/
+  /- Restores the module's outputs from the Lake cache. When `needRecord`, given whether the outputs came from an
+  archive (an archive hit, or a trace or entry with the mark of one, `CacheHit.fromArchive`), answers `true` for outputs
+  with no service record (an archive keeps none), restores nothing, so that the caller builds the module. The trace that
+  an unpack writes has the mark (`Module.unpackLtar`), and so has each trace or Lake cache entry of its outputs. -/
   fetchFromCache? presetup savedTrace restoreAll (line? : Option ModuleLine) (remoteRead := true)
       (needRecord : Bool → JobM Bool := fun _ => pure false) : JobM ModuleFetchState := do
     let inputHash := (← getTrace).hash
@@ -2726,9 +2737,9 @@ where
     let some (hit : CacheHit ModuleOutputs) ←
       getArtifacts? inputHash savedTrace mod.pkg mod.name.toString (some presetup.srcHash) remoteRead
       | return .incomplete savedTrace none
-    let archive := hit.arts matches .ltar ..
-    if archive || hit.remote?.isNone then
-      if (← needRecord archive) then return .incomplete savedTrace none
+    let fromArchive := (hit.arts matches .ltar ..) || hit.fromArchive
+    if fromArchive || hit.remote?.isNone then
+      if (← needRecord fromArchive) then return .incomplete savedTrace none
     match hit.arts with
     | .ltar ltar usage? resolved? usekey? =>
       updateAction .unpack
@@ -2796,7 +2807,7 @@ where
           -- result in downloading module outputs that are not available on the remote.
           unless arts.cacheSkipped do
             (← getLakeCache).writeOutputs mod.pkg.cacheScope inputHash arts.descrs
-              (log := savedTrace.log) (overwrite := true)
+              (log := savedTrace.log) (overwrite := true) (fromArchive := true)
           mod.indexUsage presetup arts restoreAll savedTrace.log
           return .complete arts
         else
@@ -2811,7 +2822,7 @@ where
         -- an input hash, and an archive depends only on outputs.
         writeFetchTrace mod.traceFile inputHash
           (toJson {arts.descrs with usage? := none, resolved? := none, usekey? := none}) hit.log
-          (some presetup.localTrace.hash) (remote? := hit.remote?)
+          (some presetup.localTrace.hash) (remote? := hit.remote?) (fromArchive := hit.fromArchive)
       ModuleLine.noteFound line? hit.remote? hit.fromRemoteCache
       let arts ←
         if restoreAll then
@@ -2852,6 +2863,7 @@ where
       if writable then
         unless arts.cacheSkipped do
           (← getLakeCache).writeOutputs mod.pkg.cacheScope inputHash arts.descrs (log := data.log)
+            (fromArchive := true)
         mod.indexUsage presetup arts restore data.log
       return some arts
     | .incomplete _ none => return none
@@ -2944,9 +2956,11 @@ where
             let arts ← mod.withSavedKeptFrom arts
             -- An archive from the cache describes the mapping's outputs, which accepted ones are not.
             let arts := if arts.keptFrom?.isSome then arts else {arts with ltar? := arts.ltar? <|> ltar?}
-            -- The trace holds the log of the action that produced the outputs: their replay, restore
-            -- (by input hash or from the usage index), unpack, kept-module check's accept or build
-            let log := (← readTraceFile mod.traceFile).log
+            -- The trace holds the log of the action that produced the outputs (their replay, restore
+            -- by input hash or from the usage index, unpack, kept-module check's accept or build), and
+            -- whether they came from an archive
+            let current ← readTraceFile mod.traceFile
+            let log := current.log
             -- Queued before the local mapping is written: a build that finds the mapping never
             -- compiles (or queues) this input. After a crash between the two, the next build
             -- restores the outputs through the trace without queueing them, so they stay queued once.
@@ -2957,6 +2971,7 @@ where
                 queueCompiledOutputs claim? mod.pkg depTrace.hash mod.name.toString
                   (some presetup.srcHash) (toJson {arts.descrs with ltar? := none}) log
               (← getLakeCache).writeOutputs mod.pkg.cacheScope depTrace.hash arts.descrs (log := log)
+                (fromArchive := current.fromArchive)
             mod.indexUsage presetup arts restore log
             return .done arts
           else

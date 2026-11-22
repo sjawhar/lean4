@@ -1,5 +1,5 @@
 # The `lines` group of test.sh, which sources it: the rows of the log line's table (LAKE_REMOTE_EXEC_LOG),
-# L1-L34 with L4b, L5b, L5c, L5d, L5e and L9b, but L8 (remoteExecToolchainMismatch) and L29
+# L1-L34 with L4b, L5b, L5c, L5d, L5e, L5f, L5g and L9b, but L8 (remoteExecToolchainMismatch) and L29
 # (remoteExecSourceRace). Each row builds in directories of its own under $WORK/lines, and each build writes
 # its lines to a log of its own, which `lines_check.py` checks: one `lean` line for each module of the build,
 # every field with its type, and the row's own rules. L2, L3 and L4 build on L1's tree, Lake cache and
@@ -136,18 +136,24 @@ row_L5b() (
   done
 )
 
-# L5e: with the cutoff off, the Lake cache holds each module only as an archive (L5b's seed). Under `--no-build` a
+# archive_seed NAME: a service build of the fresh tree NAME-seed with `-o`, whose mappings `lake cache add` installs in
+# the tree's Lake cache, which then holds each module only as an archive (L5b's seed)
+archive_seed() {
+  enter "$1-seed"; log_to "$1-seed"
+  LAKE_ARTIFACT_CACHE=true test_run build Rx -o "$LW/$1-outputs.jsonl"
+  test_run cache add "$LW/$1-outputs.jsonl"
+  find "$LAKE_CACHE_DIR/artifacts" -type f ! -name '*.ltar' -delete
+  test_exp "$(find "$LAKE_CACHE_DIR/artifacts" -type f -name '*.ltar' | wc -l)" -gt 0
+}
+
+# L5e: with the cutoff off, the Lake cache holds each module only as an archive (`archive_seed`). Under `--no-build` a
 # tree restores each one from its archive, which keeps no record: `local-cache` with no action and no outputs. In a
 # build that uses the service, each one goes to the service instead, whose cache answers from the seed's run: `cached`
 # with the action and the outputs. Each tree reads the seed's cache and does not write it, so the archives stay its
 # only entries
 row_L5e() (
   export LAKE_USAGE_CUTOFF=0 LAKE_RESTORE_ARTIFACTS=true LAKE_REMOTE_EXEC=grpc://fake:1
-  enter L5e-seed; log_to L5e-seed
-  LAKE_ARTIFACT_CACHE=true test_run build Rx -o "$LW/L5e-outputs.jsonl"
-  test_run cache add "$LW/L5e-outputs.jsonl"
-  find "$LAKE_CACHE_DIR/artifacts" -type f ! -name '*.ltar' -delete
-  test_exp "$(find "$LAKE_CACHE_DIR/artifacts" -type f -name '*.ltar' | wc -l)" -gt 0
+  archive_seed L5e
   enter L5e-nobuild; export LAKE_CACHE_DIR="$LW/L5e-seed.cache"; log_to L5e-nobuild
   test_run build --no-build Rx
   lines L5e-nobuild --modules "$MODS" --expect '*:result=local-cache,action=null,outputs=null,code=null'
@@ -155,6 +161,41 @@ row_L5e() (
   enter L5e-service; export LAKE_CACHE_DIR="$LW/L5e-seed.cache"; log_to L5e-service
   test_run build Rx
   lines L5e-service --modules "$MODS" --expect '*:result=cached,action=digest,outputs=digests,code=null'
+)
+
+# L5f: L5e's case with trees that write the Lake cache. Under `--no-build`, tree A restores each module from its
+# archive with no record, and writes the Lake cache entry of the unpacked outputs, which says that they came from an
+# archive, as A's traces do. In a build that uses the service, a fresh tree B that restores those entries, and then
+# tree A, send each module to the service, whose cache answers from the seed's run: `cached` with the action and the
+# outputs. B builds first: a result of the service replaces the entry with one that has the record
+row_L5f() (
+  export LAKE_USAGE_CUTOFF=0 LAKE_RESTORE_ARTIFACTS=true LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_ARTIFACT_CACHE=true
+  archive_seed L5f
+  enter L5f-a; export LAKE_CACHE_DIR="$LW/L5f-seed.cache"; log_to L5f-a
+  test_run build --no-build Rx
+  lines L5f-a --modules "$MODS" --expect '*:result=local-cache,action=null,outputs=null,code=null'
+  test_exp "$(find "$LAKE_CACHE_DIR/artifacts" -type f ! -name '*.ltar' | wc -l)" -gt 0
+  enter L5f-b; export LAKE_CACHE_DIR="$LW/L5f-seed.cache"; log_to L5f-b
+  test_run build Rx
+  lines L5f-b --modules "$MODS" --expect '*:result=cached,action=digest,outputs=digests,code=null'
+  cd "$LW/L5f-a"; log_to L5f-c
+  test_run build Rx
+  lines L5f-c --modules "$MODS" --expect '*:result=cached,action=digest,outputs=digests,code=null'
+)
+
+# L5g: L5e's case under the fallback, with a tree that writes the Lake cache. While the service does not answer, the
+# build restores each module from its archive with no record: `local-cache` with no action and no outputs. When the
+# service answers, the same tree's traces, which say that the outputs came from an archive, send each module to the
+# service, whose cache answers from the seed's run: `cached` with the action and the outputs
+row_L5g() (
+  export LAKE_USAGE_CUTOFF=0 LAKE_RESTORE_ARTIFACTS=true LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_ARTIFACT_CACHE=true
+  archive_seed L5g
+  enter L5g; export LAKE_CACHE_DIR="$LW/L5g-seed.cache"; log_to L5g-down
+  FAKE_UNREACHABLE=1 LAKE_REMOTE_EXEC_FALLBACK=local test_run build Rx
+  lines L5g-down --modules "$MODS" --expect '*:result=local-cache,action=null,outputs=null,code=null'
+  log_to L5g
+  test_run build Rx
+  lines L5g --modules "$MODS" --expect '*:result=cached,action=digest,outputs=digests,code=null'
 )
 
 # L5c: under the fallback, with the usage cutoff, a change of Rx.A that Rx.B does not use: Rx.A compiles,
@@ -531,5 +572,5 @@ row_L34() (
   lines L34 --modules Rx.P,Rx.Q --expect 'Rx.P:result=executed|cached,exitCode=0' --expect "Rx.Q:$IMPORT_FAILED"
 )
 
-run_rows L1 L2 L3 L4 L4b L5 L5d L5b L5e L5c L6 L7 L9 L9b L10 L11 L12 L13 L14 L15 L16 L17 L18 L19 L20 L21 L22 \
-  L23 L24 L25 L26 L27 L28 L30 L31 L32 L33 L34
+run_rows L1 L2 L3 L4 L4b L5 L5d L5b L5e L5f L5g L5c L6 L7 L9 L9b L10 L11 L12 L13 L14 L15 L16 L17 L18 L19 L20 L21 \
+  L22 L23 L24 L25 L26 L27 L28 L30 L31 L32 L33 L34

@@ -349,6 +349,11 @@ public structure CacheOutput where
     sha256? : Option Sha256Map := none
     /-- The build service's record of the outputs (`remote`), for outputs that a service action made. -/
     remote? : Option RemoteExec.Record := none
+    /--
+    Whether the outputs came from an archive (`.ltar`), which keeps no service record, so that a service action may
+    have made them (`fromArchive`).
+    -/
+    fromArchive : Bool := false
     deriving Inhabited
 
 namespace CacheOutput
@@ -366,6 +371,7 @@ public protected def toJson (out : CacheOutput) : Json := Id.run do
   obj := obj.insertSome "log" out.log?
   obj := obj.insertSome "sha256" out.sha256?
   obj := obj.insertSome "remote" out.remote?
+  obj := obj.insertSome "fromArchive" (if out.fromArchive then some true else none)
   return obj.insert "data" out.data
 
 public instance : ToJson CacheOutput := ⟨CacheOutput.toJson⟩
@@ -390,7 +396,8 @@ public protected def fromJson? (json : Json) : Except String CacheOutput := do
       let sha256? ← obj.get? "sha256"
       -- A record that does not parse is no record: the entry still names its outputs
       let remote? : Option RemoteExec.Record := (obj.get? "remote").toOption.join
-      return {data, service?, scope?, log?, sha256?, remote?}
+      let fromArchive ← obj.getD "fromArchive" false
+      return {data, service?, scope?, log?, sha256?, remote?, fromArchive}
   -- old format: just the data
   return .ofData json
 
@@ -470,10 +477,12 @@ def writeOutputsCore
   (cache : Cache) (scope : String) (inputHash : Hash) (out : Json)
   (service? : Option CacheServiceName) (remoteScope? : Option CacheServiceScope)
   (log : Log) (sha256? : Option Sha256Map) (overwrite : Bool) (remote? : Option RemoteExec.Record := none)
+  (fromArchive := false)
 : IO Unit := do
   let file := cache.outputsFile scope inputHash
   createParentDirs file
-  let out := {service?, scope? := remoteScope?, data := out, log? := cachedLog? log, sha256?, remote? : CacheOutput}
+  let out : CacheOutput :=
+    {service?, scope? := remoteScope?, data := out, log? := cachedLog? log, sha256?, remote?, fromArchive}
   let isKept (data : Json) := (data.getObjVal? "kf").isOk
   let contents := (toJson out).pretty
   if isKept out.data then
@@ -485,15 +494,17 @@ def writeOutputsCore
 
 /--
 Cache the outputs corresponding to the given input for the package,
-along with the log of the build that produced them and, for outputs that a service action made, its record.
+along with the log of the build that produced them, for outputs that a service action made its record, and for
+outputs that came from an archive the mark of it (`CacheOutput.fromArchive`).
 -/
 public def writeOutputs
   [ToJson α] (cache : Cache) (scope : String) (inputHash : Hash) (outputs : α)
   (service? : Option CacheServiceName := none) (remoteScope? : Option CacheServiceScope := none)
   (log : Log := {}) (sha256? : Option Sha256Map := none) (overwrite := true)
-  (remote? : Option RemoteExec.Record := none)
+  (remote? : Option RemoteExec.Record := none) (fromArchive := false)
 : IO Unit :=
   cache.writeOutputsCore scope inputHash (toJson outputs) service? remoteScope? log sha256? overwrite remote?
+    fromArchive
 
 /-- Cache the input-to-outputs mappings from a `CacheMap`.  -/
 public def writeMap

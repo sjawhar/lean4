@@ -201,8 +201,9 @@ machine for them. Lake writes the outputs of each action into the build director
 ends. These stay on this machine and write no line: executables, static libraries, `extern_lib`
 targets and other targets with build code of their own, `leanir` (`postponeCompile`), LLVM
 objects (`bc.o`) and the shared libraries that link them, and the shared library of a module or a
-library whose link takes a file that no native action of the build made (a library's
-`moreLinkObjs`, or on Windows the libraries it links as arguments, an `extern_lib`'s among them).
+library whose link takes a file that a request cannot carry: an object that is no native artifact
+of the build (a library's `moreLinkObjs`, an LLVM object), or, on Windows, where the link takes its
+libraries as arguments, any library.
 After a promotion (below) changes the .olean of a module with `postponeCompile`, the next build runs
 the module's `leanir` step again. If that step writes other files, the modules that import it go to
 the service again.
@@ -218,12 +219,14 @@ with the result of that run, before the other jobs take the file. So does the jo
 in a build with LAKE_USAGE_CUTOFF on: a local compile then passes --usage, which writes digests into
 the .olean, and the cutoff keeps or skips outputs, so they are not what the service compiles. This
 holds also for module outputs in the Lake cache with no record: the job compiles the module on the
-service and does not restore them. So does the job of a module that the Lake cache holds as an
-archive (.ltar), which keeps no record, whatever the cutoff. Lake uses any other such module as it
-is. Before an action on the service takes an output with no record as an input, Lake runs its own
-action on the service and writes the service's files over the local ones. This promotion writes no
-line: the target keeps its one line. Lake assumes that, with the cutoff off, a local compile of a
-module with the same toolchain gives the service's bytes; if it does not, the modules that import a
+service and does not restore them. So does the job of a module whose outputs came from an archive
+(.ltar), which keeps no record, whatever the cutoff: a cached archive, the outputs that an unpack
+in an earlier build left here (under --no-build or while the build did not use the service), and
+a Lake cache entry that such an unpack wrote. Lake uses any other such module as it is. Before an
+action on the service takes an output with no record as an input, Lake runs its own action on the
+service and writes the service's files over the local ones. This promotion writes no line: the
+target keeps its one line. Lake assumes that, with the cutoff off, a local compile of a module
+with the same toolchain gives the service's bytes; if it does not, the modules that import a
 promoted one build again on the service in the next build. A C object or shared library is not
 covered: the service builds it with LAKE_REMOTE_EXEC_CC (see `local` below). The actions of one
 commit have the same digests on two machines when LAKE_REMOTE_EXEC_SYSROOT (unset: the path of the
@@ -286,7 +289,10 @@ The results:
                       (whatever the exit code)
   timeout             the action ran longer than LAKE_REMOTE_EXEC_TIMEOUT
   local-cache         Lake found the outputs on this machine and sent no request (action and
-                      outputs give the service's record, or null when no service action made them)
+                      outputs give the service's record, or null when no service action made them
+                      or when they came from an archive, which Lake uses only under --no-build or
+                      while the build does not use the service; in a build that uses the service,
+                      such a module goes to the service, with the result executed or cached)
   local               the fallback built it on this machine
   toolchain-mismatch  the fallback built it on this machine, and the service runs another Lean
   bucket              the fallback restored the module from the LAKE_REMOTE_CACHE service
