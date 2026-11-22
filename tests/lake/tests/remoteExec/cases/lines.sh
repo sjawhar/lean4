@@ -1,5 +1,5 @@
 # The `lines` group of test.sh, which sources it: the rows of the log line's table (LAKE_REMOTE_EXEC_LOG),
-# L1-L34 with L4b, L5b, L5c, L5d, L5e, L5f, L5g and L9b, but L8 (remoteExecToolchainMismatch) and L29
+# L1-L34 with L4b, L5b, L5c, L5d, L5e, L5f, L5g, L5h and L9b, but L8 (remoteExecToolchainMismatch) and L29
 # (remoteExecSourceRace). Each row builds in directories of its own under $WORK/lines, and each build writes
 # its lines to a log of its own, which `lines_check.py` checks: one `lean` line for each module of the build,
 # every field with its type, and the row's own rules. L2, L3 and L4 build on L1's tree, Lake cache and
@@ -146,6 +146,50 @@ archive_seed() {
   test_exp "$(find "$LAKE_CACHE_DIR/artifacts" -type f -name '*.ltar' | wc -l)" -gt 0
 }
 
+# archive_traces NAME MARK: each module's trace in this tree is the one that a direct unpack (`leantar -x -j -`) of its
+# archive in NAME's seed (`archive_seed`, whose cache is this tree's) under the trace's hash writes in
+# $LW/NAME-direct/MODULE: with MARK `marked`, plus the one key `fromArchive` (true), and with `plain`, byte for byte;
+# either way it has no `inputs` and no `synthetic`. The Lake cache entry under that hash has `fromArchive` (true) with
+# `marked`, and no `fromArchive` with `plain`
+archive_traces() {
+  rm -rf "$LW/$1-direct"
+  test_cmd "$PYTHON" -c 'import glob, json, os, subprocess, sys
+cache, outputs, direct, mark, mods = sys.argv[1:6]
+ltars = dict(json.loads(l) for l in open(outputs).read().splitlines()[1:] if l.strip())
+leantar = os.path.join(subprocess.check_output(["lean", "--print-prefix"], text=True).strip(), "bin", "leantar")
+bad = []
+for mod in mods.split(","):
+    rel = mod.replace(".", "/")
+    raw = open(os.path.join(".lake/build/lib/lean", rel + ".trace"), "rb").read()
+    trace = json.loads(raw)
+    dep = trace["depHash"]
+    lib, ir = os.path.join(direct, mod, "lib"), os.path.join(direct, mod, "ir")
+    os.makedirs(lib); os.makedirs(ir)
+    spec = json.dumps([{"file": os.path.join(cache, "artifacts", ltars[dep]), "hash": dep}])
+    subprocess.run([leantar, "-C", lib, "-C", ir, "-x", "-j", "-"], input=spec, text=True, check=True)
+    plain = open(os.path.join(lib, rel.rsplit("/", 1)[-1] + ".trace"), "rb").read()
+    keys, want = sorted(trace), sorted(json.loads(plain))
+    if mark == "marked":
+        rest = {k: v for k, v in trace.items() if k != "fromArchive"}
+        ok = keys == sorted(want + ["fromArchive"]) and trace.get("fromArchive") is True and rest == json.loads(plain)
+    else:
+        ok = raw == plain
+    if not ok or {"inputs", "synthetic"} & set(keys):
+        bad.append("%s: its trace has the keys %s (fromArchive %r); the direct unpack writes %s, and the row wants %s"
+                   % (mod, keys, trace.get("fromArchive"), want, "those and fromArchive (true)" if mark == "marked"
+                      else "its bytes"))
+    found = glob.glob(os.path.join(cache, "outputs", "*", dep + ".json"))
+    if len(found) != 1:
+        bad.append("%s: the Lake cache has %d entries under %s" % (mod, len(found), dep))
+        continue
+    entry = json.load(open(found[0]))
+    has = entry["fromArchive"] if "fromArchive" in entry else None
+    if has is not (True if mark == "marked" else None):
+        bad.append("%s: its Lake cache entry %s has fromArchive %r" % (mod, found[0], has))
+print("\n".join(bad) or "ok: %s traces" % mark)
+sys.exit(1 if bad else 0)' "$LAKE_CACHE_DIR" "$LW/$1-outputs.jsonl" "$LW/$1-direct" "$2" "$MODS"
+}
+
 # L5e: with the cutoff off, the Lake cache holds each module only as an archive (`archive_seed`). Under `--no-build` a
 # tree restores each one from its archive, which keeps no record: `local-cache` with no action and no outputs. In a
 # build that uses the service, each one goes to the service instead, whose cache answers from the seed's run: `cached`
@@ -164,10 +208,11 @@ row_L5e() (
 )
 
 # L5f: L5e's case with trees that write the Lake cache. Under `--no-build`, tree A restores each module from its
-# archive with no record, and writes the Lake cache entry of the unpacked outputs, which says that they came from an
-# archive, as A's traces do. In a build that uses the service, a fresh tree B that restores those entries, and then
-# tree A, send each module to the service, whose cache answers from the seed's run: `cached` with the action and the
-# outputs. B builds first: a result of the service replaces the entry with one that has the record
+# archive with no record, and each trace is the one that the archive holds with the one key `fromArchive` added, as
+# the Lake cache entry of the unpacked outputs has it (`archive_traces`). In a build that uses the service, a fresh
+# tree B that restores those entries, and then tree A, send each module to the service, whose cache answers from the
+# seed's run: `cached` with the action and the outputs. B builds first: a result of the service replaces the entry
+# with one that has the record
 row_L5f() (
   export LAKE_USAGE_CUTOFF=0 LAKE_RESTORE_ARTIFACTS=true LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_ARTIFACT_CACHE=true
   archive_seed L5f
@@ -175,6 +220,7 @@ row_L5f() (
   test_run build --no-build Rx
   lines L5f-a --modules "$MODS" --expect '*:result=local-cache,action=null,outputs=null,code=null'
   test_exp "$(find "$LAKE_CACHE_DIR/artifacts" -type f ! -name '*.ltar' | wc -l)" -gt 0
+  archive_traces L5f marked
   enter L5f-b; export LAKE_CACHE_DIR="$LW/L5f-seed.cache"; log_to L5f-b
   test_run build Rx
   lines L5f-b --modules "$MODS" --expect '*:result=cached,action=digest,outputs=digests,code=null'
@@ -196,6 +242,17 @@ row_L5g() (
   log_to L5g
   test_run build Rx
   lines L5g --modules "$MODS" --expect '*:result=cached,action=digest,outputs=digests,code=null'
+)
+
+# L5h: L5f's tree A with service mode unset, which marks nothing: after the unpack under `--no-build`, each trace is the
+# one that the archive holds, byte for byte, and the Lake cache entry of the unpacked outputs has no `fromArchive`
+row_L5h() (
+  export LAKE_USAGE_CUTOFF=0 LAKE_RESTORE_ARTIFACTS=true LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_ARTIFACT_CACHE=true
+  archive_seed L5h
+  unset LAKE_REMOTE_EXEC
+  enter L5h; export LAKE_CACHE_DIR="$LW/L5h-seed.cache"
+  test_run build --no-build Rx
+  archive_traces L5h plain
 )
 
 # L5c: under the fallback, with the usage cutoff, a change of Rx.A that Rx.B does not use: Rx.A compiles,
@@ -590,5 +647,5 @@ row_L34() (
   lines L34 --modules Rx.P,Rx.Q --expect 'Rx.P:result=executed|cached,exitCode=0' --expect "Rx.Q:$IMPORT_FAILED"
 )
 
-run_rows L1 L2 L3 L4 L4b L5 L5d L5b L5e L5f L5g L5c L6 L7 L9 L9b L10 L11 L12 L13 L14 L15 L16 L17 L18 L19 L20 L21 \
-  L22 L23 L24 L25 L26 L27 L28 L30 L31 L32 L33 L34
+run_rows L1 L2 L3 L4 L4b L5 L5d L5b L5e L5f L5g L5h L5c L6 L7 L9 L9b L10 L11 L12 L13 L14 L15 L16 L17 L18 L19 L20 \
+  L21 L22 L23 L24 L25 L26 L27 L28 L30 L31 L32 L33 L34

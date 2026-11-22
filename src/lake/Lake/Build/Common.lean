@@ -83,8 +83,9 @@ public structure BuildMetadata where
   -/
   remote? : Option RemoteExec.Record := none
   /--
-  Whether the outputs came from an archive (`.ltar`), which keeps no service record, so that a service action may
-  have made them. It is kept out of `outputs?` too, and an archive does not keep it.
+  Whether the outputs came from an archive (`.ltar`) that an unpack in service mode restored (`Module.unpackLtar`): an
+  archive keeps no service record, so a service action may have made them. It is kept out of `outputs?` too, and an
+  archive does not keep it.
   -/
   fromArchive : Bool := false
 

@@ -350,8 +350,8 @@ public structure CacheOutput where
     /-- The build service's record of the outputs (`remote`), for outputs that a service action made. -/
     remote? : Option RemoteExec.Record := none
     /--
-    Whether the outputs came from an archive (`.ltar`), which keeps no service record, so that a service action may
-    have made them (`fromArchive`).
+    Whether the outputs came from an archive (`.ltar`) that an unpack in service mode restored, which keeps no
+    service record, so that a service action may have made them (`fromArchive`).
     -/
     fromArchive : Bool := false
     deriving Inhabited

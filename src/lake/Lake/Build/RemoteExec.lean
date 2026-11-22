@@ -1570,13 +1570,14 @@ public def buildNativeSharedLib (kind : NativeKind) (target : String) (rel? : Op
     let args := weakArgs ++ traceArgs
     -- The default `linkDeps` of `buildLeanSharedLibSync`: whether the link takes `libs` as arguments
     let linkDeps := System.Platform.isWindows
+    let linkHere := buildLeanSharedLibSync libName libFile objs libs args plugin (linkDeps := linkDeps)
     let some s ← remoteSession?
-      | buildLeanSharedLibSync libName libFile objs libs args plugin (linkDeps := linkDeps)
+      | linkHere
     let some rel := rel?
-      | buildLeanSharedLibSync libName libFile objs libs args plugin (linkDeps := linkDeps)
+      | linkHere
     let registered ← objs.allM fun obj => do return (← nativeArtifact? obj).isSome
     unless registered && !(linkDeps && !libs.isEmpty) do
-      return ← buildLeanSharedLibSync libName libFile objs libs args plugin (linkDeps := linkDeps)
+      return ← linkHere
     Internal.addLeanSharedLibTrace
     let act : NativeAction :=
       {kind, target, file := libFile, rel, inputs := .objects objs (libs.map (·.path)), args}
