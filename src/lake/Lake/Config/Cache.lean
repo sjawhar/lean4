@@ -249,6 +249,12 @@ public def insert
   (platformIndependent := false)
 : BaseIO Unit := cache.modify (·.insert inputHash (toJson val) platformIndependent)
 
+/-- Maps `inputHash` to `val` (as `CacheRef.insert`) in place of the mapping of `oldHash`, in one step. -/
+@[inline] public def replace
+  [ToJson α] (oldHash inputHash : Hash) (val : α) (cache : CacheRef)
+  (platformIndependent := false)
+: BaseIO Unit := cache.modify fun m => CacheMap.insert inputHash (toJson val) (m.erase oldHash) platformIndependent
+
 end CacheRef
 
 /-! ## Cache Service Name -/

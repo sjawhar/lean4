@@ -975,17 +975,18 @@ No local output is an input of a service action. An input that has no service re
 that this machine built: under the fallback, in an earlier build, or with service mode off) is promoted before a
 service action takes it: its own action runs on the service (a cache hit when another builder built it), its own
 inputs promoted first, and the service's outputs are materialized over the local files (the bridge renames each into
-place, so a process that has an old file open keeps it); the `.hash` files, the trace and the Lake cache entry then
-follow the service's bytes, with the service's record. A promotion writes no line of `LAKE_REMOTE_EXEC_LOG` (the job of
-its target wrote that), and one promotion serves every job of the process (`promoteOnce`). Under `--no-build` no
-service action runs, so nothing is promoted. A native artifact that is up to date with no record is promoted by its
-own job when the build uses the service (`buildNativeArtifact`), before any consumer takes its hash, and so is such a
+place, so a process that has an old file open keeps it); the `.hash` files, the trace, the Lake cache entry and the
+`-o` entry then follow the service's bytes, with the service's record (a module's `-o` entry names a new archive).
+A promotion writes no line of `LAKE_REMOTE_EXEC_LOG` (the job of its target wrote that), and one promotion serves
+every job of the process (`promoteOnce`). Under `--no-build` no service action runs, so nothing is promoted. A native
+artifact that is up to date with no record is promoted by its own job when the build uses the service
+(`buildNativeArtifact`), before any consumer takes its hash, and so is such a
 module in a build with the usage cutoff on, whose outputs a service compile does not reproduce (`Module.fetchRemote`).
 The promotion here serves the others: native artifacts that their jobs built or replayed here while the build did not
 use the service, and modules whose local compile gives the service's bytes, so that their importers' hashes hold.
-A service action whose request promoted inputs (its own, or those of a promotion's request) writes its trace and its
-Lake cache entry under the hash of its inputs after the promotion, which the next build computes from the files
-(`Module.retrace`, `NativeAction.retrace`). Another job of the build that took the hash of an output before its
+A service action whose request promoted inputs (its own, or those of a promotion's request) writes its trace, its Lake
+cache entry and its `-o` entry under the hash of its inputs after the promotion, which the next build computes from the
+files (`Module.retrace`, `NativeAction.retrace`). Another job of the build that took the hash of an output before its
 promotion keeps that hash.
 -/
 
@@ -1001,6 +1002,13 @@ public def BuildTrace.withInputs? (t : BuildTrace) (inputs : Array BuildTrace) :
 /-- `t` mixed again with `u` in place of its input at `i` (`BuildTrace.withInputs?`). -/
 public def BuildTrace.withInput? (t : BuildTrace) (i : Nat) (u : BuildTrace) : Option BuildTrace :=
   if i < t.inputs.size then t.withInputs? (t.inputs.set! i u) else none
+
+/-- `t` mixed again with each input whose hash `hashes` gives (in order) taking that hash (`BuildTrace.withInputs?`);
+`t` itself when `hashes` gives none. -/
+def BuildTrace.withHashes? (t : BuildTrace) (hashes : Array (Option Hash)) : Option BuildTrace :=
+  if hashes.all (·.isNone) then some t
+  else if t.inputs.size != hashes.size then none
+  else t.withInputs? <| (t.inputs.zip hashes).map fun (u, hash?) => hash?.elim u fun hash => {u with hash}
 
 /-- Why a promotion (`promoteOnce`) gave its input no service record. -/
 public inductive PromotionError
@@ -1084,10 +1092,11 @@ public inductive NativeInputs
   | source (file : FilePath) (rel : String)
     (promote : RemoteSession → JobM (Except PromotionError (Option Artifact)))
   /-- A link: the objects' local paths, each the output of a native action of this build (`nativeArtifact?`), which
-  the request takes by their service digest. -/
-  | objects (files : Array FilePath)
+  the request takes by their service digest, and the local paths of the libraries that the link's trace takes
+  (`linkLibs`), none of which is an input of the request. -/
+  | objects (files libs : Array FilePath)
 
-public instance : Inhabited NativeInputs := ⟨.objects #[]⟩
+public instance : Inhabited NativeInputs := ⟨.objects #[] #[]⟩
 
 /-- A native action of service mode: the data its `run` request is built from (`NativeAction.request`). -/
 public structure NativeAction where
@@ -1208,21 +1217,19 @@ public def NativeAction.request (act : NativeAction) (s : RemoteSession) (ins : 
 /--
 The trace `depTrace` of the native action's job (`NativeAction.fetch`) as the next build computes it from the files,
 once a request of the action resolved its inputs (`NativeAction.serviceInputs`), which can promote them: a link's
-object that this process promoted (`NativeArtifact.promotedHash?`), or the C file of a `CCompile` whose module it
-promoted (`NativeInputs.source`), has the hash of the service's output in place of the one that its job hashed. The
-first input of `depTrace` is the objects' trace, with each object's job's trace in order (`buildNativeSharedLib`), or
-the trace of the C file's job, whose first input is the C file's (`buildModuleO`, the module's `c` facet). With no
-input promoted, `depTrace` is unchanged, and so it is when it is not that mix: the action has run, and a trace that
-keeps the hash from before the promotion costs one more build of the artifact. A verbose line says so.
+object or library that this process promoted (`NativeArtifact.promotedHash?`), or the C file of a `CCompile` whose
+module it promoted (`NativeInputs.source`), has the hash of the service's output in place of the one that its job
+hashed. The first two inputs of a link's `depTrace` are the objects' trace and the libraries' trace, each with each
+one's job's trace in order (`buildNativeSharedLib`); the first input of a `CCompile`'s is the trace of the C file's
+job, whose first input is the C file's (`buildModuleO`, the module's `c` facet). With no input promoted, `depTrace` is
+unchanged, and so it is when it is not that mix: the action has run, and a trace that keeps the hash from before the
+promotion costs one more build of the artifact. A verbose line says so.
 -/
 def NativeAction.retrace (act : NativeAction) (s : RemoteSession) (depTrace : BuildTrace) : JobM BuildTrace := do
   let keep : JobM BuildTrace := do
     logVerbose s!"{act.target}: its trace keeps the hash from before the promotion of its inputs: it is not the one \
       that its build makes"
     return depTrace
-  let withFirst (first : BuildTrace) : JobM BuildTrace := do
-    let some trace := depTrace.withInput? 0 first | keep
-    return trace
   match act.inputs with
   | .source _ _ promote =>
     let .ok (some c) ← promote s | return depTrace
@@ -1230,15 +1237,18 @@ def NativeAction.retrace (act : NativeAction) (s : RemoteSession) (depTrace : Bu
     let some cTrace := cJob.inputs[0]? | keep
     if c.hash == cTrace.hash then return depTrace
     let some cJob := cJob.withInput? 0 {cTrace with hash := c.hash} | keep
-    withFirst cJob
-  | .objects files =>
-    let hashes ← files.mapM fun file => return (← nativeArtifact? file).bind (·.promotedHash?)
-    if hashes.all (·.isNone) then return depTrace
-    let some objs := depTrace.inputs[0]? | keep
-    unless objs.inputs.size == files.size do return ← keep
-    let inputs := (objs.inputs.zip hashes).map fun (t, hash?) => hash?.elim t fun hash => {t with hash}
-    let some objs := objs.withInputs? inputs | keep
-    withFirst objs
+    let some trace := depTrace.withInput? 0 cJob | keep
+    return trace
+  | .objects files libFiles =>
+    let promotedHashes (paths : Array FilePath) : BaseIO (Array (Option Hash)) :=
+      paths.mapM fun path => return (← nativeArtifact? path).bind (·.promotedHash?)
+    let objHashes ← promotedHashes files
+    let libHashes ← promotedHashes libFiles
+    if objHashes.all (·.isNone) && libHashes.all (·.isNone) then return depTrace
+    let some objs := depTrace.inputs[0]? >>= (·.withHashes? objHashes) | keep
+    let some libs := depTrace.inputs[1]? >>= (·.withHashes? libHashes) | keep
+    let some trace := depTrace.withInputs? ((depTrace.inputs.set! 0 objs).set! 1 libs) | keep
+    return trace
 
 mutual
 
@@ -1273,7 +1283,7 @@ public partial def NativeAction.serviceInputs (act : NativeAction) (s : RemoteSe
   match act.inputs with
   | .source file rel promote =>
     return (← promote s).map fun promoted? => .source ((promoted?.map (·.path)).getD file) rel
-  | .objects files =>
+  | .objects files _ =>
     let mut objs := #[]
     for file in files do
       let some a ← nativeArtifact? file
@@ -1345,7 +1355,9 @@ Promotes the native artifact of `act` (see "Promotion of the inputs of service a
 service, its inputs promoted first (`NativeAction.serviceInputs`), and, with `skipCacheLookup`, past the service's
 action cache; then materializes the output over the artifact's file with the output's executable bit, and writes the
 service's record into the file's trace, its Lake cache entry (`cacheServiceArtifact`) and `nativeArtifacts`, the trace
-and the entry under the hash of the action's inputs after their promotion (`NativeAction.retrace`). Returns the output.
+and the entry under the hash of the action's inputs after their promotion (`NativeAction.retrace`). The trace of a
+`--no-build` run goes, and the artifact's `-o` entry, which its job wrote under the job's trace, becomes that hash mapped
+to the promoted file. Returns the output.
 -/
 public partial def NativeAction.promote (act : NativeAction) (s : RemoteSession) (skipCacheLookup := false) :
     JobM (Except PromotionError RemoteExec.RecordOutput) := do
@@ -1375,6 +1387,9 @@ public partial def NativeAction.promote (act : NativeAction) (s : RemoteSession)
       else .ofBuild depTrace (toJson art.descr) data.log (remote? := some record)
     | _ => BuildMetadata.ofFetch depTrace.hash (toJson art.descr) {} (remote? := some record)
   data.writeFile traceFile
+  removeFileIfExists (traceFile.addExtension "nobuild")
+  if let some ref ← Internal.getOutputsRef? a.pkg then
+    ref.replace a.depTrace.hash depTrace.hash art.descr
   registerNativeArtifact {a with depTrace, record? := some record, promotedHash? := some art.hash}
   return .ok {digest := out.digest, executable := out.executable}
 
@@ -1575,7 +1590,8 @@ public def buildNativeSharedLib (kind : NativeKind) (target : String) (rel? : Op
     unless registered do
       return ← buildLeanSharedLibSync libName libFile objs libs args plugin
     Internal.addLeanSharedLibTrace
-    let act : NativeAction := {kind, target, file := libFile, rel, inputs := .objects objs, args}
+    let act : NativeAction :=
+      {kind, target, file := libFile, rel, inputs := .objects objs (libs.map (·.path)), args}
     let art ← buildNativeArtifact s act (Internal.linkLeanSharedLib libFile objs libs args)
     return {name := libName, path := art.path, deps := libs, plugin}
 
