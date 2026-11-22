@@ -235,12 +235,13 @@ holds also for module outputs in the Lake cache with no record (an archive keeps
 compiles the module on the service and does not restore them. Lake uses any other such module as it
 is. Before an action on the service takes an output with no record as an input, Lake runs its own
 action on the service and writes the service's files over the local ones. This promotion writes no
-line: the target keeps its one line. Lake assumes that, with the cutoff off, a local compile with
-the same toolchain gives the service's bytes; if it does not, the modules that import a promoted
-one build again on the service in the next build. The actions of one commit have the same digests
-on two machines when LAKE_REMOTE_EXEC_SYSROOT (unset: the path of the local sysroot),
-LAKE_REMOTE_EXEC_TOOLCHAIN, LAKE_REMOTE_EXEC_CC, LAKE_REMOTE_EXEC_PATH and LAKE_REMOTE_EXEC_TIMEOUT
-are the same on both.
+line: the target keeps its one line. Lake assumes that, with the cutoff off, a local compile of a
+module with the same toolchain gives the service's bytes; if it does not, the modules that import a
+promoted one build again on the service in the next build. A C object or shared library is not
+covered: the service builds it with LAKE_REMOTE_EXEC_CC (see `local` below). The actions of one
+commit have the same digests on two machines when LAKE_REMOTE_EXEC_SYSROOT (unset: the path of the
+local sysroot), LAKE_REMOTE_EXEC_TOOLCHAIN, LAKE_REMOTE_EXEC_CC, LAKE_REMOTE_EXEC_PATH and
+LAKE_REMOTE_EXEC_TIMEOUT are the same on both.
 
 The service does not answer when its `hello` finds it unreachable, or when a request still answers
 UNAVAILABLE after the daemon's own retries. Then LAKE_REMOTE_EXEC_FALLBACK decides, for a module,
@@ -248,10 +249,13 @@ a C object or a shared library:
   local   builds it on this machine and publishes nothing. Until the service answers, each later
           one also builds here at once, with no request. Lake asks the service again 1 s after
           the failure, then after 2, 4, 8 and 16 s, then every 30 s. Each one that starts after
-          the service answers goes to the service again. With LAKE_USAGE_CUTOFF on, each module
-          that the build compiled or replayed here while the service did not answer, and that
-          took the hash of an output that a later request promoted, goes to the service in the
-          next build, and `lake build --no-build` exits with code 3 until then.
+          the service answers goes to the service again. Each module, C object and shared
+          library that the build compiled, replayed or linked here while the service did not
+          answer, and that took the hash of an output that a later request promoted, goes to the
+          service in the next build, and `lake build --no-build` exits with code 3 until then.
+          With LAKE_USAGE_CUTOFF off, this happens when the promoted output is a C object or a
+          shared library: LAKE_REMOTE_EXEC_CC on the service can write other bytes than the C
+          compiler of this machine.
   wait    builds nothing on this machine. Lake asks again after 1, 2, 4 … 30 s and says so on
           standard error.
   fail    fails it with the code UNAVAILABLE. The build exits with code 75 when each of its

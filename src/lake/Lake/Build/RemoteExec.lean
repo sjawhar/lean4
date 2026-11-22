@@ -701,8 +701,17 @@ public def useService (s : RemoteSession) (outcome : IO.Ref RemoteOutcome) : Job
 Whether the build service answers by this process's decision (`ensureDecision`, as `useService` reads it): `true`
 exactly when `useService` would answer `true` at once, with no wait for the service and no failure of the job.
 -/
-public def serviceAnswers (s : RemoteSession) : BaseIO Bool :=
+def serviceAnswers (s : RemoteSession) : BaseIO Bool :=
   return (← ensureDecision s.client s.cfg.endpoint s.leanGithash s.cfg.fallback) matches .active
+
+/--
+Whether the build uses the service (`serviceAnswers`) and is not `--no-build`, which sends no request. Then a local
+output with no service record goes to the service in its own job: a native artifact's (`NativeAction.fetch`), and a
+module's with the usage cutoff on (`Module.fetchRemote`).
+-/
+public def buildUsesService (s : RemoteSession) : JobM Bool := do
+  if (← getNoBuild) then return false
+  serviceAnswers s
 
 /--
 Exit code of a build whose every failure is an unavailable service under `fail`, or a confirmed
@@ -1001,26 +1010,6 @@ the restore leaves the records that a promotion of its own leaves. No promotion 
 two promotions never wait on each other: it takes the lock only once its request is made, which promotes the request's
 inputs first, and releases it while it makes a lost input again (`promotionRun`).
 -/
-
-/--
-`t`, a mix of its inputs onto a nil trace (`BuildTrace.mix` from `BuildTrace.nil`, as a job's trace and a collection's
-are), mixed again with `inputs` in their place; `none` if `inputs` has another size or `t` is no such mix of its own
-inputs (its inputs were dropped, `BuildTrace.withoutInputs`, or mixed onto another trace).
--/
-public def BuildTrace.withInputs? (t : BuildTrace) (inputs : Array BuildTrace) : Option BuildTrace :=
-  let remix (ins : Array BuildTrace) := ins.foldl (·.mix ·) (BuildTrace.nil t.caption)
-  if inputs.size == t.inputs.size && (remix t.inputs).hash == t.hash then some (remix inputs) else none
-
-/-- `t` mixed again with `u` in place of its input at `i` (`BuildTrace.withInputs?`). -/
-public def BuildTrace.withInput? (t : BuildTrace) (i : Nat) (u : BuildTrace) : Option BuildTrace :=
-  if i < t.inputs.size then t.withInputs? (t.inputs.set! i u) else none
-
-/-- `t` mixed again with each input whose hash `hashes` gives (in order) taking that hash (`BuildTrace.withInputs?`);
-`t` itself when `hashes` gives none. -/
-def BuildTrace.withHashes? (t : BuildTrace) (hashes : Array (Option Hash)) : Option BuildTrace :=
-  if hashes.all (·.isNone) then some t
-  else if t.inputs.size != hashes.size then none
-  else t.withInputs? <| (t.inputs.zip hashes).map fun (u, hash?) => hash?.elim u fun hash => {u with hash}
 
 /-- Why a promotion (`promoteOnce`) gave its input no service record. -/
 public inductive PromotionError
@@ -1577,7 +1566,7 @@ def NativeAction.fetch (act : NativeAction) (s : RemoteSession) (build : JobM PU
     -- A file that a local build made has no record: a build that uses the service builds it there (below), so that
     -- each consumer of this build takes the hash of the service's bytes, as the next build does
     let toService ← do
-      if savedTrace.remote?.isSome || (← getNoBuild) then pure false else serviceAnswers s
+      if savedTrace.remote?.isSome then pure false else buildUsesService s
     unless toService do
       discard <| savedTrace.replayCachedIfUpToDate inputHash
       let (art, record?) ← replayServiceArtifact pkg inputHash savedTrace file ext name
@@ -1619,8 +1608,8 @@ Builds the native artifact of `act` in service mode (contract C3.1) as `buildArt
 `build` (under the extension `NativeKind.cacheExt` in the Lake cache), with the current job's trace and the timeout
 rule (`RemoteSession.mixTimeout`). The artifact is up to date when its trace has the job's input hash and describes
 the file (`SavedTrace.fileUpToDate`): the job replays it (`replayServiceArtifact`) with the trace's service record. A
-file that a local build made has no record: under `--no-build`, and while the build does not use the service
-(`serviceAnswers`: the service does not answer, is refused or runs another Lean), it replays with none, and goes to
+file that a local build made has no record: while the build does not use the service (`buildUsesService`: under
+`--no-build`, or the service does not answer, is refused or runs another Lean), it replays with none, and goes to
 the service later only when a service action takes it as an input (`NativeArtifact.serviceOutput`); otherwise the job
 builds it on the service as below (its promotion), so that each consumer of this build takes the hash of the
 service's bytes, as the next build does. An artifact that is not up to date is restored from the Lake cache when its
