@@ -1,0 +1,308 @@
+# lake build
+ℹ Built A
+ℹ Built A:c.o (with exports)
+ℹ Built B
+ℹ Built B:c.o (with exports)
+ℹ Built Foo
+ℹ Built Foo.Bar
+ℹ Built Foo.Bar:c.o (with exports)
+ℹ Built Foo.Baz
+ℹ Built Foo.Baz:c.o (with exports)
+ℹ Built Foo.Foo
+ℹ Built Foo.Foo:c.o (with exports)
+ℹ Built Foo:c.o (with exports)
+ℹ Built Main
+ℹ Built Main:c.o (with exports)
+ℹ Built Root
+ℹ Built Root:c.o (with exports)
+ℹ Built bar:exe
+✔ Ran A:irArts
+✔ Ran B:irArts
+✔ Ran Foo.Bar:irArts
+✔ Ran Foo.Baz:irArts
+✔ Ran Foo.Foo:irArts
+✔ Ran Foo:irArts
+✔ Ran Main:irArts
+✔ Ran Root:irArts
+✔ Ran a:extraDep
+✔ Ran b:extraDep
+✔ Ran bar:extraDep
+✔ Ran foo:extraDep
+✔ Ran job computation
+✔ Ran root:extraDep
+✔ Ran store/storeKeys
+Build completed successfully (31 jobs).
+# store keys after lake build
+@root:extraDep
+@root:transDeps
+@foo:extraDep
+@foo:transDeps
+@bar:extraDep
+@bar:transDeps
+@a:extraDep
+@a:transDeps
+@b:extraDep
+@b:transDeps
+foo/+Foo.Baz:c.o.export
+foo/+Foo.Baz:imports
+foo/+Foo.Baz:precompileImports
+foo/+Foo.Baz:elabArts
+foo/+Foo.Baz:c
+foo/+Foo.Baz:metaExportInfo
+foo/+Foo.Baz:input
+foo/+Foo.Baz:transImports
+foo/+Foo.Baz:importInfo
+foo/+Foo.Baz:exportInfo
+foo/+Foo.Baz:irArts
+foo/+Foo.Baz:presetup
+foo/+Foo.Baz:header
+b/+B:c.o.export
+b/+B:imports
+b/+B:precompileImports
+b/+B:elabArts
+b/+B:c
+b/+B:metaExportInfo
+b/+B:input
+b/+B:transImports
+b/+B:importInfo
+b/+B:exportInfo
+b/+B:irArts
+b/+B:presetup
+b/+B:header
+foo/+Foo:c.o.export
+foo/+Foo:imports
+foo/+Foo:precompileImports
+foo/+Foo:elabArts
+foo/+Foo:c
+foo/+Foo:metaExportInfo
+foo/+Foo:input
+foo/+Foo:transImports
+foo/+Foo:importInfo
+foo/+Foo:exportInfo
+foo/+Foo:irArts
+foo/+Foo:presetup
+foo/+Foo:header
+foo/+Foo.Foo:c.o.export
+foo/+Foo.Foo:imports
+foo/+Foo.Foo:precompileImports
+foo/+Foo.Foo:elabArts
+foo/+Foo.Foo:c
+foo/+Foo.Foo:metaExportInfo
+foo/+Foo.Foo:input
+foo/+Foo.Foo:transImports
+foo/+Foo.Foo:importInfo
+foo/+Foo.Foo:exportInfo
+foo/+Foo.Foo:irArts
+foo/+Foo.Foo:presetup
+foo/+Foo.Foo:header
+root/+Root:c.o.export
+root/+Root:imports
+root/+Root:precompileImports
+root/+Root:elabArts
+root/+Root:c
+root/+Root:metaExportInfo
+root/+Root:input
+root/+Root:transImports
+root/+Root:importInfo
+root/+Root:exportInfo
+root/+Root:irArts
+root/+Root:presetup
+root/+Root:header
+a/+A:c.o.export
+a/+A:imports
+a/+A:precompileImports
+a/+A:elabArts
+a/+A:c
+a/+A:metaExportInfo
+a/+A:input
+a/+A:transImports
+a/+A:importInfo
+a/+A:exportInfo
+a/+A:irArts
+a/+A:presetup
+a/+A:header
+bar/+Main:c.o.export
+bar/+Main:imports
+bar/+Main:linkInfoNoExport
+bar/+Main:precompileImports
+bar/+Main:elabArts
+bar/+Main:c
+bar/+Main:input
+bar/+Main:transImports
+bar/+Main:importInfo
+bar/+Main:irArts
+bar/+Main:presetup
+bar/+Main:header
+foo/+Foo.Bar:c.o.export
+foo/+Foo.Bar:imports
+foo/+Foo.Bar:precompileImports
+foo/+Foo.Bar:elabArts
+foo/+Foo.Bar:c
+foo/+Foo.Bar:metaExportInfo
+foo/+Foo.Bar:input
+foo/+Foo.Bar:transImports
+foo/+Foo.Bar:importInfo
+foo/+Foo.Bar:exportInfo
+foo/+Foo.Bar:irArts
+foo/+Foo.Bar:presetup
+foo/+Foo.Bar:header
+root/Root:extraDep
+foo/Foo:extraDep
+bar/bar:extraDep
+bar/bar:exe
+a/A:extraDep
+b/B:extraDep
+# lake build (no-op)
+ℹ Replayed A
+ℹ Replayed A:c.o (with exports)
+ℹ Replayed B
+ℹ Replayed B:c.o (with exports)
+ℹ Replayed Foo
+ℹ Replayed Foo.Bar
+ℹ Replayed Foo.Bar:c.o (with exports)
+ℹ Replayed Foo.Baz
+ℹ Replayed Foo.Baz:c.o (with exports)
+ℹ Replayed Foo.Foo
+ℹ Replayed Foo.Foo:c.o (with exports)
+ℹ Replayed Foo:c.o (with exports)
+ℹ Replayed Main
+ℹ Replayed Main:c.o (with exports)
+ℹ Replayed Root
+ℹ Replayed Root:c.o (with exports)
+ℹ Replayed bar:exe
+✔ Ran A:irArts
+✔ Ran B:irArts
+✔ Ran Foo.Bar:irArts
+✔ Ran Foo.Baz:irArts
+✔ Ran Foo.Foo:irArts
+✔ Ran Foo:irArts
+✔ Ran Main:irArts
+✔ Ran Root:irArts
+✔ Ran a:extraDep
+✔ Ran b:extraDep
+✔ Ran bar:extraDep
+✔ Ran foo:extraDep
+✔ Ran job computation
+✔ Ran root:extraDep
+✔ Ran store/storeKeys
+Build completed successfully (31 jobs).
+# store keys after lake build (no-op)
+@root:extraDep
+@root:transDeps
+@foo:extraDep
+@foo:transDeps
+@bar:extraDep
+@bar:transDeps
+@a:extraDep
+@a:transDeps
+@b:extraDep
+@b:transDeps
+foo/+Foo.Baz:c.o.export
+foo/+Foo.Baz:imports
+foo/+Foo.Baz:precompileImports
+foo/+Foo.Baz:elabArts
+foo/+Foo.Baz:c
+foo/+Foo.Baz:metaExportInfo
+foo/+Foo.Baz:input
+foo/+Foo.Baz:transImports
+foo/+Foo.Baz:importInfo
+foo/+Foo.Baz:exportInfo
+foo/+Foo.Baz:irArts
+foo/+Foo.Baz:presetup
+foo/+Foo.Baz:header
+b/+B:c.o.export
+b/+B:imports
+b/+B:precompileImports
+b/+B:elabArts
+b/+B:c
+b/+B:metaExportInfo
+b/+B:input
+b/+B:transImports
+b/+B:importInfo
+b/+B:exportInfo
+b/+B:irArts
+b/+B:presetup
+b/+B:header
+foo/+Foo:c.o.export
+foo/+Foo:imports
+foo/+Foo:precompileImports
+foo/+Foo:elabArts
+foo/+Foo:c
+foo/+Foo:metaExportInfo
+foo/+Foo:input
+foo/+Foo:transImports
+foo/+Foo:importInfo
+foo/+Foo:exportInfo
+foo/+Foo:irArts
+foo/+Foo:presetup
+foo/+Foo:header
+foo/+Foo.Foo:c.o.export
+foo/+Foo.Foo:imports
+foo/+Foo.Foo:precompileImports
+foo/+Foo.Foo:elabArts
+foo/+Foo.Foo:c
+foo/+Foo.Foo:metaExportInfo
+foo/+Foo.Foo:input
+foo/+Foo.Foo:transImports
+foo/+Foo.Foo:importInfo
+foo/+Foo.Foo:exportInfo
+foo/+Foo.Foo:irArts
+foo/+Foo.Foo:presetup
+foo/+Foo.Foo:header
+root/+Root:c.o.export
+root/+Root:imports
+root/+Root:precompileImports
+root/+Root:elabArts
+root/+Root:c
+root/+Root:metaExportInfo
+root/+Root:input
+root/+Root:transImports
+root/+Root:importInfo
+root/+Root:exportInfo
+root/+Root:irArts
+root/+Root:presetup
+root/+Root:header
+a/+A:c.o.export
+a/+A:imports
+a/+A:precompileImports
+a/+A:elabArts
+a/+A:c
+a/+A:metaExportInfo
+a/+A:input
+a/+A:transImports
+a/+A:importInfo
+a/+A:exportInfo
+a/+A:irArts
+a/+A:presetup
+a/+A:header
+bar/+Main:c.o.export
+bar/+Main:imports
+bar/+Main:linkInfoNoExport
+bar/+Main:precompileImports
+bar/+Main:elabArts
+bar/+Main:c
+bar/+Main:input
+bar/+Main:transImports
+bar/+Main:importInfo
+bar/+Main:irArts
+bar/+Main:presetup
+bar/+Main:header
+foo/+Foo.Bar:c.o.export
+foo/+Foo.Bar:imports
+foo/+Foo.Bar:precompileImports
+foo/+Foo.Bar:elabArts
+foo/+Foo.Bar:c
+foo/+Foo.Bar:metaExportInfo
+foo/+Foo.Bar:input
+foo/+Foo.Bar:transImports
+foo/+Foo.Bar:importInfo
+foo/+Foo.Bar:exportInfo
+foo/+Foo.Bar:irArts
+foo/+Foo.Bar:presetup
+foo/+Foo.Bar:header
+root/Root:extraDep
+foo/Foo:extraDep
+bar/bar:extraDep
+bar/bar:exe
+a/A:extraDep
+b/B:extraDep

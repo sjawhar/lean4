@@ -9,6 +9,7 @@ prelude
 public import Init.Data.Order
 public import Lean.Data.NameMap.Basic
 public import Lake.Util.RBArray
+public import Lake.Util.DPHashMap
 public import Lake.Util.Family
 public import Lake.Util.Store
 
@@ -20,6 +21,10 @@ public instance {cmp : κ → κ → Ordering} [Monad m] [Std.LawfulEqCmp cmp] :
   store k a := modify (·.insert k a)
 
 public instance {cmp : κ → κ → Ordering} [MonadLiftT (ST ω) m] [Monad m] [Std.LawfulEqCmp cmp] : MonadDStore κ β (StateRefT' ω (Std.DTreeMap κ β cmp) m) where
+  fetch? k := modifyGet fun m => (m.get? k, m)
+  store k a := modify (·.insert k a)
+
+public instance [BEq κ] [Hashable κ] [LawfulBEq κ] [MonadLiftT (ST ω) m] [Monad m] : MonadDStore κ β (StateRefT' ω (DPHashMap κ β) m) where
   fetch? k := modifyGet fun m => (m.get? k, m)
   store k a := modify (·.insert k a)
 
