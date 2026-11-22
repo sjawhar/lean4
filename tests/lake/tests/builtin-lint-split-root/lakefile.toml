@@ -1,0 +1,15 @@
+name = "root"
+defaultTargets = ["Root", "SharedExtra"]
+
+[[require]]
+name = "dep"
+path = "dep"
+
+[[lean_lib]]
+name = "Root"
+
+# A module under the root `Shared`, which the dependency's library `Shared` also
+# uses: the root package's build directory then holds a `Shared/` directory too.
+[[lean_lib]]
+name = "SharedExtra"
+roots = ["Shared.Extra"]

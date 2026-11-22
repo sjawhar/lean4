@@ -9,6 +9,7 @@ prelude
 public import Init.Data.Order
 public import Lean.Data.NameMap.Basic
 public import Lake.Util.RBArray
+public import Lake.Util.DPHashMap
 public import Lake.Util.Family
 public import Lake.Util.Store
 
@@ -20,7 +21,14 @@ public instance {cmp : κ → κ → Ordering} [Monad m] [Std.LawfulEqCmp cmp] :
   store k a := modify (·.insert k a)
 
 public instance {cmp : κ → κ → Ordering} [MonadLiftT (ST ω) m] [Monad m] [Std.LawfulEqCmp cmp] : MonadDStore κ β (StateRefT' ω (Std.DTreeMap κ β cmp) m) where
-  fetch? k := modifyGet fun m => (m.get? k, m)
+  -- A lookup reads a snapshot of the (persistent) map: `ST.Ref.get` holds the cell only to bump a reference count,
+  -- whereas `modifyGet` would hold it across the whole tree search, serializing every fetch of every build thread.
+  fetch? k := (·.get? k) <$> get
+  store k a := modify (·.insert k a)
+
+public instance [BEq κ] [Hashable κ] [LawfulBEq κ] [MonadLiftT (ST ω) m] [Monad m] : MonadDStore κ β (StateRefT' ω (DPHashMap κ β) m) where
+  -- As for `Std.DTreeMap` above, a lookup reads a snapshot of the persistent map.
+  fetch? k := (·.get? k) <$> get
   store k a := modify (·.insert k a)
 
 public instance [Monad m] : MonadStore κ α (StateT (RBArray κ α cmp) m) where
@@ -28,7 +36,7 @@ public instance [Monad m] : MonadStore κ α (StateT (RBArray κ α cmp) m) wher
   store k a := modify (·.insert k a)
 
 public instance [MonadLiftT (ST ω) m] [Monad m] : MonadStore κ α (StateRefT' ω (RBArray κ α cmp) m) where
-  fetch? k := modifyGet fun m => (m.find? k, m)
+  fetch? k := (·.find? k) <$> get
   store k a := modify (·.insert k a)
 
 public instance [Monad m] : MonadStore Name α (StateT (NameMap α) m) where
@@ -36,7 +44,7 @@ public instance [Monad m] : MonadStore Name α (StateT (NameMap α) m) where
   store k a := modify (·.insert k a)
 
 public instance [MonadLiftT (ST ω) m] [Monad m] : MonadStore Name α (StateRefT' ω (NameMap α) m) where
-  fetch? k := modifyGet fun m => (m.find? k, m)
+  fetch? k := (·.find? k) <$> get
   store k a := modify (·.insert k a)
 
 public instance [MonadDStore κ β m] [t : FamilyOut β k α] : MonadStore1Of k α m where

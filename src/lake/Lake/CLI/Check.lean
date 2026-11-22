@@ -18,6 +18,7 @@ import Init.Data.String.TakeDrop
 import Init.Data.ToString.Macro
 import Init.System.IO
 import Init.System.Platform
+import Lake.Util.Proc
 import Std.Internal.UV.System
 
 /-!
@@ -128,7 +129,7 @@ def getLegalAxioms : M (Array Lean.Name) := do return (← read).legalAxioms
 /-- Resolves `exe` to an absolute path via `PATH`, or `none` if it is not there. -/
 def whichExe (exe : String) : IO (Option System.FilePath) := do
   let out ←
-    try IO.Process.output { cmd := "which", args := #[exe] }
+    try outputProc { cmd := "which", args := #[exe] }
     catch _ => return none
   if out.exitCode != 0 then
     return none
@@ -227,7 +228,7 @@ partial def runSandBoxedWithStdoutTo (handle : IO.FS.Handle) (spawnArgs : Sandbo
     throw <| .userError s!"Child exited with {exitCode}"
 where
   pipedOutput (args : SpawnArgs) : IO (String × UInt32) := do
-    let child ← spawn { args with stdout := .piped, stderr := .piped, stdin := .null }
+    let child ← spawnProc { args with stdout := .piped, stderr := .piped, stdin := .null }
     let stdout ← IO.asTask (prio := .dedicated) do
       let rec loop : IO Unit := do
         let buf ← child.stdout.read 4096
@@ -244,7 +245,7 @@ where
     return (stderr, exitCode)
 
 def runSandBoxedWithStdout (spawnArgs : SandboxArgs) : M String := do
-  let { stdout, stderr, exitCode } ← IO.Process.output (← sandboxSpawnArgs spawnArgs)
+  let { stdout, stderr, exitCode } ← outputProc (← sandboxSpawnArgs spawnArgs)
   IO.eprint stderr
   if exitCode != 0 then
     throw <| .userError s!"Child exited with {exitCode}"
@@ -252,7 +253,7 @@ def runSandBoxedWithStdout (spawnArgs : SandboxArgs) : M String := do
 
 /-- Runs `spawnArgs` sandboxed, letting its output through, and returns its exit code. -/
 def runSandBoxedExitCode (spawnArgs : SandboxArgs) : M UInt32 := do
-  let proc ← IO.Process.spawn (← sandboxSpawnArgs spawnArgs)
+  let proc ← spawnProc (← sandboxSpawnArgs spawnArgs)
   proc.wait
 
 def runSandBoxed (spawnArgs : SandboxArgs) : M Unit := do

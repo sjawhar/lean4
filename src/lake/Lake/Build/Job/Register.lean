@@ -24,12 +24,13 @@ job-local state that should not be inherited by downstream jobs.
 Resets the job's state after a checkpoint (e.g., registering the job).
 Preserves information that downstream jobs want to depend on while resetting
 job-local information that should not be inherited by downstream jobs.
+A canceled result stays canceled, so that the jobs that await or continue it are canceled too.
 -/
 public def Job.renew (self : Job α) : Job α :=
   have : OptDataKind α := self.kind
   self.mapResult (sync := true) fun
   | .ok a s => .ok a s.renew
-  | .error _ s => .error 0 s.renew
+  | .error _ s => .error 0 {s.renew with canceled := s.canceled}
 
 /--
 Registers the job for the top-level build monitor,
@@ -40,10 +41,13 @@ Registers the job for the top-level build monitor,
   (caption : String) (job : Job α) (optional := false)
 : m (Job α) := do
   let job : Job α := {job with caption, optional}
-  (← getBuildContext).registeredJobs.modify (·.push job)
+  (← getBuildContext).registeredJobs.modify (job :: ·)
   return job.renew
 
-/-- Wraps stray I/O, logs, and errors in `x` into the produced job.  -/
+/--
+Wraps stray I/O, logs, and errors in `x` into the produced job. If `x` fails without an error entry
+once the build is canceled, the job is canceled (`JobState.canceled`, see `isCanceledFetch`).
+-/
 @[nospecialize] public def ensureJob
   [OptDataKind α] (x : FetchM (Job α))
 : FetchM (Job α) := .ofFn fun fetch pkg? stack store ctx log => do
@@ -58,7 +62,8 @@ Registers the job for the top-level build monitor,
       return .ok job log
   | .error _ log =>
     let (log, jobLog) := log.split iniPos
-    return .ok (.error jobLog) log
+    let canceled ← isCanceledFetch ctx.cancelTk? jobLog
+    return .ok (.ofTask (.pure (.error 0 {log := jobLog, canceled}))) log
 
 /--
 Registers the produced job for the top-level build monitor

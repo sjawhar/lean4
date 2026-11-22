@@ -9,6 +9,7 @@ prelude
 public import Lean.CoreM
 public import Lean.Compiler.MetaAttr  -- TODO: public because of specializations
 import Init.Data.Range.Polymorphic.Stream
+public import Lean.Util.UsedByChecks  -- public: `recordExtraModUse*` are specialized at their callers
 
 /-!
 Infrastructure for recording extra import dependencies not implied by the environment constants for
@@ -69,12 +70,16 @@ builtin_initialize extraModUses : SimplePersistentEnvExtension ExtraModUse (PHas
     exportEntriesFnEx? := some fun _ _ entries =>
       { exported := #[], server := #[], «private» := entries.toArray }
     asyncMode := .sync
-    replay? := some <| SimplePersistentEnvExtension.replayOfFilter (·.contains ·) (·.insert ·)
+    replay? := some <| SimplePersistentEnvExtension.replayOfFilter (!·.contains ·) (·.insert ·)
   }
 
 /-- Returns additional recorded import dependencies of the given module. -/
 public def getExtraModUses (env : Environment) (modIdx : ModuleIdx) : Array ExtraModUse :=
   extraModUses.getModuleEntries env modIdx
+
+/-- Returns the additional import dependencies recorded so far for the current module. -/
+public def getLocalExtraModUses (env : Environment) : Array ExtraModUse :=
+  (extraModUses.getEntries env).toArray
 
 /-- Copies additional recorded import dependencies from one environment to another. -/
 public def copyExtraModUses (src dest : Environment) : Environment := Id.run do
@@ -84,12 +89,24 @@ public def copyExtraModUses (src dest : Environment) : Environment := Id.run do
       env := extraModUses.addEntry env entry
   env
 
-def recordExtraModUseCore (mod : Name) (isMeta : Bool) (hint : Name := .anonymous) : m Unit := do
+/-- Every extra module use recorded in this process while usage recording is on, including those of commands
+whose environment is then discarded (`example`, `#check`, `#eval`, `#synth`, `#reduce`), which
+`getLocalExtraModUses` loses. Private: it only grows, through `recordExtraModUseCore`. -/
+builtin_initialize extraModUsesByChecksRef : IO.Ref (Std.HashSet ExtraModUse) ← IO.mkRef {}
+
+/-- The extra module uses `extraModUsesByChecksRef` holds. -/
+public def extraModUsesByChecks : BaseIO (Std.HashSet ExtraModUse) :=
+  extraModUsesByChecksRef.get
+
+def recordExtraModUseCore [MonadLiftT IO m] (mod : Name) (isMeta : Bool) (hint : Name := .anonymous) :
+    m Unit := do
   let entry := { module := mod, isExported := (← getEnv).isExporting, isMeta }
   if !(extraModUses.getState (asyncMode := .local) (← getEnv)).contains entry then
     trace[extraModUses] "recording {if entry.isExported then "public" else "private"} \
       {if isMeta then "meta" else "regular"} extra mod use {mod}\
       {if hint.isAnonymous then m!"" else m!" of {hint}"}"
+    if (← (usageRecordingEnabled : IO Bool)) then
+      (extraModUsesByChecksRef.modify (·.insert entry) : IO Unit)
     modifyEnv (extraModUses.addEntry · entry)
 
 /--
@@ -99,7 +116,7 @@ the visibility level.
 NOTE: Directly recording a module name does not trigger including indirect dependencies recorded via
 `recordIndirectModUse`, prefer `recordExtraModUseFromDecl` instead.
 -/
-public def recordExtraModUse (modName : Name) (isMeta : Bool) : m Unit := do
+public def recordExtraModUse [MonadLiftT IO m] (modName : Name) (isMeta : Bool) : m Unit := do
   if modName != (← getEnv).mainModule then
     recordExtraModUseCore modName isMeta
 
@@ -108,7 +125,7 @@ Records the module of the given declaration as an additional import dependency f
 module, using `Environment.isExporting` as the visibility level. If the declaration itself is
 already `meta`, the module dependency is recorded as a non-`meta` dependency.
 -/
-public def recordExtraModUseFromDecl (declName : Name) (isMeta : Bool) : m Unit := do
+public def recordExtraModUseFromDecl [MonadLiftT IO m] (declName : Name) (isMeta : Bool) : m Unit := do
   let env ← getEnv
   if let some mod := env.getModuleIdxFor? declName |>.bind (env.header.modules[·]?) then
     -- If the declaration itself is already `meta`, no need to mark the import.

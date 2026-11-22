@@ -7,6 +7,7 @@ module
 
 prelude
 public import Lake.Build.Fetch
+public import Init.Task
 
 open System Lean
 
@@ -140,16 +141,34 @@ example : MonadLiftT JobM FetchM := inferInstance
 /-- Ensures that `SpawnM` lifts into `FetchM`. -/
 example : MonadLiftT SpawnM FetchM := inferInstance
 
-/-- Run a `FetchM` action in `JobM`. -/
+/--
+Run a `FetchM` action in `JobM`. If it fails without an error entry once the build is canceled, the
+job is canceled (`JobState.canceled`, see `isCanceledFetch`).
+-/
 @[inline] public def JobM.runFetchM (x : FetchM α) : JobM α := .ofFn fun fetch pkg? stack store ctx s => do
   match (← x.toFn fetch pkg? stack store ctx s.log) with
   | .ok a log => return .ok a {s with log}
-  | .error e log => return .error e {s with log}
+  | .error e log =>
+    let canceled ← isCanceledFetch ctx.cancelTk? log
+    return .error e {s with log, canceled := s.canceled || canceled}
 
 public instance : MonadLift FetchM JobM := ⟨JobM.runFetchM⟩
 
 /-- Ensures that `FetchM` lifts into `JobM`. -/
 example : MonadLiftT FetchM JobM := inferInstance
+
+/--
+How a computation fails when a job that it awaits was canceled (see `Job.await`). In `JobM`, it
+cancels the current job (`Job.cancelJob`). Elsewhere it throws as for any other failure: a fetch
+(`FetchM`) has no job state, and where its failure becomes a job's (`ensureJob`, `JobM.runFetchM`),
+that job is canceled (see `isCanceledFetch`).
+-/
+public class MonadAwaitCanceled (m : Type → Type) where
+  /-- Fails the computation. The canceled job failed at `pos`, a position of its own log. -/
+  awaitCanceled (pos : Log.Pos) : m α
+
+public instance (priority := low) [MonadLiftT LogIO m] : MonadAwaitCanceled m :=
+  ⟨fun pos => liftM (throw pos : LogIO _)⟩
 
 namespace Job
 
@@ -165,12 +184,15 @@ namespace Job
   .ofTask (caption := caption) <$> Task.pure <$>
     (withLoggedIO act).toFn fetch pkg? stack store ctx {}
 
-/-- Spawn a job that asynchronously performs `act`. -/
+/--
+Spawn a job that asynchronously performs `act`. Its module compile asks for a build slot at `prio`
+(`JobState.slotPrio`).
+-/
 @[nospecialize] public protected def async
-  [OptDataKind α] (act : JobM α) (prio := Task.Priority.default) (caption := "")
+  [OptDataKind α] (act : JobM α) (prio := Task.Priority.max) (caption := "")
 : SpawnM (Job α) := .ofFn fun fetch pkg? stack store ctx _ =>
   .ofTask (caption := caption) <$> BaseIO.asTask (prio := prio) do
-    (withLoggedIO act).toFn fetch pkg? stack store ctx {}
+    (withLoggedIO act).toFn fetch pkg? stack store ctx {slotPrio := prio}
 
 /-- Wait for a job to complete and return the result. -/
 @[inline] public protected def wait (self : Job α) : BaseIO (JobResult α) := do
@@ -185,17 +207,24 @@ If an error occurred, return `none` and discarded any logs produced.
 
 /--
 Wait for a job to complete and return the produced value.
-Logs the job's log and throws if there was an error.
+Logs the job's log and throws if there was an error. A canceled job (`JobState.canceled`) cancels
+the current computation as well (see `MonadAwaitCanceled`).
 -/
-public protected def await (self : Job α) : LogIO α := do
-  match (← self.wait) with
-  | .error n {log, ..} => log.replay; throw n
-  | .ok a {log, ..} => log.replay; pure a
+@[inline] public protected def await
+  [Monad m] [MonadLiftT LogIO m] [MonadAwaitCanceled m] (self : Job α)
+: m α := do
+  match (← (liftM self.wait : LogIO (JobResult α))) with
+  | .error n {log, canceled, ..} =>
+    (log.replay : LogIO PUnit)
+    if canceled then MonadAwaitCanceled.awaitCanceled n else liftM (throw n : LogIO α)
+  | .ok a {log, ..} => (log.replay : LogIO PUnit); pure a
 
 /-- Fail the current job as canceled (no log entry; see `JobState.canceled`). -/
 public def cancelJob : JobM α := do
   modify ({· with canceled := true})
   failure
+
+public instance : MonadAwaitCanceled JobM := ⟨fun _ => cancelJob⟩
 
 /--
 Like `wait?`, but a canceled job cancels the current job as well (via
@@ -218,10 +247,11 @@ message to replay; classification uses `JobState.canceled`.
 /--
 Apply `f` asynchronously to the job's output.
 If the build's cancellation token is set, errors without running `f`.
+A module compile in `f` asks for a build slot at `prio` (`JobState.slotPrio`).
 -/
 @[nospecialize] public protected def mapM
   [kind : OptDataKind β] (self : Job α) (f : α → JobM β)
-  (prio := Task.Priority.default) (sync := false)
+  (prio := Task.Priority.max) (sync := false)
 : SpawnM (Job β) := .ofFn fun fetch pkg? stack store ctx trace => do
   self.bindTask fun task => do
   BaseIO.mapTask (t := task) (prio := prio) (sync := sync) fun
@@ -229,17 +259,18 @@ If the build's cancellation token is set, errors without running `f`.
       if let some tk := ctx.cancelTk? then
         if ← tk.isSet then return canceledResult s
       let trace := mixTrace trace s.trace
-      withLoggedIO (f a) |>.toFn fetch pkg? stack store ctx {s with trace}
+      withLoggedIO (f a) |>.toFn fetch pkg? stack store ctx {s with trace, slotPrio := prio}
     | .error n s => return .error n s
 
 /--
 Apply `f` asynchronously to the job's output
 and asynchronously await the resulting job.
 If the build's cancellation token is set, errors without running `f`.
+A module compile in `f` asks for a build slot at `prio` (`JobState.slotPrio`).
 -/
 @[nospecialize] public def bindM
   [kind : OptDataKind β] (self : Job α) (f : α → JobM (Job β))
-  (prio := Task.Priority.default) (sync := false)
+  (prio := Task.Priority.max) (sync := false)
 : SpawnM (Job β) := .ofFn fun fetch pkg? stack store ctx trace => do
   self.bindTask fun task => do
   BaseIO.bindTask task (prio := prio) (sync := sync) fun
@@ -247,7 +278,8 @@ If the build's cancellation token is set, errors without running `f`.
       if let some tk := ctx.cancelTk? then
         if ← tk.isSet then return Task.pure (canceledResult sa)
       let trace := mixTrace trace sa.trace
-      match (← withLoggedIO (f a) |>.toFn fetch pkg? stack store ctx {sa with trace}) with
+      let st := {sa with trace, slotPrio := prio}
+      match (← withLoggedIO (f a) |>.toFn fetch pkg? stack store ctx st) with
       | .ok job sa =>
         return job.task.map (prio := prio) (sync := true) fun
         | .ok b sb => .ok b {sa.merge sb with trace := sb.trace}
@@ -261,11 +293,16 @@ results of `a` and `b`. The job `c` errors if either `a` or `b` error.
 -/
 @[inline] public def zipResultWith
   [OptDataKind γ] (f : JobResult α → JobResult β → JobResult γ) (self : Job α) (other : Job β)
-  (prio := Task.Priority.default) (sync := false)
+  (prio := Task.Priority.max) (sync := false)
 : Job γ := Job.ofTask $
   self.task.bind (prio := prio) (sync := true) fun rx =>
   other.task.map (prio := prio) (sync := sync) fun ry =>
   f rx ry
+
+/-- The result of `a.zipWith f b` from the results of `a` and `b`. -/
+@[inline] public def zipResults (f : α → β → γ) : JobResult α → JobResult β → JobResult γ
+  | .ok a sa, .ok b sb => .ok (f a b) (sa.merge sb)
+  | ra, rb => .error 0 (ra.state.merge rb.state)
 
 /--
 `a.zipWith f b` produces a new job `c` that applies `f` to the
@@ -273,11 +310,9 @@ results of `a` and `b`. The job `c` errors if either `a` or `b` error.
 -/
 @[inline] public def zipWith
   [OptDataKind γ] (f : α → β → γ) (self : Job α) (other : Job β)
-  (prio := Task.Priority.default) (sync := false)
+  (prio := Task.Priority.max) (sync := false)
 : Job γ :=
-  self.zipResultWith (other := other) (prio := prio) (sync := sync) fun
-  | .ok a sa, .ok b sb => .ok (f a b) (sa.merge sb)
-  | ra, rb => .error 0 (ra.state.merge rb.state)
+  self.zipResultWith (zipResults f) (other := other) (prio := prio) (sync := sync)
 
 /-- Merges this job with another, discarding its output and trace. -/
 public def add (self : Job α) (other : Job β) : Job α :=
@@ -290,28 +325,70 @@ public def add (self : Job α) (other : Job β) : Job α :=
 public def mix (self : Job α) (other : Job β) : Job Unit :=
   self.zipWith (sync := true) (fun _ _ => ()) other
 
+/-!
+A chain of tasks that folds the results of many jobs, one `zipWith` per job, takes time quadratic in
+the number of jobs when a job is still running as the chain is built: Lean marks the result of a
+task that had to wait as shared between threads and never updates such a value in place, so every
+later step copies the arrays it extends (e.g., the log and the trace inputs that `JobState.merge`
+accumulates). The folds below wait for all the jobs with `Task.mapList`, whose chain only prepends
+each result to a list, and then fold their results in one task.
+-/
+
+/--
+The job `jobs.foldl (·.zipWith (sync := true) f ·) init`: `f` folded over the outputs of `jobs`, in
+order, from the output of `init`, in one task once every job is done.
+-/
+public def zipWithAll
+  [OptDataKind β] (f : β → α → β) (init : Job β) (jobs : Array (Job α))
+: Job β :=
+  let rs := Task.mapList (sync := true) id (jobs.toList.map (·.task))
+  Job.ofTask <| init.task.bind (sync := true) fun r =>
+  rs.map (sync := true) (·.foldl (zipResults f) r)
+
+/--
+The job `jobs.foldr (zipWith (sync := true) f) init`, in one task once every job is done.
+
+`JobState.merge a b` appends the log of `b` to the log of `a`, and in a right fold `b` holds the
+logs merged so far, so a fold that merged the logs would copy them at each step. This fold merges
+the states without their logs and joins the logs separately, left to right.
+-/
+public def zipWithAllRight
+  [OptDataKind β] (f : α → β → β) (jobs : List (Job α)) (init : Job β)
+: Job β :=
+  let rs := Task.mapList (sync := true) id (jobs.map (·.task))
+  Job.ofTask <| init.task.bind (sync := true) fun r =>
+  rs.map (sync := true) fun rs =>
+    let log := rs.foldl (init := ({} : Log)) (· ++ ·.state.log) ++ r.state.log
+    let noLog (s : JobState) : JobState := {s with log := {}}
+    let r := rs.foldr (init := r.modifyState noLog) fun ra r =>
+      zipResults f (ra.modifyState noLog) r
+    r.modifyState fun s => {s with log}
+
 /-- Merge a `List` of jobs into one, discarding their outputs. -/
 public def mixList (jobs : List (Job α)) (traceCaption := "<collection>")  : Job Unit :=
-  jobs.foldr (·.mix ·) (traceRoot () traceCaption)
+  zipWithAllRight (fun _ _ => ()) jobs (traceRoot () traceCaption)
 
 /-- Merge an `Array` of jobs into one, discarding their outputs. -/
 public def mixArray (jobs : Array (Job α)) (traceCaption := "<collection>")  : Job Unit :=
-  jobs.foldl (·.mix ·) (traceRoot () traceCaption)
+  (traceRoot () traceCaption).zipWithAll (fun _ _ => ()) jobs
 
 /-- Merge a `List` of jobs into one, collecting their outputs into a `List`. -/
 public def collectList (jobs : List (Job α)) (traceCaption := "<collection>") : Job (List α) :=
-  jobs.foldr (zipWith (sync := true) List.cons) (traceRoot [] traceCaption)
+  zipWithAllRight List.cons jobs (traceRoot [] traceCaption)
 
 /-- Merge an `Array` of jobs into one, collecting their outputs into an `Array`. -/
 public def collectArray (jobs : Array (Job α)) (traceCaption := "<collection>") : Job (Array α) :=
-  jobs.foldl (zipWith (sync := true) Array.push) (traceRoot (Array.mkEmpty jobs.size) traceCaption)
+  (traceRoot (Array.mkEmpty jobs.size) traceCaption).zipWithAll Array.push jobs
 
 instance : Nonempty ({α : Type u} → [Nonempty α] → α) := ⟨Classical.ofNonempty⟩
 
 /-- Merge an `Vector` of jobs into one, collecting their outputs into an `Array`. -/
 public def collectVector {α : Type u} [Nonempty α] (jobs : Vector (Job α) n) (traceCaption := "<collection>") : Job (Vector α n) :=
   let placeholder := unsafe have : Nonempty α := inferInstance; (unsafeCast () : α)
-  n.fold (init := traceRoot (Vector.replicate n placeholder) traceCaption) fun i h job =>
-    job.zipWith (sync := true) (Vector.set · i · h) jobs[i]
+  let init : JobResult (Vector α n) := .ok (Vector.replicate n placeholder) {trace := .nil traceCaption}
+  Job.ofTask <| Task.mapList (sync := true) (tasks := jobs.toList.map (·.task)) fun rs =>
+    let rs := rs.toArray
+    n.fold (init := init) fun i h r =>
+      if h' : i < rs.size then zipResults (Vector.set · i · h) r rs[i] else r
 
 end Job

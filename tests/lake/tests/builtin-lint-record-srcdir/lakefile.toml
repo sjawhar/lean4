@@ -1,0 +1,9 @@
+name = "lint-record-srcdir"
+defaultTargets = ["Violations"]
+
+[[lean_lib]]
+name = "Linters"
+
+[[lean_lib]]
+name = "Violations"
+srcDir = "./src"
