@@ -539,15 +539,16 @@ public def ofRun (r : RemoteExec.RunResult) (outputs : Array (String × RemoteEx
   stderrDigest? := r.stderrDigest?
   limits? := r.limits?
 
-/-- The line of an error of the bridge that is the module's result: `timeout` with the error's
-fields, `oom`, `disk-limit`, or `error` with the bridge's code as it sent it. -/
+/-- The line of an error of the bridge that is the module's result: `timeout`, `oom` or `disk-limit` with the error's
+action, termination signal, stream digests and limits, or `error` with the bridge's code as it sent it. -/
 public def ofError (e : RemoteExec.Error) : RemoteOutcome :=
+  let killed (result : String) : RemoteOutcome := {
+    result, action? := e.action?, terminationSignal? := e.terminationSignal?
+    stdoutDigest? := e.stdoutDigest?, stderrDigest? := e.stderrDigest?, limits? := e.limits? }
   match e.code with
-  | .timeout => {
-      result := "timeout", action? := e.action?, terminationSignal? := e.terminationSignal?
-      stdoutDigest? := e.stdoutDigest?, stderrDigest? := e.stderrDigest?, limits? := e.limits? }
-  | .oom => {result := "oom"}
-  | .diskLimit => {result := "disk-limit"}
+  | .timeout => killed "timeout"
+  | .oom => killed "oom"
+  | .diskLimit => killed "disk-limit"
   | _ => error e.codeText
 
 /-- The line of outputs found without a compile (`local-cache`, `bucket`), with the action and

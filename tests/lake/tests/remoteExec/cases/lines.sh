@@ -394,14 +394,32 @@ row_L17() (
   done
 )
 
-# L18: the service's errors OOM and DISK_LIMIT are `oom` and `disk-limit`, with no action and no exit code
+# L18: the service's errors OOM and DISK_LIMIT are `oom` and `disk-limit`, with no exit code. The fake's error has no
+# fields, so the line has no action. A replayed error with the fields of a killed action gives them, as `timeout` does
+# (L12): its action, its signal, its limits and the digest of its stdout, none of its empty stderr
 row_L18() (
+  local code c result limit
   export LAKE_REMOTE_EXEC=grpc://fake:1
   for code in OOM:oom DISK_LIMIT:disk-limit; do
     enter "L18-${code#*:}"; log_to "L18-${code#*:}"
     FAKE_ERROR_TARGET="Rx.B:${code%:*}" test_fails build Rx
     lines "L18-${code#*:}" --modules "$MODS" --expect "Rx.C|Rx:$IMPORT_FAILED" \
       --expect "Rx.B:result=${code#*:},action=null,exitCode=null"
+  done
+  for c in 'OOM oom limits.oomKills>=1' 'DISK_LIMIT disk-limit limits.diskLimitExceeded=true'; do
+    read -r code result limit <<< "$c"
+    enter "L18-$result-fields"; log_to "L18-$result-fields"
+    "$PYTHON" -c 'import hashlib, json, sys
+code, path = sys.argv[1:]
+digest = lambda b: "%s/%d" % (hashlib.sha256(b).hexdigest(), len(b))
+disk = code == "DISK_LIMIT"
+error = {"code": code, "message": "Rx.B: the service answered " + code, "action": digest(b"L18 " + code.encode()),
+         "terminationSignal": "KILL", "stdoutDigest": digest(b"Rx.B: started\n"),
+         "limits": {"oomKills": 0 if disk else 1, "writtenBytes": 4096 if disk else 0, "diskLimitExceeded": disk}}
+json.dump({"error": error}, open(path, "w"))' "$code" "$LW/L18-$result-fields.json"
+    FAKE_REPLAY_TARGET=Rx.B FAKE_REPLAY_FILE="$LW/L18-$result-fields.json" test_fails build Rx
+    lines "L18-$result-fields" --modules "$MODS" --expect "Rx.C|Rx:$IMPORT_FAILED" --expect \
+      "Rx.B:result=$result,action=digest,terminationSignal=KILL,$limit,stdoutDigest=digest,stderrDigest=null,exitCode=null"
   done
 )
 
