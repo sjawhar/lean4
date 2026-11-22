@@ -698,20 +698,15 @@ public def useService (s : RemoteSession) (outcome : IO.Ref RemoteOutcome) : Job
       return true
 
 /--
-Whether the build service answers by this process's decision (`ensureDecision`, as `useService` reads it): `true`
-exactly when `useService` would answer `true` at once, with no wait for the service and no failure of the job.
--/
-def serviceAnswers (s : RemoteSession) : BaseIO Bool :=
-  return (← ensureDecision s.client s.cfg.endpoint s.leanGithash s.cfg.fallback) matches .active
-
-/--
-Whether the build uses the service (`serviceAnswers`) and is not `--no-build`, which sends no request. Then a local
-output with no service record goes to the service in its own job: a native artifact's (`NativeAction.fetch`), and a
-module's that an archive holds, or with the usage cutoff on (`Module.fetchRemote`).
+Whether the build uses the service: not `--no-build`, which sends no request, and the service answers by this process's
+decision (`ensureDecision`, as `useService` reads it), so that `useService` would answer `true` at once, with no wait
+for the service and no failure of the job. Then a local output with no service record goes to the service in its own
+job: a native artifact's (`NativeAction.fetch`), and a module's that an archive holds, or with the usage cutoff on
+(`Module.fetchRemote`).
 -/
 public def buildUsesService (s : RemoteSession) : JobM Bool := do
   if (← getNoBuild) then return false
-  serviceAnswers s
+  return (← ensureDecision s.client s.cfg.endpoint s.leanGithash s.cfg.fallback) matches .active
 
 /--
 Exit code of a build whose every failure is an unavailable service under `fail`, or a confirmed

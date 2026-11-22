@@ -3761,7 +3761,7 @@ def Module.recBuildIRArts (mod : Module) : FetchM (Job ModuleOutputArtifacts) :=
   elabJob.mapM fun elabArts => do
     -- Already complete because `elabArts` waits on it
     let presetup ← (← mod.presetup.fetch).await
-    -- Use the same trace as `elabArts` to maintain compatibility
+    -- The setup's trace, which the `elabArts` job's is too before `fetchCore` mixes the timeout rule into it
     setTrace presetup.trace
     -- The hash of the module's trace and Lake cache entry when its job did not build it on the service: the
     -- `elabArts` job's, into which `fetchCore` mixes the timeout rule
