@@ -543,15 +543,16 @@ public def ofRun (r : RemoteExec.RunResult) (outputs : Array (String × RemoteEx
   stderrDigest? := r.stderrDigest?
   limits? := r.limits?
 
-/-- The line of an error of the bridge that is the module's result: `timeout` with the error's
-fields, `oom`, `disk-limit`, or `error` with the bridge's code as it sent it. -/
+/-- The line of an error of the bridge that is the module's result: `timeout`, `oom` or `disk-limit` with the error's
+action, termination signal, stream digests and limits, or `error` with the bridge's code as it sent it. -/
 public def ofError (e : RemoteExec.Error) : RemoteOutcome :=
+  let killed (result : String) : RemoteOutcome := {
+    result, action? := e.action?, terminationSignal? := e.terminationSignal?
+    stdoutDigest? := e.stdoutDigest?, stderrDigest? := e.stderrDigest?, limits? := e.limits? }
   match e.code with
-  | .timeout => {
-      result := "timeout", action? := e.action?, terminationSignal? := e.terminationSignal?
-      stdoutDigest? := e.stdoutDigest?, stderrDigest? := e.stderrDigest?, limits? := e.limits? }
-  | .oom => {result := "oom"}
-  | .diskLimit => {result := "disk-limit"}
+  | .timeout => killed "timeout"
+  | .oom => killed "oom"
+  | .diskLimit => killed "disk-limit"
   | _ => error e.codeText
 
 /-- The line of outputs found without a compile (`local-cache`, `bucket`), with the action and
@@ -701,8 +702,8 @@ public def useService (s : RemoteSession) (outcome : IO.Ref RemoteOutcome) : Job
 Whether the build uses the service: not `--no-build`, which sends no request, and the service answers by this process's
 decision (`ensureDecision`, as `useService` reads it), so that `useService` would answer `true` at once, with no wait
 for the service and no failure of the job. Then a local output with no service record goes to the service in its own
-job: a native artifact's (`NativeAction.fetch`), and a module's that an archive holds, or with the usage cutoff on
-(`Module.fetchRemote`).
+job: a native artifact's (`NativeAction.fetch`), and a module's whose outputs came from an archive, or with the usage
+cutoff on (`Module.fetchRemote`).
 -/
 public def buildUsesService (s : RemoteSession) : JobM Bool := do
   if (← getNoBuild) then return false
@@ -1658,11 +1659,10 @@ public def buildModuleO (mod : Module) (facet : String) (oFile : FilePath) (cJob
 Links a Lean shared library as `buildLeanSharedLib` does, with the same trace; in service mode on the build service
 (`buildNativeArtifact`) as the action `kind` with `target`, whose output is `rel?` in the input root
 (`remoteBuildPath`). A request takes the link's objects and no library of `linkLibs`, as a link on Linux does
-(`linkDeps` is false there). So the link stays here, as `buildLeanSharedLib` does it, and writes no line, when it takes
-a file that no native action of the build made: when its output has no path in the input root, when one of its objects
-is no native artifact of this build (an object of the LLVM backend, a library's `moreLinkObjs`, or an object of
-another target), or when the link takes its libraries as arguments (`linkDeps`, on Windows) and it has any (an
-`extern_lib`'s, or an import's). This is the one rule for the shared libraries of modules and of libraries.
+(`linkDeps` is false there). So the link stays here, as `buildLeanSharedLib` does it, and writes no line, when its
+output has no path in the input root, or when it takes a file that a request cannot carry: an object that is no native
+artifact of the build (a library's `moreLinkObjs`, an LLVM object), or, on Windows, where the link takes its libraries
+as arguments (`linkDeps`), any library. This is the one rule for the shared libraries of modules and of libraries.
 -/
 public def buildNativeSharedLib (kind : NativeKind) (target : String) (rel? : Option String) (libName : String)
     (libFile : FilePath) (linkObjs : Array (Job FilePath)) (linkLibs : Array (Job Dynlib))
@@ -1671,19 +1671,19 @@ public def buildNativeSharedLib (kind : NativeKind) (target : String) (rel? : Op
   (Job.collectArray linkLibs "linkLibs").mapM fun libs => do
     addPureTrace traceArgs "traceArgs"
     let args := weakArgs ++ traceArgs
-    let some s ← remoteSession?
-      | buildLeanSharedLibSync libName libFile objs libs args plugin
-    let some rel := rel?
-      | buildLeanSharedLibSync libName libFile objs libs args plugin
-    let registered ← objs.allM fun obj => do return (← nativeArtifact? obj).isSome
     -- The default `linkDeps` of `buildLeanSharedLibSync`: whether the link takes `libs` as arguments
     let linkDeps := System.Platform.isWindows
+    let some s ← remoteSession?
+      | buildLeanSharedLibSync libName libFile objs libs args plugin (linkDeps := linkDeps)
+    let some rel := rel?
+      | buildLeanSharedLibSync libName libFile objs libs args plugin (linkDeps := linkDeps)
+    let registered ← objs.allM fun obj => do return (← nativeArtifact? obj).isSome
     unless registered && !(linkDeps && !libs.isEmpty) do
-      return ← buildLeanSharedLibSync libName libFile objs libs args plugin
+      return ← buildLeanSharedLibSync libName libFile objs libs args plugin (linkDeps := linkDeps)
     Internal.addLeanSharedLibTrace
     let act : NativeAction :=
       {kind, target, file := libFile, rel, inputs := .objects objs (libs.map (·.path)), args}
-    let art ← buildNativeArtifact s act (Internal.linkLeanSharedLib libFile objs libs args)
+    let art ← buildNativeArtifact s act (Internal.linkLeanSharedLib libFile objs libs args (linkDeps := linkDeps))
     return {name := libName, path := art.path, deps := libs, plugin}
 
 end Lake

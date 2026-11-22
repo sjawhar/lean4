@@ -52,7 +52,8 @@ public structure Error where
   codeText : String := code.toString
   message : String
   missing : Array Digest := #[]
-  /-- The fields of a `TIMEOUT` error (contract C5.1 v7), each `none` when the bridge sent none. -/
+  /-- The fields of a killed action's error: a `TIMEOUT` error has them (contract C5.1 v7), and an `OOM` or
+  `DISK_LIMIT` error where the bridge sends them; each `none` when the bridge sent none. -/
   action? : Option String := none
   stdoutDigest? : Option Digest := none
   stderrDigest? : Option Digest := none
