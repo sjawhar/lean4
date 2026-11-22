@@ -620,7 +620,7 @@ These targets stay on this machine, as outside service mode, and write no line t
 * `extern_lib` targets, and other targets with build code of their own
 * objects of the LLVM backend (`bc.o`), and the shared libraries that link them
 * `leanir`, the separate code generation of a module with `postponeCompile`
-* the shared library of a library that has `moreLinkObjs`, or whose link takes an `extern_lib` as an argument (on Windows)
+* the shared library of a module or a library whose link takes a file that no native action of the build made: a library's `moreLinkObjs`, or, on Windows, where the link takes its libraries as arguments, the libraries it links (an `extern_lib`'s or an import's)
 
 After a promotion (see [Inputs of Service Actions](#inputs-of-service-actions)) changes the `.olean` of a module with `postponeCompile`, the next build runs the module's `leanir` step again. If that step writes other files, the modules that import it go to the service again.
 
@@ -645,7 +645,7 @@ When the service answers again in the middle of a build, each module, C object a
 
 Lake promotes under every fallback when the service answers. A promotion that gets no answer from the service has the same effect as a request of the target that needs it: `local` builds that target on this machine, `fail` fails it with the code `UNAVAILABLE`, and `wait` waits. Under `--no-build`, Lake sends no request and promotes nothing.
 
-The actions of one commit have the same digests on two machines when these values are the same on both: `LAKE_REMOTE_EXEC_SYSROOT` (without it, the path of the local sysroot), `LAKE_REMOTE_EXEC_TOOLCHAIN`, `LAKE_REMOTE_EXEC_CC`, `LAKE_REMOTE_EXEC_PATH` and `LAKE_REMOTE_EXEC_TIMEOUT`. An action names its files by their paths in its input root, and it does not use the local C compiler or linker. A shared library that stays on this machine (see [Native Code on the Service](#native-code-on-the-service): an `extern_lib`'s, or that of a library that has `moreLinkObjs` or whose link takes an `extern_lib` as an argument) is an input of a Lean action by its bytes, so that action has the same digest on two machines only when both build the same bytes.
+The actions of one commit have the same digests on two machines when these values are the same on both: `LAKE_REMOTE_EXEC_SYSROOT` (without it, the path of the local sysroot), `LAKE_REMOTE_EXEC_TOOLCHAIN`, `LAKE_REMOTE_EXEC_CC`, `LAKE_REMOTE_EXEC_PATH` and `LAKE_REMOTE_EXEC_TIMEOUT`. An action names its files by their paths in its input root, and it does not use the local C compiler or linker. A shared library that stays on this machine (see [Native Code on the Service](#native-code-on-the-service): an `extern_lib`'s, or that of a module or a library whose link takes a file that no native action of the build made) is an input of a Lean action by its bytes, so that action has the same digest on two machines only when both build the same bytes.
 
 ### The Timeout
 

@@ -200,10 +200,11 @@ as PATH and the headers and libraries of LAKE_REMOTE_EXEC_SYSROOT. Lake starts n
 machine for them. Lake writes the outputs of each action into the build directory when the action
 ends. These stay on this machine and write no line: executables, static libraries, `extern_lib`
 targets and other targets with build code of their own, `leanir` (`postponeCompile`), LLVM
-objects (`bc.o`) and the shared libraries that link them, and the shared library of a library that
-has `moreLinkObjs` or whose link takes an `extern_lib` as an argument (on Windows). After a
-promotion (below) changes the .olean of a module with `postponeCompile`, the next build runs the
-module's `leanir` step again. If that step writes other files, the modules that import it go to
+objects (`bc.o`) and the shared libraries that link them, and the shared library of a module or a
+library whose link takes a file that no native action of the build made (a library's
+`moreLinkObjs`, or on Windows the libraries it links as arguments, an `extern_lib`'s among them).
+After a promotion (below) changes the .olean of a module with `postponeCompile`, the next build runs
+the module's `leanir` step again. If that step writes other files, the modules that import it go to
 the service again.
 
 No file that this machine compiled is an input of an action on the service, except a shared

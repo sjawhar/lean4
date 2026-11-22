@@ -1559,10 +1559,12 @@ public def buildModuleO (mod : Module) (facet : String) (oFile : FilePath) (cJob
 /--
 Links a Lean shared library as `buildLeanSharedLib` does, with the same trace; in service mode on the build service
 (`buildNativeArtifact`) as the action `kind` with `target`, whose output is `rel?` in the input root
-(`remoteBuildPath`). As on Linux, no library of `linkLibs` is an argument of the link (`linkDeps` is false), so none is
-an input of the action. A link whose output has no path in the input root, or one of whose objects is no native
-artifact of this build (an object of the LLVM backend, or of another target), links here, as `buildLeanSharedLib`
-does, and writes no line.
+(`remoteBuildPath`). A request takes the link's objects and no library of `linkLibs`, as a link on Linux does
+(`linkDeps` is false there). So the link stays here, as `buildLeanSharedLib` does it, and writes no line, when it takes
+a file that no native action of the build made: when its output has no path in the input root, when one of its objects
+is no native artifact of this build (an object of the LLVM backend, a library's `moreLinkObjs`, or an object of
+another target), or when the link takes its libraries as arguments (`linkDeps`, on Windows) and it has any (an
+`extern_lib`'s, or an import's). This is the one rule for the shared libraries of modules and of libraries.
 -/
 public def buildNativeSharedLib (kind : NativeKind) (target : String) (rel? : Option String) (libName : String)
     (libFile : FilePath) (linkObjs : Array (Job FilePath)) (linkLibs : Array (Job Dynlib))
@@ -1576,7 +1578,9 @@ public def buildNativeSharedLib (kind : NativeKind) (target : String) (rel? : Op
     let some rel := rel?
       | buildLeanSharedLibSync libName libFile objs libs args plugin
     let registered ← objs.allM fun obj => do return (← nativeArtifact? obj).isSome
-    unless registered do
+    -- The default `linkDeps` of `buildLeanSharedLibSync`: whether the link takes `libs` as arguments
+    let linkDeps := System.Platform.isWindows
+    unless registered && !(linkDeps && !libs.isEmpty) do
       return ← buildLeanSharedLibSync libName libFile objs libs args plugin
     Internal.addLeanSharedLibTrace
     let act : NativeAction :=
