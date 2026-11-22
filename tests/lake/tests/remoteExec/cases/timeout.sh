@@ -1,4 +1,4 @@
-# The `timeout` group of test.sh, which sources it: LAKE_REMOTE_EXEC_TIMEOUT, rows T1-T6 (T7 is the `native`
+# The `timeout` group of test.sh, which sources it: LAKE_REMOTE_EXEC_TIMEOUT, rows T1-T6 and T8 (T7 is the `native`
 # group's). The fake records each `run` request's `timeoutSecs` and lets the action run to its end (no
 # FAKE_ENFORCE_TIMEOUT). Each row builds in a directory of its own under $WORK/timeout, and each build has a
 # fake log of its own. T6 builds on T1's tree: `build_T1` builds it once, so that each of them also runs alone.
@@ -20,6 +20,21 @@ p, target = sys.argv[1], sys.argv[2:]
 ls = [json.loads(l) for l in open(p) if l.strip()] if os.path.exists(p) else []
 print(" ".join(map(str, sorted({l["params"].get("timeoutSecs") for l in ls if l.get("method") == "run"
                                 and (not target or l["params"].get("target") == target[0])}))))' "$FAKE_LOG" "$@"
+}
+# o_keys OUTPUTS MOD...: for each module MOD, `MOD=ok` when the `depHash` of MOD's trace is a key of the `-o` file
+# OUTPUTS and the Lake cache has one entry under it, else `MOD=` and what lacks it (`outputs`, `cache`); then `keys=N`,
+# the number of keys of OUTPUTS
+o_keys() {
+  "$PYTHON" -c 'import glob, json, os, sys
+outputs, mods = sys.argv[1], sys.argv[2:]
+keys = {k for k, _ in (json.loads(l) for l in open(outputs).read().splitlines()[1:] if l.strip())}
+res = []
+for m in mods:
+    dep = json.load(open(os.path.join(".lake/build/lib/lean", *m.split(".")) + ".trace"))["depHash"]
+    entries = glob.glob(os.path.join(os.environ["LAKE_CACHE_DIR"], "outputs", "*", dep + ".json"))
+    miss = [w for w, ok in (("outputs", dep in keys), ("cache", len(entries) == 1)) if not ok]
+    res.append("%s=%s" % (m, "+".join(miss) or "ok"))
+print(" ".join(res + ["keys=%d" % len(keys)]))' "$@"
 }
 
 # T1's tree: a fresh tree built through the fake with LAKE_REMOTE_EXEC_TIMEOUT unset
@@ -87,4 +102,19 @@ row_T6() (
   test_cmd_eq 0 count_method run
 )
 
-run_rows T1 T2 T3 T4 T5 T6
+# T8: with a timeout other than 3600 s, the `-o` file keys each module by the hash of its trace and of its Lake cache
+# entry, which mix the timeout in. T8's tree, built with 1 s and the artifact cache, then a change of Rx.C: in one
+# `lake build -o` with 1 s, Rx.A, Rx.B and Rx.M replay, and Rx.C and Rx (which imports it) build on the service
+row_T8() (
+  enter T8; logs T8-first
+  export LAKE_REMOTE_EXEC_TIMEOUT=1 LAKE_ARTIFACT_CACHE=true
+  test_run build Rx
+  printf '\ndef c2 := c + 1\n' >> Rx/C.lean
+  logs T8
+  test_run build Rx -o "$TW/T8.outputs.jsonl"
+  check_lines "$LAKE_REMOTE_EXEC_LOG" --modules Rx,Rx.A,Rx.B,Rx.C,Rx.M \
+    --expect 'Rx.A|Rx.B|Rx.M:result=local-cache' --expect 'Rx.C|Rx:result=executed|cached'
+  test_cmd_eq "Rx=ok Rx.A=ok Rx.B=ok Rx.C=ok Rx.M=ok keys=5" o_keys "$TW/T8.outputs.jsonl" Rx Rx.A Rx.B Rx.C Rx.M
+)
+
+run_rows T1 T2 T3 T4 T5 T6 T8

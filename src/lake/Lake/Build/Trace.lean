@@ -372,6 +372,26 @@ public def mix (t1 t2 : BuildTrace) : BuildTrace where
 public instance : MixTrace BuildTrace := ⟨mix⟩
 
 /--
+`t`, a mix of its inputs onto a nil trace (`BuildTrace.mix` from `BuildTrace.nil`, as a job's trace and a collection's
+are), mixed again with `inputs` in their place; `none` if `inputs` has another size or `t` is no such mix of its own
+inputs (its inputs were dropped, `BuildTrace.withoutInputs`, or mixed onto another trace).
+-/
+public def withInputs? (t : BuildTrace) (inputs : Array BuildTrace) : Option BuildTrace :=
+  let remix (ins : Array BuildTrace) := ins.foldl (·.mix ·) (BuildTrace.nil t.caption)
+  if inputs.size == t.inputs.size && (remix t.inputs).hash == t.hash then some (remix inputs) else none
+
+/-- `t` mixed again with `u` in place of its input at `i` (`BuildTrace.withInputs?`). -/
+public def withInput? (t : BuildTrace) (i : Nat) (u : BuildTrace) : Option BuildTrace :=
+  if i < t.inputs.size then t.withInputs? (t.inputs.set! i u) else none
+
+/-- `t` mixed again with each input whose hash `hashes` gives (in order) taking that hash (`BuildTrace.withInputs?`);
+`t` itself when `hashes` gives none. -/
+public def withHashes? (t : BuildTrace) (hashes : Array (Option Hash)) : Option BuildTrace :=
+  if hashes.all (·.isNone) then some t
+  else if t.inputs.size != hashes.size then none
+  else t.withInputs? <| (t.inputs.zip hashes).map fun (u, hash?) => hash?.elim u fun hash => {u with hash}
+
+/--
 Check if the info is up-to-date using a hash.
 That is, check that info exists and its input hash matches this trace's hash.
 -/

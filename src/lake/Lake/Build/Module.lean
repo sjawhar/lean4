@@ -702,17 +702,28 @@ when it precompiles its imports, else its precompiled imports. -/
 def Module.fetchPrecompileImports (mod : Module) : FetchM (Job (Array Module)) :=
   if mod.shouldPrecompileImports then mod.transImports.fetch else mod.precompileImports.fetch
 
+/-- The jobs of the shared libraries that a module loads (`Module.fetchLibJobs`), in groups, each with its trace's
+caption. -/
+structure ModuleLibJobs where
+  importLibs : String × Array (Job Dynlib)
+  externLibs : String × Array (Job Dynlib)
+  dynlibs : String × Array (Job Dynlib)
+  plugins : String × Array (Job Dynlib)
+
+/-- The groups in the order in which `recFetchPreSetup` mixes their traces into the module's library trace. -/
+def ModuleLibJobs.groups (jobs : ModuleLibJobs) : Array (String × Array (Job Dynlib)) :=
+  #[jobs.importLibs, jobs.externLibs, jobs.dynlibs, jobs.plugins]
+
 /-- The jobs of the shared libraries that the module loads, given the imports whose libraries it loads (`imps`,
-`Module.fetchPrecompileImports`), in groups, each with its trace's caption, in the order in which `recFetchPreSetup`
-mixes their traces into the module's library trace. -/
-def Module.fetchLibJobs (mod : Module) (imps : Array Module) :
-    FetchM (Vector (String × Array (Job Dynlib)) 4) :=
-  return #v[
-    ("import dynlibs", ← mod.fetchImportLibs imps mod.shouldPrecompile mod.shouldPrecompileImports),
-    ("package external libraries",
-      ← if mod.shouldPrecompileImports then mod.pkg.externLibs.mapM (·.dynlib.fetch) else pure #[]),
-    ("module dynlibs", ← mod.dynlibs.mapM (·.fetchIn mod.pkg)),
-    ("module plugins", ← mod.plugins.mapM (·.fetchIn mod.pkg))]
+`Module.fetchPrecompileImports`). -/
+def Module.fetchLibJobs (mod : Module) (imps : Array Module) : FetchM ModuleLibJobs :=
+  return {
+    importLibs := ("import dynlibs", ← mod.fetchImportLibs imps mod.shouldPrecompile mod.shouldPrecompileImports)
+    externLibs := ("package external libraries",
+      ← if mod.shouldPrecompileImports then mod.pkg.externLibs.mapM (·.dynlib.fetch) else pure #[])
+    dynlibs := ("module dynlibs", ← mod.dynlibs.mapM (·.fetchIn mod.pkg))
+    plugins := ("module plugins", ← mod.plugins.mapM (·.fetchIn mod.pkg))
+  }
 
 /--
 Recursively build a module's dependencies, including:
@@ -747,11 +758,12 @@ def Module.recFetchPreSetup (mod : Module) : FetchM (Job ModulePreSetup) := ensu
   itself is precompiled, but they are currently kept to preserve the "bad import" errors.
   -/
   let precompileImports ← (← mod.fetchPrecompileImports).await
-  let libJobs := (← mod.fetchLibJobs precompileImports).map fun (caption, jobs) => Job.collectArray jobs caption
-  let impLibsJob := libJobs[0]
-  let externLibsJob := libJobs[1]
-  let dynlibsJob := libJobs[2]
-  let pluginsJob := libJobs[3]
+  let libJobs ← mod.fetchLibJobs precompileImports
+  let collect (group : String × Array (Job Dynlib)) := Job.collectArray group.2 group.1
+  let impLibsJob := collect libJobs.importLibs
+  let externLibsJob := collect libJobs.externLibs
+  let dynlibsJob := collect libJobs.dynlibs
+  let pluginsJob := collect libJobs.plugins
 
   inputJob.bindM (sync := true) fun input => do
   impInfoJob.bindM (sync := true) fun info => do
@@ -1639,6 +1651,28 @@ def awaitBuilt (what : String) (job : Job α) : ExceptT String JobM α := do
 (`Module.retrace` then keeps the module's trace). -/
 abbrev PromotedExportInfoM := StateT (NameMap (Option ModuleMetaExportInfo)) (ExceptT String JobM)
 
+/--
+The import info (`importInfo`) of the module `modName`, whose direct imports are `imports` (`ModuleInput.imports`), as
+`fetchImportInfo` makes it from the export infos of the imports: for each import, the one that `expInfo?` gives, else
+the build's (`metaExportInfo`). Also whether `expInfo?` gave any.
+-/
+def mixImportInfo (modName : Name) (isModule : Bool) (imports : Array ModuleImport)
+    (expInfo? : Module → PromotedExportInfoM (Option ModuleMetaExportInfo)) :
+    PromotedExportInfoM (ModuleImportInfo × Bool) := do
+  let nonModule := !isModule
+  let mut info := ModuleImportInfo.nil modName
+  let mut changed := false
+  for imp in imports do
+    -- The first module of the name, as `fetchImportInfo` takes it
+    let some mod := imp.module? | continue
+    match ← expInfo? mod with
+    | some expInfo =>
+      changed := true
+      info := info.addImport nonModule imp.toImport expInfo
+    | none =>
+      info := info.addImport nonModule imp.toImport (← awaitBuilt mod.name.toString (← mod.metaExportInfo.fetch))
+  return (info, changed)
+
 mutual
 
 /--
@@ -1677,23 +1711,12 @@ partial def Module.promotedExportInfo? (promoted : NameMap ModuleOutputArtifacts
 
 /--
 The import info (`importInfo`) of the module `modName`, whose direct imports are `imports` (`ModuleInput.imports`), as
-the next build computes it once the promotions `promoted` are in place (`Module.promotedExportInfo?`), as
-`fetchImportInfo` makes it; `none` when the export info of no import changed.
+the next build computes it once the promotions `promoted` are in place (`Module.promotedExportInfo?`, `mixImportInfo`);
+`none` when the export info of no import changed.
 -/
 partial def promotedImportInfo? (promoted : NameMap ModuleOutputArtifacts) (modName : Name) (isModule : Bool)
     (imports : Array ModuleImport) : PromotedExportInfoM (Option ModuleImportInfo) := do
-  let nonModule := !isModule
-  let mut info := ModuleImportInfo.nil modName
-  let mut changed := false
-  for imp in imports do
-    -- The first module of the name, as `fetchImportInfo` takes it
-    let some mod := imp.module? | continue
-    match ← mod.promotedExportInfo? promoted with
-    | some expInfo =>
-      changed := true
-      info := info.addImport nonModule imp.toImport expInfo
-    | none =>
-      info := info.addImport nonModule imp.toImport (← awaitBuilt mod.name.toString (← mod.metaExportInfo.fetch))
+  let (info, changed) ← mixImportInfo modName isModule imports (·.promotedExportInfo? promoted)
   return if changed then some info else none
 
 end
@@ -1712,7 +1735,7 @@ def Module.promotedLibTrace? (mod : Module) (presetup : ModulePreSetup) : Except
   let imps ← awaitBuilt mod.name.toString (← mod.fetchPrecompileImports)
   let mut built := BuildTrace.nil "libs"
   let mut libTrace := BuildTrace.nil "libs"
-  for (caption, jobs) in (← mod.fetchLibJobs imps).toArray do
+  for (caption, jobs) in (← mod.fetchLibJobs imps).groups do
     let mut builtGroup := BuildTrace.nil caption
     let mut group := BuildTrace.nil caption
     for job in jobs do
@@ -1734,15 +1757,21 @@ The trace of the module's action as the next build computes it from the files, w
 `Module.promote`'s): the module's trace (`ModulePreSetup.trace`) with the imports' trace and the library trace mixed
 again from the hashes of the service's outputs that this process's promotions put in place of the outputs that the
 build's jobs hashed (`promotedImportInfo?`, `Module.promotedLibTrace?`). It is the module's trace when no promotion
-changed either, and also when the module's trace is not the mix that `recFetchPreSetup` makes or a job it reads
-failed: the action has run, and a trace that keeps the hash from before the promotion costs one more build of the
+changed either, and also when the module's trace is not the mix that `recFetchPreSetup` makes, when the same mix with no
+promotion substituted does not give the imports' trace or the library trace of the module's setup, or when a job it
+reads failed: the action has run, and a trace that keeps the hash from before the promotion costs one more build of the
 module. A verbose line says so.
 -/
 def Module.retrace (mod : Module) (presetup : ModulePreSetup) (s : RemoteSession) : JobM BuildTrace := do
   let retrace : ExceptT String JobM BuildTrace := do
     let promoted ← promotedModules.atomically (m := BaseIO) get
-    let info? ← if promoted.isEmpty then pure none else
-      (promotedImportInfo? promoted mod.name presetup.isModule presetup.directImports).run' {}
+    -- Only the promotion of a transitive import changes the module's import info
+    let importPromoted ← if promoted.isEmpty then pure false else do
+      let imps ← awaitBuilt mod.name.toString (← mod.transImports.fetch)
+      pure (imps.any (promoted.contains ·.name))
+    let info? ← if importPromoted then
+        (promotedImportInfo? promoted mod.name presetup.isModule presetup.directImports).run' {}
+      else pure none
     let libTrace? ← mod.promotedLibTrace? presetup
     if info?.isNone && libTrace?.isNone then return presetup.trace
     let malformed := "its trace is not the one that its setup makes"
@@ -1750,7 +1779,11 @@ def Module.retrace (mod : Module) (presetup : ModulePreSetup) (s : RemoteSession
     -- extra dependencies' trace, and the library trace is its second input
     let mut inputs := presetup.trace.inputs
     if let some info := info? then
-      let some deps := inputs[0]? >>= (·.withInput? 1 info.trace) | throwThe String malformed
+      let some deps := inputs[0]? | throwThe String malformed
+      let (built, _) ← (mixImportInfo mod.name presetup.isModule presetup.directImports fun _ => pure none).run' {}
+      unless deps.inputs[1]?.map (·.hash) == some built.trace.hash do
+        throwThe String "its imports' trace is not the one that its setup made"
+      let some deps := deps.withInput? 1 info.trace | throwThe String malformed
       inputs := inputs.set! 0 deps
     if let some libTrace := libTrace? then
       inputs := inputs.set! 1 libTrace
@@ -1821,17 +1854,19 @@ partial def Module.promote (mod : Module) (s : RemoteSession) : JobM (Except Pro
     (remote? := some record)
   removeFileIfExists (mod.traceFile.addExtension "nobuild")
   let mut arts ← mod.cacheRemoteOutputs presetup depTrace.hash arts record
-  let jobHash? ← serviceInputHashes.atomically (m := BaseIO) <|
-    modifyGet fun hashes => (hashes.find? mod.name, hashes.insert mod.name depTrace.hash)
   let outputsRef? ← Internal.getOutputsRef? mod.pkg
   if hadLtar || outputsRef?.isSome then
     -- After the trace, which the archive holds
-    let ltar ← mod.packLtar arts
-    arts := {arts with ltar? := some ltar}
-    if let some ref := outputsRef? then
-      -- The key of `trackOutputsIfEnabled`: the `irArts` job's trace is the setup's
-      ref.replace (jobHash?.getD presetup.trace.hash) depTrace.hash ltar.descr (mod.platformIndependent.getD false)
-  promotedModules.atomically (m := BaseIO) (modify (·.insert mod.name arts))
+    arts := {arts with ltar? := some (← mod.packLtar arts)}
+  -- The key of `trackOutputsIfEnabled` for a module that its job did not build on the service
+  let jobHash := (← mod.elabArts.fetch).getTrace.hash
+  -- `serviceInputHashes`, the `-o` entry and `promotedModules` change in one step, after the last step that can fail
+  serviceInputHashes.atomically (m := BaseIO) do
+    let oldHash := ((← get).find? mod.name).getD jobHash
+    modify (·.insert mod.name depTrace.hash)
+    if let (some ref, some ltar) := (outputsRef?, arts.ltar?) then
+      ref.replace oldHash depTrace.hash ltar.descr (mod.platformIndependent.getD false)
+    promotedModules.atomically (m := BaseIO) (modify (·.insert mod.name arts))
   return .ok {record, promoted? := some arts}
 
 /-- The `run` request of the module's action with its head (`remoteHead`, `Module.remoteRunRequest`), and each input
@@ -1987,7 +2022,7 @@ with the service's record of the outputs and under the hash of the module's inpu
 Outputs with no record in a build with the usage cutoff on come from a local compile with `--usage` (which writes
 digests into the `.olean`), a usage skip or a kept check, so a service compile does not give their bytes. This holds
 for outputs here whose trace is up to date, for a Lake cache entry with no record, and for an archive, which keeps no
-record. When the build uses the service (`serviceAnswers`, not `--no-build`), such a module is compiled there instead
+record. When the build uses the service (`buildUsesService`), such a module is compiled there instead
 of replayed or restored, so that each importer of this build takes the hash of the service's outputs, as the next
 build does. Without the cutoff, a local compile with the same toolchain gives the service's bytes, so such outputs
 replay or restore and are promoted only when a service action takes them (`Module.serviceFor`). Returns `none` when
@@ -2015,7 +2050,7 @@ def Module.fetchRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSes
   -- Whether outputs with no record go to the service. The usage cutoff's setting is an input of the
   -- trace, so the build's setting is the outputs'.
   let needRecord : JobM Bool := do
-    if (← getNoBuild) || !(← usageCutoffEnabled) then pure false else serviceAnswers s
+    if (← usageCutoffEnabled) then buildUsesService s else pure false
   let toService ← do
     if !outputsHere || !traced || savedTrace.remote?.isSome then pure false else needRecord
   unless toService do
@@ -3169,8 +3204,11 @@ def Module.recBuildIRArts (mod : Module) : FetchM (Job ModuleOutputArtifacts) :=
     let presetup ← (← mod.presetup.fetch).await
     -- Use the same trace as `elabArts` to maintain compatibility
     setTrace presetup.trace
+    -- The hash of the module's trace and Lake cache entry when its job did not build it on the service: the
+    -- `elabArts` job's, into which `fetchCore` mixes the timeout rule
+    let jobHash := elabJob.getTrace.hash
     unless elabArts.c?.isNone do
-      let elabArts ← trackOutputsIfEnabled elabArts
+      let elabArts ← trackOutputsIfEnabled jobHash elabArts
       return elabArts
     let depTrace := BuildTrace.nil s!"{mod.name} (leanir)"
       |>.mix (← importAllTrace elabArts) |>.mix presetup.irSigTrace
@@ -3183,7 +3221,7 @@ def Module.recBuildIRArts (mod : Module) : FetchM (Job ModuleOutputArtifacts) :=
       compileLeanIR mod.irSetupFile mod.irFile mod.cFile (← getLeanPath) (← getLeanir)
     let arts ← mod.computeIRArtifacts elabArts upToDate
     let arts ← adjustMTime arts mod.irTraceFile
-    let arts ← trackOutputsIfEnabled arts
+    let arts ← trackOutputsIfEnabled jobHash arts
     return arts
 where
   importAllTrace arts := do
@@ -3199,16 +3237,16 @@ where
       return allArtsTrace.mix arts.olean.trace
   /-
   Records the module's archive in the `-o` outputs file, under the hash of the trace and the Lake
-  cache entry that its job's service action wrote (`serviceInputHashes`), else of the job's trace.
+  cache entry that its job's service action wrote (`serviceInputHashes`), else under `jobHash`.
   The entry of a module whose outputs a kept-module check accepted also carries their lineage
   (`{"l": <archive>, "kf": <hash>}`), so that a cache installing the file applies the supersede
   rule to it (`Cache.writeOutputsCore`). A later promotion of the module replaces the entry
   (`Module.promote`).
   -/
-  trackOutputsIfEnabled arts : JobM ModuleOutputArtifacts := do
+  trackOutputsIfEnabled (jobHash : Hash) arts : JobM ModuleOutputArtifacts := do
     if let some ref ← Internal.getOutputsRef? mod.pkg then
       let inputHash := (← serviceInputHashes.atomically (m := BaseIO) (return (← get).find? mod.name)).getD
-        (← getTrace).hash
+        jobHash
       let (arts, ltar) ← id do
         if let some ltar := arts.ltar? then pure (arts, ltar) else
         let ltar ← mod.packLtar arts
