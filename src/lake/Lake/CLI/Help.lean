@@ -222,9 +222,9 @@ holds also for module outputs in the Lake cache with no record: the job compiles
 service and does not restore them. So does the job of a module whose outputs came from an archive
 (.ltar), which keeps no record, whatever the cutoff: a cached archive, the outputs that an unpack
 in an earlier build in service mode left here (under --no-build or while the build did not use the
-service), and a Lake cache entry that such an unpack wrote. Lake marks outputs that came from an
-archive only in service mode, so those of an unpack with LAKE_REMOTE_EXEC unset are like those of
-a tree that an earlier release wrote. Lake uses any other such module as it is. Before an action
+service), and a Lake cache entry that such an unpack wrote. Only an unpack in service mode marks
+outputs that came from an archive, so those of an unpack with LAKE_REMOTE_EXEC unset are like those
+of a tree that an earlier release wrote. Lake uses any other such module as it is. Before an action
 on the service takes an output with no record as an input, Lake runs its own action on the
 service and writes the service's files over the local ones. This promotion writes no line: the
 target keeps its one line. Lake assumes that, with the cutoff off, a local compile of a module
