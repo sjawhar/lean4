@@ -1359,18 +1359,24 @@ def SavedTrace.keptFrom? (self : SavedTrace) : Option Hash :=
   self.moduleOutputDescrs?.bind (·.keptFrom?)
 
 /--
-Fails, discarding the module's outputs, if its source changed since `recFetchInput` read it: the input
-hash covers the source as read then, while `lean` reads it again and a usage skip keeps old outputs.
+The message `<file>: source file was modified during the build` if the module's source changed since `recFetchInput`
+read it: the input hash covers the source as read then, while `lean` reads it again and a usage skip keeps old outputs.
 -/
-def Module.checkSourceUnchanged (mod : Module) (presetup : ModulePreSetup) : JobM Unit := do
+def Module.sourceChanged? (mod : Module) (presetup : ModulePreSetup) : JobM (Option String) := do
   -- A rewrite can keep the modification time (`cp -p`, `rsync -a`, or a read part-way through one
   -- in-place `write`), so compare the contents too.
   if (← getMTime presetup.srcFile) != presetup.srcMTime ||
       Hash.ofText (← IO.FS.readFile presetup.srcFile) != presetup.srcHash then
-    mod.clearOutputArtifacts
     let relSrcFile := relPathFrom mod.pkg.dir presetup.srcFile
-    error s!"{relSrcFile}: source file was modified during the build; \
-      its outputs were discarded (build again to compile the current version)"
+    return some s!"{relSrcFile}: source file was modified during the build"
+  return none
+
+/-- Fails, discarding the module's outputs, if its source changed since `recFetchInput` read it
+(`Module.sourceChanged?`). -/
+def Module.checkSourceUnchanged (mod : Module) (presetup : ModulePreSetup) : JobM Unit := do
+  if let some msg ← mod.sourceChanged? presetup then
+    mod.clearOutputArtifacts
+    error s!"{msg}; its outputs were discarded (build again to compile the current version)"
 
 /--
 The outputs that a module's archive (`.ltar`) holds after its trace, in archive order, each with
@@ -1821,7 +1827,8 @@ compile writes) and the trace of a `--no-build` run go, which also ends a kept l
 the build writes `-o` mappings, the archive is packed again from the promoted outputs, and the module's `-o` entry, which
 its `irArts` job wrote before any promotion of the module (`trackOutputsIfEnabled`), becomes the hash of the trace
 mapped to that archive. The module's job wrote its one line already, and the promotion replays none of Lean's messages
-and counts in no statistic.
+and counts in no statistic. When the module's source changed since the build hashed it (`Module.sourceChanged?`), the
+run may have read the new source, so the promotion fails with that message and writes nothing.
 -/
 partial def Module.promote (mod : Module) (s : RemoteSession) : JobM (Except PromotionError ModuleService) := do
   let some presetup ← (← mod.presetup.fetch).wait?
@@ -1830,6 +1837,10 @@ partial def Module.promote (mod : Module) (s : RemoteSession) : JobM (Except Pro
   let result ← match ← promotionRun s msg (mod.serviceRequest presetup s) with
     | .ok r => pure r
     | .error e => return .error e
+  -- The request takes the source by path
+  if let some changed ← mod.sourceChanged? presetup then
+    return .error (.failed (msg
+      s!"{changed}; the promotion wrote nothing (build again to compile the current version)"))
   let outputFiles := mod.remoteOutputFiles
   let mut found := #[]
   for o in result.outputs do
