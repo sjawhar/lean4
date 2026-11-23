@@ -2,4 +2,5 @@ import Lake
 open System Lake DSL
 
 package collectAxioms
-@[default_target] lean_lib CollectAxioms
+@[default_target] lean_lib CollectAxioms where
+  roots := #[`CollectAxioms, `CollectAxioms.VisitOrderFlip]

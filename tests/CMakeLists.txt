@@ -309,6 +309,14 @@ foreach(T ${LEANLAKETESTS})
                export ${TEST_VARS}
                LAKE=lake ./test.sh"
     )
+    # Each slice takes 8-11 min idle, so ctest's default 1500 s cuts it off on a loaded machine.
+    if(T_PATH MATCHES "^tests/lake/tests/usageCutoffCompiled/")
+      set_tests_properties("${T_PATH}" PROPERTIES TIMEOUT 7200)
+    endif()
+    # Each takes 1000-1500 s or longer on a loaded machine, where ctest's default 1500 s cuts it off.
+    if(T_PATH MATCHES "^tests/lake/tests/(remoteCacheClaim|keptCheck)/")
+      set_tests_properties("${T_PATH}" PROPERTIES TIMEOUT 7200)
+    endif()
   endif()
 endforeach(T)
 

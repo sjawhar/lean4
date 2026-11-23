@@ -22,7 +22,7 @@ def popcount32_impl (x : BitVec 32) : BitVec 32 :=
 theorem popcount32_correct (x : BitVec 32) :
   (popcount32_spec x) = (popcount32_impl x) := by
   dsimp only [popcount32_spec_rec, popcount32_spec, popcount32_impl]
-  bv_decide
+  bv_decide (config := { timeout := 120 })
 
 def parity32_spec_rec (i : Nat) (x : BitVec 32) : Bool :=
   match i with
@@ -44,4 +44,4 @@ def parity32_impl (x : BitVec 32) : BitVec 32 :=
 theorem parity32_correct (x : BitVec 32) :
     (parity32_spec x) = ((parity32_impl x).getLsbD 0) := by
   dsimp only [parity32_spec, parity32_impl, parity32_spec_rec]
-  bv_decide
+  bv_decide (config := { timeout := 120 })
