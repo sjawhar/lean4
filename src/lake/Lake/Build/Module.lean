@@ -1551,19 +1551,25 @@ def SavedTrace.keptFrom? (self : SavedTrace) : Option Hash :=
   self.moduleOutputDescrs?.bind (·.keptFrom?)
 
 /--
-Fails, discarding the module's outputs, if its source changed since `recFetchInput` read it: the input
-hash covers the source as read then, while `lean` reads it again and a usage skip keeps old outputs.
+The message `<file>: source file was modified during the build` if the module's source changed since `recFetchInput`
+read it: the input hash covers the source as read then, while `lean` reads it again and a usage skip keeps old outputs.
 -/
-def Module.checkSourceUnchanged (mod : Module) (presetup : ModulePreSetup) : JobM Unit := do
+def Module.sourceChanged? (mod : Module) (presetup : ModulePreSetup) : JobM (Option String) := do
   -- A rewrite can keep the modification time (`cp -p`, `rsync -a`, or a read part-way through one
   -- in-place `write`), so compare the contents too.
   if (← getMTime presetup.srcFile) != presetup.srcMTime ||
       Hash.ofText (← IO.FS.readFile presetup.srcFile) != presetup.srcHash then
+    let relSrcFile := relPathFrom mod.pkg.dir presetup.srcFile
+    return some s!"{relSrcFile}: source file was modified during the build"
+  return none
+
+/-- Fails, discarding the module's outputs, if its source changed since `recFetchInput` read it
+(`Module.sourceChanged?`). -/
+def Module.checkSourceUnchanged (mod : Module) (presetup : ModulePreSetup) : JobM Unit := do
+  if let some msg ← mod.sourceChanged? presetup then
     mod.clearOutputArtifacts
     removeStamp mod.sourceStampFile mod.name.toString
-    let relSrcFile := relPathFrom mod.pkg.dir presetup.srcFile
-    error s!"{relSrcFile}: source file was modified during the build; \
-      its outputs were discarded (build again to compile the current version)"
+    error s!"{msg}; its outputs were discarded (build again to compile the current version)"
 
 /--
 The outputs that a module's archive (`.ltar`) holds after its trace, in archive order, each with
@@ -2077,7 +2083,9 @@ mapped to that archive (`Module.notePromoted`). The run, the materialize and the
 module's input under the hash from before that promotion, which the module's build takes (`promotionRun`); under it, a
 cache entry that has the service's record (another process promoted the module) is restored instead, with no request,
 and leaves the same records (`Module.restorePromoted?`). The module's job wrote its one line already, and the promotion
-replays none of Lean's messages and counts in no statistic.
+replays none of Lean's messages and counts in no statistic. When the module's source changed since the build hashed it
+(`Module.sourceChanged?`), the run may have read the new source, so the promotion fails with that message and writes
+nothing.
 -/
 partial def Module.promote (mod : Module) (s : RemoteSession) : JobM (Except PromotionError ModuleService) := do
   let some presetup ← (← mod.presetup.fetch).wait?
@@ -2085,6 +2093,10 @@ partial def Module.promote (mod : Module) (s : RemoteSession) : JobM (Except Pro
   let msg (what : String) := s!"promoting {mod.name}: {what}"
   promotionRun s msg mod.pkg (s.mixTimeout presetup.trace).hash (mod.serviceRequest presetup s)
     (some (do mod.restorePromoted? (← mod.retrace presetup s))) fun result => do
+  -- The request takes the source by path
+  if let some changed ← mod.sourceChanged? presetup then
+    return .error (.failed (msg
+      s!"{changed}; the promotion wrote nothing (build again to compile the current version)"))
   let outputFiles := mod.remoteOutputFiles
   let mut found := #[]
   for o in result.outputs do
