@@ -639,13 +639,15 @@ These targets stay on this machine, as outside service mode, and write no line t
 * objects of the LLVM backend (`bc.o`), and the shared libraries that link them
 * `leanir`, the separate code generation of a module with `postponeCompile`
 * the shared library of a module or a library whose link takes a file that a request cannot carry: an object that is no native artifact of the build (a library's `moreLinkObjs`, an LLVM object), or, on Windows, where the link takes its libraries as arguments, any library
-* the shared library of a library whose file has no path in the input root: one that the package's `nativeLibDir` puts outside its build directory
+* the shared library of a library whose file has no path in the input root: one whose package's `nativeLibDir` leaves the build directory, that is, an absolute directory outside the build directory, or any directory with a `..` component (for example `../lib`)
+
+No action on the service can take a file that has no path in the input root. So in a build that uses the service, a module fails with the code `request` when its compile loads one of these files: a plugin or shared library outside the workspace (below no package's build directory) and outside the Lean sysroot, or the shared library of a library whose `nativeLibDir` leaves the build directory. To build such a module, turn service mode off; in the second case, a `nativeLibDir` inside the build directory also works. A `.` component of a directory is dropped from the names of its files in the input root: with `nativeLibDir = "./lib"`, the shared library of a library is `native/<package>/lib/<file>` there.
 
 After a promotion (see [Inputs of Service Actions](#inputs-of-service-actions)) changes the `.olean` of a module with `postponeCompile`, the next build runs the module's `leanir` step again. If that step writes other files, the modules that import it go to the service again.
 
 ### Inputs of Service Actions
 
-No file that this machine compiled is an input of an action on the service, with two exceptions: a shared library that stays on this machine (see the list above), and the files that `leanir` writes. Lake sends the imports of a module by path, and their files hold the outputs of the service. Lake sends each other plugin and shared library of the workspace by the digest and the executable bit of the service's output, not as a local file.
+No file that this machine compiled is an input of an action on the service, with two exceptions: a shared library that stays on this machine and has a path in the input root (see the list above; no action can take one with no path there), and the files that `leanir` writes. Lake sends the imports of a module by path, and their files hold the outputs of the service. Lake sends each other plugin and shared library of the workspace by the digest and the executable bit of the service's output, not as a local file.
 
 A module, C object or shared library that this machine built has no service record. The fallback `local`, an earlier build and a build with service mode off all make such outputs. A module whose outputs came from an archive (`.ltar`) has no record either. Before an action on the service takes such an output as an input, Lake promotes it:
 
@@ -667,7 +669,7 @@ When the service answers again in the middle of a build, each module, C object a
 
 Lake promotes under every fallback when the service answers. A promotion that gets no answer from the service has the same effect as a request of the target that needs it: `local` builds that target on this machine, `fail` fails it with the code `UNAVAILABLE`, and `wait` waits. A later request that needs the output promotes it again. Under `--no-build`, Lake sends no `run` request and promotes nothing.
 
-The actions of one commit have the same digests on two machines when these values are the same on both: `LAKE_REMOTE_EXEC_SYSROOT` (without it, the real path of the local sysroot), `LAKE_REMOTE_EXEC_TOOLCHAIN`, `LAKE_REMOTE_EXEC_CC`, `LAKE_REMOTE_EXEC_PATH` and `LAKE_REMOTE_EXEC_TIMEOUT`. An action names its files by their paths in its input root, and it does not use the local C compiler or linker. A shared library that stays on this machine (see the list in [Native Code on the Service](#native-code-on-the-service)) is an input of a Lean action by its bytes, so that action has the same digest on two machines only when both build the same bytes.
+The actions of one commit have the same digests on two machines when these values are the same on both: `LAKE_REMOTE_EXEC_SYSROOT` (without it, the real path of the local sysroot), `LAKE_REMOTE_EXEC_TOOLCHAIN`, `LAKE_REMOTE_EXEC_CC`, `LAKE_REMOTE_EXEC_PATH` and `LAKE_REMOTE_EXEC_TIMEOUT`. An action names its files by their paths in its input root, and it does not use the local C compiler or linker. A shared library that stays on this machine and has a path in the input root (see the list in [Native Code on the Service](#native-code-on-the-service)) is an input of a Lean action by its bytes, so that action has the same digest on two machines only when both build the same bytes.
 
 ### The Timeout
 
@@ -747,7 +749,7 @@ The `code` of an `error` line is the code of the service as it sent it (for exam
 | `undeclared-output` | The service gave an output that the target does not have: for `lean`, a file that is none of the module's outputs (see `outputs` above); for `c` and `shared`, any file but the action's one output. |
 | `materialize` | Lake could not write the outputs or the trace into the build directory, could not hash the outputs there, or could not replay or restore them. For `c` and `shared`, also: Lake could not save the service's output to the Lake cache (see [Local Cache in Build-Service Mode](#local-cache-in-build-service-mode)). |
 | `malformed-result` | Lake could not read the result of the `run` request. |
-| `request` | Lake could not make the request, for example for a plugin outside the workspace, or the promotion of an input failed. |
+| `request` | Lake could not make the request, for example for a plugin or shared library with no path in the input root (see [Native Code on the Service](#native-code-on-the-service)), or the promotion of an input failed. |
 | `setup` | The setup of the module failed for a cause other than an import: its header, its source, a `needs` target, or a native dependency. |
 | `no-build` | The target needs a build, and `--no-build` is set. |
 | `canceled` | `--fail-fast` stopped the job. |
