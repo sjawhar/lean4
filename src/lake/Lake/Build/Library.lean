@@ -153,9 +153,8 @@ public def LeanLib.staticExportFacetConfig : LibraryFacetConfig staticExportFace
 /-! ## Build Shared Lib -/
 
 /--
-Build the library's shared library. In service mode, the build service links it (`LinkSharedLibrary`,
-`buildNativeSharedLib`), unless its link takes a file that a request cannot carry (the library's `moreLinkObjs`, or
-on Windows, where the link takes its libraries as arguments, any library): `buildNativeSharedLib` holds that rule.
+Build the library's shared library. In service mode, `buildNativeSharedLib` decides whether the build service links it
+(`LinkSharedLibrary`).
 -/
 def LeanLib.recBuildShared (self : LeanLib) : FetchM (Job Dynlib) := do
   withRegisterJob s!"{self.name}:shared" <| withCurrPackage self.pkg do

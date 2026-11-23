@@ -1682,8 +1682,8 @@ failed (an import that was only canceled did not, as the presetup's import fold 
 a canceled job, else `error` with code `setup`. It reads only jobs that have finished, and waits for
 none: an import's job whose failure failed the presetup has finished, or the import's presetup has (then
 that job fails too). The line is written before any reader sees the job's result. A module whose import
-failed is no failure of its own (exit code 75 counts the failures of the service,
-`failedOnlyForService`), so the job logs no error; a line it cannot append is a warning in its log.
+failed is no failure of its own (`failedOnlyForService`), so the job logs no error; a line it cannot
+append is a warning in its log.
 -/
 def Module.writeUnwrittenLine (mod : Module) (line : ModuleLine) (job : Job ModuleOutputArtifacts) :
     SpawnM (Job ModuleOutputArtifacts) := .ofFn fun _ _ _ store ctx _ =>
@@ -1729,9 +1729,10 @@ def Module.writeUnwrittenLine (mod : Module) (line : ModuleLine) (job : Job Modu
 
 /--
 The path part of a module's action (contract C2.1): plugins, dynlibs and `LEAN_PATH`, rewritten to input-root-relative
-form. A plugin or dynlib of the workspace that a native job of this build made goes in by the digest and executable
-bit of its output on the service (`nativeServiceOutput`, which promotes it first if it has no service record), so that
-neither its local bytes nor its mode enter the action; another one of the workspace (an `extern_lib`) goes in by path.
+form. A plugin or dynlib of the workspace goes in by the digest and executable bit of its output on the service when it
+has one (`nativeServiceOutput`, which first promotes a native artifact of this build that has no service record), so
+that neither its local bytes nor its mode enter the action; any other one of the workspace (an `extern_lib`'s, or one
+that `buildNativeSharedLib` links on this machine) goes in by path.
 A toolchain plugin is found under the local sysroot and named under the remote one.
 -/
 def remoteHead (presetup : ModulePreSetup) (s : RemoteSession) : JobM (Except PromotionError RemoteHead) := do
@@ -2255,31 +2256,14 @@ def Module.buildRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSes
   return {arts, record, outcome := run, depTrace := ← mod.retrace presetup s}
 
 /--
-Fetch a module's outputs from the build service (contract C5.1): replay an up-to-date trace with no
-request, else restore them from the local Lake cache with no request (`fromCache`, as `fetchLocal`
-restores before a compile), otherwise `run` the action, materialize the outputs, write the trace as a
-local compile does (`buildRemote`), and save them to the local Lake cache (`cacheRemoteOutputs`), both
-with the service's record of the outputs and under the hash of the module's inputs after the request promoted them
-(`Module.retrace`), which the next build computes; its `-o` entry takes that hash too (`serviceInputHashes`).
-A module goes to the service instead of being replayed, restored or unpacked, when the build uses it
-(`buildUsesService`) and the outputs that it would take have no service record, in two cases; `needRecord` decides,
-given that record and whether those outputs came from an archive. With the usage cutoff on, its outputs come from a
-local compile with `--usage` (which writes digests into the `.olean`), a usage skip or a kept check, so a service
-compile does not give their bytes; this holds for outputs here whose trace is up to date and for a Lake cache entry.
-Whatever the cutoff, its outputs came from an archive (`.ltar`), which keeps no record, so a service action may have
-made them: an archive in the Lake cache, or outputs whose trace or Lake cache entry says that an unpack in service mode
-wrote them (`BuildMetadata.fromArchive`, `CacheOutput.fromArchive`). Each importer of this build then takes the hash
-of the service's outputs, as the next build does, and the module's line has the service's record; the service's cache
-answers when it ran the same action before and keeps its entry, whatever packed the archive. Without the cutoff, a
-local compile with the same toolchain gives the service's bytes, so other outputs with no record replay or restore and
-are promoted only when a service action takes them (`Module.serviceFor`). Returns
-`none` when the service is unavailable or has a confirmed toolchain mismatch and `LAKE_REMOTE_EXEC_FALLBACK` is
-`local` (`useService`, `remoteUnavailable`): the caller then compiles on this machine, where imports' outputs were
-materialized. A request that answers `UNAVAILABLE` after a probe found the service again (the epoch moved since it
-was sent) is sent again (`retryWhileUnavailable`). Under `wait`, an unavailable request is retried once the service
-answers (`awaitServiceAgain`); a confirmed mismatch fails with exit 75. A result of the service (a nonzero exit,
-`OOM`, `TIMEOUT`, `DISK_LIMIT`) and every other error are the module's result, never a reason to fall back. Each path
-sets the module's line (`line`).
+Fetch a module's outputs from the build service (contract C5.1): replay an up-to-date trace with no request, else
+restore them from the local Lake cache with no request (`fromCache`), otherwise `run` the action (`buildRemote`), write
+the trace and save the outputs to the local Lake cache when the package writes it (`cacheRemoteOutputs`), both with the
+service's record and under the hash of the module's inputs after the request promoted them (`Module.retrace`); its `-o`
+entry takes that hash too (`serviceInputHashes`). Outputs with no service record go to the service instead of a replay
+or a restore when `needRecord` says so (its comment states the rule). Returns `none` when the fallback `local` applies
+(`useService`, `retryWhileUnavailable`): the caller then fetches the module on this machine (`fetchLocal`) and sets the
+module's line. Every other path sets the line (`line`).
 -/
 def Module.fetchRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSession) (line : ModuleLine)
     (savedTrace : SavedTrace)
@@ -2295,9 +2279,10 @@ def Module.fetchRemote (mod : Module) (presetup : ModulePreSetup) (s : RemoteSes
   let traced := match savedTrace with
     | .ok data => data.depHash == inputHash
     | _ => false
-  -- Whether outputs go to the service, given the record and the mark (`SavedTrace.fromArchive`, `fetchFromCache?`) of
-  -- those that the caller would use: with a record never; else those that came from an archive, and others with the
-  -- usage cutoff on, whose setting is an input of the trace, so the build's setting is the outputs'.
+  -- Whether outputs go to the service, given the record of those that the caller would use and whether they come
+  -- from an archive or carry its mark (`SavedTrace.fromArchive`, `fetchFromCache?`): with a record never; else, when
+  -- the build uses the service, those, and with the usage cutoff on all others, whose setting is an input of the
+  -- trace, so the build's setting is the outputs'.
   let needRecord (remote? : Option RemoteExec.Record) (fromArchive : Bool) : JobM Bool := do
     if remote?.isSome then return false
     if fromArchive || (← usageCutoffEnabled) then buildUsesService s else pure false
@@ -2392,8 +2377,8 @@ def Module.withSavedKeptFrom (mod : Module) (arts : ModuleOutputArtifacts) : Job
 
 /--
 Unpacks `ltar`, an archive of the module's outputs, into the build directory, with the archive's trace. In service
-mode (`LAKE_REMOTE_EXEC` set, whether or not the service answers), the one key `fromArchive` is added to that trace
-(`BuildMetadata.fromArchive`): an archive keeps no service record. Otherwise the trace stays as leantar wrote it.
+mode (`LAKE_REMOTE_EXEC` set, whether or not the service answers), it adds the archive mark, the one key `fromArchive`,
+to that trace (`BuildMetadata.fromArchive`). Otherwise the trace stays as leantar wrote it.
 -/
 def Module.unpackLtar (self : Module) (ltar : FilePath) (inputHash : Hash) : JobM Unit := do
   -- Archive has no `depHash` (packed with `-s`); supply it via `-j -` JSON stdin.
@@ -2409,7 +2394,10 @@ def Module.unpackLtar (self : Module) (ltar : FilePath) (inputHash : Hash) : Job
   withBuildSlot <| proc (quiet := true) (input? := input.compress) (lend := true)
     {cmd := (← getLeantar).toString, args}
   unless (← getLakeEnv).remoteExec?.isSome do return
-  -- Only the one key changes; a trace that is no JSON object is left as it is, for its reader to report
+  -- Only the one key changes, not through `BuildMetadata.writeFile`: its `toJson` always adds `inputs` and `synthetic`,
+  -- whose absence a reader outside Lake takes as an archive restore (theorem-labs/machcsl-riscv-experimental,
+  -- `traceState` in `tools/lean/StrictFacts.lean`). A trace that is no JSON object is left as it is, for its reader to
+  -- report
   if let .ok contents ← (IO.FS.readFile self.traceFile).toBaseIO then
     if let .ok trace@(.obj _) := Json.parse contents then
       IO.FS.writeFile self.traceFile (trace.setObjVal! "fromArchive" true).pretty
@@ -3109,12 +3097,10 @@ def Module.recBuildElabArts (mod : Module) : FetchM (Job ModuleOutputArtifacts) 
       | .wait wait => return .wait wait
   if let some line := line?.filter (·.log?.isSome) then mod.writeUnwrittenLine line job else return job
 where
-  /- Restores the module's outputs from the Lake cache. When `needRecord`, given the service record of the outputs
-  that the restore would use and whether they came from an archive (an archive hit, whose restore has no record, or a
-  trace or entry with the mark of one, `CacheHit.fromArchive`), answers `true`, restores nothing, so that the caller
-  builds the module. In service mode the trace that an unpack writes has the mark (`Module.unpackLtar`), and with the
-  usage cutoff off so has each trace or Lake cache entry of its outputs; with the cutoff on, `needRecord` sends every
-  module with no record, and the cutoff's writers keep no mark. -/
+  /- Restores the module's outputs from the Lake cache, unless `needRecord` (`Module.fetchRemote`'s rule) answers
+  `true` for the hit's service record and whether it is an archive or has the mark (`CacheHit.fromArchive`; an archive
+  hit has no record): then it restores nothing, so that the caller builds the module. The trace of a restored entry,
+  and the entry of an unpacked archive, keep the mark of the entry or of the unpacked trace (`Module.unpackLtar`). -/
   fetchFromCache? presetup savedTrace restoreAll (line? : Option ModuleLine) (inputHash? : Option Hash := none)
       (remoteRead := true) (needRecord : Option RemoteExec.Record → Bool → JobM Bool := fun _ _ => pure false) :
       JobM ModuleFetchState := do
@@ -3427,7 +3413,7 @@ where
           let arts := if arts.keptFrom?.isSome then arts else {arts with ltar? := arts.ltar? <|> ltar?}
           -- The trace holds the log of the action that produced the outputs (their replay, restore
           -- by input hash or from the usage index, unpack, kept-module check's accept or build), and
-          -- whether they came from an archive
+          -- their archive mark
           let current ← readTraceFile mod.traceFile
           let log := current.log
           -- Queued before the local mapping is written: a build that finds the mapping never
@@ -3913,7 +3899,7 @@ def Module.serviceC? (mod : Module) (s : RemoteSession) : JobM (Except Promotion
 /--
 Recursively build the module's object file from its C file produced by `lean`
 with `-DLEAN_EXPORTING` set, which exports Lean symbols defined within the C files.
-In service mode, the build service compiles it (`buildModuleO`).
+In service mode, `buildModuleO` builds it (`CCompile`).
 -/
 def Module.recBuildLeanCToOExport (self : Module) : FetchM (Job FilePath) := do
   let suffix := if (← getIsVerbose) then " (with exports)" else ""
@@ -3931,7 +3917,7 @@ public def Module.coExportFacetConfig : ModuleFacetConfig coExportFacet :=
 /--
 Recursively build the module's object file from its C file produced by `lean`.
 This version does not export any Lean symbols.
-In service mode, the build service compiles it (`buildModuleO`).
+In service mode, `buildModuleO` builds it (`CCompile`).
 -/
 def Module.recBuildLeanCToONoExport (self : Module) : FetchM (Job FilePath) := do
   let suffix := if (← getIsVerbose) then " (without exports)" else ""
@@ -4032,7 +4018,7 @@ public def Module.linkInfoNoExportFacetConfig : ModuleFacetConfig linkInfoNoExpo
 /--
 Recursively build the shared library of a module
 (e.g., for `--load-dynlib` or `--plugin`).
-In service mode, the build service links it (`LinkShared`, `buildNativeSharedLib`).
+In service mode, `buildNativeSharedLib` decides whether the build service links it (`LinkShared`).
 -/
 def Module.recBuildDynlib (mod : Module) : FetchM (Job Dynlib) :=
   withRegisterJob s!"{mod.name}:dynlib" <| withCurrPackage mod.pkg do

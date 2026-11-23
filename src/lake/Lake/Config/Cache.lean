@@ -349,10 +349,7 @@ public structure CacheOutput where
     sha256? : Option Sha256Map := none
     /-- The build service's record of the outputs (`remote`), for outputs that a service action made. -/
     remote? : Option RemoteExec.Record := none
-    /--
-    Whether the outputs came from an archive (`.ltar`) that an unpack in service mode restored, which keeps no
-    service record, so that a service action may have made them (`fromArchive`).
-    -/
+    /-- The archive mark of the outputs (`fromArchive`, see `Lake.BuildMetadata.fromArchive`). -/
     fromArchive : Bool := false
     deriving Inhabited
 
@@ -494,8 +491,8 @@ def writeOutputsCore
 
 /--
 Cache the outputs corresponding to the given input for the package,
-along with the log of the build that produced them, for outputs that a service action made its record, and for
-outputs that came from an archive the mark of it (`CacheOutput.fromArchive`).
+along with the log of the build that produced them, the build service's record `remote?` and the archive mark
+`fromArchive` (`CacheOutput`).
 -/
 public def writeOutputs
   [ToJson α] (cache : Cache) (scope : String) (inputHash : Hash) (outputs : α)

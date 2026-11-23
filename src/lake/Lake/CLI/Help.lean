@@ -194,7 +194,8 @@ BUILD SERVICE:          compile Lean modules and their native code on a shared s
   LAKE_REMOTE_EXEC            service endpoint (grpc://host:port or grpcs://host:port), which turns
                               service mode on
   LAKE_REMOTE_EXEC_TOOLCHAIN  sha256:<hex> of the toolchain image (required in service mode)
-  LAKE_REMOTE_EXEC_SYSROOT    Lean sysroot inside the image (default: the local sysroot)
+  LAKE_REMOTE_EXEC_SYSROOT    Lean sysroot inside the image (default: the real path of the local
+                              sysroot)
   LAKE_REMOTE_EXEC_CC         C compiler and linker of the native actions (default: /usr/bin/cc)
   LAKE_REMOTE_EXEC_PATH       PATH of the native actions
                               (default: /theorem/llvm-bin:/usr/local/bin:/usr/bin:/bin)
@@ -203,138 +204,44 @@ BUILD SERVICE:          compile Lean modules and their native code on a shared s
   LAKE_REMOTE_EXEC_INSTANCE   service instance name (default: lean)
   LAKE_REMOTE_EXEC_CLIENT     the `lean-remote` executable (default: lean-remote)
   LAKE_REMOTE_EXEC_SOCKET     daemon socket passed to the bridge
+  LAKE_REMOTE_EXEC_REPO       repository name, sent as `repo` in the `hello` (default: none)
+  LAKE_REMOTE_EXEC_SKIP_CACHE 1 sends `skipCache: true` in the `hello` (default: unset, false)
   LAKE_REMOTE_EXEC_FALLBACK   local (default), wait or fail: what to do when the service does not
-                              answer
-  LAKE_REMOTE_EXEC_LOG        append one JSON line for each module, C object and shared library of
-                              the build (see below)
+                              answer (below)
+  LAKE_REMOTE_EXEC_LOG        append one JSON line for each module, and for each C object and shared
+                              library of a native action whose inputs were built (results below)
   LEAN_REMOTE_CLIENT_LABEL    overrides the client label reported to the service
 
-The service runs the action of each Lean module. Its native actions compile the C file of each
-module to an object (`c.o.export`, `c.o.noexport`) and link the shared library of each module
-(`dynlib`) and of each library (`shared`). They run LAKE_REMOTE_EXEC_CC with LAKE_REMOTE_EXEC_PATH
-as PATH and the headers and libraries of LAKE_REMOTE_EXEC_SYSROOT. Lake starts no compiler of this
-machine for them. Lake writes the outputs of each action into the build directory when the action
-ends. These stay on this machine and write no line: executables, static libraries, `extern_lib`
-targets and other targets with build code of their own, `leanir` (`postponeCompile`), LLVM
-objects (`bc.o`) and the shared libraries that link them, and the shared library of a module or a
-library whose link takes a file that a request cannot carry: an object that is no native artifact
-of the build (a library's `moreLinkObjs`, an LLVM object), or, on Windows, where the link takes its
-libraries as arguments, any library.
-After a promotion (below) changes the .olean of a module with `postponeCompile`, the next build runs
-the module's `leanir` step again. If that step writes other files, the modules that import it go to
-the service again.
+Below, a target is a Lean module, or a C object or shared library of a native action. Lake refuses a
+service that does not verify that its toolchain runs this Lake's Lean, or that it cannot use
+(lean-remote does not run, or the daemon refuses the protocol). Then each target that needs a build
+fails, unless only a re-probe of `local` found the refusal, and a build with such a failure exits
+with code 1. When the service does not answer (its `hello` finds it unreachable, or a request still
+answers UNAVAILABLE after the daemon's own retries), LAKE_REMOTE_EXEC_FALLBACK decides:
+  local   build here, publish nothing; later targets too, until a probe finds the service usable
+  wait    build nothing here; ask again after 1, 2, 4 … 30 s, saying so on standard error
+  fail    fail the target with the code UNAVAILABLE
+Once the service runs another Lean, each later target that needs a build builds here as
+toolchain-mismatch under `local`, and fails under `wait` and `fail`. Under `wait` and `fail`, the
+build exits with code 75 when all its failures are UNAVAILABLE or mismatches. When the first `hello`
+of `lake build` finds the refusal, or the mismatch under `wait` or `fail`, it exits with code 1 or
+75 also with no failure. A compile that failed on the service, OOM, TIMEOUT or DISK_LIMIT is the
+target's result, never a reason to fall back. In service mode nothing is queued for
+LAKE_REMOTE_CACHE.
 
-No file that this machine compiled is an input of an action on the service, except a shared
-library that stays on this machine (above) and the files that `leanir` writes. A module, C object
-or shared library that this machine built (by the fallback, in an earlier build, or with service
-mode off) has no service record. While its trace is up to date, Lake uses it as it is, with the
-result local-cache, under --no-build and while the build does not use the service (it does not
-answer, is refused or runs another Lean). When the build uses the service, the job of such a C
-object or shared library runs its action there and writes the service's file over the local one,
-with the result of that run, before the other jobs take the file. So does the job of such a module
-in a build with LAKE_USAGE_CUTOFF on: a local compile then passes --usage, which writes digests into
-the .olean, and the cutoff keeps or skips outputs, so they are not what the service compiles. This
-holds also for module outputs in the Lake cache with no record: the job compiles the module on the
-service and does not restore them. So does the job of a module whose outputs came from an archive
-(.ltar), which keeps no record, whatever the cutoff: a cached archive, the outputs that an unpack
-in an earlier build in service mode left here (under --no-build or while the build did not use the
-service), and a Lake cache entry that such an unpack wrote. Only an unpack in service mode marks
-outputs that came from an archive, so those of an unpack with LAKE_REMOTE_EXEC unset are like those
-of a tree that an earlier release wrote. Lake uses any other such module as it is. Before an action
-on the service takes an output with no record as an input, Lake runs its own action on the
-service and writes the service's files over the local ones. This promotion writes no line: the
-target keeps its one line. Lake assumes that, with the cutoff off, a local compile of a module
-with the same toolchain gives the service's bytes; if it does not, the modules that import a
-promoted one build again on the service in the next build. A C object or shared library is not
-covered: the service builds it with LAKE_REMOTE_EXEC_CC (see `local` below). The actions of one
-commit have the same digests on two machines when LAKE_REMOTE_EXEC_SYSROOT (unset: the path of the
-local sysroot), LAKE_REMOTE_EXEC_TOOLCHAIN, LAKE_REMOTE_EXEC_CC, LAKE_REMOTE_EXEC_PATH and
-LAKE_REMOTE_EXEC_TIMEOUT are the same on both.
+The `result` of a line of LAKE_REMOTE_EXEC_LOG is cached, executed, local-cache, local,
+toolchain-mismatch, bucket, import-failed, timeout, oom, disk-limit or error.
 
-The service does not answer when its `hello` finds it unreachable, or when a request still answers
-UNAVAILABLE after the daemon's own retries. Then LAKE_REMOTE_EXEC_FALLBACK decides, for a module,
-a C object or a shared library:
-  local   builds it on this machine and publishes nothing. Until the service answers, each later
-          one also builds here at once, with no request. Lake asks the service again 1 s after
-          the failure, then after 2, 4, 8 and 16 s, then every 30 s. Each one that starts after
-          the service answers goes to the service again. Each module, C object and shared
-          library that the build compiled, replayed or linked here while the service did not
-          answer, and that took the hash of an output that a later request promoted, goes to the
-          service in the next build, and `lake build --no-build` exits with code 3 until then.
-          With LAKE_USAGE_CUTOFF off, this happens when the promoted output is a C object or a
-          shared library: LAKE_REMOTE_EXEC_CC on the service can write other bytes than the C
-          compiler of this machine.
-  wait    builds nothing on this machine. Lake asks again after 1, 2, 4 … 30 s and says so on
-          standard error.
-  fail    fails it with the code UNAVAILABLE. The build exits with code 75 when each of its
-          failures is of this kind or a toolchain mismatch (below).
-A compile that failed on the service, OOM, TIMEOUT or DISK_LIMIT is the result of the job, never a
-reason to fall back. In service mode nothing is queued for LAKE_REMOTE_CACHE.
+Unless -q is set, the build ends with `lake: remote: <state>; <c> cached (<m> from manifest),
+<e> executed, <l> local; other actions: …` (C objects and shared libraries). `cached` and
+`executed` count, with the exceptions that README lists, the targets whose action the service
+answered, from its cache or by running it for this build, compiles that failed there included;
+`<m>` is always 0; `local` counts the targets that the fallback built here successfully; `<state>`
+is ok, unreachable, off: <reason>, or idle.
 
-Lake refuses a service that does not verify that its toolchain runs this Lake's Lean: each module
-that needs a build fails with the code toolchain-unverified, and Lake exits with code 1. When the
-service runs another Lean, `local` builds on this machine with the result toolchain-mismatch and
-warns once. `wait` and `fail` fail each module that needs a build with the code
-toolchain-mismatch, and Lake exits with code 75. Lake still runs the build, so that each module
-writes its line.
-
-LAKE_REMOTE_EXEC_TIMEOUT takes a whole number from 1 to 21600, written with the digits 0-9 only. An
-empty value gives the default. Any other value stops Lake with an error before it builds anything.
-Each request carries the value, so it is part of the action digest. A value other than 3600 is
-also part of each trace, so a change of the value makes each module out of date.
-
-Each line of LAKE_REMOTE_EXEC_LOG is a JSON object with all of these fields (null for no value):
-  kind                lean, c or shared
-  target              the module, `<module>:c.o.export`, `<module>:c.o.noexport`,
-                      `<module>:dynlib` or `<package>/<library>:shared`
-  result              see below
-  action              the digest of the service action
-  outputs             the digest of each output, by extension (olean, ilean, c, …, o, so)
-  exitCode            the action's exit code, or 0 for a local build that succeeded
-  terminationSignal   the signal that ended the action (for example KILL)
-  stdoutDigest        the digest of the action's standard output (none for an empty stream)
-  stderrDigest        the digest of the action's standard error (none for an empty stream)
-  code                for the result error only: the cause
-  limits              the sandbox's oomKills, writtenBytes and diskLimitExceeded
-  wallMs              milliseconds from the start of the job's work to the line
-  startMs             the start of the job's work, in milliseconds since the Unix epoch
-The results:
-  executed            the service ran the action for this build (a failed compile has an
-                      exitCode other than 0)
-  cached              the service's cache gave the result of the same action
-  oom, disk-limit     the service answered OOM or DISK_LIMIT, or the action's limits say that the
-                      sandbox killed a process for its memory or that the action filled its disk
-                      (whatever the exit code)
-  timeout             the action ran longer than LAKE_REMOTE_EXEC_TIMEOUT
-  local-cache         Lake found the outputs on this machine and sent no request (action and
-                      outputs give the service's record, or null when no service action made them
-                      or when they came from an archive; in service mode Lake uses those only under
-                      --no-build or while the build does not use the service, and in a build that
-                      uses the service such a module goes to the service, with the result executed
-                      or cached; an unpack with LAKE_REMOTE_EXEC unset leaves no mark, so its
-                      outputs are used as they are)
-  local               the fallback built it on this machine
-  toolchain-mismatch  the fallback built it on this machine, and the service runs another Lean
-  bucket              the fallback restored the module from the LAKE_REMOTE_CACHE service
-  import-failed       a direct import of the module failed (all other fields are null)
-  error               the job failed (see `code`)
-`code` is the service's own code as it sent it (INTERNAL, NOT_FOUND, …), UNAVAILABLE under `fail`,
-toolchain-mismatch or toolchain-unverified (above), or one of these codes of Lake:
-undeclared-output (an output that the action did not declare), materialize (Lake could not write
-the outputs into the build directory or hash them), malformed-result (a `run` result that Lake
-could not read), request (Lake could not make the request, or the promotion of an input failed),
-setup (the module's setup failed for a reason other than an import), no-build (the target needs a
-build and --no-build is set), canceled (--fail-fast stopped the job), source-changed (the source
-changed during the build). These write no line: a bad LAKE_REMOTE_EXEC_TIMEOUT (Lake stops before
-the build), the file that `lake lean` runs (its imports write their lines), and a C object or
-shared library whose input failed (the module's line gives the cause).
-
-The build ends with `lake: remote: <state>; <c> cached (<m> from manifest), <e> executed, <l> local;
-other actions: <c> cached, <e> executed, <l> local`. The first counts are for Lean modules, and the
-other actions are the C objects and shared libraries. `executed` counts every action that the
-service ran for this build, compiles that failed there included. `local` counts what the fallback
-built on this machine. Lake counts no local-cache line and no promotion of an input. `<state>` is
-ok, unreachable, off: <reason>, or idle."
+The section \"Build-Service Mode\" of Lake's README (src/lake/README.md) states the rules: the
+fallback and its re-probe, the end-of-build line, the log's fields and results, promotion, the
+archive mark, the usage cutoff and the native links."
 
 def helpQuery :=
 "Build targets and output results
