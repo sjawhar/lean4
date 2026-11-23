@@ -83,9 +83,10 @@ public structure BuildMetadata where
   -/
   remote? : Option RemoteExec.Record := none
   /--
-  Whether the outputs came from an archive (`.ltar`) that an unpack in service mode restored (`Module.unpackLtar`): an
-  archive keeps no service record, so a service action may have made them. It is kept out of `outputs?` too, and an
-  archive does not keep it.
+  The archive mark (`fromArchive`): `Module.unpackLtar` sets it on the trace that an unpack in service mode writes, and
+  the restores and replays of marked outputs copy it (README, "The Archive Mark", lists them). A usage skip under
+  `--no-build` writes no trace, so an existing trace keeps its mark. An archive keeps no service record. It is kept out
+  of `outputs?` too, and an archive does not keep it.
   -/
   fromArchive : Bool := false
 
@@ -206,7 +207,7 @@ public def SavedTrace.remote? : SavedTrace → Option RemoteExec.Record
 | .ok data => data.remote?
 | _ => none
 
-/-- Whether the saved trace's outputs came from an archive (`BuildMetadata.fromArchive`). -/
+/-- Whether the saved trace has the archive mark (`BuildMetadata.fromArchive`). -/
 public def SavedTrace.fromArchive : SavedTrace → Bool
 | .ok data => data.fromArchive
 | _ => false
@@ -818,7 +819,7 @@ public class ResolveOutputs (α : Type) where
 /--
 Outputs found in the Lake cache (`getArtifacts?`), with the log of the build that produced them, the
 service record of the trace or cache entry that named them (`BuildMetadata.remote?`, `CacheOutput.remote?`),
-whether that trace or entry says that they came from an archive (`BuildMetadata.fromArchive`,
+whether that trace or entry has the archive mark (`BuildMetadata.fromArchive`,
 `CacheOutput.fromArchive`), and whether the shared remote cache's mapping named them (`readRemoteOutputs?`).
 
 **For internal use only.**
