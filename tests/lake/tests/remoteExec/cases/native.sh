@@ -1,8 +1,9 @@
-# The `native` group of test.sh, which sources it: the C compiles and links of service mode (A6), rows N1-N16,
+# The `native` group of test.sh, which sources it: the C compiles and links of service mode (A6), rows N1-N18,
 # where N8 is T7 (the timeout of native actions), so the row is named T7. The package `native/` has a library
 # `Nat0` whose modules are precompiled, so each module has an object (`CCompile`), `Nat0.Use`'s compile loads
 # `Nat0.Tac`'s module library (`LinkShared`) as a plugin, and `Use2`'s compile loads `Nat0`'s library
-# (`LinkSharedLibrary`). N16 builds the package `ext/`, which has an `extern_lib`. Each row builds in a directory of
+# (`LinkSharedLibrary`). N16 builds the package `ext/`, which has an `extern_lib`. N17 and N18 build `native/` with
+# another `nativeLibDir`: `../lib`, outside the build directory, and `./lib`. Each row builds in a directory of
 # its own under $WORK/native, with its own service (FAKE_CAS) and Lake cache, and each build has a fake log and a
 # LAKE_REMOTE_EXEC_LOG of its own. N2, N4 and N5 read N1's tree, N10 and N12 read N10's, and N11 and N13 read N11's:
 # `build_N1`, `build_N10` and `build_N11` build each once, so that each row also runs alone.
@@ -93,6 +94,16 @@ got = [i for p in runs if p.get("target") == t for i in p["inputs"] if i.get("re
 print("%s takes %s; the outputs of the fake there: %s" % (t, json.dumps(got), sorted(outs)))
 sys.exit(0 if got and sorted(got[0]) == ["digest", "executable", "rel"] and got[0]["digest"] in outs else 1)' \
     "$FAKE_LOG" "$FAKE_CAS" "$@"
+}
+# run_rels TARGET NAME: the `rel` of each output and input of TARGET's `run` requests in the fake's log whose file
+# name is NAME, sorted, each once
+run_rels() {
+  "$PYTHON" -c 'import json, sys
+log, t, name = sys.argv[1:4]
+runs = [e["params"] for e in map(json.loads, filter(str.strip, open(log)))
+        if e.get("method") == "run" and e["params"].get("target") == t]
+rels = {o for p in runs for o in p["outputs"]} | {i["rel"] for p in runs for i in p["inputs"]}
+print(" ".join(sorted(r for r in rels if r.rpartition("/")[2] == name)))' "$FAKE_LOG" "$@"
 }
 # own_toolchain DIR: `toolchain DIR`, with the `.olean` files of the test's Lake in DIR/lib/lean in place of the
 # sysroot's, as a release has those of its `bin/lake`: a `lakefile.lean`, which imports Lake, needs them. The sysroot's
@@ -422,4 +433,50 @@ row_N16() (
   test_cmd fake_bytes .lake/build/lib/libext_Ext0.so
 )
 
-run_rows N1 N2 N3 N4 N5 N6 N7 T7 N9 N10 N11 N12 N13 N14 N15 N16
+# N17: with `nativeLibDir = "../lib"`, Nat0's library is outside the build directory and has no path in the input
+# root. `lake build Nat0:shared` links it here with LEAN_CC, a script that logs its arguments and runs the service's C
+# compiler: no request is `LinkSharedLibrary`, the link writes no line, and the end-of-build line counts the objects
+# and module libraries only. Nat0's modules compile on the service. Then `lake build Use2`, whose compile loads that
+# library, sends no request: Use2 fails with the code `request`, and the message names the library's file
+row_N17() (
+  local lines='Nat0.Tac:c.o.export=executed Nat0.Tac:dynlib=executed Nat0.Use:c.o.export=executed'
+  lines="$lines Nat0.Use:dynlib=executed Nat0:c.o.export=executed"
+  enter N17 native; logs N17
+  { echo 'nativeLibDir = "../lib"'; cat "$TEST_DIR/native/lakefile.toml"; } > lakefile.toml
+  mkdir -p "$NW/N17.bin"
+  printf '#!/bin/sh\necho "$*" >> "%s"\nexec "%s" "$@"\n' "$NW/N17.cc.log" "$LAKE_REMOTE_EXEC_CC" > "$NW/N17.bin/cc"
+  chmod +x "$NW/N17.bin/cc"
+  : > "$NW/N17.cc.log"
+  export LEAN_CC="$NW/N17.bin/cc"
+  lake_out build Nat0:shared
+  cp produced.out "$NW/N17.out"
+  test_cmd_eq "${NATIVES% LinkSharedLibrary:native/Nat0:shared}" natives
+  test_cmd_eq "$lines" native_lines "$NW/N17.jsonl"
+  check_lines "$NW/N17.jsonl" --modules Nat0,Nat0.Tac,Nat0.Use \
+    --expect 'Nat0|Nat0.Tac|Nat0.Use:kind=lean,result=executed'
+  match_text "other actions: 0 cached, 5 executed, 0 local" "$NW/N17.out"
+  test_exp -f .lake/lib/libnative_Nat0.so
+  match_text "-shared -o $PWD/.lake/build/../lib/libnative_Nat0.so " "$NW/N17.cc.log"
+  logs N17-use
+  test_err "$PWD/.lake/build/../lib/libnative_Nat0.so has no path in the action's input root" build Use2
+  test_cmd_eq 0 count_method run
+  check_lines "$NW/N17-use.jsonl" --modules "$MODS" --expect 'Use2:kind=lean,result=error,code=request' \
+    --expect 'Nat0|Nat0.Tac|Nat0.Use:kind=lean,result=local-cache,action=digest'
+)
+
+# N18: with `nativeLibDir = "./lib"`, the name of Nat0's library in the input root has no `.` component: the
+# `LinkSharedLibrary` request's output and Use2's input for that file are the same name. Use2's request takes the file
+# by the digest of the service's output, and the file holds the fake's bytes
+row_N18() (
+  local rel=native/native.0/lib/libnative_Nat0.so
+  enter N18 native; logs N18
+  { echo 'nativeLibDir = "./lib"'; cat "$TEST_DIR/native/lakefile.toml"; } > lakefile.toml
+  test_run build Use2 Nat0:shared
+  test_cmd_eq "$NATIVES" natives
+  test_cmd_eq "$rel" run_rels native/Nat0:shared libnative_Nat0.so
+  test_cmd_eq "$rel" run_rels Use2 libnative_Nat0.so
+  test_cmd by_service_digest Use2 native/Nat0:shared
+  test_cmd fake_bytes .lake/build/lib/libnative_Nat0.so
+)
+
+run_rows N1 N2 N3 N4 N5 N6 N7 T7 N9 N10 N11 N12 N13 N14 N15 N16 N17 N18

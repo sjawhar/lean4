@@ -153,8 +153,8 @@ print(" ".join(sorted("%s=%s" % (l.get("target"), l.get("result")) for l in ls i
 # toolchain DIR: DIR becomes a toolchain that holds the test's Lake beside Lean, as a release does: links to the
 # files of `lean --print-prefix`, with a copy of $LAKE as `bin/lake`. Lean loads Lake's own shared library as a
 # plugin wherever it loads a plugin of the workspace, and a request names that library only under the sysroot:
-# the test's Lake has it in tests/lake/.lake/build, so it sends no request that loads a plugin (`plugin … is
-# outside the workspace`). Beside Lean, Lake's library is the sysroot's lib/lean/libLake_shared.so.
+# the test's Lake has it in tests/lake/.lake/build, so it sends no request that loads a plugin (`plugin … has no
+# path in the action's input root`). Beside Lean, Lake's library is the sysroot's lib/lean/libLake_shared.so.
 toolchain() {
   local sysroot f
   sysroot=$(lean --print-prefix)

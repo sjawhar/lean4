@@ -792,13 +792,21 @@ public def remoteIrPath (mod : Module) (ext : String) : String :=
 public def remoteSrcPath (mod : Module) : String :=
   (Lean.modToFilePath "src" mod.name "lean").toString
 
-/-- `p` relative to the directory `dir`, if `p` lies below it. -/
-public def pathBelow? (dir p : FilePath) : Option String :=
-  (p.toString.dropPrefix? (dir.toString ++ "/")).map (·.toString)
+/--
+The rest of `p` below the directory `dir`, in canonical form: its components without the empty ones and `.`, joined
+by `/`. `none` when `p` is not below `dir`, when no component is left, or when a component is `..`, since then `p`
+may leave `dir`.
+-/
+public def pathBelow? (dir p : FilePath) : Option String := do
+  let rest ← p.toString.dropPrefix? (dir.toString ++ "/")
+  let parts := (FilePath.mk rest.toString).components.filter fun c => c != "" && c != "."
+  if parts.isEmpty || parts.contains ".." then none else some (String.intercalate "/" parts)
 
 /--
 The path in the action's input root of `file`, a file of `pkg`'s build (contract C2.1): `lib/<pkg>/…` below the
-package's `leanLibDir`, else `native/<pkg>/…` below its `buildDir`; `none` below neither.
+package's `leanLibDir`, else `native/<pkg>/…` below its `buildDir`, with the empty and `.` components of the rest
+dropped (`pathBelow?`). `none` below neither, and when a `..` component follows the directory: such a file has no path
+in the input root.
 -/
 public def remoteBuildPath (pkg : Package) (file : FilePath) : Option String :=
   match pathBelow? pkg.leanLibDir file with

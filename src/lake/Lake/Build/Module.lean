@@ -1540,9 +1540,12 @@ def Module.writeUnwrittenLine (mod : Module) (line : ModuleLine) (job : Job Modu
 The path part of a module's action (contract C2.1): plugins, dynlibs and `LEAN_PATH`, rewritten to input-root-relative
 form. A plugin or dynlib of the workspace goes in by the digest and executable bit of its output on the service when it
 has one (`nativeServiceOutput`, which first promotes a native artifact of this build that has no service record), so
-that neither its local bytes nor its mode enter the action; any other one of the workspace (an `extern_lib`'s, or one
-that `buildNativeSharedLib` links on this machine) goes in by path.
-A toolchain plugin is found under the local sysroot and named under the remote one.
+that neither its local bytes nor its mode enter the action; any other one of the workspace with a path in the input
+root (an `extern_lib`'s, or one that `buildNativeSharedLib` links on this machine) goes in by path.
+A toolchain plugin is found under the local sysroot and named under the remote one. A plugin or dynlib with no path in
+the input root makes the request fail: one below no package's build directory and not under the sysroot (outside the
+workspace, or under an absolute `nativeLibDir` outside the build directory), or one below a `..` component of a
+package's directory (`remoteBuildPath`).
 -/
 def remoteHead (presetup : ModulePreSetup) (s : RemoteSession) : JobM (Except PromotionError RemoteHead) := do
   let ws ← getWorkspace
@@ -1550,19 +1553,20 @@ def remoteHead (presetup : ModulePreSetup) (s : RemoteSession) : JobM (Except Pr
   let localSysroot := (← getLeanInstall).sysroot
   let localSysrootReal ← (IO.FS.realPath localSysroot).catchExceptions fun _ => pure localSysroot
   -- The file's name in the action, and whether it is the workspace's
-  let classify (p : FilePath) : JobM (String × Bool) := do
+  let classify (isPlugin : Bool) (p : FilePath) : JobM (String × Bool) := do
     for pkg in ws.packages do
       if let some rel := remoteBuildPath pkg p then
         return (rel, true)
     if let some rel := (pathBelow? localSysroot p).orElse fun _ => pathBelow? localSysrootReal p then
       return (s!"{sysrootStr}/{rel}", false)
-    error s!"plugin {p} is outside the workspace"
+    let kind := if isPlugin then "plugin" else "dynlib"
+    error s!"{kind} {p} has no path in the action's input root"
   let mut plugins := #[]
   let mut dynlibs := #[]
   let mut inputFiles := #[]
   let mut digestInputs := #[]
   for (isPlugin, lib) in presetup.plugins.map (true, ·) ++ presetup.dynlibs.map (false, ·) do
-    let (r, inWorkspace) ← classify lib.path
+    let (r, inWorkspace) ← classify isPlugin lib.path
     if isPlugin then plugins := plugins.push r else dynlibs := dynlibs.push r
     if inWorkspace then
       match ← nativeServiceOutput s lib.path with
