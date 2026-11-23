@@ -1264,8 +1264,8 @@ public partial def NativeAction.serviceInputs (act : NativeAction) (s : RemoteSe
     JobM (Except PromotionError NativeRequestInputs) := do
   match act.inputs with
   | .source file rel promote =>
-    -- No check of the C file follows the run, which reads it by path: nothing writes it by then, as the `c` facet
-    -- waits for `irArts`, and a running promotion of the module owns the promise that `promote` waits for
+    -- The run reads the C file by path while nothing writes it: the `c` facet waits for `irArts`, and `promote`
+    -- waits for any running promotion of the module (`promoteOnce`)
     return (← promote s).map fun promoted? => .source ((promoted?.map (·.path)).getD file) rel
   | .objects files _ =>
     let mut objs := #[]

@@ -628,6 +628,7 @@ These targets stay on this machine, as outside service mode, and write no line t
 * objects of the LLVM backend (`bc.o`), and the shared libraries that link them
 * `leanir`, the separate code generation of a module with `postponeCompile`
 * the shared library of a module or a library whose link takes a file that a request cannot carry: an object that is no native artifact of the build (a library's `moreLinkObjs`, an LLVM object), or, on Windows, where the link takes its libraries as arguments, any library
+* the shared library of a library whose file has no path in the input root: one that the package's `nativeLibDir` puts outside its build directory
 
 After a promotion (see [Inputs of Service Actions](#inputs-of-service-actions)) changes the `.olean` of a module with `postponeCompile`, the next build runs the module's `leanir` step again. If that step writes other files, the modules that import it go to the service again.
 
