@@ -31,9 +31,11 @@ export LAKE_REMOTE_EXEC_CLIENT="$HERE/../remoteExec/fake_lean_remote.py"
 export LAKE_REMOTE_EXEC_TOOLCHAIN=sha256:0000000000000000000000000000000000000000000000000000000000000001
 export LAKE_REMOTE_EXEC_SYSROOT="$(lean --print-prefix)" FAKE_CAS="$W/cas"
 
-# Force the trace-based cache path, whose trace omits the usage sidecar descriptors.
+# Force the trace-based cache path, whose trace omits the usage sidecar descriptors. The service does not answer: with
+# the usage cutoff on, local outputs (compiled with --usage, kept or skipped) are not what the service compiles, so an
+# answering service would get T.M in its own job and change T.D's input; here only a restore builds the tree.
 rm "$B/D.olean"
-LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=false FAKE_LOG="$W/writable.log" \
+LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=false FAKE_UNREACHABLE=1 FAKE_LOG="$W/writable.log" \
   test_out '0 cached (0 from manifest), 0 executed, 0 local;' -d "$W/seed" build T.D
 python3 - "$W/mapping-before.json" "$MAP" <<'PY'
 import json, sys
@@ -41,8 +43,9 @@ before, after = [json.load(open(path))['data'] for path in sys.argv[1:]]
 assert {key: after.get(key) for key in ('u', 'v', 'k')} == {key: before[key] for key in ('u', 'v', 'k')}, (before, after)
 PY
 
-# A read-only cache restores all artifacts to the tree even when restoreAllArtifacts is false.
-env -u LAKE_ARTIFACT_CACHE LAKE_RESTORE_ARTIFACTS=false FAKE_LOG="$W/readonly.log" \
+# A read-only cache restores all artifacts to the tree even when restoreAllArtifacts is false. The service does not
+# answer: an answering service would get T.M under the cutoff rule above, so the step would not reach the restore.
+env -u LAKE_ARTIFACT_CACHE LAKE_RESTORE_ARTIFACTS=false FAKE_UNREACHABLE=1 FAKE_LOG="$W/readonly.log" \
   "$LAKE" -d "$W/readonly" build T.D > "$W/readonly.out" 2>&1
 cat "$W/readonly.out"
 match_text '0 cached (0 from manifest), 0 executed, 0 local;' "$W/readonly.out"

@@ -167,16 +167,35 @@ public def noteRemoteRead
   if let some msg := notice? then
     logVerbose msg
 
+/-- The task of the last probe read this process started (`probeRemoteRead`). -/
+builtin_initialize remoteReadProbeTask : IO.Ref (Option (Task Unit)) ← IO.mkRef none
+
+/--
+The longest one try of a probe read takes, in milliseconds: the read broker stops a `curl` run
+`transferMaxSecs` of its largest body (a mapping's, `remoteMappingMaxFileSize`) and 10 s more after
+the run starts (`ReadBroker.runCurl`).
+-/
+def remoteReadProbeTryMs : Nat := (transferMaxSecs remoteMappingMaxFileSize + 10) * 1000
+
+/--
+Waits for the probe read in flight (`probeRemoteRead`), if any, for at most one try
+(`remoteReadProbeTryMs`), as the runtime does when `main` returns: an exit that cuts the probe leaves
+its `curl` run's config file, which can hold the cache token, in the temporary directory.
+-/
+public def awaitRemoteReadProbe : BaseIO Unit := do
+  if let some t ← remoteReadProbeTask.get then
+    discard <| waitUntil t ((← IO.monoMsNow) + remoteReadProbeTryMs)
+
 /--
 While this build has stopped reading the shared remote cache, sends a probe read of `url` (the
 mapping of a read that the stop skipped) if no probe is in flight and `remoteReadProbeSecs` have
 passed since the stop or since the last probe started. The probe goes on in the background: the
 job that skipped its read compiles its target and does not wait for it, so a remote that does not
 answer costs no target any time; only a probe still in flight when the build ends holds Lake's
-exit, for at most one try (a probe is not tried again: the next probe is its retry). Its body is
-not used. It counts toward the stop as any read does (see `noteRemoteRead`), so a probe that gets
-an answer resumes the reads; the next read of the build, or the end of the build, logs what it
-did (see `remoteReadsStopped`).
+exit, for at most one try (a probe is not tried again: the next probe is its retry), also when Lake
+ends the process itself (`awaitRemoteReadProbe`). Its body is not used. It counts toward the stop as
+any read does (see `noteRemoteRead`), so a probe that gets an answer resumes the reads; the next read
+of the build, or the end of the build, logs what it did (see `remoteReadsStopped`).
 -/
 def probeRemoteRead (url : String) (tmpDir : FilePath) (cacheToken : Bool) : JobM Unit := do
   let status := (← getBuildContext).remoteReadStatus
@@ -199,7 +218,8 @@ def probeRemoteRead (url : String) (tmpDir : FilePath) (cacheToken : Bool) : Job
       let (s, notice?) := s.noteRead m body?.isNone sentAt now (probe := true)
       let s := {s with probing := false}
       notice?.elim s fun msg => {s with notices := s.notices.push msg}
-  discard <| liftM (m := BaseIO) <| BaseIO.asTask probe (prio := .dedicated)
+  let task ← liftM (m := BaseIO) <| BaseIO.asTask probe (prio := .dedicated)
+  liftM (m := BaseIO) <| remoteReadProbeTask.set (some task)
 
 /--
 Runs `read`, a read of the shared remote cache, with a `ReadBroker.Meter` of its sends, which it

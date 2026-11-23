@@ -3,12 +3,20 @@ source ../common.sh
 ./clean.sh
 # Service mode against the fake daemon (fake_lean_remote.py), which runs each action locally in a
 # scratch input root. Each case builds in its own directory, so the absolute paths differ.
+#
+# The cases are in groups: `base` (below) and `cases/<group>.sh` for each other group, whose rows are
+# its functions `row_<name>`. REMOTE_EXEC_CASES (space- or comma-separated; default: every group)
+# selects groups, and REMOTE_EXEC_ROWS (comma-separated row names, e.g. `L1,L3`; default: every row)
+# selects rows of a group. Each group runs in a subshell of its own, stops at its first failure and
+# prints `group <name>: pass` or `group <name>: fail at <file>:<line>`; the test fails when a group did.
 PYTHON="${PYTHON:-python3}"
 TEST_DIR="$(norm_path "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)")"
 WORK="$TEST_DIR/work"; mkdir -p "$WORK"
 
-# The fake itself first, so that the cases below test Lake and not the fake.
+# The fake and the checkers first, so that the cases below test Lake and not them.
 test_cmd bash "$TEST_DIR/fake_selftest.sh"
+test_cmd "$PYTHON" "$TEST_DIR/lines_check.py" --self-test
+test_cmd "$PYTHON" "$TEST_DIR/probe_check.py" --self-test
 
 for d in local remote remote2 failed timeout unreach later later-local later2 wrongtc killed termed termed-write stuck \
     late late-ref fb-local fb-mixed fb-unavail fb-mat fb-mat-nf fb-seed fb-restore fb-wait fb-wait-mid \
@@ -23,6 +31,13 @@ export LAKE_CACHE_DIR="$WORK/lake-cache"
 count_method() {
   "$PYTHON" -c 'import json,os,sys
 p=sys.argv[2]; print(0 if not os.path.exists(p) else sum(1 for l in open(p) if l.strip() and json.loads(l).get("method")==sys.argv[1]))' "$1" "$FAKE_LOG"
+}
+# run_targets SKIP: the sorted targets of the `run` requests after line SKIP of the fake's log, each once
+run_targets() {
+  "$PYTHON" -c 'import json,os,sys
+p=sys.argv[1]; ls=open(p).read().splitlines()[int(sys.argv[2]):] if os.path.exists(p) else []
+print(" ".join(sorted({e["params"]["target"] for e in map(json.loads, filter(str.strip, ls)) if e.get("method")=="run"})))' \
+    "$FAKE_LOG" "$1"
 }
 # same_outputs DIR: every output of DIR is byte-identical to the local build's
 same_outputs() {
@@ -69,9 +84,9 @@ seconds_since() { "$PYTHON" -c 'import sys, time; print(round(time.time() - floa
 in_range() { "$PYTHON" -c 'import sys; x, lo, hi = map(float, sys.argv[1:]); sys.exit(0 if lo <= x < hi else 1)' "$@"; }
 # dead PID: PID is no longer running
 dead() { ! kill -0 "$1" 2> /dev/null; }
-# wait_dead PID: wait up to 120 s until PID is no longer running
+# wait_dead PID [S]: wait up to S s (default 120) until PID is no longer running
 wait_dead() {
-  for _ in $(seq 1 1200); do
+  for _ in $(seq 1 $((${2:-120} * 10))); do
     dead "$1" && return 0
     sleep 0.1
   done
@@ -93,22 +108,15 @@ results() {
 c=collections.Counter(json.loads(l)["result"] for l in open(sys.argv[1]) if l.strip())
 print(" ".join(f"{k} {c[k]}" for k in sorted(c)))' "$1"
 }
-# local_targets FILE: the sorted targets of the `local` lines of a LAKE_REMOTE_EXEC_LOG file; each line names
-# no action and no output, and has the compile's own wall time
-local_targets() {
-  "$PYTHON" -c 'import json,sys
-ls=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
-ls=[l for l in ls if l["result"]=="local"]
-assert all(l["kind"]=="lean" and l["action"]=="" and l["outputs"]=={} and l["exitCode"]==0 and l["wallMs"]>0 for l in ls), ls
-print(" ".join(sorted(l["target"] for l in ls)))' "$1"
-}
+# check_lines LOG ARGS...: lines_check.py's checks of a LAKE_REMOTE_EXEC_LOG file (see its docstring)
+check_lines() { test_cmd "$PYTHON" "$TEST_DIR/lines_check.py" "$@"; }
 # log_lines: how many lines the fake's log has
 log_lines() { if [ -f "$FAKE_LOG" ]; then wc -l < "$FAKE_LOG"; else echo 0; fi; }
 # wait_down SKIP N: wait up to 120 s until N hello answers after line SKIP of the fake's log said unreachable
 wait_down() {
   for _ in $(seq 1 1200); do
-    [ "$("$PYTHON" -c 'import json,sys
-ls=open(sys.argv[1]).read().splitlines()[int(sys.argv[2]):]
+    [ "$("$PYTHON" -c 'import json,os,sys
+p=sys.argv[1]; ls=open(p).read().splitlines()[int(sys.argv[2]):] if os.path.exists(p) else []
 print(sum(1 for l in ls if l.strip() and json.loads(l).get("answer")=="hello" and not json.loads(l)["reachable"]))' \
       "$FAKE_LOG" "$1")" -ge "$2" ] && return 0
     sleep 0.1
@@ -116,6 +124,48 @@ print(sum(1 for l in ls if l.strip() and json.loads(l).get("answer")=="hello" an
   return 1
 }
 
+# The helpers below are the case files': the rows of a group work in its directory GW, $WORK/<group>.
+# enter NAME [PKG]: a fresh copy of the test package (or of $TEST_DIR/PKG) in $GW/NAME, made the working directory,
+# with the new Lake cache $GW/NAME.cache and the new service $GW/NAME.cas (GROUP_CAS, if the group has one service)
+enter() {
+  rm -rf "$GW/$1" "$GW/$1.cas" "$GW/$1.cache"; mkdir -p "$GW/$1"
+  if [ -n "${2:-}" ]; then
+    cp -r "$TEST_DIR/$2/." "$GW/$1/"
+  else
+    cp -r "$TEST_DIR/lakefile.toml" "$TEST_DIR/Rx.lean" "$TEST_DIR/Rx" "$GW/$1/"
+  fi
+  chmod -R u+w "$GW/$1"
+  cd "$GW/$1"
+  export LAKE_CACHE_DIR="$GW/$1.cache" FAKE_CAS="${GROUP_CAS:-$GW/$1.cas}"
+}
+# logs NAME: the next builds log to the new files $GW/NAME.fake.log (the fake's) and $GW/NAME.jsonl (Lake's lines)
+logs() {
+  export FAKE_LOG="$GW/$1.fake.log" LAKE_REMOTE_EXEC_LOG="$GW/$1.jsonl"
+  rm -f "$FAKE_LOG" "$FAKE_LOG.actions" "$LAKE_REMOTE_EXEC_LOG"
+}
+# native_lines LOG: the lines of LAKE_REMOTE_EXEC_LOG file LOG whose kind is not `lean`, each `TARGET=RESULT`, sorted
+native_lines() {
+  "$PYTHON" -c 'import json, os, sys
+p = sys.argv[1]
+ls = [json.loads(l) for l in open(p) if l.strip()] if os.path.exists(p) else []
+print(" ".join(sorted("%s=%s" % (l.get("target"), l.get("result")) for l in ls if l.get("kind") != "lean")))' "$1"
+}
+# toolchain DIR: DIR becomes a toolchain that holds the test's Lake beside Lean, as a release does: links to the
+# files of `lean --print-prefix`, with a copy of $LAKE as `bin/lake`. Lean loads Lake's own shared library as a
+# plugin wherever it loads a plugin of the workspace, and a request names that library only under the sysroot:
+# the test's Lake has it in tests/lake/.lake/build, so it sends no request that loads a plugin (`plugin … is
+# outside the workspace`). Beside Lean, Lake's library is the sysroot's lib/lean/libLake_shared.so.
+toolchain() {
+  local sysroot f
+  sysroot=$(lean --print-prefix)
+  rm -rf "$1"; mkdir -p "$1/bin"
+  for f in "$sysroot"/*; do [ "${f##*/}" = bin ] || ln -s "$f" "$1/"; done
+  for f in "$sysroot"/bin/*; do [ "${f##*/}" = lake ] || ln -s "$f" "$1/bin/"; done
+  f=$(command -v "$LAKE")
+  ln "$f" "$1/bin/lake" 2> /dev/null || cp "$f" "$1/bin/lake"
+}
+
+group_base() {
 (cd "$WORK/local" && test_run build Rx)
 
 # Every module is an action on the service, and its outputs are those of a local compile.
@@ -137,6 +187,7 @@ hellos=$(count_method hello)
 match_text "c says hi" "$WORK/remote2/produced.out"
 test_cmd same_actions
 test_cmd same_outputs "$WORK/remote2"
+# The decision's bridge and the build's: the service answers throughout, so no timer starts
 test_cmd_eq 2 echo "$(($(count_method hello) - hellos))"
 test_cmd_eq 1 grep -cxF "\"end of input $(cat "$WORK/remote2.pid")\"" "$WORK/exits.log"
 
@@ -173,11 +224,17 @@ no_match_text "no such file or directory" "$WORK/failed/produced.out"
 test_exp ! -e "$WORK/failed/.lake/build/lib/lean/Rx/B.olean"
 test_exp ! -e "$WORK/failed/.lake/build/lib/lean/Rx/B.trace"
 
-# An action that ran on the service and ended in TIMEOUT, OOM or DISK_LIMIT counts as executed too.
-for var in FAKE_TIMEOUT_TARGET FAKE_OOM_TARGET FAKE_DISK_TARGET; do
+# An action that ran on the service and ended in TIMEOUT counts as executed too.
+rm -rf "$WORK/timeout/.lake"
+(cd "$WORK/timeout" && FAKE_TIMEOUT_TARGET=Rx.B LAKE_REMOTE_EXEC=grpc://fake:1 \
+  test_err "the build service's run of Rx.B failed" build Rx)
+match_text "lake: remote: ok; 2 cached (0 from manifest), 1 executed, 0 local;" "$WORK/timeout/produced.out"
+# So does one that the service killed for its memory or its disk: a result with exit code -1 and no
+# outputs, which fails the module as a failed compile does.
+for var in FAKE_OOM_TARGET FAKE_DISK_TARGET; do
   rm -rf "$WORK/timeout/.lake"
   (cd "$WORK/timeout" && export "$var=Rx.B" && LAKE_REMOTE_EXEC=grpc://fake:1 \
-    test_err "the build service's run of Rx.B failed" build Rx)
+    test_err "Lean exited with code 255" build Rx)
   match_text "lake: remote: ok; 2 cached (0 from manifest), 1 executed, 0 local;" "$WORK/timeout/produced.out"
 done
 
@@ -248,7 +305,8 @@ match_text "lake: remote: unreachable; 0 cached (0 from manifest), 0 executed, 0
 
 # The default fallback (`local`): a service that does not answer fails no build. Every module compiles on
 # this machine and counts as `local`, no `run` is sent, the outputs are those of a local build, and the
-# per-target log has one `local` line for each. The same tree again is up to date: nothing compiles.
+# per-target log has one `local` line for each. The same tree again is up to date: nothing compiles, and
+# each module adds a `local-cache` line.
 runs=$(count_method run)
 (cd "$WORK/fb-local" && FAKE_UNREACHABLE=1 LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_REMOTE_EXEC_LOG="$WORK/fb-local.jsonl" \
   test_out "lake: remote: unreachable; 0 cached (0 from manifest), 0 executed, 5 local;" build Rx)
@@ -256,10 +314,11 @@ match_text "c says hi" "$WORK/fb-local/produced.out"
 test_cmd_eq "$runs" count_method run
 test_cmd same_outputs "$WORK/fb-local"
 test_cmd_eq "local 5" results "$WORK/fb-local.jsonl"
-test_cmd_eq "Rx Rx.A Rx.B Rx.C Rx.M" local_targets "$WORK/fb-local.jsonl"
+check_lines "$WORK/fb-local.jsonl" --modules Rx,Rx.A,Rx.B,Rx.C,Rx.M \
+  --expect '*:kind=lean,result=local,action=null,outputs=null,exitCode=0,wallMs>0'
 (cd "$WORK/fb-local" && FAKE_UNREACHABLE=1 LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_REMOTE_EXEC_LOG="$WORK/fb-local.jsonl" \
   test_out "lake: remote: unreachable; 0 cached (0 from manifest), 0 executed, 0 local;" build Rx)
-test_cmd_eq "local 5" results "$WORK/fb-local.jsonl"
+test_cmd_eq "local 5 local-cache 5" results "$WORK/fb-local.jsonl"
 
 # With `fail`, a build whose failures are not all the service's exits with code 1, not 75: Rx.M does not
 # compile (a result, sent before the service stopped answering), and Rx.B's run answers UNAVAILABLE.
@@ -269,50 +328,66 @@ printf 'module\n\n/-! A module that does not compile. -/\n\npublic def m : Nat :
 match_text "the build service's run of Rx.B failed" "$WORK/fb-mixed/produced.out"
 
 # A request that answers UNAVAILABLE mid-build (after the daemon's own retries): with the default fallback,
-# Rx.B compiles locally, and so do the modules after it, without a request: the service is not asked again
-# in this build. Rx.A and Rx.M came from the service's cache before.
-runs=$(count_method run)
+# Rx.B compiles locally. The timer then asks the service again and the fake answers, so a module that starts
+# after that answer goes to the service again; but Rx.C and Rx import Rx.B, whose promotion (its own run on the
+# service) answers UNAVAILABLE again, so they compile locally too and send no run of their own. The end-of-build
+# line says `ok` if a probe found the service after the last UNAVAILABLE answer, else `unreachable`, as timing
+# decides. Rx.A and Rx.M came from the service's cache before.
+skip=$(log_lines)
 (cd "$WORK/fb-unavail" && FAKE_UNAVAILABLE_TARGET=Rx.B LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_REMOTE_EXEC_LOG="$WORK/fb-unavail.jsonl" \
-  test_out "lake: remote: unreachable; 2 cached (0 from manifest), 0 executed, 3 local;" build Rx)
-test_cmd_eq "$((runs + 3))" count_method run
+  test_out_pat "lake: remote: (ok|unreachable); 2 cached \(0 from manifest\), 0 executed, 3 local;" build Rx)
+test_cmd_eq "Rx.A Rx.B Rx.M" run_targets "$skip"
 test_cmd same_outputs "$WORK/fb-unavail"
 test_cmd_eq "cached 2 local 3" results "$WORK/fb-unavail.jsonl"
-test_cmd_eq "Rx Rx.B Rx.C" local_targets "$WORK/fb-unavail.jsonl"
+check_lines "$WORK/fb-unavail.jsonl" --modules Rx,Rx.A,Rx.B,Rx.C,Rx.M \
+  --expect 'Rx|Rx.B|Rx.C:kind=lean,result=local,action=null,outputs=null,exitCode=0,wallMs>0'
 
 # A materialize that answers UNAVAILABLE after a good run: the module compiles locally and counts once, as
-# `local`; the remote run's messages, already replayed, are dropped, so Rx.C's message shows once.
+# `local`; the remote run's messages, already replayed, are dropped, so Rx.C's message shows once. The timer
+# then asks the service again and the fake answers, so Rx may go to the service: Rx.C, compiled locally, is
+# promoted first, and that promotion's materialize answers UNAVAILABLE again, so Rx compiles locally too (a
+# promotion shows none of Rx.C's messages). The end-of-build line's state is as in `fb-unavail`.
 (cd "$WORK/fb-mat" && FAKE_MATERIALIZE_FAIL=UNAVAILABLE:/Rx/C.olean LAKE_REMOTE_EXEC=grpc://fake:1 \
   LAKE_REMOTE_EXEC_LOG="$WORK/fb-mat.jsonl" \
-  test_out "lake: remote: unreachable; 3 cached (0 from manifest), 0 executed, 2 local;" build Rx)
+  test_out_pat "lake: remote: (ok|unreachable); 3 cached \(0 from manifest\), 0 executed, 2 local;" build Rx)
 test_cmd_eq 1 grep -c "c says hi" "$WORK/fb-mat/produced.out"
 test_cmd same_outputs "$WORK/fb-mat"
-test_cmd_eq "Rx Rx.C" local_targets "$WORK/fb-mat.jsonl"
+check_lines "$WORK/fb-mat.jsonl" --modules Rx,Rx.A,Rx.B,Rx.C,Rx.M \
+  --expect 'Rx|Rx.C:kind=lean,result=local,action=null,outputs=null,exitCode=0,wallMs>0' \
+  --expect 'Rx.A|Rx.B|Rx.M:result!=local'
 
-# Any other materialize failure is not a fallback: the build fails, and the run still counts as cached.
+# Any other materialize failure is not a fallback: the build fails, and the module's one line is `error`
+# with code `materialize`.
 (cd "$WORK/fb-mat-nf" && FAKE_MATERIALIZE_FAIL=NOT_FOUND:/Rx/B.olean LAKE_REMOTE_EXEC=grpc://fake:1 \
+  LAKE_REMOTE_EXEC_LOG="$WORK/fb-mat-nf.jsonl" \
   test_status_out 1 "materializing Rx.B from the build service failed" build Rx)
-match_text "lake: remote: ok; 3 cached (0 from manifest), 0 executed, 0 local;" "$WORK/fb-mat-nf/produced.out"
+check_lines "$WORK/fb-mat-nf.jsonl" --modules Rx,Rx.A,Rx.B,Rx.C,Rx.M \
+  --expect 'Rx.B:result=error,code=materialize'
 
 # `local` counts compiles only: a fresh tree whose fallback finds its modules in the Lake cache restores them,
-# replays the saved log of each (here Rx.C's message), and records `0 local`. With `LAKE_RESTORE_ARTIFACTS=false`
+# replays the saved log of each (here Rx.C's message), records `0 local`, and writes a `local-cache` line for
+# each, with no service record (a local build wrote the cache). With `LAKE_RESTORE_ARTIFACTS=false`
 # (Lake's default), a restore leaves each `.olean` in the cache, and Lake gives a reader the cache's file.
 (cd "$WORK/fb-seed" && LAKE_CACHE_DIR="$WORK/fb-cache" LAKE_ARTIFACT_CACHE=true test_run build Rx)
 (cd "$WORK/fb-restore" && LAKE_CACHE_DIR="$WORK/fb-cache" LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=false \
   FAKE_UNREACHABLE=1 LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_REMOTE_EXEC_LOG="$WORK/fb-restore.jsonl" \
   test_out "lake: remote: unreachable; 0 cached (0 from manifest), 0 executed, 0 local;" build Rx)
 match_text "Replayed Rx.C" "$WORK/fb-restore/produced.out"
-test_exp ! -s "$WORK/fb-restore.jsonl"
+check_lines "$WORK/fb-restore.jsonl" --modules Rx,Rx.A,Rx.B,Rx.C,Rx.M \
+  --expect '*:result=local-cache,action=null,outputs=null'
 # Rx.D, which the cache does not hold, imports Rx, so its compile needs `Rx.olean`. With the service still down,
 # Rx is restored (`Reused`: taken from the cache again, through the trace the restore wrote), not compiled: Rx.D
-# is the one local compile, and the per-target log has its line only, none for Rx.
+# is the one local compile, and the per-target log has its `local` line and a `local-cache` line for each module
+# it imports.
 printf 'import Rx\n\n/-! A module that imports the library root, so its compile needs `Rx.olean`. -/\n\ndef d := c + m\n' \
   > "$WORK/fb-restore/Rx/D.lean"
 (cd "$WORK/fb-restore" && LAKE_CACHE_DIR="$WORK/fb-cache" LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=false \
   FAKE_UNREACHABLE=1 LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_REMOTE_EXEC_LOG="$WORK/fb-consume.jsonl" \
   test_out_pat "Reused Rx( |$)" -v build Rx.D)
 match_text "lake: remote: unreachable; 0 cached (0 from manifest), 0 executed, 1 local;" "$WORK/fb-restore/produced.out"
-test_cmd_eq "local 1" results "$WORK/fb-consume.jsonl"
-test_cmd_eq "Rx.D" local_targets "$WORK/fb-consume.jsonl"
+test_cmd_eq "local 1 local-cache 5" results "$WORK/fb-consume.jsonl"
+check_lines "$WORK/fb-consume.jsonl" --modules Rx,Rx.A,Rx.B,Rx.C,Rx.M,Rx.D \
+  --expect 'Rx.D:kind=lean,result=local,action=null,outputs=null,exitCode=0,wallMs>0'
 # The `Rx.olean` that Lake gives Rx's readers has the bytes of the one a local build makes, and it is the cache's
 # file: the tree has none.
 rx_olean=$(cd "$WORK/fb-restore" && LAKE_CACHE_DIR="$WORK/fb-cache" LAKE_ARTIFACT_CACHE=true \
@@ -322,8 +397,8 @@ test_exp "${rx_olean#"$WORK/fb-cache/artifacts/"}" != "$rx_olean"
 test_exp ! -e "$WORK/fb-restore/.lake/build/lib/lean/Rx.olean"
 
 # The Lake cache comes first in service mode too, as in a local build: a fresh tree whose modules the cache holds
-# restores each of them with no request, replays its saved log (Rx.C's message), counts nothing, writes no line to
-# LAKE_REMOTE_EXEC_LOG, and has the outputs of a local build.
+# restores each of them with no request, replays its saved log (Rx.C's message), counts nothing, writes a
+# `local-cache` line with no service record for each to LAKE_REMOTE_EXEC_LOG, and has the outputs of a local build.
 (cd "$WORK/cf-seed" && LAKE_CACHE_DIR="$WORK/cf-cache" LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true \
   test_run build Rx)
 runs=$(count_method run)
@@ -333,7 +408,8 @@ runs=$(count_method run)
 match_text "c says hi" "$WORK/cf-restore/produced.out"
 test_cmd_eq "$runs" count_method run
 test_cmd same_outputs "$WORK/cf-restore"
-test_exp ! -s "$WORK/cf-restore.jsonl"
+check_lines "$WORK/cf-restore.jsonl" --modules Rx,Rx.A,Rx.B,Rx.C,Rx.M \
+  --expect '*:result=local-cache,action=null,outputs=null'
 # The outputs that the service gives a build go to the Lake cache, as a local compile's do: another fresh tree on
 # that cache restores every module with no request, and so does the first tree for an output it lost.
 (cd "$WORK/cf-svc" && LAKE_CACHE_DIR="$WORK/cf-cache2" LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true \
@@ -356,7 +432,7 @@ rm -f "$WORK/down" "$WORK/down.tripped"; touch "$WORK/down"
 skip=$(log_lines)
 (cd "$WORK/fb-wait" && FAKE_DOWN_FILE="$WORK/down" LAKE_REMOTE_EXEC_FALLBACK=wait LAKE_REMOTE_EXEC=grpc://fake:1 \
   "$LAKE" build Rx > "$WORK/fb-wait.out" 2>&1) & wait_pid=$!
-wait_down "$skip" 4 || { kill "$wait_pid" 2> /dev/null; cat "$WORK/fb-wait.out"; exit 1; }
+wait_down "$skip" 4 || { kill "$wait_pid" 2> /dev/null; cat "$WORK/fb-wait.out"; false; }
 rm -f "$WORK/down"
 rc=0; wait "$wait_pid" || rc=$?
 cat "$WORK/fb-wait.out"
@@ -372,7 +448,7 @@ rm -f "$WORK/down" "$WORK/down.tripped"
 skip=$(log_lines)
 (cd "$WORK/fb-wait-mid" && FAKE_DOWN_FILE="$WORK/down" FAKE_DOWN_AT_TARGET=Rx.B LAKE_REMOTE_EXEC_FALLBACK=wait \
   LAKE_REMOTE_EXEC=grpc://fake:1 "$LAKE" build Rx > "$WORK/fb-wait-mid.out" 2>&1) & wait_pid=$!
-wait_down "$skip" 2 || { kill "$wait_pid" 2> /dev/null; cat "$WORK/fb-wait-mid.out"; exit 1; }
+wait_down "$skip" 2 || { kill "$wait_pid" 2> /dev/null; cat "$WORK/fb-wait-mid.out"; false; }
 rm -f "$WORK/down"
 rc=0; wait "$wait_pid" || rc=$?
 cat "$WORK/fb-wait-mid.out"
@@ -507,7 +583,7 @@ test_exp ! -e "$WORK/wrongtc/.lake/build/lib/lean/Rx/A.olean"
   test_cmd in_range "$took" 9.5 inf
   test_cmd dead "$(cat "$WORK/stuck.pid")"
   test_exp ! -e "$WORK/stuck.exits"
-  # The decision's bridge and the build's
+  # The decision's bridge and the build's: the service answers throughout, so no timer starts
   test_cmd_eq 2 echo "$(($(count_method hello) - hellos))"
   hellos=$(count_method hello)
   start=$("$PYTHON" -c 'import time; print(time.time())')
@@ -516,7 +592,7 @@ test_exp ! -e "$WORK/wrongtc/.lake/build/lib/lean/Rx/A.olean"
   echo "an up-to-date build whose bridge ignores end of input took $(seconds_since "$start") s"
   test_cmd dead "$(cat "$WORK/stuck.pid")"
   test_exp ! -e "$WORK/stuck.exits"
-  # The decision's bridge only
+  # The decision's bridge only: the service answers, so no timer starts
   test_cmd_eq 1 echo "$(($(count_method hello) - hellos))"
 )
 
@@ -582,3 +658,58 @@ printf '#!/bin/sh\necho start >> "$DEAD_LOG"\nsleep 1\nexit 75\n' > "$WORK/dead-
 (cd "$WORK/unreach" && rm -rf .lake && DEAD_LOG="$WORK/dead.log" LAKE_REMOTE_EXEC_CLIENT="$WORK/dead-bridge" \
   LAKE_REMOTE_EXEC_FALLBACK=fail LAKE_REMOTE_EXEC=grpc://fake:1 test_status_out 75 "did not answer" lean Rx.lean)
 test_cmd_eq 1 grep -c start "$WORK/dead.log"
+}
+
+# on_err: notes where a group failed, once: the innermost line of the call stack that is in case code (a
+# group, a row, a row's shared setup `build_*`, or a file's top level), not in a helper
+on_err() {
+  local i f
+  [ -s "$GROUP_FAIL" ] && return 0
+  for ((i = 1; i < ${#FUNCNAME[@]}; i++)); do
+    case ${FUNCNAME[i]} in group_*|row_*|build_*|source|main) ;; *) continue ;; esac
+    f=${BASH_SOURCE[i]#"$TEST_DIR/"}
+    echo "${f#./}:${BASH_LINENO[i-1]}" > "$GROUP_FAIL"
+    return 0
+  done
+}
+# run_rows ROW...: runs `row_<ROW>` for each ROW that REMOTE_EXEC_ROWS selects, in the order given
+run_rows() {
+  local r sel=${REMOTE_EXEC_ROWS:-}
+  for r in "$@"; do
+    case ",${sel// /,}," in ,,|*",$r,"*) ;; *) continue ;; esac
+    echo "# row $r"
+    "row_$r"
+  done
+}
+
+ALL_GROUPS="base lines timeout probe native digests"
+selected=${REMOTE_EXEC_CASES:-$ALL_GROUPS}
+failed=0
+for g in ${selected//,/ }; do
+  file="cases/$g.sh"; [ "$g" != base ] || file=test.sh
+  case " $ALL_GROUPS " in *" $g "*) ;; *) echo "group $g: unknown"; failed=1; continue ;; esac
+  if [ ! -f "$TEST_DIR/$file" ]; then
+    echo "group $g: missing"
+    failed=1
+    continue
+  fi
+  echo "# group $g"
+  GROUP_FAIL="$WORK/$g.fail"; rm -f "$GROUP_FAIL"
+  # The group's own errexit: a group run as the condition of `if` or `||` would ignore it
+  set +e
+  (
+    set -eE
+    trap on_err ERR
+    if [ "$g" = base ]; then group_base; else GW="$WORK/$g"; mkdir -p "$GW"; source "$TEST_DIR/$file"; fi
+  )
+  rc=$?
+  set -e
+  if [ "$rc" = 0 ]; then
+    echo "group $g: pass"
+  else
+    where=$(cat "$GROUP_FAIL" 2> /dev/null || true)
+    echo "group $g: fail at ${where:-$file:?}"
+    failed=1
+  fi
+done
+exit "$failed"

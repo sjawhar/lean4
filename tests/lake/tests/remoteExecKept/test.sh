@@ -29,18 +29,20 @@ export LAKE_REMOTE_EXEC_CLIENT="$HERE/../remoteExec/fake_lean_remote.py"
 export LAKE_REMOTE_EXEC_TOOLCHAIN=sha256:0000000000000000000000000000000000000000000000000000000000000001
 export LAKE_REMOTE_EXEC_SYSROOT="$(lean --print-prefix)" FAKE_CAS="$W/cas"
 failures=0
-# A service-mode replay must export the same kept lineage as the accepted trace, with no run.
+# With the usage cutoff on, local outputs (compiled with --usage, kept or skipped) are not what the service compiles, so
+# a service-mode build sends P.A and the kept P.B to the service in their own jobs: B's kept lineage ends, and its
+# importers take the service's bytes in the same build.
 FAKE_LOG="$W/replay.log" test_run -d "$W/replay" build P.B -o "$W/replay.jsonl"
 python3 - "$W" <<'PY' || failures=$((failures+1))
 import json, pathlib, sys
 w = pathlib.Path(sys.argv[1])
 t = json.loads((w/'replay/.lake/build/lib/lean/P/B.trace').read_text())
+assert 'kf' not in t['outputs'], t
 rows = [json.loads(x) for x in (w/'replay.jsonl').read_text().splitlines() if x.strip()]
-entry = next(v for h,v in rows[1:] if h == t['depHash'])
-assert isinstance(entry, dict) and entry.get('kf') == t['outputs']['kf'], entry
+assert not any(isinstance(v, dict) and 'kf' in v for h,v in rows[1:] if h == t['depHash']), rows
 requests = [json.loads(x) for x in (w/'replay.log').read_text().splitlines() if x.strip()]
-assert not any(x.get('method') in ('run','materialize') for x in requests)
-print('kept replay: export lineage preserved, build-action requests=0')
+assert [x['params']['target'] for x in requests if x.get('method') == 'run'] == ['P.A', 'P.B'], requests
+print('kept replay: P.A and P.B compiled on the service in their own jobs, no kept marker remains')
 PY
 # Exclusion under --no-build must report that B needs a build, without changing kept outputs.
 printf 'P.B\n' > "$W/exclude"
@@ -76,12 +78,15 @@ python3 - "$W" <<'PY' || failures=$((failures+1))
 import json, pathlib, sys
 w = pathlib.Path(sys.argv[1])
 requests = [json.loads(x) for x in (w/'excluded.log').read_text().splitlines() if x.strip()]
-assert [x['params']['target'] for x in requests if x.get('method') == 'run'] == ['P.B'], requests
+# P.A, compiled on this machine with the usage cutoff, goes to the service in its own job before P.B's run
+assert [x['params']['target'] for x in requests if x.get('method') == 'run'] == ['P.A', 'P.B'], requests
 t = json.loads((w/'excluded/.lake/build/lib/lean/P/B.trace').read_text())
 assert 'kf' not in t['outputs'], t
 print('excluded kept module: B executed once and no kept marker remains')
 PY
-# A newer compiled mapping replaces an existing kept trace before any service-mode replay.
+# A newer compiled mapping no longer replaces the kept trace in service mode: with the usage cutoff on, local outputs
+# (compiled with --usage, kept or skipped) are not what the service compiles, so P.A goes to the service in its own
+# job, P.B's input then differs from the compiled mapping's, and P.B is compiled on the service too.
 LAKE_ARTIFACT_CACHE=true FAKE_LOG="$W/replaced.log" test_run -d "$W/replaced" build P.B
 python3 - "$W" <<'PY' || failures=$((failures+1))
 import json, pathlib, sys
@@ -89,7 +94,7 @@ w = pathlib.Path(sys.argv[1])
 t = json.loads((w/'replaced/.lake/build/lib/lean/P/B.trace').read_text())
 assert 'kf' not in t['outputs'], t
 requests = [json.loads(x) for x in (w/'replaced.log').read_text().splitlines() if x.strip()]
-assert not any(x.get('method') in ('run','materialize') for x in requests), requests
-print('compiled replacement: kept trace replaced locally, build-action requests=0')
+assert [x['params']['target'] for x in requests if x.get('method') == 'run'] == ['P.A', 'P.B'], requests
+print('compiled replacement: P.A and P.B compiled on the service, no kept marker remains')
 PY
 test_exp "$failures" = 0

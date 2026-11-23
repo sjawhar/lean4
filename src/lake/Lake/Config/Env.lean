@@ -24,12 +24,15 @@ namespace Lake
 /--
 What a build does when the build service does not answer (`LAKE_REMOTE_EXEC_FALLBACK`): when the
 `hello` that decides finds it unreachable, or a request still answers `UNAVAILABLE` after the
-daemon's own retries. A result of the service (a failed compile, `OOM`, `TIMEOUT`, `DISK_LIMIT`) is
-never a reason to fall back, and a service that refuses (another toolchain) fails whatever this says.
+daemon's own retries. It also decides what a confirmed toolchain mismatch does: only
+`compileLocally` builds on this machine (`Lake.useService`, `Lake.startRemoteSession`). A result of
+the service (a failed compile, `OOM`, `TIMEOUT`, `DISK_LIMIT`) is never a reason to fall back, nor
+is a refused service (`Lake.SessionDecision.refused`).
 -/
 public inductive RemoteFallback
-  /-- Compile on this machine and publish nothing (the default; design "Failure"). After the service
-  did not answer once, every later module of the build compiles locally without asking it again. -/
+  /-- Build on this machine and publish nothing (the default). While the service does not answer,
+  every later job builds here at once without a request, and the re-probe timer asks the service
+  again (`Lake.startProbeTimer`). -/
   | compileLocally
   /-- Never compile on this machine: wait for the service, probing it again after 1, 2, 4 … 30 s. -/
   | wait
@@ -38,15 +41,11 @@ public inductive RemoteFallback
   | fail
   deriving Inhabited, DecidableEq, Repr
 
-/-- When Lake fetches the bytes of outputs that are only on the build service (`LAKE_REMOTE_EXEC_MATERIALIZE`). -/
-public inductive RemoteMaterialize
-  /-- When a local process will read them (`needed`, the default). -/
-  | needed
-  /-- As soon as a build records them (`all`). -/
-  | all
-  /-- Only for processes Lake itself starts that read them (`none`): `setup-file` prints absent paths. -/
-  | never
-  deriving Inhabited, DecidableEq, Repr
+/-- The default of `LAKE_REMOTE_EXEC_TIMEOUT`, in seconds. -/
+public def defaultRemoteTimeoutSecs : Nat := 3600
+
+/-- The largest value of `LAKE_REMOTE_EXEC_TIMEOUT`, in seconds. -/
+public def maxRemoteTimeoutSecs : Nat := 21600
 
 /-- The build service settings of this Lake process (`LAKE_REMOTE_EXEC*`, contract C5.1). -/
 public structure RemoteExecConfig where
@@ -60,12 +59,10 @@ public structure RemoteExecConfig where
   socket? : Option System.FilePath := none
   fallback : RemoteFallback := .compileLocally
   repo? : Option String := none
-  largeModules? : Option System.FilePath := none
-  materialize : RemoteMaterialize := .needed
   log? : Option System.FilePath := none
-  manifestOut? : Option System.FilePath := none
   skipCache : Bool := false
-  rerunFailures : Bool := false
+  /-- The longest a service action may run, in seconds (`LAKE_REMOTE_EXEC_TIMEOUT`). -/
+  timeoutSecs : Nat := defaultRemoteTimeoutSecs
   deriving Inhabited, Repr
 
 /-- A Lake environment. -/
@@ -404,13 +401,16 @@ where
       | some "wait" => pure .wait
       | some "fail" => pure .fail
       | some v => throw s!"'LAKE_REMOTE_EXEC_FALLBACK' must be local, wait or fail, got '{v}'"
-    let materialize : RemoteMaterialize ← match ← get "LAKE_REMOTE_EXEC_MATERIALIZE" with
-      | none | some "needed" => pure .needed
-      | some "all" => pure .all
-      | some "none" => pure .never
-      | some v => throw s!"'LAKE_REMOTE_EXEC_MATERIALIZE' must be needed, all or none, got '{v}'"
+    let timeoutSecs : Nat ← match ← get "LAKE_REMOTE_EXEC_TIMEOUT" with
+      | none => pure defaultRemoteTimeoutSecs
+      | some v =>
+        -- ASCII digits only: `String.toNat?` also reads `_` separators
+        let n := if v.all Char.isDigit then v.toNat?.getD 0 else 0
+        if 0 < n ∧ n ≤ maxRemoteTimeoutSecs then pure n else
+          throw s!"'LAKE_REMOTE_EXEC_TIMEOUT' must be a whole number of seconds from 1 to {maxRemoteTimeoutSecs}, \
+            got '{v}'"
     return some {
-      endpoint, fallback, materialize
+      endpoint, fallback, timeoutSecs
       toolchain? := ← get "LAKE_REMOTE_EXEC_TOOLCHAIN"
       sysroot? := (← get "LAKE_REMOTE_EXEC_SYSROOT").map FilePath.mk
       cc := (← get "LAKE_REMOTE_EXEC_CC").getD "/usr/bin/cc"
@@ -418,12 +418,9 @@ where
       client := (← get "LAKE_REMOTE_EXEC_CLIENT").getD "lean-remote"
       socket? := (← get "LAKE_REMOTE_EXEC_SOCKET").map FilePath.mk
       repo? := ← get "LAKE_REMOTE_EXEC_REPO"
-      largeModules? := (← get "LAKE_REMOTE_EXEC_LARGE_MODULES").map FilePath.mk
       log? := (← get "LAKE_REMOTE_EXEC_LOG").map FilePath.mk
-      manifestOut? := (← get "LAKE_REMOTE_EXEC_MANIFEST_OUT").map FilePath.mk
       instanceName := (← get "LAKE_REMOTE_EXEC_INSTANCE").getD "lean"
       skipCache := (← get "LAKE_REMOTE_EXEC_SKIP_CACHE") == some "1"
-      rerunFailures := (← get "LAKE_REMOTE_EXEC_RERUN_FAILURES") == some "1"
     }
 
 /--
