@@ -1,7 +1,6 @@
 /-
 Copyright (c) 2026 Theorem Labs. All rights reserved.
 Released under Apache 2.0 license as described in the file LICENSE.
-Authors: LINUX-30 build-platform
 -/
 module
 
@@ -9,9 +8,9 @@ prelude
 public import Lean.Data.Json
 public import Lake.Util.Log
 public import Lake.Util.JsonObject
-public import Lake.Util.String
+public import Lake.Util.RemoteRecord
 import Lake.Util.Proc
-import Std.Sync.Mutex
+public import Std.Sync.Mutex
 import Std.Data.HashMap
 import Init.Data.String.Basic
 import Init.Data.String.Legacy
@@ -29,27 +28,6 @@ open System Lean
 
 namespace Lake.RemoteExec
 
-/-- A content digest: the SHA-256 of a blob and its byte size (wire form `"<64 hex>/<size>"`). -/
-public structure Digest where
-  hash : String
-  size : Nat
-  deriving BEq, Hashable, Inhabited, Repr
-
-namespace Digest
-public def toString (d : Digest) : String := s!"{d.hash}/{d.size}"
-public instance : ToString Digest := ⟨Digest.toString⟩
-public def ofString? (s : String) : Option Digest := do
-  let [h, n] := s.splitOn "/" | none
-  guard (h.utf8ByteSize == 64 && Lake.isHex h)
-  return {hash := h, size := ← n.toNat?}
-public instance : ToJson Digest := ⟨(toJson ·.toString)⟩
-public instance : FromJson Digest := ⟨fun j => do
-  let s ← j.getStr?
-  match ofString? s with | some d => pure d | none => throw s!"malformed digest '{s}'"⟩
-/-- The digest of the empty blob. -/
-public def empty : Digest := ⟨"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 0⟩
-end Digest
-
 public inductive ErrorCode
   | unavailable | notFound | oom | timeout | diskLimit | invalid | unauthenticated | permissionDenied | internal
   deriving DecidableEq, Repr, Inhabited
@@ -60,10 +38,26 @@ public def ErrorCode.ofString : String → ErrorCode
   | "INVALID" => .invalid | "UNAUTHENTICATED" => .unauthenticated
   | "PERMISSION_DENIED" => .permissionDenied | _ => .internal
 
+/-- The code's text on the wire (`ErrorCode.ofString` reads it back). -/
+public def ErrorCode.toString : ErrorCode → String
+  | .unavailable => "UNAVAILABLE" | .notFound => "NOT_FOUND" | .oom => "OOM" | .timeout => "TIMEOUT"
+  | .diskLimit => "DISK_LIMIT" | .invalid => "INVALID" | .unauthenticated => "UNAUTHENTICATED"
+  | .permissionDenied => "PERMISSION_DENIED" | .internal => "INTERNAL"
+
 public structure Error where
   code : ErrorCode
+  /-- The code as the bridge sent it, a code that `ErrorCode` does not know included (`code` is then
+  `internal`); for an error that Lake made itself, `code`'s text. -/
+  codeText : String := code.toString
   message : String
   missing : Array Digest := #[]
+  /-- The fields of a killed action's error: a `TIMEOUT` error has them (contract C5.1 v7), and an `OOM` or
+  `DISK_LIMIT` error where the bridge sends them; each `none` when the bridge sent none. -/
+  action? : Option String := none
+  stdoutDigest? : Option Digest := none
+  stderrDigest? : Option Digest := none
+  terminationSignal? : Option String := none
+  limits? : Option JsonObject := none
   deriving Inhabited
 
 public instance : ToString Error := ⟨(·.message)⟩
@@ -99,7 +93,7 @@ builtin_initialize connRef : Std.Mutex (Option Conn) ← Std.Mutex.new none
 /-- The serial of the last connection started (see `Conn.serial`). -/
 builtin_initialize connSerial : IO.Ref Nat ← IO.mkRef 0
 
-/-- Kills a bridge process and reaps it. -/
+/-- Kills a bridge process (with its process group, if it has one of its own) and reaps it. -/
 def reap {cfg : IO.Process.StdioConfig} (child : IO.Process.Child cfg) : BaseIO Unit := do
   let _ ← child.kill.toBaseIO
   let _ ← child.wait.toBaseIO
@@ -135,10 +129,18 @@ builtin_initialize waiters : IO.Ref Nat ← IO.mkRef 0
 
 def decodeResponse (j : Json) : Except Error Json :=
   match j.getObjVal? "error" with
-  | .ok e => .error {
-      code := .ofString ((e.getObjValAs? String "code").toOption.getD "INTERNAL")
-      message := (e.getObjValAs? String "message").toOption.getD ""
-      missing := (e.getObjValAs? (Array Digest) "missing").toOption.getD #[] }
+  | .ok e =>
+    let str? (k : String) := (e.getObjValAs? String k).toOption
+    let digest? (k : String) := (e.getObjValAs? Digest k).toOption
+    let codeText := (str? "code").getD "INTERNAL"
+    .error {
+      code := .ofString codeText, codeText
+      message := (str? "message").getD ""
+      missing := (e.getObjValAs? (Array Digest) "missing").toOption.getD #[]
+      action? := str? "action"
+      stdoutDigest? := digest? "stdoutDigest", stderrDigest? := digest? "stderrDigest"
+      terminationSignal? := str? "terminationSignal"
+      limits? := (e.getObjValAs? JsonObject "limits").toOption }
   | .error _ => .ok ((j.getObjVal? "result").toOption.getD .null)
 
 /-- Ends a bridge: closes its standard input, waits up to `bridgeExitTimeoutMs` for it to exit, and
@@ -171,39 +173,83 @@ partial def readLoop (out : IO.FS.Handle) (conn : Conn) : BaseIO Unit := do
     readLoop out conn
   | .error e => closeConn conn s!"reading the lean-remote bridge: {e}"
 
-/-- Starts a bridge and says `hello` on it before any other request (contract C5.1); a bridge
-started again after one exited says `hello` again with the same params, so the invocation id stays
-the build's. -/
-def connect (cfg : ClientConfig) : BaseIO (Except Error Conn) := do
+/--
+Ends probes (`probe`) from another task: once `stop` has run, the bridge of a probe made with it that
+waits for its `hello` answer is killed with its process group, and each later probe made with it
+fails at once as `unavailable`. Probes made without one, and the probes of another `ProbeStop`, go on.
+-/
+public structure ProbeStop where
+  /-- Whether `stop` has run, and the bridge of the probe that waits for its `hello` answer. -/
+  state : Std.Mutex (Bool × Option (IO.Process.Child {stdin := .piped, stdout := .piped, stderr := .inherit}))
+
+public def ProbeStop.new : BaseIO ProbeStop :=
+  return {state := ← Std.Mutex.new (false, none)}
+
+public def ProbeStop.isStopped (s : ProbeStop) : BaseIO Bool :=
+  s.state.atomically do return (← get).1
+
+/-- Only kills the bridge's process group: `probe`, which waits for its `hello` answer, reaps the
+bridge, so the group's id (the bridge's pid) cannot be reused before the kill. -/
+public def ProbeStop.stop (s : ProbeStop) : BaseIO Unit :=
+  s.state.atomically do
+    if let some child := (← get).2 then
+      discard <| (child.kill.toBaseIO : BaseIO _)
+    modify fun _ => (true, none)
+
+/-- Registers the bridge of a probe that waits for its `hello` answer; `false` if `stop` has run. -/
+def ProbeStop.watch (s : ProbeStop)
+    (child : IO.Process.Child {stdin := .piped, stdout := .piped, stderr := .inherit}) : BaseIO Bool :=
+  s.state.atomically do
+    if (← get).1 then return false
+    set (false, some child)
+    return true
+
+def ProbeStop.unwatch (s : ProbeStop) : BaseIO Unit :=
+  s.state.atomically do modify fun (stopped, _) => (stopped, none)
+
+/-- Starts a bridge (`lean-remote bridge`, with `--socket` if set) with `spawnProc`, its messages on
+Lake's standard error; with `setsid`, in a session and process group of its own. -/
+def spawnBridge (cfg : ClientConfig) (setsid : Bool) (inheritBuildLock := true) :
+    BaseIO (Except Error (IO.Process.Child {stdin := .piped, stdout := .piped, stderr := .inherit})) := do
   let args := #["bridge"] ++ (cfg.socket?.elim #[] fun s => #["--socket", s.toString])
-  -- The bridge writes its messages to Lake's standard error. A reader of that stream (a pipe, `tee`)
-  -- therefore sees it end only when the bridge exits too, which after a killed Lake is once the
-  -- daemon has cancelled that Lake's requests; no limit of Lake's applies then.
-  -- It stays in Lake's process group (no `setsid`), so a signal to the group reaches it as the build
-  -- lock design expects: a connected bridge ignores it and outlives Lake until end of input.
-  let spawned ← (IO.Process.spawn {cmd := cfg.exe.toString, args, stdin := .piped, stdout := .piped, stderr := .inherit}).toBaseIO
-  let spawnedChild ← match spawned with
-    | .ok c => pure c
-    | .error e => return .error {code := .invalid, message := s!"LAKE_REMOTE_EXEC is set but `{cfg.exe}` cannot run: {e}"}
-  let (stdin, child) ← match ← spawnedChild.takeStdin.toBaseIO with
-    | .ok r => pure r
-    | .error e => return .error {code := .internal, message := s!"taking the lean-remote bridge's stdin: {e}"}
+  match ← (spawnProc (inheritBuildLock := inheritBuildLock)
+      {cmd := cfg.exe.toString, args, stdin := .piped, stdout := .piped, stderr := .inherit, setsid}).toBaseIO with
+  | .ok c => return .ok c
+  | .error e => return .error {code := .invalid, message := s!"LAKE_REMOTE_EXEC is set but `{cfg.exe}` cannot run: {e}"}
+
+/-- Says `hello` on a bridge just started, before any other request (contract C5.1): writes the
+request with `cfg.helloParams` to `stdin`, and returns the result of the answer that `stdout` brings. -/
+def sayHello (cfg : ClientConfig) (stdin stdout : IO.FS.Handle) : BaseIO (Except Error Json) := do
   let r ← (do
     stdin.putStrLn (Json.mkObj [("id", (0 : Nat)), ("method", "hello"), ("params", cfg.helloParams)]).compress
     stdin.flush
-    child.stdout.getLine).toBaseIO
-  -- A bridge that has not answered `hello` carries no write into the workspace, so it is killed.
+    stdout.getLine).toBaseIO
   let .ok line := r
-    | reap child
-      return .error {code := .unavailable, message := "the lean-remote bridge did not answer hello"}
-  let hello ← match Json.parse line >>= (pure <| decodeResponse ·) with
-    | .error _ =>
-      reap child
-      return .error {code := .unavailable, message := "the lean-remote bridge exited before answering hello"}
-    | .ok (.error e) =>
+    | return .error {code := .unavailable, message := "the lean-remote bridge did not answer hello"}
+  match Json.parse line with
+  | .ok j => return decodeResponse j
+  | .error _ => return .error {code := .unavailable, message := "the lean-remote bridge exited before answering hello"}
+
+/-- Starts a bridge and says `hello` on it (`sayHello`); a bridge started again after one exited says
+`hello` again with the same params, so the invocation id stays the build's. -/
+def connect (cfg : ClientConfig) : BaseIO (Except Error Conn) := do
+  -- The bridge writes its messages to Lake's standard error. A reader of that stream (a pipe, `tee`)
+  -- therefore sees it end only when the bridge exits too, which after a killed Lake is once the
+  -- daemon has cancelled that Lake's requests; no limit of Lake's applies then.
+  -- It stays in Lake's process group (unlike a probe's bridge), so a signal to the group reaches it
+  -- as the build lock design expects: a connected bridge ignores it and outlives Lake until end of input.
+  let spawnedChild ← match ← spawnBridge cfg (setsid := false) with
+    | .ok c => pure c
+    | .error e => return .error e
+  let (stdin, child) ← match ← spawnedChild.takeStdin.toBaseIO with
+    | .ok r => pure r
+    | .error e => return .error {code := .internal, message := s!"taking the lean-remote bridge's stdin: {e}"}
+  -- A bridge that has not answered `hello` carries no write into the workspace, so it is killed.
+  let hello ← match ← sayHello cfg stdin child.stdout with
+    | .ok h => pure h
+    | .error e =>
       reap child
       return .error e
-    | .ok (.ok h) => pure h
   let serial ← connSerial.modifyGet fun n => (n + 1, n + 1)
   let stdin ← IO.mkRef (some stdin)
   let pending ← Std.Mutex.new {}
@@ -226,17 +272,31 @@ public def hello (cfg : ClientConfig) : BaseIO (Except Error Json) :=
   return (← getConn cfg).map (·.hello)
 
 /--
-Asks whether the service answers now, on a bridge of its own: it says `hello` and is killed at once,
-so it carries no request and no write into the workspace, and this process's connection (and the
-requests in flight on it) stays as it is.
+Asks whether the service answers now, on a bridge of its own: it says `hello` and is killed at once
+with its process group, so it carries no request and no write into the workspace, and this process's
+connection (and the requests in flight on it) stays as it is. `stop?` can end it from another task
+(`ProbeStop`).
 -/
-public def probe (cfg : ClientConfig) : BaseIO (Except Error Json) := do
-  match ← connect cfg with
-  | .error e => return .error e
-  | .ok conn =>
-    conn.writeLock.atomically (m := BaseIO) do conn.stdin.set none
-    reap conn.child
-    return .ok conn.hello
+public def probe (cfg : ClientConfig) (stop? : Option ProbeStop := none) : BaseIO (Except Error Json) := do
+  -- A process group of its own, so that a kill also reaches a bridge that the bridge command runs as
+  -- its child (a wrapper without `exec`), which would otherwise hold its standard output open until it
+  -- answers; the daemon that a bridge may start is in a session of its own, which the kill never reaches.
+  -- Without the build lock: it carries no write into the workspace, and one that hangs on its `hello`
+  -- after a killed Lake must not keep the workspace locked
+  let child ← match ← spawnBridge cfg (setsid := true) (inheritBuildLock := false) with
+    | .ok c => pure c
+    | .error e => return .error e
+  if let some stop := stop? then
+    unless ← stop.watch child do
+      reap child
+      return .error {code := .unavailable, message := "the probe of the build service was stopped"}
+  -- On the child `spawnProc` returned: the one `Child.takeStdin` returns has lost `setsid`, so its
+  -- `kill` would reach the bridge command only
+  let hello ← sayHello cfg child.stdin child.stdout
+  -- Before the reap, so that `ProbeStop.stop` never kills the group of a bridge that was reaped
+  if let some stop := stop? then stop.unwatch
+  reap child
+  return hello
 
 /--
 Stops this process's bridge (`stopBridge`) if its `hello` does not pass `admits`, in one section of
@@ -316,7 +376,7 @@ public def OutputFile.ofJson? (j : Json) : Except String OutputFile := do
   }
 public instance : FromJson OutputFile := ⟨OutputFile.ofJson?⟩
 
-/-- The result of a `run` request; only the fields slice 1 reads. -/
+/-- The result of a `run` request; only the fields Lake reads. -/
 public structure RunResult where
   action : String := ""
   cached : Bool := false
@@ -324,6 +384,12 @@ public structure RunResult where
   terminationSignal? : Option String := none
   stdout : String := ""
   stderr : String := ""
+  /-- The digests of the streams; an empty stream has none. -/
+  stdoutDigest? : Option Digest := none
+  stderrDigest? : Option Digest := none
+  /-- The sandbox's use of its limits (`{oomKills, writtenBytes, diskLimitExceeded}`, contract C5.1 v7),
+  as the bridge sent it. -/
+  limits? : Option JsonObject := none
   outputs : Array OutputFile := #[]
   deriving Inhabited
 
@@ -336,6 +402,9 @@ public def RunResult.ofJson? (j : Json) : Except String RunResult := do
     terminationSignal? := ← o.get? "terminationSignal"
     stdout := ← o.getD "stdout" ""
     stderr := ← o.getD "stderr" ""
+    stdoutDigest? := ← o.get? "stdoutDigest"
+    stderrDigest? := ← o.get? "stderrDigest"
+    limits? := ← o.get? "limits"
     outputs := ← o.getD "outputs" #[]
   }
 public instance : FromJson RunResult := ⟨RunResult.ofJson?⟩

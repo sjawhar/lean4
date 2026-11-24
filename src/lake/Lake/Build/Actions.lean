@@ -132,20 +132,24 @@ public def compileO
     args := #["-c", "-o", oFile.toString, srcFile.toString] ++ moreArgs
   }
 
-public def mkArgs (basePath : FilePath) (args : Array String) : LogIO (Array String) := do
-  -- Use response file to avoid potentially exceeding CLI length limits.
-  -- On Windows this is always needed; on macOS/Linux this is needed for large
-  -- projects like Mathlib where the number of object files exceeds ARG_MAX.
-  let rspFile := basePath.addExtension "rsp"
-  let h ← IO.FS.Handle.mk rspFile .write
-  args.forM fun arg =>
+/-- The contents of a response file (`@file`) that holds `args`: each argument quoted on a line of its own. -/
+public def rspContents (args : Array String) : String :=
+  args.foldl (init := "") fun text arg =>
     -- Escape special characters
     let arg := arg.foldl (init := "") fun s c =>
       if c == '\\' || c == '"' then
         s.push '\\' |>.push c
       else
         s.push c
-    h.putStr s!"\"{arg}\"\n"
+    text ++ s!"\"{arg}\"\n"
+
+public def mkArgs (basePath : FilePath) (args : Array String) : LogIO (Array String) := do
+  -- Use response file to avoid potentially exceeding CLI length limits.
+  -- On Windows this is always needed; on macOS/Linux this is needed for large
+  -- projects like Mathlib where the number of object files exceeds ARG_MAX.
+  let rspFile := basePath.addExtension "rsp"
+  let h ← IO.FS.Handle.mk rspFile .write
+  h.putStr (rspContents args)
   return #[s!"@{rspFile}"]
 
 public def compileStaticLib
