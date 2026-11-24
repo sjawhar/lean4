@@ -57,8 +57,12 @@ end Test
 section Control
 
 /-!
-Sanity check: The test above fails if `nestedDecidable` is just a reducible definition,
-lacking the `abbrev` kernel hint that it has on the current toolchain.
+Control: the same proofs re-checked with a `regular` hint on the wrapper, so that the kernel unfolds
+`X` first. With an `is_def_eq` cache of exact pairs only (upstream #14806), this re-check repeats
+its unfolding work and times out at 1000 heartbeats. The union-find closure of successful
+`is_def_eq` queries, which the kernel uses when it checks a definition or theorem
+(`type_checker::use_equiv_closure`), reuses that work, and the re-check ends within the limit.
+This control fails if a later change loses the closure for declaration checks.
 -/
 
 /-- `Grind.nestedDecidable` with a `regular` reducibility hint. -/
@@ -87,7 +91,7 @@ elab "#recheck_with_regular_wrapper " thm:ident : command => liftCoreM do
 
 set_option maxHeartbeats 1000
 
-/-- error: (kernel) deterministic timeout -/
+-- No message: the closure answers the re-check within 1000 heartbeats (see the control's docstring).
 #guard_msgs in
 #recheck_with_regular_wrapper MyChar.isLower_toUpper
 
