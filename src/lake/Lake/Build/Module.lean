@@ -1944,6 +1944,7 @@ partial def Module.remoteRunRequest (mod : Module) (presetup : ModulePreSetup) (
     outs := outs.push bcRel
   outs := outs.qsort (fun a b => compare a b == .lt)
   let inputs := #[(presetup.srcFile, srcRel)] ++ importFiles ++ head.inputFiles
+  -- `LEAN_PATH` split as the service splits it: a key with `:` makes an entry of its own
   let names := inputs.map (·.2) ++ head.digestInputs.map (·.2.1) ++ outs ++ (head.leanPath.splitOn ":").toArray
   if let .error e := checkInputRootNames mod.name.toString names then
     return .error e
