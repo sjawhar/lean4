@@ -18,12 +18,11 @@ field is as the bridge sent it.
 
 ## How they were captured
 
-`capture.py` beside this file made them. It ran in Kubernetes Job `linux-1735-k0-capture-tsqgx`
-(namespace `builds-linux`, service account `build-service-client`, whose identity the service
-admits) on 2026-11-20: the Job ran from 21:17:14 to 21:20:47 UTC, and the service answered between
-21:19:56 and 21:20:44 UTC. The client image was
+`capture.py` beside this file made them. It ran in a Job of the build cluster whose identity the
+service admits, on 2026-11-20: the Job ran from 21:17:14 to 21:20:47 UTC, and the service answered
+between 21:19:56 and 21:20:44 UTC. The client image was the build service's r19 client image, digest
 
-    us-west1-docker.pkg.dev/theorem-agent-infra/lean-build/lean-build-client-r19@sha256:b4c4c472b3994a5ceca6e6953e066f225d12dbe25fb9d0e3adf0ba4557242f31
+    sha256:b4c4c472b3994a5ceca6e6953e066f225d12dbe25fb9d0e3adf0ba4557242f31
 
 with that image's `lean-remote` (`lean-remote 1.0.0`) and `lean-build-probe`, on instance `lean`,
 for the r19 toolchain: service digest
@@ -46,14 +45,13 @@ The Job ran:
     [[lean_lib]]
     name = "T"
 
-and `T.lean`:
+and `T.lean`, one comment line and:
 
-    -- LINUX-1735 k0: a module that runs past a 1 s timeout.
     #eval IO.sleep 5000
 
 `capture.py` takes the `timeout` request from the fake's log of `lake build T` in service mode,
 run by the image's own `lake`, and sets its `timeoutSecs` to 1. Every request has
 `skipCacheLookup` and a fresh salt (`LEAN_BUILD_PROBE_SALT` in the probe's environment, a comment
 appended to `T.lean`), so the service ran each action and served none from its cache. The Job
-manifest, with the endpoint, the audience and the CA, is an artifact of LINUX-1735
-(`k0-capture-job.yaml`); `capture.py`'s docstring lists its steps.
+manifest, with the endpoint, the audience and the CA, is not in this repository; `capture.py`'s
+docstring lists its steps.

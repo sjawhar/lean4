@@ -81,7 +81,7 @@ def parse_args():
 
 
 def lean_platform(toolchain):
-    """lean-build-probe's `leanPlatform(toolchain, "std")` (build-service/cmd/probe/action.go)."""
+    """lean-build-probe's `leanPlatform(toolchain, "std")`: the Lean platform of the probe's actions."""
     return {"arch": "x86_64", "memory": "std", "os": "linux", "toolchain": toolchain}
 
 
