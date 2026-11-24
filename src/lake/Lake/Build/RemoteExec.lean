@@ -802,11 +802,6 @@ public def pathBelow? (dir p : FilePath) : Option String := do
   let parts := (FilePath.mk rest.toString).components.filter fun c => c != "" && c != "."
   if parts.isEmpty || parts.contains ".." then none else some (String.intercalate "/" parts)
 
-/-- The first of `names` that is absolute or has a `..` component, if any: a name in the action's input root must be
-relative with no `..` component, or it can name a file outside the root. -/
-public def nameOutsideInputRoot? (names : Array String) : Option String :=
-  names.find? fun n => let p := FilePath.mk n; p.isAbsolute || p.components.contains ".."
-
 /--
 The path in the action's input root of `file`, a file of `pkg`'s build (contract C2.1): `lib/<pkg>/<rest>` with the
 rest of `file` below the package's `leanLibDir` (`pathBelow?`), else `native/<pkg>/<rest>` with its rest below the
@@ -1015,6 +1010,14 @@ public inductive PromotionError
 /-- The error of a promotion whose request, sent at `epoch`, failed with `e`; `msg` says so. -/
 public def PromotionError.ofError (e : RemoteExec.Error) (epoch : Nat) (msg : String) : PromotionError :=
   if e.code == .unavailable then .unavailable epoch msg else .failed msg
+
+/-- The error of `target`'s request when one of its `names` in the action's input root is absolute or has a `..`
+component, which could name a file outside the root. -/
+public def checkInputRootNames (target : String) (names : Array String) : Except PromotionError Unit :=
+  match names.find? fun n => let p := FilePath.mk n; p.isAbsolute || p.components.contains ".." with
+  | some name => .error (.failed s!"{target}: the request names {name}, which is not a path below the action's \
+      input root")
+  | none => .ok ()
 
 /--
 Leaves the build action of a service action, which started at the log position `pos`, because a promotion of one of
@@ -1291,7 +1294,7 @@ public partial def NativeAction.serviceInputs (act : NativeAction) (s : RemoteSe
 
 /-- The `run` request of a native action with its inputs (`NativeAction.serviceInputs`, `NativeAction.request`), and
 each input that it takes by digest with its local path. It fails when one of its names in the input root is absolute
-or has a `..` component (`nameOutsideInputRoot?`). -/
+or has a `..` component (`checkInputRootNames`). -/
 partial def NativeAction.serviceRequest (act : NativeAction) (s : RemoteSession) (skipCacheLookup := false) :
     JobM (Except PromotionError (Json × Array (RemoteExec.Digest × FilePath))) := do
   let ins ← match ← act.serviceInputs s with
@@ -1300,9 +1303,8 @@ partial def NativeAction.serviceRequest (act : NativeAction) (s : RemoteSession)
   let names := match ins with
     | .source _ rel => #[act.rel, rel]
     | .objects objs => #[act.rel] ++ objs.map (·.1)
-  if let some name := nameOutsideInputRoot? names then
-    return .error (.failed s!"{act.target}: the request names {name}, which is not a path below the action's \
-      input root")
+  if let .error e := checkInputRootNames act.target names then
+    return .error e
   return .ok (act.request s ins skipCacheLookup, ins.byDigest)
 
 /--
