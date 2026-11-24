@@ -2416,9 +2416,8 @@ def Module.unpackLtar (self : Module) (ltar : FilePath) (inputHash : Hash) : Job
     {cmd := (← getLeantar).toString, args}
   unless (← getLakeEnv).remoteExec?.isSome do return
   -- Only the one key changes, not through `BuildMetadata.writeFile`: its `toJson` always adds `inputs` and `synthetic`,
-  -- whose absence a reader outside Lake takes as an archive restore (theorem-labs/machcsl-riscv-experimental,
-  -- `traceState` in `tools/lean/StrictFacts.lean`). A trace that is no JSON object is left as it is, for its reader to
-  -- report
+  -- whose absence a reader outside Lake takes as an archive restore. A trace that is no JSON object is left as it is,
+  -- for its reader to report
   if let .ok contents ← (IO.FS.readFile self.traceFile).toBaseIO then
     if let .ok trace@(.obj _) := Json.parse contents then
       IO.FS.writeFile self.traceFile (trace.setObjVal! "fromArchive" true).pretty
