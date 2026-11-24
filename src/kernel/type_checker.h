@@ -16,6 +16,7 @@ Author: Leonardo de Moura
 #include "kernel/environment.h"
 #include "kernel/local_ctx.h"
 #include "kernel/expr_maps.h"
+#include "kernel/equiv_manager.h"
 
 namespace lean {
 /** \brief Lean Type Checker. It can also be used to infer types, check whether a
@@ -41,6 +42,17 @@ public:
         expr_pair_set             m_failure;
         expr_map<expr>            m_unfold;
         friend type_checker;
+        /* The union-find closure of successful `is_def_eq` queries, used instead of `m_success` only by a
+           checker that `use_equiv_closure` switched on: one checking the type and value of a definition,
+           theorem or opaque constant (`environment.cpp`). Every pair it merges is definitionally equal, and
+           definitional equality is transitive, so each `true` it gives is a sound answer; it can only turn
+           a `false` the incomplete `is_def_eq` would give into `true`, so its answers depend on the order of
+           the queries. Accepting a definition needs only sound `true` answers, and without the closure a
+           value checked by `rw`/`show` chains can repeat its unfolding work until it exhausts memory. The
+           inductive-declaration module never switches it on: it builds recursors from repeated `is_def_eq`
+           answers that must agree, which is how the closure was exploited (tests/elab/
+           kernel_is_def_eq_equiv_manager_{1,2}.lean). */
+        equiv_manager             m_eqv_manager;
     public:
         state(environment const & env);
         environment & env() { return m_env; }
@@ -58,6 +70,8 @@ private:
     wrapped with `eagerReduce`.
     */
     bool                      m_eager_reduce = false;
+    /* Whether `is_def_eq` uses `m_st->m_eqv_manager` (see `state`) instead of the pair cache `m_success`. */
+    bool                      m_eqv_closure = false;
     /* When `m_lparams != nullptr, the `check` method makes sure all level parameters
        are in `m_lparams`. */
     names const *             m_lparams;
@@ -87,7 +101,7 @@ private:
     bool is_def_eq_binding(expr t, expr s);
     bool is_def_eq(level const & l1, level const & l2);
     bool is_def_eq(levels const & ls1, levels const & ls2);
-    lbool quick_is_def_eq(expr const & t, expr const & s);
+    lbool quick_is_def_eq(expr const & t, expr const & s, bool use_hash = false);
     lbool is_def_eq_offset(expr const & t, expr const & s);
     bool is_def_eq_args(expr t, expr s);
     bool try_eta_expansion_core(expr const & t, expr const & s);
@@ -127,6 +141,10 @@ public:
     ~type_checker();
 
     environment const & env() const { return m_st->m_env; }
+
+    /** \brief Use the union-find closure of successful `is_def_eq` queries (see `state::m_eqv_manager`).
+        Only for checking a definition, theorem or opaque constant, never while building an inductive type. */
+    void use_equiv_closure() { m_eqv_closure = true; }
 
     /** \brief Return the type of \c t.
         It does not check whether the input expression is type correct or not.

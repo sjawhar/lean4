@@ -13,6 +13,7 @@ add_library(
   environment.cpp
   type_checker.cpp
   init_module.cpp
+  equiv_manager.cpp
   quot.cpp
   inductive.cpp
   trace.cpp
