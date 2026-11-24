@@ -806,11 +806,15 @@ public def pathBelow? (dir p : FilePath) : Option String := do
   let parts := (FilePath.mk rest.toString).components.filter fun c => c != "" && c != "."
   if parts.isEmpty || parts.contains ".." then none else some (String.intercalate "/" parts)
 
+/-- The first of `names` that is absolute or has a `..` component, if any: a name in the action's input root must be
+relative with no `..` component, or it can name a file outside the root. -/
+public def nameOutsideInputRoot? (names : Array String) : Option String :=
+  names.find? fun n => let p := FilePath.mk n; p.isAbsolute || p.components.contains ".."
+
 /--
-The path in the action's input root of `file`, a file of `pkg`'s build (contract C2.1): `lib/<pkg>/…` below the
-package's `leanLibDir`, else `native/<pkg>/…` below its `buildDir`, with the empty and `.` components of the rest
-dropped (`pathBelow?`). `none` below neither, and when a `..` component follows the directory: such a file has no path
-in the input root.
+The path in the action's input root of `file`, a file of `pkg`'s build (contract C2.1): `lib/<pkg>/<rest>` with the
+rest of `file` below the package's `leanLibDir` (`pathBelow?`), else `native/<pkg>/<rest>` with its rest below the
+package's `buildDir`, else `none`: such a file has no path in the input root.
 -/
 public def remoteBuildPath (pkg : Package) (file : FilePath) : Option String :=
   match pathBelow? pkg.leanLibDir file with
@@ -1354,10 +1358,20 @@ public partial def NativeAction.serviceInputs (act : NativeAction) (s : RemoteSe
     return .ok (.objects objs)
 
 /-- The `run` request of a native action with its inputs (`NativeAction.serviceInputs`, `NativeAction.request`), and
-each input that it takes by digest with its local path. -/
+each input that it takes by digest with its local path. It fails when one of its names in the input root is absolute
+or has a `..` component (`nameOutsideInputRoot?`). -/
 partial def NativeAction.serviceRequest (act : NativeAction) (s : RemoteSession) (skipCacheLookup := false) :
     JobM (Except PromotionError (Json × Array (RemoteExec.Digest × FilePath))) := do
-  return (← act.serviceInputs s).map fun ins => (act.request s ins skipCacheLookup, ins.byDigest)
+  let ins ← match ← act.serviceInputs s with
+    | .ok ins => pure ins
+    | .error e => return .error e
+  let names := match ins with
+    | .source _ rel => #[act.rel, rel]
+    | .objects objs => #[act.rel] ++ objs.map (·.1)
+  if let some name := nameOutsideInputRoot? names then
+    return .error (.failed s!"{act.target}: the request names {name}, which is not a path below the action's \
+      input root")
+  return .ok (act.request s ins skipCacheLookup, ins.byDigest)
 
 /--
 Sends the `run` request that `build` makes (its params, and each input that it takes by digest with the local path of

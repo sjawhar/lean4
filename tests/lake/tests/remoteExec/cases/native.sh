@@ -1,12 +1,13 @@
-# The `native` group of test.sh, which sources it: the C compiles and links of service mode (A6), rows N1-N18,
+# The `native` group of test.sh, which sources it: the C compiles and links of service mode (A6), rows N1-N19,
 # where N8 is T7 (the timeout of native actions), so the row is named T7. The package `native/` has a library
 # `Nat0` whose modules are precompiled, so each module has an object (`CCompile`), `Nat0.Use`'s compile loads
 # `Nat0.Tac`'s module library (`LinkShared`) as a plugin, and `Use2`'s compile loads `Nat0`'s library
 # (`LinkSharedLibrary`). N16 builds the package `ext/`, which has an `extern_lib`. N17 and N18 build `native/` with
-# another `nativeLibDir`: `../lib`, outside the build directory, and `./lib`. Each row builds in a directory of
-# its own under $WORK/native, with its own service (FAKE_CAS) and Lake cache, and each build has a fake log and a
-# LAKE_REMOTE_EXEC_LOG of its own. N2, N4 and N5 read N1's tree, N10 and N12 read N10's, and N11 and N13 read N11's:
-# `build_N1`, `build_N10` and `build_N11` build each once, so that each row also runs alone.
+# another `nativeLibDir`: `../lib`, outside the build directory, and `./lib`; N19 with `nativeLibDir` and `leanLibDir`
+# both `../lib`. Each row builds in a directory of its own under $WORK/native, with its own service (FAKE_CAS) and
+# Lake cache, and each build has a fake log and a LAKE_REMOTE_EXEC_LOG of its own. N2, N4 and N5 read N1's tree, N10
+# and N12 read N10's, and N11 and N13 read N11's: `build_N1`, `build_N10` and `build_N11` build each once, so that
+# each row also runs alone.
 
 NW=$GW
 export LAKE_REMOTE_EXEC=grpc://fake:1
@@ -59,11 +60,12 @@ print(" ".join(sorted({str(e["params"].get("timeoutSecs")) for e in ls
 }
 # fake_bytes FILE...: each FILE of the tree (relative to it) holds the bytes of the output of an action that the
 # fake ran (its action cache), at the path of the input root that names FILE: `lib/<pkg>/`, `native/<pkg>/` and
-# `ir/<pkg>/` are the package's lean lib, build and IR directories, here the defaults
+# `ir/<pkg>/` are the package's lean lib, build and IR directories, here the defaults, but the lean lib is
+# FAKE_BYTES_LIB when that is set
 fake_bytes() {
   "$PYTHON" -c 'import hashlib, json, os, sys
-ac, files = os.path.join(sys.argv[1], "ac"), sys.argv[2:]
-dirs = {"lib": ".lake/build/lib/lean", "native": ".lake/build", "ir": ".lake/build/ir"}
+ac, files = os.path.join(sys.argv[1], "ac"), sys.argv[3:]
+dirs = {"lib": sys.argv[2], "native": ".lake/build", "ir": ".lake/build/ir"}
 outs = {}
 for k in (sorted(os.listdir(ac)) if os.path.isdir(ac) else []):
     for o in json.load(open(os.path.join(ac, k))).get("outputs") or []:
@@ -77,7 +79,7 @@ for f in files:
     if outs.get(f) != {d}:
         bad.append("%s is %s; the outputs of the fake there: %s" % (f, d, sorted(outs.get(f, ()))))
 print("\n".join(bad) or "%d files hold the outputs of the fake" % len(files))
-sys.exit(1 if bad else 0)' "$FAKE_CAS" "$@"
+sys.exit(1 if bad else 0)' "$FAKE_CAS" "${FAKE_BYTES_LIB:-.lake/build/lib/lean}" "$@"
 }
 # by_service_digest TARGET PRODUCER: TARGET's last `run` request takes the output of PRODUCER's `run` by digest,
 # `{rel, digest, executable}` with no path, and that digest is of an output that the fake stored there (its action
@@ -484,4 +486,20 @@ row_N18() (
   test_cmd fake_bytes .lake/build/lib/libnative_Nat0.so
 )
 
-run_rows N1 N2 N3 N4 N5 N6 N7 T7 N9 N10 N11 N12 N13 N14 N15 N16 N17 N18
+# N19: with `nativeLibDir` and `leanLibDir` both `../lib`, Nat0's library is below the `leanLibDir`, which Lake names
+# as a whole, so it has a path in the input root: the `LinkSharedLibrary` request runs on the service, its output and
+# Use2's input for that file are the same name, Use2's request takes the file by the digest of the service's output,
+# and the file holds the fake's bytes
+row_N19() (
+  local rel=lib/native.0/libnative_Nat0.so
+  enter N19 native; logs N19
+  { printf 'nativeLibDir = "../lib"\nleanLibDir = "../lib"\n'; cat "$TEST_DIR/native/lakefile.toml"; } > lakefile.toml
+  test_run build Use2 Nat0:shared
+  test_cmd_eq "$NATIVES" natives
+  test_cmd_eq "$rel" run_rels native/Nat0:shared libnative_Nat0.so
+  test_cmd_eq "$rel" run_rels Use2 libnative_Nat0.so
+  test_cmd by_service_digest Use2 native/Nat0:shared
+  FAKE_BYTES_LIB=.lake/lib test_cmd fake_bytes .lake/lib/libnative_Nat0.so
+)
+
+run_rows N1 N2 N3 N4 N5 N6 N7 T7 N9 N10 N11 N12 N13 N14 N15 N16 N17 N18 N19

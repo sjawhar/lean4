@@ -22,6 +22,7 @@ import Lake.Build.Target
 import Lake.Build.StampStore
 import Std.Time.DateTime.Timestamp
 import Init.Omega
+import Init.Data.String.Legacy
 import Std.Sync.Mutex
 import Init.Data.String.Search
 import Init.Data.Iterators.Consumers
@@ -1739,10 +1740,8 @@ form. A plugin or dynlib of the workspace goes in by the digest and executable b
 has one (`nativeServiceOutput`, which first promotes a native artifact of this build that has no service record), so
 that neither its local bytes nor its mode enter the action; any other one of the workspace with a path in the input
 root (an `extern_lib`'s, or one that `buildNativeSharedLib` links on this machine) goes in by path.
-A toolchain plugin is found under the local sysroot and named under the remote one. A plugin or dynlib with no path in
-the input root makes the request fail: one below no package's build directory and not under the sysroot (outside the
-workspace, or under an absolute `nativeLibDir` outside the build directory), or one below a `..` component of a
-package's directory (`remoteBuildPath`).
+A toolchain plugin, one with a path below the local sysroot (`pathBelow?`), is named under the remote one. A plugin or
+dynlib with no path in the input root (`remoteBuildPath`) and none below the sysroot makes the request fail.
 -/
 def remoteHead (presetup : ModulePreSetup) (s : RemoteSession) : JobM (Except PromotionError RemoteHead) := do
   let ws ← getWorkspace
@@ -2140,7 +2139,10 @@ partial def Module.serviceRequest (mod : Module) (presetup : ModulePreSetup) (s 
 The exact module-compile `run` request (contract C2.1): relative paths, `setup.json` inline, the toolchain as a
 platform property, and the plugins and dynlibs of `head`. Each workspace import goes in by path with the outputs that
 its service record describes (`Module.serviceFor`, which promotes an import that has none first), so that no local
-output is an input. Returns the request and the inputs that it takes by digest, each with its local path.
+output is an input. Returns the request and the inputs that it takes by digest, each with its local path. It fails
+when one of its names in the input root is absolute or has a `..` component (`nameOutsideInputRoot?`), which a
+module's or a package's name can make; a toolchain plugin is named under the remote sysroot, and only the rest of its
+name below the sysroot is checked.
 -/
 partial def Module.remoteRunRequest (mod : Module) (presetup : ModulePreSetup) (head : RemoteHead)
     (s : RemoteSession) : JobM (Except PromotionError (Json × Array (RemoteExec.Digest × FilePath))) := do
@@ -2186,6 +2188,13 @@ partial def Module.remoteRunRequest (mod : Module) (presetup : ModulePreSetup) (
     outs := outs.push bcRel
   outs := outs.qsort (fun a b => compare a b == .lt)
   let inputs := #[(presetup.srcFile, srcRel)] ++ importFiles ++ head.inputFiles
+  let libRels := (head.plugins ++ head.dynlibs).map fun p =>
+    ((p.dropPrefix? (head.sysroot ++ "/")).map (·.toString)).getD p
+  let names := inputs.map (·.2) ++ head.digestInputs.map (·.2.1) ++ outs ++
+    (head.leanPath.splitOn ":").toArray ++ libRels
+  if let some name := nameOutsideInputRoot? names then
+    return .error (.failed s!"{mod.name}: the request names {name}, which is not a path below the action's \
+      input root")
   let inputsJson := inputs.map (fun (path, rel) => remoteInputByPath rel path) ++
     head.digestInputs.map fun (_, rel, o) => remoteInputByDigest rel o
   let params := Json.mkObj [

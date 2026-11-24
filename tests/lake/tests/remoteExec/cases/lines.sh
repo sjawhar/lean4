@@ -1,5 +1,5 @@
 # The `lines` group of test.sh, which sources it: the rows of the log line's table (LAKE_REMOTE_EXEC_LOG),
-# L1-L34 with L4b, L5b, L5c, L5d, L5e, L5f, L5g, L5h and L9b, but L8 (remoteExecToolchainMismatch) and L29
+# L1-L36 with L4b, L5b, L5c, L5d, L5e, L5f, L5g, L5h and L9b, but L8 (remoteExecToolchainMismatch) and L29
 # (remoteExecSourceRace). Each row builds in directories of its own under $WORK/lines, and each build writes
 # its lines to a log of its own, which `lines_check.py` checks: one `lean` line for each module of the build,
 # every field with its type, and the row's own rules. L2, L3 and L4 build on L1's tree, Lake cache and
@@ -647,5 +647,33 @@ row_L34() (
   lines L34 --modules Rx.P,Rx.Q --expect 'Rx.P:result=executed|cached,exitCode=0' --expect "Rx.Q:$IMPORT_FAILED"
 )
 
+# L35: a module whose name has a `..` component, `Dot.«..».B` (its source is `Dot/../B.lean`), has names in the input
+# root with one too: Lake sends no `run` request, and the module fails with the code `request`, whose message names
+# such a name
+row_L35() (
+  enter L35; logs L35
+  rm lakefile.toml
+  printf 'import Lake\nopen Lake DSL\n\npackage rx\n\nlean_lib Dot where\n  roots := #[`Dot.«..».B]\n' > lakefile.lean
+  mkdir Dot
+  printf '/-! A module whose name has a `..` component. -/\n\ndef b := 1\n' > B.lean
+  LAKE_REMOTE_EXEC=grpc://fake:1 test_err \
+    "Dot.«..».B: the request names src/Dot/../B.lean, which is not a path below the action's input root" build Dot
+  test_cmd_eq 0 count_method run
+  lines L35 --modules 'Dot.«..».B' --expect 'Dot.«..».B:result=error,code=request'
+)
+
+# L36: a package named `«p/../../../x»`, whose key `«p/../../../x».0` gives the names of its modules' files in the input
+# root `..` components: Lake sends no `run` request, the modules that the build tries fail with the code `request`,
+# and their importers' imports failed
+row_L36() (
+  enter L36; logs L36
+  rm lakefile.toml
+  printf 'import Lake\nopen Lake DSL\n\npackage «p/../../../x»\n\nlean_lib Rx\n' > lakefile.lean
+  LAKE_REMOTE_EXEC=grpc://fake:1 test_err "which is not a path below the action's input root" build Rx
+  match_text 'Rx.A: the request names ir/«p/../../../x».0/Rx/A.' produced.out
+  test_cmd_eq 0 count_method run
+  lines L36 --modules "$MODS" --expect 'Rx.A|Rx.M:result=error,code=request' --expect "Rx.B|Rx.C|Rx:$IMPORT_FAILED"
+)
+
 run_rows L1 L2 L3 L4 L4b L5 L5d L5b L5e L5f L5g L5h L5c L6 L7 L9 L9b L10 L11 L12 L13 L14 L15 L16 L17 L18 L19 L20 \
-  L21 L22 L23 L24 L25 L26 L27 L28 L30 L31 L32 L33 L34
+  L21 L22 L23 L24 L25 L26 L27 L28 L30 L31 L32 L33 L34 L35 L36
