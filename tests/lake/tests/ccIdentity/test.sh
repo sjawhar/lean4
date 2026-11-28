@@ -16,7 +16,10 @@ fi
 
 ./clean.sh
 
-export REAL_CC=${CC:-cc}
+# The fake compilers run the system's C compiler, `cc`, as the other Lake tests do. Not `$CC`: the test suite puts
+# the Lean toolchain's `bin` first on `PATH` (tests/CMakeLists.txt), so a `CC` of `clang` (as a Nix shell sets it)
+# names the toolchain's clang, which finds its own headers (`stddef.h`) only with leanc's flags.
+export REAL_CC=cc
 for dir in plain plain2 avx2; do
   mkdir -p .lake/cc/$dir/tools
   cp fakecc.sh .lake/cc/$dir/cc

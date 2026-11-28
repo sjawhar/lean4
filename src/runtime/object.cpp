@@ -565,7 +565,7 @@ static obj_res mark_persistent_fn(obj_arg o) {
 #endif
 #endif
 
-extern "C" void lean_mark_persistent_unshared(object * o);
+extern "C" LEAN_EXPORT void lean_mark_persistent_unshared(object * o);
 
 static obj_res mark_persistent_unshared_fn(obj_arg o) {
     lean_mark_persistent_unshared(o);

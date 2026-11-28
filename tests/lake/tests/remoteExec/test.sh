@@ -18,10 +18,12 @@ test_cmd bash "$TEST_DIR/fake_selftest.sh"
 test_cmd "$PYTHON" "$TEST_DIR/lines_check.py" --self-test
 test_cmd "$PYTHON" "$TEST_DIR/probe_check.py" --self-test
 
+# Each case's copy of the test package is made writable, as `enter` below makes its copies: `cp` keeps the mode of
+# the checked-in files, which CI makes read-only, and cases edit their copy (e.g. `failed` rewrites Rx/B.lean).
 for d in local remote remote2 failed timeout unreach later later-local later2 wrongtc killed termed termed-write stuck \
     late late-ref fb-local fb-mixed fb-unavail fb-mat fb-mat-nf fb-seed fb-restore fb-wait fb-wait-mid \
     cf-seed cf-restore cf-svc cf-svc2; do
-  mkdir -p "$WORK/$d"; cp -r lakefile.toml Rx.lean Rx "$WORK/$d/"
+  mkdir -p "$WORK/$d"; cp -r lakefile.toml Rx.lean Rx "$WORK/$d/"; chmod -R u+w "$WORK/$d"
 done
 export LAKE_REMOTE_EXEC_CLIENT="$TEST_DIR/fake_lean_remote.py" FAKE_CAS="$WORK/cas" FAKE_LOG="$WORK/fake.log"
 export LAKE_REMOTE_EXEC_TOOLCHAIN=sha256:0000000000000000000000000000000000000000000000000000000000000001
