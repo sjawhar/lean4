@@ -23,7 +23,9 @@ ALL="Test.B Test.C Test.D Test.E Test.G"
 # a module-system file whose macro `mkms` `G` (importing `MS` and `X`) uses, so `MS` is one of `G`'s `extra` modules
 mkpkg() {
   mkdir -p "$1/Test"
+  # writable, since cases append to it: `cp` keeps the mode of the checked-in file, which CI makes read-only
   cp "$LAKEFILE" "$1/lakefile.toml"
+  chmod u+w "$1/lakefile.toml"
   seta "$1" "${2:-1}"
   printf 'def x := 0\n' > "$1/Test/X.lean"
   printf 'import Test.A\nimport Test.X\ndef b := a + 1\n' > "$1/Test/B.lean"
