@@ -20,13 +20,15 @@ on:
         options:
           - release nightly
       release_tag:
-        description: "Build as the run on this tag would (e.g. v4.36-machcsl-r21): check level 3, no nightly, no release"
+        description: "Forks only (refused on leanprover/lean4): build as the run on this tag would, at check level 3, with no nightly and no release. The tag's name: 'v' and then letters, digits, '.', '_' or '-' (e.g. v4.36-machcsl-r21)"
         required: false
         default: ""
         type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  # A dispatch with `release_tag` has a group of its own, so that it and a nightly re-release dispatch on the same ref
+  # do not cancel each other
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}${{ inputs.release_tag && '-release-tag' || '' }}
   cancel-in-progress: true
 
 jobs:
@@ -137,13 +139,29 @@ jobs:
           fi
 
       - name: Check for custom releases (e.g., not in the main lean repository)
-        # A dispatch with `release_tag` gives the tag's output here, so that its run has the tag's check level (3)
-        if: (startsWith(github.ref, 'refs/tags/') || inputs.release_tag) && github.repository != 'leanprover/lean4'
+        # A dispatch with `release_tag` (forks only) gives the tag's output here, so that its run has the tag's check
+        # level (3). The input reaches this step only as environment data, and only a tag-shaped name gets through;
+        # later steps read only whether this step gave a tag, as a Boolean.
+        if: (startsWith(github.ref, 'refs/tags/') && github.repository != 'leanprover/lean4') || inputs.release_tag != ''
         id: set-release-custom
         env:
           RELEASE_TAG_INPUT: ${{ inputs.release_tag }}
         run: |
-          TAG_NAME="${RELEASE_TAG_INPUT:-${GITHUB_REF##*/}}"
+          if [[ -n "$RELEASE_TAG_INPUT" ]]; then
+            if [[ "$GITHUB_REPOSITORY" == leanprover/lean4 ]]; then
+              echo "::error::release_tag is for forks: leanprover/lean4 builds its releases from tag pushes"
+              exit 1
+            fi
+            tag_re='^v[0-9A-Za-z._-]+$'
+            if [[ ! "$RELEASE_TAG_INPUT" =~ $tag_re ]]; then
+              echo "::error::release_tag must be a tag name: 'v' and then letters, digits, '.', '_' or '-'"
+              printf 'release_tag was: %q\n' "$RELEASE_TAG_INPUT"
+              exit 1
+            fi
+            TAG_NAME=$RELEASE_TAG_INPUT
+          else
+            TAG_NAME="${GITHUB_REF##*/}"
+          fi
           echo "RELEASE_TAG=$TAG_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Validate CMakeLists.txt version matches tag
@@ -207,7 +225,7 @@ jobs:
           macos_arm=false
           target_stage=1
 
-          if [[ -n "${{ steps.set-release.outputs.RELEASE_TAG }}" || -n "${{ steps.set-release-custom.outputs.RELEASE_TAG }}" ]]; then
+          if [[ -n "${{ steps.set-release.outputs.RELEASE_TAG }}" || "$CUSTOM_RELEASE" == true ]]; then
             check_level=3
           elif [[ -n "${{ steps.set-nightly.outputs.nightly }}" ]]; then
             check_level=2
@@ -247,6 +265,8 @@ jobs:
           } >> "$GITHUB_OUTPUT"
         env:
           GH_TOKEN: ${{ github.token }}
+          # whether "Check for custom releases" gave a tag (a fork's tag, or a validated `release_tag`), as a Boolean
+          CUSTOM_RELEASE: ${{ steps.set-release-custom.outputs.RELEASE_TAG != '' }}
 
       - name: Check self-hosted runner availability
         id: runner-fallback
