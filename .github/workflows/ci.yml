@@ -9,7 +9,7 @@ on:
   merge_group:
   schedule:
     - cron: "0 7 * * *" # 8AM CET/11PM PT
-  # for manual re-release of a nightly
+  # for manual re-release of a nightly, or (with `release_tag`) a run that builds as a tag's run would
   workflow_dispatch:
     inputs:
       action:
@@ -19,9 +19,16 @@ on:
         type: choice
         options:
           - release nightly
+      release_tag:
+        description: "Forks only (refused on leanprover/lean4): build as the run on this tag would, at check level 3, with no nightly and no release. The tag's name: 'v' and then letters, digits, '.', '_' or '-' (e.g. v4.36-machcsl-r21)"
+        required: false
+        default: ""
+        type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  # A dispatch with `release_tag` has a group of its own, so that it and a nightly re-release dispatch on the same ref
+  # do not cancel each other
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}${{ inputs.release_tag && '-release-tag' || '' }}
   cancel-in-progress: true
 
 jobs:
@@ -29,8 +36,8 @@ jobs:
   configure:
     runs-on: ubuntu-latest
     env:
-      # don't schedule nightlies on forks
-      IS_NIGHTLY: ${{ (github.event_name == 'schedule' && github.repository == 'leanprover/lean4') || inputs.action == 'release nightly' }}
+      # don't schedule nightlies on forks; a dispatch with `release_tag` builds as a tag's run, never a nightly
+      IS_NIGHTLY: ${{ ((github.event_name == 'schedule' && github.repository == 'leanprover/lean4') || inputs.action == 'release nightly') && !inputs.release_tag }}
       IS_LEAN4_REPO_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.repository == 'leanprover/lean4' }}
     outputs:
       # The build matrix, dynamically generated here
@@ -132,10 +139,29 @@ jobs:
           fi
 
       - name: Check for custom releases (e.g., not in the main lean repository)
-        if: startsWith(github.ref, 'refs/tags/') && github.repository != 'leanprover/lean4'
+        # A dispatch with `release_tag` (forks only) gives the tag's output here, so that its run has the tag's check
+        # level (3). The input reaches this step only as environment data, and only a tag-shaped name gets through;
+        # later steps read only whether this step gave a tag, as a Boolean.
+        if: (startsWith(github.ref, 'refs/tags/') && github.repository != 'leanprover/lean4') || inputs.release_tag != ''
         id: set-release-custom
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.release_tag }}
         run: |
-          TAG_NAME="${GITHUB_REF##*/}"
+          if [[ -n "$RELEASE_TAG_INPUT" ]]; then
+            if [[ "$GITHUB_REPOSITORY" == leanprover/lean4 ]]; then
+              echo "::error::release_tag is for forks: leanprover/lean4 builds its releases from tag pushes"
+              exit 1
+            fi
+            tag_re='^v[0-9A-Za-z._-]+$'
+            if [[ ! "$RELEASE_TAG_INPUT" =~ $tag_re ]]; then
+              echo "::error::release_tag must be a tag name: 'v' and then letters, digits, '.', '_' or '-'"
+              printf 'release_tag was: %q\n' "$RELEASE_TAG_INPUT"
+              exit 1
+            fi
+            TAG_NAME=$RELEASE_TAG_INPUT
+          else
+            TAG_NAME="${GITHUB_REF##*/}"
+          fi
           echo "RELEASE_TAG=$TAG_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Validate CMakeLists.txt version matches tag
@@ -199,7 +225,7 @@ jobs:
           macos_arm=false
           target_stage=1
 
-          if [[ -n "${{ steps.set-release.outputs.RELEASE_TAG }}" || -n "${{ steps.set-release-custom.outputs.RELEASE_TAG }}" ]]; then
+          if [[ -n "${{ steps.set-release.outputs.RELEASE_TAG }}" || "$CUSTOM_RELEASE" == true ]]; then
             check_level=3
           elif [[ -n "${{ steps.set-nightly.outputs.nightly }}" ]]; then
             check_level=2
@@ -239,6 +265,8 @@ jobs:
           } >> "$GITHUB_OUTPUT"
         env:
           GH_TOKEN: ${{ github.token }}
+          # whether "Check for custom releases" gave a tag (a fork's tag, or a validated `release_tag`), as a Boolean
+          CUSTOM_RELEASE: ${{ steps.set-release-custom.outputs.RELEASE_TAG != '' }}
 
       - name: Check self-hosted runner availability
         id: runner-fallback
@@ -273,6 +301,11 @@ jobs:
             const isPr = "${{ github.event_name }}" == "pull_request";
             const isPushToMaster = "${{ github.event_name }}" == "push" && "${{ github.ref_name }}" == "master";
             const chonk = ${{ steps.runner-fallback.outputs.use-runner }};
+            // The fork's tag build: a fork's tag push, or a dispatch with `release_tag`. "Check for custom releases"
+            // gives a tag for those, and also for a dispatch from a tag ref without `release_tag` (e.g. a nightly
+            // re-release), which is no tag build
+            const forkTag = ${{ steps.set-release-custom.outputs.RELEASE_TAG != '' && ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')) }};
+            const theoremLabs = ${{ github.repository == 'theorem-labs/lean4' }};
             let matrix = [
               /* TODO: to be updated to new LLVM
               {
@@ -353,7 +386,14 @@ jobs:
               },
               {
                 "name": "Linux tsanitize",
-                "os": large ? "nscloud-ubuntu-24.04-amd64-32x64" : "ubuntu-latest",
+                // In theorem-labs/lean4's tag build (LINUX-1736, E3(5)), a GitHub larger runner of 16 CPUs and 64 GB,
+                // for its memory: on ubuntu-latest the runner was lost about 39 s into
+                // elab/async_http_h1_incremental.lean, on r20's tag and on a rehearsal of r21's; upstream gives this
+                // job 32 CPUs and 64 GB. A probe run on theorem-labs/lean4 (run 46126841398, 2026-11-28) got
+                // `ubuntu-24.04-16core` in the organization's runner group `proofs`, with 16 CPUs and 62 GiB
+                // (`free -g`), so the label is selected only in theorem-labs/lean4, where the probe ran. `-j2` below is
+                // upstream's value for this job on 64 GB, the same memory, and stays.
+                "os": large ? "nscloud-ubuntu-24.04-amd64-32x64" : (forkTag && theoremLabs ? "ubuntu-24.04-16core" : "ubuntu-latest"),
                 "enabled": (level >= 2 || fsanitize) && target_stage < 2,
                 "test": true,
                 // turn off custom allocator & symbolic functions to make TSAN do its magic
@@ -380,7 +420,10 @@ jobs:
                 // Kept out of the merge queue, where it would be the slowest job; breakage surfaces
                 // on master instead.
                 "enabled": isPushToMaster || level >= 2 || macos_arm,
-                "test": level >= 2,
+                // Not tested in the fork's tag build (LINUX-1736, E3(5)); it still builds there. The fork publishes no
+                // macOS build, and on r20's tag 27 Lake tests and elab/openssl.lean failed: the fork's Lake tests
+                // assume GNU tools and a newer bash than macOS's bash 3.2, and the runner's OpenSSL is 4.
+                "test": level >= 2 && !forkTag,
                 // standard GH runner only comes with 7GB so use large runner if possible when running tests
                 "os": large && (fast || level >= 2) ? "nscloud-macos-sequoia-arm64-6x14" : "macos-15",
                 "CMAKE_OPTIONS": "-DLEAN_INSTALL_SUFFIX=-darwin_aarch64",
@@ -396,7 +439,9 @@ jobs:
                 "os": large && (fast || level >= 2) ? "namespace-profile-windows-amd64-4x16" : "windows-2022",
                 "release": true,
                 "enabled": level >= 2,
-                "test": true,
+                // Not tested in the fork's tag build (LINUX-1736, E3(5)); it still builds there. The fork publishes no
+                // Windows build, and the fork's tests assume a POSIX system; sjawhar/lean4#12 keeps the build working.
+                "test": !forkTag,
                 "shell": "msys2 {0}",
                 "CMAKE_OPTIONS": "-G \"Unix Makefiles\"",
                 "llvm-url": "https://github.com/leanprover/lean-llvm/releases/download/23.1.1/lean-llvm-x86_64-w64-windows-gnu.tar.zst",
@@ -505,10 +550,12 @@ jobs:
           script: |
             core.setFailed('Some jobs failed')
 
-  # This job creates releases from tags
+  # This job creates releases from tags pushed to leanprover/lean4
   # (whether they are "unofficial" releases for experiments, or official releases when the tag is "v" followed by a semver string.)
+  # A fork attaches nothing to a tag's release: its releases hold only the files it publishes by hand, so this job does
+  # not run there. A dispatch with `release_tag` builds as a tag's run, and is no tag push.
   release:
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.repository == 'leanprover/lean4'
     runs-on: ubuntu-latest
     needs: build
     permissions:
@@ -526,7 +573,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Update release.lean-lang.org
-        if: github.repository == 'leanprover/lean4'
         run: |
           gh workflow -R leanprover/release-index run update-index.yml
         env:
