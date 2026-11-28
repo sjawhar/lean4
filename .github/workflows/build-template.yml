@@ -196,7 +196,10 @@ jobs:
         name: Upload Lake Cache
         # Caching on cancellation created some mysterious issues perhaps related to improper build
         # shutdown. Also, since this needs access to secrets, it cannot be run on forks.
-        if: matrix.lake-cache && !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        # Nor where the repository has no cache endpoint (`vars.LAKE_CACHE_ENDPOINT`): a fork of lean4
+        # has neither it nor the key, and there `lake cache put` fails with the endpoint `/a1`, so a
+        # pull request within the fork failed here before its tests ran.
+        if: matrix.lake-cache && !cancelled() && vars.LAKE_CACHE_ENDPOINT != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         run: |
           curl --version
           cd src
