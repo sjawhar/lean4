@@ -9,9 +9,14 @@ A preload for the Linux part of cacheInsertPartial/test.sh:
   that starts with <prefix> is logged to <file>.
 - LAKE_TEST_STAT_PATH=<path>, LAKE_TEST_STAT_BARRIER=<dir>: a `stat` of <path> creates <dir>/<pid>,
   waits until <dir>/release exists, and reports that <path> does not exist.
+It replaces functions of the C library, which a process calls through the dynamic linker, and not
+libuv's: a release links libuv into libleanshared.so with -Bsymbolic, so the runtime's calls of
+`uv_fs_link` and `uv_fs_stat` bind inside that library, where no preload can replace them. libuv
+makes a hard link with `link`, and a `stat` with the `statx` system call through `syscall`.
 */
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -19,8 +24,8 @@ A preload for the Linux part of cacheInsertPartial/test.sh:
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 #include <unistd.h>
-#include <uv.h>
 
 static int env_is(const char *name, const char *path) {
   const char *value = getenv(name);
@@ -80,12 +85,12 @@ int open64(const char *path, int flags, ...) {
   return fd;
 }
 
-int uv_fs_stat(uv_loop_t *loop, uv_fs_t *req, const char *path, uv_fs_cb cb) {
+/* Whether a `stat` of `path` is held by LAKE_TEST_STAT_BARRIER: then it has waited until the
+   barrier's release, and the caller reports that `path` does not exist. */
+static int stat_held(const char *path) {
   const char *barrier = getenv("LAKE_TEST_STAT_BARRIER");
-  if (barrier == NULL || !env_is("LAKE_TEST_STAT_PATH", path)) {
-    typedef int (*uv_fs_stat_fn)(uv_loop_t *, uv_fs_t *, const char *, uv_fs_cb);
-    return ((uv_fs_stat_fn)dlsym(RTLD_NEXT, "uv_fs_stat"))(loop, req, path, cb);
-  }
+  if (barrier == NULL || path == NULL || !env_is("LAKE_TEST_STAT_PATH", path))
+    return 0;
   char marker[4096], release[4096];
   snprintf(marker, sizeof(marker), "%s/%ld", barrier, (long)getpid());
   snprintf(release, sizeof(release), "%s/release", barrier);
@@ -94,20 +99,32 @@ int uv_fs_stat(uv_loop_t *loop, uv_fs_t *req, const char *path, uv_fs_cb cb) {
     close(fd);
   while (access(release, F_OK) != 0)
     usleep(1000);
-  memset(req, 0, sizeof(*req));
-  req->fs_type = UV_FS_STAT;
-  req->result = UV_ENOENT;
-  return UV_ENOENT;
+  return 1;
 }
 
-int uv_fs_link(uv_loop_t *loop, uv_fs_t *req, const char *path, const char *new_path, uv_fs_cb cb) {
-  if (!env_prefixes("LAKE_TEST_FAIL_LINK", new_path)) {
-    typedef int (*uv_fs_link_fn)(uv_loop_t *, uv_fs_t *, const char *, const char *, uv_fs_cb);
-    return ((uv_fs_link_fn)dlsym(RTLD_NEXT, "uv_fs_link"))(loop, req, path, new_path, cb);
+/* libuv's `stat` is `syscall(SYS_statx, dirfd, path, flags, mask, buf)`. Every other call passes
+   on its six possible arguments, as the C library's `syscall` itself reads them. */
+long syscall(long number, ...) {
+  va_list args;
+  va_start(args, number);
+  long arg[6];
+  for (int i = 0; i < 6; i++)
+    arg[i] = va_arg(args, long);
+  va_end(args);
+#ifdef SYS_statx
+  if (number == SYS_statx && stat_held((const char *)arg[1])) {
+    errno = ENOENT;
+    return -1;
   }
+#endif
+  return ((long (*)(long, ...))dlsym(RTLD_NEXT, "syscall"))(
+    number, arg[0], arg[1], arg[2], arg[3], arg[4], arg[5]);
+}
+
+int link(const char *path, const char *new_path) {
+  if (!env_prefixes("LAKE_TEST_FAIL_LINK", new_path))
+    return ((int (*)(const char *, const char *))dlsym(RTLD_NEXT, "link"))(path, new_path);
   log_line("LAKE_TEST_LINK_LOG", new_path);
-  memset(req, 0, sizeof(*req));
-  req->fs_type = UV_FS_LINK;
-  req->result = UV_EPERM;
-  return UV_EPERM;
+  errno = EPERM;
+  return -1;
 }
