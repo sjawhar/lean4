@@ -21,8 +21,9 @@ libuv's: a release links libuv into libleanshared.so with -Bsymbolic, so the run
   `__xstat64` (or `__xstat`), and from 2.33 `stat` (or `stat64`). The barrier holds a `stat` of its
   path in `syscall` for statx and in each of these entry points, and in `fstatat`, `fstatat64`,
   `__fxstatat`, `__fxstatat64` and the C library's own `statx`.
-This file declares those entry points itself, with `void *` for the buffers it passes on untouched,
-and does not include <sys/stat.h>, whose declarations differ between glibc versions.
+This file declares those entry points itself, with the stat structs declared but not defined (it
+passes the buffers on untouched), and does not include <sys/stat.h>, whose declarations differ
+between C library versions.
 */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -54,6 +55,11 @@ and does not include <sys/stat.h>, whose declarations differ between glibc versi
 #ifdef SYS_statx
 _Static_assert(SYS_statx == NHL_SYS_STATX, "SYS_statx is not NHL_SYS_STATX");
 #endif
+
+/* The buffers of the `stat` family, which this file only passes on */
+struct stat;
+struct stat64;
+struct statx;
 
 static int env_is(const char *name, const char *path) {
   const char *value = getenv(name);
@@ -138,51 +144,61 @@ static int not_found(void) {
   return -1;
 }
 
-/* The C library's definition of `name` that this preload replaces (of symbol version `version`, if
-   not NULL), or NULL with errno ENOSYS if it has none. */
+/* The C library's definition of `name` that this preload replaces, or NULL with errno ENOSYS if it
+   has none. With glibc, `version` (if not NULL) is the definition's symbol version; other C
+   libraries (musl) have neither `dlvsym` nor the versioned names, so `dlsym` finds none there. */
 static void *next(const char *name, const char *version) {
+#ifdef __GLIBC__
   void *f = version != NULL ? dlvsym(RTLD_NEXT, name, version) : dlsym(RTLD_NEXT, name);
+#else
+  (void)version;
+  void *f = dlsym(RTLD_NEXT, name);
+#endif
   if (f == NULL)
     errno = ENOSYS;
   return f;
 }
 
-typedef int (*stat_fn)(const char *, void *);
-typedef int (*fstatat_fn)(int, const char *, void *, int);
-typedef int (*statx_fn)(int, const char *, int, unsigned int, void *);
-typedef int (*xstat_fn)(int, const char *, void *);
-typedef int (*fxstatat_fn)(int, int, const char *, void *, int);
+typedef int (*stat_fn)(const char *, struct stat *);
+typedef int (*stat64_fn)(const char *, struct stat64 *);
+typedef int (*fstatat_fn)(int, const char *, struct stat *, int);
+typedef int (*fstatat64_fn)(int, const char *, struct stat64 *, int);
+typedef int (*statx_fn)(int, const char *, int, unsigned int, struct statx *);
+typedef int (*xstat_fn)(int, const char *, struct stat *);
+typedef int (*xstat64_fn)(int, const char *, struct stat64 *);
+typedef int (*fxstatat_fn)(int, int, const char *, struct stat *, int);
+typedef int (*fxstatat64_fn)(int, int, const char *, struct stat64 *, int);
 
 /* The `stat` family of glibc 2.33 and later, and the C library's `statx` (glibc 2.28). */
-int stat(const char *path, void *buf) {
+int stat(const char *path, struct stat *buf) {
   if (stat_held(AT_FDCWD, path))
     return not_found();
   stat_fn f = (stat_fn)next("stat", NULL);
   return f != NULL ? f(path, buf) : -1;
 }
 
-int stat64(const char *path, void *buf) {
+int stat64(const char *path, struct stat64 *buf) {
   if (stat_held(AT_FDCWD, path))
     return not_found();
-  stat_fn f = (stat_fn)next("stat64", NULL);
+  stat64_fn f = (stat64_fn)next("stat64", NULL);
   return f != NULL ? f(path, buf) : -1;
 }
 
-int fstatat(int dirfd, const char *path, void *buf, int flags) {
+int fstatat(int dirfd, const char *path, struct stat *buf, int flags) {
   if (stat_held(dirfd, path))
     return not_found();
   fstatat_fn f = (fstatat_fn)next("fstatat", NULL);
   return f != NULL ? f(dirfd, path, buf, flags) : -1;
 }
 
-int fstatat64(int dirfd, const char *path, void *buf, int flags) {
+int fstatat64(int dirfd, const char *path, struct stat64 *buf, int flags) {
   if (stat_held(dirfd, path))
     return not_found();
-  fstatat_fn f = (fstatat_fn)next("fstatat64", NULL);
+  fstatat64_fn f = (fstatat64_fn)next("fstatat64", NULL);
   return f != NULL ? f(dirfd, path, buf, flags) : -1;
 }
 
-int statx(int dirfd, const char *path, int flags, unsigned int mask, void *buf) {
+int statx(int dirfd, const char *path, int flags, unsigned int mask, struct statx *buf) {
   if (stat_held(dirfd, path))
     return not_found();
   statx_fn f = (statx_fn)next("statx", NULL);
@@ -191,31 +207,31 @@ int statx(int dirfd, const char *path, int flags, unsigned int mask, void *buf) 
 
 /* The entry points that `stat` and `fstatat` compile to against glibc before 2.33, found by their
    symbol version: from 2.33 glibc keeps them only under it, and `dlsym` does not return them. */
-int __xstat(int ver, const char *path, void *buf) {
+int __xstat(int ver, const char *path, struct stat *buf) {
   if (stat_held(AT_FDCWD, path))
     return not_found();
   xstat_fn f = (xstat_fn)next("__xstat", NHL_GLIBC_XSTAT);
   return f != NULL ? f(ver, path, buf) : -1;
 }
 
-int __xstat64(int ver, const char *path, void *buf) {
+int __xstat64(int ver, const char *path, struct stat64 *buf) {
   if (stat_held(AT_FDCWD, path))
     return not_found();
-  xstat_fn f = (xstat_fn)next("__xstat64", NHL_GLIBC_XSTAT);
+  xstat64_fn f = (xstat64_fn)next("__xstat64", NHL_GLIBC_XSTAT);
   return f != NULL ? f(ver, path, buf) : -1;
 }
 
-int __fxstatat(int ver, int dirfd, const char *path, void *buf, int flags) {
+int __fxstatat(int ver, int dirfd, const char *path, struct stat *buf, int flags) {
   if (stat_held(dirfd, path))
     return not_found();
   fxstatat_fn f = (fxstatat_fn)next("__fxstatat", NHL_GLIBC_FXSTATAT);
   return f != NULL ? f(ver, dirfd, path, buf, flags) : -1;
 }
 
-int __fxstatat64(int ver, int dirfd, const char *path, void *buf, int flags) {
+int __fxstatat64(int ver, int dirfd, const char *path, struct stat64 *buf, int flags) {
   if (stat_held(dirfd, path))
     return not_found();
-  fxstatat_fn f = (fxstatat_fn)next("__fxstatat64", NHL_GLIBC_FXSTATAT);
+  fxstatat64_fn f = (fxstatat64_fn)next("__fxstatat64", NHL_GLIBC_FXSTATAT);
   return f != NULL ? f(ver, dirfd, path, buf, flags) : -1;
 }
 
@@ -233,17 +249,25 @@ Both jumps follow the processor's calling convention: on x86-64 (System V) and o
 same order, as a call of a function prototyped with those parameter types, and a jump leaves the
 caller's return address for the target. A constructor of another library can call `syscall` before
 this preload's constructors would run, so the C library's `syscall` is looked up at the first call:
-the instructions save the argument registers, call `nhl_resolve_syscall`, and restore them.
+the instructions save the argument registers, call `nhl_resolve_syscall`, and restore them. If the C
+library has no `syscall`, they jump to `nhl_syscall_missing`, so the call fails with ENOSYS.
 */
 typedef long (*syscall_fn)(long, ...);
 
 /* The C library's `syscall` once looked up; the instructions below read it. */
 __attribute__((visibility("hidden"))) syscall_fn nhl_real_syscall;
 
+/* Looks up the C library's `syscall`; NULL if it has none */
 __attribute__((visibility("hidden"))) syscall_fn nhl_resolve_syscall(void) {
   syscall_fn f = (syscall_fn)dlsym(RTLD_NEXT, "syscall");
   __atomic_store_n(&nhl_real_syscall, f, __ATOMIC_RELEASE);
   return f;
+}
+
+/* A `syscall` call where the C library has no `syscall` */
+__attribute__((visibility("hidden"))) long nhl_syscall_missing(void) {
+  errno = ENOSYS;
+  return -1;
 }
 
 /* `syscall(SYS_statx, dirfd, path, flags, mask, buf)`, as libuv's `uv__statx` calls it */
@@ -254,6 +278,8 @@ __attribute__((visibility("hidden"))) long nhl_statx_from_syscall(long number, i
   syscall_fn real = __atomic_load_n(&nhl_real_syscall, __ATOMIC_ACQUIRE);
   if (real == NULL)
     real = nhl_resolve_syscall();
+  if (real == NULL)
+    return nhl_syscall_missing();
   return real(number, dirfd, path, flags, mask, buf);
 }
 
@@ -291,6 +317,8 @@ __asm__(
   "  popq %rdx\n"
   "  popq %rsi\n"
   "  popq %rdi\n"
+  "  testq %rax, %rax\n"
+  "  jz nhl_syscall_missing\n"
   "  jmp *%rax\n"
   "  .size syscall, .-syscall\n"
   "  .popsection\n");
@@ -323,6 +351,7 @@ __asm__(
   "  ldp x4, x5, [sp, #48]\n"
   "  ldr x6, [sp, #64]\n"
   "  ldp x29, x30, [sp], #80\n"
+  "  cbz x16, nhl_syscall_missing\n"
   "  br x16\n"
   "  .size syscall, .-syscall\n"
   "  .popsection\n");
