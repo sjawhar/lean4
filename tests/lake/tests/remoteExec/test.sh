@@ -196,7 +196,8 @@ test_cmd_eq 1 grep -cxF "\"end of input $(cat "$WORK/remote2.pid")\"" "$WORK/exi
 # A client that runs the bridge as its child (a wrapper script without `exec`, as `timeout` or
 # `strace -f` also do): when Lake kills the decision bridge, that child keeps Lake's pipes and exits
 # only at end of input, so Lake must close the bridge's input too, or it never exits.
-printf '#!/bin/sh\n"%s" "$@"\n' "$TEST_DIR/fake_lean_remote.py" > "$WORK/fork-bridge"; chmod +x "$WORK/fork-bridge"
+# The bridge runs the fake beside its directory's parent ($WORK/fork-bridge, $TEST_DIR/fake_lean_remote.py)
+printf '%s\n' '#!/bin/sh' '"${0%/*}/../fake_lean_remote.py" "$@"' > "$WORK/fork-bridge"; chmod +x "$WORK/fork-bridge"
 rc=0
 (cd "$WORK/remote" && FAKE_PIDFILE="$WORK/fork.pid" LAKE_REMOTE_EXEC_CLIENT="$WORK/fork-bridge" \
   LAKE_REMOTE_EXEC=grpc://fake:1 timeout 120 "$LAKE" build Rx > "$WORK/fork.out" 2>&1) || rc=$?

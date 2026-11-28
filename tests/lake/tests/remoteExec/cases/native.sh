@@ -164,7 +164,8 @@ row_N2() (
 row_N3() (
   enter N3 native; logs N3
   mkdir -p "$NW/N3.bin"
-  printf '#!/bin/sh\necho "$*" >> "%s"\nexit 1\n' "$NW/N3.cc.log" > "$NW/N3.bin/cc"
+  # The script's log is beside its directory: $NW/N3.cc.log
+  printf '%s\n' '#!/bin/sh' 'echo "$*" >> "${0%/*}/../N3.cc.log"' 'exit 1' > "$NW/N3.bin/cc"
   chmod +x "$NW/N3.bin/cc"
   : > "$NW/N3.cc.log"
   LEAN_CC="$NW/N3.bin/cc" PATH="$NW/N3.bin:$PATH" test_run build Use2 Nat0:shared
@@ -336,7 +337,9 @@ row_N13() (
 row_N14() (
   enter N14 native; logs N14
   mkdir -p "$NW/N14.bin"
-  printf '#!/bin/sh\nrm -f "%s"\nsleep 30\nexec "%s" -g "$@"\n' "$NW/N14.down" "$LAKE_REMOTE_EXEC_CC" > "$NW/N14.bin/cc"
+  # The script removes the down file beside its directory, $NW/N14.down
+  printf '%s\n' '#!/bin/sh' 'rm -f "${0%/*}/../N14.down"' 'sleep 30' 'exec "$LAKE_REMOTE_EXEC_CC" -g "$@"' \
+    > "$NW/N14.bin/cc"
   chmod +x "$NW/N14.bin/cc"
   touch "$NW/N14.down"
   LEAN_CC=cc PATH="$NW/N14.bin:$PATH" FAKE_DOWN_FILE="$NW/N14.down" test_run build +Nat0.Tac:dynlib
@@ -367,18 +370,22 @@ row_N15() (
   mkdir -p "$NW/N15.bin"
   printf '#!/bin/sh\nexec "$LAKE_REMOTE_EXEC_CC" -g "$@" -L "$LAKE_REMOTE_EXEC_SYSROOT/lib"\n' > "$NW/N15.bin/cc"
   chmod +x "$NW/N15.bin/cc"
-  cat > Nat0/Slow.lean << EOF
+  # The module reads the paths of the fake's down file and log from the environment of its compile (FAKE_DOWN_FILE, set
+  # for the row's first build, and FAKE_LOG)
+  cat > Nat0/Slow.lean << 'EOF'
 import Nat0.Use
 
 /-! A module whose compile brings the build service back: it removes the fake's down file, then waits until the fake
-answered a \`hello\` as reachable (at most 120 s), and 2 s more. -/
+answered a `hello` as reachable (at most 120 s), and 2 s more. -/
 
 #eval show IO Unit from do
-  let down : System.FilePath := "$NW/N15.down"
+  let some down ← IO.getEnv "FAKE_DOWN_FILE" | return
+  let down : System.FilePath := down
   if !(← down.pathExists) then return
   IO.FS.removeFile down
+  let some log ← IO.getEnv "FAKE_LOG" | throw <| IO.userError "FAKE_LOG is not set"
   for _ in [0:1200] do
-    if ((← IO.FS.readFile "$FAKE_LOG").splitOn "\"reachable\": true").length > 1 then
+    if ((← IO.FS.readFile log).splitOn "\"reachable\": true").length > 1 then
       IO.sleep 2000
       return
     IO.sleep 100

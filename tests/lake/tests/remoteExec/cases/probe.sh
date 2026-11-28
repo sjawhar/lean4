@@ -98,8 +98,9 @@ row_S3() (
   enter_row S3; bridges
   slow Sl 20000; slow W 3000
   printf 'import Rx.W\n\n/-! A module whose run answers UNAVAILABLE. -/\n\ndef u := w\n' > Rx/U.lean
-  # The killed bridge leaves its action's scratch root in the row's directory
-  mkdir -p "$D/tmp"; printf 'export TMPDIR="%s"\n' "$D/tmp" > "$B/2.env"
+  # The killed bridge leaves its action's scratch root in the row's directory: the bridge, which sources 2.env,
+  # expands the exported BRIDGES ($D/b) when it runs
+  mkdir -p "$D/tmp"; printf 'export TMPDIR="$BRIDGES/../tmp"\n' > "$B/2.env"
   echo '$' lake build Rx.Sl Rx.U
   FAKE_CONCURRENT=1 FAKE_UNAVAILABLE_TARGET=Rx.U "$LAKE" build Rx.Sl Rx.U > "$D/out" 2>&1 & lake_pid=$!
   trap 'kill "$lake_pid" 2> /dev/null || true' EXIT

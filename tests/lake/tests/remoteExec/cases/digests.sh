@@ -127,7 +127,8 @@ row_D1() (
   for g in g g0; do
     enter "D1-$g" native; export FAKE_CAS="$DW/D1.cas"; logs "D1-$g"
     mkdir -p "$DW/D1-$g.bin"
-    printf '#!/bin/sh\nexec "%s" -%s "$@"\n' "$LAKE_REMOTE_EXEC_CC" "$g" > "$DW/D1-$g.bin/cc"
+    # The script expands the exported LAKE_REMOTE_EXEC_CC when it runs; `-$g` is `-g` or `-g0`, no path
+    printf '#!/bin/sh\nexec "$LAKE_REMOTE_EXEC_CC" -%s "$@"\n' "$g" > "$DW/D1-$g.bin/cc"
     chmod +x "$DW/D1-$g.bin/cc"
     LEAN_CC=cc PATH="$DW/D1-$g.bin:$PATH" test_run build Use2 Nat0:shared
   done
