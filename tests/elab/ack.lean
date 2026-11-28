@@ -16,8 +16,10 @@ trace: [simp] Diagnostics
   use `set_option diagnostics.threshold <num>` to control threshold for reporting counters
 ---
 trace: [diag] Diagnostics
-  [kernel] unfolded declarations (max: 86, num: 1):
-    [kernel] OfNat.ofNat ↦ 86
+  [kernel] unfolded declarations (max: 176, num: 3):
+    [kernel] OfNat.ofNat ↦ 176
+    [kernel] Add.add ↦ 60
+    [kernel] HAdd.hAdd ↦ 60
   use `set_option diagnostics.threshold <num>` to control threshold for reporting counters
 -/
 #guard_msgs in
@@ -40,8 +42,10 @@ trace: [simp] Diagnostics
   use `set_option diagnostics.threshold <num>` to control threshold for reporting counters
 ---
 trace: [diag] Diagnostics
-  [kernel] unfolded declarations (max: 84, num: 1):
-    [kernel] OfNat.ofNat ↦ 84
+  [kernel] unfolded declarations (max: 174, num: 3):
+    [kernel] OfNat.ofNat ↦ 174
+    [kernel] Add.add ↦ 58
+    [kernel] HAdd.hAdd ↦ 58
   use `set_option diagnostics.threshold <num>` to control threshold for reporting counters
 -/
 #guard_msgs in
@@ -64,8 +68,10 @@ trace: [simp] Diagnostics
   use `set_option diagnostics.threshold <num>` to control threshold for reporting counters
 ---
 trace: [diag] Diagnostics
-  [kernel] unfolded declarations (max: 84, num: 1):
-    [kernel] OfNat.ofNat ↦ 84
+  [kernel] unfolded declarations (max: 174, num: 3):
+    [kernel] OfNat.ofNat ↦ 174
+    [kernel] Add.add ↦ 58
+    [kernel] HAdd.hAdd ↦ 58
   use `set_option diagnostics.threshold <num>` to control threshold for reporting counters
 -/
 #guard_msgs in
@@ -85,8 +91,10 @@ trace: [simp] Diagnostics
   use `set_option diagnostics.threshold <num>` to control threshold for reporting counters
 ---
 trace: [diag] Diagnostics
-  [kernel] unfolded declarations (max: 84, num: 1):
-    [kernel] OfNat.ofNat ↦ 84
+  [kernel] unfolded declarations (max: 174, num: 3):
+    [kernel] OfNat.ofNat ↦ 174
+    [kernel] Add.add ↦ 58
+    [kernel] HAdd.hAdd ↦ 58
   use `set_option diagnostics.threshold <num>` to control threshold for reporting counters
 -/
 #guard_msgs in
