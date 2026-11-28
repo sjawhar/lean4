@@ -9,7 +9,7 @@ on:
   merge_group:
   schedule:
     - cron: "0 7 * * *" # 8AM CET/11PM PT
-  # for manual re-release of a nightly
+  # for manual re-release of a nightly, or (with `release_tag`) a run that builds as a tag's run would
   workflow_dispatch:
     inputs:
       action:
@@ -19,6 +19,11 @@ on:
         type: choice
         options:
           - release nightly
+      release_tag:
+        description: "Build as the run on this tag would (e.g. v4.36-machcsl-r21): check level 3, no nightly, no release"
+        required: false
+        default: ""
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
@@ -29,8 +34,8 @@ jobs:
   configure:
     runs-on: ubuntu-latest
     env:
-      # don't schedule nightlies on forks
-      IS_NIGHTLY: ${{ (github.event_name == 'schedule' && github.repository == 'leanprover/lean4') || inputs.action == 'release nightly' }}
+      # don't schedule nightlies on forks; a dispatch with `release_tag` builds as a tag's run, never a nightly
+      IS_NIGHTLY: ${{ ((github.event_name == 'schedule' && github.repository == 'leanprover/lean4') || inputs.action == 'release nightly') && !inputs.release_tag }}
       IS_LEAN4_REPO_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.repository == 'leanprover/lean4' }}
     outputs:
       # The build matrix, dynamically generated here
@@ -132,10 +137,13 @@ jobs:
           fi
 
       - name: Check for custom releases (e.g., not in the main lean repository)
-        if: startsWith(github.ref, 'refs/tags/') && github.repository != 'leanprover/lean4'
+        # A dispatch with `release_tag` gives the tag's output here, so that its run has the tag's check level (3)
+        if: (startsWith(github.ref, 'refs/tags/') || inputs.release_tag) && github.repository != 'leanprover/lean4'
         id: set-release-custom
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.release_tag }}
         run: |
-          TAG_NAME="${GITHUB_REF##*/}"
+          TAG_NAME="${RELEASE_TAG_INPUT:-${GITHUB_REF##*/}}"
           echo "RELEASE_TAG=$TAG_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Validate CMakeLists.txt version matches tag
@@ -505,10 +513,12 @@ jobs:
           script: |
             core.setFailed('Some jobs failed')
 
-  # This job creates releases from tags
+  # This job creates releases from tags pushed to leanprover/lean4
   # (whether they are "unofficial" releases for experiments, or official releases when the tag is "v" followed by a semver string.)
+  # A fork attaches nothing to a tag's release: its releases hold only the files it publishes by hand, so this job does
+  # not run there. A dispatch with `release_tag` builds as a tag's run, and is no tag push.
   release:
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.repository == 'leanprover/lean4'
     runs-on: ubuntu-latest
     needs: build
     permissions:
@@ -526,7 +536,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Update release.lean-lang.org
-        if: github.repository == 'leanprover/lean4'
         run: |
           gh workflow -R leanprover/release-index run update-index.yml
         env:
