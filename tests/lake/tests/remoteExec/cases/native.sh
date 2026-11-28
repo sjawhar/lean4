@@ -17,6 +17,11 @@ unset LAKE_REMOTE_EXEC_TIMEOUT LAKE_REMOTE_EXEC_FALLBACK LAKE_ARTIFACT_CACHE LAK
 LAKE_REMOTE_EXEC_CC=$(command -v cc)
 lld=$(command -v ld.lld)
 export LAKE_REMOTE_EXEC_CC LAKE_REMOTE_EXEC_PATH="$(dirname "$lld"):/usr/bin:/bin"
+# The toolchain's library directory, which a local C compiler of a row (LEAN_CC, a script that runs LAKE_REMOTE_EXEC_CC)
+# needs to link a library here: Lake gives such a compiler Lean's link flags (`-lc++`, `-lc++abi`, `-lgmp`, ...) with
+# only `-L <sysroot>/lib/lean` (Lake and leanc give `<sysroot>/lib` only to Lean's own compiler), and a standalone
+# toolchain, as CI's, keeps those libraries as static archives in `<sysroot>/lib`, which the service's links search
+LOCAL_CC_LIB="$LAKE_REMOTE_EXEC_SYSROOT/lib"
 MODS=Nat0,Nat0.Tac,Nat0.Use,Use2
 # The native targets of `lake build Use2 Nat0:shared`: the object of each module, the module libraries that the
 # compiles of Nat0.Use and Nat0 load, and the library that Use2's compile loads
@@ -267,7 +272,7 @@ build_N11() (
   [ ! -e "$NW/N11.built" ] || exit 0
   enter N11 native; logs N11-local
   mkdir -p "$NW/N11.bin"
-  printf '#!/bin/sh\nexec "%s" -g "$@"\n' "$LAKE_REMOTE_EXEC_CC" > "$NW/N11.bin/cc"
+  printf '#!/bin/sh\nexec "%s" -g "$@" -L "%s"\n' "$LAKE_REMOTE_EXEC_CC" "$LOCAL_CC_LIB" > "$NW/N11.bin/cc"
   chmod +x "$NW/N11.bin/cc"
   LEAN_CC=cc PATH="$NW/N11.bin:$PATH" FAKE_UNREACHABLE=1 test_run build Use2 Nat0:shared
   logs N11
@@ -333,7 +338,10 @@ row_N14() (
   printf '#!/bin/sh\nrm -f "%s"\nsleep 30\nexec "%s" -g "$@"\n' "$NW/N14.down" "$LAKE_REMOTE_EXEC_CC" > "$NW/N14.bin/cc"
   chmod +x "$NW/N14.bin/cc"
   touch "$NW/N14.down"
-  LEAN_CC=cc PATH="$NW/N14.bin:$PATH" FAKE_DOWN_FILE="$NW/N14.down" test_run build +Nat0.Tac:dynlib
+  # Every build of the row's tree has the row's local C compiler: an object's trace holds the local compiler's flags
+  # (`ccFlags`), in service mode too, and Lake's own compiler, where the toolchain has one (as CI's), has other flags
+  export LEAN_CC=cc PATH="$NW/N14.bin:$PATH"
+  FAKE_DOWN_FILE="$NW/N14.down" test_run build +Nat0.Tac:dynlib
   check_lines "$NW/N14.jsonl" --modules Nat0.Tac --expect 'Nat0.Tac:result=local' \
     --expect 'Nat0.Tac:c.o.export:kind=c,result=local' --expect 'Nat0.Tac:dynlib:kind=shared,result=executed|cached'
   test_cmd_eq "CCompile:Nat0.Tac:c.o.export LinkShared:Nat0.Tac:dynlib" natives
@@ -344,8 +352,8 @@ row_N14() (
 )
 
 # N15: N14 with a chain of modules, the usage cutoff, the artifact cache and `lake build -o`. Nat0.Tac, Nat0.Use (which
-# imports it), their objects and module libraries compile here while the service does not answer, with N14's local C
-# compiler (`-g`, no delay); then so does Nat0.Slow, which imports Nat0.Use and is in Nat0: its compile brings the
+# imports it), their objects and module libraries compile here while the service does not answer, with N11's local C
+# compiler (`-g`); then so does Nat0.Slow, which imports Nat0.Use and is in Nat0: its compile brings the
 # service back (it removes the down file) and lasts until a probe has found the service. The targets after it go to
 # the service, and their requests promote each of those modules, objects and module libraries. After the build no
 # file names a promoted one as it was before its promotion (`promo_check.py`). The Lake cache's entry under an input
@@ -354,14 +362,16 @@ row_N14() (
 # a copy of the sources and a new Lake cache that holds only the artifacts that the mappings name, which `lake cache
 # add` installs. With service mode off, the fresh tree restores every target with no compile or link, but the objects,
 # with the bytes that the row's tree holds: on this tree an object's trace with service mode off also holds the local
-# C compiler's identity (`addCcTrace`), which a trace of service mode does not, so the objects compile again here (with
-# the same compiler as the fake's, so with the same bytes, and no link needs to run again).
+# C compiler's identity (`addCcTrace`), which a trace of service mode does not, so the objects compile again here. They
+# compile with the service's compiler as the fake runs it (LAKE_REMOTE_EXEC_CC with LAKE_REMOTE_EXEC_PATH as its whole
+# environment), so with the service's bytes, and no link needs to run again; Lake's own compiler (the toolchain's
+# `bin/clang` and its internal flags, where the toolchain has one, as CI's does) would give other bytes.
 row_N15() (
   local f fresh="$NW/N15-fresh"
   enter N15 native; logs N15
   export LAKE_USAGE_CUTOFF=1 LAKE_ARTIFACT_CACHE=true
   mkdir -p "$NW/N15.bin"
-  printf '#!/bin/sh\nexec "%s" -g "$@"\n' "$LAKE_REMOTE_EXEC_CC" > "$NW/N15.bin/cc"
+  printf '#!/bin/sh\nexec "%s" -g "$@" -L "%s"\n' "$LAKE_REMOTE_EXEC_CC" "$LOCAL_CC_LIB" > "$NW/N15.bin/cc"
   chmod +x "$NW/N15.bin/cc"
   cat > Nat0/Slow.lean << EOF
 import Nat0.Use
@@ -383,8 +393,9 @@ def slow : Nat := zero
 EOF
   printf 'import Nat0.Tac\nimport Nat0.Use\nimport Nat0.Slow\n\n/-! The root of the library `Nat0`. -/\n' > Nat0.lean
   touch "$NW/N15.down"
-  LEAN_CC=cc PATH="$NW/N15.bin:$PATH" FAKE_DOWN_FILE="$NW/N15.down" \
-    test_run build Use2 Nat0:shared -o "$NW/N15.outputs.jsonl"
+  # Every build of the row's tree has the row's local C compiler, as in N14
+  export LEAN_CC=cc PATH="$NW/N15.bin:$PATH"
+  FAKE_DOWN_FILE="$NW/N15.down" test_run build Use2 Nat0:shared -o "$NW/N15.outputs.jsonl"
   check_lines "$NW/N15.jsonl" --modules Nat0,Nat0.Tac,Nat0.Use,Nat0.Slow,Use2 \
     --expect 'Nat0.Tac|Nat0.Use|Nat0.Slow:result=local' --expect 'Nat0|Use2:result=executed|cached' \
     --expect 'Nat0.Tac:c.o.export|Nat0.Use:c.o.export|Nat0.Tac:dynlib|Nat0.Use:dynlib:result=local' \
@@ -407,7 +418,9 @@ for _, v in [json.loads(l) for l in open(sys.argv[1]) if l.strip()][1:]:
     cd "$fresh"; unset LAKE_REMOTE_EXEC
     export LAKE_CACHE_DIR="$fresh.cache" LAKE_RESTORE_ARTIFACTS=true
     test_run cache add "$NW/N15.outputs.jsonl"
-    lake_out build Use2 Nat0:shared
+    printf '#!/bin/sh\nexec env -i PATH="%s" "%s" "$@"\n' "$LAKE_REMOTE_EXEC_PATH" "$LAKE_REMOTE_EXEC_CC" > "$fresh.cc"
+    chmod +x "$fresh.cc"
+    LEAN_CC="$fresh.cc" lake_out build Use2 Nat0:shared
     test_cmd "$PYTHON" -c 'import re, sys
 built = re.findall(r"Built (\S+)", open("produced.out").read())
 print(built)
@@ -442,16 +455,18 @@ row_N16() (
 
 # N17: with `nativeLibDir = "../lib"`, Nat0's library is outside the build directory and has no path in the input
 # root. `lake build Nat0:shared` links it here with LEAN_CC, a script that logs its arguments and runs the service's C
-# compiler: no request is `LinkSharedLibrary`, the link writes no line, and the end-of-build line counts the objects
-# and module libraries only. Nat0's modules compile on the service. Then `lake build Use2`, whose compile loads that
-# library, sends no request: Use2 fails with the code `request`, and the message names the library's file
+# compiler with the toolchain's library directory: no request is `LinkSharedLibrary`, the link writes no line, and the
+# end-of-build line counts the objects and module libraries only. Nat0's modules compile on the service. Then `lake
+# build Use2`, whose compile loads that library, sends no request: Use2 fails with the code `request`, and the
+# message names the library's file
 row_N17() (
   local lines='Nat0.Tac:c.o.export=executed Nat0.Tac:dynlib=executed Nat0.Use:c.o.export=executed'
   lines="$lines Nat0.Use:dynlib=executed Nat0:c.o.export=executed"
   enter N17 native; logs N17
   { echo 'nativeLibDir = "../lib"'; cat "$TEST_DIR/native/lakefile.toml"; } > lakefile.toml
   mkdir -p "$NW/N17.bin"
-  printf '#!/bin/sh\necho "$*" >> "%s"\nexec "%s" "$@"\n' "$NW/N17.cc.log" "$LAKE_REMOTE_EXEC_CC" > "$NW/N17.bin/cc"
+  printf '#!/bin/sh\necho "$*" >> "%s"\nexec "%s" "$@" -L "%s"\n' "$NW/N17.cc.log" "$LAKE_REMOTE_EXEC_CC" \
+    "$LOCAL_CC_LIB" > "$NW/N17.bin/cc"
   chmod +x "$NW/N17.bin/cc"
   : > "$NW/N17.cc.log"
   export LEAN_CC="$NW/N17.bin/cc"
