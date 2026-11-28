@@ -354,8 +354,10 @@ row_N14() (
 # a copy of the sources and a new Lake cache that holds only the artifacts that the mappings name, which `lake cache
 # add` installs. With service mode off, the fresh tree restores every target with no compile or link, but the objects,
 # with the bytes that the row's tree holds: on this tree an object's trace with service mode off also holds the local
-# C compiler's identity (`addCcTrace`), which a trace of service mode does not, so the objects compile again here (with
-# the same compiler as the fake's, so with the same bytes, and no link needs to run again).
+# C compiler's identity (`addCcTrace`), which a trace of service mode does not, so the objects compile again here. They
+# compile with the service's compiler as the fake runs it (LAKE_REMOTE_EXEC_CC with LAKE_REMOTE_EXEC_PATH as its whole
+# environment), so with the service's bytes, and no link needs to run again; Lake's own compiler (the toolchain's
+# `bin/clang` and its internal flags, where the toolchain has one, as CI's does) would give other bytes.
 row_N15() (
   local f fresh="$NW/N15-fresh"
   enter N15 native; logs N15
@@ -407,7 +409,9 @@ for _, v in [json.loads(l) for l in open(sys.argv[1]) if l.strip()][1:]:
     cd "$fresh"; unset LAKE_REMOTE_EXEC
     export LAKE_CACHE_DIR="$fresh.cache" LAKE_RESTORE_ARTIFACTS=true
     test_run cache add "$NW/N15.outputs.jsonl"
-    lake_out build Use2 Nat0:shared
+    printf '#!/bin/sh\nexec env -i PATH="%s" "%s" "$@"\n' "$LAKE_REMOTE_EXEC_PATH" "$LAKE_REMOTE_EXEC_CC" > "$fresh.cc"
+    chmod +x "$fresh.cc"
+    LEAN_CC="$fresh.cc" lake_out build Use2 Nat0:shared
     test_cmd "$PYTHON" -c 'import re, sys
 built = re.findall(r"Built (\S+)", open("produced.out").read())
 print(built)
