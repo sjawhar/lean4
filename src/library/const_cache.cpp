@@ -79,7 +79,8 @@ struct entry {
     lean_object * m_val;
     // set once by the first `modIdxCached?` of the key
     std::atomic<mod_memo *> m_mod;
-    // next entry inserted into the same cache, for freeing
+    // next entry inserted into the same cache, for freeing an owned cache and for keeping the
+    // global cache's entries reachable
     entry * m_next;
 };
 
@@ -105,7 +106,8 @@ struct table {
 
 struct cache {
     std::atomic<table *> m_table;
-    // all entries inserted into some table of an owned cache
+    // all entries inserted into some table of this cache: an owned cache frees them, while the
+    // global cache keeps them reachable after `resetCache` empties their slots
     std::atomic<entry *> m_entries;
 };
 
@@ -456,13 +458,14 @@ static inline __attribute__((always_inline)) lean_obj_res find_cached_in(cache &
         delete ne;
         return r;
     }
-    if (owned) {
-        entry * head = c.m_entries.load(std::memory_order_relaxed);
-        do {
-            ne->m_next = head;
-        } while (!c.m_entries.compare_exchange_weak(head, ne, std::memory_order_release,
-                    std::memory_order_relaxed));
-    }
+    // An owned cache frees its entries through this list; the global cache never frees its own, as
+    // concurrent readers may still hold them, but keeps them reachable through it once `resetCache`
+    // has emptied their slots.
+    entry * head = c.m_entries.load(std::memory_order_relaxed);
+    do {
+        ne->m_next = head;
+    } while (!c.m_entries.compare_exchange_weak(head, ne, std::memory_order_release,
+                std::memory_order_relaxed));
     lean_inc(r);
     *e_out = ne;
     if (2 * (t->m_num_entries.fetch_add(1, std::memory_order_relaxed) + 1) >= t->m_num_slots)
@@ -582,7 +585,8 @@ extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_drop_cache(b_lean_obj_a
 extern "C" LEAN_EXPORT lean_obj_res lean_imported_consts_cache_reset() {
     table * t = g_global_cache.m_table.load(std::memory_order_acquire);
     for (size_t i = 0; i < t->m_num_slots; i++) {
-        // entries (and their pins) are leaked: concurrent readers may still dereference them
+        // entries (and their pins) are never freed, as concurrent readers may still dereference
+        // them, and stay reachable through `m_entries`
         t->m_slots[i].store(nullptr, std::memory_order_release);
     }
     // occupancy is only ever an estimate; a racing insert after the reset merely re-adds one
