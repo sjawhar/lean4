@@ -12,6 +12,7 @@ import Lake.Config.PushQueue
 import Lake.Config.RemoteCache
 import Lake.Build.Common
 import Lake.Build.Module
+import Lake.Build.UsagePack
 import Lake.Build.RemoteCache
 import Lake.Build.Claim
 import Lake.Util.IO
@@ -399,16 +400,16 @@ def stageOutputs
 Stages the outputs of a module as one archive, as `Module.packLtar` packs it, from the verified
 bytes of its artifacts and a trace written from the entry alone: the outputs, the log and the
 input hash (which `-s` strips, and which a reader supplies again when it unpacks). With the
-module's usage-cutoff sidecars (`.usage`, `.resolved`, `.usekey`) too, when the build wrote them:
-a reader with usage cutoff needs them to check the module and its importers, and the archive
-compresses them.
+module's usage-cutoff records too, when the build wrote them: its pack (`.usepack`, `Lake.UsagePack`), or, for an
+entry written before packs, its `.usage`, `.resolved` and `.usekey`. A reader with usage cutoff needs them to check
+the module and its importers, and the archive compresses them.
 -/
 def stageModule
   (ctx : PushContext) (dir : FilePath) (idx : Nat) (entry : RemotePushEntry) (json : Json)
   (service : CacheService) (stem : String) (descrs : ModuleOutputDescrs)
   (files : Array (ArtifactDescr × Bool))
 : LoggerIO StagedEntry := do
-  let sidecars := #[descrs.usage?, descrs.resolved?, descrs.usekey?].filterMap id
+  let sidecars := #[descrs.usepack?, descrs.usage?, descrs.resolved?, descrs.usekey?].filterMap id
   let files := files ++ sidecars.map (·, false)
   let contents ← match ← verifyArtifacts ctx.cache entry.target json (files.map (·.1)) with
     | .ok contents => pure contents
@@ -422,9 +423,9 @@ def stageModule
   IO.FS.createDirAll irDir
   for (descr, inIrDir) in files, bytes in contents do
     IO.FS.writeBinFile ((if inIrDir then irDir else libDir) / fileName descr.ext) bytes
-  -- The sidecars stay out of the trace, as in every trace that a restore writes: they are files of
+  -- The records stay out of the trace, as in every trace that a restore writes: they are files of
   -- the build directory, and a kept module's `.usekey` is rewritten later
-  let traceDescrs := {descrs with usage? := none, resolved? := none, usekey? := none}
+  let traceDescrs := descrs.withoutRecords
   (BuildMetadata.ofFetch entry.inputHash (toJson traceDescrs) entry.log).writeFile
     (libDir / fileName "trace")
   let ltar := dir / "outputs.ltar"
@@ -506,8 +507,8 @@ def stageLine (ctx : PushContext) (dir : FilePath) (idx : Nat) (line : String) :
     unless files.all (ArtifactDescr.isCacheExtension ·.1.ext) do
       return ← invalid s!"{entry.target}: an output has an unsupported extension"
     let sidecarOk (descr? : Option ArtifactDescr) (ext : String) := descr?.all (·.ext == ext)
-    unless sidecarOk descrs.usage? "usage" && sidecarOk descrs.resolved? "resolved" &&
-        sidecarOk descrs.usekey? "usekey" do
+    unless sidecarOk descrs.usepack? UsagePack.ext && sidecarOk descrs.usage? "usage" &&
+        sidecarOk descrs.resolved? "resolved" && sidecarOk descrs.usekey? "usekey" do
       return ← invalid s!"{entry.target}: a usage-cutoff file has another extension"
     stageModule ctx dir idx entry json service stem descrs files
   else

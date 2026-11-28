@@ -19,7 +19,6 @@ import Lake.Util.IO
 import Lake.Config.PushQueue
 import Lake.Build.Claim
 import Lake.Build.InputLock
-import Lake.Util.RemoteExec
 import Lake.Build.RemoteExec
 
 /-! # Build Runner
@@ -591,12 +590,6 @@ def runQueuedPush (ws : Workspace) (logger : MonadLog BaseIO) : BaseIO Unit := d
   | .ok rc => logger.logEntry (.warning s!"`lake cache push` exited with code {rc}")
   | .error e => logger.logEntry (.warning s!"could not run `lake cache push`: {e}")
 
-/--
-Exit code of a build whose every failure is an unavailable service under `fail`, or a confirmed
-toolchain mismatch under `wait` or `fail`: 75 (`EX_TEMPFAIL`), distinct from a broken build.
--/
-public def remoteUnavailableCode : ExitCode := 75
-
 def failedOnlyForService (bctx : BuildContext) (result : MonitorResult) : BaseIO Bool := do
   let some rcfg := bctx.workspace.lakeEnv.remoteExec?
     | return false
@@ -624,8 +617,9 @@ def finalizeBuild
     let state ← remoteDecisionState
     print! mctx.out s!"{({stats with state}).line}\n"
     flush mctx.out
-  -- The build is done with the service; stop the bridge before Lake goes on (e.g. `lake exe` runs).
-  RemoteExec.shutdown
+  -- The build is done with the service; stop the re-probe timer and the bridge before Lake goes on
+  -- (e.g. `lake exe` runs).
+  shutdownRemote
   let remoteStatus ← bctx.remoteReadStatus.get
   -- What a probe did after the last read of the build, which no job logged
   for msg in remoteStatus.notices do
@@ -652,9 +646,9 @@ def finalizeBuild
     return a
   | .error e =>
     if cfg.noBuild && result.wantsRebuild then
-      IO.Process.exit noBuildCode.toUInt8
+      exitProcess noBuildCode.toUInt8
     else if (← failedOnlyForService bctx result) then
-      IO.Process.exit remoteUnavailableCode.toUInt8
+      exitProcess remoteUnavailableCode.toUInt8
     else
       throw (IO.userError e)
 
@@ -667,7 +661,8 @@ which registers it as `buildLockHandle`), so if Lake is killed, the lock is held
 too: the compiler of a killed Lake cannot write into the workspace while another Lake builds it.
 A process that runs in a session of its own (the kept-module checker, the detached `lake cache push`,
 the cache token command) does not inherit it. (Windows releases the lock with the process.)
-Setting `LAKE_NO_BUILD_LOCK=1` disables it and the input lock of each module build (`acquireInputLock?`).
+Setting `LAKE_NO_BUILD_LOCK=1` disables it and the input lock (`acquireInputLock?`) of each module build
+and each promotion to the build service.
 -/
 public def Workspace.withBuildLock (ws : Workspace) (act : IO α) : IO α := do
   if (← isBuildLockDisabled) then

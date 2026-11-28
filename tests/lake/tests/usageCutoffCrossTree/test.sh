@@ -56,17 +56,18 @@ depHash() { sed -n 's/.*"depHash": *"\([0-9a-f]*\)".*/\1/p' "$1"; }
 entryArt() { sed -n "s/.*\"$2\": *\"\\([^\"]*\\)\".*/\\1/p" "$1"; }
 # entry DIR MOD [OUTDIR] -- the cache's outputs entry for MOD's current input hash in package dir DIR
 entry() { echo "$LAKE_CACHE_DIR/outputs/${PKG:-test}/$(depHash "$1/${3:-$OUT}/$2.trace").json"; }
-# idxdir DIR MOD -- MOD's usage-index directory: its package's, under the local hash its `.usekey` in DIR records
+# idxdir DIR MOD -- MOD's usage-index directory: its package's, under the local hash its `.usekey` in DIR records (in
+# its pack)
 idxdir() {
-  echo "$LAKE_CACHE_DIR/usage-index/${PKG:-test}/$(sed -n 's/.*"local":"\([0-9a-f]*\)".*/\1/p' "$1/${3:-$OUT}/$2.usekey")"
+  echo "$LAKE_CACHE_DIR/usage-index/${PKG:-test}/$(usepack_part "$1/${3:-$OUT}/$2.usepack" k | sed -n 's/.*"local":"\([0-9a-f]*\)".*/\1/p')"
 }
 # idxname DIR MOD [OUTDIR] -- the name of the usage-index file of the compile whose outputs DIR's entry for MOD names:
-# the file of its directory that names the same `.usekey` (a file is named by the dependency state its key records)
+# the file of its directory that names the same pack (a file is named by the dependency state its key records)
 idxname() {
-  local k f
-  k=$(entryArt "$(entry "$1" "$2" "${3:-}")" k)
+  local p f
+  p=$(entryArt "$(entry "$1" "$2" "${3:-}")" p)
   for f in "$(idxdir "$1" "$2" "${3:-}")"/*.json; do
-    if grep -qF "\"$k\"" "$f"; then basename "$f"; return; fi
+    if grep -qF "\"$p\"" "$f"; then basename "$f"; return; fi
   done
   return 1
 }
@@ -92,7 +93,9 @@ case1() {
   mkpkg f
   test_run -d f build $ALL
   # (premise) the macro's module reaches G's `extra`, as `usageCutoff` shows for a non-module file
-  test_cmd_out '"extra":[[["Test","MS"],"' cat f/$OUT/G.usekey
+  test_cmd_out '"extra":[[["Test","MS"],"' usepack_part f/$OUT/G.usepack k
+  # each module keeps its usage-cutoff records in one file, its pack, with no `.hash` file
+  usepack_alone f/$OUT/B f/$OUT/G
   mkpkg t
   edx t
   lake_out -d t build -v Test.B Test.G
@@ -196,7 +199,7 @@ case5() {
   no_match_text "Built Test.B" produced.out
   jobhas Test.B "usage index: restored"
   test_exp -f "$(entry t B)"
-  test_exp "$(entryArt "$(entry t B)" k)" = "$(entryArt "$(entry f B)" k)"
+  test_exp "$(entryArt "$(entry t B)" p)" = "$(entryArt "$(entry f B)" p)"
   lake_out -d t build -v Test.B
   no_match_text "Built" produced.out
   no_match_text "usage index" produced.out
@@ -209,7 +212,7 @@ case5() {
 
 # 6a. Another workspace rewrites a dependency the build has read: workspaces `a` and `b` require the same path
 # dependency `D`, and each build holds only its own workspace's lock, so `b` rebuilds `D` while a build of `a` holds.
-# `M0`'s lookup reads `D`'s sidecars before the rewrite; then `D`'s `shared_eq` gets another proof (which leaves its
+# `M0`'s lookup reads `D`'s records before the rewrite; then `D`'s `shared_eq` gets another proof (which leaves its
 # closure as it was). `M`, which uses `shared_eq`, passes the pre-filter against what this build first read of `D`,
 # and its full check, which reads `D` again, rejects it. `M2`, which uses only `otherValue`, is restored against the
 # rewritten `D`. (Theorems keep `D` out of a module's `extra` modules.)
@@ -298,7 +301,7 @@ case6b() {
     if command -v python3 > /dev/null; then
       test_cmd python3 -c 'import json, sys; json.load(open(sys.argv[1]))' "$f"
     fi
-    test_cmd grep -qE '"k": *"[0-9a-f]{16}\.usekey"' "$f"
+    test_cmd grep -qE '"p": *"[0-9a-f]{16}\.usepack"' "$f"
     for k in $(grep -oE '"[0-9a-f]{16}\.[a-z.]+"' "$f" | tr -d '"'); do
       test_exp -f "$LAKE_CACHE_DIR/artifacts/$k"
     done
@@ -354,7 +357,7 @@ case7() {
   jobnot Test.B "usage index"
 }
 
-# 8. A chain of hits: E's check reads the `.usage` and `.usekey` that B's hit restored
+# 8. A chain of hits: E's check reads the `.usage` and `.usekey` (in the pack) that B's hit restored
 case8() {
   mkpkg f
   test_run -d f build $ALL
@@ -503,18 +506,19 @@ case12() {
 }
 
 # 13. The pre-filter reads a candidate's compact usage record (`<name>.pre`, which the index writes beside the
-# compile's file), not its `.usage`: with the cached `.usage` replaced by bytes that do not parse, the candidate still
-# passes the pre-filter, and the check, which reads the `.usage` by the digest the key records, rejects it, so B
-# builds. (Reading the `.usage`, the pre-filter rejects it unchecked: `0 fully checked`.) C is restored.
+# compile's file), not its `.usage`: with the cached `.usage` (in the cached pack) replaced by bytes that do not parse,
+# the candidate still passes the pre-filter, and the check, which reads the `.usage` by the digest the key records,
+# rejects it, so B builds. (Reading the `.usage`, the pre-filter rejects it unchecked: `0 fully checked`.) C is
+# restored.
 case13() {
   local art
   mkpkg f
   test_run -d f build $ALL
   test_exp -f "$(idxdir f B)/$(idxname f B | sed 's/\.json$/.pre/')"
-  art="$LAKE_CACHE_DIR/artifacts/$(entryArt "$(entry f B)" u)"
+  art="$LAKE_CACHE_DIR/artifacts/$(entryArt "$(entry f B)" p)"
   test_exp -f "$art"
   printf 'not a usage record\n' > bad.tmp
-  mv -f bad.tmp "$art"
+  test_cmd usepack_set "$art" u bad.tmp
   mkpkg t
   edx t
   lake_out -d t build -v Test.B Test.C
@@ -525,21 +529,21 @@ case13() {
 
 # 14. The same, for a candidate whose used constants carry names with numeric components: a private name
 # (`_private.<module>.0.Secret`) and a macro's hygienic one (`Hid._@.Test.A.<n>._hygCtx._hyg.3`), which the record
-# encodes through the name table's number branch. With the cached `.usage` replaced, only the record can carry them,
-# so the pre-filter passes the candidate to the check (which rejects it on the `.usage`) exactly when they
-# round-trip.
+# encodes through the name table's number branch. With the cached `.usage` (in the cached pack) replaced, only the
+# record can carry them, so the pre-filter passes the candidate to the check (which rejects it on the `.usage`)
+# exactly when they round-trip.
 case14() {
   local art
   mkpkg f
   setnum f
   test_run -d f build Test.B Test.C
   # (premise) B's `.usage` names a private and a hygienic constant of A, both with a numeric component
-  test_cmd_out '"_private","Test","A",0,"Secret"' cat f/$OUT/B.usage
-  test_cmd_out '"_hygCtx","_hyg",3' cat f/$OUT/B.usage
+  test_cmd_out '"_private","Test","A",0,"Secret"' usepack_part f/$OUT/B.usepack u
+  test_cmd_out '"_hygCtx","_hyg",3' usepack_part f/$OUT/B.usepack u
   test_exp -f "$(idxdir f B)/$(idxname f B | sed 's/\.json$/.pre/')"
-  art="$LAKE_CACHE_DIR/artifacts/$(entryArt "$(entry f B)" u)"
+  art="$LAKE_CACHE_DIR/artifacts/$(entryArt "$(entry f B)" p)"
   printf 'not a usage record\n' > bad.tmp
-  mv -f bad.tmp "$art"
+  test_cmd usepack_set "$art" u bad.tmp
   mkpkg t
   setnum t
   edx t
@@ -591,7 +595,9 @@ case20() {
   edx t2 2
   lake_out -d t2 build -v Test.B
   jobhas Test.B "Built Test.B"
-  test_cmd_fails cmp -s "t1/$OUT/B.usekey" "t2/$OUT/B.usekey"
+  usepack_part "t1/$OUT/B.usepack" k > key1.tmp
+  usepack_part "t2/$OUT/B.usepack" k > key2.tmp
+  test_cmd_fails cmp -s key1.tmp key2.tmp
   test_exp "$(idxname t2 B)" = "$f"
   test_cmd mv held.json "$d/$f"
   test_cmd mv held.pre "$d/${f%.json}.pre"
@@ -624,17 +630,18 @@ case20() {
   jobhas Test.B "Built Test.B"
 }
 
-# 16. A restored `.resolved` must have the bytes its entry records, as each other restored file must (with the other
-# sidecars it counts as an output, `Module.outputMismatches`): one replaced in the cache by other bytes is quarantined,
-# and B builds. The edit changes the value of `x`, not what `X` provides, so B's check does not read the `.resolved`.
+# 16. A restored pack must have the bytes its entry records, as each other restored file must (with the usage-cutoff
+# records it counts as an output, `Module.outputMismatches`): one whose `.resolved` is replaced in the cache by other
+# bytes (under a header that records them, so the pack reads as a pack) is quarantined, and B builds. The edit changes
+# the value of `x`, not what `X` provides, so B's check does not read the `.resolved`.
 case16() {
   local art
   mkpkg f
   test_run -d f build Test.B
-  art="$(cat f/$OUT/B.resolved.hash).resolved"
-  cat "$LAKE_CACHE_DIR/artifacts/$art" > good.tmp
+  art=$(entryArt "$(entry f B)" p)
+  usepack_part "$LAKE_CACHE_DIR/artifacts/$art" v > good.tmp
   { cat good.tmp; printf 'replaced'; } > bad.tmp
-  mv -f bad.tmp "$LAKE_CACHE_DIR/artifacts/$art"
+  test_cmd usepack_set "$LAKE_CACHE_DIR/artifacts/$art" v bad.tmp
   mkpkg t
   printf 'def x := 5\n' > t/Test/X.lean
   lake_out -d t build -v Test.B
@@ -691,15 +698,15 @@ case18() {
 # 19. Records the header cannot serve, read as the second candidate, after the first one's pre-filter filled the memo:
 # one of format 1 (no header, as Lake wrote them before format 2) and one cut short inside its header. The lookup
 # takes each through the whole pre-filter and restores B; the hit writes the format 1 record again in format 2. A
-# format 1 record still decodes: with the cached `.usage` replaced by bytes that do not parse, it alone passes the
-# candidate to the check (`1 fully checked`, as in case 13). An index file cut short is skipped.
+# format 1 record still decodes: with the cached `.usage` (in the cached pack) replaced by bytes that do not parse, it
+# alone passes the candidate to the check (`1 fully checked`, as in case 13). An index file cut short is skipped.
 case19() {
-  local d u1 p1 p3 g
+  local d p1u p1 p3 g
   mkpkg f
   test_run -d f build Test.B
   d=$(idxdir f B)
   p1="$d/$(idxname f B | sed 's/\.json$/.pre/')"
-  u1=$(entryArt "$(entry f B)" u)
+  p1u=$(entryArt "$(entry f B)" p)
   seta f 2
   test_run -d f build Test.B
   if command -v python3 > /dev/null; then
@@ -721,7 +728,7 @@ EOF
     # the format 1 record decodes: the `.usage` it was made from no longer parses
     test_cmd cp v1.pre "$p1"
     printf 'not a usage record\n' > bad.tmp
-    mv -f bad.tmp "$LAKE_CACHE_DIR/artifacts/$u1"
+    test_cmd usepack_set "$LAKE_CACHE_DIR/artifacts/$p1u" u bad.tmp
     mkpkg t2
     edx t2 2
     lake_out -d t2 build -v Test.B

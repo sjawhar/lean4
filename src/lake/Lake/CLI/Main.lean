@@ -1061,11 +1061,14 @@ protected def build : CliM PUnit := do
     | none, none => return none
   let buildConfig := mkBuildConfig opts (out := .stdout) (showSuccess := true) outputsPackage?
   -- Say `hello` to the build service at the build's start, so its GetCapabilities carries the
-  -- build's invocation id (contract C5.1). A no-op when service mode is off.
-  if let some mismatch ← startRemoteSession ws then
-    logError mismatch
-    exit remoteUnavailableCode
+  -- build's invocation id (contract C5.1). A no-op when service mode is off. A refused service, or a
+  -- confirmed mismatch under `wait` or `fail`, fails each module that needs a build: its message shows
+  -- here once, and the build still runs, so that each module writes its line. Lake then exits with
+  -- code 1 for a refused service and 75 for a mismatch, also when no module needed a build.
+  let failure? ← startRemoteSession ws
+  if let some (msg, _) := failure? then logError msg
   ws.runBuild (buildSpecs specs) {buildConfig with forgetContext := opts.oneShot}
+  if let some (_, code) := failure? then exit code
 
 protected def checkBuild : CliM PUnit := do
   processOptions lakeOption
@@ -1579,8 +1582,19 @@ def lake : CliM PUnit := do
       else
         throw <| CliError.missingCommand
 
-/-- Runs the Lake command `args`. With `oneShot`, the process exits when it returns (`LakeOptions.oneShot`). -/
+/--
+Runs the Lake command `args`. With `oneShot`, the process exits when it returns
+(`LakeOptions.oneShot`); if the command abandoned a re-probe of the build service
+(`remoteProbeAbandoned`), `cli` ends the process itself (`exitProcess`) with the command's exit code
+once the command has ended.
+-/
 public def cli (args : List String) (oneShot := false) : BaseIO ExitCode := do
-  -- However a command ends (an exception included), stop the build-service bridge: its read task
-  -- would otherwise keep this process from exiting.
-  try inline <| (lake).run args oneShot finally RemoteExec.shutdown
+  -- However a command ends (an exception included), stop the build service's re-probe timer and
+  -- bridge: their tasks would otherwise keep this process from exiting.
+  let rc ← try inline <| (lake).run args oneShot finally shutdownRemote
+  -- When `main` returns, the runtime waits for every task, the abandoned re-probe's too, which waits
+  -- for its bridge. On POSIX the status is the one that returning `rc` gives.
+  if oneShot && (← remoteProbeAbandoned) then
+    (exitProcess rc.toUInt8).catchExceptions fun _ => pure rc
+  else
+    return rc

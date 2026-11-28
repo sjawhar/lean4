@@ -160,10 +160,10 @@ trace: [diag] Diagnostics
   [kernel] unfolded declarations (max: 4, num: 10):
     [kernel] instOfNatNat ↦ 4
     [kernel] OfNat.ofNat ↦ 4
+    [kernel] Ne ↦ 2
     [kernel] BitVec.ofNat ↦ 2
     [kernel] Fin.Internal.ofNat ↦ 2
     [kernel] DecidableEq ↦ 1
-    [kernel] Ne ↦ 1
     [kernel] instDecidableNot ↦ 1
     [kernel] not ↦ 1
     [kernel] Bool.rec ↦ 1

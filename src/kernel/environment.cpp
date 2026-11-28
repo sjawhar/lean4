@@ -164,11 +164,13 @@ environment environment::add_definition(declaration const & d, bool check) const
            So, we check the header, add, and then type check the body. */
         if (check) {
             type_checker checker(*this, diag.get(), definition_safety::unsafe);
+            checker.use_equiv_closure();
             check_constant_val(*this, v.to_constant_val(), checker);
         }
         environment new_env = add(constant_info(d));
         if (check) {
             type_checker checker(new_env, diag.get(), definition_safety::unsafe);
+            checker.use_equiv_closure();
             check_no_metavar_no_fvar(new_env, v.get_name(), v.get_value());
             expr val_type = checker.check(v.get_value(), v.get_lparams());
             if (!checker.is_def_eq(val_type, v.get_type()))
@@ -178,6 +180,7 @@ environment environment::add_definition(declaration const & d, bool check) const
     } else {
         if (check) {
             type_checker checker(*this, diag.get());
+            checker.use_equiv_closure();
             check_constant_val(*this, v.to_constant_val(), checker);
             check_no_metavar_no_fvar(*this, v.get_name(), v.get_value());
             expr val_type = checker.check(v.get_value(), v.get_lparams());
@@ -193,6 +196,7 @@ environment environment::add_theorem(declaration const & d, bool check) const {
     theorem_val const & v = d.to_theorem_val();
     if (check) {
         type_checker checker(*this, diag.get());
+        checker.use_equiv_closure();
         sharecommon_persistent_fn share;
         expr val(share(v.get_value().raw()));
         expr type(share(v.get_type().raw()));
@@ -212,6 +216,7 @@ environment environment::add_opaque(declaration const & d, bool check) const {
     opaque_val const & v = d.to_opaque_val();
     if (check) {
         type_checker checker(*this, diag.get());
+        checker.use_equiv_closure();
         check_constant_val(*this, v.to_constant_val(), checker);
         check_no_metavar_no_fvar(*this, v.get_name(), v.get_value());
         expr val_type = checker.check(v.get_value(), v.get_lparams());
@@ -233,6 +238,7 @@ environment environment::add_mutual(declaration const & d, bool check) const {
     /* Check declarations header */
     if (check) {
         type_checker checker(*this, diag.get(), safety);
+        checker.use_equiv_closure();
         name_set found;
         for (definition_val const & v : vs) {
             if (v.get_safety() != safety)
@@ -257,6 +263,7 @@ environment environment::add_mutual(declaration const & d, bool check) const {
     /* Check actual definitions */
     if (check) {
         type_checker checker(new_env, diag.get(), safety);
+        checker.use_equiv_closure();
         for (definition_val const & v : vs) {
             check_no_metavar_no_fvar(new_env, v.get_name(), v.get_value());
             expr val_type = checker.check(v.get_value(), v.get_lparams());

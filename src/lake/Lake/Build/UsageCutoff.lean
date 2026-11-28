@@ -11,6 +11,7 @@ public import Lean.Util.ModuleUsage.Basic
 public import Std.Data.HashSet
 import Lean.Util.ModuleUsage
 import Lake.Config.Monad
+import Lake.Build.UsagePack
 
 /-!
 # Usage cutoff
@@ -437,17 +438,23 @@ def UsekeySidecar.importedClosure? (key : UsekeySidecar) (m : Name) : Option Mod
   (key.importer.importedClosures.binSearch (m, ⟨0, 0⟩) (Name.quickLt ·.1 ·.1)).map (·.2)
 
 /--
-The bytes of the usage-cutoff sidecar at `path` with their digest and the stamp of the file they were read from, if
-it stands for them (`Lean.ModuleUsage.readFileStamped`), or `none` if it does not exist or its bytes do not have the
-digest `expected?` (the `.usage` a `.usekey` was written from). Fails if it exists but cannot be read.
+The bytes of the usage-cutoff record that the sidecar path `path` names (`Lake.UsagePack.readSidecar`: from the
+module's pack, or from the file of the layout before packs) with their digest and the stamp of the file they were
+read from, if it stands for them (a `.usekey` in a pack: `UsagePack.readPrefixStamped`'s stamp of the pack's path;
+otherwise `Lean.ModuleUsage.readFileStamped`'s of the file read), or `none` if it does not exist or its bytes do not
+have the digest `expected?` (the `.usage` a `.usekey` was written from). A pack that cannot be read as one
+(`UsagePack.Read.invalid`, which a pack larger than `UsagePack.maxWhole` is too) gives `none`, with a warning, so that
+the module builds normally. Fails if a file exists but cannot be read for another reason.
 -/
 def readSidecarBytes? (path : FilePath) (expected? : Option ModuleUsage.Digest) :
     JobM (Option (ByteArray × ModuleUsage.Digest × Option ModuleUsage.FileStamp)) := do
-  match (← ModuleUsage.readFileStamped path |>.toBaseIO) with
-  | .ok (bytes, stamp?) =>
-    let digest := ModuleUsage.Digest.ofBytes bytes
+  match (← UsagePack.readSidecar path |>.toBaseIO) with
+  | .ok (.found bytes digest stamp?) =>
     return if expected?.any (· != digest) then none else some (bytes, digest, stamp?)
-  | .error (.noFileOrDirectory ..) =>
+  | .ok .absent =>
+    return none
+  | .ok (.invalid pack reason) =>
+    logWarning s!"{pack}: not a usage-cutoff pack this Lake can read ({reason}); reading its records as absent"
     return none
   | .error e =>
     error s!"{path}: read failed: {e}"
@@ -455,11 +462,12 @@ def readSidecarBytes? (path : FilePath) (expected? : Option ModuleUsage.Digest) 
 /-- An entry of `BuildContext.sidecarCache`. -/
 abbrev SidecarEntry := Option ModuleUsage.FileStamp × ModuleUsage.Digest × Dynamic
 
-/-- The build's parse of the sidecar at `path`, with the digest of the contents it was parsed from and the file's
-current stamp, if that stamp is the one recorded with it (`BuildContext.sidecarCache`). -/
+/-- The build's parse of the sidecar at `path`, with the digest of the contents it was parsed from and the current
+stamp of the file it is read from (`UsagePack.sidecarStamp`), if that stamp is the one recorded with it
+(`BuildContext.sidecarCache`). -/
 def stampedSidecar? (path : FilePath) :
     JobM (Option (ModuleUsage.Digest × Dynamic × ModuleUsage.FileStamp)) := do
-  let some stamp ← ModuleUsage.fileStamp path | return none
+  let some stamp ← UsagePack.sidecarStamp path | return none
   let shard := (← getBuildContext).sidecarCache.get (hash path)
   let some (some recorded, digest, value) ← shard.atomically (return (← get).find? path) | return none
   return if recorded == stamp then some (digest, value, stamp) else none
@@ -936,9 +944,11 @@ public def publishFacts [Monad m] [MonadBuild m] [MonadLiftT BaseIO m] (b : Fact
     artsTaken := s.artsTaken + b.artsTaken, artsRead := s.artsRead + b.artsRead
   } : BaseIO Unit)
 
-/-- Whether the file at `path` has the stamp `stamp` now, all of its fields (`Lean.ModuleUsage.FileStamp`'s `BEq`). -/
+/-- Whether the file at `path` has the stamp `stamp` now, all of its fields (`Lean.ModuleUsage.FileStamp`'s `BEq`). A
+usage-cutoff record's path (`UsagePack.Part.ofSidecar?`) stands for the file it is read from (`UsagePack.sidecarStamp`).
+-/
 def stampIs (path : FilePath) (stamp : ModuleUsage.FileStamp) : BaseIO Bool := do
-  match ← (ModuleUsage.fileStamp path).toBaseIO with
+  match ← (UsagePack.sidecarStamp path).toBaseIO with
   | .ok (some s) => return s == stamp
   | _ => return false
 
@@ -1479,11 +1489,11 @@ imports' stamps are read in parallel (`parallelRuns`); an import whose `.usekey`
 -/
 def changedDirectImport? (hashes : ContentHashes) (presetup : ModulePreSetup) (importArts : NameMap ImportArtifacts)
     (key : UsekeySidecar) (usekeyFile : FilePath) : JobM (Option (Name × Option ModuleUsage.Digest)) := do
-  let some own ← ModuleUsage.fileStamp usekeyFile | return none
+  let some own ← UsagePack.sidecarStamp usekeyFile | return none
   let mods := directModules presetup
   let runs ← parallelRuns mods fun m => do
     let some olean := (importArts.find? m).bind (·.olean?) | return false
-    let some s ← ModuleUsage.fileStamp (olean.withExtension "usekey") | return true
+    let some s ← UsagePack.usekeyStamp (olean.withExtension "usekey") | return true
     return s.mtimeSec > own.mtimeSec || (s.mtimeSec == own.mtimeSec && s.mtimeNsec > own.mtimeNsec)
   for m in mods, r in runs do
     unless (← replayRun r) do continue
@@ -1827,18 +1837,19 @@ def UsageSidecar.kernelDisjoint (usage : UsageSidecar) (presetup : ModulePreSetu
   return !clashes
 
 /--
-The module's `.resolved` sidecar at `file` (Lean writes it next to its `.usage`, `Lean.ModuleUsage.encodeResolved`), if
+The module's `.resolved` record at the sidecar path `file` (Lean writes it next to its `.usage`,
+`Lean.ModuleUsage.encodeResolved`; Lake packs it, `Lake.UsagePack`), if
 its bytes have the digest the `.usage` records (`UsageSidecar.resolvedDigest`, `Lean.ModuleUsage.Digest.ofBytes`) and
-decode (`Lean.ModuleUsage.ResolvedTable.decode?`): `none` if it is missing, has other bytes or does not decode. Fails if
-it exists but cannot be read. Only a check that needs the recorded names reads it (`UsageSidecar.resolvedUnchanged`).
+decode (`Lean.ModuleUsage.ResolvedTable.decode?`): `none` if it is missing, has other bytes, does not decode or is in a
+pack that cannot be read as one. Fails if a file exists but cannot be read. Only a check that needs the recorded names
+reads it (`UsageSidecar.resolvedUnchanged`).
 -/
 def readResolvedSidecar (usage : UsageSidecar) (file : FilePath) : IO (Option ModuleUsage.ResolvedTable) := do
-  match (← IO.FS.readBinFile file |>.toBaseIO) with
-  | .ok bytes =>
-    if ModuleUsage.Digest.ofBytes bytes != usage.resolvedDigest then return none
+  match (← UsagePack.readSidecar file) with
+  | .found bytes digest _ =>
+    if digest != usage.resolvedDigest then return none
     return (ModuleUsage.ResolvedTable.decode? bytes).toOption
-  | .error (.noFileOrDirectory ..) => return none
-  | .error e => throw e
+  | _ => return none
 
 /--
 Whether every name whose defining module the compile looked up, used or referred to (the module's `.resolved` sidecar
@@ -1912,17 +1923,18 @@ builtin_initialize parsedUsages : Std.Mutex (Std.HashMap Hash (UsageSidecar × M
 def maxParsedUsages : Nat := 64
 
 /--
-Writes the module's `.usekey` from the `.usage` Lean just wrote: the digest of the `.usage` bytes, the module's
-local trace hash, the hash of its `.olean`, the `modsysHash` of its closure, the `closureHash` of its direct imports,
-for each workspace `extra` module, the hash of its `.olean` and its current `moduleDigest`, and the `.usage` fields its
-importers read (`UsageSidecar.importerJson`). Each `.olean` hash is of its bytes (`contentHash`).
+Makes the module's `.usekey` from the `.usage` Lean just wrote, and returns its bytes, which the caller packs with the
+`.usage` and the `.resolved` (`Lake.UsagePack`, `Module.packUsageRecords`): the digest of the `.usage` bytes, the
+module's local trace hash, the hash of its `.olean`, the `modsysHash` of its closure, the `closureHash` of its direct
+imports, for each workspace `extra` module, the hash of its `.olean` and its current `moduleDigest`, and the `.usage`
+fields its importers read (`UsageSidecar.importerJson`). Each `.olean` hash is of its bytes (`contentHash`).
 
 The key must describe what the compile read, and another workspace can rebuild a shared dependency while the module
 compiles. So every direct import's `closure` and every `extra` module's `moduleDigest`, read now through
 `importUsage?`, must be what the compile imported (`UsageSidecar.importedClosures`, `importedDigests`, which Lean
 took from the `.olean` files it loaded), and the closure's module-system files must have the bytes they had before
 the compile (`modsysBefore`).
-Writes nothing if not, or if the `.usage` does not cover the closure (`UsageSidecar.coversClosure`) or is missing,
+Makes no key (`none`) if not, or if the `.usage` does not cover the closure (`UsageSidecar.coversClosure`) or is missing,
 or if `importUsage?` accepts nothing for a direct import or a workspace `extra` module, so the module is never
 skipped. A kept module's `.usage` holds digests of its declarations as Lean compiled them, and a compile against it
 records those as what it used: a key over them would let a later check skip the module once the kept module compiles
@@ -1931,34 +1943,34 @@ is untrusted — kept, or without a key binding its fields to its `.olean` (`unt
 the direct imports and the `extra` modules) — gets no key, and it compiles the next time it is stale. That check is
 read twice: `untrustedBefore?` is its result as the compile started, and it is run again here. Another workspace can
 rebuild a kept dependency normally while this module compiles, so a module untrusted when the compile read it can
-have an ordinary key by the time the compile ends; the key is written only when neither the state the compile read
+have an ordinary key by the time the compile ends; the key is made only when neither the state the compile read
 nor the state now has an untrusted closure module. The key also records `inputHash?`, the input hash of the compile,
 so that a build that later keeps these outputs for another input can name the compile that made them
 (`queueRemoteAlias`). With `usageArt?`, the artifact hash of the `.usage`, it keeps the `.usage` it read for the usage
-index when it writes the key (`parsedUsages`), so that the index does not parse it again (`Module.indexUsage`).
+index when it makes the key (`parsedUsages`), so that the index does not parse it again (`Module.indexUsage`).
 Counted in `BuildContext.usageCutoffInFlight` while it runs (`countedInFlight`).
 -/
 public def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     (importArts : NameMap ImportArtifacts) (modsysBefore : ModuleUsage.Digest) (untrustedBefore? : Option Name)
     (oleanDigest? : Option ModuleUsage.Digest := none) (inputHash? : Option Hash := none)
-    (usageArt? : Option Hash := none) : JobM Unit := countedInFlight do
-  let some (usage, usageDigest) ← readOwnUsage mod.usageFile | return
-  unless usage.coversClosure importArts do return
+    (usageArt? : Option Hash := none) : JobM (Option ByteArray) := countedInFlight do
+  let some (usage, usageDigest) ← readOwnUsage mod.usageFile | return none
+  unless usage.coversClosure importArts do return none
   let hashes ← ContentHashes.new
   let modsys ← modsysHash hashes importArts
-  unless modsys == modsysBefore do return
+  unless modsys == modsysBefore do return none
   -- No key if the compile read an untrusted closure module (kept, or without a key binding its fields to its
   -- `.olean`): `untrustedBefore?` is that check as the compile started, rechecked here, since another workspace can
   -- give a kept dependency an ordinary key while this module compiles.
-  if untrustedBefore?.isSome then return
-  if (← untrustedClosureModule? hashes importArts).isSome then return
+  if untrustedBefore?.isSome then return none
+  if (← untrustedClosureModule? hashes importArts).isSome then return none
   let some closure ← closureHash hashes presetup importArts (importedClosures? := some usage.importedClosures)
-    | return
+    | return none
   let mut extra := #[]
   for m in usage.extra do
     if (← findModule? m).isNone then continue
-    let some (olean, imp) ← importUsage? hashes importArts m | return
-    unless usage.importedDigests.find? m == some imp.moduleDigest do return
+    let some (olean, imp) ← importUsage? hashes importArts m | return none
+    unless usage.importedDigests.find? m == some imp.moduleDigest do return none
     extra := extra.push <|
       Json.arr #[ModuleUsage.nameToJson m, toJson (← contentHash hashes olean), toJson imp.moduleDigest]
   let fields : List (String × Json) := [
@@ -1972,12 +1984,12 @@ public def Module.writeUsekey (mod : Module) (presetup : ModulePreSetup)
     ("importer", usage.importerJson)
   ]
   let key := Json.mkObj <| fields ++ (inputHash?.map fun h => ("input", toJson h.hex)).toList
-  ModuleUsage.writeFileReplacing mod.usekeyFile key.compress.toUTF8
   if let some art := usageArt? then
     -- a few entries at most: `Module.indexUsage` takes each one after the module's build, unless the build fails or
     -- does not cache; an entry no build takes is dropped at the next insert past `maxParsedUsages`
     parsedUsages.atomically <| modify fun m =>
       (if m.size ≥ maxParsedUsages then {} else m).insert art (usage, usageDigest)
+  return some key.compress.toUTF8
 
 /-- What a stale module's usage records say about it (`Module.usageVerdict`). -/
 public inductive UsageVerdict
@@ -2340,11 +2352,12 @@ def readHeader? (file : FilePath) : BaseIO (Option Header) := do
 end PrefilterUsage
 
 /--
-The compact record (`PrefilterUsage.encode`) of the `.usage` at `path`, a cached compile's that a usage index entry
-names, or `none` if it cannot be read or parsed, or has another format version (it is then never read in its place).
+The compact record (`PrefilterUsage.encode`) of the `.usage` record at the sidecar path `path` (`Lake.UsagePack`), a
+cached compile's that a usage index entry names, or `none` if it cannot be read or parsed, or has another format
+version (it is then never read in its place).
 -/
 public def compactUsage? (path : FilePath) : BaseIO (Option ByteArray) := do
-  let .ok bytes ← (IO.FS.readBinFile path).toBaseIO | return none
+  let .ok (some bytes) ← (UsagePack.readSidecarBytes? path).toBaseIO | return none
   let .ok (some usage) := UsageSidecar.parse? bytes | return none
   return usage.toPrefilter.encode (ModuleUsage.Digest.ofBytes bytes)
 
@@ -2377,7 +2390,7 @@ insert under one mutex the question would otherwise add to each of them.
 -/
 public def hasCompactUsage (compactFile usekeyFile : FilePath) : BaseIO Bool := do
   unless (← compactFile.pathExists) do return false
-  let .ok bytes ← (IO.FS.readBinFile usekeyFile).toBaseIO | return false
+  let .ok (some bytes) ← (UsagePack.readSidecarBytes? usekeyFile).toBaseIO | return false
   let .ok (some key) := parseUsageSidecar.parse UsekeySidecar usekeyVersion bytes | return false
   return (← readCompactUsage? compactFile key.usage (current := true)).isSome
 
@@ -2392,7 +2405,7 @@ has another format version.
 def readCandidateUsage? (compactFile usageFile : FilePath) (usage : ModuleUsage.Digest) :
     BaseIO (Option PrefilterUsage) := do
   if let some record ← readCompactUsage? compactFile usage then return some record
-  let .ok bytes ← (IO.FS.readBinFile usageFile).toBaseIO | return none
+  let .ok (some bytes) ← (UsagePack.readSidecarBytes? usageFile).toBaseIO | return none
   let .ok (some u) := UsageSidecar.parse? bytes | return none
   return some u.toPrefilter
 

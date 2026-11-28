@@ -911,9 +911,10 @@ bool type_checker::is_def_eq(levels const & ls1, levels const & ls2) {
 }
 
 /** \brief This is an auxiliary method for is_def_eq. It handles the "easy cases". */
-lbool type_checker::quick_is_def_eq(expr const & t, expr const & s) {
-    /* Cheap structural check plus the positive `is_def_eq` cache. */
-    if (t == s || succeeded_before(t, s))
+lbool type_checker::quick_is_def_eq(expr const & t, expr const & s, bool use_hash) {
+    /* Cheap structural check plus the positive `is_def_eq` cache: the union-find closure for a checker that
+       `use_equiv_closure` switched on (see `state::m_eqv_manager`), else the pair cache. */
+    if (m_eqv_closure ? m_st->m_eqv_manager.is_equiv(t, s, use_hash) : (t == s || succeeded_before(t, s)))
         return l_true;
     if (t.kind() == s.kind()) {
         switch (t.kind()) {
@@ -1248,7 +1249,7 @@ bool type_checker::is_def_eq_unit_like(expr const & t, expr const & s) {
 bool type_checker::is_def_eq_core(expr const & t, expr const & s) {
     scope_rec_depth guard;
     check_system("is_definitionally_equal", /* do_check_interrupted */ true);
-    lbool r = quick_is_def_eq(t, s);
+    lbool r = quick_is_def_eq(t, s, /* use_hash */ true);
     if (r != l_undef) return r == l_true;
 
     // Very basic support for proofs by reflection. If `t` has no free variables and `s` is `Bool.true`,
@@ -1324,8 +1325,12 @@ bool type_checker::is_def_eq_core(expr const & t, expr const & s) {
 
 bool type_checker::is_def_eq(expr const & t, expr const & s) {
     bool r = is_def_eq_core(t, s);
-    if (r)
-        cache_success(t, s);
+    if (r) {
+        if (m_eqv_closure)
+            m_st->m_eqv_manager.add_equiv(t, s);
+        else
+            cache_success(t, s);
+    }
     return r;
 }
 

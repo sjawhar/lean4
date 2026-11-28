@@ -506,14 +506,15 @@ test_cmd_eq 1 grep -c 'a warning logged by its build' .lake/log/rebuild.out
 # trace records. Here one was changed after the build, so Lake warns about it
 # and builds the module, and the cache keeps the log of that build alone:
 # a copy that restores it prints the module's warning once and not Lake's.
-# Usage cutoff needs the imports' `.usekey` next to their `.olean`, so the
-# artifacts are restored to the build directory.
+# Usage cutoff needs the imports' `.usekey` (in their `.usepack`) next to their
+# `.olean`, so the artifacts are restored to the build directory.
 CUTOFF_CACHE="$(norm_path "$TEST_DIR")/.lake/cutoff-cache"
 test_cmd cp -r log .lake/log/tree5
 test_cmd cp -r log .lake/log/tree6
 test_cmd chmod -R u+w .lake/log/tree5 .lake/log/tree6
 LAKE_RESTORE_ARTIFACTS=true LAKE_USAGE_CUTOFF=true cache_build "$CUTOFF_CACHE" tree5 Log.Lint
-test_exp -f .lake/log/tree5/.lake/build/lib/lean/Log/Lint.usekey
+test_cmd usepack_has .lake/log/tree5/.lake/build/lib/lean/Log/Lint.usepack k
+usepack_alone .lake/log/tree5/.lake/build/lib/lean/Log/Lint
 for tree in tree5 tree6; do
   echo 'theorem notUsedByLint : True := trivial' >> ".lake/log/$tree/Log/Sorry.lean"
 done

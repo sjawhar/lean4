@@ -12,6 +12,8 @@ cp "$W/seed/T/"*.lean "$W/readonly/T/"
 export LAKE_CACHE_DIR="$W/cache" LAKE_USAGE_CUTOFF=1
 LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true test_run -d "$W/seed" build T.D
 B="$W/seed/.lake/build/lib/lean/T"
+# A module keeps its usage-cutoff records in one file, its pack, with no `.hash` file
+usepack_alone "$B/M" "$B/D"
 cp "$B/D.olean" "$W/D.olean"
 MAP=$(python3 - "$B/D.trace" "$LAKE_CACHE_DIR" <<'PY'
 import json, pathlib, sys
@@ -24,25 +26,29 @@ cp "$MAP" "$W/mapping-before.json"
 python3 - "$MAP" <<'PY'
 import json, sys
 mapping = json.load(open(sys.argv[1]))['data']
-assert all(mapping.get(key) for key in ('u', 'v', 'k')), mapping
+assert mapping.get('p'), mapping
+assert not any(key in mapping for key in ('u', 'v', 'k')), mapping
 PY
 export LAKE_REMOTE_EXEC=grpc://fake:1 LAKE_REMOTE_EXEC_FALLBACK=fail
 export LAKE_REMOTE_EXEC_CLIENT="$HERE/../remoteExec/fake_lean_remote.py"
 export LAKE_REMOTE_EXEC_TOOLCHAIN=sha256:0000000000000000000000000000000000000000000000000000000000000001
 export LAKE_REMOTE_EXEC_SYSROOT="$(lean --print-prefix)" FAKE_CAS="$W/cas"
 
-# Force the trace-based cache path, whose trace omits the usage sidecar descriptors.
+# Force the trace-based cache path, whose trace omits the usage sidecar descriptors. The service does not answer: with
+# the usage cutoff on, local outputs (compiled with --usage, kept or skipped) are not what the service compiles, so an
+# answering service would get T.M in its own job and change T.D's input; here only a restore builds the tree.
 rm "$B/D.olean"
-LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=false FAKE_LOG="$W/writable.log" \
+LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=false FAKE_UNREACHABLE=1 FAKE_LOG="$W/writable.log" \
   test_out '0 cached (0 from manifest), 0 executed, 0 local;' -d "$W/seed" build T.D
 python3 - "$W/mapping-before.json" "$MAP" <<'PY'
 import json, sys
 before, after = [json.load(open(path))['data'] for path in sys.argv[1:]]
-assert {key: after.get(key) for key in ('u', 'v', 'k')} == {key: before[key] for key in ('u', 'v', 'k')}, (before, after)
+assert after.get('p') == before['p'], (before, after)
 PY
 
-# A read-only cache restores all artifacts to the tree even when restoreAllArtifacts is false.
-env -u LAKE_ARTIFACT_CACHE LAKE_RESTORE_ARTIFACTS=false FAKE_LOG="$W/readonly.log" \
+# A read-only cache restores all artifacts to the tree even when restoreAllArtifacts is false. The service does not
+# answer: an answering service would get T.M under the cutoff rule above, so the step would not reach the restore.
+env -u LAKE_ARTIFACT_CACHE LAKE_RESTORE_ARTIFACTS=false FAKE_UNREACHABLE=1 FAKE_LOG="$W/readonly.log" \
   "$LAKE" -d "$W/readonly" build T.D > "$W/readonly.out" 2>&1
 cat "$W/readonly.out"
 match_text '0 cached (0 from manifest), 0 executed, 0 local;' "$W/readonly.out"
@@ -63,11 +69,12 @@ LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true \
   test_not_out 'Built T.D' -d "$W/seed" build T.D
 test_exp -f "$B/D.olean"
 
-# The preserved mapping must still recover missing sidecars for the usage-cutoff decision.
-rm -f "$B/D.usage" "$B/D.resolved" "$B/D.usekey"
+# The preserved mapping must still recover a missing pack for the usage-cutoff decision.
+rm -f "$B/D.usepack"
 printf '/-! A dependency for service-cache sidecar tests. -/\ndef m : Nat := 1\ndef unused : Nat := 2\n' > "$W/seed/T/M.lean"
 LAKE_ARTIFACT_CACHE=true LAKE_RESTORE_ARTIFACTS=true lake_out -d "$W/seed" build -v T.D
 match_text 'Built T.M' produced.out
 match_text 'Replayed T.D' produced.out
 no_match_text 'Built T.D' produced.out
-for ext in usage resolved usekey; do test_exp -f "$B/D.$ext"; done
+for part in k u v; do test_cmd usepack_has "$B/D.usepack" $part; done
+usepack_alone "$B/D"
