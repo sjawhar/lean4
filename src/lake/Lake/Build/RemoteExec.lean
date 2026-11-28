@@ -1246,8 +1246,11 @@ The `run` request of a native action (contract C3.1) with its inputs `ins` (`Nat
 `skipCacheLookup`, the service runs it past its action cache. The arguments are in the order of a local build's
 (`compileO`, `compileSharedLib`, `mkLeanLinkArgs`), with `LAKE_REMOTE_EXEC_CC` as the compiler and the linker, the remote
 sysroot's headers and libraries, and Lean's C and link flags (`getCFlags'`, `getLinkerFlags'`), which name no path of
-this machine; a link's arguments are in a response file inline in the request. The action runs with
-`LAKE_REMOTE_EXEC_PATH` as its `PATH`, on the platform of the session's Lean actions.
+this machine; a link's arguments are in a response file inline in the request. A link searches the sysroot's
+`lib/lean` (Lean's libraries) and its `lib`, where a standalone toolchain keeps the static C and C++ libraries that
+Lean's link flags name (`-lc++`, `-lc++abi`, `-luv`, `-lgmp`, ...), as a local link with the bundled compiler does
+(`getInternalLinkerFlags`): `LAKE_REMOTE_EXEC_CC` need not have them. The action runs with `LAKE_REMOTE_EXEC_PATH` as
+its `PATH`, on the platform of the session's Lean actions.
 -/
 public def NativeAction.request (act : NativeAction) (s : RemoteSession) (ins : NativeRequestInputs)
     (skipCacheLookup := false) : Json := Id.run do
@@ -1259,7 +1262,7 @@ public def NativeAction.request (act : NativeAction) (s : RemoteSession) (ins : 
       (argv, #[remoteInputByPath rel file], #[])
     | .objects objs =>
       let rsp := act.rel ++ ".rsp"
-      let args := objs.map (·.1) ++ act.args ++ #["-L", s!"{s.sysroot}/lib/lean"] ++
+      let args := objs.map (·.1) ++ act.args ++ #["-L", s!"{s.sysroot}/lib/lean", "-L", s!"{s.sysroot}/lib"] ++
         Lean.Compiler.FFI.getLinkerFlags' (linkStatic := false)
       let inputs := objs.map fun (rel, o, _) => remoteInputByDigest rel o
       let rspFile := Json.mkObj [("rel", rsp), ("contents", rspContents args)]

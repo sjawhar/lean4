@@ -540,7 +540,13 @@ test_exp ! -e "$WORK/wrongtc/.lake/build/lib/lean/Rx/A.olean"
     FAKE_EXIT_LOG="$WORK/termedw.exits" LAKE_REMOTE_EXEC=grpc://fake:1 \
     setsid "$LAKE" build Rx >"$WORK/termedw.out" 2>&1 &
   lake_pid=$!
-  write_started() { compgen -G '.lake/build/lib/lean/Rx/A.olean.fake-*.tmp' > /dev/null; }
+  # whether a temporary file of the write exists; a glob test, not `compgen`, which a bash built without
+  # programmable completion (Nix's, which CI's shell runs) does not have
+  write_started() {
+    local f
+    for f in .lake/build/lib/lean/Rx/A.olean.fake-*.tmp; do [ -e "$f" ] && return 0; done
+    return 1
+  }
   for _ in $(seq 1 1200); do
     write_started && break
     sleep 0.1
@@ -608,7 +614,11 @@ test_exp ! -e "$WORK/wrongtc/.lake/build/lib/lean/Rx/A.olean"
   FAKE_SLOW_WRITE=lib/lean/Rx/A.olean FAKE_SLOW_WRITE_GO="$WORK/late.go" FAKE_PIDFILE="$WORK/late.pid" \
     LAKE_REMOTE_EXEC=grpc://fake:1 "$LAKE" build Rx >"$WORK/late1.out" 2>&1 &
   lake_pid=$!
-  slow_write_started() { compgen -G '.lake/build/lib/lean/Rx/A.olean.fake-*.tmp' > /dev/null; }
+  slow_write_started() {
+    local f
+    for f in .lake/build/lib/lean/Rx/A.olean.fake-*.tmp; do [ -e "$f" ] && return 0; done
+    return 1
+  }
   for _ in $(seq 1 1200); do
     slow_write_started && break
     sleep 0.1
