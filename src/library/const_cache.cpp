@@ -19,14 +19,16 @@ The imported-constants views of an environment are immutable per import set, so 
 views, such as ones loaded from header snapshots or modified for testing, use a process-global cache.
 
 Slots hold immutable entries behind a single atomic pointer each, so lookups are lock-free; races
-merely lose an insertion. Entries pin their key and value with references that are never dropped,
-so hits perform no reference counting on the root and key (pointer comparison and read-only name
-comparison only). Entries of the global cache additionally pin their root, so that its address
-cannot be reused by another view. The value is marked persistent so that hits are free of atomic
-reference counting. `lean_mark_persistent` must NOT be used here: it plain-writes reference counts
-while other elaboration threads concurrently update them atomically, corrupting shared object
-graphs. Freeing a view's cache thus frees its entries and tables but leaks the pinned keys and
-values.
+merely lose an insertion. Entries pin their key and value with references held for as long as the
+entry exists, so hits perform no reference counting on the root and key (pointer comparison and
+read-only name comparison only). Entries of the global cache additionally pin their root, so that
+its address cannot be reused by another view. The value is marked persistent so that hits are free
+of atomic reference counting, unless it is multi-threaded already (as a lazy node's value is).
+`lean_mark_persistent` must NOT be used here: it plain-writes reference counts while other
+elaboration threads concurrently update them atomically, corrupting shared object graphs. Freeing a
+view's cache frees its entries and tables and releases their key and value pins, on whichever
+thread frees the view, so an owned cache marks a key multi-threaded before pinning it. Persistent
+values are never freed.
 
 The cache uses open addressing with a short probe window and never replaces an entry: a replaced
 entry would have to be leaked (it may still be read concurrently), and colliding hot keys would
@@ -161,6 +163,10 @@ void cache_finalize(void * p) {
     entry * e = c->m_entries.load(std::memory_order_acquire);
     while (e) {
         entry * next = e->m_next;
+        // release the pins: the key is multi-threaded or persistent (see `find_cached_in`), and so is
+        // the value; a memo's value is persistent
+        lean_dec(e->m_key);
+        lean_dec(e->m_val);
         delete e->m_mod.load(std::memory_order_acquire);
         delete e;
         e = next;
@@ -177,7 +183,8 @@ void cache_finalize(void * p) {
 }
 
 void cache_foreach(void *, b_lean_obj_arg) {
-    // pinned objects are deliberately not visited: they are never released
+    // pinned objects are deliberately not visited: they are multi-threaded or persistent once pinned,
+    // and only `cache_finalize` releases them
 }
 
 lean_external_class * get_cache_class() {
@@ -442,9 +449,12 @@ static inline __attribute__((always_inline)) lean_obj_res find_cached_in(cache &
     *e_out = nullptr;
     if (empty == t->m_num_slots)
         return r;
-    // Pin the key, and the root unless it owns the cache; hits only compare them, so they need no
-    // special marking.
-    if (!owned)
+    // Pin the key, and the root unless it owns the cache; hits only compare them. An owned cache
+    // releases its key pins when it is freed, on whichever thread frees it, so it first marks the
+    // key multi-threaded, as sharing an object with another thread requires.
+    if (owned)
+        lean_mark_mt(n);
+    else
         lean_inc(root);
     lean_inc(n);
     entry * ne = new entry{h, root, n, r, nullptr, nullptr};
