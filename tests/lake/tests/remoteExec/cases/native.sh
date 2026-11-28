@@ -413,7 +413,8 @@ for _, v in [json.loads(l) for l in open(sys.argv[1]) if l.strip()][1:]:
     cd "$fresh"; unset LAKE_REMOTE_EXEC
     export LAKE_CACHE_DIR="$fresh.cache" LAKE_RESTORE_ARTIFACTS=true
     test_run cache add "$NW/N15.outputs.jsonl"
-    printf '#!/bin/sh\nexec env -i PATH="%s" "%s" "$@"\n' "$LAKE_REMOTE_EXEC_PATH" "$LAKE_REMOTE_EXEC_CC" > "$fresh.cc"
+    # The script expands the exported LAKE_REMOTE_EXEC_PATH and LAKE_REMOTE_EXEC_CC when it runs
+    printf '#!/bin/sh\nexec env -i PATH="$LAKE_REMOTE_EXEC_PATH" "$LAKE_REMOTE_EXEC_CC" "$@"\n' > "$fresh.cc"
     chmod +x "$fresh.cc"
     LEAN_CC="$fresh.cc" lake_out build Use2 Nat0:shared
     test_cmd "$PYTHON" -c 'import re, sys
