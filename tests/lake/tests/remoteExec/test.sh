@@ -18,10 +18,12 @@ test_cmd bash "$TEST_DIR/fake_selftest.sh"
 test_cmd "$PYTHON" "$TEST_DIR/lines_check.py" --self-test
 test_cmd "$PYTHON" "$TEST_DIR/probe_check.py" --self-test
 
+# Each case's copy of the test package is made writable, as `enter` below makes its copies: `cp` keeps the mode of
+# the checked-in files, which CI makes read-only, and cases edit their copy (e.g. `failed` rewrites Rx/B.lean).
 for d in local remote remote2 failed timeout unreach later later-local later2 wrongtc killed termed termed-write stuck \
     late late-ref fb-local fb-mixed fb-unavail fb-mat fb-mat-nf fb-seed fb-restore fb-wait fb-wait-mid \
     cf-seed cf-restore cf-svc cf-svc2; do
-  mkdir -p "$WORK/$d"; cp -r lakefile.toml Rx.lean Rx "$WORK/$d/"
+  mkdir -p "$WORK/$d"; cp -r lakefile.toml Rx.lean Rx "$WORK/$d/"; chmod -R u+w "$WORK/$d"
 done
 export LAKE_REMOTE_EXEC_CLIENT="$TEST_DIR/fake_lean_remote.py" FAKE_CAS="$WORK/cas" FAKE_LOG="$WORK/fake.log"
 export LAKE_REMOTE_EXEC_TOOLCHAIN=sha256:0000000000000000000000000000000000000000000000000000000000000001
@@ -194,7 +196,8 @@ test_cmd_eq 1 grep -cxF "\"end of input $(cat "$WORK/remote2.pid")\"" "$WORK/exi
 # A client that runs the bridge as its child (a wrapper script without `exec`, as `timeout` or
 # `strace -f` also do): when Lake kills the decision bridge, that child keeps Lake's pipes and exits
 # only at end of input, so Lake must close the bridge's input too, or it never exits.
-printf '#!/bin/sh\n"%s" "$@"\n' "$TEST_DIR/fake_lean_remote.py" > "$WORK/fork-bridge"; chmod +x "$WORK/fork-bridge"
+# The bridge runs the fake beside its directory's parent ($WORK/fork-bridge, $TEST_DIR/fake_lean_remote.py)
+printf '%s\n' '#!/bin/sh' '"${0%/*}/../fake_lean_remote.py" "$@"' > "$WORK/fork-bridge"; chmod +x "$WORK/fork-bridge"
 rc=0
 (cd "$WORK/remote" && FAKE_PIDFILE="$WORK/fork.pid" LAKE_REMOTE_EXEC_CLIENT="$WORK/fork-bridge" \
   LAKE_REMOTE_EXEC=grpc://fake:1 timeout 120 "$LAKE" build Rx > "$WORK/fork.out" 2>&1) || rc=$?
@@ -538,7 +541,13 @@ test_exp ! -e "$WORK/wrongtc/.lake/build/lib/lean/Rx/A.olean"
     FAKE_EXIT_LOG="$WORK/termedw.exits" LAKE_REMOTE_EXEC=grpc://fake:1 \
     setsid "$LAKE" build Rx >"$WORK/termedw.out" 2>&1 &
   lake_pid=$!
-  write_started() { compgen -G '.lake/build/lib/lean/Rx/A.olean.fake-*.tmp' > /dev/null; }
+  # whether a temporary file of the write exists; a glob test, not `compgen`, which a bash built without
+  # programmable completion (Nix's, which CI's shell runs) does not have
+  write_started() {
+    local f
+    for f in .lake/build/lib/lean/Rx/A.olean.fake-*.tmp; do [ -e "$f" ] && return 0; done
+    return 1
+  }
   for _ in $(seq 1 1200); do
     write_started && break
     sleep 0.1
@@ -606,7 +615,11 @@ test_exp ! -e "$WORK/wrongtc/.lake/build/lib/lean/Rx/A.olean"
   FAKE_SLOW_WRITE=lib/lean/Rx/A.olean FAKE_SLOW_WRITE_GO="$WORK/late.go" FAKE_PIDFILE="$WORK/late.pid" \
     LAKE_REMOTE_EXEC=grpc://fake:1 "$LAKE" build Rx >"$WORK/late1.out" 2>&1 &
   lake_pid=$!
-  slow_write_started() { compgen -G '.lake/build/lib/lean/Rx/A.olean.fake-*.tmp' > /dev/null; }
+  slow_write_started() {
+    local f
+    for f in .lake/build/lib/lean/Rx/A.olean.fake-*.tmp; do [ -e "$f" ] && return 0; done
+    return 1
+  }
   for _ in $(seq 1 1200); do
     slow_write_started && break
     sleep 0.1

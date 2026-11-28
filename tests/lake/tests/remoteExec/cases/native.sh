@@ -17,6 +17,12 @@ unset LAKE_REMOTE_EXEC_TIMEOUT LAKE_REMOTE_EXEC_FALLBACK LAKE_ARTIFACT_CACHE LAK
 LAKE_REMOTE_EXEC_CC=$(command -v cc)
 lld=$(command -v ld.lld)
 export LAKE_REMOTE_EXEC_CC LAKE_REMOTE_EXEC_PATH="$(dirname "$lld"):/usr/bin:/bin"
+# A local C compiler of a row (LEAN_CC, a script that runs LAKE_REMOTE_EXEC_CC) passes `-L <sysroot>/lib`, the
+# toolchain's library directory, to link a library here: Lake gives such a compiler Lean's link flags (`-lc++`,
+# `-lc++abi`, `-lgmp`, ...) with only `-L <sysroot>/lib/lean` (Lake and leanc give `<sysroot>/lib` only to Lean's own
+# compiler), and a standalone toolchain, as CI's, keeps those libraries as static archives in `<sysroot>/lib`, which the
+# service's links search. Each script expands the exported LAKE_REMOTE_EXEC_CC and LAKE_REMOTE_EXEC_SYSROOT when it
+# runs, so that no path of this machine is written into its source.
 MODS=Nat0,Nat0.Tac,Nat0.Use,Use2
 # The native targets of `lake build Use2 Nat0:shared`: the object of each module, the module libraries that the
 # compiles of Nat0.Use and Nat0 load, and the library that Use2's compile loads
@@ -158,7 +164,8 @@ row_N2() (
 row_N3() (
   enter N3 native; logs N3
   mkdir -p "$NW/N3.bin"
-  printf '#!/bin/sh\necho "$*" >> "%s"\nexit 1\n' "$NW/N3.cc.log" > "$NW/N3.bin/cc"
+  # The script's log is beside its directory: $NW/N3.cc.log
+  printf '%s\n' '#!/bin/sh' 'echo "$*" >> "${0%/*}/../N3.cc.log"' 'exit 1' > "$NW/N3.bin/cc"
   chmod +x "$NW/N3.bin/cc"
   : > "$NW/N3.cc.log"
   LEAN_CC="$NW/N3.bin/cc" PATH="$NW/N3.bin:$PATH" test_run build Use2 Nat0:shared
@@ -267,7 +274,7 @@ build_N11() (
   [ ! -e "$NW/N11.built" ] || exit 0
   enter N11 native; logs N11-local
   mkdir -p "$NW/N11.bin"
-  printf '#!/bin/sh\nexec "%s" -g "$@"\n' "$LAKE_REMOTE_EXEC_CC" > "$NW/N11.bin/cc"
+  printf '#!/bin/sh\nexec "$LAKE_REMOTE_EXEC_CC" -g "$@" -L "$LAKE_REMOTE_EXEC_SYSROOT/lib"\n' > "$NW/N11.bin/cc"
   chmod +x "$NW/N11.bin/cc"
   LEAN_CC=cc PATH="$NW/N11.bin:$PATH" FAKE_UNREACHABLE=1 test_run build Use2 Nat0:shared
   logs N11
@@ -330,7 +337,9 @@ row_N13() (
 row_N14() (
   enter N14 native; logs N14
   mkdir -p "$NW/N14.bin"
-  printf '#!/bin/sh\nrm -f "%s"\nsleep 30\nexec "%s" -g "$@"\n' "$NW/N14.down" "$LAKE_REMOTE_EXEC_CC" > "$NW/N14.bin/cc"
+  # The script removes the down file beside its directory, $NW/N14.down
+  printf '%s\n' '#!/bin/sh' 'rm -f "${0%/*}/../N14.down"' 'sleep 30' 'exec "$LAKE_REMOTE_EXEC_CC" -g "$@"' \
+    > "$NW/N14.bin/cc"
   chmod +x "$NW/N14.bin/cc"
   touch "$NW/N14.down"
   LEAN_CC=cc PATH="$NW/N14.bin:$PATH" FAKE_DOWN_FILE="$NW/N14.down" test_run build +Nat0.Tac:dynlib
@@ -344,8 +353,8 @@ row_N14() (
 )
 
 # N15: N14 with a chain of modules, the usage cutoff, the artifact cache and `lake build -o`. Nat0.Tac, Nat0.Use (which
-# imports it), their objects and module libraries compile here while the service does not answer, with N14's local C
-# compiler (`-g`, no delay); then so does Nat0.Slow, which imports Nat0.Use and is in Nat0: its compile brings the
+# imports it), their objects and module libraries compile here while the service does not answer, with N11's local C
+# compiler (`-g`); then so does Nat0.Slow, which imports Nat0.Use and is in Nat0: its compile brings the
 # service back (it removes the down file) and lasts until a probe has found the service. The targets after it go to
 # the service, and their requests promote each of those modules, objects and module libraries. After the build no
 # file names a promoted one as it was before its promotion (`promo_check.py`). The Lake cache's entry under an input
@@ -359,20 +368,24 @@ row_N15() (
   enter N15 native; logs N15
   export LAKE_USAGE_CUTOFF=1 LAKE_ARTIFACT_CACHE=true
   mkdir -p "$NW/N15.bin"
-  printf '#!/bin/sh\nexec "%s" -g "$@"\n' "$LAKE_REMOTE_EXEC_CC" > "$NW/N15.bin/cc"
+  printf '#!/bin/sh\nexec "$LAKE_REMOTE_EXEC_CC" -g "$@" -L "$LAKE_REMOTE_EXEC_SYSROOT/lib"\n' > "$NW/N15.bin/cc"
   chmod +x "$NW/N15.bin/cc"
-  cat > Nat0/Slow.lean << EOF
+  # The module reads the paths of the fake's down file and log from the environment of its compile (FAKE_DOWN_FILE, set
+  # for the row's first build, and FAKE_LOG)
+  cat > Nat0/Slow.lean << 'EOF'
 import Nat0.Use
 
 /-! A module whose compile brings the build service back: it removes the fake's down file, then waits until the fake
-answered a \`hello\` as reachable (at most 120 s), and 2 s more. -/
+answered a `hello` as reachable (at most 120 s), and 2 s more. -/
 
 #eval show IO Unit from do
-  let down : System.FilePath := "$NW/N15.down"
+  let some down ← IO.getEnv "FAKE_DOWN_FILE" | return
+  let down : System.FilePath := down
   if !(← down.pathExists) then return
   IO.FS.removeFile down
+  let some log ← IO.getEnv "FAKE_LOG" | throw <| IO.userError "FAKE_LOG is not set"
   for _ in [0:1200] do
-    if ((← IO.FS.readFile "$FAKE_LOG").splitOn "\"reachable\": true").length > 1 then
+    if ((← IO.FS.readFile log).splitOn "\"reachable\": true").length > 1 then
       IO.sleep 2000
       return
     IO.sleep 100
@@ -437,16 +450,19 @@ row_N16() (
 
 # N17: with `nativeLibDir = "../lib"`, Nat0's library is outside the build directory and has no path in the input
 # root. `lake build Nat0:shared` links it here with LEAN_CC, a script that logs its arguments and runs the service's C
-# compiler: no request is `LinkSharedLibrary`, the link writes no line, and the end-of-build line counts the objects
-# and module libraries only. Nat0's modules compile on the service. Then `lake build Use2`, whose compile loads that
-# library, sends no request: Use2 fails with the code `request`, and the message names the library's file
+# compiler with the toolchain's library directory: no request is `LinkSharedLibrary`, the link writes no line, and the
+# end-of-build line counts the objects and module libraries only. Nat0's modules compile on the service. Then `lake
+# build Use2`, whose compile loads that library, sends no request: Use2 fails with the code `request`, and the
+# message names the library's file
 row_N17() (
   local lines='Nat0.Tac:c.o.export=executed Nat0.Tac:dynlib=executed Nat0.Use:c.o.export=executed'
   lines="$lines Nat0.Use:dynlib=executed Nat0:c.o.export=executed"
   enter N17 native; logs N17
   { echo 'nativeLibDir = "../lib"'; cat "$TEST_DIR/native/lakefile.toml"; } > lakefile.toml
   mkdir -p "$NW/N17.bin"
-  printf '#!/bin/sh\necho "$*" >> "%s"\nexec "%s" "$@"\n' "$NW/N17.cc.log" "$LAKE_REMOTE_EXEC_CC" > "$NW/N17.bin/cc"
+  # The script's log is beside its directory: $NW/N17.cc.log
+  printf '%s\n' '#!/bin/sh' 'echo "$*" >> "${0%/*}/../N17.cc.log"' \
+    'exec "$LAKE_REMOTE_EXEC_CC" "$@" -L "$LAKE_REMOTE_EXEC_SYSROOT/lib"' > "$NW/N17.bin/cc"
   chmod +x "$NW/N17.bin/cc"
   : > "$NW/N17.cc.log"
   export LEAN_CC="$NW/N17.bin/cc"
