@@ -333,7 +333,10 @@ row_N14() (
   printf '#!/bin/sh\nrm -f "%s"\nsleep 30\nexec "%s" -g "$@"\n' "$NW/N14.down" "$LAKE_REMOTE_EXEC_CC" > "$NW/N14.bin/cc"
   chmod +x "$NW/N14.bin/cc"
   touch "$NW/N14.down"
-  LEAN_CC=cc PATH="$NW/N14.bin:$PATH" FAKE_DOWN_FILE="$NW/N14.down" test_run build +Nat0.Tac:dynlib
+  # Every build of the row's tree has the row's local C compiler: an object's trace holds the local compiler's flags
+  # (`ccFlags`), in service mode too, and Lake's own compiler, where the toolchain has one (as CI's), has other flags
+  export LEAN_CC=cc PATH="$NW/N14.bin:$PATH"
+  FAKE_DOWN_FILE="$NW/N14.down" test_run build +Nat0.Tac:dynlib
   check_lines "$NW/N14.jsonl" --modules Nat0.Tac --expect 'Nat0.Tac:result=local' \
     --expect 'Nat0.Tac:c.o.export:kind=c,result=local' --expect 'Nat0.Tac:dynlib:kind=shared,result=executed|cached'
   test_cmd_eq "CCompile:Nat0.Tac:c.o.export LinkShared:Nat0.Tac:dynlib" natives
@@ -385,8 +388,9 @@ def slow : Nat := zero
 EOF
   printf 'import Nat0.Tac\nimport Nat0.Use\nimport Nat0.Slow\n\n/-! The root of the library `Nat0`. -/\n' > Nat0.lean
   touch "$NW/N15.down"
-  LEAN_CC=cc PATH="$NW/N15.bin:$PATH" FAKE_DOWN_FILE="$NW/N15.down" \
-    test_run build Use2 Nat0:shared -o "$NW/N15.outputs.jsonl"
+  # Every build of the row's tree has the row's local C compiler, as in N14
+  export LEAN_CC=cc PATH="$NW/N15.bin:$PATH"
+  FAKE_DOWN_FILE="$NW/N15.down" test_run build Use2 Nat0:shared -o "$NW/N15.outputs.jsonl"
   check_lines "$NW/N15.jsonl" --modules Nat0,Nat0.Tac,Nat0.Use,Nat0.Slow,Use2 \
     --expect 'Nat0.Tac|Nat0.Use|Nat0.Slow:result=local' --expect 'Nat0|Use2:result=executed|cached' \
     --expect 'Nat0.Tac:c.o.export|Nat0.Use:c.o.export|Nat0.Tac:dynlib|Nat0.Use:dynlib:result=local' \
